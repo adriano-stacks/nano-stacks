@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use clarity::vm::ast::build_ast;
-use clarity::vm::contexts::{ContractContext, GlobalContext};
+use clarity::vm::contexts::{ContractContext, GlobalContext, OwnedEnvironment};
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
 use clarity::vm::database::{
@@ -11,7 +11,9 @@ use clarity::vm::database::{
     NULL_BURN_STATE_DB, NULL_HEADER_DB,
 };
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
-use clarity::vm::types::QualifiedContractIdentifier;
+use clarity::vm::events::StacksTransactionEvent;
+use clarity::vm::representations::SymbolicExpression;
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
     CheckpointError, MarfError, MarfValue, StateRoot, VersionedMarf, import_checkpoint,
@@ -36,6 +38,14 @@ pub struct ExecutionResult {
 pub struct Evaluation {
     pub value: Option<Value>,
     pub cost: ExecutionCost,
+}
+
+/// The observable result of a transaction executed by the Clarity VM.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransactionResult {
+    pub value: Option<Value>,
+    pub cost: ExecutionCost,
+    pub events: Vec<StacksTransactionEvent>,
 }
 
 /// Epoch 4 Clarity execution over a versioned MARF-backed store.
@@ -68,6 +78,38 @@ impl Vm {
         cost_tracker: LimitedCostTracker,
     ) -> Result<Evaluation, ClarityEvalError> {
         evaluate_with_tracker(&mut self.store, source, cost_tracker)
+    }
+
+    /// Publish a Clarity contract in the active block state.
+    pub fn deploy_contract(
+        &mut self,
+        contract: QualifiedContractIdentifier,
+        version: ClarityVersion,
+        source: &str,
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<TransactionResult, ClarityEvalError> {
+        deploy_contract(&mut self.store, contract, version, source, cost_tracker)
+    }
+
+    /// Call a published contract with consensus-serialized Clarity arguments.
+    pub fn execute_contract_call(
+        &mut self,
+        sender: PrincipalData,
+        sponsor: Option<PrincipalData>,
+        contract: QualifiedContractIdentifier,
+        function: &str,
+        arguments: &[Vec<u8>],
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<TransactionResult, VmExecutionError> {
+        execute_contract_call(
+            &mut self.store,
+            sender,
+            sponsor,
+            contract,
+            function,
+            arguments,
+            cost_tracker,
+        )
     }
 
     /// Seal the active block state.
@@ -681,6 +723,76 @@ pub fn evaluate_with_tracker(
     })
 }
 
+/// Publish a versioned Clarity contract in an active MARF-backed state.
+pub fn deploy_contract(
+    store: &mut MarfStore,
+    contract: QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, ClarityEvalError> {
+    let database = store.as_clarity_db();
+    let mut environment = OwnedEnvironment::new_cost_limited(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+    );
+    let ((), _, events) =
+        environment.initialize_versioned_contract(contract, version, source, None)?;
+
+    Ok(TransactionResult {
+        value: None,
+        cost: environment.get_cost_total(),
+        events,
+    })
+}
+
+/// Call a Clarity contract using the encoded arguments found in a transaction payload.
+pub fn execute_contract_call(
+    store: &mut MarfStore,
+    sender: PrincipalData,
+    sponsor: Option<PrincipalData>,
+    contract: QualifiedContractIdentifier,
+    function: &str,
+    arguments: &[Vec<u8>],
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, VmExecutionError> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| {
+            let mut bytes = argument.as_slice();
+            let value = Value::deserialize_read(&mut bytes, None, false).map_err(|error| {
+                VmInternalError::Expect(format!("invalid transaction argument: {error}"))
+            })?;
+            if !bytes.is_empty() {
+                return Err(VmInternalError::Expect(
+                    "transaction argument has trailing bytes".to_owned(),
+                )
+                .into());
+            }
+            Ok(SymbolicExpression::atom_value(value))
+        })
+        .collect::<Result<Vec<_>, VmExecutionError>>()?;
+    let database = store.as_clarity_db();
+    let mut environment = OwnedEnvironment::new_cost_limited(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+    );
+    let (value, _, events) =
+        environment.execute_transaction(sender, sponsor, contract, function, &arguments)?;
+
+    Ok(TransactionResult {
+        value: Some(value),
+        cost: environment.get_cost_total(),
+        events,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -690,6 +802,7 @@ mod tests {
     use clarity::vm::database::clarity_store::make_contract_hash_key;
     use clarity::vm::types::QualifiedContractIdentifier;
     use nano_primitives::TrieHash;
+    use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
     use super::{MarfStore, Vm, evaluate, evaluate_in_store};
@@ -810,6 +923,44 @@ mod tests {
 
         assert_eq!(evaluation.value, Some(Value::UInt(2)));
         assert_eq!(vm.root(block), Some(root));
+    }
+
+    #[test]
+    fn deploys_and_calls_a_contract_with_encoded_arguments() {
+        let block = [9; 32];
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
+            .expect("valid contract identifier");
+        let sender = contract.issuer.clone().into();
+        let mut argument = Vec::new();
+        Value::UInt(41)
+            .consensus_serialize(&mut argument)
+            .expect("serialize Clarity value");
+        let mut vm = Vm::new().expect("create VM");
+        vm.begin_block(None, block).expect("begin block");
+        vm.deploy_contract(
+            contract.clone(),
+            clarity::vm::ClarityVersion::Clarity6,
+            "(define-public (increment (value uint)) (ok (+ value u1)))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy contract");
+
+        let result = vm
+            .execute_contract_call(
+                sender,
+                None,
+                contract,
+                "increment",
+                &[argument],
+                LimitedCostTracker::new_free(),
+            )
+            .expect("call contract");
+
+        assert_eq!(
+            result.value,
+            Some(Value::okay(Value::UInt(42)).expect("valid response"))
+        );
+        vm.seal_block().expect("seal block");
     }
 
     #[test]
