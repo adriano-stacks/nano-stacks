@@ -8,7 +8,7 @@ pub use nakamoto::{
 };
 
 use clarity::vm::ClarityVersion as VmClarityVersion;
-use clarity::vm::costs::LimitedCostTracker;
+use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use nano_codec::{ClarityVersion, Principal, Transaction, TransactionPayloadData};
@@ -168,6 +168,9 @@ impl ChainState {
         &mut self,
         transaction: &Transaction,
     ) -> Result<TransactionReceipt, ChainStateError> {
+        if let Some(receipt) = system_receipt(transaction) {
+            return Ok(receipt);
+        }
         let origin = transaction.origin_address().ok_or_else(|| {
             ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
         })?;
@@ -261,6 +264,24 @@ impl ChainState {
             result,
         })
     }
+}
+
+fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
+    matches!(
+        transaction.payload().data(),
+        TransactionPayloadData::Coinbase { .. }
+            | TransactionPayloadData::CoinbaseToAltRecipient { .. }
+            | TransactionPayloadData::NakamotoCoinbase { .. }
+            | TransactionPayloadData::TenureChange(_)
+    )
+    .then(|| TransactionReceipt {
+        txid: transaction.txid(),
+        result: TransactionResult {
+            value: None,
+            cost: ExecutionCost::ZERO,
+            events: Vec::new(),
+        },
+    })
 }
 
 fn principal_from_address(
