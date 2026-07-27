@@ -172,6 +172,7 @@ impl ChainState {
             .iter()
             .map(|transaction| self.execute_transaction(transaction))
             .collect::<Result<Vec<_>, _>>()?;
+        self.vm.process_scheduled_unlocks()?;
         let state_root = self.vm.seal_block()?;
         let actual = TrieHash::from_bytes(state_root.0);
         if actual != block.header.state_index_root {

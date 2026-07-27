@@ -13,7 +13,7 @@ use clarity::vm::database::{
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::representations::SymbolicExpression;
-use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
     CheckpointError, MarfError, MarfValue, StateRoot, VersionedMarf, import_checkpoint,
@@ -282,6 +282,12 @@ impl Vm {
     pub fn set_tenure_height(&mut self, height: u32) -> Result<(), VmExecutionError> {
         let Self { store, context } = self;
         set_tenure_height_in_context(store, context, height)
+    }
+
+    /// Credit STX scheduled to unlock at the current Stacks block height.
+    pub fn process_scheduled_unlocks(&mut self) -> Result<(), VmExecutionError> {
+        let Self { store, context } = self;
+        process_scheduled_unlocks_in_context(store, context)
     }
 
     /// Publish a Clarity contract in the active block state.
@@ -589,7 +595,13 @@ impl MarfStore {
     }
 
     fn checkpoint_block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
-        self.marf.block_at_height(block, height)
+        self.marf.block_at_height(block, height).or_else(|| {
+            self.active
+                .as_ref()
+                .filter(|active| active.block == block)
+                .and_then(|active| active.parent)
+                .and_then(|parent| self.marf.block_at_height(parent, height))
+        })
     }
 
     fn current_block(&self) -> Option<[u8; 32]> {
@@ -792,7 +804,12 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn set_block_hash(&mut self, block: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
-        if !self.states.contains_key(&block.0) {
+        if !self.states.contains_key(&block.0)
+            && self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.block != block.0)
+        {
             return Err(RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(block.0)).into());
         }
         let previous = self.current_block().unwrap_or([0; 32]);
@@ -1196,6 +1213,45 @@ fn debit_fee_in_context(
         }
         balance.debit(u128::from(fee))?;
         balance.save()
+    })
+}
+
+fn process_scheduled_unlocks_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        let block_height = Value::UInt(u128::from(global.database.get_current_block_height()));
+        let lockup_contract = clarity::boot_util::boot_code_id("lockup", false);
+        let entries = match global.database.fetch_entry_unknown_descriptor(
+            &lockup_contract,
+            "lockups",
+            &block_height,
+            &global.epoch_id,
+        )? {
+            Value::Optional(optional) => match optional.data.map(|value| *value) {
+                Some(Value::Sequence(SequenceData::List(entries))) => entries.data,
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        for entry in entries {
+            let schedule = entry.expect_tuple()?;
+            let amount = schedule.get("amount")?.to_owned().expect_u128()?;
+            let recipient = schedule.get("recipient")?.to_owned().expect_principal()?;
+            let mut balance = global.database.get_stx_balance_snapshot(&recipient)?;
+            balance.credit(amount)?;
+            balance.save()?;
+        }
+        Ok(())
     })
 }
 
