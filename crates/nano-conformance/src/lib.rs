@@ -352,7 +352,9 @@ mod tests {
         PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
         PoxAddressType32 as ReferencePoxAddressType32,
     };
-    use blockstack_lib::chainstate::stacks::index::MARFValue as ReferenceMarfValue;
+    use blockstack_lib::chainstate::stacks::index::{
+        MARFValue as ReferenceMarfValue, TrieLeaf as ReferenceTrieLeaf, bits::get_leaf_hash,
+    };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
@@ -361,7 +363,7 @@ mod tests {
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
-    use nano_marf::{MarfValue, key_path};
+    use nano_marf::{MarfValue, key_path, leaf_hash};
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
     use stacks_common::util::{
@@ -508,6 +510,20 @@ mod tests {
             let reference_path = ReferenceTrieHash::from_key(&text);
             prop_assert_eq!(ours.as_bytes(), &reference.0);
             prop_assert_eq!(our_path.as_bytes(), reference_path.as_bytes());
+        }
+
+        #[test]
+        fn marf_leaf_hashes_match_stacks_core(
+            path in proptest::collection::vec(any::<u8>(), 0..=32),
+            value in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let text = String::from_utf8_lossy(&value);
+            let ours = leaf_hash(&path, MarfValue::from_value(text.as_bytes())).expect("bounded path");
+            let reference = get_leaf_hash(&ReferenceTrieLeaf::from_value(
+                &path,
+                ReferenceMarfValue::from_value(&text),
+            ));
+            prop_assert_eq!(ours.as_bytes(), &reference.0);
         }
 
         #[test]

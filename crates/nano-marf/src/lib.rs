@@ -155,6 +155,19 @@ pub fn internal_node_hash(
     Ok(TrieHash::from_bytes(*sha512_256(&bytes).as_bytes()))
 }
 
+/// Hash a MARF leaf's path suffix and fixed-width value.
+pub fn leaf_hash(path: &[u8], value: MarfValue) -> Result<TrieHash, MarfError> {
+    if path.len() > 32 {
+        return Err(MarfError::InvalidPath);
+    }
+    let mut bytes = Vec::with_capacity(42 + path.len());
+    bytes.push(TrieNodeId::Leaf as u8);
+    bytes.push(u8::try_from(path.len()).expect("validated path length"));
+    bytes.extend_from_slice(path);
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(TrieHash::from_bytes(*sha512_256(&bytes).as_bytes()))
+}
+
 /// Fold a trie content hash into the MARF's power-of-two ancestor history.
 #[must_use]
 pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
@@ -181,7 +194,9 @@ impl StateRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path, state_root};
+    use super::{
+        MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path, leaf_hash, state_root,
+    };
 
     #[test]
     fn value_hashing_and_integer_encoding_are_canonical() {
@@ -210,6 +225,14 @@ mod tests {
         assert_eq!(
             internal_node_hash(TrieNodeId::Node4, &[], b"", &[]),
             Err(MarfError::InvalidPointerCount)
+        );
+    }
+
+    #[test]
+    fn leaf_paths_are_limited_to_a_single_hash_suffix() {
+        assert_eq!(
+            leaf_hash(&[0; 33], MarfValue::from_u32(1)),
+            Err(MarfError::InvalidPath)
         );
     }
 
