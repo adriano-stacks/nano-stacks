@@ -3,7 +3,7 @@
 use std::fmt;
 
 use nano_chainstate::{NakamotoBlock, NakamotoCodecError};
-use nano_primitives::{ConsensusHash, StacksBlockId};
+use nano_primitives::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 
@@ -17,7 +17,7 @@ pub struct SyncClient {
 pub struct NodeInfo {
     pub bitcoin_height: u64,
     pub stacks_height: u64,
-    pub stacks_tip: StacksBlockId,
+    pub stacks_tip: BlockHeaderHash,
     pub consensus_hash: ConsensusHash,
     pub network_id: u32,
 }
@@ -85,7 +85,7 @@ impl SyncClient {
         Ok(NodeInfo {
             bitcoin_height: response.burn_block_height,
             stacks_height: response.stacks_tip_height,
-            stacks_tip: parse_block_id(&response.stacks_tip)?,
+            stacks_tip: parse_block_hash(&response.stacks_tip)?,
             consensus_hash: parse_consensus_hash(&response.stacks_tip_consensus_hash)?,
             network_id: response.network_id,
         })
@@ -190,6 +190,10 @@ fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {
     parse_hex(value).map(StacksBlockId::from_bytes)
 }
 
+fn parse_block_hash(value: &str) -> Result<BlockHeaderHash, SyncError> {
+    parse_hex(value).map(BlockHeaderHash::from_bytes)
+}
+
 fn parse_consensus_hash(value: &str) -> Result<ConsensusHash, SyncError> {
     parse_hex(value).map(ConsensusHash::from_bytes)
 }
@@ -208,7 +212,9 @@ fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError
 
 #[cfg(test)]
 mod tests {
-    use super::{SyncError, parse_block_id, parse_consensus_hash};
+    use reqwest::Url;
+
+    use super::{SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash};
 
     #[test]
     fn hashes_must_be_exact_lower_or_upper_hex() {
@@ -217,6 +223,12 @@ mod tests {
         assert_eq!(
             parse_block_id("0000000000000000000000000000000000000000000000000000000000000000")
                 .expect("valid block ID")
+                .as_bytes(),
+            &[0; 32]
+        );
+        assert_eq!(
+            parse_block_hash("0000000000000000000000000000000000000000000000000000000000000000")
+                .expect("valid block hash")
                 .as_bytes(),
             &[0; 32]
         );
@@ -230,5 +242,20 @@ mod tests {
             parse_consensus_hash("00"),
             Err(SyncError::InvalidHash)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_tip_block_downloads_and_validates() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let tenure = client.tenure_info().await.expect("fetch tenure info");
+        let block = client
+            .block(tenure.tip_block_id)
+            .await
+            .expect("fetch tip block");
+
+        assert_eq!(block.block_id(), tenure.tip_block_id);
     }
 }
