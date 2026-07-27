@@ -16,7 +16,8 @@ use nano_codec::{
 };
 use nano_primitives::{Sha256Sum, TrieHash};
 use nano_sortition::SortitionSnapshot;
-use nano_vm::{BitcoinBlockContext, ExecutionResult, MarfStoreError, TransactionResult, Vm};
+pub use nano_vm::BitcoinBlockContext;
+use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
 use std::path::Path;
 
 /// M0 boundary that makes the final validation stage explicit.

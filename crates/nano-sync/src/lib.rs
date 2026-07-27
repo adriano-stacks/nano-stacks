@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use nano_chainstate::{NakamotoBlock, NakamotoCodecError};
+use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, NakamotoCodecError};
 use nano_primitives::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -42,6 +42,20 @@ pub struct PoxInfo {
     pub reward_phase_length: u32,
     pub reward_slots: u32,
     pub rejection_fraction: Option<u64>,
+}
+
+impl PoxInfo {
+    /// Convert the node response into the context required for VM execution.
+    #[must_use]
+    pub fn bitcoin_context(&self) -> BitcoinBlockContext {
+        BitcoinBlockContext {
+            height: self.bitcoin_height,
+            first_height: self.first_bitcoin_height,
+            prepare_phase_length: self.prepare_phase_length,
+            reward_phase_length: self.reward_phase_length,
+            rejection_fraction: self.rejection_fraction.unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -305,6 +319,7 @@ mod tests {
         assert!(calendar.prepare_phase_length > 0);
         assert!(calendar.reward_phase_length > 0);
         assert!(calendar.reward_slots > 0);
+        assert_eq!(calendar.bitcoin_context().height, calendar.bitcoin_height);
     }
 
     #[tokio::test]
