@@ -892,6 +892,35 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn reference_generated_transaction_round_trips_with_nano_codec(chain_id in any::<u32>()) {
+            let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+            let path = fs::read_dir(blocks)
+                .expect("read fixture blocks")
+                .next()
+                .expect("at least one fixture block")
+                .expect("fixture entry")
+                .path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let mut block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .expect("decode fixture block");
+            let mut transaction = block.txs.remove(0);
+            transaction.chain_id = chain_id;
+
+            let mut encoded = Vec::new();
+            transaction
+                .consensus_serialize(&mut encoded)
+                .expect("serialize generated reference transaction");
+            let (nano, consumed) = NanoTransaction::decode(&encoded).expect("decode generated transaction");
+            prop_assert_eq!(consumed, encoded.len());
+            prop_assert_eq!(nano.encode(), encoded);
+            let nano_txid = nano.txid();
+            let reference_txid = transaction.txid();
+            prop_assert_eq!(nano_txid.as_bytes(), reference_txid.as_bytes());
+        }
+    }
+
     #[test]
     fn fixture_transaction_header_mutations_match_stacks_core_acceptance() {
         let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
