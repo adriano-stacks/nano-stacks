@@ -1492,6 +1492,16 @@ mod tests {
                 assert_eq!(consumed, reference.len());
                 assert_eq!(nano.encode(), reference);
                 assert_eq!(nano.txid().as_bytes(), transaction.txid().as_bytes());
+                assert_eq!(
+                    nano.origin_address().map(|address| address.to_string()),
+                    Some(transaction.origin_address().to_string())
+                );
+                assert_eq!(
+                    nano.sponsor_address().map(|address| address.to_string()),
+                    transaction
+                        .sponsor_address()
+                        .map(|address| address.to_string())
+                );
                 nano_transactions.push(nano);
             }
             assert_eq!(

@@ -62,6 +62,17 @@ impl Vm {
         })
     }
 
+    /// Open a VM at a checkpointed Clarity state.
+    pub fn from_checkpoint(
+        path: impl AsRef<Path>,
+        source: [u8; 32],
+        expected_root: TrieHash,
+    ) -> Result<Self, MarfStoreError> {
+        Ok(Self {
+            store: MarfStore::from_checkpoint(path, source, expected_root)?,
+        })
+    }
+
     /// Begin execution for a block state.
     pub fn begin_block(
         &mut self,

@@ -220,6 +220,21 @@ impl TransactionAuth {
         }
         writer.finish()
     }
+
+    #[must_use]
+    pub const fn origin(&self) -> &SpendingCondition {
+        match self {
+            Self::Standard(origin) | Self::Sponsored { origin, .. } => origin,
+        }
+    }
+
+    #[must_use]
+    pub const fn sponsor(&self) -> Option<&SpendingCondition> {
+        match self {
+            Self::Standard(_) => None,
+            Self::Sponsored { sponsor, .. } => Some(sponsor),
+        }
+    }
 }
 
 /// A complete SIP-005 transaction, retained in its canonical consensus encoding.
@@ -735,6 +750,31 @@ impl Transaction {
     pub fn txid(&self) -> Sha256Sum {
         sha512_256(&self.encode())
     }
+
+    /// Return the origin address implied by the authorization and transaction network.
+    #[must_use]
+    pub fn origin_address(&self) -> Option<StacksAddress> {
+        self.network_mainnet()
+            .map(|mainnet| self.auth.origin().account_address(mainnet))
+    }
+
+    /// Return the sponsor address for a sponsored transaction.
+    #[must_use]
+    pub fn sponsor_address(&self) -> Option<StacksAddress> {
+        self.network_mainnet().and_then(|mainnet| {
+            self.auth
+                .sponsor()
+                .map(|sponsor| sponsor.account_address(mainnet))
+        })
+    }
+
+    const fn network_mainnet(&self) -> Option<bool> {
+        match self.version {
+            TransactionVersion::Mainnet => Some(true),
+            TransactionVersion::Testnet => Some(false),
+            TransactionVersion::Other(_) => None,
+        }
+    }
 }
 
 /// Calculate the tagged Merkle root committed by a block header.
@@ -1221,6 +1261,23 @@ fn encode_payload(writer: &mut Writer, payload: &TransactionPayloadData) {
 }
 
 impl SpendingCondition {
+    #[must_use]
+    pub fn account_address(&self, mainnet: bool) -> StacksAddress {
+        let (signer, singlesig) = match self {
+            Self::Singlesig(condition) => (condition.signer, Some(condition.hash_mode)),
+            Self::Multisig(condition) => (condition.signer, None),
+            Self::OrderIndependentMultisig(condition) => (condition.signer, None),
+        };
+        let version = match (mainnet, singlesig) {
+            (true, Some(SinglesigHashMode::P2pkh)) => 22,
+            (false, Some(SinglesigHashMode::P2pkh)) => 26,
+            (true, _) => 20,
+            (false, _) => 21,
+        };
+
+        StacksAddress::new(version, signer).expect("protocol address versions are valid")
+    }
+
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let mode = reader.byte()?;
         match mode {

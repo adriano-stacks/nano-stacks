@@ -1,7 +1,7 @@
 ---
 id: "011"
 title: "M10: implement full block execution and fixture replay"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["008", "009", "010"]
@@ -13,12 +13,19 @@ created_at: 2026-07-27
 
 ## Objective
 
-<!-- Describe the goal of this task -->
+Replay captured Nakamoto blocks from the checkpoint, producing the same
+Clarity receipts and state roots as stacks-core.
 
 ## Tasks
 
-- [ ] TODO
+- [x] Execute decoded contract deployments and contract calls through the Epoch 4 VM.
+- [ ] Apply token transfers, coinbase, tenure changes, fees, and account nonces.
+- [ ] Enforce post-conditions and transaction-level runtime error semantics.
+- [ ] Carry block-level cost limits and receipt costs/events through execution.
+- [ ] Replay captured blocks from the checkpoint and report the first divergence.
 
 ## Acceptance Criteria
 
-- TODO
+- Every captured block has matching transaction receipts, including status, costs, and events.
+- Every replayed header has the matching `state_index_root`.
+- The scoreboard reports replay depth and the exact first divergence.
