@@ -894,18 +894,22 @@ mod tests {
 
     proptest! {
         #[test]
-        fn reference_generated_transaction_round_trips_with_nano_codec(chain_id in any::<u32>()) {
+        fn reference_generated_transaction_round_trips_with_nano_codec(
+            chain_id in any::<u32>(),
+            block_index in any::<usize>(),
+            transaction_index in any::<usize>(),
+        ) {
             let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
-            let path = fs::read_dir(blocks)
+            let paths = fs::read_dir(blocks)
                 .expect("read fixture blocks")
-                .next()
-                .expect("at least one fixture block")
-                .expect("fixture entry")
-                .path();
-            let bytes = fs::read(&path).expect("read fixture block");
+                .map(|entry| entry.expect("fixture entry").path())
+                .collect::<Vec<_>>();
+            let path = &paths[block_index % paths.len()];
+            let bytes = fs::read(path).expect("read fixture block");
             let mut block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .expect("decode fixture block");
-            let mut transaction = block.txs.remove(0);
+            let transaction_index = transaction_index % block.txs.len();
+            let mut transaction = block.txs.remove(transaction_index);
             transaction.chain_id = chain_id;
 
             let mut encoded = Vec::new();
