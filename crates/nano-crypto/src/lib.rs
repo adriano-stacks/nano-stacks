@@ -87,9 +87,6 @@ impl StacksPublicKey {
         digest: &[u8; 32],
         signature: &MessageSignature,
     ) -> Result<(), CryptoError> {
-        if !signature.is_low_s()? {
-            return Err(CryptoError::HighS);
-        }
         if signature.recover(digest)? != *self {
             return Err(CryptoError::SignatureMismatch);
         }
