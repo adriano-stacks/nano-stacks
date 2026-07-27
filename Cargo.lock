@@ -1442,6 +1442,7 @@ dependencies = [
  "nano-marf",
  "nano-node",
  "nano-primitives",
+ "nano-sortition",
  "proptest",
  "stacks-common",
  "stackslib",

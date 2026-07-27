@@ -351,6 +351,10 @@ mod tests {
         MagicBytes,
         bitcoin::{BitcoinNetworkType, BitcoinTxInput, blocks::BitcoinBlockParser},
     };
+    use blockstack_lib::chainstate::burn::{
+        ConsensusHashExtensions, OpsHash as ReferenceOpsHash,
+        SortitionHash as ReferenceSortitionHash,
+    };
     use blockstack_lib::chainstate::stacks::address::{
         PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
         PoxAddressType32 as ReferencePoxAddressType32,
@@ -393,7 +397,6 @@ mod tests {
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
-    use stacks_common::deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize;
     use stacks_common::util::{
         secp256k1::{
             MessageSignature as ReferenceMessageSignature,
@@ -417,6 +420,13 @@ mod tests {
         },
         util::uint::Uint256 as ReferenceUint256,
         util::vrf::VRFProof as ReferenceVrfProof,
+    };
+    use stacks_common::{
+        deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize,
+        types::chainstate::{
+            BurnchainHeaderHash as ReferenceBitcoinHeaderHash,
+            ConsensusHash as ReferenceConsensusHash, PoxId as ReferencePoxId,
+        },
     };
     use std::{
         fs,
@@ -958,6 +968,63 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sortition_hash_chain_matches_stacks_core() {
+        let mut chain =
+            nano_sortition::SnapshotChain::new(nano_sortition::SortitionSnapshot::genesis(
+                0,
+                nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            ));
+        let mut reference_sortition_hash = ReferenceSortitionHash::initial();
+        let mut reference_consensus_hashes = vec![ReferenceConsensusHash::empty()];
+
+        for height in 1_u64..=64 {
+            let hash = [u8::try_from(height).expect("test height fits u8"); 32];
+            let block = nano_bitcoin::BitcoinBlock {
+                height,
+                hash,
+                operations: Vec::new(),
+            };
+            let snapshot = chain
+                .append(&block, 0, nano_sortition::PoxId::initial())
+                .expect("contiguous Bitcoin block");
+            let reference_header_hash = ReferenceBitcoinHeaderHash(hash);
+            let reference_ops_hash = ReferenceOpsHash::from_txids(&[]);
+            let parent_index = reference_consensus_hashes.len() - 1;
+            let mut previous_hashes = Vec::new();
+            for exponent in 0..64 {
+                let offset = (1_usize << exponent).saturating_sub(1);
+                let Some(index) = parent_index.checked_sub(offset) else {
+                    break;
+                };
+                previous_hashes.push(reference_consensus_hashes[index].clone());
+            }
+            let reference_consensus_hash = ReferenceConsensusHash::from_ops(
+                &reference_header_hash,
+                &reference_ops_hash,
+                0,
+                &previous_hashes,
+                &ReferencePoxId::initial(),
+            );
+            reference_sortition_hash =
+                reference_sortition_hash.mix_burn_header(&reference_header_hash);
+
+            assert_eq!(
+                snapshot.operations_hash.as_bytes(),
+                reference_ops_hash.as_bytes()
+            );
+            assert_eq!(
+                snapshot.consensus_hash.as_bytes(),
+                reference_consensus_hash.as_bytes()
+            );
+            assert_eq!(
+                snapshot.sortition_hash.as_bytes(),
+                reference_sortition_hash.as_bytes()
+            );
+            reference_consensus_hashes.push(reference_consensus_hash);
         }
     }
 

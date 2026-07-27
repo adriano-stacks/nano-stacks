@@ -13,12 +13,17 @@ created_at: 2026-07-27
 
 ## Objective
 
-<!-- Describe the goal of this task -->
+Reproduce epoch-4 sortition snapshots from Bitcoin operations without a
+production dependency on Stacks-Core.
 
 ## Tasks
 
-- [ ] TODO
+- [x] Implement operation, consensus, and rolling sortition hashes.
+- [ ] Build the six-block commit distribution and assumed-total-commit rules.
+- [ ] Select winners and maintain snapshot state across Bitcoin blocks.
+- [ ] Replay captured snapshots and compare every consensus-critical field.
 
 ## Acceptance Criteria
 
-- TODO
+- Captured snapshots match their operations, consensus hashes, sortition hashes,
+  total burns, and winners.
