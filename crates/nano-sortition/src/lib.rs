@@ -101,7 +101,7 @@ pub fn commitment_distribution(
         .commitments
         .iter()
         .cloned()
-        .map(|commitment| vec![Link::Commitment(commitment)])
+        .map(|commitment| vec![Some(Link::Commitment(commitment))])
         .collect::<Vec<_>>();
 
     for block in earlier.iter().rev() {
@@ -119,18 +119,18 @@ pub fn commitment_distribution(
             .map(|commitment| (commitment.txid, commitment))
             .collect::<HashMap<_, _>>();
         for chain in &mut linked {
-            let Some(last) = chain.last() else {
+            let Some(last) = chain.iter().rev().find_map(Option::as_ref) else {
                 return Err(SortitionError::InvalidCommitmentWindow);
             };
             let (spent_txid, spent_output) = last.spent();
             if spent_output != expected_output {
-                chain.push(Link::Missing);
+                chain.push(None);
             } else if let Some(commitment) = commitments.remove(&spent_txid) {
-                chain.push(Link::Commitment(commitment));
+                chain.push(Some(Link::Commitment(commitment)));
             } else if let Some(commitment) = missed.remove(&spent_txid) {
-                chain.push(Link::Missed(commitment));
+                chain.push(Some(Link::Missed(commitment)));
             } else {
-                chain.push(Link::Missing);
+                chain.push(None);
             }
         }
     }
@@ -166,14 +166,13 @@ pub fn select_winner(
 enum Link {
     Commitment(MiningCommitment),
     Missed(MissedCommitment),
-    Missing,
 }
 
 impl Link {
     const fn burn_sats(&self) -> u64 {
         match self {
             Self::Commitment(commitment) => commitment.burn_sats,
-            Self::Missed(_) | Self::Missing => 1,
+            Self::Missed(_) => 1,
         }
     }
 
@@ -181,19 +180,21 @@ impl Link {
         match self {
             Self::Commitment(commitment) => (commitment.spent_txid, commitment.spent_output),
             Self::Missed(commitment) => (commitment.spent_txid, commitment.spent_output),
-            Self::Missing => ([0; 32], u32::MAX),
         }
     }
 }
 
-fn make_burn_sample(chain: &[Link], window_len: u8) -> Result<BurnSample, SortitionError> {
-    let Some(Link::Commitment(candidate)) = chain.first() else {
+fn make_burn_sample(chain: &[Option<Link>], window_len: u8) -> Result<BurnSample, SortitionError> {
+    let Some(Some(Link::Commitment(candidate))) = chain.first() else {
         return Err(SortitionError::InvalidCommitmentWindow);
     };
     if chain.len() != usize::from(window_len) {
         return Err(SortitionError::InvalidCommitmentWindow);
     }
-    let burns = chain.iter().map(Link::burn_sats).collect::<Vec<_>>();
+    let burns = chain
+        .iter()
+        .map(|link| link.as_ref().map_or(1, Link::burn_sats))
+        .collect::<Vec<_>>();
     let mut sorted = burns.clone();
     sorted.sort_unstable();
     let middle = sorted.len() / 2;
@@ -210,13 +211,8 @@ fn make_burn_sample(chain: &[Link], window_len: u8) -> Result<BurnSample, Sortit
         candidate: candidate.clone(),
         burn_sats: burns[0].min(median_burn_sats),
         median_burn_sats,
-        frequency: u8::try_from(
-            chain
-                .iter()
-                .filter(|link| !matches!(link, Link::Missing))
-                .count(),
-        )
-        .expect("commitment window fits u8"),
+        frequency: u8::try_from(chain.iter().filter(|link| link.is_some()).count())
+            .expect("commitment window fits u8"),
         range_start: Uint256::zero(),
         range_end: Uint256::zero(),
     })
