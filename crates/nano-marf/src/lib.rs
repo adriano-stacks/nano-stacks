@@ -225,12 +225,46 @@ impl MarfTrie {
     }
 
     #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<MarfValue> {
+        self.get_path(*key_path(key).as_bytes())
+    }
+
+    #[must_use]
+    pub fn get_path(&self, path: [u8; 32]) -> Option<MarfValue> {
+        self.root_children
+            .iter()
+            .find(|(character, _)| *character == path[0])
+            .and_then(|(_, child)| child.get(&path[1..]))
+    }
+
+    #[must_use]
     pub fn root_hash(&self) -> TrieHash {
         hash_children(TrieNodeId::Node256, &[], &self.root_children)
     }
 }
 
 impl TrieNode {
+    fn get(&self, path: &[u8]) -> Option<MarfValue> {
+        match self {
+            Self::Leaf {
+                path: leaf_path,
+                value,
+            } => (leaf_path == path).then_some(*value),
+            Self::Internal {
+                path: node_path,
+                children,
+            } => path
+                .strip_prefix(node_path.as_slice())
+                .and_then(|remaining| remaining.split_first())
+                .and_then(|(character, remaining)| {
+                    children
+                        .iter()
+                        .find(|(child_character, _)| child_character == character)
+                        .and_then(|(_, child)| child.get(remaining))
+                }),
+        }
+    }
+
     fn insert(&mut self, path: &[u8], value: MarfValue) {
         match self {
             Self::Leaf {
@@ -469,5 +503,10 @@ mod tests {
         assert_ne!(overwritten_root, root_before_overwrite);
         trie.insert_path(overwritten_path, MarfValue::from_u32(100));
         assert_eq!(trie.root_hash(), overwritten_root);
+        assert_eq!(
+            trie.get_path(overwritten_path),
+            Some(MarfValue::from_u32(100))
+        );
+        assert_eq!(trie.get_path([0xff; 32]), None);
     }
 }
