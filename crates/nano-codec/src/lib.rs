@@ -254,6 +254,14 @@ impl TransactionVersion {
             other => Self::Other(other),
         }
     }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Mainnet => 0,
+            Self::Testnet => 0x80,
+            Self::Other(value) => value,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +280,14 @@ impl AnchorMode {
             _ => Err(CodecError::InvalidTransaction),
         }
     }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::OnChainOnly => 1,
+            Self::OffChainOnly => 2,
+            Self::Any => 3,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +302,13 @@ impl PostConditionMode {
             1 => Ok(Self::Deny),
             2 => Ok(Self::Allow),
             _ => Err(CodecError::InvalidTransaction),
+        }
+    }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Deny => 1,
+            Self::Allow => 2,
         }
     }
 }
@@ -432,6 +455,17 @@ impl ClarityVersion {
             _ => Err(CodecError::InvalidPayload),
         }
     }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Clarity1 => 1,
+            Self::Clarity2 => 2,
+            Self::Clarity3 => 3,
+            Self::Clarity4 => 4,
+            Self::Clarity5 => 5,
+            Self::Clarity6 => 6,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,6 +504,18 @@ impl TenureChangeCause {
             5 => Ok(Self::ExtendedWriteCount),
             6 => Ok(Self::ExtendedWriteLength),
             _ => Err(CodecError::InvalidPayload),
+        }
+    }
+
+    const fn byte(self) -> u8 {
+        match self {
+            Self::BlockFound => 0,
+            Self::Extended => 1,
+            Self::ExtendedRuntime => 2,
+            Self::ExtendedReadCount => 3,
+            Self::ExtendedReadLength => 4,
+            Self::ExtendedWriteCount => 5,
+            Self::ExtendedWriteLength => 6,
         }
     }
 }
@@ -620,7 +666,19 @@ impl Transaction {
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        self.bytes.clone()
+        let mut writer = Writer::default();
+        writer.byte(self.version.byte());
+        writer.u32(self.chain_id);
+        writer.raw(&self.auth.encode());
+        writer.byte(self.anchor_mode.byte());
+        writer.byte(self.post_condition_mode.byte());
+        writer
+            .u32(u32::try_from(self.post_conditions.len()).expect("post-condition count fits u32"));
+        for post_condition in &self.post_conditions {
+            encode_post_condition(&mut writer, post_condition.data());
+        }
+        encode_payload(&mut writer, self.payload.data());
+        writer.finish()
     }
 
     #[must_use]
@@ -675,7 +733,7 @@ impl Transaction {
 
     #[must_use]
     pub fn txid(&self) -> Sha256Sum {
-        sha512_256(&self.bytes)
+        sha512_256(&self.encode())
     }
 }
 
@@ -979,6 +1037,187 @@ fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecErr
     Ok(())
 }
 
+fn encode_post_condition(writer: &mut Writer, post_condition: &PostConditionData) {
+    match post_condition {
+        PostConditionData::Stx {
+            principal,
+            condition,
+            amount,
+        } => {
+            writer.byte(0);
+            encode_post_condition_principal(writer, principal);
+            encode_fungible_condition(writer, *condition);
+            writer.u64(*amount);
+        }
+        PostConditionData::Fungible {
+            principal,
+            asset,
+            condition,
+            amount,
+        } => {
+            writer.byte(1);
+            encode_post_condition_principal(writer, principal);
+            encode_asset_info(writer, asset);
+            encode_fungible_condition(writer, *condition);
+            writer.u64(*amount);
+        }
+        PostConditionData::NonFungible {
+            principal,
+            asset,
+            asset_value,
+            condition,
+        } => {
+            writer.byte(2);
+            encode_post_condition_principal(writer, principal);
+            encode_asset_info(writer, asset);
+            writer.raw(asset_value.as_bytes());
+            writer.byte(match condition {
+                NonFungibleCondition::DoesNotSend => 0x10,
+                NonFungibleCondition::DoesSend => 0x11,
+            });
+        }
+    }
+}
+
+fn encode_post_condition_principal(writer: &mut Writer, principal: &PostConditionPrincipal) {
+    match principal {
+        PostConditionPrincipal::Origin => writer.byte(1),
+        PostConditionPrincipal::Standard(address) => {
+            writer.byte(2);
+            writer.address(*address);
+        }
+        PostConditionPrincipal::Contract {
+            address,
+            contract_name,
+        } => {
+            writer.byte(3);
+            writer.address(*address);
+            writer.name(contract_name);
+        }
+    }
+}
+
+fn encode_asset_info(writer: &mut Writer, asset: &AssetInfo) {
+    writer.address(asset.address);
+    writer.name(&asset.contract_name);
+    writer.name(&asset.asset_name);
+}
+
+fn encode_fungible_condition(writer: &mut Writer, condition: FungibleCondition) {
+    writer.byte(match condition {
+        FungibleCondition::SentEqual => 1,
+        FungibleCondition::SentGreater => 2,
+        FungibleCondition::SentGreaterEqual => 3,
+        FungibleCondition::SentLess => 4,
+        FungibleCondition::SentLessEqual => 5,
+    });
+}
+
+fn encode_principal(writer: &mut Writer, principal: &Principal) {
+    match principal {
+        Principal::Standard(address) => {
+            writer.byte(5);
+            writer.address(*address);
+        }
+        Principal::Contract {
+            address,
+            contract_name,
+        } => {
+            writer.byte(6);
+            writer.address(*address);
+            writer.name(contract_name);
+        }
+    }
+}
+
+fn encode_payload(writer: &mut Writer, payload: &TransactionPayloadData) {
+    match payload {
+        TransactionPayloadData::TokenTransfer {
+            recipient,
+            amount,
+            memo,
+        } => {
+            writer.byte(0);
+            encode_principal(writer, recipient);
+            writer.u64(*amount);
+            writer.raw(memo);
+        }
+        TransactionPayloadData::SmartContract {
+            contract_name,
+            source,
+        } => {
+            writer.byte(1);
+            writer.name(contract_name);
+            writer.stacks_string(source);
+        }
+        TransactionPayloadData::ContractCall {
+            address,
+            contract_name,
+            function_name,
+            arguments,
+        } => {
+            writer.byte(2);
+            writer.address(*address);
+            writer.name(contract_name);
+            writer.name(function_name);
+            writer.u32(u32::try_from(arguments.len()).expect("argument count fits u32"));
+            for argument in arguments {
+                writer.raw(argument.as_bytes());
+            }
+        }
+        TransactionPayloadData::PoisonMicroblock { first, second } => {
+            writer.byte(3);
+            writer.raw(first.as_bytes());
+            writer.raw(second.as_bytes());
+        }
+        TransactionPayloadData::Coinbase { payload } => {
+            writer.byte(4);
+            writer.raw(payload);
+        }
+        TransactionPayloadData::CoinbaseToAltRecipient { payload, recipient } => {
+            writer.byte(5);
+            writer.raw(payload);
+            encode_principal(writer, recipient);
+        }
+        TransactionPayloadData::VersionedSmartContract {
+            clarity_version,
+            contract_name,
+            source,
+        } => {
+            writer.byte(6);
+            writer.byte(clarity_version.byte());
+            writer.name(contract_name);
+            writer.stacks_string(source);
+        }
+        TransactionPayloadData::TenureChange(payload) => {
+            writer.byte(7);
+            writer.raw(payload.tenure_consensus_hash.as_bytes());
+            writer.raw(payload.previous_tenure_consensus_hash.as_bytes());
+            writer.raw(payload.bitcoin_view_consensus_hash.as_bytes());
+            writer.raw(payload.previous_tenure_end.as_bytes());
+            writer.u32(payload.previous_tenure_blocks);
+            writer.byte(payload.cause.byte());
+            writer.hash160(payload.public_key_hash);
+        }
+        TransactionPayloadData::NakamotoCoinbase {
+            payload,
+            recipient,
+            vrf_proof,
+        } => {
+            writer.byte(8);
+            writer.raw(payload);
+            match recipient {
+                Some(principal) => {
+                    writer.byte(10);
+                    encode_principal(writer, principal);
+                }
+                None => writer.byte(9),
+            }
+            writer.raw(vrf_proof);
+        }
+    }
+}
+
 impl SpendingCondition {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let mode = reader.byte()?;
@@ -1230,6 +1469,9 @@ impl Writer {
     fn byte(&mut self, value: u8) {
         self.bytes.push(value);
     }
+    fn raw(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+    }
     fn u16(&mut self, value: u16) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -1241,6 +1483,18 @@ impl Writer {
     }
     fn hash160(&mut self, value: Hash160) {
         self.bytes.extend_from_slice(value.as_bytes());
+    }
+    fn address(&mut self, value: StacksAddress) {
+        self.byte(value.version());
+        self.hash160(value.hash160());
+    }
+    fn name(&mut self, value: &str) {
+        self.byte(u8::try_from(value.len()).expect("name length fits u8"));
+        self.raw(value.as_bytes());
+    }
+    fn stacks_string(&mut self, value: &str) {
+        self.u32(u32::try_from(value.len()).expect("string length fits u32"));
+        self.raw(value.as_bytes());
     }
     fn signature(&mut self, value: MessageSignature) {
         self.bytes.extend_from_slice(value.as_bytes());
