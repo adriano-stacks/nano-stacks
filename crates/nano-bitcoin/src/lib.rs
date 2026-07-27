@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, fmt, hash::BuildHasher};
+use std::{collections::HashMap, fmt};
 
 use bitcoin::{
     Block,
@@ -16,6 +16,27 @@ pub struct BitcoinBlock {
     pub height: u64,
     pub hash: [u8; 32],
     pub operations: Vec<BitcoinOperation>,
+}
+
+const PRE_STX_WINDOW_BLOCKS: u64 = 6;
+
+/// `PreStx` outputs available to later Bitcoin blocks.
+#[derive(Clone, Debug, Default)]
+pub struct PreStxCache {
+    senders: HashMap<[u8; 32], (nano_address::StacksAddress, u64)>,
+}
+
+impl PreStxCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn retain_window(&mut self, height: u64) {
+        self.senders.retain(|_, (_, seen_height)| {
+            height.saturating_sub(*seen_height) <= PRE_STX_WINDOW_BLOCKS
+        });
+    }
 }
 
 /// The source boundary for Bitcoin input.
@@ -122,16 +143,17 @@ pub fn decode_block(
     bytes: &[u8],
     magic: [u8; 2],
 ) -> Result<BitcoinBlock, BitcoinParseError> {
-    decode_block_with_pre_stx(height, bytes, magic, &mut HashMap::new())
+    decode_block_with_pre_stx(height, bytes, magic, &mut PreStxCache::new())
 }
 
 /// Decode a Bitcoin block while retaining `PreStx` outputs needed by later blocks.
-pub fn decode_block_with_pre_stx<S: BuildHasher>(
+pub fn decode_block_with_pre_stx(
     height: u64,
     bytes: &[u8],
     magic: [u8; 2],
-    pre_stx_senders: &mut HashMap<[u8; 32], nano_address::StacksAddress, S>,
+    pre_stx_cache: &mut PreStxCache,
 ) -> Result<BitcoinBlock, BitcoinParseError> {
+    pre_stx_cache.retain_window(height);
     let block: Block = deserialize(bytes).map_err(|_| BitcoinParseError::InvalidBlock)?;
     let mut operations = Vec::new();
     for (index, transaction) in block.txdata.iter().enumerate() {
@@ -170,14 +192,14 @@ pub fn decode_block_with_pre_stx<S: BuildHasher>(
         let sender = inputs
             .first()
             .filter(|input| input.output_index == 1)
-            .and_then(|input| pre_stx_senders.get(&input.txid))
-            .copied();
+            .and_then(|input| pre_stx_cache.senders.get(&input.txid))
+            .map(|(sender, _)| *sender);
         let Some(kind) = parse_operation(opcode, payload, &outputs, sender) else {
             continue;
         };
         let txid = transaction.compute_txid().to_byte_array();
         if let BitcoinOperationKind::PreStx { sender } = &kind {
-            pre_stx_senders.insert(txid, *sender);
+            pre_stx_cache.senders.insert(txid, (*sender, height));
         }
         operations.push(BitcoinOperation {
             txid,
@@ -352,9 +374,9 @@ fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, path::Path};
+    use std::{fs, path::Path};
 
-    use super::{decode_block, decode_block_with_pre_stx};
+    use super::{PreStxCache, decode_block, decode_block_with_pre_stx};
 
     #[test]
     fn captured_bitcoin_blocks_decode_with_hacknet_magic() {
@@ -380,13 +402,27 @@ mod tests {
             .map(|entry| entry.expect("fixture entry").path())
             .collect::<Vec<_>>();
         paths.sort();
-        let mut pre_stx_senders = HashMap::new();
+        let mut pre_stx_cache = PreStxCache::new();
         for path in paths {
             let hex = fs::read_to_string(&path).expect("read fixture block");
             let bytes = hex::decode(hex.trim()).expect("decode fixture hex");
-            let block = decode_block_with_pre_stx(0, &bytes, *b"T3", &mut pre_stx_senders)
+            let block = decode_block_with_pre_stx(0, &bytes, *b"T3", &mut pre_stx_cache)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert_eq!(block.operations.len(), 3, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn prestx_cache_expires_after_six_bitcoin_blocks() {
+        let mut cache = PreStxCache::new();
+        let sender =
+            nano_address::StacksAddress::new(26, nano_primitives::Hash160::from_bytes([0x24; 20]))
+                .expect("valid Stacks address");
+        cache.senders.insert([0x42; 32], (sender, 100));
+
+        cache.retain_window(106);
+        assert_eq!(cache.senders.len(), 1);
+        cache.retain_window(107);
+        assert!(cache.senders.is_empty());
     }
 }

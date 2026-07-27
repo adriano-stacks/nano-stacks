@@ -11,6 +11,7 @@ nano-address = { path = "../nano-address" }
 
 [dev-dependencies]
 hex = "0.4.3"
+nano-primitives = { path = "../nano-primitives" }
 
 [lints]
 workspace = true
