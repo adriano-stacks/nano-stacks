@@ -347,6 +347,11 @@ mod tests {
         FixtureManifest, FixtureMode, FixtureStatus, baseline_replay, scoreboard,
         validate_fixture_tree,
     };
+    use blockstack_lib::chainstate::stacks::address::{
+        PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
+        PoxAddressType32 as ReferencePoxAddressType32,
+    };
+    use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
@@ -362,7 +367,10 @@ mod tests {
     use stacks_common::{
         bitvec::BitVec as ReferenceBitVec,
         codec::StacksMessageCodec,
-        types::{PrivateKey, PublicKey, chainstate::TrieHash as ReferenceTrieHash},
+        types::{
+            PrivateKey, PublicKey,
+            chainstate::{StacksAddress as ReferenceStacksAddress, TrieHash as ReferenceTrieHash},
+        },
         util::hash::{
             Hash160 as ReferenceHash160, Sha256Sum as ReferenceSha256Sum,
             Sha512Sum as ReferenceSha512Sum, Sha512Trunc256Sum,
@@ -482,6 +490,14 @@ mod tests {
             reference.consensus_serialize(&mut reference_bytes).expect("serializes");
             prop_assert_eq!(ours.wire_bytes(), reference_bytes);
         }
+
+        #[test]
+        fn stacks_addresses_match_stacks_core(version in 0_u8..=31, bytes in any::<[u8; 20]>()) {
+            let ours = StacksAddress::new(version, nano_primitives::Hash160::from_bytes(bytes)).expect("valid version");
+            let reference = ReferenceStacksAddress::new(version, ReferenceHash160(bytes)).expect("valid version");
+            prop_assert_eq!(ours.to_string(), reference.to_string());
+            prop_assert_eq!(ours.to_string().parse::<StacksAddress>().expect("decodes"), ours);
+        }
     }
 
     #[test]
@@ -497,6 +513,58 @@ mod tests {
             .consensus_serialize(&mut reference_bytes)
             .expect("serializes");
         assert_eq!(ours.wire_bytes(), reference_bytes);
+    }
+
+    #[test]
+    fn pox_addresses_match_stacks_core() {
+        let bytes20 = [0x42; 20];
+        let bytes32 = [0x24; 32];
+        let cases = [
+            (
+                PoxAddress::Standard {
+                    address: StacksAddress::new(26, nano_primitives::Hash160::from_bytes(bytes20))
+                        .expect("valid address"),
+                    hash_mode: None,
+                },
+                ReferencePoxAddress::Standard(
+                    ReferenceStacksAddress::new(26, ReferenceHash160(bytes20))
+                        .expect("valid address"),
+                    None,
+                ),
+            ),
+            (
+                PoxAddress::Addr20 {
+                    mainnet: true,
+                    address_type: PoxAddressType20::P2wpkh,
+                    bytes: bytes20,
+                },
+                ReferencePoxAddress::Addr20(true, ReferencePoxAddressType20::P2WPKH, bytes20),
+            ),
+            (
+                PoxAddress::Addr32 {
+                    mainnet: false,
+                    address_type: PoxAddressType32::P2wsh,
+                    bytes: bytes32,
+                },
+                ReferencePoxAddress::Addr32(false, ReferencePoxAddressType32::P2WSH, bytes32),
+            ),
+            (
+                PoxAddress::Addr32 {
+                    mainnet: true,
+                    address_type: PoxAddressType32::P2tr,
+                    bytes: bytes32,
+                },
+                ReferencePoxAddress::Addr32(true, ReferencePoxAddressType32::P2TR, bytes32),
+            ),
+        ];
+        for (ours, reference) in cases {
+            assert_eq!(
+                ours.bitcoin_address()
+                    .expect("valid Bitcoin address")
+                    .to_string(),
+                reference.to_b58()
+            );
+        }
     }
 
     #[test]

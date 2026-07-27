@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+nano-address = { path = "../nano-address" }
 nano-crypto = { path = "../nano-crypto" }
 nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
@@ -14,6 +15,7 @@ nano-primitives = { path = "../nano-primitives" }
 [dev-dependencies]
 proptest = "1.11.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 
 [lints]
 workspace = true
