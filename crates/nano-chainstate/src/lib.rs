@@ -174,6 +174,20 @@ impl ChainState {
             .sponsor_address()
             .map(principal_from_address)
             .transpose()?;
+        let origin_condition = transaction.auth().origin();
+        let payer_condition = transaction.auth().payer();
+        if self.vm.account_nonce(&sender)? != origin_condition.nonce() {
+            return Err(ChainStateError::InvalidTransaction(
+                "origin nonce does not match account state".to_owned(),
+            ));
+        }
+        let payer = sponsor.as_ref().unwrap_or(&sender);
+        if self.vm.account_nonce(payer)? != payer_condition.nonce() {
+            return Err(ChainStateError::InvalidTransaction(
+                "payer nonce does not match account state".to_owned(),
+            ));
+        }
+        self.vm.debit_fee(payer, payer_condition.fee())?;
         let result = match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
@@ -214,8 +228,8 @@ impl ChainState {
                 function_name,
                 arguments,
             } => self.vm.execute_contract_call(
-                sender,
-                sponsor,
+                sender.clone(),
+                sponsor.clone(),
                 contract_identifier(*address, contract_name)?,
                 function_name,
                 &arguments
@@ -226,6 +240,20 @@ impl ChainState {
             )?,
             _ => return Err(ChainStateError::UnsupportedPayload),
         };
+        self.vm.set_account_nonce(
+            &sender,
+            origin_condition.nonce().checked_add(1).ok_or_else(|| {
+                ChainStateError::InvalidTransaction("origin nonce overflow".to_owned())
+            })?,
+        )?;
+        if sponsor.is_some() {
+            self.vm.set_account_nonce(
+                payer,
+                payer_condition.nonce().checked_add(1).ok_or_else(|| {
+                    ChainStateError::InvalidTransaction("payer nonce overflow".to_owned())
+                })?,
+            )?;
+        }
         Ok(TransactionReceipt {
             txid: transaction.txid(),
             result,
@@ -323,8 +351,8 @@ mod tests {
             "(define-public (increment (value uint)) (ok (+ value u1)))",
         );
         let call_payload = contract_call_payload("counter", "increment", 41);
-        let deployment = decoded_transaction(&deployment_payload);
-        let call = decoded_transaction(&call_payload);
+        let deployment = decoded_transaction(&deployment_payload, 0, 0);
+        let call = decoded_transaction(&call_payload, 1, 0);
 
         let deployed = chainstate
             .execute_transaction(&deployment)
@@ -377,14 +405,14 @@ mod tests {
         assert_eq!(receipt.result.events.len(), 1);
     }
 
-    fn decoded_transaction(payload: &[u8]) -> Transaction {
+    fn decoded_transaction(payload: &[u8], nonce: u64, fee: u64) -> Transaction {
         let mut bytes = vec![0x80];
         bytes.extend_from_slice(&0x8000_0000_u32.to_be_bytes());
         bytes.push(4);
         bytes.push(0);
         bytes.extend_from_slice(&[0; 20]);
-        bytes.extend_from_slice(&0_u64.to_be_bytes());
-        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&nonce.to_be_bytes());
+        bytes.extend_from_slice(&fee.to_be_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&[0; 65]);
         bytes.push(3);

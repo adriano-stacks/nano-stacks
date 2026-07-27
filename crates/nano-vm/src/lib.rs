@@ -142,6 +142,25 @@ impl Vm {
         )
     }
 
+    /// Read an account nonce from the active block state.
+    pub fn account_nonce(&mut self, principal: &PrincipalData) -> Result<u64, VmExecutionError> {
+        account_nonce(&mut self.store, principal)
+    }
+
+    /// Debit a transaction fee from an account's available STX balance.
+    pub fn debit_fee(&mut self, payer: &PrincipalData, fee: u64) -> Result<(), VmExecutionError> {
+        debit_fee(&mut self.store, payer, fee)
+    }
+
+    /// Store a transaction nonce in the active block state.
+    pub fn set_account_nonce(
+        &mut self,
+        principal: &PrincipalData,
+        nonce: u64,
+    ) -> Result<(), VmExecutionError> {
+        set_account_nonce(&mut self.store, principal, nonce)
+    }
+
     /// Seal the active block state.
     pub fn seal_block(&mut self) -> Result<StateRoot, MarfStoreError> {
         self.store.seal()
@@ -854,6 +873,63 @@ pub fn transfer_stx(
         cost: environment.get_cost_total(),
         events,
     })
+}
+
+/// Debit an account's available STX balance in an isolated database transaction.
+pub fn debit_fee(
+    store: &mut MarfStore,
+    payer: &PrincipalData,
+    fee: u64,
+) -> Result<(), VmExecutionError> {
+    let database = store.as_clarity_db();
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        let mut balance = global.database.get_stx_balance_snapshot_genesis(payer)?;
+        if !balance.can_transfer(u128::from(fee))? {
+            return Err(VmInternalError::InsufficientBalance.into());
+        }
+        balance.debit(u128::from(fee))?;
+        balance.save()
+    })
+}
+
+/// Read an account nonce in an isolated database transaction.
+pub fn account_nonce(
+    store: &mut MarfStore,
+    principal: &PrincipalData,
+) -> Result<u64, VmExecutionError> {
+    let database = store.as_clarity_db();
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.get_account_nonce(principal))
+}
+
+/// Store an account nonce in an isolated database transaction.
+pub fn set_account_nonce(
+    store: &mut MarfStore,
+    principal: &PrincipalData,
+    nonce: u64,
+) -> Result<(), VmExecutionError> {
+    let database = store.as_clarity_db();
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.set_account_nonce(principal, nonce))
 }
 
 #[cfg(test)]

@@ -235,6 +235,14 @@ impl TransactionAuth {
             Self::Sponsored { sponsor, .. } => Some(sponsor),
         }
     }
+
+    #[must_use]
+    pub const fn payer(&self) -> &SpendingCondition {
+        match self {
+            Self::Standard(origin) => origin,
+            Self::Sponsored { sponsor, .. } => sponsor,
+        }
+    }
 }
 
 /// A complete SIP-005 transaction, retained in its canonical consensus encoding.
@@ -1261,6 +1269,24 @@ fn encode_payload(writer: &mut Writer, payload: &TransactionPayloadData) {
 }
 
 impl SpendingCondition {
+    #[must_use]
+    pub const fn nonce(&self) -> u64 {
+        match self {
+            Self::Singlesig(condition) => condition.nonce,
+            Self::Multisig(condition) => condition.nonce,
+            Self::OrderIndependentMultisig(condition) => condition.nonce,
+        }
+    }
+
+    #[must_use]
+    pub const fn fee(&self) -> u64 {
+        match self {
+            Self::Singlesig(condition) => condition.fee,
+            Self::Multisig(condition) => condition.fee,
+            Self::OrderIndependentMultisig(condition) => condition.fee,
+        }
+    }
+
     #[must_use]
     pub fn account_address(&self, mainnet: bool) -> StacksAddress {
         let (signer, singlesig) = match self {
