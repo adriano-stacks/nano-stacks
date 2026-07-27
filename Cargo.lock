@@ -1434,7 +1434,9 @@ name = "nano-conformance"
 version = "0.1.0"
 dependencies = [
  "clarity",
+ "hex",
  "nano-address",
+ "nano-bitcoin",
  "nano-codec",
  "nano-crypto",
  "nano-marf",

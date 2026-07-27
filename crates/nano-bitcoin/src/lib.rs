@@ -181,11 +181,14 @@ pub fn decode_block_with_pre_stx(
         else {
             continue;
         };
+        if transaction.input.is_empty() || outputs.is_empty() {
+            continue;
+        }
         let inputs: Vec<_> = transaction
             .input
             .iter()
             .map(|input| BitcoinInput {
-                txid: input.previous_output.txid.to_byte_array(),
+                txid: bitcoin_hash_bytes(input.previous_output.txid.to_byte_array()),
                 output_index: input.previous_output.vout,
             })
             .collect();
@@ -197,7 +200,7 @@ pub fn decode_block_with_pre_stx(
         let Some(kind) = parse_operation(opcode, payload, &outputs, sender) else {
             continue;
         };
-        let txid = transaction.compute_txid().to_byte_array();
+        let txid = bitcoin_hash_bytes(transaction.compute_txid().to_byte_array());
         if let BitcoinOperationKind::PreStx { sender } = &kind {
             pre_stx_cache.senders.insert(txid, (*sender, height));
         }
@@ -211,9 +214,14 @@ pub fn decode_block_with_pre_stx(
     }
     Ok(BitcoinBlock {
         height,
-        hash: block.block_hash().to_byte_array(),
+        hash: bitcoin_hash_bytes(block.block_hash().to_byte_array()),
         operations,
     })
+}
+
+fn bitcoin_hash_bytes(mut bytes: [u8; 32]) -> [u8; 32] {
+    bytes.reverse();
+    bytes
 }
 
 fn protocol_payload(script: &Script, magic: [u8; 2]) -> Option<(u8, &[u8])> {
@@ -377,8 +385,19 @@ fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 mod tests {
     use std::{fs, path::Path};
 
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Transaction, TxIn,
+        TxMerkleNode, TxOut,
+        absolute::LockTime,
+        block::{Header, Version as BlockVersion},
+        consensus::serialize,
+        hashes::Hash,
+        transaction::Version as TransactionVersion,
+    };
+
     use super::{
-        PreStxCache, decode_block, decode_block_with_pre_stx, parse_leader_key_registration,
+        BitcoinOperationKind, PreStxCache, decode_block, decode_block_with_pre_stx,
+        parse_leader_key_registration,
     };
 
     #[test]
@@ -430,7 +449,88 @@ mod tests {
     }
 
     #[test]
+    fn prestx_sender_is_resolved_from_the_second_output() {
+        let pre_stx = transaction(
+            vec![TxIn::default()],
+            vec![protocol_output(b'p', &[]), p2pkh_output(0x24)],
+        );
+        let transfer = transaction(
+            vec![TxIn {
+                previous_output: OutPoint::new(pre_stx.compute_txid(), 1),
+                ..TxIn::default()
+            }],
+            vec![protocol_output(b'$', &[0; 16]), p2pkh_output(0x42)],
+        );
+
+        let block = decode_block(100, &block_bytes(vec![pre_stx, transfer]), *b"T3")
+            .expect("valid Bitcoin block");
+        assert_eq!(block.operations.len(), 2);
+        match (&block.operations[0].kind, &block.operations[1].kind) {
+            (
+                BitcoinOperationKind::PreStx { sender },
+                BitcoinOperationKind::TransferStx {
+                    sender: transfer_sender,
+                    ..
+                },
+            ) => assert_eq!(sender, transfer_sender),
+            operations => panic!("unexpected operations: {operations:?}"),
+        }
+    }
+
+    #[test]
+    fn operations_require_an_input_and_a_decodable_output() {
+        let transaction = transaction(vec![], vec![protocol_output(b'p', &[]), p2pkh_output(0x24)]);
+        let block = decode_block(100, &block_bytes(vec![transaction]), *b"T3")
+            .expect("valid Bitcoin block");
+        assert!(block.operations.is_empty());
+    }
+
+    #[test]
     fn leader_key_registration_requires_a_valid_vrf_key() {
         assert!(parse_leader_key_registration(&[0; 52]).is_none());
+    }
+
+    fn transaction(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: TransactionVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input,
+            output,
+        }
+    }
+
+    fn protocol_output(opcode: u8, payload: &[u8]) -> TxOut {
+        let mut data = Vec::with_capacity(payload.len() + 3);
+        data.extend_from_slice(b"T3");
+        data.push(opcode);
+        data.extend_from_slice(payload);
+        let length = u8::try_from(data.len()).expect("test packet fits direct push");
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes([vec![0x6a, length], data].concat()),
+        }
+    }
+
+    fn p2pkh_output(byte: u8) -> TxOut {
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(
+                [vec![0x76, 0xa9, 0x14], vec![byte; 20], vec![0x88, 0xac]].concat(),
+            ),
+        }
+    }
+
+    fn block_bytes(transactions: Vec<Transaction>) -> Vec<u8> {
+        serialize(&Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: CompactTarget::from_consensus(0),
+                nonce: 0,
+            },
+            txdata: transactions,
+        })
     }
 }

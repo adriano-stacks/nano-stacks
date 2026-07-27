@@ -1,7 +1,7 @@
 ---
 id: "007"
 title: "M6: implement sortition"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["006"]

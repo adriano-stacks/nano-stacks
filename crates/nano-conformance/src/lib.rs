@@ -347,6 +347,10 @@ mod tests {
         FixtureManifest, FixtureMode, FixtureStatus, baseline_replay, scoreboard,
         validate_fixture_tree,
     };
+    use blockstack_lib::burnchains::{
+        MagicBytes,
+        bitcoin::{BitcoinNetworkType, BitcoinTxInput, blocks::BitcoinBlockParser},
+    };
     use blockstack_lib::chainstate::stacks::address::{
         PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
         PoxAddressType32 as ReferencePoxAddressType32,
@@ -371,9 +375,11 @@ mod tests {
             TransactionVersion as ReferenceTransactionVersion,
         },
     };
+    use blockstack_lib::core::StacksEpochId;
     use clarity::vm::ClarityVersion as ReferenceClarityVersion;
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
+    use nano_bitcoin::decode_block as decode_bitcoin_block;
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
         transaction_merkle_root,
@@ -387,6 +393,7 @@ mod tests {
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
+    use stacks_common::deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize;
     use stacks_common::util::{
         secp256k1::{
             MessageSignature as ReferenceMessageSignature,
@@ -883,6 +890,78 @@ mod tests {
     }
 
     #[test]
+    fn captured_bitcoin_packets_match_stacks_core() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/bitcoin/blocks");
+        let parser = BitcoinBlockParser::new(
+            BitcoinNetworkType::Regtest,
+            MagicBytes::from(b"T3".as_slice()),
+        );
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let hex = fs::read_to_string(&path).expect("read fixture block");
+            let bytes = hex::decode(hex.trim()).expect("decode fixture hex");
+            let reference_block = reference_bitcoin_deserialize(&bytes)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let reference = parser.parse_block(&reference_block, 0, StacksEpochId::Epoch40);
+            let ours = decode_bitcoin_block(0, &bytes, *b"T3")
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+            assert_eq!(ours.hash, reference.block_hash.0, "{}", path.display());
+            assert_eq!(
+                ours.operations.len(),
+                reference.txs.len(),
+                "{}",
+                path.display()
+            );
+            for (ours, reference) in ours.operations.iter().zip(&reference.txs) {
+                assert_eq!(ours.txid, reference.txid.0, "{}", path.display());
+                assert_eq!(
+                    ours.transaction_index,
+                    reference.vtxindex,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(
+                    operation_opcode(ours),
+                    reference.opcode,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(operation_data(ours), reference.data, "{}", path.display());
+                assert_eq!(
+                    ours.inputs.len(),
+                    reference.inputs.len(),
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(
+                    ours.outputs.len(),
+                    reference.outputs.len(),
+                    "{}",
+                    path.display()
+                );
+                for (ours, reference) in ours.inputs.iter().zip(&reference.inputs) {
+                    let (txid, output_index) = match reference {
+                        BitcoinTxInput::Raw(input) => (input.tx_ref.0.0, input.tx_ref.1),
+                        BitcoinTxInput::Structured(input) => (input.tx_ref.0.0, input.tx_ref.1),
+                    };
+                    assert_eq!(ours.txid, txid, "{}", path.display());
+                    assert_eq!(ours.output_index, output_index, "{}", path.display());
+                }
+                for (ours, reference) in ours.outputs.iter().zip(&reference.outputs) {
+                    assert_eq!(ours.amount_sats, reference.units, "{}", path.display());
+                    assert_eq!(
+                        ours.recipient.script_pubkey().as_bytes(),
+                        reference_bitcoin_script_pubkey(&reference.address),
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fixture_authorizations_round_trip_with_nano_codec() {
         let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
         for entry in fs::read_dir(blocks).expect("read fixture blocks") {
@@ -1106,6 +1185,160 @@ mod tests {
         ReferenceStacksTransaction::consensus_deserialize(&mut cursor).is_ok_and(|_| {
             usize::try_from(cursor.position()).expect("cursor fits usize") == bytes.len()
         })
+    }
+
+    fn operation_opcode(operation: &nano_bitcoin::BitcoinOperation) -> u8 {
+        match &operation.kind {
+            nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit { .. } => b'[',
+            nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration { .. } => b'^',
+            nano_bitcoin::BitcoinOperationKind::PreStx { .. } => b'p',
+            nano_bitcoin::BitcoinOperationKind::StackStx { .. } => b'x',
+            nano_bitcoin::BitcoinOperationKind::TransferStx { .. } => b'$',
+            nano_bitcoin::BitcoinOperationKind::DelegateStx { .. } => b'#',
+            nano_bitcoin::BitcoinOperationKind::VoteForAggregateKey { .. } => b'v',
+        }
+    }
+
+    fn reference_bitcoin_script_pubkey(
+        address: &blockstack_lib::burnchains::bitcoin::address::BitcoinAddress,
+    ) -> Vec<u8> {
+        match address {
+            blockstack_lib::burnchains::bitcoin::address::BitcoinAddress::Legacy(address) => {
+                let mut script = match address.addrtype {
+                    blockstack_lib::burnchains::bitcoin::address::LegacyBitcoinAddressType::PublicKeyHash => {
+                        vec![0x76, 0xa9, 0x14]
+                    }
+                    blockstack_lib::burnchains::bitcoin::address::LegacyBitcoinAddressType::ScriptHash => {
+                        vec![0xa9, 0x14]
+                    }
+                };
+                script.extend_from_slice(&address.bytes.0);
+                script.extend_from_slice(match address.addrtype {
+                    blockstack_lib::burnchains::bitcoin::address::LegacyBitcoinAddressType::PublicKeyHash => {
+                        &[0x88, 0xac]
+                    }
+                    blockstack_lib::burnchains::bitcoin::address::LegacyBitcoinAddressType::ScriptHash => {
+                        &[0x87]
+                    }
+                });
+                script
+            }
+            blockstack_lib::burnchains::bitcoin::address::BitcoinAddress::Segwit(address) => {
+                let mut script = match address {
+                    blockstack_lib::burnchains::bitcoin::address::SegwitBitcoinAddress::P2WPKH(
+                        ..,
+                    ) => {
+                        vec![0x00, 0x14]
+                    }
+                    blockstack_lib::burnchains::bitcoin::address::SegwitBitcoinAddress::P2WSH(
+                        ..,
+                    ) => {
+                        vec![0x00, 0x20]
+                    }
+                    blockstack_lib::burnchains::bitcoin::address::SegwitBitcoinAddress::P2TR(
+                        ..,
+                    ) => {
+                        vec![0x51, 0x20]
+                    }
+                };
+                script.extend_from_slice(address.bytes_ref());
+                script
+            }
+        }
+    }
+
+    fn operation_data(operation: &nano_bitcoin::BitcoinOperation) -> Vec<u8> {
+        let mut data = Vec::new();
+        match &operation.kind {
+            nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                block_header_hash,
+                new_seed,
+                parent_block_height,
+                parent_transaction_index,
+                key_block_height,
+                key_transaction_index,
+                memo,
+                parent_modulus,
+            } => {
+                data.extend_from_slice(block_header_hash);
+                data.extend_from_slice(new_seed);
+                data.extend_from_slice(&parent_block_height.to_be_bytes());
+                data.extend_from_slice(&parent_transaction_index.to_be_bytes());
+                data.extend_from_slice(&key_block_height.to_be_bytes());
+                data.extend_from_slice(&key_transaction_index.to_be_bytes());
+                data.push((memo << 3) | parent_modulus);
+            }
+            nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                consensus_hash,
+                vrf_public_key,
+                memo,
+                ..
+            } => {
+                data.extend_from_slice(consensus_hash);
+                data.extend_from_slice(vrf_public_key);
+                data.extend_from_slice(memo);
+            }
+            nano_bitcoin::BitcoinOperationKind::PreStx { .. } => {}
+            nano_bitcoin::BitcoinOperationKind::StackStx {
+                amount,
+                cycles,
+                signer_key,
+                max_amount,
+                authorization_id,
+                ..
+            } => {
+                data.extend_from_slice(&amount.to_be_bytes());
+                data.push(*cycles);
+                if let Some(signer_key) = signer_key {
+                    data.extend_from_slice(signer_key);
+                }
+                if let Some(max_amount) = max_amount {
+                    data.extend_from_slice(&max_amount.to_be_bytes());
+                }
+                if let Some(authorization_id) = authorization_id {
+                    data.extend_from_slice(&authorization_id.to_be_bytes());
+                }
+            }
+            nano_bitcoin::BitcoinOperationKind::TransferStx { amount, memo, .. } => {
+                data.extend_from_slice(&amount.to_be_bytes());
+                data.extend_from_slice(memo);
+            }
+            nano_bitcoin::BitcoinOperationKind::DelegateStx {
+                amount,
+                reward_address_output,
+                until_bitcoin_height,
+                ..
+            } => {
+                data.extend_from_slice(&amount.to_be_bytes());
+                match reward_address_output {
+                    Some(index) => {
+                        data.push(1);
+                        data.extend_from_slice(&index.to_be_bytes());
+                    }
+                    None => data.push(0),
+                }
+                match until_bitcoin_height {
+                    Some(height) => {
+                        data.push(1);
+                        data.extend_from_slice(&height.to_be_bytes());
+                    }
+                    None => data.push(0),
+                }
+            }
+            nano_bitcoin::BitcoinOperationKind::VoteForAggregateKey {
+                signer_index,
+                aggregate_key,
+                round,
+                reward_cycle,
+                ..
+            } => {
+                data.extend_from_slice(&signer_index.to_be_bytes());
+                data.extend_from_slice(aggregate_key);
+                data.extend_from_slice(&round.to_be_bytes());
+                data.extend_from_slice(&reward_cycle.to_be_bytes());
+            }
+        }
+        data
     }
 
     fn reference_payloads() -> Vec<ReferenceTransactionPayload> {
