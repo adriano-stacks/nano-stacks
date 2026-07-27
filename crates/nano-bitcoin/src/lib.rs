@@ -64,8 +64,11 @@ pub enum BitcoinOperationKind {
         block_signing_key_hash: Option<[u8; 20]>,
         memo: Vec<u8>,
     },
-    PreStx,
+    PreStx {
+        sender: nano_address::StacksAddress,
+    },
     StackStx {
+        reward_address: PoxAddress,
         amount: u128,
         cycles: u8,
         signer_key: Option<[u8; 33]>,
@@ -73,11 +76,14 @@ pub enum BitcoinOperationKind {
         authorization_id: Option<u32>,
     },
     TransferStx {
+        recipient: nano_address::StacksAddress,
         amount: u128,
         memo: Vec<u8>,
     },
     DelegateStx {
+        delegate: nano_address::StacksAddress,
         amount: u128,
+        reward_address: Option<PoxAddress>,
         reward_address_output: Option<u32>,
         until_bitcoin_height: Option<u64>,
     },
@@ -123,9 +129,6 @@ pub fn decode_block(
         else {
             continue;
         };
-        let Some(kind) = parse_operation(opcode, payload) else {
-            continue;
-        };
         let Some(outputs) = transaction
             .output
             .iter()
@@ -140,6 +143,9 @@ pub fn decode_block(
             })
             .collect::<Option<Vec<_>>>()
         else {
+            continue;
+        };
+        let Some(kind) = parse_operation(opcode, payload, &outputs) else {
             continue;
         };
         operations.push(BitcoinOperation {
@@ -182,14 +188,20 @@ fn protocol_payload(script: &Script, magic: [u8; 2]) -> Option<(u8, &[u8])> {
     (data.starts_with(&magic) && data.len() > magic.len()).then(|| (data[2], &data[3..]))
 }
 
-fn parse_operation(opcode: u8, data: &[u8]) -> Option<BitcoinOperationKind> {
+fn parse_operation(
+    opcode: u8,
+    data: &[u8],
+    outputs: &[BitcoinOutput],
+) -> Option<BitcoinOperationKind> {
     match opcode {
         b'[' => parse_leader_block_commit(data),
         b'^' => parse_leader_key_registration(data),
-        b'p' => Some(BitcoinOperationKind::PreStx),
-        b'x' => parse_stack_stx(data),
-        b'$' => parse_transfer_stx(data),
-        b'#' => parse_delegate_stx(data),
+        b'p' => Some(BitcoinOperationKind::PreStx {
+            sender: outputs.first()?.recipient.as_stacks_address()?,
+        }),
+        b'x' => parse_stack_stx(data, outputs),
+        b'$' => parse_transfer_stx(data, outputs),
+        b'#' => parse_delegate_stx(data, outputs),
         b'v' => parse_vote_for_aggregate_key(data),
         _ => None,
     }
@@ -228,13 +240,14 @@ fn parse_leader_key_registration(data: &[u8]) -> Option<BitcoinOperationKind> {
     })
 }
 
-fn parse_stack_stx(data: &[u8]) -> Option<BitcoinOperationKind> {
+fn parse_stack_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
     let amount = u128::from_be_bytes(array(data.get(..16)?)?);
     let cycles = *data.get(16)?;
     let signer_key = data.get(17..50).and_then(array);
     let max_amount = data.get(50..66).and_then(array).map(u128::from_be_bytes);
     let authorization_id = data.get(66..70).and_then(array).map(u32::from_be_bytes);
     Some(BitcoinOperationKind::StackStx {
+        reward_address: outputs.first()?.recipient.clone(),
         amount,
         cycles,
         signer_key,
@@ -243,17 +256,18 @@ fn parse_stack_stx(data: &[u8]) -> Option<BitcoinOperationKind> {
     })
 }
 
-fn parse_transfer_stx(data: &[u8]) -> Option<BitcoinOperationKind> {
+fn parse_transfer_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
     if !(16..=77).contains(&data.len()) {
         return None;
     }
     Some(BitcoinOperationKind::TransferStx {
+        recipient: outputs.first()?.recipient.as_stacks_address()?,
         amount: u128::from_be_bytes(array(data.get(..16)?)?),
         memo: data.get(16..)?.to_vec(),
     })
 }
 
-fn parse_delegate_stx(data: &[u8]) -> Option<BitcoinOperationKind> {
+fn parse_delegate_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
     let amount = u128::from_be_bytes(array(data.get(..16)?)?);
     let reward_address_output = match *data.get(16)? {
         0 => None,
@@ -266,7 +280,11 @@ fn parse_delegate_stx(data: &[u8]) -> Option<BitcoinOperationKind> {
         _ => return None,
     };
     Some(BitcoinOperationKind::DelegateStx {
+        delegate: outputs.first()?.recipient.as_stacks_address()?,
         amount,
+        reward_address: reward_address_output
+            .and_then(|index| outputs.get(usize::try_from(index).ok()?).cloned())
+            .map(|output| output.recipient),
         reward_address_output,
         until_bitcoin_height,
     })

@@ -174,6 +174,14 @@ pub enum PoxAddress {
 }
 
 impl PoxAddress {
+    #[must_use]
+    pub const fn as_stacks_address(&self) -> Option<StacksAddress> {
+        match self {
+            Self::Standard { address, .. } => Some(*address),
+            Self::Addr20 { .. } | Self::Addr32 { .. } => None,
+        }
+    }
+
     pub fn from_script_pubkey(script: &[u8], mainnet: bool) -> Result<Self, AddressError> {
         let standard = |version, bytes| {
             StacksAddress::new(version, Hash160::from_bytes(bytes)).map(|address| Self::Standard {
