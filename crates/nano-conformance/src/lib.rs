@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     fmt::Write,
     fs,
     path::{Path, PathBuf},
@@ -10,6 +11,7 @@ use nano_chainstate::{ChainState, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
 use nano_primitives::{BitcoinHeaderHash, TrieHash};
 use nano_sortition::SortitionSnapshot;
+use serde::Deserialize;
 
 /// The minimum metadata needed to make replay depth visible before fixture
 /// capture is available.
@@ -25,6 +27,13 @@ pub struct FixtureManifest {
 pub enum FixtureMode {
     Baseline,
     Captured,
+}
+
+#[derive(Deserialize)]
+struct CapturedBitcoinSnapshot {
+    block_height: u64,
+    burn_header_hash: String,
+    consensus_hash: String,
 }
 
 impl FixtureManifest {
@@ -373,6 +382,13 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             first_failure: Some(1),
         };
     };
+    let Some(snapshots) = captured_bitcoin_snapshots(root) else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+        };
+    };
     let Ok(mut entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
         return ReplayDepth {
             completed: 0,
@@ -398,10 +414,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             .ok()
             .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
             .and_then(|block| {
-                let snapshot =
-                    SortitionSnapshot::genesis(0, BitcoinHeaderHash::from_bytes([0; 32]));
+                let snapshot = snapshots.get(&block.header.consensus_hash.to_string())?;
                 chainstate
-                    .append_nakamoto_block(&snapshot, parent, &block)
+                    .append_nakamoto_block(snapshot, parent, &block)
                     .ok()
                     .map(|_| block)
             });
@@ -420,6 +435,23 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
         expected: manifest.replay_blocks,
         first_failure: (completed < manifest.replay_blocks).then_some(completed + 1),
     }
+}
+
+fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, SortitionSnapshot>> {
+    let snapshots: Vec<CapturedBitcoinSnapshot> =
+        serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            Some((
+                snapshot.consensus_hash,
+                SortitionSnapshot::genesis(
+                    snapshot.block_height,
+                    BitcoinHeaderHash::from_bytes(decode_hash(&snapshot.burn_header_hash)?),
+                ),
+            ))
+        })
+        .collect()
 }
 
 fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
