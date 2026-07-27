@@ -141,7 +141,8 @@ impl ChainState {
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
         let block_id = *block.block_id().as_bytes();
-        self.vm.begin_block(parent, block_id)?;
+        self.vm
+            .begin_block_at_bitcoin_height(parent, block_id, snapshot.bitcoin_height)?;
         let receipts = block
             .transactions
             .iter()

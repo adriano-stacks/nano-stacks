@@ -7,7 +7,7 @@ use clarity::vm::contexts::{ContractContext, GlobalContext, OwnedEnvironment};
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
 use clarity::vm::database::{
-    ClarityBackingStore, ClarityDatabase, ClarityDeserializable, MemoryBackingStore,
+    BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, MemoryBackingStore,
     NULL_BURN_STATE_DB, NULL_HEADER_DB,
 };
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
@@ -22,8 +22,11 @@ use nano_primitives::TrieHash;
 use rusqlite::{OptionalExtension, params};
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::{
-    StacksEpochId,
-    chainstate::{BlockHeaderHash, StacksBlockId, TrieHash as ReferenceTrieHash},
+    StacksEpoch, StacksEpochId,
+    chainstate::{
+        BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
+        TrieHash as ReferenceTrieHash,
+    },
 };
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
@@ -48,10 +51,120 @@ pub struct TransactionResult {
     pub events: Vec<StacksTransactionEvent>,
 }
 
+/// Bitcoin state available while executing one block.
+#[derive(Debug, Default)]
+struct BitcoinContext {
+    height: u32,
+}
+
+impl BitcoinContext {
+    fn new(height: u64) -> Result<Self, MarfStoreError> {
+        Ok(Self {
+            height: u32::try_from(height)
+                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(height))?,
+        })
+    }
+}
+
+impl BurnStateDB for BitcoinContext {
+    fn get_tip_burn_block_height(&self) -> Option<u32> {
+        Some(self.height)
+    }
+
+    fn get_tip_sortition_id(&self) -> Option<SortitionId> {
+        None
+    }
+
+    fn get_v1_unlock_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_v2_unlock_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_v3_unlock_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_pox_3_activation_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_pox_4_activation_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_pox_5_activation_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_burn_block_height(&self, _sortition_id: &SortitionId) -> Option<u32> {
+        None
+    }
+
+    fn get_burn_start_height(&self) -> u32 {
+        0
+    }
+
+    fn get_pox_prepare_length(&self) -> u32 {
+        0
+    }
+
+    fn get_pox_reward_cycle_length(&self) -> u32 {
+        0
+    }
+
+    fn get_pox_rejection_fraction(&self) -> u64 {
+        0
+    }
+
+    fn get_burn_header_hash(
+        &self,
+        _height: u32,
+        _sortition_id: &SortitionId,
+    ) -> Option<BurnchainHeaderHash> {
+        None
+    }
+
+    fn get_sortition_id_from_consensus_hash(
+        &self,
+        _consensus_hash: &ConsensusHash,
+    ) -> Option<SortitionId> {
+        None
+    }
+
+    fn get_stacks_epoch(&self, _height: u32) -> Option<StacksEpoch<ExecutionCost>> {
+        Some(StacksEpoch {
+            epoch_id: StacksEpochId::Epoch40,
+            start_height: 0,
+            end_height: u64::MAX,
+            block_limit: ExecutionCost::max_value(),
+            network_epoch: 0,
+        })
+    }
+
+    fn get_stacks_epoch_by_epoch_id(
+        &self,
+        _epoch_id: &StacksEpochId,
+    ) -> Option<StacksEpoch<ExecutionCost>> {
+        self.get_stacks_epoch(self.height)
+    }
+
+    fn get_pox_payout_addrs(
+        &self,
+        _height: u32,
+        _sortition_id: &SortitionId,
+    ) -> Option<(Vec<clarity::vm::types::TupleData>, u128)> {
+        None
+    }
+}
+
 /// Epoch 4 Clarity execution over a versioned MARF-backed store.
 #[derive(Debug)]
 pub struct Vm {
     store: MarfStore,
+    context: BitcoinContext,
 }
 
 impl Vm {
@@ -59,6 +172,7 @@ impl Vm {
     pub fn new() -> Result<Self, MarfStoreError> {
         Ok(Self {
             store: MarfStore::new()?,
+            context: BitcoinContext::default(),
         })
     }
 
@@ -70,6 +184,7 @@ impl Vm {
     ) -> Result<Self, MarfStoreError> {
         Ok(Self {
             store: MarfStore::from_checkpoint(path, source, expected_root)?,
+            context: BitcoinContext::default(),
         })
     }
 
@@ -79,6 +194,17 @@ impl Vm {
         parent: Option<[u8; 32]>,
         block: [u8; 32],
     ) -> Result<(), MarfStoreError> {
+        self.begin_block_at_bitcoin_height(parent, block, 0)
+    }
+
+    /// Begin execution for a block state at the supplied Bitcoin height.
+    pub fn begin_block_at_bitcoin_height(
+        &mut self,
+        parent: Option<[u8; 32]>,
+        block: [u8; 32],
+        bitcoin_height: u64,
+    ) -> Result<(), MarfStoreError> {
+        self.context = BitcoinContext::new(bitcoin_height)?;
         self.store.begin(parent, block)
     }
 
@@ -88,7 +214,8 @@ impl Vm {
         source: &str,
         cost_tracker: LimitedCostTracker,
     ) -> Result<Evaluation, ClarityEvalError> {
-        evaluate_with_tracker(&mut self.store, source, cost_tracker)
+        let Self { store, context } = self;
+        evaluate_with_tracker_in_context(store, context, source, cost_tracker)
     }
 
     /// Publish a Clarity contract in the active block state.
@@ -99,7 +226,8 @@ impl Vm {
         source: &str,
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, ClarityEvalError> {
-        deploy_contract(&mut self.store, contract, version, source, cost_tracker)
+        let Self { store, context } = self;
+        deploy_contract_in_context(store, context, contract, version, source, cost_tracker)
     }
 
     /// Call a published contract with consensus-serialized Clarity arguments.
@@ -112,13 +240,17 @@ impl Vm {
         arguments: &[Vec<u8>],
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, VmExecutionError> {
-        execute_contract_call(
-            &mut self.store,
-            sender,
-            sponsor,
-            contract,
-            function,
-            arguments,
+        let Self { store, context } = self;
+        execute_contract_call_in_context(
+            store,
+            context,
+            ContractCall {
+                sender,
+                sponsor,
+                contract,
+                function,
+                arguments,
+            },
             cost_tracker,
         )
     }
@@ -132,8 +264,10 @@ impl Vm {
         memo: &[u8],
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, VmExecutionError> {
-        transfer_stx(
-            &mut self.store,
+        let Self { store, context } = self;
+        transfer_stx_in_context(
+            store,
+            context,
             sender,
             recipient,
             amount,
@@ -144,12 +278,14 @@ impl Vm {
 
     /// Read an account nonce from the active block state.
     pub fn account_nonce(&mut self, principal: &PrincipalData) -> Result<u64, VmExecutionError> {
-        account_nonce(&mut self.store, principal)
+        let Self { store, context } = self;
+        account_nonce_in_context(store, context, principal)
     }
 
     /// Debit a transaction fee from an account's available STX balance.
     pub fn debit_fee(&mut self, payer: &PrincipalData, fee: u64) -> Result<(), VmExecutionError> {
-        debit_fee(&mut self.store, payer, fee)
+        let Self { store, context } = self;
+        debit_fee_in_context(store, context, payer, fee)
     }
 
     /// Store a transaction nonce in the active block state.
@@ -158,7 +294,8 @@ impl Vm {
         principal: &PrincipalData,
         nonce: u64,
     ) -> Result<(), VmExecutionError> {
-        set_account_nonce(&mut self.store, principal, nonce)
+        let Self { store, context } = self;
+        set_account_nonce_in_context(store, context, principal, nonce)
     }
 
     /// Seal the active block state.
@@ -218,6 +355,7 @@ pub enum MarfStoreError {
     Checkpoint(CheckpointError),
     Sql(rusqlite::Error),
     NoActiveState,
+    BitcoinHeightOverflow(u64),
 }
 
 impl std::fmt::Display for MarfStoreError {
@@ -227,6 +365,9 @@ impl std::fmt::Display for MarfStoreError {
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
             Self::NoActiveState => formatter.write_str("no active VM state"),
+            Self::BitcoinHeightOverflow(height) => {
+                write!(formatter, "Bitcoin height {height} exceeds u32")
+            }
         }
     }
 }
@@ -744,8 +885,17 @@ pub fn evaluate_with_tracker(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<Evaluation, ClarityEvalError> {
+    evaluate_with_tracker_in_context(store, &NULL_BURN_STATE_DB, source, cost_tracker)
+}
+
+fn evaluate_with_tracker_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    source: &str,
+    cost_tracker: LimitedCostTracker,
+) -> Result<Evaluation, ClarityEvalError> {
     let contract_id = QualifiedContractIdentifier::transient();
-    let database = store.as_clarity_db();
+    let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
         false,
         CHAIN_ID_TESTNET,
@@ -780,7 +930,25 @@ pub fn deploy_contract(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, ClarityEvalError> {
-    let database = store.as_clarity_db();
+    deploy_contract_in_context(
+        store,
+        &NULL_BURN_STATE_DB,
+        contract,
+        version,
+        source,
+        cost_tracker,
+    )
+}
+
+fn deploy_contract_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    contract: QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, ClarityEvalError> {
+    let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         false,
         CHAIN_ID_TESTNET,
@@ -808,7 +976,36 @@ pub fn execute_contract_call(
     arguments: &[Vec<u8>],
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, VmExecutionError> {
-    let arguments = arguments
+    execute_contract_call_in_context(
+        store,
+        &NULL_BURN_STATE_DB,
+        ContractCall {
+            sender,
+            sponsor,
+            contract,
+            function,
+            arguments,
+        },
+        cost_tracker,
+    )
+}
+
+struct ContractCall<'a> {
+    sender: PrincipalData,
+    sponsor: Option<PrincipalData>,
+    contract: QualifiedContractIdentifier,
+    function: &'a str,
+    arguments: &'a [Vec<u8>],
+}
+
+fn execute_contract_call_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    call: ContractCall<'_>,
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, VmExecutionError> {
+    let arguments = call
+        .arguments
         .iter()
         .map(|argument| {
             let mut bytes = argument.as_slice();
@@ -824,7 +1021,7 @@ pub fn execute_contract_call(
             Ok(SymbolicExpression::atom_value(value))
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
-    let database = store.as_clarity_db();
+    let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         false,
         CHAIN_ID_TESTNET,
@@ -832,8 +1029,13 @@ pub fn execute_contract_call(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
-    let (value, _, events) =
-        environment.execute_transaction(sender, sponsor, contract, function, &arguments)?;
+    let (value, _, events) = environment.execute_transaction(
+        call.sender,
+        call.sponsor,
+        call.contract,
+        call.function,
+        &arguments,
+    )?;
 
     Ok(TransactionResult {
         value: Some(value),
@@ -851,7 +1053,27 @@ pub fn transfer_stx(
     memo: &[u8],
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, VmExecutionError> {
-    let database = store.as_clarity_db();
+    transfer_stx_in_context(
+        store,
+        &NULL_BURN_STATE_DB,
+        sender,
+        recipient,
+        amount,
+        memo,
+        cost_tracker,
+    )
+}
+
+fn transfer_stx_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    sender: &PrincipalData,
+    recipient: &PrincipalData,
+    amount: u128,
+    memo: &[u8],
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         false,
         CHAIN_ID_TESTNET,
@@ -881,7 +1103,19 @@ pub fn debit_fee(
     payer: &PrincipalData,
     fee: u64,
 ) -> Result<(), VmExecutionError> {
-    let database = store.as_clarity_db();
+    debit_fee_in_context(store, &NULL_BURN_STATE_DB, payer, fee)
+}
+
+fn debit_fee_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    payer: &PrincipalData,
+    fee: u64,
+) -> Result<(), VmExecutionError> {
+    if fee == 0 {
+        return Ok(());
+    }
+    let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
         false,
         CHAIN_ID_TESTNET,
@@ -890,7 +1124,7 @@ pub fn debit_fee(
         StacksEpochId::Epoch40,
     );
     context.execute(|global| {
-        let mut balance = global.database.get_stx_balance_snapshot_genesis(payer)?;
+        let mut balance = global.database.get_stx_balance_snapshot(payer)?;
         if !balance.can_transfer(u128::from(fee))? {
             return Err(VmInternalError::InsufficientBalance.into());
         }
@@ -904,7 +1138,15 @@ pub fn account_nonce(
     store: &mut MarfStore,
     principal: &PrincipalData,
 ) -> Result<u64, VmExecutionError> {
-    let database = store.as_clarity_db();
+    account_nonce_in_context(store, &NULL_BURN_STATE_DB, principal)
+}
+
+fn account_nonce_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    principal: &PrincipalData,
+) -> Result<u64, VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
         false,
         CHAIN_ID_TESTNET,
@@ -921,7 +1163,16 @@ pub fn set_account_nonce(
     principal: &PrincipalData,
     nonce: u64,
 ) -> Result<(), VmExecutionError> {
-    let database = store.as_clarity_db();
+    set_account_nonce_in_context(store, &NULL_BURN_STATE_DB, principal, nonce)
+}
+
+fn set_account_nonce_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    principal: &PrincipalData,
+    nonce: u64,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
         false,
         CHAIN_ID_TESTNET,
@@ -930,6 +1181,13 @@ pub fn set_account_nonce(
         StacksEpochId::Epoch40,
     );
     context.execute(|global| global.database.set_account_nonce(principal, nonce))
+}
+
+fn clarity_database<'a>(
+    store: &'a mut MarfStore,
+    bitcoin_context: &'a dyn BurnStateDB,
+) -> ClarityDatabase<'a> {
+    ClarityDatabase::new(store, &NULL_HEADER_DB, bitcoin_context)
 }
 
 #[cfg(test)]
