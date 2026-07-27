@@ -430,6 +430,20 @@ mod tests {
     }
 
     #[test]
+    fn supports_epoch_four_clarity_six_words() {
+        let concatenated =
+            evaluate("(concat 0x01 0x02 0x03)").expect("variadic concat should evaluate");
+        let parsed_bitcoin = evaluate("(get-bitcoin-tx-output? 0x00 u0)")
+            .expect("bitcoin transaction parser should evaluate");
+
+        assert_eq!(
+            concatenated,
+            Some(Value::buff_from(vec![1, 2, 3]).expect("valid buffer"))
+        );
+        assert_eq!(parsed_bitcoin, Some(Value::err_uint(1)));
+    }
+
+    #[test]
     fn rejects_invalid_programs() {
         assert!(evaluate("(unknown-word u1)").is_err());
     }
