@@ -24,7 +24,7 @@ dependencies on Stacks-Core.
 - [x] Compute transaction IDs and tagged transaction Merkle roots.
 - [ ] Add generated differential tests for every transaction shape and invalid
   encoding boundary.
-- [ ] Replace preserved wire sections with typed transaction payload and
+- [x] Replace preserved wire sections with typed transaction payload and
   post-condition models used by execution.
 
 ## Acceptance Criteria
