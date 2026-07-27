@@ -1,7 +1,7 @@
 ---
 id: "008"
 title: "M7: implement bit-exact MARF and checkpoint import"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["002"]
@@ -13,12 +13,17 @@ created_at: 2026-07-27
 
 ## Objective
 
-<!-- Describe the goal of this task -->
+Reproduce Stacks-Core MARF roots for fresh writes, forks, copy-on-write, and
+PCS checkpoint imports without a production Stacks-Core dependency.
 
 ## Tasks
 
-- [ ] TODO
+- [ ] Match all node and leaf consensus preimages.
+- [ ] Match insert, promotion, fork, and copy-on-write root sequences.
+- [ ] Import the captured PCS checkpoint and verify its published root.
+- [ ] Extend the imported checkpoint with a reference-verified write.
 
 ## Acceptance Criteria
 
-- TODO
+- Randomized fork/copy-on-write scripts match Stacks-Core after every write.
+- The captured PCS checkpoint root and its first extension match Stacks-Core.
