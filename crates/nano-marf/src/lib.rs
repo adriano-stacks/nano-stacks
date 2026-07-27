@@ -603,6 +603,30 @@ impl VersionedMarf {
         self.versions.get(&block).map(|version| version.root)
     }
 
+    /// Return a sealed state's parent block, if the state exists.
+    #[must_use]
+    pub fn parent(&self, block: MarfBlockId) -> Option<Option<MarfBlockId>> {
+        self.versions.get(&block).map(|version| version.parent)
+    }
+
+    /// Return a sealed state's height.
+    #[must_use]
+    pub fn height(&self, block: MarfBlockId) -> Option<u32> {
+        self.versions.get(&block).map(|version| version.height)
+    }
+
+    /// Find an ancestor at `height` from a sealed state.
+    #[must_use]
+    pub fn block_at_height(&self, mut block: MarfBlockId, height: u32) -> Option<MarfBlockId> {
+        loop {
+            let version = self.versions.get(&block)?;
+            if version.height == height {
+                return Some(block);
+            }
+            block = version.parent?;
+        }
+    }
+
     fn ancestor_roots(&self, parent: Option<MarfBlockId>) -> Result<Vec<TrieHash>, MarfError> {
         let mut roots = Vec::new();
         let mut cursor = parent;

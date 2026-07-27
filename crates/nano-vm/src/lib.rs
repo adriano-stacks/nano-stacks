@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use clarity::vm::ast::build_ast;
 use clarity::vm::contexts::{ContractContext, GlobalContext};
@@ -13,8 +13,11 @@ use clarity::vm::database::{
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::{ClarityVersion, Value, eval_all};
-use nano_marf::{MarfError, MarfValue, StateRoot, VersionedMarf};
+use nano_marf::{
+    CheckpointError, MarfError, MarfValue, StateRoot, VersionedMarf, import_checkpoint,
+};
 use nano_primitives::TrieHash;
+use rusqlite::{OptionalExtension, params};
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::{
     StacksEpochId,
@@ -121,6 +124,7 @@ struct StoreState {
 #[derive(Debug)]
 pub enum MarfStoreError {
     Marf(MarfError),
+    Checkpoint(CheckpointError),
     Sql(rusqlite::Error),
     NoActiveState,
 }
@@ -129,6 +133,7 @@ impl std::fmt::Display for MarfStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Marf(error) => write!(formatter, "MARF error: {error}"),
+            Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
             Self::NoActiveState => formatter.write_str("no active VM state"),
         }
@@ -143,6 +148,12 @@ impl From<MarfError> for MarfStoreError {
     }
 }
 
+impl From<CheckpointError> for MarfStoreError {
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
 impl From<rusqlite::Error> for MarfStoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sql(error)
@@ -154,11 +165,34 @@ impl MarfStore {
     pub fn new() -> Result<Self, MarfStoreError> {
         Ok(Self {
             marf: VersionedMarf::default(),
-            side_store: rusqlite::Connection::open_in_memory()?,
+            side_store: create_side_store()?,
             states: BTreeMap::new(),
             parents: BTreeMap::new(),
             heights: BTreeMap::new(),
             read_block: None,
+            active: None,
+        })
+    }
+
+    /// Load a checkpointed Clarity MARF and its corresponding `SQLite` side tables.
+    pub fn from_checkpoint(
+        path: impl AsRef<Path>,
+        source: [u8; 32],
+        expected_root: TrieHash,
+    ) -> Result<Self, MarfStoreError> {
+        let path = path.as_ref();
+        let marf = import_checkpoint(path, source, expected_root)?;
+        let side_store = copy_side_store(path)?;
+        let mut states = BTreeMap::new();
+        states.insert(source, StoreState::default());
+
+        Ok(Self {
+            marf,
+            side_store,
+            states,
+            parents: BTreeMap::new(),
+            heights: BTreeMap::new(),
+            read_block: Some(source),
             active: None,
         })
     }
@@ -179,7 +213,12 @@ impl MarfStore {
             .and_then(|parent| self.states.get(&parent).cloned())
             .unwrap_or_default();
         let height = parent
-            .and_then(|parent| self.heights.get(&parent).copied())
+            .and_then(|parent| {
+                self.heights
+                    .get(&parent)
+                    .copied()
+                    .or_else(|| self.marf.height(parent))
+            })
             .map_or(0, |height| height + 1);
         self.active = Some(ActiveStore {
             block,
@@ -193,9 +232,13 @@ impl MarfStore {
 
     /// Persist a Clarity database key and commit its value hash into the active MARF.
     pub fn put(&mut self, key: String, value: String) -> Result<(), MarfStoreError> {
+        let value_hash = MarfValue::from_value(value.as_bytes());
+        self.marf.insert(key.as_bytes(), value_hash)?;
+        self.side_store.execute(
+            "INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)",
+            params![marf_value_key(value_hash), &value],
+        )?;
         let active = self.active.as_mut().ok_or(MarfStoreError::NoActiveState)?;
-        self.marf
-            .insert(key.as_bytes(), MarfValue::from_value(value.as_bytes()))?;
         active.state.values.insert(key, value);
         Ok(())
     }
@@ -247,12 +290,148 @@ impl MarfStore {
         }
     }
 
+    fn checkpoint_block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
+        self.marf.block_at_height(block, height)
+    }
+
     fn current_block(&self) -> Option<[u8; 32]> {
         self.active
             .as_ref()
             .map(|active| active.block)
             .or(self.read_block)
     }
+
+    fn selected_state(&self) -> Option<(&StoreState, Option<[u8; 32]>)> {
+        if let Some(block) = self.read_block {
+            if let Some(active) = self.active.as_ref().filter(|active| active.block == block) {
+                return Some((&active.state, active.parent));
+            }
+            return self.states.get(&block).map(|state| (state, Some(block)));
+        }
+        self.active
+            .as_ref()
+            .map(|active| (&active.state, active.parent))
+    }
+
+    fn data_from_marf(
+        &self,
+        block: Option<[u8; 32]>,
+        key: &str,
+    ) -> Result<Option<String>, VmExecutionError> {
+        block
+            .and_then(|block| self.marf.get(block, key.as_bytes()))
+            .map_or(Ok(None), |value| self.data_from_side_store(value))
+    }
+
+    fn data_from_path(
+        &self,
+        block: Option<[u8; 32]>,
+        path: [u8; 32],
+    ) -> Result<Option<String>, VmExecutionError> {
+        block
+            .and_then(|block| self.marf.get_path(block, path))
+            .map_or(Ok(None), |value| self.data_from_side_store(value))
+    }
+
+    fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {
+        Ok(self
+            .side_store
+            .query_row(
+                "SELECT value FROM data_table WHERE key = ?1",
+                params![marf_value_key(value)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?)
+    }
+
+    fn metadata_from_side_store(
+        &self,
+        block: [u8; 32],
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+    ) -> Result<Option<String>, VmExecutionError> {
+        Ok(self
+            .side_store
+            .query_row(
+                "SELECT value FROM metadata_table WHERE blockhash = ?1 AND key = ?2",
+                params![block_hex(block), format!("clr-meta::{contract}::{key}"),],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| VmInternalError::Expect(format!("metadata read failed: {error}")))?)
+    }
+}
+
+fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
+    let connection = rusqlite::Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE data_table (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE metadata_table (
+             key TEXT NOT NULL,
+             blockhash TEXT,
+             value TEXT NOT NULL,
+             UNIQUE (key, blockhash)
+         );
+         CREATE INDEX md_blockhashes ON metadata_table(blockhash);",
+    )?;
+    Ok(connection)
+}
+
+fn copy_side_store(path: &Path) -> Result<rusqlite::Connection, MarfStoreError> {
+    let source_uri = format!("file:{}?immutable=1", path.display());
+    let source = rusqlite::Connection::open_with_flags(
+        source_uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let destination = create_side_store()?;
+
+    let mut data = source.prepare("SELECT key, value FROM data_table")?;
+    let data_rows = data.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in data_rows {
+        let (key, value) = row?;
+        destination.execute(
+            "INSERT INTO data_table (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+    }
+
+    let mut metadata = source.prepare("SELECT key, blockhash, value FROM metadata_table")?;
+    let metadata_rows = metadata.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in metadata_rows {
+        let (key, blockhash, value) = row?;
+        destination.execute(
+            "INSERT INTO metadata_table (key, blockhash, value) VALUES (?1, ?2, ?3)",
+            params![key, blockhash, value],
+        )?;
+    }
+    Ok(destination)
+}
+
+fn marf_value_key(value: MarfValue) -> String {
+    hex_bytes(value.as_bytes())
+}
+
+fn block_hex(block: [u8; 32]) -> String {
+    hex_bytes(&block)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    hex
 }
 
 impl ClarityBackingStore for MarfStore {
@@ -269,21 +448,33 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
-        Ok(self
-            .read_state()
-            .and_then(|state| state.values.get(key).cloned()))
+        let Some((state, fallback_block)) = self.selected_state() else {
+            return Ok(None);
+        };
+        state.values.get(key).cloned().map_or_else(
+            || self.data_from_marf(fallback_block, key),
+            |value| Ok(Some(value)),
+        )
     }
 
     fn get_data_from_path(
         &mut self,
         path: &ReferenceTrieHash,
     ) -> Result<Option<String>, VmExecutionError> {
-        Ok(self.read_state().and_then(|state| {
-            state.values.iter().find_map(|(key, value)| {
+        let Some((state, fallback_block)) = self.selected_state() else {
+            return Ok(None);
+        };
+        state
+            .values
+            .iter()
+            .find_map(|(key, value)| {
                 (nano_marf::key_path(key.as_bytes()).as_bytes() == path.as_bytes())
                     .then(|| value.clone())
             })
-        }))
+            .map_or_else(
+                || self.data_from_path(fallback_block, *path.as_bytes()),
+                |value| Ok(Some(value)),
+            )
     }
 
     fn get_data_with_proof(
@@ -313,7 +504,10 @@ impl ClarityBackingStore for MarfStore {
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
         self.current_block()
-            .and_then(|block| self.block_at_height(block, height))
+            .and_then(|block| {
+                self.block_at_height(block, height)
+                    .or_else(|| self.checkpoint_block_at_height(block, height))
+            })
             .map(StacksBlockId)
     }
 
@@ -323,7 +517,11 @@ impl ClarityBackingStore for MarfStore {
             .map(|active| active.height + 1)
             .or_else(|| {
                 self.current_block()
-                    .and_then(|block| self.heights.get(&block).copied())
+                    .and_then(|block| {
+                        self.marf
+                            .height(block)
+                            .or_else(|| self.heights.get(&block).copied())
+                    })
                     .map(|height| height + 1)
             })
             .unwrap_or(0)
@@ -373,12 +571,16 @@ impl ClarityBackingStore for MarfStore {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        Ok(self.read_state().and_then(|state| {
+        if let Some(value) = self.read_state().and_then(|state| {
             state
                 .metadata
                 .get(&(contract.to_string(), key.to_owned()))
                 .cloned()
-        }))
+        }) {
+            return Ok(Some(value));
+        }
+        let (block, _) = self.get_contract_hash(contract)?;
+        self.metadata_from_side_store(block.0, contract, key)
     }
 
     fn get_metadata_manual(
@@ -389,14 +591,20 @@ impl ClarityBackingStore for MarfStore {
     ) -> Result<Option<String>, VmExecutionError> {
         let block = self
             .current_block()
-            .and_then(|block| self.block_at_height(block, height))
+            .and_then(|block| {
+                self.block_at_height(block, height)
+                    .or_else(|| self.checkpoint_block_at_height(block, height))
+            })
             .ok_or_else(|| RuntimeError::BadBlockHeight(height.to_string()))?;
-        Ok(self.states.get(&block).and_then(|state| {
+        if let Some(value) = self.states.get(&block).and_then(|state| {
             state
                 .metadata
                 .get(&(contract.to_string(), key.to_owned()))
                 .cloned()
-        }))
+        }) {
+            return Ok(Some(value));
+        }
+        self.metadata_from_side_store(block, contract, key)
     }
 }
 
@@ -475,8 +683,13 @@ pub fn evaluate_with_tracker(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clarity::vm::Value;
     use clarity::vm::database::ClarityBackingStore;
+    use clarity::vm::database::clarity_store::make_contract_hash_key;
+    use clarity::vm::types::QualifiedContractIdentifier;
+    use nano_primitives::TrieHash;
     use stacks_common::types::chainstate::StacksBlockId;
 
     use super::{MarfStore, Vm, evaluate, evaluate_in_store};
@@ -597,5 +810,56 @@ mod tests {
 
         assert_eq!(evaluation.value, Some(Value::UInt(2)));
         assert_eq!(vm.root(block), Some(root));
+    }
+
+    #[test]
+    fn loads_clarity_values_and_metadata_from_a_checkpoint() {
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        let root = TrieHash::from_bytes([
+            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
+            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
+            0x3a, 0x64, 0xc0, 0x71,
+        ]);
+        let checkpoint = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/chainstate/checkpoint-H/marf.sqlite");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
+            .expect("valid boot contract identifier");
+        let mut store =
+            MarfStore::from_checkpoint(checkpoint, source, root).expect("load checkpoint");
+
+        assert_eq!(
+            store.root(source).map(|root| root.0),
+            Some(*root.as_bytes())
+        );
+        assert!(
+            store
+                .get_data(&make_contract_hash_key(&contract))
+                .expect("read contract commitment")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_metadata(&contract, "vm-metadata::9::contract-src")
+                .expect("read contract source")
+                .is_some()
+        );
+
+        store
+            .begin(Some(source), [0x42; 32])
+            .expect("extend checkpoint state");
+        assert!(
+            store
+                .get_data(&make_contract_hash_key(&contract))
+                .expect("read inherited contract commitment")
+                .is_some()
+        );
+        store
+            .put("nano-checkpoint-extension".to_owned(), "value".to_owned())
+            .expect("write extension");
+        store.seal().expect("seal checkpoint extension");
     }
 }
