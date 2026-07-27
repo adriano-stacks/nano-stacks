@@ -135,6 +135,27 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             return Err(FixtureValidationError::MissingOrEmptyFile(path));
         }
     }
+    let snapshots: Vec<CapturedBitcoinSnapshot> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).map_err(|_| {
+            FixtureValidationError::InvalidSnapshotFile(root.join("sortition/snapshots.json"))
+        })?,
+    )
+    .map_err(|_| {
+        FixtureValidationError::InvalidSnapshotFile(root.join("sortition/snapshots.json"))
+    })?;
+    if snapshots.is_empty() {
+        return Err(FixtureValidationError::InvalidSnapshotFile(
+            root.join("sortition/snapshots.json"),
+        ));
+    }
+    for snapshot in snapshots {
+        let block = root
+            .join("bitcoin/blocks")
+            .join(format!("{}.hex", snapshot.burn_header_hash));
+        if !is_nonempty_file(&block)? {
+            return Err(FixtureValidationError::MissingOrEmptyFile(block));
+        }
+    }
 
     let checkpoint = root.join("chainstate/checkpoint-H");
     if count_files_recursively(&checkpoint)? == 0 {
@@ -216,6 +237,7 @@ pub enum FixtureValidationError {
     MissingOrEmptyFile(PathBuf),
     EmptyCheckpoint(PathBuf),
     InvalidCheckpointManifest(PathBuf),
+    InvalidSnapshotFile(PathBuf),
     EmptyCapture,
     Metadata {
         path: PathBuf,
@@ -254,6 +276,13 @@ impl std::fmt::Display for FixtureValidationError {
                 "invalid portable MARF checkpoint manifest: {}",
                 path.display()
             ),
+            Self::InvalidSnapshotFile(path) => {
+                write!(
+                    formatter,
+                    "invalid captured Bitcoin snapshots: {}",
+                    path.display()
+                )
+            }
             Self::EmptyCapture => {
                 formatter.write_str("captured fixtures must contain at least one replay block")
             }
@@ -589,7 +618,9 @@ mod tests {
     use clarity::vm::ClarityVersion as ReferenceClarityVersion;
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
-    use nano_bitcoin::decode_block as decode_bitcoin_block;
+    use nano_bitcoin::{
+        PreStxCache, decode_block as decode_bitcoin_block, decode_block_with_pre_stx,
+    };
     use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, SignerSet};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
@@ -650,6 +681,7 @@ mod tests {
         block_height: u64,
         burn_header_hash: String,
         parent_burn_header_hash: String,
+        ops_hash: String,
         sortition: u8,
         sortition_hash: String,
     }
@@ -1066,11 +1098,20 @@ mod tests {
             &root.join("manifest.toml"),
             "mode = \"captured\"\nreplay_blocks = 1\n",
         )?;
-        write_file(&root.join("bitcoin/blocks/00000001.hex"), "00")?;
+        let bitcoin_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        write_file(
+            &root
+                .join("bitcoin/blocks")
+                .join(format!("{bitcoin_hash}.hex")),
+            "00",
+        )?;
         write_file(&root.join("nakamoto/blocks/00000001.bin"), "block")?;
         write_file(&root.join("events/new_block/00000001.json"), "{}")?;
         write_file(&root.join("stacker_set/cycle-0.json"), "{}")?;
-        write_file(&root.join("sortition/snapshots.json"), "[]")?;
+        let snapshot = format!(
+            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"consensus_hash\":\"0000000000000000000000000000000000000000\"}}]"
+        );
+        write_file(&root.join("sortition/snapshots.json"), &snapshot)?;
         write_file(
             &root.join("chainstate/checkpoint-H/checkpoint.toml"),
             "format = \"stacks-core-marf-sqlite-v2\"\nsource_state_id = \"id\"\npublished_state_index_root = \"root\"\n",
@@ -1728,6 +1769,65 @@ mod tests {
                 derived.sortition_hash.as_bytes(),
                 &hex_array(&snapshot.sortition_hash),
                 "{}",
+                snapshot.block_height
+            );
+        }
+    }
+
+    #[test]
+    fn captured_bitcoin_blocks_match_the_recorded_operation_hashes() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let snapshots: Vec<CapturedSortitionSnapshot> = serde_json::from_slice(
+            &fs::read(fixture_root.join("sortition/snapshots.json"))
+                .expect("read captured sortition snapshots"),
+        )
+        .expect("parse captured sortition snapshots");
+        let mut pre_stx_cache = PreStxCache::new();
+
+        for snapshot in snapshots {
+            if snapshot.block_height == 0 {
+                continue;
+            }
+            let raw = fs::read_to_string(
+                fixture_root
+                    .join("bitcoin/blocks")
+                    .join(format!("{}.hex", snapshot.burn_header_hash)),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "missing Bitcoin block at height {}: {error}",
+                    snapshot.block_height
+                )
+            });
+            let block = decode_block_with_pre_stx(
+                snapshot.block_height,
+                &hex::decode(raw.trim()).expect("decode captured Bitcoin block"),
+                *b"T3",
+                &mut pre_stx_cache,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "decode captured Bitcoin block at height {}: {error}",
+                    snapshot.block_height
+                )
+            });
+            assert_eq!(
+                block.hash,
+                hex_array(&snapshot.burn_header_hash),
+                "Bitcoin block hash at height {}",
+                snapshot.block_height
+            );
+            assert_eq!(
+                nano_sortition::OpsHash::from_txids(
+                    &block
+                        .operations
+                        .iter()
+                        .map(|operation| operation.txid)
+                        .collect::<Vec<_>>(),
+                )
+                .as_bytes(),
+                &hex_array(&snapshot.ops_hash),
+                "operation hash at Bitcoin height {}",
                 snapshot.block_height
             );
         }

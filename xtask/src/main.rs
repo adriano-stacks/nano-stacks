@@ -188,7 +188,10 @@ impl CaptureConfig {
         sortition_db: &Path,
         node_root: &Path,
     ) -> Result<(), String> {
-        let mut burn_hashes = Vec::new();
+        let snapshot_query = "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots order by block_height";
+        let snapshots = sqlite_json(sortition_db, snapshot_query)?;
+        let bitcoin_blocks = Self::bitcoin_blocks(&snapshots)?;
+
         for block in blocks {
             let name = format!("{:08}-{}.bin", block.height, block.block_hash);
             let destination = staging.join("nakamoto/blocks").join(name);
@@ -204,10 +207,10 @@ impl CaptureConfig {
                 &staging.join("events/new_block").join(event_name),
                 event.as_bytes(),
             )?;
-            burn_hashes.push(burn_hash_from_event(&event)?);
         }
 
-        for burn_hash in &burn_hashes {
+        for bitcoin_block in bitcoin_blocks {
+            let burn_hash = bitcoin_block.hash;
             let payload = format!(
                 "{{\"jsonrpc\":\"1.0\",\"id\":\"nano-stacks\",\"method\":\"getblock\",\"params\":[\"{burn_hash}\",0]}}"
             );
@@ -221,8 +224,6 @@ impl CaptureConfig {
             )?;
         }
 
-        let snapshot_query = "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots order by block_height";
-        let snapshots = sqlite_json(sortition_db, snapshot_query)?;
         write_file(
             &staging.join("sortition/snapshots.json"),
             snapshots.as_bytes(),
@@ -290,6 +291,22 @@ impl CaptureConfig {
         );
         let output = sqlite(database, &query)?;
         CapturedBlock::parse(output.trim())
+    }
+
+    fn bitcoin_blocks(snapshots: &str) -> Result<Vec<CapturedBitcoinBlock>, String> {
+        let snapshots: Vec<serde_json::Value> = serde_json::from_str(snapshots)
+            .map_err(|error| format!("could not parse captured Bitcoin snapshots: {error}"))?;
+        let bitcoin_blocks = snapshots
+            .iter()
+            .map(CapturedBitcoinBlock::from_snapshot)
+            .collect::<Result<Vec<_>, _>>()?;
+        if bitcoin_blocks
+            .windows(2)
+            .any(|blocks| blocks[1].height != blocks[0].height.saturating_add(1))
+        {
+            return Err("captured Bitcoin blocks are not contiguous".to_owned());
+        }
+        Ok(bitcoin_blocks)
     }
 
     fn checkpoint_root(&self, checkpoint: &CapturedBlock) -> Result<String, String> {
@@ -370,6 +387,27 @@ struct CapturedBlock {
     block_hash: String,
     consensus_hash: String,
     index_block_hash: String,
+}
+
+struct CapturedBitcoinBlock {
+    height: u64,
+    hash: String,
+}
+
+impl CapturedBitcoinBlock {
+    fn from_snapshot(snapshot: &serde_json::Value) -> Result<Self, String> {
+        let height = snapshot
+            .get("block_height")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "missing Bitcoin block height from captured snapshot".to_owned())?;
+        let hash = snapshot
+            .get("burn_header_hash")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| "missing Bitcoin block hash from captured snapshot".to_owned())?
+            .to_owned();
+        Ok(Self { height, hash })
+    }
 }
 
 impl CapturedBlock {
@@ -508,19 +546,6 @@ fn hex(bytes: &[u8]) -> String {
         value.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     value
-}
-
-fn burn_hash_from_event(event: &str) -> Result<String, String> {
-    let marker = "\"burn_block_hash\":\"0x";
-    let start = event
-        .find(marker)
-        .map(|index| index + marker.len())
-        .ok_or_else(|| "new_block event is missing burn_block_hash".to_owned())?;
-    let end = event[start..]
-        .find('"')
-        .map(|index| start + index)
-        .ok_or_else(|| "new_block event has an unterminated burn_block_hash".to_owned())?;
-    Ok(event[start..end].to_owned())
 }
 
 fn json_result_string(response: &str) -> Result<String, String> {
