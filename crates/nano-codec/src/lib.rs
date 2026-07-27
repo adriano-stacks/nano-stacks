@@ -4,7 +4,7 @@ use std::fmt;
 
 use nano_address::StacksAddress;
 use nano_crypto::MessageSignature;
-use nano_primitives::{Hash160, Sha256Sum, sha512_256};
+use nano_primitives::{ConsensusHash, Hash160, Sha256Sum, StacksBlockId, sha512_256};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecError {
@@ -320,23 +320,78 @@ impl TransactionPayloadType {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Principal {
+    Standard(StacksAddress),
+    Contract {
+        address: StacksAddress,
+        contract_name: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostConditionPrincipal {
+    Origin,
+    Standard(StacksAddress),
+    Contract {
+        address: StacksAddress,
+        contract_name: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetInfo {
+    pub address: StacksAddress,
+    pub contract_name: String,
+    pub asset_name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PostConditionType {
-    Stx,
-    Fungible,
-    NonFungible,
+pub enum FungibleCondition {
+    SentEqual,
+    SentGreater,
+    SentGreaterEqual,
+    SentLess,
+    SentLessEqual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NonFungibleCondition {
+    DoesNotSend,
+    DoesSend,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostConditionData {
+    Stx {
+        principal: PostConditionPrincipal,
+        condition: FungibleCondition,
+        amount: u64,
+    },
+    Fungible {
+        principal: PostConditionPrincipal,
+        asset: AssetInfo,
+        condition: FungibleCondition,
+        amount: u64,
+    },
+    NonFungible {
+        principal: PostConditionPrincipal,
+        asset: AssetInfo,
+        asset_value: ClarityValue,
+        condition: NonFungibleCondition,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostCondition {
-    kind: PostConditionType,
+    data: PostConditionData,
     bytes: Vec<u8>,
 }
 
 impl PostCondition {
     #[must_use]
-    pub const fn kind(&self) -> PostConditionType {
-        self.kind
+    pub const fn data(&self) -> &PostConditionData {
+        &self.data
     }
 
     #[must_use]
@@ -346,15 +401,164 @@ impl PostCondition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClarityValue(Vec<u8>);
+
+impl ClarityValue {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClarityVersion {
+    Clarity1,
+    Clarity2,
+    Clarity3,
+    Clarity4,
+    Clarity5,
+    Clarity6,
+}
+
+impl ClarityVersion {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            1 => Ok(Self::Clarity1),
+            2 => Ok(Self::Clarity2),
+            3 => Ok(Self::Clarity3),
+            4 => Ok(Self::Clarity4),
+            5 => Ok(Self::Clarity5),
+            6 => Ok(Self::Clarity6),
+            _ => Err(CodecError::InvalidPayload),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MicroblockHeader {
+    pub sequence: u16,
+    pub previous_block: StacksBlockId,
+    bytes: [u8; 132],
+}
+
+impl MicroblockHeader {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 132] {
+        &self.bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TenureChangeCause {
+    BlockFound,
+    Extended,
+    ExtendedRuntime,
+    ExtendedReadCount,
+    ExtendedReadLength,
+    ExtendedWriteCount,
+    ExtendedWriteLength,
+}
+
+impl TenureChangeCause {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            0 => Ok(Self::BlockFound),
+            1 => Ok(Self::Extended),
+            2 => Ok(Self::ExtendedRuntime),
+            3 => Ok(Self::ExtendedReadCount),
+            4 => Ok(Self::ExtendedReadLength),
+            5 => Ok(Self::ExtendedWriteCount),
+            6 => Ok(Self::ExtendedWriteLength),
+            _ => Err(CodecError::InvalidPayload),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenureChangePayload {
+    pub tenure_consensus_hash: ConsensusHash,
+    pub previous_tenure_consensus_hash: ConsensusHash,
+    pub bitcoin_view_consensus_hash: ConsensusHash,
+    pub previous_tenure_end: StacksBlockId,
+    pub previous_tenure_blocks: u32,
+    pub cause: TenureChangeCause,
+    pub public_key_hash: Hash160,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionPayloadData {
+    TokenTransfer {
+        recipient: Principal,
+        amount: u64,
+        memo: [u8; 34],
+    },
+    SmartContract {
+        contract_name: String,
+        source: String,
+    },
+    ContractCall {
+        address: StacksAddress,
+        contract_name: String,
+        function_name: String,
+        arguments: Vec<ClarityValue>,
+    },
+    PoisonMicroblock {
+        first: MicroblockHeader,
+        second: MicroblockHeader,
+    },
+    Coinbase {
+        payload: [u8; 32],
+    },
+    CoinbaseToAltRecipient {
+        payload: [u8; 32],
+        recipient: Principal,
+    },
+    VersionedSmartContract {
+        clarity_version: ClarityVersion,
+        contract_name: String,
+        source: String,
+    },
+    TenureChange(TenureChangePayload),
+    NakamotoCoinbase {
+        payload: [u8; 32],
+        recipient: Option<Principal>,
+        vrf_proof: [u8; 80],
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionPayload {
-    kind: TransactionPayloadType,
+    data: TransactionPayloadData,
     bytes: Vec<u8>,
 }
 
 impl TransactionPayload {
     #[must_use]
+    pub const fn data(&self) -> &TransactionPayloadData {
+        &self.data
+    }
+
+    #[must_use]
     pub const fn kind(&self) -> TransactionPayloadType {
-        self.kind
+        match &self.data {
+            TransactionPayloadData::TokenTransfer { .. } => TransactionPayloadType::TokenTransfer,
+            TransactionPayloadData::SmartContract { .. } => TransactionPayloadType::SmartContract,
+            TransactionPayloadData::ContractCall { .. } => TransactionPayloadType::ContractCall,
+            TransactionPayloadData::PoisonMicroblock { .. } => {
+                TransactionPayloadType::PoisonMicroblock
+            }
+            TransactionPayloadData::Coinbase { .. } => TransactionPayloadType::Coinbase,
+            TransactionPayloadData::CoinbaseToAltRecipient { .. } => {
+                TransactionPayloadType::CoinbaseToAltRecipient
+            }
+            TransactionPayloadData::VersionedSmartContract { .. } => {
+                TransactionPayloadType::VersionedSmartContract
+            }
+            TransactionPayloadData::TenureChange(_) => TransactionPayloadType::TenureChange,
+            TransactionPayloadData::NakamotoCoinbase { .. } => {
+                TransactionPayloadType::NakamotoCoinbase
+            }
+        }
     }
 
     #[must_use]
@@ -385,16 +589,16 @@ impl Transaction {
         let mut post_conditions = Vec::with_capacity(post_condition_count);
         for _ in 0..post_condition_count {
             let start = reader.position();
-            let kind = scan_post_condition(&mut reader)?;
+            let data = read_post_condition(&mut reader)?;
             post_conditions.push(PostCondition {
-                kind,
+                data,
                 bytes: reader.bytes[start..reader.position()].to_vec(),
             });
         }
         let payload_start = reader.position();
-        let payload_type = scan_payload(&mut reader)?;
+        let data = read_payload(&mut reader)?;
         let payload = TransactionPayload {
-            kind: payload_type,
+            data,
             bytes: reader.bytes[payload_start..reader.position()].to_vec(),
         };
 
@@ -516,184 +720,215 @@ fn tagged_hash(tag: u8, data: &[u8]) -> Sha256Sum {
     sha512_256(&bytes)
 }
 
-fn scan_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadType, CodecError> {
-    let payload_type = TransactionPayloadType::parse(reader.byte()?)?;
-    match payload_type {
-        TransactionPayloadType::TokenTransfer => {
-            scan_principal(reader)?;
-            reader.u64()?;
-            reader.take(34)?;
-        }
-        TransactionPayloadType::SmartContract => {
-            scan_name(reader)?;
-            scan_stacks_string(reader)?;
-        }
+fn read_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadData, CodecError> {
+    match TransactionPayloadType::parse(reader.byte()?)? {
+        TransactionPayloadType::TokenTransfer => Ok(TransactionPayloadData::TokenTransfer {
+            recipient: read_principal(reader)?,
+            amount: reader.u64()?,
+            memo: reader.take(34)?.try_into().expect("fixed slice"),
+        }),
+        TransactionPayloadType::SmartContract => Ok(TransactionPayloadData::SmartContract {
+            contract_name: read_name(reader)?,
+            source: read_stacks_string(reader)?,
+        }),
         TransactionPayloadType::ContractCall => {
-            scan_address(reader)?;
-            scan_name(reader)?;
-            scan_name(reader)?;
-            let arguments = reader.u32()?;
-            for _ in 0..arguments {
-                scan_clarity_value(reader, 0)?;
+            let address = read_address(reader)?;
+            let contract_name = read_name(reader)?;
+            let function_name = read_name(reader)?;
+            let count = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
+            if count > reader.remaining() {
+                return Err(CodecError::InvalidLength);
             }
+            let mut arguments = Vec::with_capacity(count);
+            for _ in 0..count {
+                arguments.push(read_clarity_value(reader)?);
+            }
+            Ok(TransactionPayloadData::ContractCall {
+                address,
+                contract_name,
+                function_name,
+                arguments,
+            })
         }
         TransactionPayloadType::PoisonMicroblock => {
-            let first = scan_microblock_header(reader)?;
-            let second = scan_microblock_header(reader)?;
-            if first == second
-                || (first.sequence != second.sequence && first.previous != second.previous)
+            let first = read_microblock_header(reader)?;
+            let second = read_microblock_header(reader)?;
+            if first.bytes == second.bytes
+                || (first.sequence != second.sequence
+                    && first.previous_block != second.previous_block)
             {
                 return Err(CodecError::InvalidPayload);
             }
+            Ok(TransactionPayloadData::PoisonMicroblock { first, second })
         }
-        TransactionPayloadType::Coinbase => {
-            reader.take(32)?;
-        }
+        TransactionPayloadType::Coinbase => Ok(TransactionPayloadData::Coinbase {
+            payload: reader.take(32)?.try_into().expect("fixed slice"),
+        }),
         TransactionPayloadType::CoinbaseToAltRecipient => {
-            reader.take(32)?;
-            let value_start = reader.position();
-            scan_clarity_value(reader, 0)?;
-            if reader.bytes[value_start] != 5 && reader.bytes[value_start] != 6 {
-                return Err(CodecError::InvalidPayload);
-            }
+            Ok(TransactionPayloadData::CoinbaseToAltRecipient {
+                payload: reader.take(32)?.try_into().expect("fixed slice"),
+                recipient: read_principal(reader)?,
+            })
         }
         TransactionPayloadType::VersionedSmartContract => {
-            match reader.byte()? {
-                1..=6 => {}
-                _ => return Err(CodecError::InvalidPayload),
-            }
-            scan_name(reader)?;
-            scan_stacks_string(reader)?;
+            Ok(TransactionPayloadData::VersionedSmartContract {
+                clarity_version: ClarityVersion::parse(reader.byte()?)?,
+                contract_name: read_name(reader)?,
+                source: read_stacks_string(reader)?,
+            })
         }
         TransactionPayloadType::TenureChange => {
-            reader.take(20 * 3 + 32)?;
-            reader.u32()?;
-            if reader.byte()? > 6 {
-                return Err(CodecError::InvalidPayload);
-            }
-            reader.take(20)?;
+            Ok(TransactionPayloadData::TenureChange(TenureChangePayload {
+                tenure_consensus_hash: read_consensus_hash(reader)?,
+                previous_tenure_consensus_hash: read_consensus_hash(reader)?,
+                bitcoin_view_consensus_hash: read_consensus_hash(reader)?,
+                previous_tenure_end: read_block_id(reader)?,
+                previous_tenure_blocks: reader.u32()?,
+                cause: TenureChangeCause::parse(reader.byte()?)?,
+                public_key_hash: reader.hash160()?,
+            }))
         }
         TransactionPayloadType::NakamotoCoinbase => {
-            reader.take(32)?;
-            let value_start = reader.position();
-            scan_clarity_value(reader, 0)?;
-            let principal = &reader.bytes[value_start..reader.position()];
-            if !matches!(principal, [9] | [10, 5 | 6, ..]) {
-                return Err(CodecError::InvalidPayload);
-            }
-            reader.take(80)?;
+            let payload = reader.take(32)?.try_into().expect("fixed slice");
+            let recipient = match reader.byte()? {
+                9 => None,
+                10 => Some(read_principal(reader)?),
+                _ => return Err(CodecError::InvalidPayload),
+            };
+            Ok(TransactionPayloadData::NakamotoCoinbase {
+                payload,
+                recipient,
+                vrf_proof: reader.take(80)?.try_into().expect("fixed slice"),
+            })
         }
     }
-    Ok(payload_type)
 }
 
-#[derive(Eq, PartialEq)]
-struct MicroblockIdentity {
-    sequence: u16,
-    previous: [u8; 32],
-    bytes: [u8; 132],
-}
-
-fn scan_microblock_header(reader: &mut Reader<'_>) -> Result<MicroblockIdentity, CodecError> {
+fn read_microblock_header(reader: &mut Reader<'_>) -> Result<MicroblockHeader, CodecError> {
     let bytes: [u8; 132] = reader.take(132)?.try_into().expect("fixed slice");
-    Ok(MicroblockIdentity {
+    Ok(MicroblockHeader {
         sequence: u16::from_be_bytes(bytes[1..3].try_into().expect("fixed slice")),
-        previous: bytes[3..35].try_into().expect("fixed slice"),
+        previous_block: StacksBlockId::from_bytes(bytes[3..35].try_into().expect("fixed slice")),
         bytes,
     })
 }
 
-fn scan_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionType, CodecError> {
-    let kind = match reader.byte()? {
-        0 => {
-            scan_post_condition_principal(reader)?;
-            scan_fungible_condition(reader)?;
-            reader.u64()?;
-            PostConditionType::Stx
-        }
-        1 => {
-            scan_post_condition_principal(reader)?;
-            scan_asset_info(reader)?;
-            scan_fungible_condition(reader)?;
-            reader.u64()?;
-            PostConditionType::Fungible
-        }
-        2 => {
-            scan_post_condition_principal(reader)?;
-            scan_asset_info(reader)?;
-            scan_clarity_value(reader, 0)?;
-            match reader.byte()? {
-                0x10 | 0x11 => {}
+fn read_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionData, CodecError> {
+    match reader.byte()? {
+        0 => Ok(PostConditionData::Stx {
+            principal: read_post_condition_principal(reader)?,
+            condition: read_fungible_condition(reader)?,
+            amount: reader.u64()?,
+        }),
+        1 => Ok(PostConditionData::Fungible {
+            principal: read_post_condition_principal(reader)?,
+            asset: read_asset_info(reader)?,
+            condition: read_fungible_condition(reader)?,
+            amount: reader.u64()?,
+        }),
+        2 => Ok(PostConditionData::NonFungible {
+            principal: read_post_condition_principal(reader)?,
+            asset: read_asset_info(reader)?,
+            asset_value: read_clarity_value(reader)?,
+            condition: match reader.byte()? {
+                0x10 => NonFungibleCondition::DoesNotSend,
+                0x11 => NonFungibleCondition::DoesSend,
                 _ => return Err(CodecError::InvalidPostCondition),
-            }
-            PostConditionType::NonFungible
-        }
-        _ => return Err(CodecError::InvalidPostCondition),
-    };
-    Ok(kind)
-}
-
-fn scan_post_condition_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
-    match reader.byte()? {
-        1 => Ok(()),
-        2 => scan_address(reader),
-        3 => {
-            scan_address(reader)?;
-            scan_name(reader)
-        }
+            },
+        }),
         _ => Err(CodecError::InvalidPostCondition),
     }
 }
 
-fn scan_asset_info(reader: &mut Reader<'_>) -> Result<(), CodecError> {
-    scan_address(reader)?;
-    scan_name(reader)?;
-    scan_name(reader)
-}
-
-fn scan_fungible_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+fn read_post_condition_principal(
+    reader: &mut Reader<'_>,
+) -> Result<PostConditionPrincipal, CodecError> {
     match reader.byte()? {
-        1..=5 => Ok(()),
+        1 => Ok(PostConditionPrincipal::Origin),
+        2 => Ok(PostConditionPrincipal::Standard(read_address(reader)?)),
+        3 => Ok(PostConditionPrincipal::Contract {
+            address: read_address(reader)?,
+            contract_name: read_name(reader)?,
+        }),
         _ => Err(CodecError::InvalidPostCondition),
     }
 }
 
-fn scan_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+fn read_asset_info(reader: &mut Reader<'_>) -> Result<AssetInfo, CodecError> {
+    Ok(AssetInfo {
+        address: read_address(reader)?,
+        contract_name: read_name(reader)?,
+        asset_name: read_name(reader)?,
+    })
+}
+
+fn read_fungible_condition(reader: &mut Reader<'_>) -> Result<FungibleCondition, CodecError> {
     match reader.byte()? {
-        5 => scan_address(reader),
-        6 => {
-            scan_address(reader)?;
-            scan_name(reader)
-        }
+        1 => Ok(FungibleCondition::SentEqual),
+        2 => Ok(FungibleCondition::SentGreater),
+        3 => Ok(FungibleCondition::SentGreaterEqual),
+        4 => Ok(FungibleCondition::SentLess),
+        5 => Ok(FungibleCondition::SentLessEqual),
+        _ => Err(CodecError::InvalidPostCondition),
+    }
+}
+
+fn read_principal(reader: &mut Reader<'_>) -> Result<Principal, CodecError> {
+    match reader.byte()? {
+        5 => Ok(Principal::Standard(read_address(reader)?)),
+        6 => Ok(Principal::Contract {
+            address: read_address(reader)?,
+            contract_name: read_name(reader)?,
+        }),
         _ => Err(CodecError::InvalidPrincipal),
     }
 }
 
-fn scan_address(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+fn read_address(reader: &mut Reader<'_>) -> Result<StacksAddress, CodecError> {
     let bytes = reader.take(21)?;
     let hash160 = Hash160::from_bytes(bytes[1..].try_into().expect("fixed slice"));
-    StacksAddress::new(bytes[0], hash160).map_err(|_| CodecError::InvalidPrincipal)?;
-    Ok(())
+    StacksAddress::new(bytes[0], hash160).map_err(|_| CodecError::InvalidPrincipal)
 }
 
-fn scan_name(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+fn read_consensus_hash(reader: &mut Reader<'_>) -> Result<ConsensusHash, CodecError> {
+    Ok(ConsensusHash::from_bytes(
+        reader.take(20)?.try_into().expect("fixed slice"),
+    ))
+}
+
+fn read_block_id(reader: &mut Reader<'_>) -> Result<StacksBlockId, CodecError> {
+    Ok(StacksBlockId::from_bytes(
+        reader.take(32)?.try_into().expect("fixed slice"),
+    ))
+}
+
+fn read_name(reader: &mut Reader<'_>) -> Result<String, CodecError> {
     let length = usize::from(reader.byte()?);
-    if length == 0 || length > 128 || !reader.take(length)?.iter().all(u8::is_ascii) {
+    let bytes = reader.take(length)?;
+    if length == 0 || length > 128 || !bytes.iter().all(u8::is_ascii) {
         return Err(CodecError::InvalidName);
     }
-    Ok(())
+    Ok(String::from_utf8(bytes.to_vec()).expect("ASCII is valid UTF-8"))
 }
 
-fn scan_stacks_string(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+fn read_stacks_string(reader: &mut Reader<'_>) -> Result<String, CodecError> {
     let length = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
-    if !reader
-        .take(length)?
+    let bytes = reader.take(length)?;
+    if !bytes
         .iter()
         .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
     {
         return Err(CodecError::InvalidString);
     }
-    Ok(())
+    Ok(String::from_utf8(bytes.to_vec()).expect("ASCII is valid UTF-8"))
+}
+
+fn read_clarity_value(reader: &mut Reader<'_>) -> Result<ClarityValue, CodecError> {
+    let start = reader.position();
+    scan_clarity_value(reader, 0)?;
+    Ok(ClarityValue(
+        reader.bytes[start..reader.position()].to_vec(),
+    ))
 }
 
 fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecError> {
@@ -713,11 +948,11 @@ fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecErr
         }
         3 | 4 | 9 => {}
         5 => {
-            reader.take(21)?;
+            read_address(reader)?;
         }
         6 => {
-            reader.take(21)?;
-            scan_name(reader)?;
+            read_address(reader)?;
+            read_name(reader)?;
         }
         7 | 8 | 10 => scan_clarity_value(reader, depth + 1)?,
         11 => {
@@ -735,7 +970,7 @@ fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecErr
                 return Err(CodecError::InvalidClarityValue);
             }
             for _ in 0..length {
-                scan_name(reader)?;
+                read_name(reader)?;
                 scan_clarity_value(reader, depth + 1)?;
             }
         }
