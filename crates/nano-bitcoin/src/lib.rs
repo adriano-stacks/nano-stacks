@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, hash::BuildHasher};
 
 use bitcoin::{
     Block,
@@ -122,9 +122,18 @@ pub fn decode_block(
     bytes: &[u8],
     magic: [u8; 2],
 ) -> Result<BitcoinBlock, BitcoinParseError> {
+    decode_block_with_pre_stx(height, bytes, magic, &mut HashMap::new())
+}
+
+/// Decode a Bitcoin block while retaining `PreStx` outputs needed by later blocks.
+pub fn decode_block_with_pre_stx<S: BuildHasher>(
+    height: u64,
+    bytes: &[u8],
+    magic: [u8; 2],
+    pre_stx_senders: &mut HashMap<[u8; 32], nano_address::StacksAddress, S>,
+) -> Result<BitcoinBlock, BitcoinParseError> {
     let block: Block = deserialize(bytes).map_err(|_| BitcoinParseError::InvalidBlock)?;
     let mut operations = Vec::new();
-    let mut pre_stx_senders = HashMap::new();
     for (index, transaction) in block.txdata.iter().enumerate() {
         let index = u32::try_from(index).map_err(|_| BitcoinParseError::TooManyTransactions)?;
         let Some((opcode, payload)) = transaction
