@@ -391,6 +391,7 @@ mod tests {
             .expect("read fixture block"),
         )
         .expect("decode fixture block");
+        assert_eq!(block.transactions.len(), 1);
         let mut chainstate =
             ChainState::from_checkpoint(checkpoint, source, root).expect("open checkpoint");
         chainstate
