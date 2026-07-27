@@ -15,6 +15,7 @@ use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use nano_codec::{
     ClarityVersion, Principal, TenureChangeCause, Transaction, TransactionPayloadData,
 };
+use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
 pub use nano_vm::BitcoinBlockContext;
@@ -119,6 +120,24 @@ impl ChainState {
         })
     }
 
+    /// Return the committed MARF leaves for a block state.
+    #[must_use]
+    pub fn state_leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
+        self.vm.state_leaves(block)
+    }
+
+    /// Return the MARF content hash before ancestry is incorporated.
+    #[must_use]
+    pub fn state_content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
+        self.vm.content_root(block)
+    }
+
+    /// Return the root pointers in their consensus serialization order.
+    #[must_use]
+    pub fn state_root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
+        self.vm.root_pointers(block)
+    }
+
     /// Execute a Clarity program for a block and seal its consensus state root.
     pub fn append_program(
         &mut self,
@@ -192,7 +211,8 @@ impl ChainState {
             .iter()
             .map(|transaction| self.execute_transaction(transaction))
             .collect::<Result<Vec<_>, _>>()?;
-        self.vm.process_scheduled_unlocks()?;
+        let unlocked = self.vm.process_scheduled_unlocks()?;
+        self.vm.increment_liquid_stx_supply(unlocked)?;
         let state_root = self.vm.seal_block_to(block_id)?;
         Ok(AppliedBlock {
             bitcoin_height: bitcoin_context.height,

@@ -697,8 +697,8 @@ fn decode_hash(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureManifest, FixtureMode, FixtureStatus, baseline_replay, scoreboard,
-        validate_fixture_tree,
+        ChainState, FixtureManifest, FixtureMode, FixtureStatus, baseline_replay,
+        captured_bitcoin_snapshots, checkpoint_state, scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -919,6 +919,63 @@ mod tests {
             .join("fixtures/chainstate/checkpoint-H/marf.sqlite");
         let imported = import_checkpoint(checkpoint, source, root).expect("imports checkpoint");
         assert_eq!(imported.root(source), Some(root));
+    }
+
+    #[test]
+    fn captured_first_block_state_matches_reference() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let path = fixture.join(
+            "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
+        );
+        let block =
+            NanoNakamotoBlock::decode(&fs::read(&path).expect("read block")).expect("decode block");
+        let expected_state = import_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            *block.block_id().as_bytes(),
+            block.header.state_index_root,
+        )
+        .expect("import expected state");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let mut chainstate = ChainState::from_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+        let bitcoin_context = *snapshots
+            .get(&block.header.consensus_hash.to_string())
+            .expect("Bitcoin context");
+        let applied = chainstate
+            .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, Some(source), &block)
+            .expect("execute block");
+        assert_eq!(
+            TrieHash::from_bytes(applied.execution.state_root.0),
+            block.header.state_index_root
+        );
+        assert_eq!(
+            chainstate
+                .state_content_root(*block.block_id().as_bytes())
+                .expect("actual content root"),
+            expected_state
+                .content_root(*block.block_id().as_bytes())
+                .expect("expected content root")
+        );
+        let expected_pointers = expected_state
+            .root_pointers(*block.block_id().as_bytes())
+            .expect("expected root pointers");
+        let actual_pointers = chainstate
+            .state_root_pointers(*block.block_id().as_bytes())
+            .expect("actual root pointers");
+        assert_eq!(actual_pointers, expected_pointers);
+        assert_eq!(
+            chainstate
+                .state_leaves(*block.block_id().as_bytes())
+                .expect("actual leaves"),
+            expected_state
+                .leaves(*block.block_id().as_bytes())
+                .expect("expected leaves")
+        );
     }
 
     #[test]

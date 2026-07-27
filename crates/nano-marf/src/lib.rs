@@ -294,6 +294,41 @@ impl MarfTrie {
         hash_children(TrieNodeId::Node256, &[], &self.root_children)
     }
 
+    /// Return every stored path and value in deterministic path order.
+    #[must_use]
+    pub fn leaves(&self) -> Vec<(TrieHash, MarfValue)> {
+        let mut leaves = Vec::new();
+        let mut path = Vec::with_capacity(32);
+        for child in &self.root_children {
+            path.push(child.character);
+            child.node.collect_leaves(&mut path, &mut leaves);
+            path.pop();
+        }
+        leaves.sort_unstable_by_key(|(path, _)| *path);
+        leaves
+    }
+
+    /// Return the root pointers in their consensus serialization order.
+    #[must_use]
+    pub fn root_pointers(&self) -> Vec<TriePointer> {
+        let mut pointers = vec![
+            TriePointer {
+                id: 0,
+                character: 0,
+                referenced_block: None,
+            };
+            TrieNodeId::Node256.pointer_count()
+        ];
+        for child in &self.root_children {
+            pointers[usize::from(child.character)] = TriePointer {
+                id: child.node.node_id() as u8 | u8::from(child.referenced_block.is_some()) << 7,
+                character: child.character,
+                referenced_block: child.referenced_block,
+            };
+        }
+        pointers
+    }
+
     fn prepare_root_for_copy(&mut self, block: [u8; 32]) {
         for child in &mut self.root_children {
             if child.referenced_block.is_none() {
@@ -304,6 +339,33 @@ impl MarfTrie {
 }
 
 impl TrieNode {
+    fn collect_leaves(&self, path: &mut Vec<u8>, leaves: &mut Vec<(TrieHash, MarfValue)>) {
+        match self {
+            Self::Leaf {
+                path: suffix,
+                value,
+            } => {
+                path.extend_from_slice(suffix);
+                let mut bytes = [0; 32];
+                bytes.copy_from_slice(path);
+                leaves.push((TrieHash::from_bytes(bytes), *value));
+                path.truncate(path.len() - suffix.len());
+            }
+            Self::Internal {
+                path: prefix,
+                children,
+            } => {
+                path.extend_from_slice(prefix);
+                for child in children {
+                    path.push(child.character);
+                    child.node.collect_leaves(path, leaves);
+                    path.pop();
+                }
+                path.truncate(path.len() - prefix.len());
+            }
+        }
+    }
+
     fn get(&self, path: &[u8]) -> Option<MarfValue> {
         match self {
             Self::Leaf {
@@ -613,6 +675,30 @@ impl VersionedMarf {
     #[must_use]
     pub fn root(&self, block: MarfBlockId) -> Option<TrieHash> {
         self.versions.get(&block).map(|version| version.root)
+    }
+
+    /// Return the content hash before ancestry is incorporated into the state root.
+    #[must_use]
+    pub fn content_root(&self, block: MarfBlockId) -> Option<TrieHash> {
+        self.versions
+            .get(&block)
+            .map(|version| version.trie.root_hash())
+    }
+
+    /// Return all leaves stored for a sealed state.
+    #[must_use]
+    pub fn leaves(&self, block: MarfBlockId) -> Option<Vec<(TrieHash, MarfValue)>> {
+        self.versions
+            .get(&block)
+            .map(|version| version.trie.leaves())
+    }
+
+    /// Return the root pointers for a sealed state.
+    #[must_use]
+    pub fn root_pointers(&self, block: MarfBlockId) -> Option<Vec<TriePointer>> {
+        self.versions
+            .get(&block)
+            .map(|version| version.trie.root_pointers())
     }
 
     /// Return a sealed state's parent block, if the state exists.

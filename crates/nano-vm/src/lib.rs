@@ -16,7 +16,7 @@ use clarity::vm::representations::SymbolicExpression;
 use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
-    CheckpointError, MarfError, MarfValue, StateRoot, VersionedMarf, import_checkpoint,
+    CheckpointError, MarfError, MarfValue, StateRoot, TriePointer, VersionedMarf, import_checkpoint,
 };
 use nano_primitives::TrieHash;
 use rusqlite::{OptionalExtension, params};
@@ -311,9 +311,15 @@ impl Vm {
     }
 
     /// Credit STX scheduled to unlock at the current Stacks block height.
-    pub fn process_scheduled_unlocks(&mut self) -> Result<(), VmExecutionError> {
+    pub fn process_scheduled_unlocks(&mut self) -> Result<u128, VmExecutionError> {
         let Self { store, context } = self;
         process_scheduled_unlocks_in_context(store, context)
+    }
+
+    /// Increase the liquid STX supply by a block-finalization amount.
+    pub fn increment_liquid_stx_supply(&mut self, amount: u128) -> Result<(), VmExecutionError> {
+        let Self { store, context } = self;
+        increment_liquid_stx_supply_in_context(store, context, amount)
     }
 
     /// Publish a Clarity contract in the active block state.
@@ -410,6 +416,24 @@ impl Vm {
     #[must_use]
     pub fn root(&self, block: [u8; 32]) -> Option<StateRoot> {
         self.store.root(block)
+    }
+
+    /// Return the MARF content hash before ancestry is incorporated.
+    #[must_use]
+    pub fn content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
+        self.store.content_root(block)
+    }
+
+    /// Return the committed MARF leaves for a block state.
+    #[must_use]
+    pub fn state_leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
+        self.store.leaves(block)
+    }
+
+    /// Return the root pointers in their consensus serialization order.
+    #[must_use]
+    pub fn root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
+        self.store.root_pointers(block)
     }
 
     /// Access a stored Clarity database value for a sealed block.
@@ -611,6 +635,24 @@ impl MarfStore {
         self.marf
             .root(block)
             .map(|root: TrieHash| StateRoot(*root.as_bytes()))
+    }
+
+    /// Return the MARF content hash before ancestry is incorporated.
+    #[must_use]
+    pub fn content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
+        self.marf.content_root(block)
+    }
+
+    /// Return the committed MARF leaves for a block state.
+    #[must_use]
+    pub fn leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
+        self.marf.leaves(block)
+    }
+
+    /// Return the root pointers in their consensus serialization order.
+    #[must_use]
+    pub fn root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
+        self.marf.root_pointers(block)
     }
 
     fn read_state(&self) -> Option<&StoreState> {
@@ -1261,7 +1303,7 @@ fn debit_fee_in_context(
 fn process_scheduled_unlocks_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
-) -> Result<(), VmExecutionError> {
+) -> Result<u128, VmExecutionError> {
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
         false,
@@ -1281,10 +1323,11 @@ fn process_scheduled_unlocks_in_context(
         )? {
             Value::Optional(optional) => match optional.data.map(|value| *value) {
                 Some(Value::Sequence(SequenceData::List(entries))) => entries.data,
-                _ => return Ok(()),
+                _ => return Ok(0),
             },
-            _ => return Ok(()),
+            _ => return Ok(0),
         };
+        let mut total = 0_u128;
         for entry in entries {
             let schedule = entry.expect_tuple()?;
             let amount = schedule.get("amount")?.to_owned().expect_u128()?;
@@ -1292,9 +1335,28 @@ fn process_scheduled_unlocks_in_context(
             let mut balance = global.database.get_stx_balance_snapshot(&recipient)?;
             balance.credit(amount)?;
             balance.save()?;
+            total = total
+                .checked_add(amount)
+                .ok_or(RuntimeError::ArithmeticOverflow)?;
         }
-        Ok(())
+        Ok(total)
     })
+}
+
+fn increment_liquid_stx_supply_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    amount: u128,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.increment_ustx_liquid_supply(amount))
 }
 
 /// Read an account nonce in an isolated database transaction.
