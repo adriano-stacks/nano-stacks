@@ -299,16 +299,16 @@ pub enum PostConditionMode {
 impl PostConditionMode {
     const fn parse(value: u8) -> Result<Self, CodecError> {
         match value {
-            1 => Ok(Self::Deny),
-            2 => Ok(Self::Allow),
+            1 => Ok(Self::Allow),
+            2 => Ok(Self::Deny),
             _ => Err(CodecError::InvalidTransaction),
         }
     }
 
     const fn byte(self) -> u8 {
         match self {
-            Self::Deny => 1,
-            Self::Allow => 2,
+            Self::Allow => 1,
+            Self::Deny => 2,
         }
     }
 }
