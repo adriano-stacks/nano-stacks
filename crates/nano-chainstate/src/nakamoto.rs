@@ -117,6 +117,31 @@ impl SignerSet {
         Ok(Self { signers })
     }
 
+    /// Derive signer voting weights from stacked amounts and the stacking threshold.
+    pub fn from_stacked_amounts(
+        signers: Vec<(StacksPublicKey, u128)>,
+        threshold: u128,
+    ) -> Result<Self, SignerSetError> {
+        if threshold == 0 {
+            return Err(SignerSetError::ZeroThreshold);
+        }
+        let signers = signers
+            .into_iter()
+            .map(|(public_key, stacked_amount)| {
+                let weight = u32::try_from(stacked_amount / threshold)
+                    .map_err(|_| SignerSetError::WeightOverflow)?;
+                Ok(Signer { public_key, weight })
+            })
+            .collect::<Result<Vec<_>, SignerSetError>>()?;
+        Self::new(signers)
+    }
+
+    /// Return the signer weights in consensus order.
+    #[must_use]
+    pub fn weights(&self) -> Vec<u32> {
+        self.signers.iter().map(|signer| signer.weight).collect()
+    }
+
     /// Return the minimum signing weight required to approve a block.
     pub fn approval_threshold(&self) -> Result<u32, SignerSetError> {
         let total_weight = self.signers.iter().try_fold(0_u32, |total, signer| {
@@ -163,6 +188,7 @@ impl SignerSet {
 pub enum SignerSetError {
     Empty,
     DuplicateSigner,
+    ZeroThreshold,
     WeightOverflow,
     Signature(CryptoError),
     UnknownOrUnorderedSigner,
@@ -174,6 +200,7 @@ impl std::fmt::Display for SignerSetError {
         match self {
             Self::Empty => formatter.write_str("signer set is empty"),
             Self::DuplicateSigner => formatter.write_str("signer set has duplicate public keys"),
+            Self::ZeroThreshold => formatter.write_str("signer threshold cannot be zero"),
             Self::WeightOverflow => formatter.write_str("signer weight overflows"),
             Self::Signature(error) => write!(formatter, "invalid signer signature: {error}"),
             Self::UnknownOrUnorderedSigner => {
@@ -192,6 +219,7 @@ impl std::error::Error for SignerSetError {
             Self::Signature(error) => Some(error),
             Self::Empty
             | Self::DuplicateSigner
+            | Self::ZeroThreshold
             | Self::WeightOverflow
             | Self::UnknownOrUnorderedSigner
             | Self::InsufficientWeight => None,

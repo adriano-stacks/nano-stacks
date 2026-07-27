@@ -590,7 +590,7 @@ mod tests {
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::decode_block as decode_bitcoin_block;
-    use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, Signer, SignerSet};
+    use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, SignerSet};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
         transaction_merkle_root,
@@ -1493,10 +1493,12 @@ mod tests {
         #[derive(Deserialize)]
         struct SignerWire {
             signing_key: String,
+            stacked_amt: u64,
             weight: u32,
         }
         #[derive(Deserialize)]
         struct RewardSetWire {
+            pox_ustx_threshold: u64,
             signers: Vec<SignerWire>,
         }
         #[derive(Deserialize)]
@@ -1509,19 +1511,36 @@ mod tests {
             &fs::read(fixture_root.join("stacker_set/cycle-18.json")).expect("read reward set"),
         )
         .expect("parse reward set");
+        let expected_weights = reward_set
+            .stacker_set
+            .signers
+            .iter()
+            .map(|signer| signer.weight)
+            .collect::<Vec<_>>();
         let signers = reward_set
             .stacker_set
             .signers
             .into_iter()
-            .map(|signer| Signer {
-                public_key: StacksPublicKey::from_bytes(
-                    &hex::decode(signer.signing_key).expect("decode signing key"),
+            .map(|signer| {
+                (
+                    StacksPublicKey::from_bytes(
+                        &hex::decode(signer.signing_key).expect("decode signing key"),
+                    )
+                    .expect("valid signer key"),
+                    u128::from(signer.stacked_amt),
                 )
-                .expect("valid signer key"),
-                weight: signer.weight,
             })
             .collect();
-        let signer_set = SignerSet::new(signers).expect("valid signer set");
+        let signer_set = SignerSet::from_stacked_amounts(
+            signers,
+            u128::from(reward_set.stacker_set.pox_ustx_threshold),
+        )
+        .expect("valid signer set");
+        assert_eq!(
+            signer_set.weights(),
+            expected_weights.as_slice(),
+            "fixture signer weights"
+        );
 
         for entry in fs::read_dir(fixture_root.join("nakamoto/blocks")).expect("read blocks") {
             let path = entry.expect("fixture entry").path();
