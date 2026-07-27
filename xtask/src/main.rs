@@ -238,6 +238,22 @@ impl CaptureConfig {
             &stacker_set,
         )?;
 
+        let reward_ids = blocks
+            .iter()
+            .map(|block| format!("'{}'", block.index_block_hash))
+            .collect::<Vec<_>>()
+            .join(",");
+        let miner_rewards = sqlite_json(
+            &node_root.join("chainstate/vm/index.sqlite"),
+            &format!(
+                "select rewards.child_index_block_hash as block_id, coalesce(rewards.recipient, rewards.address) as recipient, rewards.coinbase, rewards.tx_fees_anchored, rewards.tx_fees_streamed_confirmed, rewards.tx_fees_streamed_produced from matured_rewards rewards join nakamoto_block_headers headers on headers.index_block_hash = rewards.child_index_block_hash where rewards.child_index_block_hash in ({reward_ids}) order by headers.block_height, cast(rewards.coinbase as integer) desc"
+            ),
+        )?;
+        write_file(
+            &staging.join("miner_rewards.json"),
+            miner_rewards.as_bytes(),
+        )?;
+
         let checkpoint = Self::block_at_height(blocks_db, self.checkpoint_height)?;
         let checkpoint_root = self.checkpoint_root(&checkpoint)?;
         let checkpoint_dir = staging.join("chainstate/checkpoint-H");
@@ -376,6 +392,12 @@ impl CaptureConfig {
         }
         fs::rename(staging.join("provenance.toml"), provenance)
             .map_err(io_error("install fixture provenance"))?;
+        let miner_rewards = root.join("miner_rewards.json");
+        if miner_rewards.exists() {
+            fs::remove_file(&miner_rewards).map_err(io_error("replace captured miner rewards"))?;
+        }
+        fs::rename(staging.join("miner_rewards.json"), miner_rewards)
+            .map_err(io_error("install captured miner rewards"))?;
         fs::rename(staging.join("manifest.toml"), root.join("manifest.toml"))
             .map_err(io_error("install fixture manifest"))?;
         fs::remove_dir(staging).map_err(io_error("remove capture staging"))

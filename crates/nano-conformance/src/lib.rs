@@ -7,7 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
+use clarity::vm::types::PrincipalData;
+use nano_chainstate::{BitcoinBlockContext, ChainState, MaturedMinerReward, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
 use nano_primitives::TrieHash;
 use serde::Deserialize;
@@ -64,6 +65,16 @@ struct CapturedExecutionCost {
     runtime: u64,
     write_count: u64,
     write_length: u64,
+}
+
+#[derive(Deserialize)]
+struct CapturedMaturedMinerReward {
+    block_id: String,
+    recipient: String,
+    coinbase: String,
+    tx_fees_anchored: String,
+    tx_fees_streamed_confirmed: String,
+    tx_fees_streamed_produced: String,
 }
 
 impl FixtureManifest {
@@ -159,7 +170,11 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
         }
     }
 
-    for relative_path in ["sortition/snapshots.json", "provenance.toml"] {
+    for relative_path in [
+        "miner_rewards.json",
+        "sortition/snapshots.json",
+        "provenance.toml",
+    ] {
         let path = root.join(relative_path);
         if !is_nonempty_file(&path)? {
             return Err(FixtureValidationError::MissingOrEmptyFile(path));
@@ -475,6 +490,16 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             )),
         };
     };
+    let Some(matured_rewards) = captured_matured_miner_rewards(root) else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "captured miner rewards are unavailable".to_owned(),
+            )),
+        };
+    };
     let Ok(mut entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
         return ReplayDepth {
             completed: 0,
@@ -499,7 +524,14 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let block = match apply_captured_block(root, &mut chainstate, &snapshots, parent, &path) {
+        let block = match apply_captured_block(
+            root,
+            &mut chainstate,
+            &snapshots,
+            &matured_rewards,
+            parent,
+            &path,
+        ) {
             Ok(block) => block,
             Err(divergence) => {
                 return ReplayDepth {
@@ -525,6 +557,7 @@ fn apply_captured_block(
     root: &Path,
     chainstate: &mut ChainState,
     snapshots: &BTreeMap<String, BitcoinBlockContext>,
+    matured_rewards: &BTreeMap<String, Vec<MaturedMinerReward>>,
     parent: Option<[u8; 32]>,
     path: &Path,
 ) -> Result<NakamotoBlock, ReplayDivergence> {
@@ -553,8 +586,12 @@ fn apply_captured_block(
     bitcoin_context.v2_unlock_height = event.v2;
     bitcoin_context.v3_unlock_height = event.v3;
     bitcoin_context.v4_unlock_height = event.v4;
+    let block_rewards = matured_rewards
+        .get(&block.block_id().to_string())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let applied = chainstate
-        .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
+        .execute_nakamoto_block_with_matured_rewards(bitcoin_context, block_rewards, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
     compare_receipts(&event, &applied.receipts)?;
     let actual = TrieHash::from_bytes(applied.execution.state_root.0);
@@ -663,6 +700,44 @@ fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlo
             ))
         })
         .collect()
+}
+
+fn captured_matured_miner_rewards(
+    root: &Path,
+) -> Option<BTreeMap<String, Vec<MaturedMinerReward>>> {
+    let rewards: Vec<CapturedMaturedMinerReward> =
+        serde_json::from_slice(&fs::read(root.join("miner_rewards.json")).ok()?).ok()?;
+    rewards
+        .into_iter()
+        .map(|reward| {
+            let minted = reward.coinbase.parse::<u128>().ok()?;
+            let amount = [
+                minted,
+                reward.tx_fees_anchored.parse().ok()?,
+                reward.tx_fees_streamed_confirmed.parse().ok()?,
+                reward.tx_fees_streamed_produced.parse().ok()?,
+            ]
+            .into_iter()
+            .try_fold(0_u128, u128::checked_add)?;
+            Some((
+                reward.block_id,
+                MaturedMinerReward {
+                    recipient: PrincipalData::parse(&reward.recipient).ok()?,
+                    amount,
+                    minted,
+                },
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|rewards| {
+            rewards.into_iter().fold(
+                BTreeMap::<String, Vec<MaturedMinerReward>>::new(),
+                |mut grouped, (block_id, reward)| {
+                    grouped.entry(block_id).or_default().push(reward);
+                    grouped
+                },
+            )
+        })
 }
 
 fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
@@ -1339,6 +1414,7 @@ mod tests {
         )?;
         write_file(&root.join("nakamoto/blocks/00000001.bin"), "block")?;
         write_file(&root.join("events/new_block/00000001.json"), "{}")?;
+        write_file(&root.join("miner_rewards.json"), "[]")?;
         write_file(&root.join("stacker_set/cycle-0.json"), "{}")?;
         let snapshot = format!(
             "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"consensus_hash\":\"0000000000000000000000000000000000000000\"}}]"

@@ -37,6 +37,14 @@ pub struct TransactionReceipt {
     pub result: TransactionResult,
 }
 
+/// A matured miner payout supplied by the chainstate's Bitcoin-side index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaturedMinerReward {
+    pub recipient: PrincipalData,
+    pub amount: u128,
+    pub minted: u128,
+}
+
 /// A chainstate execution context backed by versioned VM state.
 #[derive(Debug)]
 pub struct ChainState {
@@ -196,6 +204,17 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.execute_nakamoto_block_with_matured_rewards(bitcoin_context, &[], parent, block)
+    }
+
+    /// Execute a Nakamoto block with the miner payouts that matured at its tenure start.
+    pub fn execute_nakamoto_block_with_matured_rewards(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        matured_rewards: &[MaturedMinerReward],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let block_id = *block.block_id().as_bytes();
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
@@ -211,6 +230,13 @@ impl ChainState {
             .iter()
             .map(|transaction| self.execute_transaction(transaction))
             .collect::<Result<Vec<_>, _>>()?;
+        let minted = matured_rewards.iter().try_fold(0_u128, |total, reward| {
+            self.vm.credit_stx(&reward.recipient, reward.amount)?;
+            total.checked_add(reward.minted).ok_or_else(|| {
+                ChainStateError::InvalidTransaction("matured reward overflow".to_owned())
+            })
+        })?;
+        self.vm.increment_liquid_stx_supply(minted)?;
         let unlocked = self.vm.process_scheduled_unlocks()?;
         self.vm.increment_liquid_stx_supply(unlocked)?;
         let state_root = self.vm.seal_block_to(block_id)?;
