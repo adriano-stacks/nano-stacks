@@ -1818,6 +1818,8 @@ mod tests {
 
     #[test]
     fn captured_blocks_have_the_expected_signer_weight() {
+        const HACKNET_REWARD_SLOTS: u32 = 30;
+
         #[derive(Deserialize)]
         struct SignerWire {
             signing_key: String,
@@ -1859,11 +1861,13 @@ mod tests {
                 )
             })
             .collect();
-        let signer_set = SignerSet::from_stacked_amounts(
-            signers,
+        let (signer_set, threshold) =
+            SignerSet::from_reward_slots(signers, HACKNET_REWARD_SLOTS).expect("valid signer set");
+        assert_eq!(
+            threshold,
             u128::from(reward_set.stacker_set.pox_ustx_threshold),
-        )
-        .expect("valid signer set");
+            "fixture stacking threshold"
+        );
         assert_eq!(
             signer_set.weights(),
             expected_weights.as_slice(),
