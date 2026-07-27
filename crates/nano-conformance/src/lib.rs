@@ -353,7 +353,10 @@ mod tests {
         PoxAddressType32 as ReferencePoxAddressType32,
     };
     use blockstack_lib::chainstate::stacks::index::{
-        MARFValue as ReferenceMarfValue, TrieLeaf as ReferenceTrieLeaf, bits::get_leaf_hash,
+        BlockMap as ReferenceBlockMap, Error as ReferenceMarfError,
+        MARFValue as ReferenceMarfValue, TrieLeaf as ReferenceTrieLeaf,
+        bits::{get_leaf_hash, get_node_hash},
+        node::{TrieNode4 as ReferenceTrieNode4, TriePtr as ReferenceTriePointer},
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
@@ -363,7 +366,7 @@ mod tests {
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
-    use nano_marf::{MarfValue, key_path, leaf_hash};
+    use nano_marf::{MarfValue, TrieNodeId, TriePointer, internal_node_hash, key_path, leaf_hash};
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
     use stacks_common::util::{
@@ -392,6 +395,38 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    struct EmptyReferenceBlockMap;
+
+    impl ReferenceBlockMap for EmptyReferenceBlockMap {
+        type TrieId = stacks_common::types::chainstate::StacksBlockId;
+
+        fn get_block_hash(&self, _id: u32) -> Result<Self::TrieId, ReferenceMarfError> {
+            Err(ReferenceMarfError::NotFoundError)
+        }
+
+        fn get_block_hash_caching(
+            &mut self,
+            _id: u32,
+        ) -> Result<&Self::TrieId, ReferenceMarfError> {
+            Err(ReferenceMarfError::NotFoundError)
+        }
+
+        fn is_block_hash_cached(&self, _id: u32) -> bool {
+            false
+        }
+
+        fn get_block_id(&self, _hash: &Self::TrieId) -> Result<u32, ReferenceMarfError> {
+            Err(ReferenceMarfError::NotFoundError)
+        }
+
+        fn get_block_id_caching(
+            &mut self,
+            _hash: &Self::TrieId,
+        ) -> Result<u32, ReferenceMarfError> {
+            Err(ReferenceMarfError::NotFoundError)
+        }
+    }
 
     #[test]
     fn baseline_is_block_one() {
@@ -523,6 +558,37 @@ mod tests {
                 &path,
                 ReferenceMarfValue::from_value(&text),
             ));
+            prop_assert_eq!(ours.as_bytes(), &reference.0);
+        }
+
+        #[test]
+        fn marf_node4_hashes_match_stacks_core(
+            path in proptest::collection::vec(any::<u8>(), 0..=32),
+            characters in any::<[u8; 4]>(),
+            child_bytes in any::<[[u8; 32]; 4]>(),
+        ) {
+            let mut reference_node = ReferenceTrieNode4::new(&path);
+            let mut pointers = [TriePointer {
+                id: 0,
+                character: 0,
+                referenced_block: None,
+            }; 4];
+            let mut reference_children = Vec::with_capacity(4);
+            let mut children = Vec::with_capacity(4);
+            for index in 0..4 {
+                reference_node.ptrs[index] = ReferenceTriePointer::new(1, characters[index], 0);
+                pointers[index] = TriePointer {
+                    id: 1,
+                    character: characters[index],
+                    referenced_block: None,
+                };
+                reference_children.push(ReferenceTrieHash(child_bytes[index]));
+                children.push(TrieHash::from_bytes(child_bytes[index]));
+            }
+            let mut map = EmptyReferenceBlockMap;
+            let reference = get_node_hash(&reference_node, &reference_children, &mut map);
+            let ours = internal_node_hash(TrieNodeId::Node4, &pointers, &path, &children)
+                .expect("fixed pointer count");
             prop_assert_eq!(ours.as_bytes(), &reference.0);
         }
 
