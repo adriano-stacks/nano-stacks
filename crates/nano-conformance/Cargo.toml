@@ -10,6 +10,7 @@ publish = false
 nano-address = { path = "../nano-address" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
+nano-marf = { path = "../nano-marf" }
 nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
 

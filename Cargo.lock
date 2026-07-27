@@ -1272,6 +1272,7 @@ dependencies = [
  "nano-address",
  "nano-codec",
  "nano-crypto",
+ "nano-marf",
  "nano-node",
  "nano-primitives",
  "proptest",
@@ -1293,6 +1294,9 @@ dependencies = [
 [[package]]
 name = "nano-marf"
 version = "0.1.0"
+dependencies = [
+ "nano-primitives",
+]
 
 [[package]]
 name = "nano-node"
