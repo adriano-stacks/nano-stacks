@@ -29,7 +29,11 @@ impl BitcoinSource for BaselineSource {
     type Error = core::convert::Infallible;
 
     fn block_at(&self, height: u64) -> Result<BitcoinBlock, Self::Error> {
-        Ok(BitcoinBlock { height })
+        Ok(BitcoinBlock {
+            height,
+            hash: [0; 32],
+            operations: Vec::new(),
+        })
     }
 }
 

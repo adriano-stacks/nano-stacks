@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+bitcoin = "0.32.8"
+
+[dev-dependencies]
+hex = "0.4.3"
+
 [lints]
 workspace = true
