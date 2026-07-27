@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bitcoin = "0.32.8"
 nano-address = { path = "../nano-address" }
+nano-crypto = { path = "../nano-crypto" }
 
 [dev-dependencies]
 hex = "0.4.3"

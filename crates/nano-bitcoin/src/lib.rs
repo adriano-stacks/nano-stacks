@@ -277,6 +277,7 @@ fn parse_leader_block_commit(data: &[u8]) -> Option<BitcoinOperationKind> {
 fn parse_leader_key_registration(data: &[u8]) -> Option<BitcoinOperationKind> {
     let consensus_hash = array(data.get(..20)?)?;
     let vrf_public_key = array(data.get(20..52)?)?;
+    nano_crypto::VrfPublicKey::from_bytes(vrf_public_key).ok()?;
     let memo = data.get(52..)?.to_vec();
     let block_signing_key_hash = memo.get(..20).and_then(array);
     Some(BitcoinOperationKind::LeaderKeyRegistration {
@@ -376,7 +377,9 @@ fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{PreStxCache, decode_block, decode_block_with_pre_stx};
+    use super::{
+        PreStxCache, decode_block, decode_block_with_pre_stx, parse_leader_key_registration,
+    };
 
     #[test]
     fn captured_bitcoin_blocks_decode_with_hacknet_magic() {
@@ -424,5 +427,10 @@ mod tests {
         assert_eq!(cache.senders.len(), 1);
         cache.retain_window(107);
         assert!(cache.senders.is_empty());
+    }
+
+    #[test]
+    fn leader_key_registration_requires_a_valid_vrf_key() {
+        assert!(parse_leader_key_registration(&[0; 52]).is_none());
     }
 }
