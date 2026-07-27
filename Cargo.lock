@@ -1296,6 +1296,7 @@ name = "nano-marf"
 version = "0.1.0"
 dependencies = [
  "nano-primitives",
+ "rusqlite",
 ]
 
 [[package]]
