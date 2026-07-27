@@ -403,6 +403,10 @@ mod tests {
 
     struct EmptyReferenceBlockMap;
 
+    struct SingleReferenceBlockMap {
+        block: stacks_common::types::chainstate::StacksBlockId,
+    }
+
     impl ReferenceBlockMap for EmptyReferenceBlockMap {
         type TrieId = stacks_common::types::chainstate::StacksBlockId;
 
@@ -430,6 +434,36 @@ mod tests {
             _hash: &Self::TrieId,
         ) -> Result<u32, ReferenceMarfError> {
             Err(ReferenceMarfError::NotFoundError)
+        }
+    }
+
+    impl ReferenceBlockMap for SingleReferenceBlockMap {
+        type TrieId = stacks_common::types::chainstate::StacksBlockId;
+
+        fn get_block_hash(&self, id: u32) -> Result<Self::TrieId, ReferenceMarfError> {
+            (id == 1)
+                .then(|| self.block.clone())
+                .ok_or(ReferenceMarfError::NotFoundError)
+        }
+
+        fn get_block_hash_caching(&mut self, id: u32) -> Result<&Self::TrieId, ReferenceMarfError> {
+            (id == 1)
+                .then_some(&self.block)
+                .ok_or(ReferenceMarfError::NotFoundError)
+        }
+
+        fn is_block_hash_cached(&self, id: u32) -> bool {
+            id == 1
+        }
+
+        fn get_block_id(&self, hash: &Self::TrieId) -> Result<u32, ReferenceMarfError> {
+            (hash == &self.block)
+                .then_some(1)
+                .ok_or(ReferenceMarfError::NotFoundError)
+        }
+
+        fn get_block_id_caching(&mut self, hash: &Self::TrieId) -> Result<u32, ReferenceMarfError> {
+            self.get_block_id(hash)
         }
     }
 
@@ -593,6 +627,39 @@ mod tests {
             let mut map = EmptyReferenceBlockMap;
             let reference = get_node_hash(&reference_node, &reference_children, &mut map);
             let ours = internal_node_hash(TrieNodeId::Node4, &pointers, &path, &children)
+                .expect("fixed pointer count");
+            prop_assert_eq!(ours.as_bytes(), &reference.0);
+        }
+
+        #[test]
+        fn marf_back_pointer_nodes_match_stacks_core(
+            character in any::<u8>(),
+            block in any::<[u8; 32]>(),
+        ) {
+            let mut reference_node = ReferenceTrieNode256::new(&[]);
+            let mut reference_pointer = ReferenceTriePointer::new(0x81, character, 0);
+            reference_pointer.back_block = 1;
+            reference_node.ptrs[usize::from(character)] = reference_pointer;
+            let mut reference_children = vec![ReferenceTrieHash::from_data(&[]); 256];
+            reference_children[usize::from(character)] = ReferenceTrieHash(block);
+            let mut map = SingleReferenceBlockMap {
+                block: stacks_common::types::chainstate::StacksBlockId(block),
+            };
+            let reference = get_node_hash(&reference_node, &reference_children, &mut map);
+
+            let mut pointers = vec![TriePointer {
+                id: 0,
+                character: 0,
+                referenced_block: None,
+            }; 256];
+            pointers[usize::from(character)] = TriePointer {
+                id: 0x81,
+                character,
+                referenced_block: Some(block),
+            };
+            let mut children = vec![TrieHash::EMPTY; 256];
+            children[usize::from(character)] = TrieHash::from_bytes(block);
+            let ours = internal_node_hash(TrieNodeId::Node256, &pointers, &[], &children)
                 .expect("fixed pointer count");
             prop_assert_eq!(ours.as_bytes(), &reference.0);
         }
