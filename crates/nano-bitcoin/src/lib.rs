@@ -8,6 +8,7 @@ use bitcoin::{
     hashes::Hash,
     script::{Instruction, Script},
 };
+use nano_address::PoxAddress;
 
 /// A Bitcoin block accepted by the HTTP/RPC ingest boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,7 +29,21 @@ pub trait BitcoinSource {
 pub struct BitcoinOperation {
     pub txid: [u8; 32],
     pub transaction_index: u32,
+    pub inputs: Vec<BitcoinInput>,
+    pub outputs: Vec<BitcoinOutput>,
     pub kind: BitcoinOperationKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitcoinInput {
+    pub txid: [u8; 32],
+    pub output_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitcoinOutput {
+    pub amount_sats: u64,
+    pub recipient: PoxAddress,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,9 +126,34 @@ pub fn decode_block(
         let Some(kind) = parse_operation(opcode, payload) else {
             continue;
         };
+        let Some(outputs) = transaction
+            .output
+            .iter()
+            .skip(1)
+            .map(|output| {
+                PoxAddress::from_script_pubkey(output.script_pubkey.as_bytes(), false)
+                    .ok()
+                    .map(|recipient| BitcoinOutput {
+                        amount_sats: output.value.to_sat(),
+                        recipient,
+                    })
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         operations.push(BitcoinOperation {
             txid: transaction.compute_txid().to_byte_array(),
             transaction_index: index,
+            inputs: transaction
+                .input
+                .iter()
+                .map(|input| BitcoinInput {
+                    txid: input.previous_output.txid.to_byte_array(),
+                    output_index: input.previous_output.vout,
+                })
+                .collect(),
+            outputs,
             kind,
         });
     }
@@ -265,6 +305,7 @@ mod tests {
             let block = decode_block(0, &bytes, *b"T3")
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert_ne!(block.hash, [0; 32]);
+            assert_eq!(block.operations.len(), 3, "{}", path.display());
         }
     }
 }

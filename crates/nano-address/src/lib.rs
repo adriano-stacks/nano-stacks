@@ -174,6 +174,42 @@ pub enum PoxAddress {
 }
 
 impl PoxAddress {
+    pub fn from_script_pubkey(script: &[u8], mainnet: bool) -> Result<Self, AddressError> {
+        let standard = |version, bytes| {
+            StacksAddress::new(version, Hash160::from_bytes(bytes)).map(|address| Self::Standard {
+                address,
+                hash_mode: None,
+            })
+        };
+
+        match script {
+            [0x76, 0xa9, 0x14, bytes @ .., 0x88, 0xac] if bytes.len() == 20 => standard(
+                if mainnet { 22 } else { 26 },
+                bytes.try_into().expect("guarded script length"),
+            ),
+            [0xa9, 0x14, bytes @ .., 0x87] if bytes.len() == 20 => standard(
+                if mainnet { 20 } else { 21 },
+                bytes.try_into().expect("guarded script length"),
+            ),
+            [0x00, 0x14, bytes @ ..] if bytes.len() == 20 => Ok(Self::Addr20 {
+                mainnet,
+                address_type: PoxAddressType20::P2wpkh,
+                bytes: bytes.try_into().expect("guarded script length"),
+            }),
+            [0x00, 0x20, bytes @ ..] if bytes.len() == 32 => Ok(Self::Addr32 {
+                mainnet,
+                address_type: PoxAddressType32::P2wsh,
+                bytes: bytes.try_into().expect("guarded script length"),
+            }),
+            [0x51, 0x20, bytes @ ..] if bytes.len() == 32 => Ok(Self::Addr32 {
+                mainnet,
+                address_type: PoxAddressType32::P2tr,
+                bytes: bytes.try_into().expect("guarded script length"),
+            }),
+            _ => Err(AddressError::InvalidBitcoinAddress),
+        }
+    }
+
     #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
         match self {
