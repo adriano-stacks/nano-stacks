@@ -258,4 +258,28 @@ mod tests {
 
         assert_eq!(block.block_id(), tenure.tip_block_id);
     }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_tenure_downloads_and_links() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let tenure = client.tenure_info().await.expect("fetch tenure info");
+        let blocks = client
+            .tenure(tenure.tenure_start_block_id, Some(tenure.tip_block_id))
+            .await
+            .expect("fetch tenure");
+
+        assert!(!blocks.is_empty());
+        assert_eq!(
+            blocks.last().expect("non-empty tenure").block_id(),
+            tenure.tip_block_id
+        );
+        for pair in blocks.windows(2) {
+            pair[1]
+                .validate_successor(&pair[0].header)
+                .expect("tenure blocks link");
+        }
+    }
 }
