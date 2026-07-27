@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use bitcoin::{
     Block,
@@ -68,6 +68,7 @@ pub enum BitcoinOperationKind {
         sender: nano_address::StacksAddress,
     },
     StackStx {
+        sender: nano_address::StacksAddress,
         reward_address: PoxAddress,
         amount: u128,
         cycles: u8,
@@ -76,11 +77,13 @@ pub enum BitcoinOperationKind {
         authorization_id: Option<u32>,
     },
     TransferStx {
+        sender: nano_address::StacksAddress,
         recipient: nano_address::StacksAddress,
         amount: u128,
         memo: Vec<u8>,
     },
     DelegateStx {
+        sender: nano_address::StacksAddress,
         delegate: nano_address::StacksAddress,
         amount: u128,
         reward_address: Option<PoxAddress>,
@@ -88,6 +91,7 @@ pub enum BitcoinOperationKind {
         until_bitcoin_height: Option<u64>,
     },
     VoteForAggregateKey {
+        sender: nano_address::StacksAddress,
         signer_index: u16,
         aggregate_key: [u8; 33],
         round: u32,
@@ -120,6 +124,7 @@ pub fn decode_block(
 ) -> Result<BitcoinBlock, BitcoinParseError> {
     let block: Block = deserialize(bytes).map_err(|_| BitcoinParseError::InvalidBlock)?;
     let mut operations = Vec::new();
+    let mut pre_stx_senders = HashMap::new();
     for (index, transaction) in block.txdata.iter().enumerate() {
         let index = u32::try_from(index).map_err(|_| BitcoinParseError::TooManyTransactions)?;
         let Some((opcode, payload)) = transaction
@@ -145,20 +150,30 @@ pub fn decode_block(
         else {
             continue;
         };
-        let Some(kind) = parse_operation(opcode, payload, &outputs) else {
+        let inputs: Vec<_> = transaction
+            .input
+            .iter()
+            .map(|input| BitcoinInput {
+                txid: input.previous_output.txid.to_byte_array(),
+                output_index: input.previous_output.vout,
+            })
+            .collect();
+        let sender = inputs
+            .first()
+            .filter(|input| input.output_index == 1)
+            .and_then(|input| pre_stx_senders.get(&input.txid))
+            .copied();
+        let Some(kind) = parse_operation(opcode, payload, &outputs, sender) else {
             continue;
         };
+        let txid = transaction.compute_txid().to_byte_array();
+        if let BitcoinOperationKind::PreStx { sender } = &kind {
+            pre_stx_senders.insert(txid, *sender);
+        }
         operations.push(BitcoinOperation {
-            txid: transaction.compute_txid().to_byte_array(),
+            txid,
             transaction_index: index,
-            inputs: transaction
-                .input
-                .iter()
-                .map(|input| BitcoinInput {
-                    txid: input.previous_output.txid.to_byte_array(),
-                    output_index: input.previous_output.vout,
-                })
-                .collect(),
+            inputs,
             outputs,
             kind,
         });
@@ -192,6 +207,7 @@ fn parse_operation(
     opcode: u8,
     data: &[u8],
     outputs: &[BitcoinOutput],
+    sender: Option<nano_address::StacksAddress>,
 ) -> Option<BitcoinOperationKind> {
     match opcode {
         b'[' => parse_leader_block_commit(data),
@@ -199,10 +215,10 @@ fn parse_operation(
         b'p' => Some(BitcoinOperationKind::PreStx {
             sender: outputs.first()?.recipient.as_stacks_address()?,
         }),
-        b'x' => parse_stack_stx(data, outputs),
-        b'$' => parse_transfer_stx(data, outputs),
-        b'#' => parse_delegate_stx(data, outputs),
-        b'v' => parse_vote_for_aggregate_key(data),
+        b'x' => parse_stack_stx(data, outputs, sender?),
+        b'$' => parse_transfer_stx(data, outputs, sender?),
+        b'#' => parse_delegate_stx(data, outputs, sender?),
+        b'v' => parse_vote_for_aggregate_key(data, sender?),
         _ => None,
     }
 }
@@ -240,13 +256,18 @@ fn parse_leader_key_registration(data: &[u8]) -> Option<BitcoinOperationKind> {
     })
 }
 
-fn parse_stack_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
+fn parse_stack_stx(
+    data: &[u8],
+    outputs: &[BitcoinOutput],
+    sender: nano_address::StacksAddress,
+) -> Option<BitcoinOperationKind> {
     let amount = u128::from_be_bytes(array(data.get(..16)?)?);
     let cycles = *data.get(16)?;
     let signer_key = data.get(17..50).and_then(array);
     let max_amount = data.get(50..66).and_then(array).map(u128::from_be_bytes);
     let authorization_id = data.get(66..70).and_then(array).map(u32::from_be_bytes);
     Some(BitcoinOperationKind::StackStx {
+        sender,
         reward_address: outputs.first()?.recipient.clone(),
         amount,
         cycles,
@@ -256,18 +277,27 @@ fn parse_stack_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOper
     })
 }
 
-fn parse_transfer_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
+fn parse_transfer_stx(
+    data: &[u8],
+    outputs: &[BitcoinOutput],
+    sender: nano_address::StacksAddress,
+) -> Option<BitcoinOperationKind> {
     if !(16..=77).contains(&data.len()) {
         return None;
     }
     Some(BitcoinOperationKind::TransferStx {
+        sender,
         recipient: outputs.first()?.recipient.as_stacks_address()?,
         amount: u128::from_be_bytes(array(data.get(..16)?)?),
         memo: data.get(16..)?.to_vec(),
     })
 }
 
-fn parse_delegate_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinOperationKind> {
+fn parse_delegate_stx(
+    data: &[u8],
+    outputs: &[BitcoinOutput],
+    sender: nano_address::StacksAddress,
+) -> Option<BitcoinOperationKind> {
     let amount = u128::from_be_bytes(array(data.get(..16)?)?);
     let reward_address_output = match *data.get(16)? {
         0 => None,
@@ -280,6 +310,7 @@ fn parse_delegate_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinO
         _ => return None,
     };
     Some(BitcoinOperationKind::DelegateStx {
+        sender,
         delegate: outputs.first()?.recipient.as_stacks_address()?,
         amount,
         reward_address: reward_address_output
@@ -290,11 +321,15 @@ fn parse_delegate_stx(data: &[u8], outputs: &[BitcoinOutput]) -> Option<BitcoinO
     })
 }
 
-fn parse_vote_for_aggregate_key(data: &[u8]) -> Option<BitcoinOperationKind> {
+fn parse_vote_for_aggregate_key(
+    data: &[u8],
+    sender: nano_address::StacksAddress,
+) -> Option<BitcoinOperationKind> {
     if data.len() != 47 {
         return None;
     }
     Some(BitcoinOperationKind::VoteForAggregateKey {
+        sender,
         signer_index: u16::from_be_bytes(array(data.get(..2)?)?),
         aggregate_key: array(data.get(2..35)?)?,
         round: u32::from_be_bytes(array(data.get(35..39)?)?),
