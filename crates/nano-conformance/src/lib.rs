@@ -362,7 +362,10 @@ mod tests {
     };
     use blockstack_lib::chainstate::{
         nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
-        stacks::StacksTransaction as ReferenceStacksTransaction,
+        stacks::{
+            StacksTransaction as ReferenceStacksTransaction,
+            TransactionAuth as ReferenceTransactionAuth,
+        },
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
@@ -925,6 +928,8 @@ mod tests {
             chain_id in any::<u32>(),
             block_index in any::<usize>(),
             transaction_index in any::<usize>(),
+            auth_shape in 0_usize..3,
+            key_material in any::<[u8; 32]>(),
         ) {
             let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
             let paths = fs::read_dir(blocks)
@@ -938,6 +943,7 @@ mod tests {
             let transaction_index = transaction_index % block.txs.len();
             let mut transaction = block.txs.remove(transaction_index);
             transaction.chain_id = chain_id;
+            transaction.auth = generated_reference_auth(auth_shape, key_material);
 
             let mut encoded = Vec::new();
             transaction
@@ -953,34 +959,41 @@ mod tests {
     }
 
     #[test]
-    fn fixture_transaction_header_mutations_match_stacks_core_acceptance() {
+    fn fixture_transaction_mutations_match_stacks_core_acceptance() {
         let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
         for entry in fs::read_dir(blocks).expect("read fixture blocks") {
             let path = entry.expect("fixture entry").path();
             let bytes = fs::read(&path).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            for transaction in block.txs {
+            for (transaction_index, transaction) in block.txs.into_iter().enumerate() {
                 let mut encoded = Vec::new();
                 transaction
                     .consensus_serialize(&mut encoded)
                     .expect("serialize reference transaction");
-                for index in 0..encoded.len().min(120) {
+                for index in 0..encoded.len() {
                     let mut mutated = encoded.clone();
                     mutated[index] ^= 0xff;
-                    let mut cursor = Cursor::new(&mutated);
-                    let reference = ReferenceStacksTransaction::consensus_deserialize(&mut cursor)
-                        .is_ok_and(|_| {
-                            usize::try_from(cursor.position()).expect("cursor fits usize")
-                                == mutated.len()
-                        });
+                    let reference = reference_transaction_decodes(&mutated);
                     let ours = NanoTransaction::decode(&mutated)
                         .is_ok_and(|(_, consumed)| consumed == mutated.len());
                     assert_eq!(
                         ours,
                         reference,
-                        "{} transaction byte {index}",
-                        path.display()
+                        "{} transaction {transaction_index} byte {index}",
+                        path.display(),
+                    );
+                }
+                for length in 0..encoded.len() {
+                    let truncated = &encoded[..length];
+                    let reference = reference_transaction_decodes(truncated);
+                    let ours = NanoTransaction::decode(truncated)
+                        .is_ok_and(|(_, consumed)| consumed == truncated.len());
+                    assert_eq!(
+                        ours,
+                        reference,
+                        "{} transaction {transaction_index} truncated to {length} bytes",
+                        path.display(),
                     );
                 }
             }
@@ -1045,6 +1058,37 @@ mod tests {
         assert_eq!(ours_proof.to_bytes(), reference_proof.to_bytes());
         let decoded = VrfProof::from_bytes(&reference_proof.to_bytes()).expect("decodes");
         assert!(Vrf::verify(&ours_private.public_key(), &decoded, message).expect("verifies"));
+    }
+
+    fn reference_transaction_decodes(bytes: &[u8]) -> bool {
+        let mut cursor = Cursor::new(bytes);
+        ReferenceStacksTransaction::consensus_deserialize(&mut cursor).is_ok_and(|_| {
+            usize::try_from(cursor.position()).expect("cursor fits usize") == bytes.len()
+        })
+    }
+
+    fn generated_reference_auth(shape: usize, key_material: [u8; 32]) -> ReferenceTransactionAuth {
+        let keys = [0_u8, 1].map(|suffix| {
+            let mut seed = key_material.to_vec();
+            seed.push(suffix);
+            ReferenceSecp256k1PrivateKey::from_seed(&seed)
+        });
+        let standard = match shape % 2 {
+            0 => ReferenceTransactionAuth::from_p2pkh(&keys[0]),
+            1 => ReferenceTransactionAuth::from_p2wpkh(&keys[0]),
+            _ => unreachable!(),
+        }
+        .expect("generated reference authorization is valid");
+        if shape == 2 {
+            standard
+                .into_sponsored(
+                    ReferenceTransactionAuth::from_p2pkh(&keys[1])
+                        .expect("generated sponsor authorization is valid"),
+                )
+                .expect("generated sponsored authorization is valid")
+        } else {
+            standard
+        }
     }
 
     fn temporary_fixture_root() -> Result<PathBuf, std::io::Error> {

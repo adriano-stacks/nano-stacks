@@ -3,7 +3,7 @@
 use std::fmt;
 
 use nano_address::StacksAddress;
-use nano_crypto::MessageSignature;
+use nano_crypto::{MessageSignature, VrfProof};
 use nano_primitives::{ConsensusHash, Hash160, Sha256Sum, StacksBlockId, sha512_256};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -853,10 +853,12 @@ fn read_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadData, Codec
                 10 => Some(read_principal(reader)?),
                 _ => return Err(CodecError::InvalidPayload),
             };
+            let vrf_proof: [u8; 80] = reader.take(80)?.try_into().expect("fixed slice");
+            VrfProof::from_bytes(&vrf_proof).map_err(|_| CodecError::InvalidPayload)?;
             Ok(TransactionPayloadData::NakamotoCoinbase {
                 payload,
                 recipient,
-                vrf_proof: reader.take(80)?.try_into().expect("fixed slice"),
+                vrf_proof,
             })
         }
     }
