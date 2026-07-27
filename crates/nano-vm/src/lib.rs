@@ -175,10 +175,17 @@ impl MarfStore {
     }
 
     fn read_state(&self) -> Option<&StoreState> {
-        if let Some(active) = &self.active {
-            return Some(&active.state);
+        if let Some(block) = self.read_block {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.block == block)
+            {
+                return self.active.as_ref().map(|active| &active.state);
+            }
+            return self.states.get(&block);
         }
-        self.read_block.and_then(|block| self.states.get(&block))
+        self.active.as_ref().map(|active| &active.state)
     }
 
     fn block_at_height(&self, mut block: [u8; 32], height: u32) -> Option<[u8; 32]> {
@@ -419,6 +426,8 @@ pub fn evaluate_with_tracker(
 #[cfg(test)]
 mod tests {
     use clarity::vm::Value;
+    use clarity::vm::database::ClarityBackingStore;
+    use stacks_common::types::chainstate::StacksBlockId;
 
     use super::{MarfStore, evaluate, evaluate_in_store};
 
@@ -482,6 +491,14 @@ mod tests {
         assert_eq!(store.root(second), Some(second_root));
         assert_eq!(store.root(fork), Some(fork_root));
         assert_ne!(second_root, fork_root);
+
+        store
+            .set_block_hash(StacksBlockId(first))
+            .expect("select first state");
+        assert_eq!(
+            store.get_data("counter").expect("read first state"),
+            Some("one".to_owned())
+        );
     }
 
     #[test]
