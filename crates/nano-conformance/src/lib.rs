@@ -884,6 +884,62 @@ mod tests {
     }
 
     #[test]
+    fn captured_checkpoint_overwrite_matches_stacks_core() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        let root = TrieHash::from_bytes([
+            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
+            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
+            0x3a, 0x64, 0xc0, 0x71,
+        ]);
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
+        let temporary = temporary_fixture_root()?;
+        let checkpoint = temporary.join("marf.sqlite");
+        fs::copy(fixture.join("marf.sqlite"), &checkpoint)?;
+        fs::copy(
+            fixture.join("marf.sqlite.blobs"),
+            temporary.join("marf.sqlite.blobs"),
+        )?;
+
+        let next = [0x43; 32];
+        let key = "_stx-data::clarity_storage::block_time";
+        let value = "1785170178";
+        let mut imported = import_checkpoint(&checkpoint, source, root)?;
+        let mut options = ReferenceMarfOpenOpts::default();
+        options.external_blobs = true;
+        let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+            checkpoint.to_str().expect("temporary path is UTF-8"),
+            options,
+        )?;
+        let mut transaction = reference.begin_tx()?;
+        transaction.begin(
+            &ReferenceStacksBlockId(source),
+            &ReferenceStacksBlockId(next),
+        )?;
+        transaction.insert_batch(
+            &[key.to_owned()],
+            vec![ReferenceMarfValue::from_value(value)],
+        )?;
+        transaction.seal()?;
+        transaction.commit()?;
+        let reference_root = reference.get_root_hash_at(&ReferenceStacksBlockId(next))?;
+
+        imported.begin(Some(source), next)?;
+        imported.insert(key.as_bytes(), MarfValue::from_value(value.as_bytes()))?;
+        let imported_root = imported.seal()?;
+        assert_eq!(imported_root.as_bytes(), &reference_root.0);
+
+        drop(reference);
+        fs::remove_dir_all(temporary)?;
+        Ok(())
+    }
+
+    #[test]
     fn pcs_layout_import_uses_the_manifest_root() -> Result<(), Box<dyn std::error::Error>> {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
