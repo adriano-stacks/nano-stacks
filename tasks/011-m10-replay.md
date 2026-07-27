@@ -24,7 +24,7 @@ Clarity receipts and state roots as stacks-core.
 - [ ] Apply coinbase and tenure changes.
 - [ ] Enforce post-conditions and transaction-level runtime error semantics.
 - [ ] Carry block-level cost limits and receipt costs/events through execution.
-- [ ] Replay captured blocks from the checkpoint and report the first divergence.
+- [x] Replay captured blocks from the checkpoint and report the exact first divergence.
 
 ## Acceptance Criteria
 

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_chainstate::{ChainState, NakamotoBlock};
+use nano_chainstate::{ChainState, ChainStateError, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
 use nano_primitives::{BitcoinHeaderHash, TrieHash};
 use nano_sortition::SortitionSnapshot;
@@ -290,11 +290,23 @@ impl std::error::Error for FixtureValidationError {}
 impl std::error::Error for ManifestError {}
 
 /// Replay status, deliberately small until the real block decoder arrives.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplayDepth {
     pub completed: u64,
     pub expected: u64,
     pub first_failure: Option<u64>,
+    pub first_divergence: Option<ReplayDivergence>,
+}
+
+/// The precise reason captured replay first diverged from its fixture oracle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayDivergence {
+    StateRoot {
+        expected: TrieHash,
+        actual: TrieHash,
+    },
+    Application(String),
+    Fixture(String),
 }
 
 #[must_use]
@@ -307,13 +319,14 @@ pub fn baseline_replay(manifest: FixtureManifest) -> ReplayDepth {
         completed: 0,
         expected: manifest.replay_blocks,
         first_failure,
+        first_divergence: None,
     }
 }
 
 /// Render a stable, human-readable progress report for local development and CI.
 #[must_use]
 pub fn scoreboard(manifest: FixtureManifest) -> String {
-    render_scoreboard(manifest, baseline_replay(manifest))
+    render_scoreboard(manifest, &baseline_replay(manifest))
 }
 
 /// Render the fixture replay score using the checkpoint and captured block stream.
@@ -323,10 +336,10 @@ pub fn scoreboard_at(root: &Path, manifest: FixtureManifest) -> String {
         FixtureMode::Baseline => baseline_replay(manifest),
         FixtureMode::Captured => captured_replay(root, manifest),
     };
-    render_scoreboard(manifest, replay)
+    render_scoreboard(manifest, &replay)
 }
 
-fn render_scoreboard(manifest: FixtureManifest, replay: ReplayDepth) -> String {
+fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String {
     let mut output = String::from(
         "surface              oracle                     passing        first failure\n\
          ─────────────────────────────────────────────────────────────────────────────\n",
@@ -348,9 +361,13 @@ fn render_scoreboard(manifest: FixtureManifest, replay: ReplayDepth) -> String {
         "replay: state root   fixture block headers       {}/{}          {}",
         replay.completed,
         replay.expected,
-        replay
-            .first_failure
-            .map_or_else(|| "—".to_owned(), |height| format!("block {height}"))
+        replay.first_failure.map_or_else(
+            || "—".to_owned(),
+            |height| replay.first_divergence.as_ref().map_or_else(
+                || format!("block {height}"),
+                |divergence| format!("block {height}: {divergence}"),
+            ),
+        )
     );
     let _ = writeln!(
         output,
@@ -372,6 +389,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             completed: 0,
             expected: manifest.replay_blocks,
             first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "checkpoint metadata is unavailable".to_owned(),
+            )),
         };
     };
     let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
@@ -380,6 +400,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             completed: 0,
             expected: manifest.replay_blocks,
             first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "checkpoint cannot be opened".to_owned(),
+            )),
         };
     };
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
@@ -387,6 +410,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             completed: 0,
             expected: manifest.replay_blocks,
             first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "captured Bitcoin snapshots are unavailable".to_owned(),
+            )),
         };
     };
     let Ok(mut entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
@@ -394,6 +420,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             completed: 0,
             expected: manifest.replay_blocks,
             first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "captured blocks are unavailable".to_owned(),
+            )),
         };
     };
     let mut paths = entries
@@ -410,22 +439,16 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let result = fs::read(path)
-            .ok()
-            .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
-            .and_then(|block| {
-                let snapshot = snapshots.get(&block.header.consensus_hash.to_string())?;
-                chainstate
-                    .append_nakamoto_block(snapshot, parent, &block)
-                    .ok()
-                    .map(|_| block)
-            });
-        let Some(block) = result else {
-            return ReplayDepth {
-                completed,
-                expected: manifest.replay_blocks,
-                first_failure: Some(block_number),
-            };
+        let block = match apply_captured_block(&mut chainstate, &snapshots, parent, &path) {
+            Ok(block) => block,
+            Err(divergence) => {
+                return ReplayDepth {
+                    completed,
+                    expected: manifest.replay_blocks,
+                    first_failure: Some(block_number),
+                    first_divergence: Some(divergence),
+                };
+            }
         };
         parent = Some(*block.block_id().as_bytes());
         completed += 1;
@@ -434,6 +457,46 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
         completed,
         expected: manifest.replay_blocks,
         first_failure: (completed < manifest.replay_blocks).then_some(completed + 1),
+        first_divergence: None,
+    }
+}
+
+fn apply_captured_block(
+    chainstate: &mut ChainState,
+    snapshots: &BTreeMap<String, SortitionSnapshot>,
+    parent: Option<[u8; 32]>,
+    path: &Path,
+) -> Result<NakamotoBlock, ReplayDivergence> {
+    let bytes =
+        fs::read(path).map_err(|_| ReplayDivergence::Fixture("block cannot be read".to_owned()))?;
+    let block = NakamotoBlock::decode(&bytes)
+        .map_err(|_| ReplayDivergence::Fixture("block cannot be decoded".to_owned()))?;
+    let snapshot = snapshots
+        .get(&block.header.consensus_hash.to_string())
+        .ok_or_else(|| {
+            ReplayDivergence::Fixture(
+                "block consensus hash is absent from captured Bitcoin snapshots".to_owned(),
+            )
+        })?;
+    chainstate
+        .append_nakamoto_block(snapshot, parent, &block)
+        .map_err(|error| match error {
+            ChainStateError::StateRootMismatch { expected, actual } => {
+                ReplayDivergence::StateRoot { expected, actual }
+            }
+            error => ReplayDivergence::Application(error.to_string()),
+        })?;
+    Ok(block)
+}
+
+impl std::fmt::Display for ReplayDivergence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StateRoot { expected, actual } => {
+                write!(formatter, "state root {expected} != {actual}")
+            }
+            Self::Application(message) | Self::Fixture(message) => formatter.write_str(message),
+        }
     }
 }
 
