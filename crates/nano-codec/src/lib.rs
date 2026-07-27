@@ -234,8 +234,8 @@ pub struct Transaction {
     auth: TransactionAuth,
     anchor_mode: AnchorMode,
     post_condition_mode: PostConditionMode,
-    post_condition_count: u32,
-    payload_type: TransactionPayloadType,
+    post_conditions: Vec<PostCondition>,
+    payload: TransactionPayload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,6 +318,49 @@ impl TransactionPayloadType {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostConditionType {
+    Stx,
+    Fungible,
+    NonFungible,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCondition {
+    kind: PostConditionType,
+    bytes: Vec<u8>,
+}
+
+impl PostCondition {
+    #[must_use]
+    pub const fn kind(&self) -> PostConditionType {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionPayload {
+    kind: TransactionPayloadType,
+    bytes: Vec<u8>,
+}
+
+impl TransactionPayload {
+    #[must_use]
+    pub const fn kind(&self) -> TransactionPayloadType {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl Transaction {
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), CodecError> {
         let mut reader = Reader::new(bytes);
@@ -331,11 +374,24 @@ impl Transaction {
         let anchor_mode = AnchorMode::parse(reader.byte()?)?;
         let post_condition_mode = PostConditionMode::parse(reader.byte()?)?;
 
-        let post_conditions = reader.u32()?;
-        for _ in 0..post_conditions {
-            scan_post_condition(&mut reader)?;
+        let post_condition_count = reader.u32()?;
+        let mut post_conditions = Vec::with_capacity(
+            usize::try_from(post_condition_count).map_err(|_| CodecError::InvalidLength)?,
+        );
+        for _ in 0..post_condition_count {
+            let start = reader.position();
+            let kind = scan_post_condition(&mut reader)?;
+            post_conditions.push(PostCondition {
+                kind,
+                bytes: reader.bytes[start..reader.position()].to_vec(),
+            });
         }
+        let payload_start = reader.position();
         let payload_type = scan_payload(&mut reader)?;
+        let payload = TransactionPayload {
+            kind: payload_type,
+            bytes: reader.bytes[payload_start..reader.position()].to_vec(),
+        };
 
         let length = reader.position();
         Ok((
@@ -346,8 +402,8 @@ impl Transaction {
                 auth,
                 anchor_mode,
                 post_condition_mode,
-                post_condition_count: post_conditions,
-                payload_type,
+                post_conditions,
+                payload,
             },
             length,
         ))
@@ -389,13 +445,23 @@ impl Transaction {
     }
 
     #[must_use]
-    pub const fn post_condition_count(&self) -> u32 {
-        self.post_condition_count
+    pub fn post_condition_count(&self) -> usize {
+        self.post_conditions.len()
+    }
+
+    #[must_use]
+    pub fn post_conditions(&self) -> &[PostCondition] {
+        &self.post_conditions
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &TransactionPayload {
+        &self.payload
     }
 
     #[must_use]
     pub const fn payload_type(&self) -> TransactionPayloadType {
-        self.payload_type
+        self.payload.kind()
     }
 
     #[must_use]
@@ -532,18 +598,20 @@ fn scan_microblock_header(reader: &mut Reader<'_>) -> Result<MicroblockIdentity,
     })
 }
 
-fn scan_post_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
-    match reader.byte()? {
+fn scan_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionType, CodecError> {
+    let kind = match reader.byte()? {
         0 => {
             scan_post_condition_principal(reader)?;
             scan_fungible_condition(reader)?;
             reader.u64()?;
+            PostConditionType::Stx
         }
         1 => {
             scan_post_condition_principal(reader)?;
             scan_asset_info(reader)?;
             scan_fungible_condition(reader)?;
             reader.u64()?;
+            PostConditionType::Fungible
         }
         2 => {
             scan_post_condition_principal(reader)?;
@@ -553,10 +621,11 @@ fn scan_post_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
                 0x10 | 0x11 => {}
                 _ => return Err(CodecError::InvalidPostCondition),
             }
+            PostConditionType::NonFungible
         }
         _ => return Err(CodecError::InvalidPostCondition),
-    }
-    Ok(())
+    };
+    Ok(kind)
 }
 
 fn scan_post_condition_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
