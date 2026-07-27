@@ -35,6 +35,56 @@ pub struct Evaluation {
     pub cost: ExecutionCost,
 }
 
+/// Epoch 4 Clarity execution over a versioned MARF-backed store.
+#[derive(Debug)]
+pub struct Vm {
+    store: MarfStore,
+}
+
+impl Vm {
+    /// Create an empty VM.
+    pub fn new() -> Result<Self, MarfStoreError> {
+        Ok(Self {
+            store: MarfStore::new()?,
+        })
+    }
+
+    /// Begin execution for a block state.
+    pub fn begin_block(
+        &mut self,
+        parent: Option<[u8; 32]>,
+        block: [u8; 32],
+    ) -> Result<(), MarfStoreError> {
+        self.store.begin(parent, block)
+    }
+
+    /// Execute a Clarity 6 program with the supplied consensus cost tracker.
+    pub fn execute(
+        &mut self,
+        source: &str,
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<Evaluation, ClarityEvalError> {
+        evaluate_with_tracker(&mut self.store, source, cost_tracker)
+    }
+
+    /// Seal the active block state.
+    pub fn seal_block(&mut self) -> Result<StateRoot, MarfStoreError> {
+        self.store.seal()
+    }
+
+    /// Access the state root for a sealed block.
+    #[must_use]
+    pub fn root(&self, block: [u8; 32]) -> Option<StateRoot> {
+        self.store.root(block)
+    }
+
+    /// Access a stored Clarity database value for a sealed block.
+    #[must_use]
+    pub fn get(&self, block: [u8; 32], key: &str) -> Option<&str> {
+        self.store.get(block, key)
+    }
+}
+
 #[must_use]
 pub const fn execute_stub() -> ExecutionResult {
     ExecutionResult {
@@ -429,7 +479,8 @@ mod tests {
     use clarity::vm::database::ClarityBackingStore;
     use stacks_common::types::chainstate::StacksBlockId;
 
-    use super::{MarfStore, evaluate, evaluate_in_store};
+    use super::{MarfStore, Vm, evaluate, evaluate_in_store};
+    use clarity::vm::costs::LimitedCostTracker;
 
     #[test]
     fn evaluates_clarity_six_programs() {
@@ -528,5 +579,23 @@ mod tests {
         assert_eq!(value, Some(Value::UInt(2)));
         store.seal().expect("seal state");
         assert!(store.root(block).is_some());
+    }
+
+    #[test]
+    fn vm_executes_and_seals_a_block_state() {
+        let block = [9; 32];
+        let mut vm = Vm::new().expect("create VM");
+        vm.begin_block(None, block).expect("begin block");
+
+        let evaluation = vm
+            .execute(
+                "(define-data-var counter uint u1) (var-set counter u2) (var-get counter)",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("execute block");
+        let root = vm.seal_block().expect("seal block");
+
+        assert_eq!(evaluation.value, Some(Value::UInt(2)));
+        assert_eq!(vm.root(block), Some(root));
     }
 }
