@@ -356,7 +356,10 @@ mod tests {
         BlockMap as ReferenceBlockMap, Error as ReferenceMarfError,
         MARFValue as ReferenceMarfValue, TrieLeaf as ReferenceTrieLeaf,
         bits::{get_leaf_hash, get_node_hash},
-        node::{TrieNode4 as ReferenceTrieNode4, TriePtr as ReferenceTriePointer},
+        node::{
+            TrieNode4 as ReferenceTrieNode4, TrieNode256 as ReferenceTrieNode256,
+            TriePtr as ReferenceTriePointer,
+        },
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
@@ -366,7 +369,9 @@ mod tests {
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
-    use nano_marf::{MarfValue, TrieNodeId, TriePointer, internal_node_hash, key_path, leaf_hash};
+    use nano_marf::{
+        MarfTrie, MarfValue, TrieNodeId, TriePointer, internal_node_hash, key_path, leaf_hash,
+    };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
     use stacks_common::util::{
@@ -590,6 +595,70 @@ mod tests {
             let ours = internal_node_hash(TrieNodeId::Node4, &pointers, &path, &children)
                 .expect("fixed pointer count");
             prop_assert_eq!(ours.as_bytes(), &reference.0);
+        }
+
+        #[test]
+        fn marf_first_insert_matches_stacks_core(
+            path in any::<[u8; 32]>(),
+            value in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let text = String::from_utf8_lossy(&value);
+            let mut reference_root = ReferenceTrieNode256::new(&[]);
+            reference_root.ptrs[usize::from(path[0])] = ReferenceTriePointer::new(1, path[0], 0);
+            let reference_leaf = ReferenceTrieLeaf::from_value(
+                &path[1..],
+                ReferenceMarfValue::from_value(&text),
+            );
+            let mut child_hashes = vec![ReferenceTrieHash::from_data(&[]); 256];
+            child_hashes[usize::from(path[0])] = get_leaf_hash(&reference_leaf);
+            let mut map = EmptyReferenceBlockMap;
+            let reference = get_node_hash(&reference_root, &child_hashes, &mut map);
+
+            let mut ours = MarfTrie::default();
+            ours.insert_path(path, MarfValue::from_value(text.as_bytes()));
+            let root = ours.root_hash();
+            prop_assert_eq!(root.as_bytes(), &reference.0);
+        }
+
+        #[test]
+        fn marf_first_path_split_matches_stacks_core(
+            path in any::<[u8; 32]>(),
+            first_value in proptest::collection::vec(any::<u8>(), 0..1024),
+            second_value in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let first_text = String::from_utf8_lossy(&first_value);
+            let second_text = String::from_utf8_lossy(&second_value);
+            let mut alternate = path;
+            alternate[4] = alternate[4].wrapping_add(1);
+
+            let first_leaf = ReferenceTrieLeaf::from_value(
+                &path[5..],
+                ReferenceMarfValue::from_value(&first_text),
+            );
+            let second_leaf = ReferenceTrieLeaf::from_value(
+                &alternate[5..],
+                ReferenceMarfValue::from_value(&second_text),
+            );
+            let mut branch = ReferenceTrieNode4::new(&path[1..4]);
+            branch.ptrs[0] = ReferenceTriePointer::new(1, path[4], 0);
+            branch.ptrs[1] = ReferenceTriePointer::new(1, alternate[4], 0);
+            let mut map = EmptyReferenceBlockMap;
+            let mut branch_hashes = vec![ReferenceTrieHash::from_data(&[]); 4];
+            branch_hashes[0] = get_leaf_hash(&first_leaf);
+            branch_hashes[1] = get_leaf_hash(&second_leaf);
+            let branch_hash = get_node_hash(&branch, &branch_hashes, &mut map);
+
+            let mut reference_root = ReferenceTrieNode256::new(&[]);
+            reference_root.ptrs[usize::from(path[0])] = ReferenceTriePointer::new(2, path[0], 0);
+            let mut root_hashes = vec![ReferenceTrieHash::from_data(&[]); 256];
+            root_hashes[usize::from(path[0])] = branch_hash;
+            let reference = get_node_hash(&reference_root, &root_hashes, &mut map);
+
+            let mut ours = MarfTrie::default();
+            ours.insert_path(path, MarfValue::from_value(first_text.as_bytes()));
+            ours.insert_path(alternate, MarfValue::from_value(second_text.as_bytes()));
+            let root = ours.root_hash();
+            prop_assert_eq!(root.as_bytes(), &reference.0);
         }
 
         #[test]
