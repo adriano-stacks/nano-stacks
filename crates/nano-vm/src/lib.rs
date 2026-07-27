@@ -13,7 +13,7 @@ use clarity::vm::database::{
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::representations::SymbolicExpression;
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
     CheckpointError, MarfError, MarfValue, StateRoot, VersionedMarf, import_checkpoint,
@@ -119,6 +119,25 @@ impl Vm {
             contract,
             function,
             arguments,
+            cost_tracker,
+        )
+    }
+
+    /// Transfer STX between principals in the active block state.
+    pub fn transfer_stx(
+        &mut self,
+        sender: &PrincipalData,
+        recipient: &PrincipalData,
+        amount: u128,
+        memo: &[u8],
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<TransactionResult, VmExecutionError> {
+        transfer_stx(
+            &mut self.store,
+            sender,
+            recipient,
+            amount,
+            memo,
             cost_tracker,
         )
     }
@@ -796,6 +815,39 @@ pub fn execute_contract_call(
     );
     let (value, _, events) =
         environment.execute_transaction(sender, sponsor, contract, function, &arguments)?;
+
+    Ok(TransactionResult {
+        value: Some(value),
+        cost: environment.get_cost_total(),
+        events,
+    })
+}
+
+/// Transfer STX using the Clarity VM's account and event machinery.
+pub fn transfer_stx(
+    store: &mut MarfStore,
+    sender: &PrincipalData,
+    recipient: &PrincipalData,
+    amount: u128,
+    memo: &[u8],
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, VmExecutionError> {
+    let database = store.as_clarity_db();
+    let mut environment = OwnedEnvironment::new_cost_limited(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+    );
+    let (value, _, events) = environment.stx_transfer(
+        sender,
+        recipient,
+        amount,
+        &BuffData {
+            data: memo.to_vec(),
+        },
+    )?;
 
     Ok(TransactionResult {
         value: Some(value),

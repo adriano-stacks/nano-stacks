@@ -135,13 +135,23 @@ pub fn import_checkpoint(
         });
     }
 
+    let mut retained = BTreeMap::new();
+    let mut current = Some(source);
+    while let Some(block) = current {
+        let record = records
+            .get(&block)
+            .ok_or(CheckpointError::MissingBlock(block))?;
+        retained.insert(block, record);
+        current = record.parent;
+    }
+
     let mut versions = BTreeMap::new();
-    for (block, record) in &records {
+    for (block, record) in retained {
         versions.insert(
-            *block,
+            block,
             MarfVersion {
                 parent: record.parent,
-                height: height(*block, &records)?,
+                height: height(block, &records)?,
                 trie: MarfTrie::default(),
                 root: record.root,
             },

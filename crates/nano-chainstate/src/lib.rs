@@ -11,7 +11,7 @@ use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
-use nano_codec::{ClarityVersion, Transaction, TransactionPayloadData};
+use nano_codec::{ClarityVersion, Principal, Transaction, TransactionPayloadData};
 use nano_primitives::{Sha256Sum, TrieHash};
 use nano_sortition::SortitionSnapshot;
 use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
@@ -175,6 +175,20 @@ impl ChainState {
             .map(principal_from_address)
             .transpose()?;
         let result = match transaction.payload().data() {
+            TransactionPayloadData::TokenTransfer {
+                recipient,
+                amount,
+                memo,
+            } => {
+                let recipient = principal_from_codec(recipient)?;
+                self.vm.transfer_stx(
+                    &sender,
+                    &recipient,
+                    u128::from(*amount),
+                    memo,
+                    LimitedCostTracker::new_free(),
+                )?
+            }
             TransactionPayloadData::SmartContract {
                 contract_name,
                 source,
@@ -226,6 +240,18 @@ fn principal_from_address(
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }
 
+fn principal_from_codec(principal: &Principal) -> Result<PrincipalData, ChainStateError> {
+    match principal {
+        Principal::Standard(address) => principal_from_address(*address),
+        Principal::Contract {
+            address,
+            contract_name,
+        } => QualifiedContractIdentifier::parse(&format!("{address}.{contract_name}"))
+            .map(PrincipalData::Contract)
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string())),
+    }
+}
+
 fn contract_identifier(
     address: nano_address::StacksAddress,
     contract_name: &str,
@@ -258,11 +284,13 @@ pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use nano_codec::Transaction;
-    use nano_primitives::BitcoinHeaderHash;
+    use nano_primitives::{BitcoinHeaderHash, TrieHash};
     use nano_sortition::SortitionSnapshot;
 
-    use super::ChainState;
+    use super::{ChainState, NakamotoBlock};
 
     #[test]
     fn append_program_seals_the_vm_state_root() {
@@ -311,6 +339,42 @@ mod tests {
             Some(clarity::vm::Value::okay(clarity::vm::Value::UInt(42)).expect("response"))
         );
         chainstate.vm.seal_block().expect("seal block");
+    }
+
+    #[test]
+    fn executes_a_captured_checkpoint_token_transfer() {
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        let root = TrieHash::from_bytes([
+            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
+            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
+            0x3a, 0x64, 0xc0, 0x71,
+        ]);
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures");
+        let checkpoint = fixture_root.join("chainstate/checkpoint-H/marf.sqlite");
+        let block = NakamotoBlock::decode(
+            &fs::read(fixture_root.join(
+                "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
+            ))
+            .expect("read fixture block"),
+        )
+        .expect("decode fixture block");
+        let mut chainstate =
+            ChainState::from_checkpoint(checkpoint, source, root).expect("open checkpoint");
+        chainstate
+            .vm
+            .begin_block(Some(source), *block.block_id().as_bytes())
+            .expect("begin block");
+
+        let receipt = chainstate
+            .execute_transaction(&block.transactions[0])
+            .expect("execute captured transfer");
+
+        assert_eq!(receipt.result.events.len(), 1);
     }
 
     fn decoded_transaction(payload: &[u8]) -> Transaction {
