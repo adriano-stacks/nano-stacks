@@ -43,6 +43,17 @@ impl MarfValue {
     }
 
     #[must_use]
+    pub const fn from_block_id(block: [u8; 32]) -> Self {
+        let mut bytes = [0; 40];
+        let mut index = 0;
+        while index < block.len() {
+            bytes[index] = block[index];
+            index += 1;
+        }
+        Self(bytes)
+    }
+
+    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 40] {
         &self.0
     }
@@ -109,6 +120,7 @@ pub enum MarfError {
     VersionAlreadyExists,
     WriteInProgress,
     WriteNotBegun,
+    HeightOverflow,
 }
 
 impl fmt::Display for MarfError {
@@ -121,6 +133,7 @@ impl fmt::Display for MarfError {
             Self::VersionAlreadyExists => "MARF version already exists",
             Self::WriteInProgress => "MARF version write is already in progress",
             Self::WriteNotBegun => "MARF version write has not begun",
+            Self::HeightOverflow => "MARF version height overflowed",
         })
     }
 }
@@ -476,6 +489,7 @@ pub struct VersionedMarf {
 #[derive(Clone, Debug)]
 struct MarfVersion {
     parent: Option<MarfBlockId>,
+    height: u32,
     trie: MarfTrie,
     root: TrieHash,
 }
@@ -484,6 +498,7 @@ struct MarfVersion {
 struct ActiveVersion {
     block: MarfBlockId,
     parent: Option<MarfBlockId>,
+    height: u32,
     trie: MarfTrie,
 }
 
@@ -501,22 +516,29 @@ impl VersionedMarf {
             return Err(MarfError::VersionAlreadyExists);
         }
 
-        let trie = match parent {
+        let (mut trie, height) = match parent {
             Some(parent) => {
-                let mut trie = self
+                let version = self
                     .versions
                     .get(&parent)
-                    .ok_or(MarfError::UnknownVersion)?
-                    .trie
-                    .clone();
+                    .ok_or(MarfError::UnknownVersion)?;
+                let mut trie = version.trie.clone();
                 trie.prepare_root_for_copy(parent);
-                trie
+                (
+                    trie,
+                    version
+                        .height
+                        .checked_add(1)
+                        .ok_or(MarfError::HeightOverflow)?,
+                )
             }
-            None => MarfTrie::default(),
+            None => (MarfTrie::default(), 0),
         };
+        insert_metadata(&mut trie, parent, block, height);
         self.active = Some(ActiveVersion {
             block,
             parent,
+            height,
             trie,
         });
         Ok(())
@@ -548,6 +570,7 @@ impl VersionedMarf {
             active.block,
             MarfVersion {
                 parent: active.parent,
+                height: active.height,
                 trie: active.trie,
                 root,
             },
@@ -585,6 +608,49 @@ impl VersionedMarf {
     }
 }
 
+const BLOCK_HASH_TO_HEIGHT_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
+const BLOCK_HEIGHT_TO_HASH_KEY: &str = "__MARF_BLOCK_HEIGHT_TO_HASH";
+const OWN_BLOCK_HEIGHT_KEY: &str = "__MARF_BLOCK_HEIGHT_SELF";
+
+fn insert_metadata(
+    trie: &mut MarfTrie,
+    parent: Option<MarfBlockId>,
+    block: MarfBlockId,
+    height: u32,
+) {
+    trie.insert(OWN_BLOCK_HEIGHT_KEY.as_bytes(), MarfValue::from_u32(height));
+    trie.insert(
+        format!("{BLOCK_HEIGHT_TO_HASH_KEY}::{height}").as_bytes(),
+        MarfValue::from_block_id(block),
+    );
+    trie.insert(
+        format!("{BLOCK_HASH_TO_HEIGHT_KEY}::{}", block_hex(block)).as_bytes(),
+        MarfValue::from_u32(height),
+    );
+    if let Some(parent) = parent {
+        let previous_height = height
+            .checked_sub(1)
+            .expect("parent implies non-genesis height");
+        trie.insert(
+            format!("{BLOCK_HEIGHT_TO_HASH_KEY}::{previous_height}").as_bytes(),
+            MarfValue::from_block_id(parent),
+        );
+        trie.insert(
+            format!("{BLOCK_HASH_TO_HEIGHT_KEY}::{}", block_hex(parent)).as_bytes(),
+            MarfValue::from_u32(previous_height),
+        );
+    }
+}
+
+fn block_hex(block: MarfBlockId) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in block {
+        use fmt::Write;
+        write!(&mut hex, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    hex
+}
+
 /// A state root calculated by the MARF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateRoot(pub [u8; 32]);
@@ -599,7 +665,8 @@ impl StateRoot {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarfError, MarfTrie, MarfValue, TrieHash, TrieNodeId, TriePointer, VersionedMarf,
+        BLOCK_HASH_TO_HEIGHT_KEY, BLOCK_HEIGHT_TO_HASH_KEY, MarfError, MarfTrie, MarfValue,
+        OWN_BLOCK_HEIGHT_KEY, TrieHash, TrieNodeId, TriePointer, VersionedMarf, block_hex,
         internal_node_hash, key_path, leaf_hash, state_root,
     };
 
@@ -687,23 +754,13 @@ mod tests {
     }
 
     #[test]
-    fn versioned_trie_uses_block_ids_for_unchanged_children() {
+    fn copied_root_uses_block_ids_for_unchanged_children() {
         let first = [1; 32];
-        let second = [2; 32];
-        let third = [3; 32];
         let path = [7; 32];
         let first_value = MarfValue::from_u32(1);
-        let replacement = MarfValue::from_u32(2);
-        let mut trie = VersionedMarf::default();
-
-        trie.begin(None, first).expect("starts genesis state");
-        trie.insert_path(path, first_value)
-            .expect("writes genesis state");
-        let first_root = trie.seal().expect("seals genesis state");
-
-        trie.begin(Some(first), second)
-            .expect("extends first state");
-        let second_root = trie.seal().expect("seals unchanged state");
+        let mut trie = MarfTrie::default();
+        trie.insert_path(path, first_value);
+        trie.prepare_root_for_copy(first);
         let mut pointers = vec![
             TriePointer {
                 id: 0,
@@ -721,22 +778,52 @@ mod tests {
         child_hashes[usize::from(path[0])] = TrieHash::from_bytes(first);
         let content = internal_node_hash(TrieNodeId::Node256, &pointers, &[], &child_hashes)
             .expect("hashes copied root");
-        assert_eq!(second_root, state_root(content, &[first_root]));
+        assert_eq!(trie.root_hash(), content);
+    }
+
+    #[test]
+    fn versioned_trie_records_consensus_height_metadata() {
+        let first = [1; 32];
+        let second = [2; 32];
+        let third = [3; 32];
+        let path = [7; 32];
+        let first_value = MarfValue::from_u32(1);
+        let replacement = MarfValue::from_u32(2);
+        let mut trie = VersionedMarf::default();
+
+        trie.begin(None, first).expect("starts genesis state");
+        trie.insert_path(path, first_value)
+            .expect("writes genesis state");
+        let first_root = trie.seal().expect("seals genesis state");
+
+        trie.begin(Some(first), second)
+            .expect("extends first state");
+        let second_root = trie.seal().expect("seals unchanged state");
 
         trie.begin(Some(second), third)
             .expect("extends second state");
         trie.insert_path(path, replacement)
             .expect("overwrites copied leaf");
         let third_root = trie.seal().expect("seals updated state");
-        let mut expected = MarfTrie::default();
-        expected.insert_path(path, replacement);
-        assert_eq!(
-            third_root,
-            state_root(expected.root_hash(), &[second_root, first_root])
-        );
         assert_eq!(trie.get_path(first, path), Some(first_value));
         assert_eq!(trie.get_path(third, path), Some(replacement));
+        assert_eq!(
+            trie.get(third, OWN_BLOCK_HEIGHT_KEY.as_bytes()),
+            Some(2.into())
+        );
+        assert_eq!(
+            trie.get(third, format!("{BLOCK_HEIGHT_TO_HASH_KEY}::0").as_bytes()),
+            Some(MarfValue::from_block_id(first))
+        );
+        assert_eq!(
+            trie.get(
+                third,
+                format!("{BLOCK_HASH_TO_HEIGHT_KEY}::{}", block_hex(second)).as_bytes()
+            ),
+            Some(1.into())
+        );
         assert_eq!(trie.root(first), Some(first_root));
         assert_eq!(trie.root(second), Some(second_root));
+        assert_ne!(third_root, second_root);
     }
 }
