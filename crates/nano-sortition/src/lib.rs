@@ -44,6 +44,14 @@ impl SortitionHash {
     }
 
     #[must_use]
+    pub fn mix_vrf_seed(self, seed: [u8; 32]) -> Self {
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(&self.0);
+        bytes[32..].copy_from_slice(&seed);
+        Self(*sha256(&bytes).as_bytes())
+    }
+
+    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -93,6 +101,7 @@ pub struct SortitionSnapshot {
     pub consensus_hash: ConsensusHash,
     pub total_burn: u64,
     pub sortition_hash: SortitionHash,
+    pub winner_vrf_seed: Option<[u8; 32]>,
     pub pox_id: PoxId,
 }
 
@@ -106,6 +115,7 @@ impl SortitionSnapshot {
             consensus_hash: ConsensusHash::from_bytes([0; 20]),
             total_burn: 0,
             sortition_hash: SortitionHash::initial(),
+            winner_vrf_seed: None,
             pox_id: PoxId::initial(),
         }
     }
@@ -140,6 +150,16 @@ impl SnapshotChain {
         total_burn: u64,
         pox_id: PoxId,
     ) -> Result<&SortitionSnapshot, SortitionError> {
+        self.append_with_winner(block, total_burn, pox_id, None)
+    }
+
+    pub fn append_with_winner(
+        &mut self,
+        block: &BitcoinBlock,
+        total_burn: u64,
+        pox_id: PoxId,
+        winner_vrf_seed: Option<[u8; 32]>,
+    ) -> Result<&SortitionSnapshot, SortitionError> {
         let parent = self.tip();
         let expected_height = parent
             .bitcoin_height
@@ -167,15 +187,18 @@ impl SnapshotChain {
             &self.previous_consensus_hashes(),
             &pox_id,
         );
+        let sortition_hash = parent
+            .sortition_hash
+            .mix_bitcoin_header(bitcoin_header_hash);
         let snapshot = SortitionSnapshot {
             bitcoin_height: block.height,
             bitcoin_header_hash,
             operations_hash,
             consensus_hash,
             total_burn,
-            sortition_hash: parent
-                .sortition_hash
-                .mix_bitcoin_header(bitcoin_header_hash),
+            sortition_hash: winner_vrf_seed
+                .map_or(sortition_hash, |seed| sortition_hash.mix_vrf_seed(seed)),
+            winner_vrf_seed,
             pox_id,
         };
         self.snapshots.push(snapshot);

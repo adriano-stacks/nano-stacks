@@ -1444,6 +1444,8 @@ dependencies = [
  "nano-primitives",
  "nano-sortition",
  "proptest",
+ "serde",
+ "serde_json",
  "stacks-common",
  "stackslib",
 ]

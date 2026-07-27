@@ -397,6 +397,7 @@ mod tests {
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
+    use serde::Deserialize;
     use stacks_common::util::{
         secp256k1::{
             MessageSignature as ReferenceMessageSignature,
@@ -426,6 +427,7 @@ mod tests {
         types::chainstate::{
             BurnchainHeaderHash as ReferenceBitcoinHeaderHash,
             ConsensusHash as ReferenceConsensusHash, PoxId as ReferencePoxId,
+            VRFSeed as ReferenceVrfSeed,
         },
     };
     use std::{
@@ -434,6 +436,15 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[derive(Deserialize)]
+    struct CapturedSortitionSnapshot {
+        block_height: u64,
+        burn_header_hash: String,
+        parent_burn_header_hash: String,
+        sortition: u8,
+        sortition_hash: String,
+    }
 
     struct EmptyReferenceBlockMap;
 
@@ -988,8 +999,9 @@ mod tests {
                 hash,
                 operations: Vec::new(),
             };
+            let winner_vrf_seed = (height % 3 == 0).then_some(hash);
             let snapshot = chain
-                .append(&block, 0, nano_sortition::PoxId::initial())
+                .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner_vrf_seed)
                 .expect("contiguous Bitcoin block");
             let reference_header_hash = ReferenceBitcoinHeaderHash(hash);
             let reference_ops_hash = ReferenceOpsHash::from_txids(&[]);
@@ -1011,6 +1023,10 @@ mod tests {
             );
             reference_sortition_hash =
                 reference_sortition_hash.mix_burn_header(&reference_header_hash);
+            if let Some(seed) = winner_vrf_seed {
+                reference_sortition_hash =
+                    reference_sortition_hash.mix_VRF_seed(&ReferenceVrfSeed(seed));
+            }
 
             assert_eq!(
                 snapshot.operations_hash.as_bytes(),
@@ -1025,6 +1041,51 @@ mod tests {
                 reference_sortition_hash.as_bytes()
             );
             reference_consensus_hashes.push(reference_consensus_hash);
+        }
+    }
+
+    #[test]
+    fn captured_sortition_hashes_form_the_reference_bitcoin_chain() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sortition/snapshots.json");
+        let snapshots: Vec<CapturedSortitionSnapshot> =
+            serde_json::from_slice(&fs::read(&path).expect("read captured sortition snapshots"))
+                .expect("parse captured sortition snapshots");
+        let genesis = snapshots.first().expect("captured genesis snapshot");
+        assert_eq!(genesis.block_height, 0);
+        let mut chain =
+            nano_sortition::SnapshotChain::new(nano_sortition::SortitionSnapshot::genesis(
+                genesis.block_height,
+                nano_primitives::BitcoinHeaderHash::from_bytes(hex_array(
+                    &genesis.burn_header_hash,
+                )),
+            ));
+        assert_eq!(
+            chain.tip().sortition_hash.as_bytes(),
+            &hex_array(&genesis.sortition_hash)
+        );
+
+        for snapshot in snapshots.iter().skip(1) {
+            if snapshot.sortition != 0 {
+                break;
+            }
+            assert_eq!(
+                chain.tip().bitcoin_header_hash.as_bytes(),
+                &hex_array(&snapshot.parent_burn_header_hash)
+            );
+            let block = nano_bitcoin::BitcoinBlock {
+                height: snapshot.block_height,
+                hash: hex_array(&snapshot.burn_header_hash),
+                operations: Vec::new(),
+            };
+            let derived = chain
+                .append(&block, 0, nano_sortition::PoxId::initial())
+                .expect("contiguous captured Bitcoin block");
+            assert_eq!(
+                derived.sortition_hash.as_bytes(),
+                &hex_array(&snapshot.sortition_hash),
+                "{}",
+                snapshot.block_height
+            );
         }
     }
 
@@ -1264,6 +1325,12 @@ mod tests {
             nano_bitcoin::BitcoinOperationKind::DelegateStx { .. } => b'#',
             nano_bitcoin::BitcoinOperationKind::VoteForAggregateKey { .. } => b'v',
         }
+    }
+
+    fn hex_array(value: &str) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(value, &mut bytes).expect("fixed-size hex hash");
+        bytes
     }
 
     fn reference_bitcoin_script_pubkey(
