@@ -352,9 +352,9 @@ fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::HashMap, fs, path::Path};
 
-    use super::decode_block;
+    use super::{decode_block, decode_block_with_pre_stx};
 
     #[test]
     fn captured_bitcoin_blocks_decode_with_hacknet_magic() {
@@ -367,6 +367,25 @@ mod tests {
             let block = decode_block(0, &bytes, *b"T3")
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert_ne!(block.hash, [0; 32]);
+            assert_eq!(block.operations.len(), 3, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn captured_bitcoin_blocks_keep_prestx_sender_state() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/bitcoin/blocks");
+        let mut paths = fs::read_dir(directory)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("fixture entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut pre_stx_senders = HashMap::new();
+        for path in paths {
+            let hex = fs::read_to_string(&path).expect("read fixture block");
+            let bytes = hex::decode(hex.trim()).expect("decode fixture hex");
+            let block = decode_block_with_pre_stx(0, &bytes, *b"T3", &mut pre_stx_senders)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert_eq!(block.operations.len(), 3, "{}", path.display());
         }
     }
