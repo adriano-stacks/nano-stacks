@@ -392,6 +392,12 @@ impl Vm {
         debit_fee_in_context(store, context, payer, fee)
     }
 
+    /// Persist an account balance without changing it.
+    pub fn touch_stx_balance(&mut self, principal: &PrincipalData) -> Result<(), VmExecutionError> {
+        let Self { store, context } = self;
+        touch_stx_balance_in_context(store, context, principal)
+    }
+
     /// Store a transaction nonce in the active block state.
     pub fn set_account_nonce(
         &mut self,
@@ -1292,10 +1298,30 @@ fn debit_fee_in_context(
     );
     context.execute(|global| {
         let mut balance = global.database.get_stx_balance_snapshot(payer)?;
-        if !balance.can_transfer(u128::from(fee))? {
+        if fee != 0 && !balance.can_transfer(u128::from(fee))? {
             return Err(VmInternalError::InsufficientBalance.into());
         }
         balance.debit(u128::from(fee))?;
+        balance.save()
+    })
+}
+
+fn touch_stx_balance_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    principal: &PrincipalData,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        let mut balance = global.database.get_stx_balance_snapshot(principal)?;
+        balance.debit(0)?;
         balance.save()
     })
 }

@@ -225,13 +225,13 @@ impl ChainState {
         &mut self,
         transaction: &Transaction,
     ) -> Result<TransactionReceipt, ChainStateError> {
-        if let Some(receipt) = system_receipt(transaction) {
-            return Ok(receipt);
-        }
         let origin = transaction.origin_address().ok_or_else(|| {
             ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
         })?;
         let sender = principal_from_address(origin)?;
+        if let Some(receipt) = system_receipt(transaction) {
+            return self.execute_system_transaction(transaction, &sender, receipt);
+        }
         let sponsor = transaction
             .sponsor_address()
             .map(principal_from_address)
@@ -250,7 +250,46 @@ impl ChainState {
             ));
         }
         self.vm.debit_fee(payer, payer_condition.fee())?;
-        let result = match transaction.payload().data() {
+        let result = self.execute_payload(transaction, origin, &sender, sponsor.as_ref())?;
+        self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
+        Ok(TransactionReceipt {
+            txid: transaction.txid(),
+            result,
+        })
+    }
+
+    fn execute_system_transaction(
+        &mut self,
+        transaction: &Transaction,
+        sender: &PrincipalData,
+        receipt: TransactionReceipt,
+    ) -> Result<TransactionReceipt, ChainStateError> {
+        let fee = transaction.auth().payer().fee();
+        if fee == 0 {
+            self.vm.touch_stx_balance(sender)?;
+        } else {
+            self.vm.debit_fee(sender, fee)?;
+        }
+        if matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::NakamotoCoinbase { .. }
+        ) {
+            self.vm.set_account_nonce(
+                sender,
+                increment_nonce(transaction.auth().origin().nonce())?,
+            )?;
+        }
+        Ok(receipt)
+    }
+
+    fn execute_payload(
+        &mut self,
+        transaction: &Transaction,
+        origin: nano_address::StacksAddress,
+        sender: &PrincipalData,
+        sponsor: Option<&PrincipalData>,
+    ) -> Result<TransactionResult, ChainStateError> {
+        Ok(match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
                 amount,
@@ -258,7 +297,7 @@ impl ChainState {
             } => {
                 let recipient = principal_from_codec(recipient)?;
                 self.vm.transfer_stx(
-                    &sender,
+                    sender,
                     &recipient,
                     u128::from(*amount),
                     memo,
@@ -291,7 +330,7 @@ impl ChainState {
                 arguments,
             } => self.vm.execute_contract_call(
                 sender.clone(),
-                sponsor.clone(),
+                sponsor.cloned(),
                 contract_identifier(*address, contract_name)?,
                 function_name,
                 &arguments
@@ -301,25 +340,23 @@ impl ChainState {
                 LimitedCostTracker::new_free(),
             )?,
             _ => return Err(ChainStateError::UnsupportedPayload),
-        };
-        self.vm.set_account_nonce(
-            &sender,
-            origin_condition.nonce().checked_add(1).ok_or_else(|| {
-                ChainStateError::InvalidTransaction("origin nonce overflow".to_owned())
-            })?,
-        )?;
-        if sponsor.is_some() {
-            self.vm.set_account_nonce(
-                payer,
-                payer_condition.nonce().checked_add(1).ok_or_else(|| {
-                    ChainStateError::InvalidTransaction("payer nonce overflow".to_owned())
-                })?,
-            )?;
-        }
-        Ok(TransactionReceipt {
-            txid: transaction.txid(),
-            result,
         })
+    }
+
+    fn update_transaction_nonces(
+        &mut self,
+        sender: &PrincipalData,
+        payer: &PrincipalData,
+        sponsored: bool,
+        transaction: &Transaction,
+    ) -> Result<(), ChainStateError> {
+        let origin_nonce = increment_nonce(transaction.auth().origin().nonce())?;
+        self.vm.set_account_nonce(sender, origin_nonce)?;
+        if sponsored {
+            self.vm
+                .set_account_nonce(payer, increment_nonce(transaction.auth().payer().nonce())?)?;
+        }
+        Ok(())
     }
 }
 
@@ -335,6 +372,12 @@ fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
 
 fn temporary_state_id() -> [u8; 32] {
     *sha512_256(&[1; 52]).as_bytes()
+}
+
+fn increment_nonce(nonce: u64) -> Result<u64, ChainStateError> {
+    nonce
+        .checked_add(1)
+        .ok_or_else(|| ChainStateError::InvalidTransaction("origin nonce overflow".to_owned()))
 }
 
 fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
