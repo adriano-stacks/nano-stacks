@@ -1,12 +1,13 @@
 ---
 id: "005"
 title: "M4: implement SIP-005 transaction codec"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["003", "004"]
 tags: ["m4", "codec"]
 created_at: 2026-07-27
+completed_at: 2026-07-27
 ---
 
 # M4: implement SIP-005 transaction codec
@@ -22,7 +23,7 @@ dependencies on Stacks-Core.
 - [x] Validate and preserve all fixture transaction payloads, post-conditions,
   principals, and Clarity-value encodings.
 - [x] Compute transaction IDs and tagged transaction Merkle roots.
-- [ ] Add generated differential tests for every transaction shape and invalid
+- [x] Add generated differential tests for every transaction shape and invalid
   encoding boundary.
 - [x] Replace preserved wire sections with typed transaction payload and
   post-condition models used by execution.

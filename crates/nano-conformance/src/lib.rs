@@ -363,11 +363,16 @@ mod tests {
     use blockstack_lib::chainstate::{
         nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
         stacks::{
+            CoinbasePayload, StacksMicroblockHeader,
             StacksTransaction as ReferenceStacksTransaction,
-            StacksTransactionSigner as ReferenceStacksTransactionSigner,
+            StacksTransactionSigner as ReferenceStacksTransactionSigner, TokenTransferMemo,
             TransactionAuth as ReferenceTransactionAuth,
+            TransactionPayload as ReferenceTransactionPayload,
+            TransactionVersion as ReferenceTransactionVersion,
         },
     };
+    use clarity::vm::ClarityVersion as ReferenceClarityVersion;
+    use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
@@ -394,13 +399,17 @@ mod tests {
         codec::StacksMessageCodec,
         types::{
             PrivateKey, PublicKey,
-            chainstate::{StacksAddress as ReferenceStacksAddress, TrieHash as ReferenceTrieHash},
+            chainstate::{
+                BlockHeaderHash, StacksAddress as ReferenceStacksAddress,
+                TrieHash as ReferenceTrieHash,
+            },
         },
         util::hash::{
             Hash160 as ReferenceHash160, Sha256Sum as ReferenceSha256Sum,
             Sha512Sum as ReferenceSha512Sum, Sha512Trunc256Sum,
         },
         util::uint::Uint256 as ReferenceUint256,
+        util::vrf::VRFProof as ReferenceVrfProof,
     };
     use std::{
         fs,
@@ -923,6 +932,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_reference_payloads_round_trip_with_nano_codec() {
+        let mut payloads = reference_payloads();
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let bytes = fs::read(entry.expect("fixture entry").path()).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .expect("decode fixture block");
+            payloads.extend(block.txs.into_iter().map(|transaction| transaction.payload));
+        }
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| matches!(payload, ReferenceTransactionPayload::TenureChange(_))),
+            "fixture corpus contains a tenure-change payload"
+        );
+
+        for payload in payloads {
+            let transaction = ReferenceStacksTransaction::new(
+                ReferenceTransactionVersion::Testnet,
+                ReferenceTransactionAuth::from_p2pkh(&ReferenceSecp256k1PrivateKey::from_seed(
+                    b"nano-payload-generator",
+                ))
+                .expect("generated reference authorization is valid"),
+                payload,
+            );
+            let transaction = sign_generated_reference_transaction(transaction, 0, [0x42; 32]);
+            assert_reference_transaction_round_trip(&transaction);
+        }
+    }
+
     proptest! {
         #[test]
         fn reference_generated_transaction_round_trips_with_nano_codec(
@@ -1066,6 +1106,80 @@ mod tests {
         ReferenceStacksTransaction::consensus_deserialize(&mut cursor).is_ok_and(|_| {
             usize::try_from(cursor.position()).expect("cursor fits usize") == bytes.len()
         })
+    }
+
+    fn reference_payloads() -> Vec<ReferenceTransactionPayload> {
+        let principal: PrincipalData = StandardPrincipalData::transient().into();
+        let address = ReferenceStacksAddress::new(26, ReferenceHash160([0x24; 20]))
+            .expect("valid generated contract address");
+        let key = ReferenceSecp256k1PrivateKey::from_seed(b"nano-poison-generator");
+        let mut first = StacksMicroblockHeader {
+            version: 0,
+            sequence: 0,
+            prev_block: BlockHeaderHash([0; 32]),
+            tx_merkle_root: Sha512Trunc256Sum([0; 32]),
+            signature: ReferenceMessageSignature::empty(),
+        };
+        first.sign(&key).expect("generated microblock signs");
+        let mut second = first.clone();
+        second.sequence = 1;
+        second.sign(&key).expect("generated microblock signs");
+
+        vec![
+            ReferenceTransactionPayload::TokenTransfer(
+                principal.clone(),
+                42,
+                TokenTransferMemo([0; 34]),
+            ),
+            ReferenceTransactionPayload::new_contract_call(
+                address,
+                "contract",
+                "function",
+                vec![Value::UInt(42)],
+            )
+            .expect("generated contract call is valid"),
+            ReferenceTransactionPayload::new_smart_contract(
+                "contract",
+                "(define-public (function) (ok true))",
+                None,
+            )
+            .expect("generated smart contract is valid"),
+            ReferenceTransactionPayload::new_smart_contract(
+                "contract",
+                "(define-public (function) (ok true))",
+                Some(ReferenceClarityVersion::Clarity6),
+            )
+            .expect("generated versioned smart contract is valid"),
+            ReferenceTransactionPayload::PoisonMicroblock(first, second),
+            ReferenceTransactionPayload::Coinbase(CoinbasePayload([0; 32]), None, None),
+            ReferenceTransactionPayload::Coinbase(
+                CoinbasePayload([0; 32]),
+                Some(principal.clone()),
+                None,
+            ),
+            ReferenceTransactionPayload::Coinbase(
+                CoinbasePayload([0; 32]),
+                Some(principal),
+                Some(ReferenceVrfProof::empty()),
+            ),
+            ReferenceTransactionPayload::Coinbase(
+                CoinbasePayload([0; 32]),
+                None,
+                Some(ReferenceVrfProof::empty()),
+            ),
+        ]
+    }
+
+    fn assert_reference_transaction_round_trip(transaction: &ReferenceStacksTransaction) {
+        let mut encoded = Vec::new();
+        transaction
+            .consensus_serialize(&mut encoded)
+            .expect("serialize generated reference transaction");
+        let (nano, consumed) =
+            NanoTransaction::decode(&encoded).expect("decode generated reference transaction");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(nano.encode(), encoded);
+        assert_eq!(nano.txid().as_bytes(), transaction.txid().as_bytes());
     }
 
     fn sign_generated_reference_transaction(

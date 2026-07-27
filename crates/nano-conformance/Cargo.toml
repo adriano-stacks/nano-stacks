@@ -15,6 +15,7 @@ nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
 
 [dev-dependencies]
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 proptest = "1.11.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }

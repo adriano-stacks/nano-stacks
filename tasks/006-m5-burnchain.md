@@ -1,7 +1,7 @@
 ---
 id: "006"
 title: "M5: implement Bitcoin operation parsing"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["005"]
