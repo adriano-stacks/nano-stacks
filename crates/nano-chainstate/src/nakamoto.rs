@@ -331,6 +331,27 @@ impl std::fmt::Display for TenureError {
 
 impl std::error::Error for TenureError {}
 
+#[cfg(test)]
+mod tests {
+    use super::{SignerSet, SignerSetError};
+
+    #[test]
+    fn reward_set_rejects_zero_threshold() {
+        assert!(matches!(
+            SignerSet::from_stacked_amounts(Vec::new(), 0),
+            Err(SignerSetError::ZeroThreshold)
+        ));
+    }
+
+    #[test]
+    fn reward_set_rejects_empty_signers() {
+        assert!(matches!(
+            SignerSet::from_stacked_amounts(Vec::new(), 1),
+            Err(SignerSetError::Empty)
+        ));
+    }
+}
+
 fn validate_block(
     header: NakamotoBlockHeader,
     transactions: Vec<Transaction>,
