@@ -217,13 +217,14 @@ pub fn select_winner(
 #[must_use]
 pub fn select_epoch4_winner(
     distribution: &[BurnSample],
+    sampled_window_len: usize,
     sortition_hash: SortitionHash,
     previous_vrf_seed: [u8; 32],
     block_burn: u64,
     window_median_burn: u64,
 ) -> Option<usize> {
     let candidate = select_winner(distribution, sortition_hash, previous_vrf_seed)?;
-    let minimum_frequency = 3_usize.min(distribution.len());
+    let minimum_frequency = 3_usize.min(sampled_window_len);
     if usize::from(distribution[candidate].frequency) < minimum_frequency {
         return None;
     }
@@ -426,6 +427,22 @@ impl SnapshotChain {
         pox_id: PoxId,
         winner_vrf_seed: Option<[u8; 32]>,
     ) -> Result<&SortitionSnapshot, SortitionError> {
+        let operation_txids = block
+            .operations
+            .iter()
+            .map(|operation| operation.txid)
+            .collect::<Vec<_>>();
+        self.append_with_operations(block, &operation_txids, total_burn, pox_id, winner_vrf_seed)
+    }
+
+    pub fn append_with_operations(
+        &mut self,
+        block: &BitcoinBlock,
+        operation_txids: &[[u8; 32]],
+        total_burn: u64,
+        pox_id: PoxId,
+        winner_vrf_seed: Option<[u8; 32]>,
+    ) -> Result<&SortitionSnapshot, SortitionError> {
         let parent = self.tip();
         let expected_height = parent
             .bitcoin_height
@@ -438,13 +455,7 @@ impl SnapshotChain {
             });
         }
 
-        let operations_hash = OpsHash::from_txids(
-            &block
-                .operations
-                .iter()
-                .map(|operation| operation.txid)
-                .collect::<Vec<_>>(),
-        );
+        let operations_hash = OpsHash::from_txids(operation_txids);
         let bitcoin_header_hash = BitcoinHeaderHash::from_bytes(block.hash);
         let consensus_hash = consensus_hash(
             bitcoin_header_hash,
@@ -484,6 +495,91 @@ impl SnapshotChain {
             exponent += 1;
         }
         hashes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortitionEngine {
+    snapshots: SnapshotChain,
+    commitment_window: Vec<CommitmentWindowBlock>,
+}
+
+impl SortitionEngine {
+    #[must_use]
+    pub fn new(genesis: SortitionSnapshot) -> Self {
+        Self {
+            snapshots: SnapshotChain::new(genesis),
+            commitment_window: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn snapshots(&self) -> &SnapshotChain {
+        &self.snapshots
+    }
+
+    #[must_use]
+    pub fn commitment_window(&self) -> &[CommitmentWindowBlock] {
+        &self.commitment_window
+    }
+
+    pub fn append(
+        &mut self,
+        block: &BitcoinBlock,
+        accepted_operation_txids: &[[u8; 32]],
+        commitments: CommitmentWindowBlock,
+        pox_id: PoxId,
+    ) -> Result<&SortitionSnapshot, SortitionError> {
+        let mut window = self.commitment_window.clone();
+        window.push(commitments);
+        if window.len() > 6 {
+            window.remove(0);
+        }
+        let statistics = commitment_burn_statistics(&window)?;
+        let distribution = commitment_distribution(&window)?;
+        let next_sortition_hash = self
+            .snapshots
+            .tip()
+            .sortition_hash
+            .mix_bitcoin_header(BitcoinHeaderHash::from_bytes(block.hash));
+        let previous_vrf_seed = self
+            .snapshots
+            .snapshots()
+            .iter()
+            .rev()
+            .find_map(|snapshot| snapshot.winner_vrf_seed)
+            .unwrap_or([0; 32]);
+        let winner = (statistics.block_burn != 0)
+            .then(|| {
+                select_epoch4_winner(
+                    &distribution,
+                    window.len(),
+                    next_sortition_hash,
+                    previous_vrf_seed,
+                    statistics.block_burn,
+                    statistics.window_median_burn,
+                )
+            })
+            .flatten();
+        let winner = winner.and_then(|index| {
+            self.snapshots
+                .tip()
+                .total_burn
+                .checked_add(statistics.block_burn)
+                .map(|total_burn| (total_burn, distribution[index].candidate.vrf_seed))
+        });
+        let (total_burn, winner_vrf_seed) = winner.map_or_else(
+            || (self.snapshots.tip().total_burn, None),
+            |(total_burn, winner_vrf_seed)| (total_burn, Some(winner_vrf_seed)),
+        );
+        self.commitment_window = window;
+        self.snapshots.append_with_operations(
+            block,
+            accepted_operation_txids,
+            total_burn,
+            pox_id,
+            winner_vrf_seed,
+        )
     }
 }
 
@@ -557,8 +653,8 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitmentWindowBlock, MiningCommitment, SortitionHash, commitment_burn_statistics,
-        commitment_distribution, select_epoch4_winner, select_winner,
+        CommitmentWindowBlock, MiningCommitment, SortitionEngine, SortitionHash, SortitionSnapshot,
+        commitment_burn_statistics, commitment_distribution, select_epoch4_winner, select_winner,
     };
 
     #[test]
@@ -621,7 +717,7 @@ mod tests {
         };
         let distribution = vec![sample.clone(), sample.clone(), sample];
         assert_eq!(
-            select_epoch4_winner(&distribution, SortitionHash::initial(), [0; 32], 10, 10),
+            select_epoch4_winner(&distribution, 6, SortitionHash::initial(), [0; 32], 10, 10),
             None
         );
 
@@ -631,9 +727,52 @@ mod tests {
         };
         let distribution = vec![active.clone(), active.clone(), active];
         assert_eq!(
-            select_epoch4_winner(&distribution, SortitionHash::initial(), [0; 32], 0, 10),
+            select_epoch4_winner(&distribution, 6, SortitionHash::initial(), [0; 32], 0, 10),
             None
         );
+    }
+
+    #[test]
+    fn engine_keeps_winner_and_total_across_bitcoin_blocks() {
+        let genesis = SortitionSnapshot::genesis(0, super::BitcoinHeaderHash::from_bytes([0; 32]));
+        let mut engine = SortitionEngine::new(genesis);
+        let first = commitment(1, 0, 10);
+        let first_block = bitcoin_block(1, 1);
+        let snapshot = engine
+            .append(
+                &first_block,
+                &[first.txid],
+                CommitmentWindowBlock {
+                    commitments: vec![first.clone()],
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+                super::PoxId::initial(),
+            )
+            .expect("first sortition snapshot");
+        assert_eq!(snapshot.total_burn, 10);
+        assert_eq!(snapshot.winner_vrf_seed, Some(first.vrf_seed));
+        assert_eq!(
+            snapshot.operations_hash,
+            super::OpsHash::from_txids(&[first.txid])
+        );
+
+        let second = commitment(2, 1, 10);
+        let snapshot = engine
+            .append(
+                &bitcoin_block(2, 2),
+                &[second.txid],
+                CommitmentWindowBlock {
+                    commitments: vec![second.clone()],
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+                super::PoxId::initial(),
+            )
+            .expect("second sortition snapshot");
+        assert_eq!(snapshot.total_burn, 20);
+        assert_eq!(snapshot.winner_vrf_seed, Some(second.vrf_seed));
+        assert_eq!(engine.commitment_window().len(), 2);
     }
 
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
@@ -643,6 +782,14 @@ mod tests {
             spent_output: 3,
             burn_sats,
             vrf_seed: [0; 32],
+        }
+    }
+
+    fn bitcoin_block(height: u64, hash: u8) -> nano_bitcoin::BitcoinBlock {
+        nano_bitcoin::BitcoinBlock {
+            height,
+            hash: [hash; 32],
+            operations: Vec::new(),
         }
     }
 }
