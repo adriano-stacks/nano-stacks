@@ -157,6 +157,25 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        let applied =
+            self.execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, block)?;
+        let actual = TrieHash::from_bytes(applied.execution.state_root.0);
+        if actual != block.header.state_index_root {
+            return Err(ChainStateError::StateRootMismatch {
+                expected: block.header.state_index_root,
+                actual,
+            });
+        }
+        Ok(applied)
+    }
+
+    /// Execute a Nakamoto block without checking its header's committed state root.
+    pub fn execute_nakamoto_block_with_bitcoin_context(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let block_id = *block.block_id().as_bytes();
         self.vm
             .begin_block_with_bitcoin_context(parent, block_id, bitcoin_context)?;
@@ -174,13 +193,6 @@ impl ChainState {
             .collect::<Result<Vec<_>, _>>()?;
         self.vm.process_scheduled_unlocks()?;
         let state_root = self.vm.seal_block()?;
-        let actual = TrieHash::from_bytes(state_root.0);
-        if actual != block.header.state_index_root {
-            return Err(ChainStateError::StateRootMismatch {
-                expected: block.header.state_index_root,
-                actual,
-            });
-        }
         Ok(AppliedBlock {
             bitcoin_height: bitcoin_context.height,
             execution: ExecutionResult { state_root },

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_chainstate::{BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock};
+use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
 use nano_primitives::TrieHash;
 use serde::Deserialize;
@@ -45,6 +45,23 @@ struct CapturedBlockEvent {
     v3: u32,
     #[serde(rename = "pox_v4_unlock_height")]
     v4: u32,
+    transactions: Vec<CapturedTransaction>,
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CapturedTransaction {
+    status: String,
+    execution_cost: CapturedExecutionCost,
+}
+
+#[derive(Deserialize)]
+struct CapturedExecutionCost {
+    read_count: u64,
+    read_length: u64,
+    runtime: u64,
+    write_count: u64,
+    write_length: u64,
 }
 
 impl FixtureManifest {
@@ -345,6 +362,7 @@ pub enum ReplayDivergence {
         expected: TrieHash,
         actual: TrieHash,
     },
+    Receipt(String),
     Application(String),
     Fixture(String),
 }
@@ -533,15 +551,62 @@ fn apply_captured_block(
     bitcoin_context.v2_unlock_height = event.v2;
     bitcoin_context.v3_unlock_height = event.v3;
     bitcoin_context.v4_unlock_height = event.v4;
-    chainstate
-        .append_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
-        .map_err(|error| match error {
-            ChainStateError::StateRootMismatch { expected, actual } => {
-                ReplayDivergence::StateRoot { expected, actual }
-            }
-            error => ReplayDivergence::Application(error.to_string()),
-        })?;
+    let applied = chainstate
+        .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
+        .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
+    compare_receipts(&event, &applied.receipts)?;
+    let actual = TrieHash::from_bytes(applied.execution.state_root.0);
+    if actual != block.header.state_index_root {
+        return Err(ReplayDivergence::StateRoot {
+            expected: block.header.state_index_root,
+            actual,
+        });
+    }
     Ok(block)
+}
+
+fn compare_receipts(
+    event: &CapturedBlockEvent,
+    receipts: &[nano_chainstate::TransactionReceipt],
+) -> Result<(), ReplayDivergence> {
+    if event.transactions.len() != receipts.len() {
+        return Err(ReplayDivergence::Receipt(
+            "transaction count differs".to_owned(),
+        ));
+    }
+    for (expected, actual) in event.transactions.iter().zip(receipts) {
+        if expected.status != "success" {
+            return Err(ReplayDivergence::Receipt(
+                "non-success receipt is not implemented".to_owned(),
+            ));
+        }
+        let cost = &actual.result.cost;
+        if (
+            cost.read_count,
+            cost.read_length,
+            cost.runtime,
+            cost.write_count,
+            cost.write_length,
+        ) != (
+            expected.execution_cost.read_count,
+            expected.execution_cost.read_length,
+            expected.execution_cost.runtime,
+            expected.execution_cost.write_count,
+            expected.execution_cost.write_length,
+        ) {
+            return Err(ReplayDivergence::Receipt(
+                "execution cost differs".to_owned(),
+            ));
+        }
+    }
+    let actual_events = receipts
+        .iter()
+        .map(|receipt| receipt.result.events.len())
+        .sum::<usize>();
+    if event.events.len() != actual_events {
+        return Err(ReplayDivergence::Receipt("event count differs".to_owned()));
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for ReplayDivergence {
@@ -550,7 +615,9 @@ impl std::fmt::Display for ReplayDivergence {
             Self::StateRoot { expected, actual } => {
                 write!(formatter, "state root {expected} != {actual}")
             }
-            Self::Application(message) | Self::Fixture(message) => formatter.write_str(message),
+            Self::Application(message) | Self::Fixture(message) | Self::Receipt(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
