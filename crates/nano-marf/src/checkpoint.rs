@@ -147,7 +147,11 @@ struct Record {
 }
 
 fn read_records(path: &Path) -> Result<BTreeMap<MarfBlockId, Record>, CheckpointError> {
-    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let uri = format!("file:{}?immutable=1", path.display());
+    let connection = Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
     let mut statement = connection.prepare(
         "SELECT block_id, block_hash, external_offset FROM marf_data \
          WHERE unconfirmed = 0 AND external_length > 0",
