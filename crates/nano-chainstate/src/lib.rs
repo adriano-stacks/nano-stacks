@@ -143,6 +143,7 @@ impl ChainState {
         let block_id = *block.block_id().as_bytes();
         self.vm
             .begin_block_at_bitcoin_height(parent, block_id, snapshot.bitcoin_height)?;
+        self.vm.setup_block_metadata(block.header.timestamp)?;
         let receipts = block
             .transactions
             .iter()

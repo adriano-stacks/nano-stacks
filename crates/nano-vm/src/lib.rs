@@ -218,6 +218,12 @@ impl Vm {
         evaluate_with_tracker_in_context(store, context, source, cost_tracker)
     }
 
+    /// Store the timestamp supplied by the current Nakamoto block header.
+    pub fn setup_block_metadata(&mut self, timestamp: u64) -> Result<(), VmExecutionError> {
+        let Self { store, context } = self;
+        setup_block_metadata_in_context(store, context, timestamp)
+    }
+
     /// Publish a Clarity contract in the active block state.
     pub fn deploy_contract(
         &mut self,
@@ -1188,6 +1194,22 @@ fn clarity_database<'a>(
     bitcoin_context: &'a dyn BurnStateDB,
 ) -> ClarityDatabase<'a> {
     ClarityDatabase::new(store, &NULL_HEADER_DB, bitcoin_context)
+}
+
+fn setup_block_metadata_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    timestamp: u64,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.setup_block_metadata(Some(timestamp)))
 }
 
 #[cfg(test)]
