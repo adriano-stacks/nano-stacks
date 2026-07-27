@@ -5,7 +5,7 @@ members = [
     "crates/nano-crypto",
     "crates/nano-address",
     "crates/nano-codec",
-    "crates/nano-burnchain",
+    "crates/nano-bitcoin",
     "crates/nano-sortition",
     "crates/nano-marf",
     "crates/nano-vm",

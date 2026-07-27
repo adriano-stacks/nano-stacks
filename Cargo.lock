@@ -1241,7 +1241,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nano-burnchain"
+name = "nano-bitcoin"
 version = "0.1.0"
 
 [[package]]
@@ -1293,7 +1293,7 @@ version = "0.1.0"
 name = "nano-node"
 version = "0.1.0"
 dependencies = [
- "nano-burnchain",
+ "nano-bitcoin",
  "nano-chainstate",
  "nano-sortition",
 ]
@@ -1312,7 +1312,7 @@ dependencies = [
 name = "nano-sortition"
 version = "0.1.0"
 dependencies = [
- "nano-burnchain",
+ "nano-bitcoin",
 ]
 
 [[package]]

@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
-use nano_burnchain::BurnBlock;
+use nano_bitcoin::BitcoinBlock;
 
 /// The consensus context derived from a burn block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SortitionSnapshot {
-    pub burn_height: u64,
+    pub bitcoin_height: u64,
 }
 
 /// M0 placeholder. M6 replaces this with consensus sortition.
 #[must_use]
-pub const fn snapshot_for(block: &BurnBlock) -> SortitionSnapshot {
+pub const fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
     SortitionSnapshot {
-        burn_height: block.height,
+        bitcoin_height: block.height,
     }
 }

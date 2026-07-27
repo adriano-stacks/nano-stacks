@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-nano-burnchain = { path = "../nano-burnchain" }
+nano-bitcoin = { path = "../nano-bitcoin" }
 
 [lints]
 workspace = true
