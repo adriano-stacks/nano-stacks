@@ -16,6 +16,8 @@
               pkgs.cargo
               pkgs.clippy
               pkgs.curl
+              pkgs.openssl
+              pkgs.pkg-config
               pkgs.rustc
               pkgs.rustfmt
               pkgs.sqlite
