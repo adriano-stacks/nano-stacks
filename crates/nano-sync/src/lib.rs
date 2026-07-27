@@ -267,14 +267,14 @@ mod tests {
                 .expect("create sync client");
         let tenure = client.tenure_info().await.expect("fetch tenure info");
         let blocks = client
-            .tenure(tenure.tenure_start_block_id, Some(tenure.tip_block_id))
+            .tenure(tenure.tenure_start_block_id, None)
             .await
             .expect("fetch tenure");
 
         assert!(!blocks.is_empty());
         assert_eq!(
-            blocks.last().expect("non-empty tenure").block_id(),
-            tenure.tip_block_id
+            blocks.first().expect("non-empty tenure").block_id(),
+            tenure.tenure_start_block_id
         );
         for pair in blocks.windows(2) {
             pair[1]
