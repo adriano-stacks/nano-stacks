@@ -33,6 +33,17 @@ pub struct TenureInfo {
     pub reward_cycle: u64,
 }
 
+/// Bitcoin calendar and stacking parameters advertised by a node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoxInfo {
+    pub first_bitcoin_height: u64,
+    pub bitcoin_height: u64,
+    pub prepare_phase_length: u32,
+    pub reward_phase_length: u32,
+    pub reward_slots: u32,
+    pub rejection_fraction: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum SyncError {
     InvalidBaseUrl,
@@ -101,6 +112,19 @@ impl SyncClient {
             tip_block_id: parse_block_id(&response.tip_block_id)?,
             tip_height: response.tip_height,
             reward_cycle: response.reward_cycle,
+        })
+    }
+
+    /// Fetch the Bitcoin calendar and stacking parameters used by the node.
+    pub async fn pox_info(&self) -> Result<PoxInfo, SyncError> {
+        let response: PoxInfoWire = self.get("v2/pox").await?;
+        Ok(PoxInfo {
+            first_bitcoin_height: response.first_burnchain_block_height,
+            bitcoin_height: response.current_burnchain_block_height,
+            prepare_phase_length: response.prepare_phase_block_length,
+            reward_phase_length: response.reward_phase_block_length,
+            reward_slots: response.reward_slots,
+            rejection_fraction: response.rejection_fraction,
         })
     }
 
@@ -186,6 +210,16 @@ struct TenureInfoWire {
     reward_cycle: u64,
 }
 
+#[derive(Deserialize)]
+struct PoxInfoWire {
+    first_burnchain_block_height: u64,
+    current_burnchain_block_height: u64,
+    prepare_phase_block_length: u32,
+    reward_phase_block_length: u32,
+    reward_slots: u32,
+    rejection_fraction: Option<u64>,
+}
+
 fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {
     parse_hex(value).map(StacksBlockId::from_bytes)
 }
@@ -257,6 +291,20 @@ mod tests {
             .expect("fetch tip block");
 
         assert_eq!(block.block_id(), tenure.tip_block_id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_pox_calendar_is_available() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let calendar = client.pox_info().await.expect("fetch stacking calendar");
+
+        assert!(calendar.bitcoin_height >= calendar.first_bitcoin_height);
+        assert!(calendar.prepare_phase_length > 0);
+        assert!(calendar.reward_phase_length > 0);
+        assert!(calendar.reward_slots > 0);
     }
 
     #[tokio::test]
