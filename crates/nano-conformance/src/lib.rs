@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use nano_chainstate::{ChainState, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
+use nano_primitives::{BitcoinHeaderHash, TrieHash};
+use nano_sortition::SortitionSnapshot;
 
 /// The minimum metadata needed to make replay depth visible before fixture
 /// capture is available.
@@ -301,7 +304,20 @@ pub fn baseline_replay(manifest: FixtureManifest) -> ReplayDepth {
 /// Render a stable, human-readable progress report for local development and CI.
 #[must_use]
 pub fn scoreboard(manifest: FixtureManifest) -> String {
-    let replay = baseline_replay(manifest);
+    render_scoreboard(manifest, baseline_replay(manifest))
+}
+
+/// Render the fixture replay score using the checkpoint and captured block stream.
+#[must_use]
+pub fn scoreboard_at(root: &Path, manifest: FixtureManifest) -> String {
+    let replay = match manifest.mode {
+        FixtureMode::Baseline => baseline_replay(manifest),
+        FixtureMode::Captured => captured_replay(root, manifest),
+    };
+    render_scoreboard(manifest, replay)
+}
+
+fn render_scoreboard(manifest: FixtureManifest, replay: ReplayDepth) -> String {
     let mut output = String::from(
         "surface              oracle                     passing        first failure\n\
          ─────────────────────────────────────────────────────────────────────────────\n",
@@ -339,6 +355,100 @@ pub fn scoreboard(manifest: FixtureManifest) -> String {
         }
     );
     output
+}
+
+fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
+    let Some((source, state_root)) = checkpoint_state(root) else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+        };
+    };
+    let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
+    let Ok(mut chainstate) = ChainState::from_checkpoint(checkpoint, source, state_root) else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+        };
+    };
+    let Ok(mut entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+        };
+    };
+    let mut paths = entries
+        .by_ref()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut completed = 0;
+    let mut parent = Some(source);
+    for (offset, path) in paths.into_iter().enumerate() {
+        if completed >= manifest.replay_blocks {
+            break;
+        }
+        let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
+        let result = fs::read(path)
+            .ok()
+            .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
+            .and_then(|block| {
+                let snapshot =
+                    SortitionSnapshot::genesis(0, BitcoinHeaderHash::from_bytes([0; 32]));
+                chainstate
+                    .append_nakamoto_block(&snapshot, parent, &block)
+                    .ok()
+                    .map(|_| block)
+            });
+        let Some(block) = result else {
+            return ReplayDepth {
+                completed,
+                expected: manifest.replay_blocks,
+                first_failure: Some(block_number),
+            };
+        };
+        parent = Some(*block.block_id().as_bytes());
+        completed += 1;
+    }
+    ReplayDepth {
+        completed,
+        expected: manifest.replay_blocks,
+        first_failure: (completed < manifest.replay_blocks).then_some(completed + 1),
+    }
+}
+
+fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
+    let contents = fs::read_to_string(root.join("chainstate/checkpoint-H/checkpoint.toml")).ok()?;
+    let source = checkpoint_field(&contents, "source_state_id")?;
+    let state_root = checkpoint_field(&contents, "published_state_index_root")?;
+    Some((
+        decode_hash(source)?,
+        TrieHash::from_bytes(decode_hash(state_root)?),
+    ))
+}
+
+fn checkpoint_field<'a>(contents: &'a str, field: &str) -> Option<&'a str> {
+    contents
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(&format!("{field} = ")))
+        .map(|value| value.trim_matches('"'))
+}
+
+fn decode_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -619,6 +729,7 @@ mod tests {
         let reference_root = reference.get_root_hash_at(&ReferenceStacksBlockId(next))?;
         assert_eq!(imported_root.as_bytes(), &reference_root.0);
 
+        drop(reference);
         fs::remove_dir_all(temporary)?;
         Ok(())
     }
@@ -672,6 +783,7 @@ mod tests {
         let imported_root = imported.seal()?;
         assert_eq!(imported_root.as_bytes(), &reference_root.0);
 
+        drop(reference);
         fs::remove_dir_all(temporary)?;
         Ok(())
     }
@@ -1979,7 +2091,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before the Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("nano-stacks-fixtures-{unique}"));
+        let path = PathBuf::from("/tmp").join(format!("nano-stacks-fixtures-{unique}"));
         fs::create_dir(&path)?;
         Ok(path)
     }

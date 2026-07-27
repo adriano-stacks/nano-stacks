@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard, validate_fixture_tree};
+use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
 
 fn main() -> ExitCode {
     let command = env::args().nth(1);
@@ -32,7 +32,7 @@ fn print_scoreboard() -> ExitCode {
     let manifest_path = fixture_root().join("manifest.toml");
     match FixtureManifest::load(&manifest_path) {
         Ok(manifest) => {
-            print!("{}", scoreboard(manifest));
+            print!("{}", scoreboard_at(&fixture_root(), manifest));
             ExitCode::SUCCESS
         }
         Err(error) => {
