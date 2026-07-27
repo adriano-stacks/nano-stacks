@@ -322,16 +322,6 @@ impl Vm {
         increment_liquid_stx_supply_in_context(store, context, amount)
     }
 
-    /// Credit liquid STX to a principal without emitting a transaction event.
-    pub fn credit_stx(
-        &mut self,
-        recipient: &PrincipalData,
-        amount: u128,
-    ) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
-        credit_stx_in_context(store, context, recipient, amount)
-    }
-
     /// Publish a Clarity contract in the active block state.
     pub fn deploy_contract(
         &mut self,
@@ -1471,27 +1461,6 @@ fn set_tenure_height_in_context(
         StacksEpochId::Epoch40,
     );
     context.execute(|global| global.database.set_tenure_height(height))
-}
-
-fn credit_stx_in_context(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
-    recipient: &PrincipalData,
-    amount: u128,
-) -> Result<(), VmExecutionError> {
-    let database = clarity_database(store, bitcoin_context);
-    let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
-        database,
-        LimitedCostTracker::new_free(),
-        StacksEpochId::Epoch40,
-    );
-    context.execute(|global| {
-        let mut balance = global.database.get_stx_balance_snapshot(recipient)?;
-        balance.credit(amount)?;
-        balance.save()
-    })
 }
 
 #[cfg(test)]
