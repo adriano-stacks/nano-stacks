@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use clarity::vm::ast::build_ast;
 use clarity::vm::contexts::{ContractContext, GlobalContext};
-use clarity::vm::costs::LimitedCostTracker;
+use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
 use clarity::vm::database::{
     ClarityBackingStore, ClarityDatabase, ClarityDeserializable, MemoryBackingStore,
@@ -26,6 +26,13 @@ use stacks_common::util::hash::Sha512Trunc256Sum;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub state_root: StateRoot,
+}
+
+/// The value and consensus-cost dimensions produced by one Clarity evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Evaluation {
+    pub value: Option<Value>,
+    pub cost: ExecutionCost,
 }
 
 #[must_use]
@@ -372,13 +379,22 @@ pub fn evaluate_in_store(
     store: &mut MarfStore,
     source: &str,
 ) -> Result<Option<Value>, ClarityEvalError> {
+    Ok(evaluate_with_tracker(store, source, LimitedCostTracker::new_free())?.value)
+}
+
+/// Evaluate a Clarity 6 program with the supplied consensus cost tracker.
+pub fn evaluate_with_tracker(
+    store: &mut MarfStore,
+    source: &str,
+    cost_tracker: LimitedCostTracker,
+) -> Result<Evaluation, ClarityEvalError> {
     let contract_id = QualifiedContractIdentifier::transient();
     let database = store.as_clarity_db();
     let mut context = GlobalContext::new(
         false,
         CHAIN_ID_TESTNET,
         database,
-        LimitedCostTracker::new_free(),
+        cost_tracker,
         StacksEpochId::Epoch40,
     );
     let expressions = build_ast(
@@ -391,9 +407,13 @@ pub fn evaluate_in_store(
     .expressions;
     let mut contract = ContractContext::new(contract_id, ClarityVersion::Clarity6);
 
-    context
+    let value = context
         .execute(|global| eval_all(&expressions, &mut contract, global, None))
-        .map_err(ClarityEvalError::from)
+        .map_err(ClarityEvalError::from)?;
+    Ok(Evaluation {
+        value,
+        cost: context.cost_track.get_total(),
+    })
 }
 
 #[cfg(test)]
