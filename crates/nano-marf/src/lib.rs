@@ -181,6 +181,189 @@ pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
     TrieHash::from_bytes(*sha512_256(&bytes).as_bytes())
 }
 
+/// An in-memory, path-compressed trie using MARF's consensus node layouts.
+#[derive(Clone, Debug, Default)]
+pub struct MarfTrie {
+    root: Option<Box<TrieNode>>,
+}
+
+#[derive(Clone, Debug)]
+enum TrieNode {
+    Leaf {
+        path: Vec<u8>,
+        value: MarfValue,
+    },
+    Internal {
+        path: Vec<u8>,
+        children: Vec<(u8, Box<Self>)>,
+    },
+}
+
+impl MarfTrie {
+    pub fn insert(&mut self, key: &[u8], value: MarfValue) {
+        self.insert_path(*key_path(key).as_bytes(), value);
+    }
+
+    pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) {
+        match &mut self.root {
+            Some(root) => root.insert(&path, value),
+            None => {
+                self.root = Some(Box::new(TrieNode::Leaf {
+                    path: path.to_vec(),
+                    value,
+                }));
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn root_hash(&self) -> TrieHash {
+        self.root.as_deref().map_or(TrieHash::EMPTY, TrieNode::hash)
+    }
+}
+
+impl TrieNode {
+    fn insert(&mut self, path: &[u8], value: MarfValue) {
+        match self {
+            Self::Leaf {
+                path: leaf_path,
+                value: leaf_value,
+            } => {
+                if leaf_path == path {
+                    *leaf_value = value;
+                    return;
+                }
+
+                let shared = shared_prefix(leaf_path, path);
+                let old_character = leaf_path[shared];
+                let new_character = path[shared];
+                let old_leaf = Self::Leaf {
+                    path: leaf_path[shared + 1..].to_vec(),
+                    value: *leaf_value,
+                };
+                let new_leaf = Self::Leaf {
+                    path: path[shared + 1..].to_vec(),
+                    value,
+                };
+                *self = Self::Internal {
+                    path: leaf_path[..shared].to_vec(),
+                    children: vec![
+                        (old_character, Box::new(old_leaf)),
+                        (new_character, Box::new(new_leaf)),
+                    ],
+                };
+            }
+            Self::Internal {
+                path: node_path,
+                children,
+            } => {
+                let shared = shared_prefix(node_path, path);
+                if shared < node_path.len() {
+                    let old_character = node_path[shared];
+                    let new_character = path[shared];
+                    let old_node = Self::Internal {
+                        path: node_path[shared + 1..].to_vec(),
+                        children: std::mem::take(children),
+                    };
+                    let new_leaf = Self::Leaf {
+                        path: path[shared + 1..].to_vec(),
+                        value,
+                    };
+                    *self = Self::Internal {
+                        path: node_path[..shared].to_vec(),
+                        children: vec![
+                            (old_character, Box::new(old_node)),
+                            (new_character, Box::new(new_leaf)),
+                        ],
+                    };
+                    return;
+                }
+
+                let child_character = path[node_path.len()];
+                let suffix = &path[node_path.len() + 1..];
+                if let Some((_, child)) = children
+                    .iter_mut()
+                    .find(|(character, _)| *character == child_character)
+                {
+                    child.insert(suffix, value);
+                } else {
+                    children.push((
+                        child_character,
+                        Box::new(Self::Leaf {
+                            path: suffix.to_vec(),
+                            value,
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn hash(&self) -> TrieHash {
+        match self {
+            Self::Leaf { path, value } => leaf_hash(path, *value).expect("leaf paths are bounded"),
+            Self::Internal { path, children } => {
+                let node_id = node_id_for_children(children.len());
+                let mut pointers = vec![
+                    TriePointer {
+                        id: 0,
+                        character: 0,
+                        referenced_block: None,
+                    };
+                    node_id.pointer_count()
+                ];
+                let mut hashes = vec![TrieHash::EMPTY; node_id.pointer_count()];
+                if node_id == TrieNodeId::Node256 {
+                    for (character, child) in children {
+                        let index = usize::from(*character);
+                        pointers[index] = TriePointer {
+                            id: child.node_id() as u8,
+                            character: *character,
+                            referenced_block: None,
+                        };
+                        hashes[index] = child.hash();
+                    }
+                } else {
+                    for (index, (character, child)) in children.iter().enumerate() {
+                        pointers[index] = TriePointer {
+                            id: child.node_id() as u8,
+                            character: *character,
+                            referenced_block: None,
+                        };
+                        hashes[index] = child.hash();
+                    }
+                }
+                internal_node_hash(node_id, &pointers, path, &hashes)
+                    .expect("internally valid node layout")
+            }
+        }
+    }
+
+    fn node_id(&self) -> TrieNodeId {
+        match self {
+            Self::Leaf { .. } => TrieNodeId::Leaf,
+            Self::Internal { children, .. } => node_id_for_children(children.len()),
+        }
+    }
+}
+
+const fn node_id_for_children(children: usize) -> TrieNodeId {
+    match children {
+        0 | 1 => panic!("an internal trie node needs at least two children"),
+        2..=4 => TrieNodeId::Node4,
+        5..=16 => TrieNodeId::Node16,
+        17..=48 => TrieNodeId::Node48,
+        _ => TrieNodeId::Node256,
+    }
+}
+
+fn shared_prefix(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 /// A state root calculated by the MARF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateRoot(pub [u8; 32]);
@@ -195,7 +378,8 @@ impl StateRoot {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path, leaf_hash, state_root,
+        MarfError, MarfTrie, MarfValue, TrieNodeId, internal_node_hash, key_path, leaf_hash,
+        state_root,
     };
 
     #[test]
@@ -256,5 +440,23 @@ mod tests {
             .concat(),
         );
         assert_eq!(root.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn trie_overwrites_existing_paths_and_promotes_child_layouts() {
+        let mut trie = MarfTrie::default();
+        for index in 0_u8..=48 {
+            let mut path = [0; 32];
+            path[0] = index;
+            trie.insert_path(path, MarfValue::from_u32(u32::from(index)));
+        }
+        let root_before_overwrite = trie.root_hash();
+        let mut overwritten_path = [0; 32];
+        overwritten_path[0] = 9;
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100));
+        let overwritten_root = trie.root_hash();
+        assert_ne!(overwritten_root, root_before_overwrite);
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100));
+        assert_eq!(trie.root_hash(), overwritten_root);
     }
 }
