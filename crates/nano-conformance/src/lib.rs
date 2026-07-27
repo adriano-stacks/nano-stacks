@@ -1181,6 +1181,27 @@ mod tests {
     }
 
     #[test]
+    fn captured_nakamoto_blocks_link_to_their_predecessors() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        let mut paths = fs::read_dir(blocks)
+            .expect("read fixture blocks")
+            .map(|entry| entry.expect("fixture entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut previous = None;
+        for path in paths {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read fixture block"))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            if let Some(parent) = previous.as_ref() {
+                block
+                    .validate_successor(parent)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            }
+            previous = Some(block.header);
+        }
+    }
+
+    #[test]
     fn captured_blocks_have_the_expected_signer_weight() {
         #[derive(Deserialize)]
         struct SignerWire {
@@ -1590,14 +1611,20 @@ mod tests {
                 .expect_err("transaction signatures reject high-S"),
             CryptoError::HighS
         );
-        assert_eq!(
-            ours.public_key()
-                .verify_signer(&digest, &high_s)
-                .expect_err("signer signatures reject high-S"),
-            CryptoError::HighS
+        assert!(
+            ours.public_key().verify_signer(&digest, &high_s).is_ok(),
+            "signer signatures accept high-S"
         );
         let reference_high_s = ReferenceMessageSignature(high_s.as_bytes().to_owned());
         assert!(Secp256k1PublicKey::recover_to_pubkey(&digest, &reference_high_s).is_err());
+        assert!(
+            Secp256k1PublicKey::recover_to_pubkey_without_validating_low_s(
+                &digest,
+                &reference_high_s,
+            )
+            .is_ok(),
+            "reference accepts high-S signer signatures"
+        );
         assert!(
             Secp256k1PublicKey::from_private(&reference)
                 .verify(&digest, &reference_high_s)

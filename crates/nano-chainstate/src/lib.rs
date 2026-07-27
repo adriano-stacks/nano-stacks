@@ -4,6 +4,7 @@ mod nakamoto;
 
 pub use nakamoto::{
     NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, Signer, SignerSet, SignerSetError,
+    TenureError,
 };
 
 use clarity::vm::costs::LimitedCostTracker;

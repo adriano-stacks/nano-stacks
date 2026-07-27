@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use nano_codec::{CodecError, Transaction, transaction_merkle_root};
+use nano_codec::{CodecError, Transaction, TransactionPayloadType, transaction_merkle_root};
 use nano_crypto::{CryptoError, MessageSignature, StacksPublicKey};
 use nano_primitives::{
     BitVec, BitVecError, BlockHeaderHash, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash,
@@ -251,7 +251,50 @@ impl NakamotoBlock {
     pub fn block_id(&self) -> StacksBlockId {
         self.header.block_id()
     }
+
+    /// Validate this block's immediate chain and tenure linkage against its parent.
+    pub fn validate_successor(&self, parent: &NakamotoBlockHeader) -> Result<(), TenureError> {
+        if self.header.parent_block_id != parent.block_id() {
+            return Err(TenureError::ParentBlockId);
+        }
+        if self.header.chain_length != parent.chain_length.saturating_add(1) {
+            return Err(TenureError::ChainLength);
+        }
+        if self.header.timestamp <= parent.timestamp {
+            return Err(TenureError::Timestamp);
+        }
+        if self.header.consensus_hash != parent.consensus_hash
+            && !self.transactions.iter().any(|transaction| {
+                transaction.payload_type() == TransactionPayloadType::TenureChange
+            })
+        {
+            return Err(TenureError::MissingTenureChange);
+        }
+        Ok(())
+    }
 }
+
+/// Errors raised when a block does not link correctly to its immediate predecessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TenureError {
+    ParentBlockId,
+    ChainLength,
+    Timestamp,
+    MissingTenureChange,
+}
+
+impl std::fmt::Display for TenureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ParentBlockId => "Nakamoto block does not reference its parent",
+            Self::ChainLength => "Nakamoto block chain length does not advance by one",
+            Self::Timestamp => "Nakamoto block timestamp does not advance",
+            Self::MissingTenureChange => "new tenure has no tenure-change transaction",
+        })
+    }
+}
+
+impl std::error::Error for TenureError {}
 
 fn validate_block(
     header: NakamotoBlockHeader,

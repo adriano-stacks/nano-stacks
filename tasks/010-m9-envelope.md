@@ -18,7 +18,7 @@ Validate Nakamoto block envelopes and signer reward sets against captured blocks
 ## Tasks
 
 - [x] Decode and re-encode Nakamoto headers and transaction vectors byte-for-byte.
-- [ ] Validate tenure linkage, signer signatures, and signer-weight thresholds.
+- [x] Validate tenure linkage, signer signatures, and signer-weight thresholds.
 - [ ] Derive reward sets and compare them with captured `stacker_set` fixtures.
 
 ## Acceptance Criteria
