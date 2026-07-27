@@ -364,6 +364,7 @@ mod tests {
         nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
         stacks::{
             StacksTransaction as ReferenceStacksTransaction,
+            StacksTransactionSigner as ReferenceStacksTransactionSigner,
             TransactionAuth as ReferenceTransactionAuth,
         },
     };
@@ -928,7 +929,7 @@ mod tests {
             chain_id in any::<u32>(),
             block_index in any::<usize>(),
             transaction_index in any::<usize>(),
-            auth_shape in 0_usize..3,
+            auth_shape in 0_usize..7,
             key_material in any::<[u8; 32]>(),
         ) {
             let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
@@ -943,7 +944,7 @@ mod tests {
             let transaction_index = transaction_index % block.txs.len();
             let mut transaction = block.txs.remove(transaction_index);
             transaction.chain_id = chain_id;
-            transaction.auth = generated_reference_auth(auth_shape, key_material);
+            let transaction = sign_generated_reference_transaction(transaction, auth_shape, key_material);
 
             let mut encoded = Vec::new();
             transaction
@@ -1067,19 +1068,27 @@ mod tests {
         })
     }
 
-    fn generated_reference_auth(shape: usize, key_material: [u8; 32]) -> ReferenceTransactionAuth {
-        let keys = [0_u8, 1].map(|suffix| {
+    fn sign_generated_reference_transaction(
+        mut transaction: ReferenceStacksTransaction,
+        shape: usize,
+        key_material: [u8; 32],
+    ) -> ReferenceStacksTransaction {
+        let keys = [0_u8, 1, 2].map(|suffix| {
             let mut seed = key_material.to_vec();
             seed.push(suffix);
             ReferenceSecp256k1PrivateKey::from_seed(&seed)
         });
-        let standard = match shape % 2 {
+        let standard = match shape % 6 {
             0 => ReferenceTransactionAuth::from_p2pkh(&keys[0]),
             1 => ReferenceTransactionAuth::from_p2wpkh(&keys[0]),
+            2 => ReferenceTransactionAuth::from_p2sh(&keys, 2),
+            3 => ReferenceTransactionAuth::from_p2wsh(&keys, 2),
+            4 => ReferenceTransactionAuth::from_order_independent_p2sh(&keys, 2),
+            5 => ReferenceTransactionAuth::from_order_independent_p2wsh(&keys, 2),
             _ => unreachable!(),
         }
         .expect("generated reference authorization is valid");
-        if shape == 2 {
+        transaction.auth = if shape == 6 {
             standard
                 .into_sponsored(
                     ReferenceTransactionAuth::from_p2pkh(&keys[1])
@@ -1088,7 +1097,22 @@ mod tests {
                 .expect("generated sponsored authorization is valid")
         } else {
             standard
+        };
+        let mut signer = ReferenceStacksTransactionSigner::new(&transaction);
+        signer
+            .sign_origin(&keys[0])
+            .expect("generated origin signature is valid");
+        if (2..6).contains(&shape) {
+            signer
+                .sign_origin(&keys[1])
+                .expect("generated origin signature is valid");
         }
+        if shape == 6 {
+            signer
+                .sign_sponsor(&keys[1])
+                .expect("generated sponsor signature is valid");
+        }
+        signer.get_tx().expect("generated transaction is complete")
     }
 
     fn temporary_fixture_root() -> Result<PathBuf, std::io::Error> {
