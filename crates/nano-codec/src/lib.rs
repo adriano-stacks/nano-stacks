@@ -229,37 +229,125 @@ impl TransactionAuth {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
     bytes: Vec<u8>,
+    version: TransactionVersion,
+    chain_id: u32,
+    auth: TransactionAuth,
+    anchor_mode: AnchorMode,
+    post_condition_mode: PostConditionMode,
+    post_condition_count: u32,
+    payload_type: TransactionPayloadType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionVersion {
+    Mainnet,
+    Testnet,
+}
+
+impl TransactionVersion {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            0x00 => Ok(Self::Mainnet),
+            0x80 => Ok(Self::Testnet),
+            _ => Err(CodecError::InvalidTransaction),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnchorMode {
+    OnChainOnly,
+    OffChainOnly,
+    Any,
+}
+
+impl AnchorMode {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            1 => Ok(Self::OnChainOnly),
+            2 => Ok(Self::OffChainOnly),
+            3 => Ok(Self::Any),
+            _ => Err(CodecError::InvalidTransaction),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostConditionMode {
+    Deny,
+    Allow,
+}
+
+impl PostConditionMode {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            1 => Ok(Self::Deny),
+            2 => Ok(Self::Allow),
+            _ => Err(CodecError::InvalidTransaction),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPayloadType {
+    TokenTransfer,
+    SmartContract,
+    ContractCall,
+    PoisonMicroblock,
+    Coinbase,
+    CoinbaseToAltRecipient,
+    VersionedSmartContract,
+    TenureChange,
+    NakamotoCoinbase,
+}
+
+impl TransactionPayloadType {
+    const fn parse(value: u8) -> Result<Self, CodecError> {
+        match value {
+            0 => Ok(Self::TokenTransfer),
+            1 => Ok(Self::SmartContract),
+            2 => Ok(Self::ContractCall),
+            3 => Ok(Self::PoisonMicroblock),
+            4 => Ok(Self::Coinbase),
+            5 => Ok(Self::CoinbaseToAltRecipient),
+            6 => Ok(Self::VersionedSmartContract),
+            7 => Ok(Self::TenureChange),
+            8 => Ok(Self::NakamotoCoinbase),
+            _ => Err(CodecError::InvalidPayload),
+        }
+    }
 }
 
 impl Transaction {
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), CodecError> {
         let mut reader = Reader::new(bytes);
-        reader.byte()?;
-        reader.u32()?;
+        let version = TransactionVersion::parse(reader.byte()?)?;
+        let chain_id = reader.u32()?;
 
         let auth_start = reader.position();
-        let (_, auth_length) = TransactionAuth::decode(&bytes[auth_start..])?;
+        let (auth, auth_length) = TransactionAuth::decode(&bytes[auth_start..])?;
         reader.take(auth_length)?;
 
-        match reader.byte()? {
-            1..=3 => {}
-            _ => return Err(CodecError::InvalidTransaction),
-        }
-        match reader.byte()? {
-            1 | 2 => {}
-            _ => return Err(CodecError::InvalidTransaction),
-        }
+        let anchor_mode = AnchorMode::parse(reader.byte()?)?;
+        let post_condition_mode = PostConditionMode::parse(reader.byte()?)?;
 
         let post_conditions = reader.u32()?;
         for _ in 0..post_conditions {
             scan_post_condition(&mut reader)?;
         }
-        scan_payload(&mut reader)?;
+        let payload_type = scan_payload(&mut reader)?;
 
         let length = reader.position();
         Ok((
             Self {
                 bytes: bytes[..length].to_vec(),
+                version,
+                chain_id,
+                auth,
+                anchor_mode,
+                post_condition_mode,
+                post_condition_count: post_conditions,
+                payload_type,
             },
             length,
         ))
@@ -273,6 +361,41 @@ impl Transaction {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> TransactionVersion {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn chain_id(&self) -> u32 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub const fn auth(&self) -> &TransactionAuth {
+        &self.auth
+    }
+
+    #[must_use]
+    pub const fn anchor_mode(&self) -> AnchorMode {
+        self.anchor_mode
+    }
+
+    #[must_use]
+    pub const fn post_condition_mode(&self) -> PostConditionMode {
+        self.post_condition_mode
+    }
+
+    #[must_use]
+    pub const fn post_condition_count(&self) -> u32 {
+        self.post_condition_count
+    }
+
+    #[must_use]
+    pub const fn payload_type(&self) -> TransactionPayloadType {
+        self.payload_type
     }
 
     #[must_use]
@@ -322,18 +445,19 @@ fn tagged_hash(tag: u8, data: &[u8]) -> Sha256Sum {
     sha512_256(&bytes)
 }
 
-fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
-    match reader.byte()? {
-        0 => {
+fn scan_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadType, CodecError> {
+    let payload_type = TransactionPayloadType::parse(reader.byte()?)?;
+    match payload_type {
+        TransactionPayloadType::TokenTransfer => {
             scan_principal(reader)?;
             reader.u64()?;
             reader.take(34)?;
         }
-        1 => {
+        TransactionPayloadType::SmartContract => {
             scan_name(reader)?;
             scan_stacks_string(reader)?;
         }
-        2 => {
+        TransactionPayloadType::ContractCall => {
             reader.take(21)?;
             scan_name(reader)?;
             scan_name(reader)?;
@@ -342,7 +466,7 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
                 scan_clarity_value(reader, 0)?;
             }
         }
-        3 => {
+        TransactionPayloadType::PoisonMicroblock => {
             let first = scan_microblock_header(reader)?;
             let second = scan_microblock_header(reader)?;
             if first == second
@@ -351,10 +475,10 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
                 return Err(CodecError::InvalidPayload);
             }
         }
-        4 => {
+        TransactionPayloadType::Coinbase => {
             reader.take(32)?;
         }
-        5 => {
+        TransactionPayloadType::CoinbaseToAltRecipient => {
             reader.take(32)?;
             let value_start = reader.position();
             scan_clarity_value(reader, 0)?;
@@ -362,15 +486,15 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
                 return Err(CodecError::InvalidPayload);
             }
         }
-        6 => {
+        TransactionPayloadType::VersionedSmartContract => {
             match reader.byte()? {
-                1..=5 => {}
+                1..=6 => {}
                 _ => return Err(CodecError::InvalidPayload),
             }
             scan_name(reader)?;
             scan_stacks_string(reader)?;
         }
-        7 => {
+        TransactionPayloadType::TenureChange => {
             reader.take(20 * 3 + 32)?;
             reader.u32()?;
             if reader.byte()? > 6 {
@@ -378,7 +502,7 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
             }
             reader.take(20)?;
         }
-        8 => {
+        TransactionPayloadType::NakamotoCoinbase => {
             reader.take(32)?;
             let value_start = reader.position();
             scan_clarity_value(reader, 0)?;
@@ -388,9 +512,8 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
             }
             reader.take(80)?;
         }
-        _ => return Err(CodecError::InvalidPayload),
     }
-    Ok(())
+    Ok(payload_type)
 }
 
 #[derive(Eq, PartialEq)]
