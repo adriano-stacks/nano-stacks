@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use nano_chainstate::{NakamotoBlock, NakamotoCodecError};
 use nano_primitives::{ConsensusHash, StacksBlockId};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -36,6 +37,7 @@ pub struct TenureInfo {
 pub enum SyncError {
     InvalidBaseUrl,
     Http(reqwest::Error),
+    Block(NakamotoCodecError),
     InvalidHash,
 }
 
@@ -44,6 +46,7 @@ impl fmt::Display for SyncError {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
+            Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
         }
     }
@@ -53,6 +56,7 @@ impl std::error::Error for SyncError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
+            Self::Block(error) => Some(error),
             Self::InvalidBaseUrl | Self::InvalidHash => None,
         }
     }
@@ -100,6 +104,36 @@ impl SyncClient {
         })
     }
 
+    /// Download and validate one Nakamoto block by its block ID.
+    pub async fn block(&self, block_id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
+        let bytes = self.bytes(&format!("v3/blocks/{block_id}")).await?;
+        NakamotoBlock::decode(&bytes).map_err(SyncError::Block)
+    }
+
+    /// Download and validate all Nakamoto blocks in a tenure.
+    pub async fn tenure(
+        &self,
+        start_block_id: StacksBlockId,
+        stop_block_id: Option<StacksBlockId>,
+    ) -> Result<Vec<NakamotoBlock>, SyncError> {
+        let mut path = format!("v3/tenures/{start_block_id}");
+        if let Some(stop_block_id) = stop_block_id {
+            use std::fmt::Write;
+
+            write!(path, "?stop={stop_block_id}").expect("writing to a string cannot fail");
+        }
+        let bytes = self.bytes(&path).await?;
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (block, consumed) =
+                NakamotoBlock::decode_prefix(&bytes[offset..]).map_err(SyncError::Block)?;
+            offset = offset.checked_add(consumed).ok_or(SyncError::InvalidHash)?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, SyncError> {
         let url = self
             .base_url
@@ -113,6 +147,22 @@ impl SyncClient {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    async fn bytes(&self, path: &str) -> Result<Vec<u8>, SyncError> {
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|_| SyncError::InvalidBaseUrl)?;
+        Ok(self
+            .client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
     }
 }
 

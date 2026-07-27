@@ -202,6 +202,15 @@ impl std::error::Error for SignerSetError {
 impl NakamotoBlock {
     /// Decode one complete Nakamoto block and validate transaction uniqueness and its Merkle root.
     pub fn decode(bytes: &[u8]) -> Result<Self, NakamotoCodecError> {
+        let (block, consumed) = Self::decode_prefix(bytes)?;
+        if consumed != bytes.len() {
+            return Err(NakamotoCodecError::TrailingBytes);
+        }
+        Ok(block)
+    }
+
+    /// Decode one Nakamoto block from the front of a concatenated block stream.
+    pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), NakamotoCodecError> {
         let mut reader = Reader::new(bytes);
         let header = NakamotoBlockHeader {
             version: reader.byte()?,
@@ -228,10 +237,8 @@ impl NakamotoBlock {
             reader.advance(consumed)?;
             transactions.push(transaction);
         }
-        if !reader.is_empty() {
-            return Err(NakamotoCodecError::TrailingBytes);
-        }
-        validate_block(header, transactions)
+        let consumed = reader.offset;
+        Ok((validate_block(header, transactions)?, consumed))
     }
 
     /// Encode this block in its canonical consensus representation.
@@ -372,10 +379,6 @@ impl<'a> Reader<'a> {
 
     const fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.remaining() == 0
     }
 
     fn remaining_bytes(&self) -> &'a [u8] {

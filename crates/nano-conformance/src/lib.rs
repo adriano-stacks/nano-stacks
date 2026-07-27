@@ -1202,6 +1202,30 @@ mod tests {
     }
 
     #[test]
+    fn concatenated_nakamoto_blocks_decode_as_a_tenure_stream() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        let mut paths = fs::read_dir(blocks)
+            .expect("read fixture blocks")
+            .map(|entry| entry.expect("fixture entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let bytes = paths.iter().take(3).fold(Vec::new(), |mut bytes, path| {
+            bytes.extend(fs::read(path).expect("read fixture block"));
+            bytes
+        });
+        let mut offset = 0;
+        let mut count = 0;
+        while offset < bytes.len() {
+            let (_, consumed) = NanoNakamotoBlock::decode_prefix(&bytes[offset..])
+                .expect("decode block from tenure stream");
+            offset += consumed;
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        assert_eq!(offset, bytes.len());
+    }
+
+    #[test]
     fn captured_blocks_have_the_expected_signer_weight() {
         #[derive(Deserialize)]
         struct SignerWire {

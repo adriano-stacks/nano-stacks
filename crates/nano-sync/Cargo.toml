@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+nano-chainstate = { path = "../nano-chainstate" }
 nano-primitives = { path = "../nano-primitives" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
