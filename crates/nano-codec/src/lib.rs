@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use nano_address::StacksAddress;
 use nano_crypto::MessageSignature;
 use nano_primitives::{Hash160, Sha256Sum, sha512_256};
 
@@ -242,14 +243,15 @@ pub struct Transaction {
 pub enum TransactionVersion {
     Mainnet,
     Testnet,
+    Other(u8),
 }
 
 impl TransactionVersion {
-    const fn parse(value: u8) -> Result<Self, CodecError> {
+    const fn parse(value: u8) -> Self {
         match value {
-            0x00 => Ok(Self::Mainnet),
-            0x80 => Ok(Self::Testnet),
-            _ => Err(CodecError::InvalidTransaction),
+            0x00 => Self::Mainnet,
+            0x80 => Self::Testnet,
+            other => Self::Other(other),
         }
     }
 }
@@ -364,7 +366,7 @@ impl TransactionPayload {
 impl Transaction {
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), CodecError> {
         let mut reader = Reader::new(bytes);
-        let version = TransactionVersion::parse(reader.byte()?)?;
+        let version = TransactionVersion::parse(reader.byte()?);
         let chain_id = reader.u32()?;
 
         let auth_start = reader.position();
@@ -375,9 +377,12 @@ impl Transaction {
         let post_condition_mode = PostConditionMode::parse(reader.byte()?)?;
 
         let post_condition_count = reader.u32()?;
-        let mut post_conditions = Vec::with_capacity(
-            usize::try_from(post_condition_count).map_err(|_| CodecError::InvalidLength)?,
-        );
+        let post_condition_count =
+            usize::try_from(post_condition_count).map_err(|_| CodecError::InvalidLength)?;
+        if post_condition_count > reader.remaining() / 11 {
+            return Err(CodecError::InvalidLength);
+        }
+        let mut post_conditions = Vec::with_capacity(post_condition_count);
         for _ in 0..post_condition_count {
             let start = reader.position();
             let kind = scan_post_condition(&mut reader)?;
@@ -524,7 +529,7 @@ fn scan_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadType, Codec
             scan_stacks_string(reader)?;
         }
         TransactionPayloadType::ContractCall => {
-            reader.take(21)?;
+            scan_address(reader)?;
             scan_name(reader)?;
             scan_name(reader)?;
             let arguments = reader.u32()?;
@@ -631,9 +636,9 @@ fn scan_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionType, Cod
 fn scan_post_condition_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
     match reader.byte()? {
         1 => Ok(()),
-        2 => reader.take(21).map(|_| ()),
+        2 => scan_address(reader),
         3 => {
-            reader.take(21)?;
+            scan_address(reader)?;
             scan_name(reader)
         }
         _ => Err(CodecError::InvalidPostCondition),
@@ -641,7 +646,7 @@ fn scan_post_condition_principal(reader: &mut Reader<'_>) -> Result<(), CodecErr
 }
 
 fn scan_asset_info(reader: &mut Reader<'_>) -> Result<(), CodecError> {
-    reader.take(21)?;
+    scan_address(reader)?;
     scan_name(reader)?;
     scan_name(reader)
 }
@@ -655,13 +660,20 @@ fn scan_fungible_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
 
 fn scan_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
     match reader.byte()? {
-        5 => reader.take(21).map(|_| ()),
+        5 => scan_address(reader),
         6 => {
-            reader.take(21)?;
+            scan_address(reader)?;
             scan_name(reader)
         }
         _ => Err(CodecError::InvalidPrincipal),
     }
+}
+
+fn scan_address(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    let bytes = reader.take(21)?;
+    let hash160 = Hash160::from_bytes(bytes[1..].try_into().expect("fixed slice"));
+    StacksAddress::new(bytes[0], hash160).map_err(|_| CodecError::InvalidPrincipal)?;
+    Ok(())
 }
 
 fn scan_name(reader: &mut Reader<'_>) -> Result<(), CodecError> {
@@ -852,6 +864,9 @@ fn decode_fields(
     let nonce = reader.u64()?;
     let fee = reader.u64()?;
     let length = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
+    if length > reader.remaining() / 34 {
+        return Err(CodecError::InvalidLength);
+    }
     let mut fields = Vec::with_capacity(length);
     for _ in 0..length {
         fields.push(reader.field()?);
@@ -902,6 +917,9 @@ impl<'a> Reader<'a> {
     }
     const fn position(&self) -> usize {
         self.offset
+    }
+    const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
     fn take(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
         let end = self
@@ -965,6 +983,7 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
 #[derive(Default)]
 struct Writer {
     bytes: Vec<u8>,

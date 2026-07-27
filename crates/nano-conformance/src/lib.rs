@@ -347,7 +347,6 @@ mod tests {
         FixtureManifest, FixtureMode, FixtureStatus, baseline_replay, scoreboard,
         validate_fixture_tree,
     };
-    use blockstack_lib::chainstate::nakamoto::NakamotoBlock as ReferenceNakamotoBlock;
     use blockstack_lib::chainstate::stacks::address::{
         PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
         PoxAddressType32 as ReferencePoxAddressType32,
@@ -360,6 +359,10 @@ mod tests {
             TrieNode4 as ReferenceTrieNode4, TrieNode256 as ReferenceTrieNode256,
             TriePtr as ReferenceTriePointer,
         },
+    };
+    use blockstack_lib::chainstate::{
+        nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
+        stacks::StacksTransaction as ReferenceStacksTransaction,
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_codec::{
@@ -886,6 +889,41 @@ mod tests {
                 transaction_merkle_root(&nano_transactions).as_bytes(),
                 &block.header.tx_merkle_root.0
             );
+        }
+    }
+
+    #[test]
+    fn fixture_transaction_header_mutations_match_stacks_core_acceptance() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for transaction in block.txs {
+                let mut encoded = Vec::new();
+                transaction
+                    .consensus_serialize(&mut encoded)
+                    .expect("serialize reference transaction");
+                for index in 0..encoded.len().min(120) {
+                    let mut mutated = encoded.clone();
+                    mutated[index] ^= 0xff;
+                    let mut cursor = Cursor::new(&mutated);
+                    let reference = ReferenceStacksTransaction::consensus_deserialize(&mut cursor)
+                        .is_ok_and(|_| {
+                            usize::try_from(cursor.position()).expect("cursor fits usize")
+                                == mutated.len()
+                        });
+                    let ours = NanoTransaction::decode(&mutated)
+                        .is_ok_and(|(_, consumed)| consumed == mutated.len());
+                    assert_eq!(
+                        ours,
+                        reference,
+                        "{} transaction byte {index}",
+                        path.display()
+                    );
+                }
+            }
         }
     }
 
