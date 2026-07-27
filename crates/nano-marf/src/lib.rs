@@ -155,6 +155,19 @@ pub fn internal_node_hash(
     Ok(TrieHash::from_bytes(*sha512_256(&bytes).as_bytes()))
 }
 
+/// Fold a trie content hash into the MARF's power-of-two ancestor history.
+#[must_use]
+pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
+    let mut bytes = Vec::with_capacity(32 * (ancestor_roots.len().saturating_add(1)));
+    bytes.extend_from_slice(content.as_bytes());
+    let mut distance = 1_usize;
+    while distance <= ancestor_roots.len() {
+        bytes.extend_from_slice(ancestor_roots[distance - 1].as_bytes());
+        distance = distance.saturating_mul(2);
+    }
+    TrieHash::from_bytes(*sha512_256(&bytes).as_bytes())
+}
+
 /// A state root calculated by the MARF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateRoot(pub [u8; 32]);
@@ -168,7 +181,7 @@ impl StateRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path};
+    use super::{MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path, state_root};
 
     #[test]
     fn value_hashing_and_integer_encoding_are_canonical() {
@@ -198,5 +211,27 @@ mod tests {
             internal_node_hash(TrieNodeId::Node4, &[], b"", &[]),
             Err(MarfError::InvalidPointerCount)
         );
+    }
+
+    #[test]
+    fn state_root_selects_power_of_two_ancestors() {
+        let content = key_path(b"content");
+        let ancestors = [
+            key_path(b"one"),
+            key_path(b"two"),
+            key_path(b"three"),
+            key_path(b"four"),
+        ];
+        let root = state_root(content, &ancestors);
+        let expected = nano_primitives::sha512_256(
+            &[
+                content.as_bytes().as_slice(),
+                ancestors[0].as_bytes().as_slice(),
+                ancestors[1].as_bytes().as_slice(),
+                ancestors[3].as_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(root.as_bytes(), expected.as_bytes());
     }
 }
