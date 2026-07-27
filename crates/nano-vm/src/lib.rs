@@ -51,17 +51,50 @@ pub struct TransactionResult {
     pub events: Vec<StacksTransactionEvent>,
 }
 
+/// Bitcoin context required while executing one block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitcoinBlockContext {
+    pub height: u64,
+    pub first_height: u64,
+    pub prepare_phase_length: u32,
+    pub reward_phase_length: u32,
+    pub rejection_fraction: u64,
+}
+
+impl BitcoinBlockContext {
+    /// Construct a context when only the current Bitcoin height is available.
+    #[must_use]
+    pub const fn at_height(height: u64) -> Self {
+        Self {
+            height,
+            first_height: 0,
+            prepare_phase_length: 0,
+            reward_phase_length: 0,
+            rejection_fraction: 0,
+        }
+    }
+}
+
 /// Bitcoin state available while executing one block.
 #[derive(Debug, Default)]
 struct BitcoinContext {
     height: u32,
+    first_height: u32,
+    prepare_phase_length: u32,
+    reward_phase_length: u32,
+    rejection_fraction: u64,
 }
 
 impl BitcoinContext {
-    fn new(height: u64) -> Result<Self, MarfStoreError> {
+    fn new(context: BitcoinBlockContext) -> Result<Self, MarfStoreError> {
         Ok(Self {
-            height: u32::try_from(height)
-                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(height))?,
+            height: u32::try_from(context.height)
+                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.height))?,
+            first_height: u32::try_from(context.first_height)
+                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.first_height))?,
+            prepare_phase_length: context.prepare_phase_length,
+            reward_phase_length: context.reward_phase_length,
+            rejection_fraction: context.rejection_fraction,
         })
     }
 }
@@ -104,19 +137,20 @@ impl BurnStateDB for BitcoinContext {
     }
 
     fn get_burn_start_height(&self) -> u32 {
-        0
+        self.first_height
     }
 
     fn get_pox_prepare_length(&self) -> u32 {
-        0
+        self.prepare_phase_length
     }
 
     fn get_pox_reward_cycle_length(&self) -> u32 {
-        0
+        self.reward_phase_length
+            .saturating_add(self.prepare_phase_length)
     }
 
     fn get_pox_rejection_fraction(&self) -> u64 {
-        0
+        self.rejection_fraction
     }
 
     fn get_burn_header_hash(
@@ -204,7 +238,21 @@ impl Vm {
         block: [u8; 32],
         bitcoin_height: u64,
     ) -> Result<(), MarfStoreError> {
-        self.context = BitcoinContext::new(bitcoin_height)?;
+        self.begin_block_with_bitcoin_context(
+            parent,
+            block,
+            BitcoinBlockContext::at_height(bitcoin_height),
+        )
+    }
+
+    /// Begin execution with the complete Bitcoin context for this block.
+    pub fn begin_block_with_bitcoin_context(
+        &mut self,
+        parent: Option<[u8; 32]>,
+        block: [u8; 32],
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), MarfStoreError> {
+        self.context = BitcoinContext::new(bitcoin_context)?;
         self.store.begin(parent, block)
     }
 

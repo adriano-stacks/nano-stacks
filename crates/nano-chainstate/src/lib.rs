@@ -16,7 +16,7 @@ use nano_codec::{
 };
 use nano_primitives::{Sha256Sum, TrieHash};
 use nano_sortition::SortitionSnapshot;
-use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
+use nano_vm::{BitcoinBlockContext, ExecutionResult, MarfStoreError, TransactionResult, Vm};
 use std::path::Path;
 
 /// M0 boundary that makes the final validation stage explicit.
@@ -142,9 +142,23 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.append_nakamoto_block_with_bitcoin_context(
+            BitcoinBlockContext::at_height(snapshot.bitcoin_height),
+            parent,
+            block,
+        )
+    }
+
+    /// Execute a Nakamoto block with its complete Bitcoin context.
+    pub fn append_nakamoto_block_with_bitcoin_context(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let block_id = *block.block_id().as_bytes();
         self.vm
-            .begin_block_at_bitcoin_height(parent, block_id, snapshot.bitcoin_height)?;
+            .begin_block_with_bitcoin_context(parent, block_id, bitcoin_context)?;
         self.vm.setup_block_metadata(block.header.timestamp)?;
         if block_starts_new_tenure(block) {
             let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
@@ -166,7 +180,7 @@ impl ChainState {
             });
         }
         Ok(AppliedBlock {
-            bitcoin_height: snapshot.bitcoin_height,
+            bitcoin_height: bitcoin_context.height,
             execution: ExecutionResult { state_root },
             receipts,
         })
