@@ -51,7 +51,9 @@ struct CapturedBlockEvent {
 
 #[derive(Deserialize)]
 struct CapturedTransaction {
+    txid: String,
     status: String,
+    raw_result: String,
     execution_cost: CapturedExecutionCost,
 }
 
@@ -580,6 +582,25 @@ fn compare_receipts(
                 "non-success receipt is not implemented".to_owned(),
             ));
         }
+        if expected.txid != format!("0x{:?}", actual.txid) {
+            return Err(ReplayDivergence::Receipt(
+                "transaction ID differs".to_owned(),
+            ));
+        }
+        let raw_result = actual
+            .result
+            .value
+            .as_ref()
+            .ok_or_else(|| ReplayDivergence::Receipt("transaction result is absent".to_owned()))?
+            .serialize_to_hex()
+            .map_err(|_| {
+                ReplayDivergence::Receipt("transaction result cannot serialize".to_owned())
+            })?;
+        if expected.raw_result != format!("0x{raw_result}") {
+            return Err(ReplayDivergence::Receipt(
+                "transaction result differs".to_owned(),
+            ));
+        }
         let cost = &actual.result.cost;
         if (
             cost.read_count,
@@ -601,10 +622,18 @@ fn compare_receipts(
     }
     let actual_events = receipts
         .iter()
-        .map(|receipt| receipt.result.events.len())
-        .sum::<usize>();
-    if event.events.len() != actual_events {
-        return Err(ReplayDivergence::Receipt("event count differs".to_owned()));
+        .flat_map(|receipt| {
+            receipt
+                .result
+                .events
+                .iter()
+                .enumerate()
+                .map(move |(index, entry)| entry.json_serialize(index, &receipt.txid, true))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ReplayDivergence::Receipt("event cannot serialize".to_owned()))?;
+    if event.events != actual_events {
+        return Err(ReplayDivergence::Receipt("events differ".to_owned()));
     }
     Ok(())
 }

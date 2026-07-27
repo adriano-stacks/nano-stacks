@@ -8,6 +8,7 @@ pub use nakamoto::{
 };
 
 use clarity::vm::ClarityVersion as VmClarityVersion;
+use clarity::vm::Value;
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
@@ -327,7 +328,7 @@ fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
     .then(|| TransactionReceipt {
         txid: transaction.txid(),
         result: TransactionResult {
-            value: None,
+            value: Some(Value::okay(Value::Bool(true)).expect("boolean is a valid response")),
             cost: ExecutionCost::ZERO,
             events: Vec::new(),
         },
