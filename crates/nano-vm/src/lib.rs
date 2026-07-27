@@ -224,6 +224,18 @@ impl Vm {
         setup_block_metadata_in_context(store, context, timestamp)
     }
 
+    /// Read the tenure height stored in the active Clarity state.
+    pub fn tenure_height(&mut self) -> Result<u32, VmExecutionError> {
+        let Self { store, context } = self;
+        tenure_height_in_context(store, context)
+    }
+
+    /// Store the tenure height for a newly started tenure.
+    pub fn set_tenure_height(&mut self, height: u32) -> Result<(), VmExecutionError> {
+        let Self { store, context } = self;
+        set_tenure_height_in_context(store, context, height)
+    }
+
     /// Publish a Clarity contract in the active block state.
     pub fn deploy_contract(
         &mut self,
@@ -1210,6 +1222,37 @@ fn setup_block_metadata_in_context(
         StacksEpochId::Epoch40,
     );
     context.execute(|global| global.database.setup_block_metadata(Some(timestamp)))
+}
+
+fn tenure_height_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+) -> Result<u32, VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.get_tenure_height())
+}
+
+fn set_tenure_height_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    height: u32,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| global.database.set_tenure_height(height))
 }
 
 #[cfg(test)]

@@ -11,7 +11,9 @@ use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
-use nano_codec::{ClarityVersion, Principal, Transaction, TransactionPayloadData};
+use nano_codec::{
+    ClarityVersion, Principal, TenureChangeCause, Transaction, TransactionPayloadData,
+};
 use nano_primitives::{Sha256Sum, TrieHash};
 use nano_sortition::SortitionSnapshot;
 use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
@@ -144,6 +146,12 @@ impl ChainState {
         self.vm
             .begin_block_at_bitcoin_height(parent, block_id, snapshot.bitcoin_height)?;
         self.vm.setup_block_metadata(block.header.timestamp)?;
+        if block_starts_new_tenure(block) {
+            let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
+                ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
+            })?;
+            self.vm.set_tenure_height(next_height)?;
+        }
         let receipts = block
             .transactions
             .iter()
@@ -264,6 +272,16 @@ impl ChainState {
             result,
         })
     }
+}
+
+fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
+    block.transactions.iter().any(|transaction| {
+        matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::TenureChange(payload)
+                if payload.cause == TenureChangeCause::BlockFound
+        )
+    })
 }
 
 fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
