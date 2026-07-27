@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, NakamotoCodecError};
+use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, TenureError};
 use nano_primitives::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -67,6 +67,9 @@ pub enum SyncError {
     InvalidBaseUrl,
     Http(reqwest::Error),
     Block(NakamotoCodecError),
+    EmptyTenure,
+    TenureStart,
+    TenureLink(TenureError),
     InvalidHash,
 }
 
@@ -76,6 +79,9 @@ impl fmt::Display for SyncError {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
             Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
+            Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
+            Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
+            Self::TenureLink(error) => write!(formatter, "invalid tenure link: {error}"),
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
         }
     }
@@ -86,7 +92,10 @@ impl std::error::Error for SyncError {
         match self {
             Self::Http(error) => Some(error),
             Self::Block(error) => Some(error),
-            Self::InvalidBaseUrl | Self::InvalidHash => None,
+            Self::TenureLink(error) => Some(error),
+            Self::InvalidBaseUrl | Self::EmptyTenure | Self::TenureStart | Self::InvalidHash => {
+                None
+            }
         }
     }
 }
@@ -173,6 +182,7 @@ impl SyncClient {
             offset = offset.checked_add(consumed).ok_or(SyncError::InvalidHash)?;
             blocks.push(block);
         }
+        validate_tenure(start_block_id, &blocks)?;
         Ok(blocks)
     }
 
@@ -206,6 +216,22 @@ impl SyncClient {
             .await?
             .to_vec())
     }
+}
+
+fn validate_tenure(
+    start_block_id: StacksBlockId,
+    blocks: &[NakamotoBlock],
+) -> Result<(), SyncError> {
+    let first = blocks.first().ok_or(SyncError::EmptyTenure)?;
+    if first.block_id() != start_block_id {
+        return Err(SyncError::TenureStart);
+    }
+    for pair in blocks.windows(2) {
+        pair[1]
+            .validate_successor(&pair[0].header)
+            .map_err(SyncError::TenureLink)?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -264,9 +290,16 @@ fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use reqwest::Url;
 
-    use super::{SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash};
+    use super::{
+        SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
+        validate_tenure,
+    };
+    use nano_chainstate::{NakamotoBlock, TenureError};
+    use nano_primitives::StacksBlockId;
 
     #[test]
     fn hashes_must_be_exact_lower_or_upper_hex() {
@@ -293,6 +326,35 @@ mod tests {
         assert!(matches!(
             parse_consensus_hash("00"),
             Err(SyncError::InvalidHash)
+        ));
+    }
+
+    #[test]
+    fn tenure_validation_requires_a_contiguous_stream() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/nakamoto/blocks");
+        let mut paths = fs::read_dir(directory)
+            .expect("read fixture blocks")
+            .map(|entry| entry.expect("fixture block").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let blocks = paths
+            .into_iter()
+            .take(3)
+            .map(|path| NakamotoBlock::decode(&fs::read(path).expect("read fixture block")))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode fixture blocks");
+
+        validate_tenure(blocks[0].block_id(), &blocks).expect("valid fixture tenure");
+        assert!(matches!(
+            validate_tenure(blocks[1].block_id(), &blocks),
+            Err(SyncError::TenureStart)
+        ));
+        let mut invalid = blocks.clone();
+        invalid[1].header.parent_block_id = StacksBlockId::from_bytes([0; 32]);
+        assert!(matches!(
+            validate_tenure(blocks[0].block_id(), &invalid),
+            Err(SyncError::TenureLink(TenureError::ParentBlockId))
         ));
     }
 
