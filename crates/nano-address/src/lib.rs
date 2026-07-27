@@ -183,20 +183,22 @@ impl PoxAddress {
     }
 
     pub fn from_script_pubkey(script: &[u8], mainnet: bool) -> Result<Self, AddressError> {
-        let standard = |version, bytes| {
+        let standard = |version, hash_mode, bytes| {
             StacksAddress::new(version, Hash160::from_bytes(bytes)).map(|address| Self::Standard {
                 address,
-                hash_mode: None,
+                hash_mode: Some(hash_mode),
             })
         };
 
         match script {
             [0x76, 0xa9, 0x14, bytes @ .., 0x88, 0xac] if bytes.len() == 20 => standard(
                 if mainnet { 22 } else { 26 },
+                AddressHashMode::P2pkh,
                 bytes.try_into().expect("guarded script length"),
             ),
             [0xa9, 0x14, bytes @ .., 0x87] if bytes.len() == 20 => standard(
                 if mainnet { 20 } else { 21 },
+                AddressHashMode::P2sh,
                 bytes.try_into().expect("guarded script length"),
             ),
             [0x00, 0x14, bytes @ ..] if bytes.len() == 20 => Ok(Self::Addr20 {
