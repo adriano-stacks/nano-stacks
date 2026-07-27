@@ -1416,6 +1416,9 @@ dependencies = [
 name = "nano-chainstate"
 version = "0.1.0"
 dependencies = [
+ "clarity",
+ "nano-marf",
+ "nano-primitives",
  "nano-sortition",
  "nano-vm",
 ]
