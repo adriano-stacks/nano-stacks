@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::fmt;
+
 use nano_primitives::{TrieHash, sha512_256};
 
 /// The 40-byte value stored in a MARF leaf.
@@ -69,6 +71,90 @@ pub fn key_path(key: &[u8]) -> TrieHash {
     TrieHash::from_data(key)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TrieNodeId {
+    Leaf = 1,
+    Node4 = 2,
+    Node16 = 3,
+    Node48 = 4,
+    Node256 = 5,
+}
+
+impl TrieNodeId {
+    const fn pointer_count(self) -> usize {
+        match self {
+            Self::Leaf => 0,
+            Self::Node4 => 4,
+            Self::Node16 => 16,
+            Self::Node48 => 48,
+            Self::Node256 => 256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TriePointer {
+    pub id: u8,
+    pub character: u8,
+    pub referenced_block: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarfError {
+    InvalidPath,
+    InvalidPointerCount,
+    InvalidBackPointer,
+}
+
+impl fmt::Display for MarfError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPath => "trie path exceeds 32 bytes",
+            Self::InvalidPointerCount => "trie node has the wrong number of child pointers",
+            Self::InvalidBackPointer => "trie pointer has an invalid referenced block",
+        })
+    }
+}
+
+impl std::error::Error for MarfError {}
+
+/// Hash an internal node's consensus preimage.
+pub fn internal_node_hash(
+    id: TrieNodeId,
+    pointers: &[TriePointer],
+    path: &[u8],
+    child_hashes: &[TrieHash],
+) -> Result<TrieHash, MarfError> {
+    if path.len() > 32 {
+        return Err(MarfError::InvalidPath);
+    }
+    let pointers_match_node = pointers.len() == id.pointer_count();
+    let hashes_match_pointers = child_hashes.len() == pointers.len();
+    if !(pointers_match_node && hashes_match_pointers) {
+        return Err(MarfError::InvalidPointerCount);
+    }
+
+    let mut bytes =
+        Vec::with_capacity(1 + pointers.len() * 34 + 1 + path.len() + child_hashes.len() * 32);
+    bytes.push(id as u8);
+    for pointer in pointers {
+        bytes.push(pointer.id & 0x8f);
+        bytes.push(pointer.character);
+        match (pointer.id & 0x80 != 0, pointer.referenced_block) {
+            (true, Some(block)) => bytes.extend_from_slice(&block),
+            (false, None) => bytes.extend_from_slice(&[0; 32]),
+            _ => return Err(MarfError::InvalidBackPointer),
+        }
+    }
+    bytes.push(u8::try_from(path.len()).expect("validated path length"));
+    bytes.extend_from_slice(path);
+    for child_hash in child_hashes {
+        bytes.extend_from_slice(child_hash.as_bytes());
+    }
+    Ok(TrieHash::from_bytes(*sha512_256(&bytes).as_bytes()))
+}
+
 /// A state root calculated by the MARF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateRoot(pub [u8; 32]);
@@ -82,7 +168,7 @@ impl StateRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarfValue, key_path};
+    use super::{MarfError, MarfValue, TrieNodeId, internal_node_hash, key_path};
 
     #[test]
     fn value_hashing_and_integer_encoding_are_canonical() {
@@ -104,5 +190,13 @@ mod tests {
     #[test]
     fn empty_key_uses_the_consensus_empty_path() {
         assert_eq!(key_path(b""), nano_primitives::TrieHash::EMPTY);
+    }
+
+    #[test]
+    fn internal_node_requires_every_fixed_pointer_slot() {
+        assert_eq!(
+            internal_node_hash(TrieNodeId::Node4, &[], b"", &[]),
+            Err(MarfError::InvalidPointerCount)
+        );
     }
 }
