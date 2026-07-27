@@ -3,7 +3,7 @@
 use std::fmt;
 
 use nano_crypto::MessageSignature;
-use nano_primitives::Hash160;
+use nano_primitives::{Hash160, Sha256Sum, sha512_256};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecError {
@@ -13,6 +13,13 @@ pub enum CodecError {
     InvalidField,
     InvalidKey,
     InvalidLength,
+    InvalidTransaction,
+    InvalidPayload,
+    InvalidPostCondition,
+    InvalidPrincipal,
+    InvalidName,
+    InvalidString,
+    InvalidClarityValue,
 }
 
 impl fmt::Display for CodecError {
@@ -24,6 +31,13 @@ impl fmt::Display for CodecError {
             Self::InvalidField => "invalid authorization field",
             Self::InvalidKey => "invalid public key encoding",
             Self::InvalidLength => "invalid encoded length",
+            Self::InvalidTransaction => "invalid transaction",
+            Self::InvalidPayload => "invalid transaction payload",
+            Self::InvalidPostCondition => "invalid transaction post-condition",
+            Self::InvalidPrincipal => "invalid principal",
+            Self::InvalidName => "invalid Clarity name",
+            Self::InvalidString => "invalid Stacks string",
+            Self::InvalidClarityValue => "invalid Clarity value",
         })
     }
 }
@@ -205,6 +219,325 @@ impl TransactionAuth {
         }
         writer.finish()
     }
+}
+
+/// A complete SIP-005 transaction, retained in its canonical consensus encoding.
+///
+/// Transaction payloads contain Clarity values.  Their typed interpretation belongs
+/// to the VM boundary, but this codec validates their wire format before retaining
+/// the exact bytes needed for hashing, signing, and forwarding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Transaction {
+    bytes: Vec<u8>,
+}
+
+impl Transaction {
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), CodecError> {
+        let mut reader = Reader::new(bytes);
+        reader.byte()?;
+        reader.u32()?;
+
+        let auth_start = reader.position();
+        let (_, auth_length) = TransactionAuth::decode(&bytes[auth_start..])?;
+        reader.take(auth_length)?;
+
+        match reader.byte()? {
+            1..=3 => {}
+            _ => return Err(CodecError::InvalidTransaction),
+        }
+        match reader.byte()? {
+            1 | 2 => {}
+            _ => return Err(CodecError::InvalidTransaction),
+        }
+
+        let post_conditions = reader.u32()?;
+        for _ in 0..post_conditions {
+            scan_post_condition(&mut reader)?;
+        }
+        scan_payload(&mut reader)?;
+
+        let length = reader.position();
+        Ok((
+            Self {
+                bytes: bytes[..length].to_vec(),
+            },
+            length,
+        ))
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn txid(&self) -> Sha256Sum {
+        sha512_256(&self.bytes)
+    }
+}
+
+/// Calculate the tagged Merkle root committed by a block header.
+#[must_use]
+pub fn transaction_merkle_root(transactions: &[Transaction]) -> Sha256Sum {
+    if transactions.is_empty() {
+        return Sha256Sum::default();
+    }
+
+    let mut level: Vec<_> = transactions
+        .iter()
+        .map(|transaction| tagged_hash(0, transaction.txid().as_bytes()))
+        .collect();
+
+    if level.len() % 2 != 0 {
+        level.push(*level.last().expect("non-empty level"));
+    }
+
+    while level.len() > 1 {
+        if level.len() % 2 != 0 {
+            level.push(*level.last().expect("non-empty level"));
+        }
+        level = level
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut bytes = [0_u8; 64];
+                bytes[..32].copy_from_slice(pair[0].as_bytes());
+                bytes[32..].copy_from_slice(pair[1].as_bytes());
+                tagged_hash(1, &bytes)
+            })
+            .collect();
+    }
+
+    level[0]
+}
+
+fn tagged_hash(tag: u8, data: &[u8]) -> Sha256Sum {
+    let mut bytes = Vec::with_capacity(data.len() + 1);
+    bytes.push(tag);
+    bytes.extend_from_slice(data);
+    sha512_256(&bytes)
+}
+
+fn scan_payload(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    match reader.byte()? {
+        0 => {
+            scan_principal(reader)?;
+            reader.u64()?;
+            reader.take(34)?;
+        }
+        1 => {
+            scan_name(reader)?;
+            scan_stacks_string(reader)?;
+        }
+        2 => {
+            reader.take(21)?;
+            scan_name(reader)?;
+            scan_name(reader)?;
+            let arguments = reader.u32()?;
+            for _ in 0..arguments {
+                scan_clarity_value(reader, 0)?;
+            }
+        }
+        3 => {
+            let first = scan_microblock_header(reader)?;
+            let second = scan_microblock_header(reader)?;
+            if first == second
+                || (first.sequence != second.sequence && first.previous != second.previous)
+            {
+                return Err(CodecError::InvalidPayload);
+            }
+        }
+        4 => {
+            reader.take(32)?;
+        }
+        5 => {
+            reader.take(32)?;
+            let value_start = reader.position();
+            scan_clarity_value(reader, 0)?;
+            if reader.bytes[value_start] != 5 && reader.bytes[value_start] != 6 {
+                return Err(CodecError::InvalidPayload);
+            }
+        }
+        6 => {
+            match reader.byte()? {
+                1..=5 => {}
+                _ => return Err(CodecError::InvalidPayload),
+            }
+            scan_name(reader)?;
+            scan_stacks_string(reader)?;
+        }
+        7 => {
+            reader.take(20 * 3 + 32)?;
+            reader.u32()?;
+            if reader.byte()? > 6 {
+                return Err(CodecError::InvalidPayload);
+            }
+            reader.take(20)?;
+        }
+        8 => {
+            reader.take(32)?;
+            let value_start = reader.position();
+            scan_clarity_value(reader, 0)?;
+            let principal = &reader.bytes[value_start..reader.position()];
+            if !matches!(principal, [9] | [10, 5 | 6, ..]) {
+                return Err(CodecError::InvalidPayload);
+            }
+            reader.take(80)?;
+        }
+        _ => return Err(CodecError::InvalidPayload),
+    }
+    Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct MicroblockIdentity {
+    sequence: u16,
+    previous: [u8; 32],
+    bytes: [u8; 132],
+}
+
+fn scan_microblock_header(reader: &mut Reader<'_>) -> Result<MicroblockIdentity, CodecError> {
+    let bytes: [u8; 132] = reader.take(132)?.try_into().expect("fixed slice");
+    Ok(MicroblockIdentity {
+        sequence: u16::from_be_bytes(bytes[1..3].try_into().expect("fixed slice")),
+        previous: bytes[3..35].try_into().expect("fixed slice"),
+        bytes,
+    })
+}
+
+fn scan_post_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    match reader.byte()? {
+        0 => {
+            scan_post_condition_principal(reader)?;
+            scan_fungible_condition(reader)?;
+            reader.u64()?;
+        }
+        1 => {
+            scan_post_condition_principal(reader)?;
+            scan_asset_info(reader)?;
+            scan_fungible_condition(reader)?;
+            reader.u64()?;
+        }
+        2 => {
+            scan_post_condition_principal(reader)?;
+            scan_asset_info(reader)?;
+            scan_clarity_value(reader, 0)?;
+            match reader.byte()? {
+                0x10 | 0x11 => {}
+                _ => return Err(CodecError::InvalidPostCondition),
+            }
+        }
+        _ => return Err(CodecError::InvalidPostCondition),
+    }
+    Ok(())
+}
+
+fn scan_post_condition_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    match reader.byte()? {
+        1 => Ok(()),
+        2 => reader.take(21).map(|_| ()),
+        3 => {
+            reader.take(21)?;
+            scan_name(reader)
+        }
+        _ => Err(CodecError::InvalidPostCondition),
+    }
+}
+
+fn scan_asset_info(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    reader.take(21)?;
+    scan_name(reader)?;
+    scan_name(reader)
+}
+
+fn scan_fungible_condition(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    match reader.byte()? {
+        1..=5 => Ok(()),
+        _ => Err(CodecError::InvalidPostCondition),
+    }
+}
+
+fn scan_principal(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    match reader.byte()? {
+        5 => reader.take(21).map(|_| ()),
+        6 => {
+            reader.take(21)?;
+            scan_name(reader)
+        }
+        _ => Err(CodecError::InvalidPrincipal),
+    }
+}
+
+fn scan_name(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    let length = usize::from(reader.byte()?);
+    if length == 0 || length > 128 || !reader.take(length)?.iter().all(u8::is_ascii) {
+        return Err(CodecError::InvalidName);
+    }
+    Ok(())
+}
+
+fn scan_stacks_string(reader: &mut Reader<'_>) -> Result<(), CodecError> {
+    let length = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
+    if !reader
+        .take(length)?
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
+        return Err(CodecError::InvalidString);
+    }
+    Ok(())
+}
+
+fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecError> {
+    if depth > 32 {
+        return Err(CodecError::InvalidClarityValue);
+    }
+    match reader.byte()? {
+        0 | 1 => {
+            reader.take(16)?;
+        }
+        2 | 13 | 14 => {
+            let length = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
+            if length > 1024 * 1024 {
+                return Err(CodecError::InvalidClarityValue);
+            }
+            reader.take(length)?;
+        }
+        3 | 4 | 9 => {}
+        5 => {
+            reader.take(21)?;
+        }
+        6 => {
+            reader.take(21)?;
+            scan_name(reader)?;
+        }
+        7 | 8 | 10 => scan_clarity_value(reader, depth + 1)?,
+        11 => {
+            let length = reader.u32()?;
+            if length > 1024 * 1024 {
+                return Err(CodecError::InvalidClarityValue);
+            }
+            for _ in 0..length {
+                scan_clarity_value(reader, depth + 1)?;
+            }
+        }
+        12 => {
+            let length = reader.u32()?;
+            if length > 1024 * 1024 {
+                return Err(CodecError::InvalidClarityValue);
+            }
+            for _ in 0..length {
+                scan_name(reader)?;
+                scan_clarity_value(reader, depth + 1)?;
+            }
+        }
+        _ => return Err(CodecError::InvalidClarityValue),
+    }
+    Ok(())
 }
 
 impl SpendingCondition {

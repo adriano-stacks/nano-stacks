@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 nano-address = { path = "../nano-address" }
- nano-codec = { path = "../nano-codec" }
+nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }

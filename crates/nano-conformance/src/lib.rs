@@ -353,7 +353,10 @@ mod tests {
         PoxAddressType32 as ReferencePoxAddressType32,
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
-    use nano_codec::TransactionAuth as NanoTransactionAuth;
+    use nano_codec::{
+        Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
+        transaction_merkle_root,
+    };
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
@@ -605,6 +608,34 @@ mod tests {
                 assert_eq!(consumed, reference.len());
                 assert_eq!(nano.encode(), reference);
             }
+        }
+    }
+
+    #[test]
+    fn fixture_transactions_round_trip_with_nano_codec() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let mut nano_transactions = Vec::with_capacity(block.txs.len());
+            for transaction in &block.txs {
+                let mut reference = Vec::new();
+                transaction
+                    .consensus_serialize(&mut reference)
+                    .expect("serialize reference transaction");
+                let (nano, consumed) =
+                    NanoTransaction::decode(&reference).expect("decode transaction");
+                assert_eq!(consumed, reference.len());
+                assert_eq!(nano.encode(), reference);
+                assert_eq!(nano.txid().as_bytes(), transaction.txid().as_bytes());
+                nano_transactions.push(nano);
+            }
+            assert_eq!(
+                transaction_merkle_root(&nano_transactions).as_bytes(),
+                &block.header.tx_merkle_root.0
+            );
         }
     }
 
