@@ -1504,7 +1504,9 @@ dependencies = [
 name = "nano-vm"
 version = "0.1.0"
 dependencies = [
+ "clarity",
  "nano-marf",
+ "stacks-common",
 ]
 
 [[package]]
