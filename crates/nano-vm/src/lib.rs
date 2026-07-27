@@ -272,6 +272,16 @@ impl Vm {
         self.store.begin(parent, block)
     }
 
+    /// Begin block execution using the supplied temporary MARF state ID.
+    pub fn begin_block_execution(
+        &mut self,
+        parent: Option<[u8; 32]>,
+        temporary_state_id: [u8; 32],
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), MarfStoreError> {
+        self.begin_block_with_bitcoin_context(parent, temporary_state_id, bitcoin_context)
+    }
+
     /// Execute a Clarity 6 program with the supplied consensus cost tracker.
     pub fn execute(
         &mut self,
@@ -389,6 +399,11 @@ impl Vm {
     /// Seal the active block state.
     pub fn seal_block(&mut self) -> Result<StateRoot, MarfStoreError> {
         self.store.seal()
+    }
+
+    /// Seal the active state and store it under the committed block ID.
+    pub fn seal_block_to(&mut self, block: [u8; 32]) -> Result<StateRoot, MarfStoreError> {
+        self.store.seal_to(block)
     }
 
     /// Access the state root for a sealed block.
@@ -571,11 +586,22 @@ impl MarfStore {
 
     /// Seal the active state and return its MARF root.
     pub fn seal(&mut self) -> Result<StateRoot, MarfStoreError> {
+        let block = self
+            .active
+            .as_ref()
+            .ok_or(MarfStoreError::NoActiveState)?
+            .block;
+        self.seal_to(block)
+    }
+
+    /// Seal the active state and register it under its committed block ID.
+    pub fn seal_to(&mut self, block: [u8; 32]) -> Result<StateRoot, MarfStoreError> {
         let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
-        let root = self.marf.seal()?;
-        self.parents.insert(active.block, active.parent);
-        self.heights.insert(active.block, active.height);
-        self.states.insert(active.block, active.state);
+        let root = self.marf.seal_to(block)?;
+        self.parents.insert(block, active.parent);
+        self.heights.insert(block, active.height);
+        self.states.insert(block, active.state);
+        self.read_block = Some(block);
         Ok(StateRoot(*root.as_bytes()))
     }
 

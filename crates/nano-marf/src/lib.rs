@@ -568,13 +568,25 @@ impl VersionedMarf {
 
     /// Seal the active state and return its history-dependent root.
     pub fn seal(&mut self) -> Result<TrieHash, MarfError> {
+        let block = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?.block;
+        self.seal_to(block)
+    }
+
+    /// Seal the active state while registering it under its committed block ID.
+    ///
+    /// Block execution uses a stable temporary ID so the MARF's height keys do
+    /// not depend on a header that includes the state root being calculated.
+    pub fn seal_to(&mut self, block: MarfBlockId) -> Result<TrieHash, MarfError> {
+        if self.versions.contains_key(&block) {
+            return Err(MarfError::VersionAlreadyExists);
+        }
         let active = self.active.take().ok_or(MarfError::WriteNotBegun)?;
         let root = state_root(
             active.trie.root_hash(),
             &self.ancestor_roots(active.parent)?,
         );
         self.versions.insert(
-            active.block,
+            block,
             MarfVersion {
                 parent: active.parent,
                 height: active.height,

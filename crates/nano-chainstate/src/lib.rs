@@ -14,7 +14,7 @@ use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use nano_codec::{
     ClarityVersion, Principal, TenureChangeCause, Transaction, TransactionPayloadData,
 };
-use nano_primitives::{Sha256Sum, TrieHash};
+use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
@@ -178,7 +178,7 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let block_id = *block.block_id().as_bytes();
         self.vm
-            .begin_block_with_bitcoin_context(parent, block_id, bitcoin_context)?;
+            .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         self.vm.setup_block_metadata(block.header.timestamp)?;
         if block_starts_new_tenure(block) {
             let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
@@ -192,7 +192,7 @@ impl ChainState {
             .map(|transaction| self.execute_transaction(transaction))
             .collect::<Result<Vec<_>, _>>()?;
         self.vm.process_scheduled_unlocks()?;
-        let state_root = self.vm.seal_block()?;
+        let state_root = self.vm.seal_block_to(block_id)?;
         Ok(AppliedBlock {
             bitcoin_height: bitcoin_context.height,
             execution: ExecutionResult { state_root },
@@ -310,6 +310,10 @@ fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
                 if payload.cause == TenureChangeCause::BlockFound
         )
     })
+}
+
+fn temporary_state_id() -> [u8; 32] {
+    *sha512_256(&[1; 52]).as_bytes()
 }
 
 fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
