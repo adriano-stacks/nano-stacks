@@ -59,6 +59,10 @@ pub struct BitcoinBlockContext {
     pub prepare_phase_length: u32,
     pub reward_phase_length: u32,
     pub rejection_fraction: u64,
+    pub v1_unlock_height: u32,
+    pub v2_unlock_height: u32,
+    pub v3_unlock_height: u32,
+    pub v4_unlock_height: u32,
 }
 
 impl BitcoinBlockContext {
@@ -71,6 +75,10 @@ impl BitcoinBlockContext {
             prepare_phase_length: 0,
             reward_phase_length: 0,
             rejection_fraction: 0,
+            v1_unlock_height: u32::MAX,
+            v2_unlock_height: u32::MAX,
+            v3_unlock_height: u32::MAX,
+            v4_unlock_height: u32::MAX,
         }
     }
 }
@@ -83,6 +91,10 @@ struct BitcoinContext {
     prepare_phase_length: u32,
     reward_phase_length: u32,
     rejection_fraction: u64,
+    v1_unlock_height: u32,
+    v2_unlock_height: u32,
+    v3_unlock_height: u32,
+    v4_unlock_height: u32,
 }
 
 impl BitcoinContext {
@@ -95,6 +107,10 @@ impl BitcoinContext {
             prepare_phase_length: context.prepare_phase_length,
             reward_phase_length: context.reward_phase_length,
             rejection_fraction: context.rejection_fraction,
+            v1_unlock_height: context.v1_unlock_height,
+            v2_unlock_height: context.v2_unlock_height,
+            v3_unlock_height: context.v3_unlock_height,
+            v4_unlock_height: context.v4_unlock_height,
         })
     }
 }
@@ -109,15 +125,15 @@ impl BurnStateDB for BitcoinContext {
     }
 
     fn get_v1_unlock_height(&self) -> u32 {
-        u32::MAX
+        self.v1_unlock_height
     }
 
     fn get_v2_unlock_height(&self) -> u32 {
-        u32::MAX
+        self.v2_unlock_height
     }
 
     fn get_v3_unlock_height(&self) -> u32 {
-        u32::MAX
+        self.v3_unlock_height
     }
 
     fn get_pox_3_activation_height(&self) -> u32 {
@@ -129,7 +145,7 @@ impl BurnStateDB for BitcoinContext {
     }
 
     fn get_pox_5_activation_height(&self) -> u32 {
-        u32::MAX
+        self.v4_unlock_height
     }
 
     fn get_burn_block_height(&self, _sortition_id: &SortitionId) -> Option<u32> {

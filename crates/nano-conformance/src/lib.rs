@@ -7,10 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_chainstate::{ChainState, ChainStateError, NakamotoBlock};
+use nano_chainstate::{BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock};
 use nano_node::{BaselineSource, ReplayFailure, replay_one};
-use nano_primitives::{BitcoinHeaderHash, TrieHash};
-use nano_sortition::SortitionSnapshot;
+use nano_primitives::TrieHash;
 use serde::Deserialize;
 
 /// The minimum metadata needed to make replay depth visible before fixture
@@ -34,6 +33,18 @@ struct CapturedBitcoinSnapshot {
     block_height: u64,
     burn_header_hash: String,
     consensus_hash: String,
+}
+
+#[derive(Deserialize)]
+struct CapturedBlockEvent {
+    #[serde(rename = "pox_v1_unlock_height")]
+    v1: u32,
+    #[serde(rename = "pox_v2_unlock_height")]
+    v2: u32,
+    #[serde(rename = "pox_v3_unlock_height")]
+    v3: u32,
+    #[serde(rename = "pox_v4_unlock_height")]
+    v4: u32,
 }
 
 impl FixtureManifest {
@@ -468,7 +479,7 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let block = match apply_captured_block(&mut chainstate, &snapshots, parent, &path) {
+        let block = match apply_captured_block(root, &mut chainstate, &snapshots, parent, &path) {
             Ok(block) => block,
             Err(divergence) => {
                 return ReplayDepth {
@@ -491,8 +502,9 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
 }
 
 fn apply_captured_block(
+    root: &Path,
     chainstate: &mut ChainState,
-    snapshots: &BTreeMap<String, SortitionSnapshot>,
+    snapshots: &BTreeMap<String, BitcoinBlockContext>,
     parent: Option<[u8; 32]>,
     path: &Path,
 ) -> Result<NakamotoBlock, ReplayDivergence> {
@@ -500,15 +512,29 @@ fn apply_captured_block(
         fs::read(path).map_err(|_| ReplayDivergence::Fixture("block cannot be read".to_owned()))?;
     let block = NakamotoBlock::decode(&bytes)
         .map_err(|_| ReplayDivergence::Fixture("block cannot be decoded".to_owned()))?;
-    let snapshot = snapshots
+    let mut bitcoin_context = *snapshots
         .get(&block.header.consensus_hash.to_string())
         .ok_or_else(|| {
             ReplayDivergence::Fixture(
                 "block consensus hash is absent from captured Bitcoin snapshots".to_owned(),
             )
         })?;
+    let event_path = root.join("events/new_block").join(
+        path.file_stem()
+            .map(|name| format!("{}.json", name.to_string_lossy()))
+            .ok_or_else(|| ReplayDivergence::Fixture("block has no file name".to_owned()))?,
+    );
+    let event: CapturedBlockEvent = serde_json::from_slice(
+        &fs::read(event_path)
+            .map_err(|_| ReplayDivergence::Fixture("block event cannot be read".to_owned()))?,
+    )
+    .map_err(|_| ReplayDivergence::Fixture("block event cannot be decoded".to_owned()))?;
+    bitcoin_context.v1_unlock_height = event.v1;
+    bitcoin_context.v2_unlock_height = event.v2;
+    bitcoin_context.v3_unlock_height = event.v3;
+    bitcoin_context.v4_unlock_height = event.v4;
     chainstate
-        .append_nakamoto_block(snapshot, parent, &block)
+        .append_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
         .map_err(|error| match error {
             ChainStateError::StateRootMismatch { expected, actual } => {
                 ReplayDivergence::StateRoot { expected, actual }
@@ -529,7 +555,7 @@ impl std::fmt::Display for ReplayDivergence {
     }
 }
 
-fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, SortitionSnapshot>> {
+fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlockContext>> {
     let snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
     snapshots
@@ -537,10 +563,7 @@ fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, SortitionS
         .map(|snapshot| {
             Some((
                 snapshot.consensus_hash,
-                SortitionSnapshot::genesis(
-                    snapshot.block_height,
-                    BitcoinHeaderHash::from_bytes(decode_hash(&snapshot.burn_header_hash)?),
-                ),
+                BitcoinBlockContext::at_height(snapshot.block_height),
             ))
         })
         .collect()

@@ -54,6 +54,10 @@ impl PoxInfo {
             prepare_phase_length: self.prepare_phase_length,
             reward_phase_length: self.reward_phase_length,
             rejection_fraction: self.rejection_fraction.unwrap_or(0),
+            v1_unlock_height: u32::MAX,
+            v2_unlock_height: u32::MAX,
+            v3_unlock_height: u32::MAX,
+            v4_unlock_height: u32::MAX,
         }
     }
 }
