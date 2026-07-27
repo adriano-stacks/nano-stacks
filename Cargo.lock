@@ -1487,6 +1487,7 @@ name = "nano-sortition"
 version = "0.1.0"
 dependencies = [
  "nano-bitcoin",
+ "nano-primitives",
 ]
 
 [[package]]
