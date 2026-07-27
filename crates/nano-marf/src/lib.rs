@@ -6,7 +6,7 @@ use nano_primitives::{TrieHash, sha512_256};
 
 mod checkpoint;
 
-pub use checkpoint::{CheckpointError, import_checkpoint};
+pub use checkpoint::{CheckpointError, import_checkpoint, import_pcs};
 
 /// The 40-byte value stored in a MARF leaf.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

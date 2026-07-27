@@ -5,6 +5,7 @@ use std::{
 };
 
 use rusqlite::Connection;
+use serde::Deserialize;
 
 use crate::{
     MarfBlockId, MarfTrie, MarfValue, MarfVersion, TrieChild, TrieHash, TrieNode, TrieNodeId,
@@ -22,6 +23,7 @@ pub enum CheckpointError {
     Io(std::io::Error),
     Sql(rusqlite::Error),
     InvalidCheckpoint(&'static str),
+    InvalidManifest(String),
     MissingBlock(MarfBlockId),
     RootMismatch {
         expected: TrieHash,
@@ -36,6 +38,7 @@ impl std::fmt::Display for CheckpointError {
             Self::Io(error) => write!(formatter, "checkpoint I/O error: {error}"),
             Self::Sql(error) => write!(formatter, "checkpoint SQLite error: {error}"),
             Self::InvalidCheckpoint(reason) => write!(formatter, "invalid checkpoint: {reason}"),
+            Self::InvalidManifest(reason) => write!(formatter, "invalid PCS manifest: {reason}"),
             Self::MissingBlock(block) => write!(
                 formatter,
                 "checkpoint references missing block {block:02x?}"
@@ -59,11 +62,28 @@ impl std::error::Error for CheckpointError {
             Self::Io(error) => Some(error),
             Self::Sql(error) => Some(error),
             Self::InvalidCheckpoint(_)
+            | Self::InvalidManifest(_)
             | Self::MissingBlock(_)
             | Self::RootMismatch { .. }
             | Self::UnsupportedPatch => None,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct PcsManifest {
+    snapshot: PcsSnapshot,
+    roots: PcsRoots,
+}
+
+#[derive(Deserialize)]
+struct PcsSnapshot {
+    block_hash: String,
+}
+
+#[derive(Deserialize)]
+struct PcsRoots {
+    clarity_archival_marf_root_hash: Option<String>,
 }
 
 impl From<std::io::Error> for CheckpointError {
@@ -136,6 +156,27 @@ pub fn import_checkpoint(
         versions,
         active: None,
     })
+}
+
+/// Import the Clarity MARF from a standard marf-squash PCS directory.
+pub fn import_pcs(root: impl AsRef<Path>) -> Result<VersionedMarf, CheckpointError> {
+    let pcs_root = root.as_ref();
+    let manifest = fs::read_to_string(pcs_root.join("PCS_manifest.toml"))?;
+    let manifest: PcsManifest = toml::from_str(&manifest)
+        .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
+    let source = parse_hex(&manifest.snapshot.block_hash)?;
+    let expected_root = manifest
+        .roots
+        .clarity_archival_marf_root_hash
+        .as_deref()
+        .ok_or(CheckpointError::InvalidCheckpoint(
+            "PCS manifest has no Clarity archival MARF root",
+        ))?;
+    import_checkpoint(
+        pcs_root.join("chainstate/vm/clarity/marf.sqlite"),
+        source,
+        TrieHash::from_bytes(parse_hex(expected_root)?),
+    )
 }
 
 #[derive(Clone)]
@@ -568,21 +609,23 @@ fn replace_pointer(
 }
 
 fn parse_block(value: &str) -> Result<MarfBlockId, CheckpointError> {
-    if value.len() != 64 {
+    parse_hex(value)
+}
+
+fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], CheckpointError> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.len() != LENGTH * 2 {
         return Err(CheckpointError::InvalidCheckpoint(
-            "block hash is not 32 bytes",
+            "hash has the wrong length",
         ));
     }
-    let mut bytes = [0; 32];
+    let mut bytes = [0; LENGTH];
     for (index, byte) in bytes.iter_mut().enumerate() {
-        let text =
-            value
-                .get(index * 2..index * 2 + 2)
-                .ok_or(CheckpointError::InvalidCheckpoint(
-                    "block hash is truncated",
-                ))?;
+        let text = value
+            .get(index * 2..index * 2 + 2)
+            .ok_or(CheckpointError::InvalidCheckpoint("hash is truncated"))?;
         *byte = u8::from_str_radix(text, 16)
-            .map_err(|_| CheckpointError::InvalidCheckpoint("block hash is not hexadecimal"))?;
+            .map_err(|_| CheckpointError::InvalidCheckpoint("hash is not hexadecimal"))?;
     }
     Ok(bytes)
 }
