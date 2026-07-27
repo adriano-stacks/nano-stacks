@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use nano_bitcoin::BitcoinBlock;
-use nano_primitives::{BitcoinHeaderHash, ConsensusHash, hash160, sha256};
+use nano_primitives::{BitcoinHeaderHash, ConsensusHash, Uint256, Uint512, hash160, sha256};
 
 const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23, 0, 0, 0];
 
@@ -55,6 +55,202 @@ impl SortitionHash {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MiningCommitment {
+    pub txid: [u8; 32],
+    pub spent_txid: [u8; 32],
+    pub spent_output: u32,
+    pub burn_sats: u64,
+    pub vrf_seed: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissedCommitment {
+    pub txid: [u8; 32],
+    pub spent_txid: [u8; 32],
+    pub spent_output: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentWindowBlock {
+    pub commitments: Vec<MiningCommitment>,
+    pub missed_commitments: Vec<MissedCommitment>,
+    pub requires_single_commit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BurnSample {
+    pub candidate: MiningCommitment,
+    pub burn_sats: u64,
+    pub median_burn_sats: u64,
+    pub frequency: u8,
+    pub range_start: Uint256,
+    pub range_end: Uint256,
+}
+
+pub fn commitment_distribution(
+    window: &[CommitmentWindowBlock],
+) -> Result<Vec<BurnSample>, SortitionError> {
+    let Some((latest, earlier)) = window.split_last() else {
+        return Err(SortitionError::EmptyCommitmentWindow);
+    };
+    let window_len = u8::try_from(window.len()).map_err(|_| SortitionError::WindowTooLong)?;
+    let mut linked = latest
+        .commitments
+        .iter()
+        .cloned()
+        .map(|commitment| vec![Link::Commitment(commitment)])
+        .collect::<Vec<_>>();
+
+    for block in earlier.iter().rev() {
+        let expected_output = if block.requires_single_commit { 2 } else { 3 };
+        let mut commitments = block
+            .commitments
+            .iter()
+            .cloned()
+            .map(|commitment| (commitment.txid, commitment))
+            .collect::<HashMap<_, _>>();
+        let mut missed = block
+            .missed_commitments
+            .iter()
+            .cloned()
+            .map(|commitment| (commitment.txid, commitment))
+            .collect::<HashMap<_, _>>();
+        for chain in &mut linked {
+            let Some(last) = chain.last() else {
+                return Err(SortitionError::InvalidCommitmentWindow);
+            };
+            let (spent_txid, spent_output) = last.spent();
+            if spent_output != expected_output {
+                chain.push(Link::Missing);
+            } else if let Some(commitment) = commitments.remove(&spent_txid) {
+                chain.push(Link::Commitment(commitment));
+            } else if let Some(commitment) = missed.remove(&spent_txid) {
+                chain.push(Link::Missed(commitment));
+            } else {
+                chain.push(Link::Missing);
+            }
+        }
+    }
+
+    let mut samples = linked
+        .into_iter()
+        .map(|chain| make_burn_sample(&chain, window_len))
+        .collect::<Result<Vec<_>, _>>()?;
+    assign_ranges(&mut samples)?;
+    Ok(samples)
+}
+
+#[must_use]
+pub fn select_winner(
+    distribution: &[BurnSample],
+    sortition_hash: SortitionHash,
+    previous_vrf_seed: [u8; 32],
+) -> Option<usize> {
+    if distribution.is_empty() {
+        return None;
+    }
+    if distribution.len() == 1 {
+        return Some(0);
+    }
+    let point =
+        Uint256::from_little_endian(sortition_hash.mix_vrf_seed(previous_vrf_seed).as_bytes());
+    distribution
+        .iter()
+        .position(|sample| sample.range_start <= point && point < sample.range_end)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Link {
+    Commitment(MiningCommitment),
+    Missed(MissedCommitment),
+    Missing,
+}
+
+impl Link {
+    const fn burn_sats(&self) -> u64 {
+        match self {
+            Self::Commitment(commitment) => commitment.burn_sats,
+            Self::Missed(_) | Self::Missing => 1,
+        }
+    }
+
+    const fn spent(&self) -> ([u8; 32], u32) {
+        match self {
+            Self::Commitment(commitment) => (commitment.spent_txid, commitment.spent_output),
+            Self::Missed(commitment) => (commitment.spent_txid, commitment.spent_output),
+            Self::Missing => ([0; 32], u32::MAX),
+        }
+    }
+}
+
+fn make_burn_sample(chain: &[Link], window_len: u8) -> Result<BurnSample, SortitionError> {
+    let Some(Link::Commitment(candidate)) = chain.first() else {
+        return Err(SortitionError::InvalidCommitmentWindow);
+    };
+    if chain.len() != usize::from(window_len) {
+        return Err(SortitionError::InvalidCommitmentWindow);
+    }
+    let burns = chain.iter().map(Link::burn_sats).collect::<Vec<_>>();
+    let mut sorted = burns.clone();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    let median_burn_sats = if sorted.len() % 2 == 0 {
+        u64::try_from(u128::midpoint(
+            u128::from(sorted[middle - 1]),
+            u128::from(sorted[middle]),
+        ))
+        .expect("median of two u64 values fits u64")
+    } else {
+        sorted[middle]
+    };
+    Ok(BurnSample {
+        candidate: candidate.clone(),
+        burn_sats: burns[0].min(median_burn_sats),
+        median_burn_sats,
+        frequency: u8::try_from(
+            chain
+                .iter()
+                .filter(|link| !matches!(link, Link::Missing))
+                .count(),
+        )
+        .expect("commitment window fits u8"),
+        range_start: Uint256::zero(),
+        range_end: Uint256::zero(),
+    })
+}
+
+fn assign_ranges(samples: &mut [BurnSample]) -> Result<(), SortitionError> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    if samples.len() == 1 {
+        samples[0].range_end = Uint256::MAX;
+        return Ok(());
+    }
+    let total = samples.iter().try_fold(0_u64, |total, sample| {
+        total
+            .checked_add(sample.burn_sats)
+            .ok_or(SortitionError::BurnOverflow)
+    })?;
+    if total == 0 {
+        return Err(SortitionError::ZeroBurnDistribution);
+    }
+    let mut accumulated = 0_u64;
+    let mut range_end = Uint256::zero();
+    for sample in samples {
+        sample.range_start = range_end;
+        accumulated = accumulated
+            .checked_add(sample.burn_sats)
+            .ok_or(SortitionError::BurnOverflow)?;
+        let scaled = Uint512::from(Uint256::MAX) * Uint512::from(accumulated);
+        range_end = Uint256::try_from(scaled / Uint512::from(total))
+            .expect("scaled sortition range fits Uint256");
+        sample.range_end = range_end;
+    }
+    Ok(())
 }
 
 /// The reward-cycle fork history committed to by a consensus hash.
@@ -249,6 +445,11 @@ fn consensus_hash(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SortitionError {
+    EmptyCommitmentWindow,
+    InvalidCommitmentWindow,
+    WindowTooLong,
+    BurnOverflow,
+    ZeroBurnDistribution,
     HeightOverflow,
     UnexpectedHeight { expected: u64, actual: u64 },
 }
@@ -256,6 +457,13 @@ pub enum SortitionError {
 impl fmt::Display for SortitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyCommitmentWindow => formatter.write_str("commitment window is empty"),
+            Self::InvalidCommitmentWindow => formatter.write_str("commitment window is invalid"),
+            Self::WindowTooLong => formatter.write_str("commitment window exceeds 255 blocks"),
+            Self::BurnOverflow => formatter.write_str("commitment burn amount overflow"),
+            Self::ZeroBurnDistribution => {
+                formatter.write_str("commitment distribution has no burn")
+            }
             Self::HeightOverflow => formatter.write_str("Bitcoin height overflow"),
             Self::UnexpectedHeight { expected, actual } => {
                 write!(
@@ -274,4 +482,51 @@ impl std::error::Error for SortitionError {}
 pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
     let bitcoin_header_hash = BitcoinHeaderHash::from_bytes(block.hash);
     SortitionSnapshot::genesis(block.height, bitcoin_header_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CommitmentWindowBlock, MiningCommitment, SortitionHash, commitment_distribution,
+        select_winner,
+    };
+
+    #[test]
+    fn commitment_distribution_uses_minimum_median_burns() {
+        let prior = commitment(1, 0, 5);
+        let linked = commitment(2, 1, 9);
+        let unlinked = commitment(3, 9, 8);
+        let distribution = commitment_distribution(&[
+            CommitmentWindowBlock {
+                commitments: vec![prior],
+                missed_commitments: Vec::new(),
+                requires_single_commit: false,
+            },
+            CommitmentWindowBlock {
+                commitments: vec![linked, unlinked],
+                missed_commitments: Vec::new(),
+                requires_single_commit: false,
+            },
+        ])
+        .expect("valid commitment window");
+
+        assert_eq!(distribution[0].burn_sats, 7);
+        assert_eq!(distribution[0].median_burn_sats, 7);
+        assert_eq!(distribution[0].frequency, 2);
+        assert_eq!(distribution[1].burn_sats, 4);
+        assert_eq!(distribution[1].frequency, 1);
+        assert_eq!(distribution[0].range_start, super::Uint256::zero());
+        assert_eq!(distribution[1].range_end, super::Uint256::MAX);
+        assert!(select_winner(&distribution, SortitionHash::initial(), [0; 32]).is_some());
+    }
+
+    fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
+        MiningCommitment {
+            txid: [txid; 32],
+            spent_txid: [spent_txid; 32],
+            spent_output: 3,
+            burn_sats,
+            vrf_seed: [0; 32],
+        }
+    }
 }

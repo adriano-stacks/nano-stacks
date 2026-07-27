@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-pub use primitive_types::U256 as Uint256;
+pub use primitive_types::{U256 as Uint256, U512 as Uint512};
 use ripemd::{Digest as RipemdDigest, Ripemd160};
 use sha2::{Sha256, Sha512, Sha512_256};
 
