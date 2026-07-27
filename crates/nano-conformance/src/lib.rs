@@ -373,8 +373,8 @@ mod tests {
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
     use nano_marf::{
-        MarfTrie, MarfValue, TrieNodeId, TriePointer, import_checkpoint, internal_node_hash,
-        key_path, leaf_hash,
+        MarfTrie, MarfValue, TrieNodeId, TriePointer, import_checkpoint, import_pcs,
+        internal_node_hash, key_path, leaf_hash,
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use proptest::prelude::*;
@@ -519,6 +519,33 @@ mod tests {
             .join("fixtures/chainstate/checkpoint-H/marf.sqlite");
         let imported = import_checkpoint(checkpoint, source, root).expect("imports checkpoint");
         assert_eq!(imported.root(source), Some(root));
+    }
+
+    #[test]
+    fn pcs_layout_import_uses_the_manifest_root() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
+        let root = temporary_fixture_root()?;
+        let clarity = root.join("chainstate/vm/clarity");
+        fs::create_dir_all(&clarity)?;
+        fs::copy(fixture.join("marf.sqlite"), clarity.join("marf.sqlite"))?;
+        fs::copy(
+            fixture.join("marf.sqlite.blobs"),
+            clarity.join("marf.sqlite.blobs"),
+        )?;
+        write_file(
+            &root.join("PCS_manifest.toml"),
+            "[snapshot]\nblock_hash = \"0x73d536fd055e083f60be70350e729d99cceac347c5bfaaa79fd462d1b82153f3\"\n\n[roots]\nclarity_archival_marf_root_hash = \"0x8fdff09fd87ae79f970a233627013f09478ee1715379a73442584bb43a64c071\"\n",
+        )?;
+        let imported = import_pcs(&root)?;
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        assert!(imported.root(source).is_some());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
