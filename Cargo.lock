@@ -1253,10 +1253,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-codec"
+version = "0.1.0"
+dependencies = [
+ "nano-crypto",
+ "nano-primitives",
+]
+
+[[package]]
 name = "nano-conformance"
 version = "0.1.0"
 dependencies = [
  "nano-address",
+ "nano-codec",
  "nano-crypto",
  "nano-node",
  "nano-primitives",

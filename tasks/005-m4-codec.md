@@ -1,7 +1,7 @@
 ---
 id: "005"
 title: "M4: implement SIP-005 transaction codec"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["003", "004"]

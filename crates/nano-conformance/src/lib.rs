@@ -347,11 +347,13 @@ mod tests {
         FixtureManifest, FixtureMode, FixtureStatus, baseline_replay, scoreboard,
         validate_fixture_tree,
     };
+    use blockstack_lib::chainstate::nakamoto::NakamotoBlock as ReferenceNakamotoBlock;
     use blockstack_lib::chainstate::stacks::address::{
         PoxAddress as ReferencePoxAddress, PoxAddressType20 as ReferencePoxAddressType20,
         PoxAddressType32 as ReferencePoxAddressType32,
     };
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
+    use nano_codec::TransactionAuth as NanoTransactionAuth;
     use nano_crypto::{
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
@@ -379,6 +381,7 @@ mod tests {
     };
     use std::{
         fs,
+        io::Cursor,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -564,6 +567,44 @@ mod tests {
                     .to_string(),
                 reference.to_b58()
             );
+        }
+    }
+
+    #[test]
+    fn captured_blocks_round_trip_with_stacks_core() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let mut encoded = Vec::new();
+            block
+                .consensus_serialize(&mut encoded)
+                .expect("serialize fixture block");
+            assert_eq!(encoded, bytes, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn fixture_authorizations_round_trip_with_nano_codec() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for transaction in block.txs {
+                let mut reference = Vec::new();
+                transaction
+                    .auth
+                    .consensus_serialize(&mut reference)
+                    .expect("serialize reference auth");
+                let (nano, consumed) =
+                    NanoTransactionAuth::decode(&reference).expect("decode auth");
+                assert_eq!(consumed, reference.len());
+                assert_eq!(nano.encode(), reference);
+            }
         }
     }
 

@@ -4,6 +4,7 @@ members = [
     "crates/nano-primitives",
     "crates/nano-crypto",
     "crates/nano-address",
+    "crates/nano-codec",
     "crates/nano-burnchain",
     "crates/nano-sortition",
     "crates/nano-marf",
