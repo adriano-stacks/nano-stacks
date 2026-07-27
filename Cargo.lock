@@ -1523,6 +1523,7 @@ dependencies = [
  "clarity",
  "nano-marf",
  "nano-primitives",
+ "pox-locking",
  "rusqlite",
  "stacks-common",
 ]

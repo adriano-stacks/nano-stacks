@@ -627,12 +627,16 @@ fn compare_receipts(
                 .result
                 .events
                 .iter()
-                .enumerate()
-                .map(move |(index, entry)| entry.json_serialize(index, &receipt.txid, true))
+                .map(move |entry| (entry, receipt.txid))
         })
+        .enumerate()
+        .map(|(index, (entry, txid))| entry.json_serialize(index, &txid, true))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ReplayDivergence::Receipt("event cannot serialize".to_owned()))?;
-    if event.events != actual_events {
+    let mut expected_events = event.events.clone();
+    expected_events
+        .sort_by_key(|entry| entry.get("event_index").and_then(serde_json::Value::as_u64));
+    if expected_events != actual_events {
         return Err(ReplayDivergence::Receipt("events differ".to_owned()));
     }
     Ok(())
@@ -697,8 +701,9 @@ fn decode_hash(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChainState, FixtureManifest, FixtureMode, FixtureStatus, baseline_replay,
-        captured_bitcoin_snapshots, checkpoint_state, scoreboard, validate_fixture_tree,
+        ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
+        baseline_replay, captured_bitcoin_snapshots, checkpoint_state, scoreboard,
+        validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -975,6 +980,56 @@ mod tests {
             expected_state
                 .leaves(*block.block_id().as_bytes())
                 .expect("expected leaves")
+        );
+    }
+
+    #[test]
+    fn captured_fourth_block_state_matches_reference() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let mut chainstate = ChainState::from_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+        let mut parent = Some(source);
+        let mut fourth = None;
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read blocks")
+            .map(|entry| entry.expect("block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths.into_iter().take(4) {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .expect("decode block");
+            apply_captured_block(&fixture, &mut chainstate, &snapshots, parent, &path)
+                .expect("apply captured block");
+            parent = Some(*block.block_id().as_bytes());
+            fourth = Some(block);
+        }
+        let block = fourth.expect("fourth block");
+        let block_id = *block.block_id().as_bytes();
+        let expected = import_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            block_id,
+            block.header.state_index_root,
+        )
+        .expect("import expected state");
+        let expected_leaves = expected.leaves(block_id).expect("expected leaves");
+        let actual_leaves = chainstate.state_leaves(block_id).expect("actual leaves");
+        let expected_only = expected_leaves
+            .iter()
+            .filter(|leaf| !actual_leaves.contains(leaf))
+            .collect::<Vec<_>>();
+        let actual_only = actual_leaves
+            .iter()
+            .filter(|leaf| !expected_leaves.contains(leaf))
+            .collect::<Vec<_>>();
+        assert!(
+            expected_only.is_empty() && actual_only.is_empty(),
+            "expected-only: {expected_only:#?}\nactual-only: {actual_only:#?}"
         );
     }
 

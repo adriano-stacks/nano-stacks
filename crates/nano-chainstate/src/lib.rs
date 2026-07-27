@@ -270,15 +270,10 @@ impl ChainState {
         } else {
             self.vm.debit_fee(sender, fee)?;
         }
-        if matches!(
-            transaction.payload().data(),
-            TransactionPayloadData::NakamotoCoinbase { .. }
-        ) {
-            self.vm.set_account_nonce(
-                sender,
-                increment_nonce(transaction.auth().origin().nonce())?,
-            )?;
-        }
+        self.vm.set_account_nonce(
+            sender,
+            increment_nonce(transaction.auth().origin().nonce())?,
+        )?;
         Ok(receipt)
     }
 
@@ -289,6 +284,7 @@ impl ChainState {
         sender: &PrincipalData,
         sponsor: Option<&PrincipalData>,
     ) -> Result<TransactionResult, ChainStateError> {
+        let cost_tracker = self.vm.transaction_cost_tracker()?;
         Ok(match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
@@ -296,13 +292,8 @@ impl ChainState {
                 memo,
             } => {
                 let recipient = principal_from_codec(recipient)?;
-                self.vm.transfer_stx(
-                    sender,
-                    &recipient,
-                    u128::from(*amount),
-                    memo,
-                    LimitedCostTracker::new_free(),
-                )?
+                self.vm
+                    .transfer_stx(sender, &recipient, u128::from(*amount), memo, cost_tracker)?
             }
             TransactionPayloadData::SmartContract {
                 contract_name,
@@ -311,7 +302,7 @@ impl ChainState {
                 contract_identifier(origin, contract_name)?,
                 VmClarityVersion::Clarity6,
                 source,
-                LimitedCostTracker::new_free(),
+                cost_tracker,
             )?,
             TransactionPayloadData::VersionedSmartContract {
                 clarity_version,
@@ -321,7 +312,7 @@ impl ChainState {
                 contract_identifier(origin, contract_name)?,
                 clarity_version_to_vm(*clarity_version),
                 source,
-                LimitedCostTracker::new_free(),
+                cost_tracker,
             )?,
             TransactionPayloadData::ContractCall {
                 address,
@@ -337,7 +328,7 @@ impl ChainState {
                     .iter()
                     .map(|argument| argument.as_bytes().to_vec())
                     .collect::<Vec<_>>(),
-                LimitedCostTracker::new_free(),
+                cost_tracker,
             )?,
             _ => return Err(ChainStateError::UnsupportedPayload),
         })

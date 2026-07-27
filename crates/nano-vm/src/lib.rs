@@ -4,8 +4,10 @@ use std::{collections::BTreeMap, path::Path};
 
 use clarity::vm::ast::build_ast;
 use clarity::vm::contexts::{ContractContext, GlobalContext, OwnedEnvironment};
-use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
-use clarity::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
+use clarity::vm::costs::{CostErrors, ExecutionCost, LimitedCostTracker};
+use clarity::vm::database::clarity_store::{
+    ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
+};
 use clarity::vm::database::{
     BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, MemoryBackingStore,
     NULL_BURN_STATE_DB, NULL_HEADER_DB,
@@ -396,6 +398,14 @@ impl Vm {
     pub fn touch_stx_balance(&mut self, principal: &PrincipalData) -> Result<(), VmExecutionError> {
         let Self { store, context } = self;
         touch_stx_balance_in_context(store, context, principal)
+    }
+
+    /// Create a consensus cost tracker from the active chain state.
+    ///
+    /// Empty development states do not have the boot cost contracts yet and use a free tracker.
+    pub fn transaction_cost_tracker(&mut self) -> Result<LimitedCostTracker, VmExecutionError> {
+        let Self { store, context } = self;
+        transaction_cost_tracker_in_context(store, context)
     }
 
     /// Store a transaction nonce in the active block state.
@@ -839,6 +849,10 @@ impl ClarityBackingStore for MarfStore {
         &self.side_store
     }
 
+    fn get_cc_special_cases_handler(&self) -> Option<SpecialCaseHandler> {
+        Some(&pox_locking::handle_contract_call_special_cases)
+    }
+
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
         for (key, value) in items {
             self.put(key, value)
@@ -1194,7 +1208,8 @@ fn execute_contract_call_in_context(
             Ok(SymbolicExpression::atom_value(value))
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
-    let database = clarity_database(store, bitcoin_context);
+    let mut database = clarity_database(store, bitcoin_context);
+    database.begin();
     let mut environment = OwnedEnvironment::new_cost_limited(
         false,
         CHAIN_ID_TESTNET,
@@ -1202,19 +1217,32 @@ fn execute_contract_call_in_context(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
-    let (value, _, events) = environment.execute_transaction(
+    let result = environment.execute_transaction(
         call.sender,
         call.sponsor,
         call.contract,
         call.function,
         &arguments,
-    )?;
-
-    Ok(TransactionResult {
-        value: Some(value),
-        cost: environment.get_cost_total(),
-        events,
-    })
+    );
+    let (mut database, cost_tracker) = environment.destruct().ok_or_else(|| {
+        VmExecutionError::Internal(VmInternalError::Expect(
+            "contract execution left the database in an invalid state".to_owned(),
+        ))
+    })?;
+    match result {
+        Ok((value, _, events)) => {
+            database.commit()?;
+            Ok(TransactionResult {
+                value: Some(value),
+                cost: cost_tracker.get_total(),
+                events,
+            })
+        }
+        Err(error) => {
+            database.roll_back()?;
+            Err(error)
+        }
+    }
 }
 
 /// Transfer STX using the Clarity VM's account and event machinery.
@@ -1324,6 +1352,30 @@ fn touch_stx_balance_in_context(
         balance.debit(0)?;
         balance.save()
     })
+}
+
+fn transaction_cost_tracker_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+) -> Result<LimitedCostTracker, VmExecutionError> {
+    let mut database = clarity_database(store, bitcoin_context);
+    database.begin();
+    database.set_clarity_epoch_version(StacksEpochId::Epoch40)?;
+    let result = LimitedCostTracker::new_mid_block(
+        false,
+        CHAIN_ID_TESTNET,
+        ExecutionCost::max_value(),
+        &mut database,
+        StacksEpochId::Epoch40,
+    );
+    database.roll_back()?;
+    match result {
+        Ok(tracker) => Ok(tracker),
+        Err(CostErrors::CostContractLoadFailure | CostErrors::CostComputationFailed(_)) => {
+            Ok(LimitedCostTracker::new_free())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn process_scheduled_unlocks_in_context(
