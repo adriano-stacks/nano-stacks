@@ -1,0 +1,12 @@
+source = "hacknet"
+hacknet_commit = "bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1"
+captured_at_unix = 1785170837
+checkpoint_stacks_height = 109
+checkpoint_state_id = "73d536fd055e083f60be70350e729d99cceac347c5bfaaa79fd462d1b82153f3"
+checkpoint_state_index_root = "8fdff09fd87ae79f970a233627013f09478ee1715379a73442584bb43a64c071"
+first_stacks_height = 110
+replay_blocks = 10
+bitcoin_rpc = "http://127.0.0.1:18443"
+stacks_rpc = "http://127.0.0.1:20443"
+first_block_hash = "4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c"
+first_consensus_hash = "3fc6d1626f4c2709e1fd24f8648c76f8c602ccb4"

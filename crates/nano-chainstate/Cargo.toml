@@ -1,0 +1,13 @@
+[package]
+name = "nano-chainstate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nano-sortition = { path = "../nano-sortition" }
+nano-vm = { path = "../nano-vm" }
+
+[lints]
+workspace = true

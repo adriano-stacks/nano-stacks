@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nano-primitives",
+    "crates/nano-crypto",
+    "crates/nano-burnchain",
+    "crates/nano-sortition",
+    "crates/nano-marf",
+    "crates/nano-vm",
+    "crates/nano-chainstate",
+    "crates/nano-node",
+    "crates/nano-conformance",
+    "xtask",
+]
+default-members = ["crates/nano-node", "crates/nano-conformance", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/stacks-network/nano-stacks"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
