@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub(crate) mod carryover;
+
 use std::{collections::HashMap, fmt};
 
 use nano_bitcoin::BitcoinBlock;
@@ -90,6 +92,56 @@ pub struct BurnSample {
     pub range_end: Uint256,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitmentBurnStatistics {
+    pub block_burn: u64,
+    pub window_median_burn: u64,
+}
+
+pub fn commitment_burn_statistics(
+    window: &[CommitmentWindowBlock],
+) -> Result<CommitmentBurnStatistics, SortitionError> {
+    let Some(latest) = window.last() else {
+        return Err(SortitionError::EmptyCommitmentWindow);
+    };
+    let mut block_burns = window
+        .iter()
+        .map(|block| {
+            block
+                .commitments
+                .iter()
+                .try_fold(0_u64, |total, commitment| {
+                    total
+                        .checked_add(commitment.burn_sats)
+                        .ok_or(SortitionError::BurnOverflow)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    block_burns.sort_unstable();
+    let middle = block_burns.len() / 2;
+    let window_median_burn = if block_burns.len() % 2 == 0 {
+        u64::try_from(u128::midpoint(
+            u128::from(block_burns[middle - 1]),
+            u128::from(block_burns[middle]),
+        ))
+        .expect("median of two u64 values fits u64")
+    } else {
+        block_burns[middle]
+    };
+    let block_burn = latest
+        .commitments
+        .iter()
+        .try_fold(0_u64, |total, commitment| {
+            total
+                .checked_add(commitment.burn_sats)
+                .ok_or(SortitionError::BurnOverflow)
+        })?;
+    Ok(CommitmentBurnStatistics {
+        block_burn,
+        window_median_burn,
+    })
+}
+
 pub fn commitment_distribution(
     window: &[CommitmentWindowBlock],
 ) -> Result<Vec<BurnSample>, SortitionError> {
@@ -160,6 +212,28 @@ pub fn select_winner(
     distribution
         .iter()
         .position(|sample| sample.range_start <= point && point < sample.range_end)
+}
+
+#[must_use]
+pub fn select_epoch4_winner(
+    distribution: &[BurnSample],
+    sortition_hash: SortitionHash,
+    previous_vrf_seed: [u8; 32],
+    block_burn: u64,
+    window_median_burn: u64,
+) -> Option<usize> {
+    let candidate = select_winner(distribution, sortition_hash, previous_vrf_seed)?;
+    let minimum_frequency = 3_usize.min(distribution.len());
+    if usize::from(distribution[candidate].frequency) < minimum_frequency {
+        return None;
+    }
+    let Some(null_range_end) = carryover::null_miner_probability(block_burn, window_median_burn)
+    else {
+        return Some(candidate);
+    };
+    let point =
+        Uint256::from_little_endian(sortition_hash.mix_vrf_seed(previous_vrf_seed).as_bytes());
+    (point >= null_range_end).then_some(candidate)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,8 +557,8 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitmentWindowBlock, MiningCommitment, SortitionHash, commitment_distribution,
-        select_winner,
+        CommitmentWindowBlock, MiningCommitment, SortitionHash, commitment_burn_statistics,
+        commitment_distribution, select_epoch4_winner, select_winner,
     };
 
     #[test]
@@ -514,6 +588,52 @@ mod tests {
         assert_eq!(distribution[0].range_start, super::Uint256::zero());
         assert_eq!(distribution[1].range_end, super::Uint256::MAX);
         assert!(select_winner(&distribution, SortitionHash::initial(), [0; 32]).is_some());
+    }
+
+    #[test]
+    fn carryover_uses_block_totals_not_weighted_samples() {
+        let statistics = commitment_burn_statistics(&[
+            CommitmentWindowBlock {
+                commitments: vec![commitment(1, 0, 2), commitment(2, 0, 8)],
+                missed_commitments: Vec::new(),
+                requires_single_commit: false,
+            },
+            CommitmentWindowBlock {
+                commitments: vec![commitment(3, 0, 6)],
+                missed_commitments: Vec::new(),
+                requires_single_commit: false,
+            },
+        ])
+        .expect("commitment window statistics");
+        assert_eq!(statistics.block_burn, 6);
+        assert_eq!(statistics.window_median_burn, 8);
+    }
+
+    #[test]
+    fn epoch4_rejects_inactive_or_under_carried_winners() {
+        let sample = super::BurnSample {
+            candidate: commitment(1, 0, 1),
+            burn_sats: 1,
+            median_burn_sats: 1,
+            frequency: 1,
+            range_start: super::Uint256::zero(),
+            range_end: super::Uint256::MAX,
+        };
+        let distribution = vec![sample.clone(), sample.clone(), sample];
+        assert_eq!(
+            select_epoch4_winner(&distribution, SortitionHash::initial(), [0; 32], 10, 10),
+            None
+        );
+
+        let active = super::BurnSample {
+            frequency: 3,
+            ..distribution[0].clone()
+        };
+        let distribution = vec![active.clone(), active.clone(), active];
+        assert_eq!(
+            select_epoch4_winner(&distribution, SortitionHash::initial(), [0; 32], 0, 10),
+            None
+        );
     }
 
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {

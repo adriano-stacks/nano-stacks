@@ -19,7 +19,7 @@ production dependency on Stacks-Core.
 ## Tasks
 
 - [x] Implement operation, consensus, and rolling sortition hashes.
-- [ ] Build the six-block commit distribution and assumed-total-commit rules.
+- [x] Build the six-block commit distribution and assumed-total-commit rules.
 - [ ] Select winners and maintain snapshot state across Bitcoin blocks.
 - [ ] Replay captured snapshots and compare every consensus-critical field.
 
