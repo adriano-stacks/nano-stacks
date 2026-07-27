@@ -184,7 +184,7 @@ pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
 /// An in-memory, path-compressed trie using MARF's consensus node layouts.
 #[derive(Clone, Debug, Default)]
 pub struct MarfTrie {
-    root: Option<Box<TrieNode>>,
+    root_children: Vec<(u8, Box<TrieNode>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -205,20 +205,28 @@ impl MarfTrie {
     }
 
     pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) {
-        match &mut self.root {
-            Some(root) => root.insert(&path, value),
-            None => {
-                self.root = Some(Box::new(TrieNode::Leaf {
-                    path: path.to_vec(),
+        let root_character = path[0];
+        let suffix = &path[1..];
+        if let Some((_, child)) = self
+            .root_children
+            .iter_mut()
+            .find(|(character, _)| *character == root_character)
+        {
+            child.insert(suffix, value);
+        } else {
+            self.root_children.push((
+                root_character,
+                Box::new(TrieNode::Leaf {
+                    path: suffix.to_vec(),
                     value,
-                }));
-            }
+                }),
+            ));
         }
     }
 
     #[must_use]
     pub fn root_hash(&self) -> TrieHash {
-        self.root.as_deref().map_or(TrieHash::EMPTY, TrieNode::hash)
+        hash_children(TrieNodeId::Node256, &[], &self.root_children)
     }
 }
 
@@ -304,37 +312,7 @@ impl TrieNode {
             Self::Leaf { path, value } => leaf_hash(path, *value).expect("leaf paths are bounded"),
             Self::Internal { path, children } => {
                 let node_id = node_id_for_children(children.len());
-                let mut pointers = vec![
-                    TriePointer {
-                        id: 0,
-                        character: 0,
-                        referenced_block: None,
-                    };
-                    node_id.pointer_count()
-                ];
-                let mut hashes = vec![TrieHash::EMPTY; node_id.pointer_count()];
-                if node_id == TrieNodeId::Node256 {
-                    for (character, child) in children {
-                        let index = usize::from(*character);
-                        pointers[index] = TriePointer {
-                            id: child.node_id() as u8,
-                            character: *character,
-                            referenced_block: None,
-                        };
-                        hashes[index] = child.hash();
-                    }
-                } else {
-                    for (index, (character, child)) in children.iter().enumerate() {
-                        pointers[index] = TriePointer {
-                            id: child.node_id() as u8,
-                            character: *character,
-                            referenced_block: None,
-                        };
-                        hashes[index] = child.hash();
-                    }
-                }
-                internal_node_hash(node_id, &pointers, path, &hashes)
-                    .expect("internally valid node layout")
+                hash_children(node_id, path, children)
             }
         }
     }
@@ -345,6 +323,39 @@ impl TrieNode {
             Self::Internal { children, .. } => node_id_for_children(children.len()),
         }
     }
+}
+
+fn hash_children(id: TrieNodeId, path: &[u8], children: &[(u8, Box<TrieNode>)]) -> TrieHash {
+    let mut pointers = vec![
+        TriePointer {
+            id: 0,
+            character: 0,
+            referenced_block: None,
+        };
+        id.pointer_count()
+    ];
+    let mut hashes = vec![TrieHash::EMPTY; id.pointer_count()];
+    if id == TrieNodeId::Node256 {
+        for (character, child) in children {
+            let index = usize::from(*character);
+            pointers[index] = TriePointer {
+                id: child.node_id() as u8,
+                character: *character,
+                referenced_block: None,
+            };
+            hashes[index] = child.hash();
+        }
+    } else {
+        for (index, (character, child)) in children.iter().enumerate() {
+            pointers[index] = TriePointer {
+                id: child.node_id() as u8,
+                character: *character,
+                referenced_block: None,
+            };
+            hashes[index] = child.hash();
+        }
+    }
+    internal_node_hash(id, &pointers, path, &hashes).expect("internally valid node layout")
 }
 
 const fn node_id_for_children(children: usize) -> TrieNodeId {
