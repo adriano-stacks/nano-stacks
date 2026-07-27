@@ -196,6 +196,9 @@ pub fn leaf_hash(path: &[u8], value: MarfValue) -> Result<TrieHash, MarfError> {
 /// Fold a trie content hash into the MARF's power-of-two ancestor history.
 #[must_use]
 pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
+    if ancestor_roots.is_empty() {
+        return content;
+    }
     let mut bytes = Vec::with_capacity(32 * (ancestor_roots.len().saturating_add(1)));
     bytes.extend_from_slice(content.as_bytes());
     let mut distance = 1_usize;
@@ -732,6 +735,7 @@ mod tests {
             .concat(),
         );
         assert_eq!(root.as_bytes(), expected.as_bytes());
+        assert_eq!(state_root(content, &[]), content);
     }
 
     #[test]

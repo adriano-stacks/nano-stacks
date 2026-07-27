@@ -360,9 +360,10 @@ mod tests {
         PoxAddressType32 as ReferencePoxAddressType32,
     };
     use blockstack_lib::chainstate::stacks::index::{
-        BlockMap as ReferenceBlockMap, Error as ReferenceMarfError,
+        BlockMap as ReferenceBlockMap, ClarityMarfTrieId, Error as ReferenceMarfError,
         MARFValue as ReferenceMarfValue, TrieLeaf as ReferenceTrieLeaf,
         bits::{get_leaf_hash, get_node_hash},
+        marf::{MARF as ReferenceMarf, MARFOpenOpts as ReferenceMarfOpenOpts},
         node::{
             TrieNode4 as ReferenceTrieNode4, TrieNode256 as ReferenceTrieNode256,
             TriePtr as ReferenceTriePointer,
@@ -392,7 +393,7 @@ mod tests {
         CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
     };
     use nano_marf::{
-        MarfTrie, MarfValue, TrieNodeId, TriePointer, import_checkpoint, import_pcs,
+        MarfTrie, MarfValue, TrieNodeId, TriePointer, VersionedMarf, import_checkpoint, import_pcs,
         internal_node_hash, key_path, leaf_hash,
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
@@ -412,7 +413,7 @@ mod tests {
             PrivateKey, PublicKey,
             chainstate::{
                 BlockHeaderHash, StacksAddress as ReferenceStacksAddress,
-                TrieHash as ReferenceTrieHash,
+                StacksBlockId as ReferenceStacksBlockId, TrieHash as ReferenceTrieHash,
             },
         },
         util::hash::{
@@ -563,6 +564,64 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_extension_matches_stacks_core() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = temporary_fixture_root()?;
+        let checkpoint = temporary.join("marf.sqlite");
+        fs::write(format!("{}.blobs", checkpoint.display()), [])?;
+        let source = [0x41; 32];
+        let next = [0x42; 32];
+        let mut options = ReferenceMarfOpenOpts::default();
+        options.external_blobs = true;
+        let root = {
+            let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+                checkpoint.to_str().expect("temporary path is UTF-8"),
+                options.clone(),
+            )?;
+            let mut transaction = reference.begin_tx()?;
+            transaction.begin(
+                &ReferenceStacksBlockId::sentinel(),
+                &ReferenceStacksBlockId(source),
+            )?;
+            transaction.insert_batch(
+                &["checkpoint-source".to_owned()],
+                vec![ReferenceMarfValue::from_value("source")],
+            )?;
+            transaction.seal()?;
+            transaction.commit()?;
+            TrieHash::from_bytes(
+                reference
+                    .get_root_hash_at(&ReferenceStacksBlockId(source))?
+                    .0,
+            )
+        };
+        let mut imported = import_checkpoint(&checkpoint, source, root)?;
+        imported.begin(Some(source), next)?;
+        imported.insert(b"checkpoint-extension", MarfValue::from_value(b"value"))?;
+        let imported_root = imported.seal()?;
+
+        let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+            checkpoint.to_str().expect("temporary path is UTF-8"),
+            options,
+        )?;
+        let mut transaction = reference.begin_tx()?;
+        transaction.begin(
+            &ReferenceStacksBlockId(source),
+            &ReferenceStacksBlockId(next),
+        )?;
+        transaction.insert_batch(
+            &["checkpoint-extension".to_owned()],
+            vec![ReferenceMarfValue::from_value("value")],
+        )?;
+        transaction.seal()?;
+        transaction.commit()?;
+        let reference_root = reference.get_root_hash_at(&ReferenceStacksBlockId(next))?;
+        assert_eq!(imported_root.as_bytes(), &reference_root.0);
+
+        fs::remove_dir_all(temporary)?;
+        Ok(())
+    }
+
+    #[test]
     fn pcs_layout_import_uses_the_manifest_root() -> Result<(), Box<dyn std::error::Error>> {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
@@ -587,6 +646,99 @@ mod tests {
         assert!(imported.root(source).is_some());
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    fn append_reference_marf_state(
+        reference: &mut ReferenceMarf<ReferenceStacksBlockId>,
+        parent: Option<&ReferenceStacksBlockId>,
+        block: &ReferenceStacksBlockId,
+        key: &str,
+        value: &str,
+    ) -> ReferenceTrieHash {
+        let parent = parent
+            .cloned()
+            .unwrap_or_else(ReferenceStacksBlockId::sentinel);
+        let mut transaction = reference.begin_tx().expect("start reference transaction");
+        transaction
+            .begin(&parent, block)
+            .expect("begin reference state");
+        transaction
+            .insert_batch(
+                &[key.to_owned()],
+                vec![ReferenceMarfValue::from_value(value)],
+            )
+            .expect("insert reference value");
+        transaction.seal().expect("seal reference state");
+        transaction.commit().expect("commit reference state");
+        reference
+            .get_root_hash_at(block)
+            .expect("read reference state root")
+    }
+
+    fn append_nano_marf_state(
+        ours: &mut VersionedMarf,
+        parent: Option<[u8; 32]>,
+        block: [u8; 32],
+        key: &str,
+        value: &str,
+    ) -> TrieHash {
+        ours.begin(parent, block).expect("begin nano state");
+        ours.insert(key.as_bytes(), MarfValue::from_value(value.as_bytes()))
+            .expect("insert nano value");
+        ours.seal().expect("seal nano state")
+    }
+
+    #[test]
+    fn versioned_marf_first_write_matches_stacks_core() {
+        let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+            ":memory:",
+            ReferenceMarfOpenOpts::default(),
+        )
+        .expect("open reference MARF");
+        let first = ReferenceStacksBlockId([1; 32]);
+        let reference_root =
+            append_reference_marf_state(&mut reference, None, &first, "alpha", "first");
+
+        let mut ours = VersionedMarf::default();
+        let root = append_nano_marf_state(&mut ours, None, first.0, "alpha", "first");
+        assert_eq!(root.as_bytes(), &reference_root.0);
+
+        let second = ReferenceStacksBlockId([2; 32]);
+        let reference_second_root =
+            append_reference_marf_state(&mut reference, Some(&first), &second, "beta", "second");
+
+        let second_root =
+            append_nano_marf_state(&mut ours, Some(first.0), second.0, "beta", "second");
+        assert_eq!(second_root.as_bytes(), &reference_second_root.0);
+
+        let fork = ReferenceStacksBlockId([3; 32]);
+        let reference_fork_root =
+            append_reference_marf_state(&mut reference, Some(&first), &fork, "gamma", "fork");
+
+        let fork_root = append_nano_marf_state(&mut ours, Some(first.0), fork.0, "gamma", "fork");
+        assert_eq!(fork_root.as_bytes(), &reference_fork_root.0);
+
+        let mut blocks = vec![first, second, fork];
+        let mut seed = 0x9e37_79b9_u32;
+        for index in 0_u16..10_000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let parent = blocks[(seed as usize) % blocks.len()].clone();
+            let mut block_id = [0; 32];
+            block_id[30..].copy_from_slice(&(index + 4).to_be_bytes());
+            let block = ReferenceStacksBlockId(block_id);
+            let key = format!("key-{}", seed % 17);
+            let value = format!("value-{index}-{seed}");
+
+            let reference_root =
+                append_reference_marf_state(&mut reference, Some(&parent), &block, &key, &value);
+            let root = append_nano_marf_state(&mut ours, Some(parent.0), block.0, &key, &value);
+            assert_eq!(
+                root.as_bytes(),
+                &reference_root.0,
+                "randomized lockstep mismatch at state {index}"
+            );
+            blocks.push(block);
+        }
     }
 
     #[test]

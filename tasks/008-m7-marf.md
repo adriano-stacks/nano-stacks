@@ -18,9 +18,9 @@ PCS checkpoint imports without a production Stacks-Core dependency.
 
 ## Tasks
 
-- [ ] Match all node and leaf consensus preimages.
-- [ ] Match insert, promotion, fork, and copy-on-write root sequences.
-- [ ] Import the captured PCS checkpoint and verify its published root.
+- [x] Match all node and leaf consensus preimages.
+- [x] Match insert, promotion, fork, and copy-on-write root sequences.
+- [x] Import the captured PCS checkpoint and verify its published root.
 - [ ] Extend the imported checkpoint with a reference-verified write.
 
 ## Acceptance Criteria
