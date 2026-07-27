@@ -1417,6 +1417,8 @@ name = "nano-chainstate"
 version = "0.1.0"
 dependencies = [
  "clarity",
+ "nano-codec",
+ "nano-crypto",
  "nano-marf",
  "nano-primitives",
  "nano-sortition",
@@ -1440,6 +1442,7 @@ dependencies = [
  "hex",
  "nano-address",
  "nano-bitcoin",
+ "nano-chainstate",
  "nano-codec",
  "nano-crypto",
  "nano-marf",

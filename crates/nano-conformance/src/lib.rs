@@ -385,6 +385,7 @@ mod tests {
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::decode_block as decode_bitcoin_block;
+    use nano_chainstate::NakamotoBlock as NanoNakamotoBlock;
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
         transaction_merkle_root,
@@ -1112,6 +1113,69 @@ mod tests {
                 .consensus_serialize(&mut encoded)
                 .expect("serialize fixture block");
             assert_eq!(encoded, bytes, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn captured_nakamoto_envelopes_match_stacks_core() {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let path = entry.expect("fixture entry").path();
+            let bytes = fs::read(&path).expect("read fixture block");
+            let reference = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let ours = NanoNakamotoBlock::decode(&bytes)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+            assert_eq!(ours.encode(), bytes, "{}", path.display());
+            assert_eq!(
+                ours.header.version,
+                reference.header.version,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.header.chain_length,
+                reference.header.chain_length,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.header.consensus_hash.as_bytes(),
+                &reference.header.consensus_hash.0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.header.state_index_root.as_bytes(),
+                &reference.header.state_index_root.0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.header.miner_signature_hash().as_bytes(),
+                &reference.header.miner_signature_hash().0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.header.signer_signature_hash().as_bytes(),
+                &reference.header.signer_signature_hash().0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.block_id().as_bytes(),
+                &reference.block_id().0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.transactions.len(),
+                reference.txs.len(),
+                "{}",
+                path.display()
+            );
         }
     }
 

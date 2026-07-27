@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod nakamoto;
+
+pub use nakamoto::{NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError};
+
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::errors::ClarityEvalError;
 use nano_sortition::SortitionSnapshot;
