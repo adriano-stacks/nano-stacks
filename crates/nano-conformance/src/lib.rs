@@ -385,13 +385,14 @@ mod tests {
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::decode_block as decode_bitcoin_block;
-    use nano_chainstate::NakamotoBlock as NanoNakamotoBlock;
+    use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, Signer, SignerSet};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
         transaction_merkle_root,
     };
     use nano_crypto::{
-        CryptoError, MessageSignature, StacksPrivateKey, Vrf, VrfPrivateKey, VrfProof,
+        CryptoError, MessageSignature, StacksPrivateKey, StacksPublicKey, Vrf, VrfPrivateKey,
+        VrfProof,
     };
     use nano_marf::{
         MarfTrie, MarfValue, TrieNodeId, TriePointer, VersionedMarf, import_checkpoint, import_pcs,
@@ -1173,6 +1174,53 @@ mod tests {
             assert_eq!(
                 ours.transactions.len(),
                 reference.txs.len(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn captured_blocks_have_the_expected_signer_weight() {
+        #[derive(Deserialize)]
+        struct SignerWire {
+            signing_key: String,
+            weight: u32,
+        }
+        #[derive(Deserialize)]
+        struct RewardSetWire {
+            signers: Vec<SignerWire>,
+        }
+        #[derive(Deserialize)]
+        struct StackerSetWire {
+            stacker_set: RewardSetWire,
+        }
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let reward_set: StackerSetWire = serde_json::from_slice(
+            &fs::read(fixture_root.join("stacker_set/cycle-18.json")).expect("read reward set"),
+        )
+        .expect("parse reward set");
+        let signers = reward_set
+            .stacker_set
+            .signers
+            .into_iter()
+            .map(|signer| Signer {
+                public_key: StacksPublicKey::from_bytes(
+                    &hex::decode(signer.signing_key).expect("decode signing key"),
+                )
+                .expect("valid signer key"),
+                weight: signer.weight,
+            })
+            .collect();
+        let signer_set = SignerSet::new(signers).expect("valid signer set");
+
+        for entry in fs::read_dir(fixture_root.join("nakamoto/blocks")).expect("read blocks") {
+            let path = entry.expect("fixture entry").path();
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert!(
+                signer_set.verify(&block.header).is_ok(),
                 "{}",
                 path.display()
             );

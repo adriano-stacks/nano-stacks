@@ -2,7 +2,9 @@
 
 mod nakamoto;
 
-pub use nakamoto::{NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError};
+pub use nakamoto::{
+    NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, Signer, SignerSet, SignerSetError,
+};
 
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::errors::ClarityEvalError;

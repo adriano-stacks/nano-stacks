@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use nano_codec::{CodecError, Transaction, transaction_merkle_root};
-use nano_crypto::MessageSignature;
+use nano_crypto::{CryptoError, MessageSignature, StacksPublicKey};
 use nano_primitives::{
     BitVec, BitVecError, BlockHeaderHash, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash,
     sha512_256,
@@ -86,6 +86,117 @@ impl NakamotoBlockHeader {
 pub struct NakamotoBlock {
     pub header: NakamotoBlockHeader,
     pub transactions: Vec<Transaction>,
+}
+
+/// A weighted signer from the reward set active for a tenure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Signer {
+    pub public_key: StacksPublicKey,
+    pub weight: u32,
+}
+
+/// The ordered reward-set signers authorized to approve a Nakamoto block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerSet {
+    signers: Vec<Signer>,
+}
+
+impl SignerSet {
+    /// Construct a non-empty, uniquely keyed signer set.
+    pub fn new(signers: Vec<Signer>) -> Result<Self, SignerSetError> {
+        if signers.is_empty() {
+            return Err(SignerSetError::Empty);
+        }
+        let keys = signers
+            .iter()
+            .map(|signer| signer.public_key.to_bytes_compressed())
+            .collect::<BTreeSet<_>>();
+        if keys.len() != signers.len() {
+            return Err(SignerSetError::DuplicateSigner);
+        }
+        Ok(Self { signers })
+    }
+
+    /// Return the minimum signing weight required to approve a block.
+    pub fn approval_threshold(&self) -> Result<u32, SignerSetError> {
+        let total_weight = self.signers.iter().try_fold(0_u32, |total, signer| {
+            total
+                .checked_add(signer.weight)
+                .ok_or(SignerSetError::WeightOverflow)
+        })?;
+        u32::try_from((u64::from(total_weight) * 7).div_ceil(10))
+            .map_err(|_| SignerSetError::WeightOverflow)
+    }
+
+    /// Verify recovered signatures are unique, reward-set ordered, and sufficiently weighted.
+    pub fn verify(&self, header: &NakamotoBlockHeader) -> Result<u32, SignerSetError> {
+        let digest = *header.signer_signature_hash().as_bytes();
+        let mut next_index = 0;
+        let mut signed_weight = 0_u32;
+        for signature in &header.signer_signatures {
+            let public_key = signature
+                .recover(&digest)
+                .map_err(SignerSetError::Signature)?;
+            let Some((index, signer)) = self
+                .signers
+                .iter()
+                .enumerate()
+                .skip(next_index)
+                .find(|(_, signer)| signer.public_key == public_key)
+            else {
+                return Err(SignerSetError::UnknownOrUnorderedSigner);
+            };
+            signed_weight = signed_weight
+                .checked_add(signer.weight)
+                .ok_or(SignerSetError::WeightOverflow)?;
+            next_index = index + 1;
+        }
+        if signed_weight < self.approval_threshold()? {
+            return Err(SignerSetError::InsufficientWeight);
+        }
+        Ok(signed_weight)
+    }
+}
+
+/// Errors raised while constructing or applying a signer reward set.
+#[derive(Debug)]
+pub enum SignerSetError {
+    Empty,
+    DuplicateSigner,
+    WeightOverflow,
+    Signature(CryptoError),
+    UnknownOrUnorderedSigner,
+    InsufficientWeight,
+}
+
+impl std::fmt::Display for SignerSetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("signer set is empty"),
+            Self::DuplicateSigner => formatter.write_str("signer set has duplicate public keys"),
+            Self::WeightOverflow => formatter.write_str("signer weight overflows"),
+            Self::Signature(error) => write!(formatter, "invalid signer signature: {error}"),
+            Self::UnknownOrUnorderedSigner => {
+                formatter.write_str("signer is unknown or signatures are out of reward-set order")
+            }
+            Self::InsufficientWeight => {
+                formatter.write_str("signer weight is below approval threshold")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SignerSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Signature(error) => Some(error),
+            Self::Empty
+            | Self::DuplicateSigner
+            | Self::WeightOverflow
+            | Self::UnknownOrUnorderedSigner
+            | Self::InsufficientWeight => None,
+        }
+    }
 }
 
 impl NakamotoBlock {
