@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nano_codec::{CodecError, Transaction, TransactionPayloadType, transaction_merkle_root};
 use nano_crypto::{CryptoError, MessageSignature, StacksPublicKey};
@@ -136,6 +136,77 @@ impl SignerSet {
         Self::new(signers)
     }
 
+    /// Derive signer weights from stacked amounts and the available reward slots.
+    pub fn from_reward_slots(
+        signers: Vec<(StacksPublicKey, u128)>,
+        reward_slots: u32,
+    ) -> Result<(Self, u128), SignerSetError> {
+        if reward_slots == 0 {
+            return Err(SignerSetError::ZeroRewardSlots);
+        }
+
+        let mut stacked = BTreeMap::new();
+        for (public_key, amount) in signers {
+            if amount == 0 {
+                continue;
+            }
+            let key = public_key.to_bytes_compressed();
+            let entry = stacked.entry(key).or_insert((public_key, 0_u128));
+            entry.1 = entry
+                .1
+                .checked_add(amount)
+                .ok_or(SignerSetError::StackedAmountOverflow)?;
+        }
+        let total = stacked.values().try_fold(0_u128, |total, (_, amount)| {
+            total
+                .checked_add(*amount)
+                .ok_or(SignerSetError::StackedAmountOverflow)
+        })?;
+        let threshold = total.div_ceil(u128::from(reward_slots)).max(1);
+        let mut apportioned = stacked
+            .into_iter()
+            .map(|(key, (public_key, amount))| {
+                (key, public_key, amount / threshold, amount % threshold)
+            })
+            .collect::<Vec<_>>();
+        let assigned = apportioned
+            .iter()
+            .try_fold(0_u128, |total, (_, _, weight, _)| {
+                total
+                    .checked_add(*weight)
+                    .ok_or(SignerSetError::WeightOverflow)
+            })?;
+        let mut remaining = u128::from(reward_slots).saturating_sub(assigned);
+        apportioned.sort_by(
+            |(left_key, _, _, left_remainder), (right_key, _, _, right_remainder)| {
+                right_remainder
+                    .cmp(left_remainder)
+                    .then_with(|| left_key.cmp(right_key))
+            },
+        );
+        for (_, _, weight, _) in &mut apportioned {
+            if remaining == 0 {
+                break;
+            }
+            *weight = weight
+                .checked_add(1)
+                .ok_or(SignerSetError::WeightOverflow)?;
+            remaining -= 1;
+        }
+        apportioned.sort_by_key(|(key, _, _, _)| *key);
+        let signers = apportioned
+            .into_iter()
+            .filter(|(_, _, weight, _)| *weight != 0)
+            .map(|(_, public_key, weight, _)| {
+                Ok(Signer {
+                    public_key,
+                    weight: u32::try_from(weight).map_err(|_| SignerSetError::WeightOverflow)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SignerSetError>>()?;
+        Ok((Self::new(signers)?, threshold))
+    }
+
     /// Return the signer weights in consensus order.
     #[must_use]
     pub fn weights(&self) -> Vec<u32> {
@@ -189,6 +260,8 @@ pub enum SignerSetError {
     Empty,
     DuplicateSigner,
     ZeroThreshold,
+    ZeroRewardSlots,
+    StackedAmountOverflow,
     WeightOverflow,
     Signature(CryptoError),
     UnknownOrUnorderedSigner,
@@ -201,6 +274,8 @@ impl std::fmt::Display for SignerSetError {
             Self::Empty => formatter.write_str("signer set is empty"),
             Self::DuplicateSigner => formatter.write_str("signer set has duplicate public keys"),
             Self::ZeroThreshold => formatter.write_str("signer threshold cannot be zero"),
+            Self::ZeroRewardSlots => formatter.write_str("reward slot count cannot be zero"),
+            Self::StackedAmountOverflow => formatter.write_str("stacked amount overflows"),
             Self::WeightOverflow => formatter.write_str("signer weight overflows"),
             Self::Signature(error) => write!(formatter, "invalid signer signature: {error}"),
             Self::UnknownOrUnorderedSigner => {
@@ -220,6 +295,8 @@ impl std::error::Error for SignerSetError {
             Self::Empty
             | Self::DuplicateSigner
             | Self::ZeroThreshold
+            | Self::ZeroRewardSlots
+            | Self::StackedAmountOverflow
             | Self::WeightOverflow
             | Self::UnknownOrUnorderedSigner
             | Self::InsufficientWeight => None,
@@ -334,6 +411,7 @@ impl std::error::Error for TenureError {}
 #[cfg(test)]
 mod tests {
     use super::{SignerSet, SignerSetError};
+    use nano_crypto::StacksPrivateKey;
 
     #[test]
     fn reward_set_rejects_zero_threshold() {
@@ -349,6 +427,29 @@ mod tests {
             SignerSet::from_stacked_amounts(Vec::new(), 1),
             Err(SignerSetError::Empty)
         ));
+    }
+
+    #[test]
+    fn reward_slots_use_largest_remainders() {
+        let signers = (1_u8..=5)
+            .map(|seed| (StacksPrivateKey::from_seed(&[seed]).public_key(), 1_u128))
+            .collect();
+        let (signer_set, threshold) =
+            SignerSet::from_reward_slots(signers, 4).expect("derive signer set");
+
+        assert_eq!(threshold, 2);
+        assert_eq!(signer_set.weights(), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn reward_slots_aggregate_duplicate_signers() {
+        let signer = StacksPrivateKey::from_seed(b"signer").public_key();
+        let (signer_set, threshold) =
+            SignerSet::from_reward_slots(vec![(signer.clone(), 3), (signer, 2)], 4)
+                .expect("derive signer set");
+
+        assert_eq!(threshold, 2);
+        assert_eq!(signer_set.weights(), vec![3]);
     }
 }
 
