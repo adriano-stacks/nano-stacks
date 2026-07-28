@@ -2,9 +2,13 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use clar2wasm::{CompiledContract, ModuleCache};
+use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
 use clarity::vm::ast::build_ast;
-use clarity::vm::contexts::{AssetMap, ContractContext, GlobalContext, OwnedEnvironment};
-use clarity::vm::costs::{CostErrors, ExecutionCost, LimitedCostTracker};
+use clarity::vm::contexts::{
+    AssetMap, CallStack, ContractContext, GlobalContext, OwnedEnvironment,
+};
+use clarity::vm::costs::{CostErrors, CostTracker, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
 };
@@ -237,6 +241,7 @@ impl BurnStateDB for BitcoinContext {
 pub struct Vm {
     store: MarfStore,
     context: BitcoinContext,
+    modules: ModuleCache,
 }
 
 impl Vm {
@@ -245,6 +250,7 @@ impl Vm {
         Ok(Self {
             store: MarfStore::new()?,
             context: BitcoinContext::default(),
+            modules: ModuleCache::default(),
         })
     }
 
@@ -257,6 +263,7 @@ impl Vm {
         Ok(Self {
             store: MarfStore::from_checkpoint(path, source, expected_root)?,
             context: BitcoinContext::default(),
+            modules: ModuleCache::default(),
         })
     }
 
@@ -310,37 +317,37 @@ impl Vm {
         source: &str,
         cost_tracker: LimitedCostTracker,
     ) -> Result<Evaluation, ClarityEvalError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         evaluate_with_tracker_in_context(store, context, source, cost_tracker)
     }
 
     /// Store the timestamp supplied by the current Nakamoto block header.
     pub fn setup_block_metadata(&mut self, timestamp: u64) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         setup_block_metadata_in_context(store, context, timestamp)
     }
 
     /// Read the tenure height stored in the active Clarity state.
     pub fn tenure_height(&mut self) -> Result<u32, VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         tenure_height_in_context(store, context)
     }
 
     /// Store the tenure height for a newly started tenure.
     pub fn set_tenure_height(&mut self, height: u32) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         set_tenure_height_in_context(store, context, height)
     }
 
     /// Credit STX scheduled to unlock at the current Stacks block height.
     pub fn process_scheduled_unlocks(&mut self) -> Result<u128, VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         process_scheduled_unlocks_in_context(store, context)
     }
 
     /// Increase the liquid STX supply by a block-finalization amount.
     pub fn increment_liquid_stx_supply(&mut self, amount: u128) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         increment_liquid_stx_supply_in_context(store, context, amount)
     }
 
@@ -352,8 +359,20 @@ impl Vm {
         source: &str,
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, ClarityEvalError> {
-        let Self { store, context } = self;
-        deploy_contract_in_context(store, context, contract, version, source, cost_tracker)
+        let Self {
+            store,
+            context,
+            modules,
+        } = self;
+        deploy_contract_with_wasm_in_context(
+            store,
+            context,
+            modules,
+            contract,
+            version,
+            source,
+            cost_tracker,
+        )
     }
 
     /// Call a published contract with consensus-serialized Clarity arguments.
@@ -389,10 +408,15 @@ impl Vm {
         arguments: &[Vec<u8>],
         cost_tracker: LimitedCostTracker,
     ) -> Result<ContractCallOutcome, VmExecutionError> {
-        let Self { store, context } = self;
-        execute_contract_call_outcome_in_context(
+        let Self {
             store,
             context,
+            modules,
+        } = self;
+        execute_contract_call_outcome_with_wasm_in_context(
+            store,
+            context,
+            modules,
             ContractCall {
                 sender,
                 sponsor,
@@ -413,7 +437,7 @@ impl Vm {
         memo: &[u8],
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         transfer_stx_in_context(
             store,
             context,
@@ -427,19 +451,19 @@ impl Vm {
 
     /// Read an account nonce from the active block state.
     pub fn account_nonce(&mut self, principal: &PrincipalData) -> Result<u64, VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         account_nonce_in_context(store, context, principal)
     }
 
     /// Debit a transaction fee from an account's available STX balance.
     pub fn debit_fee(&mut self, payer: &PrincipalData, fee: u64) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         debit_fee_in_context(store, context, payer, fee)
     }
 
     /// Persist an account balance without changing it.
     pub fn touch_stx_balance(&mut self, principal: &PrincipalData) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         touch_stx_balance_in_context(store, context, principal)
     }
 
@@ -455,7 +479,7 @@ impl Vm {
         &mut self,
         total: ExecutionCost,
     ) -> Result<LimitedCostTracker, VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         transaction_cost_tracker_in_context(store, context, total)
     }
 
@@ -465,7 +489,7 @@ impl Vm {
         principal: &PrincipalData,
         nonce: u64,
     ) -> Result<(), VmExecutionError> {
-        let Self { store, context } = self;
+        let Self { store, context, .. } = self;
         set_account_nonce_in_context(store, context, principal, nonce)
     }
 
@@ -1293,6 +1317,83 @@ fn deploy_contract_in_context(
     })
 }
 
+fn deploy_contract_with_wasm_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    modules: &mut ModuleCache,
+    contract: QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+    cost_tracker: LimitedCostTracker,
+) -> Result<TransactionResult, ClarityEvalError> {
+    let compiled = {
+        let mut analysis = AnalysisDatabase::new(store);
+        let compiled: CompiledContract = analysis
+            .execute::<_, _, StaticCheckError>(|analysis_db| {
+                let compiled = clar2wasm::compile(
+                    source,
+                    &contract,
+                    LimitedCostTracker::new_free(),
+                    version,
+                    StacksEpochId::Epoch40,
+                    analysis_db,
+                    true,
+                )
+                .map_err(|error: clar2wasm::CompileError| {
+                    StaticCheckErrorKind::Unreachable(format!("{error:?}"))
+                })?;
+                analysis_db.insert_contract(&contract, &compiled.contract_analysis)?;
+                Ok(compiled.into_compiled_contract())
+            })
+            .map_err(|error: StaticCheckError| {
+                ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
+                    error.to_string(),
+                )))
+            })?;
+        compiled
+    };
+
+    let database = clarity_database(store, bitcoin_context);
+    let mut global = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+    );
+    global.begin();
+    global.database.insert_contract_hash(&contract, source)?;
+    let mut contract_context = ContractContext::new(contract.clone(), version);
+    let initialized = clar2wasm::initialize::initialize_contract(
+        &mut global,
+        &mut contract_context,
+        None,
+        &compiled.analysis,
+        &compiled.wasm,
+        modules,
+    )?;
+    let data_size = contract_context.data_size;
+    global
+        .database
+        .insert_contract(&contract, contract_context.into())?;
+    global
+        .database
+        .set_contract_data_size(&contract, data_size)?;
+    let (assets, events) = global.commit()?;
+    global
+        .cost_track
+        .add_cost(initialized.cost.into())
+        .map_err(VmExecutionError::from)?;
+    modules.insert(contract, compiled);
+
+    Ok(TransactionResult {
+        value: initialized.ret,
+        cost: global.cost_track.get_total(),
+        assets: assets.unwrap_or_default(),
+        events: events.map_or_else(Vec::new, |batch| batch.events),
+    })
+}
+
 /// Call a Clarity contract using the encoded arguments found in a transaction payload.
 pub fn execute_contract_call(
     store: &mut MarfStore,
@@ -1410,6 +1511,78 @@ fn execute_contract_call_outcome_in_context(
                     cost: cost_tracker.get_total(),
                     error,
                 })
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn execute_contract_call_outcome_with_wasm_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    modules: &ModuleCache,
+    call: ContractCall<'_>,
+    cost_tracker: LimitedCostTracker,
+) -> Result<ContractCallOutcome, VmExecutionError> {
+    let arguments = call
+        .arguments
+        .iter()
+        .map(|argument| {
+            let mut bytes = argument.as_slice();
+            let value = Value::deserialize_read(&mut bytes, None, false).map_err(|error| {
+                VmInternalError::Expect(format!("invalid transaction argument: {error}"))
+            })?;
+            if !bytes.is_empty() {
+                return Err(VmInternalError::Expect(
+                    "transaction argument has trailing bytes".to_owned(),
+                )
+                .into());
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, VmExecutionError>>()?;
+    let module = modules.get(&call.contract).ok_or_else(|| {
+        VmInternalError::Expect(format!("missing WASM module for {}", call.contract))
+    })?;
+    let database = clarity_database(store, bitcoin_context);
+    let mut global = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+    );
+    global.begin();
+    let contract_context = global.database.get_contract(&call.contract)?;
+    let mut call_stack = CallStack::new();
+    let result = clar2wasm::initialize::call_function(
+        call.function,
+        &arguments,
+        module,
+        &mut global,
+        &contract_context,
+        &mut call_stack,
+        Some(call.sender),
+        None,
+        call.sponsor,
+        modules,
+    );
+    match result {
+        Ok(value) => {
+            let (assets, events) = global.commit()?;
+            Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
+                value: Some(value),
+                cost: global.cost_track.get_total(),
+                assets: assets.unwrap_or_default(),
+                events: events.map_or_else(Vec::new, |batch| batch.events),
+            })))
+        }
+        Err(error) => {
+            let cost = global.cost_track.get_total();
+            global.roll_back()?;
+            if is_acceptable_runtime_failure(&error) {
+                Ok(ContractCallOutcome::RuntimeFailure { cost, error })
             } else {
                 Err(error)
             }
@@ -1914,6 +2087,36 @@ mod tests {
             Some(Value::okay(Value::UInt(42)).expect("valid response"))
         );
         vm.seal_block().expect("seal block");
+    }
+
+    #[test]
+    fn vm_calls_clarity6_bitcoin_words_through_wasm() {
+        let block = [10; 32];
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.bitcoin")
+            .expect("valid contract identifier");
+        let sender = contract.issuer.clone().into();
+        let mut vm = Vm::new().expect("create VM");
+        vm.begin_block(None, block).expect("begin block");
+        vm.deploy_contract(
+            contract.clone(),
+            clarity::vm::ClarityVersion::Clarity6,
+            "(define-read-only (output) (get-bitcoin-tx-output? 0x00 u0))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy contract");
+
+        let result = vm
+            .execute_contract_call(
+                sender,
+                None,
+                contract,
+                "output",
+                &[],
+                LimitedCostTracker::new_free(),
+            )
+            .expect("call contract");
+
+        assert_eq!(result.value, Some(Value::err_uint(1)));
     }
 
     #[test]

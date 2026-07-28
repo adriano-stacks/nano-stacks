@@ -1,5 +1,6 @@
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::contexts::GlobalContext;
+use clarity::vm::costs::CostTracker;
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::{
@@ -541,11 +542,23 @@ pub fn call_function(
         .into_iter()
         .map(placeholder_for_type)
         .collect::<Vec<_>>();
-    wasm_function
-        .call(&mut store, &wasm_arguments, &mut results)
-        .map_err(|error| {
-            error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
-        })?;
+    let call_result = wasm_function.call(&mut store, &wasm_arguments, &mut results);
+    let remaining = store
+        .data()
+        .cost_globals
+        .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+            "cost-*".to_string(),
+        )))?
+        .remaining_costs(&mut store)
+        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    store
+        .data_mut()
+        .global_context
+        .cost_track
+        .add_cost(CostMeter::used_from_remaining(remaining).into())?;
+    call_result.map_err(|error| {
+        error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
+    })?;
     let (value, _) =
         wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?;
     value.ok_or(crate::error::wasm_error(WasmError::Expect(

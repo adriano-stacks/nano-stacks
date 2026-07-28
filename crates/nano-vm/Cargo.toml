@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
