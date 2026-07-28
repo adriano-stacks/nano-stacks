@@ -5,6 +5,7 @@ use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::diagnostic::Diagnostic;
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::ClarityVersion;
+use std::collections::HashMap;
 pub use walrus::Module;
 use wasm_generator::{GeneratorError, WasmGenerator};
 
@@ -24,7 +25,9 @@ pub mod tools;
 mod copy;
 mod debug_msg;
 pub mod duck_type;
+mod error;
 mod error_mapping;
+mod layout;
 
 #[cfg(feature = "developer-mode")]
 pub mod test_utils;
@@ -45,6 +48,36 @@ pub struct CompileResult {
     pub diagnostics: Vec<Diagnostic>,
     pub module: Module,
     pub contract_analysis: ContractAnalysis,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledContract {
+    pub wasm: Vec<u8>,
+    pub analysis: ContractAnalysis,
+}
+
+impl CompileResult {
+    pub fn into_compiled_contract(mut self) -> CompiledContract {
+        CompiledContract {
+            wasm: self.module.emit_wasm(),
+            analysis: self.contract_analysis,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModuleCache {
+    contracts: HashMap<QualifiedContractIdentifier, CompiledContract>,
+}
+
+impl ModuleCache {
+    pub fn insert(&mut self, contract: QualifiedContractIdentifier, module: CompiledContract) {
+        self.contracts.insert(contract, module);
+    }
+
+    pub fn get(&self, contract: &QualifiedContractIdentifier) -> Option<&CompiledContract> {
+        self.contracts.get(contract)
+    }
 }
 
 #[derive(Debug)]
@@ -105,23 +138,6 @@ pub fn compile(
         }
     };
 
-    // Now that the typechecker pass is done, we can concretize the expressions types which
-    // might contain `ListUnionType` or `CallableType`
-    #[allow(clippy::expect_used)]
-    if let Err(e) = utils::concretize(&mut contract_analysis) {
-        diagnostics.push(e.diagnostic);
-        return Err(CompileError::Generic {
-            ast: Box::new(ast),
-            diagnostics: diagnostics.clone(),
-            cost_tracker: Box::new(
-                contract_analysis
-                    .cost_track
-                    .take()
-                    .expect("Failed to take cost tracker from contract analysis"),
-            ),
-        });
-    }
-
     #[allow(clippy::expect_used)]
     let generator = match emit_cost_code {
         false => WasmGenerator::new(contract_analysis.clone()),
@@ -155,66 +171,4 @@ pub fn compile(
 pub fn compile_contract(contract_analysis: ContractAnalysis) -> Result<Module, GeneratorError> {
     let generator = WasmGenerator::new(contract_analysis)?;
     generator.generate()
-}
-
-mod utils {
-    use clarity::vm::analysis::ContractAnalysis;
-    use clarity::vm::errors::StaticCheckError;
-    use clarity::vm::types::signatures::FunctionReturnsSignature;
-    use clarity::vm::types::{FixedFunction, FunctionType};
-
-    pub fn concretize(contract_analysis: &mut ContractAnalysis) -> Result<(), StaticCheckError> {
-        // concretize Values types
-        if let Some(mut typemap) = contract_analysis.type_map.take() {
-            typemap.concretize()?;
-            contract_analysis.type_map = Some(typemap);
-        }
-
-        // concretize constants
-        for var_ty in contract_analysis.variable_types.values_mut() {
-            *var_ty = var_ty.clone().concretize_deep()?;
-        }
-
-        // concretize private functions return types
-        for fun_ty in contract_analysis.private_function_types.values_mut() {
-            *fun_ty = concretize_function_return_type(fun_ty.clone())?;
-        }
-
-        // concretize public functions return types
-        for fun_ty in contract_analysis.public_function_types.values_mut() {
-            *fun_ty = concretize_function_return_type(fun_ty.clone())?;
-        }
-
-        // concretize read-only functions return types
-        for fun_ty in contract_analysis.read_only_function_types.values_mut() {
-            *fun_ty = concretize_function_return_type(fun_ty.clone())?;
-        }
-
-        Ok(())
-    }
-
-    fn concretize_function_return_type(ft: FunctionType) -> Result<FunctionType, StaticCheckError> {
-        match ft {
-            FunctionType::Variadic(args, return_type) => {
-                Ok(FunctionType::Variadic(args, return_type.concretize_deep()?))
-            }
-            FunctionType::Fixed(FixedFunction { args, returns }) => {
-                Ok(FunctionType::Fixed(FixedFunction {
-                    args,
-                    returns: returns.concretize_deep()?,
-                }))
-            }
-            FunctionType::UnionArgs(args, ret_type) => {
-                Ok(FunctionType::UnionArgs(args, ret_type.concretize_deep()?))
-            }
-            FunctionType::Binary(arg1, arg2, FunctionReturnsSignature::Fixed(return_type)) => {
-                Ok(FunctionType::Binary(
-                    arg1,
-                    arg2,
-                    FunctionReturnsSignature::Fixed(return_type.concretize_deep()?),
-                ))
-            }
-            ft => Ok(ft),
-        }
-    }
 }

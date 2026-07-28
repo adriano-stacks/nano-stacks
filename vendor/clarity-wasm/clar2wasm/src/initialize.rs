@@ -1,20 +1,25 @@
 use clarity::vm::analysis::ContractAnalysis;
-use clarity::vm::clarity_wasm::{AccessCostMeter, CostGlobals, CostMeter};
 use clarity::vm::contexts::GlobalContext;
-use clarity::vm::errors::{RuntimeError, VmExecutionError, WasmError};
+use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
-use clarity::vm::types::{AssetIdentifier, BuffData, PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::types::{
+    AssetIdentifier, BuffData, FunctionType, PrincipalData, QualifiedContractIdentifier,
+    TypeSignature,
+};
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
-use wasmtime::{AsContextMut, Linker, Module, Store};
+use wasmtime::{AsContextMut, Linker, Module, Store, Val};
 
+use crate::cost::{CostGlobals, CostMeter};
+use crate::error::WasmError;
 use crate::error_mapping;
 use crate::linker::{link_cost_globals, link_host_functions};
 use crate::wasm_utils::*;
+use crate::{CompiledContract, ModuleCache};
 
 // The context used when making calls into the Wasm module.
-pub struct ClarityWasmContext<'a, 'b> {
-    pub global_context: &'a mut GlobalContext<'b>,
+pub struct ClarityWasmContext<'a, 'b, 'hooks> {
+    pub global_context: &'a mut GlobalContext<'b, 'hooks>,
     contract_context: Option<&'a ContractContext>,
     contract_context_mut: Option<&'a mut ContractContext>,
     pub call_stack: &'a mut CallStack,
@@ -32,12 +37,13 @@ pub struct ClarityWasmContext<'a, 'b> {
     /// a contract, and `None` otherwise.
     pub contract_analysis: Option<&'a ContractAnalysis>,
     pub cost_globals: Option<CostGlobals>,
+    pub module_cache: &'a ModuleCache,
 }
 
-impl<'a, 'b> ClarityWasmContext<'a, 'b> {
+impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_init(
-        global_context: &'a mut GlobalContext<'b>,
+        global_context: &'a mut GlobalContext<'b, 'hooks>,
         contract_context: &'a mut ContractContext,
         call_stack: &'a mut CallStack,
         sender: Option<PrincipalData>,
@@ -45,6 +51,7 @@ impl<'a, 'b> ClarityWasmContext<'a, 'b> {
         sponsor: Option<PrincipalData>,
         contract_analysis: Option<&'a ContractAnalysis>,
         cost_globals: Option<CostGlobals>,
+        module_cache: &'a ModuleCache,
     ) -> Self {
         ClarityWasmContext {
             global_context,
@@ -59,17 +66,19 @@ impl<'a, 'b> ClarityWasmContext<'a, 'b> {
             bhh_stack: vec![],
             contract_analysis,
             cost_globals,
+            module_cache,
         }
     }
 
     pub fn new_run(
-        global_context: &'a mut GlobalContext<'b>,
+        global_context: &'a mut GlobalContext<'b, 'hooks>,
         contract_context: &'a ContractContext,
         call_stack: &'a mut CallStack,
         sender: Option<PrincipalData>,
         caller: Option<PrincipalData>,
         sponsor: Option<PrincipalData>,
         contract_analysis: Option<&'a ContractAnalysis>,
+        module_cache: &'a ModuleCache,
     ) -> Self {
         ClarityWasmContext {
             global_context,
@@ -84,6 +93,7 @@ impl<'a, 'b> ClarityWasmContext<'a, 'b> {
             bhh_stack: vec![],
             contract_analysis,
             cost_globals: None,
+            module_cache,
         }
     }
 
@@ -126,7 +136,7 @@ impl<'a, 'b> ClarityWasmContext<'a, 'b> {
     pub fn pop_at_block(&mut self) -> Result<StacksBlockId, VmExecutionError> {
         self.bhh_stack
             .pop()
-            .ok_or(VmExecutionError::Wasm(WasmError::WasmGeneratorError(
+            .ok_or(crate::error::wasm_error(WasmError::WasmGeneratorError(
                 "Could not pop at_block".to_string(),
             )))
     }
@@ -147,7 +157,7 @@ impl<'a, 'b> ClarityWasmContext<'a, 'b> {
     pub fn contract_context_mut(&mut self) -> Result<&mut ContractContext, VmExecutionError> {
         match &mut self.contract_context_mut {
             Some(contract_context) => Ok(contract_context),
-            None => Err(VmExecutionError::Wasm(
+            None => Err(crate::error::wasm_error(
                 WasmError::DefineFunctionCalledInRunMode,
             )),
         }
@@ -337,13 +347,15 @@ pub fn initialize_contract(
     contract_context: &mut ContractContext,
     sponsor: Option<PrincipalData>,
     contract_analysis: &ContractAnalysis,
+    wasm: &[u8],
+    module_cache: &ModuleCache,
 ) -> Result<ContractInitReturn, VmExecutionError> {
     let publisher: PrincipalData = contract_context.contract_identifier.issuer.clone().into();
 
     let mut call_stack = CallStack::new();
     let epoch = global_context.epoch_id;
     let clarity_version = *contract_context.get_clarity_version();
-    let engine = global_context.engine.clone();
+    let engine = wasmtime::Engine::default();
     let init_context = ClarityWasmContext::new_init(
         global_context,
         contract_context,
@@ -353,31 +365,28 @@ pub fn initialize_contract(
         sponsor.clone(),
         Some(contract_analysis),
         None,
+        module_cache,
     );
-    let module = init_context
-        .contract_context()
-        .with_wasm_module(|wasm_module| {
-            Module::from_binary(&engine, wasm_module)
-                .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e)))
-        })?;
+    let module = Module::from_binary(&engine, wasm)
+        .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
     let mut store = Store::new(&engine, init_context);
     let mut linker = Linker::new(&engine);
     // Link in the host interface functions and globals.
     link_host_functions(&mut linker)?;
     store.data_mut().cost_globals = Some(
         link_cost_globals(&mut linker, &mut store.as_context_mut())
-            .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e.into())))?,
+            .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e.into())))?,
     );
 
     let instance = linker
         .instantiate(&mut store, &module)
-        .map_err(|e| VmExecutionError::Wasm(WasmError::UnableToLoadModule(e)))?;
+        .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
 
     // Call the `.top-level` function, which contains all top-level expressions
     // from the contract.
     let top_level = instance
         .get_func(&mut store, ".top-level")
-        .ok_or(VmExecutionError::Wasm(WasmError::DefinesNotFound))?;
+        .ok_or(crate::error::wasm_error(WasmError::DefinesNotFound))?;
 
     // Get the return type of the top-level expressions function
     let ty = top_level.ty(&mut store);
@@ -393,13 +402,6 @@ pub fn initialize_contract(
             error_mapping::resolve_error(e, instance, &mut store, &epoch, &clarity_version)
         })?;
 
-    // Save the compiled Wasm module into the contract context
-    store.data_mut().contract_context_mut()?.set_wasm_module(
-        module
-            .serialize()
-            .map_err(|e| VmExecutionError::Wasm(WasmError::WasmCompileFailed(e)))?,
-    );
-
     // Get the type of the last top-level expression with a return value
     // or default to `None`.
     let return_type = contract_analysis.expressions.iter().rev().find_map(|expr| {
@@ -412,16 +414,140 @@ pub fn initialize_contract(
     let ret = if let Some(return_type) = return_type {
         let memory = instance
             .get_memory(&mut store, "memory")
-            .ok_or(VmExecutionError::Wasm(WasmError::MemoryNotFound))?;
+            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
         wasm_to_clarity_value(return_type, 0, &results, memory, &mut &mut store, epoch)
             .map(|(val, _offset)| val)?
     } else {
         None
     };
 
-    let cost = linker
-        .get_used_cost(&mut store)
-        .map_err(|_| VmExecutionError::Wasm(WasmError::GlobalNotFound("cost-*".to_string())))?;
+    let remaining = store
+        .data()
+        .cost_globals
+        .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+            "cost-*".to_string(),
+        )))?
+        .to_cost_meter(&mut store)
+        .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
+    let cost = CostMeter::used_from_remaining(remaining);
 
     Ok(ContractInitReturn { ret, cost })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_function(
+    function_name: &str,
+    arguments: &[Value],
+    module: &CompiledContract,
+    global_context: &mut GlobalContext,
+    contract_context: &ContractContext,
+    call_stack: &mut CallStack,
+    sender: Option<PrincipalData>,
+    caller: Option<PrincipalData>,
+    sponsor: Option<PrincipalData>,
+    module_cache: &ModuleCache,
+) -> Result<Value, VmExecutionError> {
+    let function = contract_context
+        .lookup_function(function_name)
+        .ok_or_else(|| {
+            clarity::vm::errors::RuntimeCheckErrorKind::UndefinedFunction(function_name.into())
+        })?;
+    let function_type = module
+        .analysis
+        .get_public_function_type(function_name)
+        .or_else(|| module.analysis.get_read_only_function_type(function_name))
+        .or_else(|| module.analysis.get_private_function(function_name))
+        .ok_or(crate::error::wasm_error(WasmError::NotInDatabase(
+            function_name.into(),
+        )))?;
+    let return_type = match function_type {
+        FunctionType::Fixed(function) => function.returns.clone(),
+        _ => {
+            return Err(crate::error::wasm_error(WasmError::InvalidFunctionKind(
+                function_name.into(),
+            )));
+        }
+    };
+    let expected_arguments = function.get_arg_types();
+    if arguments.len() != expected_arguments.len() {
+        return Err(
+            clarity::vm::errors::RuntimeCheckErrorKind::IncorrectArgumentCount(
+                expected_arguments.len(),
+                arguments.len(),
+            )
+            .into(),
+        );
+    }
+
+    let epoch = global_context.epoch_id;
+    let clarity_version = *contract_context.get_clarity_version();
+    let engine = wasmtime::Engine::default();
+    let wasm_module = Module::from_binary(&engine, &module.wasm)
+        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    let context = ClarityWasmContext::new_run(
+        global_context,
+        contract_context,
+        call_stack,
+        sender,
+        caller,
+        sponsor,
+        Some(&module.analysis),
+        module_cache,
+    );
+    let mut store = Store::new(&engine, context);
+    let mut linker = Linker::new(&engine);
+    link_host_functions(&mut linker)?;
+    store.data_mut().cost_globals = Some(link_cost_globals(&mut linker, &mut store)?);
+    let instance = linker
+        .instantiate(&mut store, &wasm_module)
+        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    let stack_pointer =
+        instance
+            .get_global(&mut store, "stack-pointer")
+            .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+                "stack-pointer".into(),
+            )))?;
+    let mut offset = stack_pointer
+        .get(&mut store)
+        .i32()
+        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    let mut wasm_arguments = Vec::new();
+    for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
+        if !expected_type.admits(&epoch, argument)? {
+            return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeError(
+                Box::new(expected_type.clone()),
+                Box::new(TypeSignature::type_of(argument)?),
+            )
+            .into());
+        }
+        let (values, next_offset) =
+            pass_argument_to_wasm(memory, &mut store, expected_type, argument, offset)?;
+        wasm_arguments.extend(values);
+        offset = next_offset;
+    }
+    stack_pointer
+        .set(&mut store, Val::I32(offset))
+        .map_err(|error| crate::error::wasm_error(WasmError::Runtime(error)))?;
+    let wasm_function = instance
+        .get_func(&mut store, function_name)
+        .ok_or_else(|| {
+            clarity::vm::errors::RuntimeCheckErrorKind::UndefinedFunction(function_name.into())
+        })?;
+    let mut results = wasm_value_types(&return_type)
+        .into_iter()
+        .map(placeholder_for_type)
+        .collect::<Vec<_>>();
+    wasm_function
+        .call(&mut store, &wasm_arguments, &mut results)
+        .map_err(|error| {
+            error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
+        })?;
+    let (value, _) =
+        wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?;
+    value.ok_or(crate::error::wasm_error(WasmError::Expect(
+        "function returned no value".into(),
+    )))
 }

@@ -2,7 +2,6 @@ use clarity::types::StacksEpochId;
 use clarity::vm::costs::CostErrors;
 use clarity::vm::errors::{
     CommonCheckErrorKind, EarlyReturnError, RuntimeCheckErrorKind, RuntimeError, VmExecutionError,
-    WasmError,
 };
 use clarity::vm::types::ResponseData;
 use clarity::vm::{ClarityVersion, Value};
@@ -11,6 +10,7 @@ use clarity_types::{ClarityName, ClarityTypeError};
 use walrus::InstrSeqBuilder;
 use wasmtime::{AsContextMut, Instance, Trap};
 
+use crate::error::WasmError;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
 use crate::wasm_utils::{
     get_global, read_bytes_from_wasm, read_from_wasm_indirect, read_identifier_from_wasm,
@@ -175,7 +175,10 @@ pub(crate) fn resolve_error(
     clarity_version: &ClarityVersion,
 ) -> VmExecutionError {
     if let Some(vm_error) = e.root_cause().downcast_ref::<VmExecutionError>() {
-        return referror_to_error(vm_error, VmExecutionError::Wasm(WasmError::ModuleNotFound));
+        return referror_to_error(
+            vm_error,
+            crate::error::wasm_error(WasmError::ModuleNotFound),
+        );
     };
 
     if let Some(vm_error) = e.root_cause().downcast_ref::<RuntimeCheckErrorKind>() {
@@ -201,7 +204,7 @@ pub(crate) fn resolve_error(
     }
 
     // All other errors are treated as general runtime errors.
-    VmExecutionError::Wasm(WasmError::Runtime(e))
+    crate::error::wasm_error(WasmError::Runtime(e))
 }
 
 /// Converts a WebAssembly runtime error code into a Clarity `Error`.
@@ -225,7 +228,7 @@ fn from_runtime_error_code(
     let runtime_error_code = get_global_i32(&instance, &mut store, "runtime-error-code");
 
     match ErrorMap::from(runtime_error_code) {
-        ErrorMap::NotClarityError => VmExecutionError::Wasm(WasmError::Runtime(e)),
+        ErrorMap::NotClarityError => crate::error::wasm_error(WasmError::Runtime(e)),
         ErrorMap::ArithmeticOverflow => {
             VmExecutionError::Runtime(RuntimeError::ArithmeticOverflow, Some(Vec::new()))
         }
@@ -243,9 +246,10 @@ fn from_runtime_error_code(
             RuntimeError::Arithmetic(SQRTI_ERROR_MESSAGE.into()),
             Some(Vec::new()),
         ),
-        ErrorMap::BadTypeConstruction => {
-            VmExecutionError::Runtime(RuntimeError::BadTypeConstruction, Some(Vec::new()))
-        }
+        ErrorMap::BadTypeConstruction => VmExecutionError::Runtime(
+            RuntimeError::Arithmetic("invalid type construction".into()),
+            Some(Vec::new()),
+        ),
         ErrorMap::Panic => {
             // TODO: see issue: #531
             // This RuntimeError::UnwrapFailure need to have a proper context.
@@ -323,29 +327,29 @@ fn from_runtime_error_code(
         ErrorMap::CostOverrunWriteLength => VmExecutionError::from(CostErrors::CostOverflow),
         ErrorMap::ExternError => {
             match instance.get_global(store.as_context_mut(), "linked-error") {
-                None => VmExecutionError::Wasm(WasmError::GlobalNotFound(
+                None => crate::error::wasm_error(WasmError::GlobalNotFound(
                     "runtime-error-linked".to_owned(),
                 )),
                 Some(global) => match global.get(store.as_context_mut()).unwrap_externref() {
-                    None => VmExecutionError::Wasm(WasmError::Expect("".to_owned())),
+                    None => crate::error::wasm_error(WasmError::Expect("".to_owned())),
                     Some(linked_error_extern) => {
                         match linked_error_extern
                             .data()
                             .downcast_ref::<VmExecutionError>()
                         {
-                            None => VmExecutionError::Wasm(WasmError::Expect(
+                            None => crate::error::wasm_error(WasmError::Expect(
                                 "runtime-error-linked should hold an error type".to_owned(),
                             )),
                             Some(ref_error) => referror_to_error(
                                 ref_error,
-                                VmExecutionError::Wasm(WasmError::ModuleNotFound),
+                                crate::error::wasm_error(WasmError::ModuleNotFound),
                             ),
                         }
                     }
                 },
             }
         }
-        ErrorMap::SignatureTypeSizeCheckError => VmExecutionError::Wasm(WasmError::Expect(
+        ErrorMap::SignatureTypeSizeCheckError => crate::error::wasm_error(WasmError::Expect(
             "FAIL: .size() overflowed on too large of a type. construction should have failed!"
                 .into(),
         )),

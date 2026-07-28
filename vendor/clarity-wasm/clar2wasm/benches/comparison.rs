@@ -169,7 +169,8 @@ where
         StacksEpochId::latest(),
     );
 
-    contract_context.set_wasm_module(compilation.module.emit_wasm());
+    let wasm = compilation.module.emit_wasm();
+    let module_cache = clar2wasm::ModuleCache::default();
 
     global_context.begin();
 
@@ -179,6 +180,8 @@ where
         &mut contract_context,
         None,
         &compilation.contract_analysis,
+        &wasm,
+        &module_cache,
     )
     .expect("Failed to initialize the contract");
 

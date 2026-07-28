@@ -11,11 +11,10 @@ use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use clarity::types::StacksEpochId;
 use clarity::vm::analysis::run_analysis;
 use clarity::vm::ast::build_ast;
-use clarity::vm::clarity_wasm::CostMeter;
 use clarity::vm::contexts::{EventBatch, GlobalContext};
 use clarity::vm::costs::{CostTracker, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::ClarityDatabase;
-use clarity::vm::errors::{StaticCheckErrorKind, VmExecutionError, WasmError};
+use clarity::vm::errors::{StaticCheckErrorKind, VmExecutionError, VmInternalError};
 use clarity::vm::events::{SmartContractEventData, StacksTransactionEvent};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData};
 use clarity::vm::{eval_all, ClarityVersion, ContractContext, ContractName, Value};
@@ -23,15 +22,19 @@ use clarity_types::types::TypeSignature;
 use regex::Regex;
 
 use crate::compile;
+use crate::cost::CostMeter;
 use crate::datastore::{BurnDatastore, Datastore, StacksConstants};
-use crate::initialize::initialize_contract;
+use crate::error::WasmError;
+use crate::initialize::{call_function, initialize_contract};
 use crate::wasm_utils::get_type_in_memory_size;
+use crate::{CompiledContract, ModuleCache};
 
 const DEFAULT_ENV_AMOUNT: u128 = 1_000_000_000;
 
 #[derive(Clone)]
 pub struct TestEnvironment {
     contract_contexts: HashMap<String, ContractContext>,
+    module_cache: ModuleCache,
     pub epoch: StacksEpochId,
     pub version: ClarityVersion,
     datastore: Datastore,
@@ -99,6 +102,7 @@ impl TestEnvironment {
 
         let mut env = Self {
             contract_contexts: HashMap::new(),
+            module_cache: ModuleCache::default(),
             epoch,
             version,
             datastore,
@@ -218,6 +222,8 @@ impl TestEnvironment {
             (StacksEpochId::Epoch33, version) => version >= ClarityVersion::Clarity4,
 
             (StacksEpochId::Epoch34, version) => version >= ClarityVersion::Clarity5,
+
+            (StacksEpochId::Epoch40, version) => version >= ClarityVersion::Clarity6,
         }
     }
 
@@ -268,7 +274,9 @@ impl TestEnvironment {
                     StaticCheckErrorKind::Unreachable(format!("Compilation failure {e:?}"))
                 })
             })
-            .map_err(|e| VmExecutionError::Wasm(WasmError::WasmGeneratorError(format!("{e:?}"))))?;
+            .map_err(|e| {
+                crate::error::wasm_error(WasmError::WasmGeneratorError(format!("{e:?}")))
+            })?;
 
         self.datastore
             .as_analysis_db()
@@ -278,8 +286,7 @@ impl TestEnvironment {
             .expect("Failed to insert contract analysis.");
 
         let mut contract_context = ContractContext::new(contract_id.clone(), self.version);
-        // compile_result.module.emit_wasm_file("test.wasm").unwrap();
-        contract_context.set_wasm_module(compile_result.module.emit_wasm());
+        let wasm = compile_result.module.emit_wasm();
 
         let mut cost_tracker = LimitedCostTracker::new_free();
         std::mem::swap(&mut self.cost_tracker, &mut cost_tracker);
@@ -302,6 +309,8 @@ impl TestEnvironment {
             &mut contract_context,
             None,
             &compile_result.contract_analysis,
+            &wasm,
+            &self.module_cache,
         )?;
 
         let data_size = contract_context.data_size;
@@ -318,8 +327,16 @@ impl TestEnvironment {
             self.events.push(events);
         }
 
+        let contract_name = contract_id.name.to_string();
         self.contract_contexts
-            .insert(contract_id.name.to_string(), contract_context);
+            .insert(contract_name.clone(), contract_context);
+        self.module_cache.insert(
+            contract_id,
+            CompiledContract {
+                wasm,
+                analysis: compile_result.contract_analysis,
+            },
+        );
 
         self.cost_tracker = global_context.cost_track;
         self.cost_tracker
@@ -335,6 +352,58 @@ impl TestEnvironment {
 
     pub fn get_contract_context(&self, contract_name: &str) -> Option<&ContractContext> {
         self.contract_contexts.get(contract_name)
+    }
+
+    pub fn call_contract(
+        &mut self,
+        contract_name: &str,
+        function_name: &str,
+        arguments: &[Value],
+    ) -> Result<Value, VmExecutionError> {
+        let contract_context = self
+            .contract_contexts
+            .get(contract_name)
+            .ok_or_else(|| VmInternalError::Expect("unknown contract".into()))?
+            .clone();
+        let module = self
+            .module_cache
+            .get(&contract_context.contract_identifier)
+            .ok_or_else(|| VmInternalError::Expect("unknown compiled contract".into()))?
+            .clone();
+        let connection = ClarityDatabase::new(
+            &mut self.datastore,
+            &self.burn_datastore,
+            &self.burn_datastore,
+        );
+        let mut tracker = LimitedCostTracker::new_free();
+        std::mem::swap(&mut self.cost_tracker, &mut tracker);
+        let mut global_context = GlobalContext::new(
+            self.is_mainnet,
+            self.chain_id,
+            connection,
+            tracker,
+            self.epoch,
+        );
+        global_context.begin();
+        let mut call_stack = clarity::vm::CallStack::new();
+        let result = call_function(
+            function_name,
+            arguments,
+            &module,
+            &mut global_context,
+            &contract_context,
+            &mut call_stack,
+            Some(PrincipalData::Standard(StandardPrincipalData::transient())),
+            None,
+            None,
+            &self.module_cache,
+        );
+        let (_, events) = global_context.commit()?;
+        if let Some(events) = events {
+            self.events.push(events);
+        }
+        self.cost_tracker = global_context.cost_track;
+        result
     }
 
     pub fn get_events(&self) -> &Vec<EventBatch> {
@@ -385,7 +454,9 @@ impl TestEnvironment {
                 )
                 .map_err(|boxed| StaticCheckErrorKind::Unreachable(format!("{:?}", boxed.0)))
             })
-            .map_err(|e| VmExecutionError::Wasm(WasmError::WasmGeneratorError(format!("{e:?}"))))?;
+            .map_err(|e| {
+                crate::error::wasm_error(WasmError::WasmGeneratorError(format!("{e:?}")))
+            })?;
 
         self.datastore
             .as_analysis_db()
@@ -583,7 +654,10 @@ impl KnownBug {
             Regex::new(regex).unwrap()
         });
 
-        if let VmExecutionError::Wasm(WasmError::WasmGeneratorError(message)) = err {
+        if let VmExecutionError::Internal(
+            clarity::vm::errors::VmInternalError::InvariantViolation(message),
+        ) = err
+        {
             RGX.captures(message).is_some_and(|caps| {
                 caps.get(1)
                     .is_none_or(|cap1| cap1.as_str() == caps.get(2).unwrap().as_str())

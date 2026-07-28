@@ -1,4 +1,4 @@
-use clarity::vm::clarity_wasm::{get_type_size, PRINCIPAL_BYTES, STANDARD_PRINCIPAL_BYTES};
+use crate::layout::{get_type_size, PRINCIPAL_BYTES, STANDARD_PRINCIPAL_BYTES};
 use clarity::vm::types::serialization::TypePrefix;
 use clarity::vm::types::{
     ListTypeData, SequenceSubtype, StringSubtype, TupleTypeSignature, TypeSignature,

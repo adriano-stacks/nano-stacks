@@ -464,15 +464,12 @@ dependencies = [
 
 [[package]]
 name = "clarity"
-version = "2.3.0"
-source = "git+https://github.com/stacks-network/stacks-core?branch=feat%2Fclarity-wasm-develop#bfc6423b2a8ae7b0a96a1c0f1f5f484609f57a54"
+version = "0.0.1"
+source = "git+https://github.com/stacks-network/stacks-core.git?rev=e04ba8e101fe2f71fae9c79a956b599e0523f3ae#e04ba8e101fe2f71fae9c79a956b599e0523f3ae"
 dependencies = [
  "clarity-types",
- "hashbrown 0.15.5",
  "integer-sqrt",
  "lazy_static",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
  "regex",
  "rstest",
  "rstest_reuse",
@@ -483,13 +480,12 @@ dependencies = [
  "serde_stacker",
  "slog",
  "stacks-common",
- "wasmtime",
 ]
 
 [[package]]
 name = "clarity-types"
 version = "0.0.1"
-source = "git+https://github.com/stacks-network/stacks-core?branch=feat%2Fclarity-wasm-develop#bfc6423b2a8ae7b0a96a1c0f1f5f484609f57a54"
+source = "git+https://github.com/stacks-network/stacks-core.git?rev=e04ba8e101fe2f71fae9c79a956b599e0523f3ae#e04ba8e101fe2f71fae9c79a956b599e0523f3ae"
 dependencies = [
  "lazy_static",
  "regex",
@@ -499,7 +495,7 @@ dependencies = [
  "serde_json",
  "slog",
  "stacks-common",
- "wasmtime",
+ "variant_count",
 ]
 
 [[package]]
@@ -1868,12 +1864,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "percent-encoding"
-version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2646,8 +2636,8 @@ dependencies = [
 
 [[package]]
 name = "stacks-common"
-version = "0.0.2"
-source = "git+https://github.com/stacks-network/stacks-core?branch=feat%2Fclarity-wasm-develop#bfc6423b2a8ae7b0a96a1c0f1f5f484609f57a54"
+version = "0.0.1"
+source = "git+https://github.com/stacks-network/stacks-core.git?rev=e04ba8e101fe2f71fae9c79a956b599e0523f3ae#e04ba8e101fe2f71fae9c79a956b599e0523f3ae"
 dependencies = [
  "chrono",
  "curve25519-dalek",
@@ -2657,7 +2647,6 @@ dependencies = [
  "libsecp256k1",
  "nix 0.23.2",
  "p256",
- "percent-encoding",
  "rand 0.8.5",
  "ripemd",
  "rusqlite",
@@ -2670,7 +2659,6 @@ dependencies = [
  "slog",
  "slog-term",
  "thiserror",
- "time",
  "toml",
  "winapi",
 ]
@@ -2900,6 +2888,17 @@ checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "variant_count"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17c13b28baa922722e35ded153b394d0247b4942b4ad54f85713a7de672cdf0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]

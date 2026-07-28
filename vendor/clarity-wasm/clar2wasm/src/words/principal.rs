@@ -1,7 +1,7 @@
-use clarity::vm::clarity_wasm::STANDARD_PRINCIPAL_BYTES;
+use crate::layout::STANDARD_PRINCIPAL_BYTES;
 use clarity::vm::types::TypeSignature;
 use clarity::vm::{ClarityName, SymbolicExpression};
-use clarity::{
+use stacks_common::address::{
     C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
     C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };

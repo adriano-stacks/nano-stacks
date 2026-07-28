@@ -412,7 +412,6 @@ impl ComplexWord for GetTenureInfo {
 #[cfg(test)]
 mod tests {
     use clarity::types::StacksEpochId;
-    use clarity::vm::errors::VmExecutionError;
     use clarity::vm::types::{OptionalData, PrincipalData, TupleData};
     use clarity::vm::{ClarityVersion, Value};
     use clarity_types::ClarityName;
@@ -1031,7 +1030,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             e,
-            VmExecutionError::Wasm(clarity::vm::errors::WasmError::DefineFunctionCalledInRunMode,),
+            crate::error::wasm_error(crate::error::WasmError::DefineFunctionCalledInRunMode),
         );
     }
 

@@ -1,4 +1,4 @@
-use clarity::vm::clarity_wasm::get_type_size;
+use crate::layout::get_type_size;
 use clarity::vm::types::{
     FixedFunction, FunctionType, ListTypeData, SequenceSubtype, StringSubtype, TypeSignature,
 };

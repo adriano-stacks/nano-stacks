@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use clarity::vm::clarity_wasm::get_type_size;
+use crate::layout::get_type_size;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{PrincipalData, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType, Value};
@@ -594,6 +594,55 @@ impl ComplexWord for WithStacking {
             // Call the host interface function, `with_stacking`
             builder.call(generator.func_by_name("stdlib.with_stacking"));
 
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WithStaking;
+
+impl Word for WithStaking {
+    fn name(&self) -> ClarityName {
+        ClarityName::from_literal("with-staking")
+    }
+}
+
+impl ComplexWord for WithStaking {
+    fn traverse(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut walrus::InstrSeqBuilder,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
+    ) -> Result<(), GeneratorError> {
+        WithStacking.traverse(generator, builder, _expr, args)
+    }
+}
+
+#[derive(Debug)]
+pub struct WithPox;
+
+impl Word for WithPox {
+    fn name(&self) -> ClarityName {
+        ClarityName::from_literal("with-pox")
+    }
+}
+
+impl ComplexWord for WithPox {
+    fn traverse(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut walrus::InstrSeqBuilder,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
+    ) -> Result<(), GeneratorError> {
+        check_args!(generator, builder, 0, args.len(), ArgumentCountCheck::Exact);
+
+        with_allowance_context(|allowance_context| {
+            builder
+                .local_get(allowance_context)
+                .call(generator.func_by_name("stdlib.with_pox"));
             Ok(())
         })
     }

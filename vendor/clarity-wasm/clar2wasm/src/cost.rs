@@ -11,12 +11,157 @@ use clarity::types::StacksEpochId;
 use clarity::vm::ClarityName;
 use walrus::ir::{BinaryOp, Instr, UnaryOp, Unop};
 use walrus::{FunctionId, GlobalId, InstrSeqBuilder, LocalId, Module};
+use wasmtime::{AsContextMut, Global, Val};
 
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
 use crate::words::Word;
 
 type Result<T, E = GeneratorError> = std::result::Result<T, E>;
+
+#[derive(Debug)]
+pub enum Cost {
+    Runtime,
+    ReadCount,
+    ReadLength,
+    WriteCount,
+    WriteLength,
+}
+
+impl Cost {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Runtime => "cost-runtime",
+            Self::ReadCount => "cost-read-count",
+            Self::ReadLength => "cost-read-length",
+            Self::WriteCount => "cost-write-count",
+            Self::WriteLength => "cost-write-length",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostMeter {
+    pub runtime: i64,
+    pub read_count: i64,
+    pub read_length: i64,
+    pub write_count: i64,
+    pub write_length: i64,
+}
+
+impl CostMeter {
+    pub const INIT: Self = Self {
+        runtime: i64::MAX,
+        read_count: i64::MAX,
+        read_length: i64::MAX,
+        write_count: i64::MAX,
+        write_length: i64::MAX,
+    };
+
+    pub const ZERO: Self = Self {
+        runtime: 0,
+        read_count: 0,
+        read_length: 0,
+        write_count: 0,
+        write_length: 0,
+    };
+
+    pub fn used_from_remaining(remaining: Self) -> Self {
+        Self {
+            runtime: Self::INIT.runtime - remaining.runtime,
+            read_count: Self::INIT.read_count - remaining.read_count,
+            read_length: Self::INIT.read_length - remaining.read_length,
+            write_count: Self::INIT.write_count - remaining.write_count,
+            write_length: Self::INIT.write_length - remaining.write_length,
+        }
+    }
+}
+
+impl From<CostMeter> for clarity::vm::costs::ExecutionCost {
+    fn from(meter: CostMeter) -> Self {
+        Self {
+            write_length: meter.write_length as u64,
+            write_count: meter.write_count as u64,
+            read_length: meter.read_length as u64,
+            read_count: meter.read_count as u64,
+            runtime: meter.runtime as u64,
+        }
+    }
+}
+
+impl From<clarity::vm::costs::ExecutionCost> for CostMeter {
+    fn from(cost: clarity::vm::costs::ExecutionCost) -> Self {
+        Self {
+            runtime: cost.runtime as i64,
+            read_count: cost.read_count as i64,
+            read_length: cost.read_length as i64,
+            write_count: cost.write_count as i64,
+            write_length: cost.write_length as i64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CostGlobals {
+    pub runtime: Global,
+    pub read_count: Global,
+    pub read_length: Global,
+    pub write_count: Global,
+    pub write_length: Global,
+}
+
+impl CostGlobals {
+    pub fn to_cost_meter<T>(
+        &self,
+        store: &mut impl AsContextMut<Data = T>,
+    ) -> wasmtime::Result<CostMeter> {
+        Ok(CostMeter {
+            runtime: self
+                .runtime
+                .get(store.as_context_mut())
+                .i64()
+                .ok_or_else(|| wasmtime::Error::msg("missing cost-runtime"))?,
+            read_count: self
+                .read_count
+                .get(store.as_context_mut())
+                .i64()
+                .ok_or_else(|| wasmtime::Error::msg("missing cost-read-count"))?,
+            read_length: self
+                .read_length
+                .get(store.as_context_mut())
+                .i64()
+                .ok_or_else(|| wasmtime::Error::msg("missing cost-read-length"))?,
+            write_count: self
+                .write_count
+                .get(store.as_context_mut())
+                .i64()
+                .ok_or_else(|| wasmtime::Error::msg("missing cost-write-count"))?,
+            write_length: self
+                .write_length
+                .get(store.as_context_mut())
+                .i64()
+                .ok_or_else(|| wasmtime::Error::msg("missing cost-write-length"))?,
+        })
+    }
+
+    pub fn from_cost_meter<T>(
+        &self,
+        store: &mut impl AsContextMut<Data = T>,
+        meter: &CostMeter,
+    ) -> wasmtime::Result<()> {
+        self.runtime
+            .set(store.as_context_mut(), Val::I64(meter.runtime))?;
+        self.read_count
+            .set(store.as_context_mut(), Val::I64(meter.read_count))?;
+        self.read_length
+            .set(store.as_context_mut(), Val::I64(meter.read_length))?;
+        self.write_count
+            .set(store.as_context_mut(), Val::I64(meter.write_count))?;
+        self.write_length
+            .set(store.as_context_mut(), Val::I64(meter.write_length))?;
+        Ok(())
+    }
+}
 
 /// Extension trait allowing for words to generate cost tracking code
 /// during traversal.
@@ -164,7 +309,9 @@ impl ChargeContext {
             | StacksEpochId::Epoch31
             | StacksEpochId::Epoch32 => clar3::WORD_COSTS.get(name),
             // From epoch 33 we should use clar4 word costs
-            StacksEpochId::Epoch33 | StacksEpochId::Epoch34 => todo!(),
+            StacksEpochId::Epoch33 | StacksEpochId::Epoch34 | StacksEpochId::Epoch40 => {
+                clar3::WORD_COSTS.get(name)
+            }
         }
     }
 }
@@ -490,8 +637,6 @@ mod caf {
     //! The code in this module tests that the code generation in the `caf_*` functions is correct,
     //! *not* that the code generation of each word is correct.
 
-    use clarity::vm::clarity_wasm::{AccessCostMeter, CostMeter};
-
     use super::*;
     use crate::linker::link_cost_globals;
 
@@ -630,11 +775,12 @@ mod caf {
         let mut linker = Linker::<()>::new(&engine);
         let mut store = Store::new(&engine, ());
 
-        link_cost_globals(&mut linker, &mut store).expect("host globals should be linked");
-        linker
-            .set_cost_meter(
+        let cost_globals =
+            link_cost_globals(&mut linker, &mut store).expect("host globals should be linked");
+        cost_globals
+            .from_cost_meter(
                 &mut store,
-                CostMeter {
+                &CostMeter {
                     runtime: initial,
                     read_count: 0,
                     read_length: 0,
@@ -652,7 +798,7 @@ mod caf {
         let err_code = instance.get_global(&mut store, "err-code").unwrap();
 
         match func.call(&mut store, arg) {
-            Ok(_) => Ok(linker.get_cost_meter(&mut store).unwrap().runtime),
+            Ok(_) => Ok(cost_globals.to_cost_meter(&mut store).unwrap().runtime),
             Err(_) => Err(err_code.get(&mut store).unwrap_i64()),
         }
     }
@@ -745,7 +891,6 @@ mod caf {
 
 #[cfg(test)]
 mod word {
-    use clarity::vm::clarity_wasm::CostMeter;
     use clarity::vm::ClarityVersion;
 
     use super::*;

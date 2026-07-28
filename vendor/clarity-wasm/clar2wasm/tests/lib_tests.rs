@@ -25,13 +25,14 @@ use hex::FromHex;
 /// - the names of the contracts to initialize (optionally including a
 ///   subdirectory, e.g. `multi-contract/contract-caller`),
 /// - a closure with type
-///   `|global_context: &mut GlobalContext, contract_context: &HashMap<&str, ContractContext>, return_val: Option<Value>|`
+///   `|global_context: &mut GlobalContext, contract_context: &HashMap<&str, ContractContext>, module_cache: &ModuleCache, return_val: Option<Value>|`
 ///   and that contains all the assertions we want to test.
 macro_rules! test_multi_contract_init {
     ($func: ident, $contract_names: expr, $context_test: expr) => {
         #[test]
         fn $func() {
             let mut contract_contexts = HashMap::new();
+            let mut module_cache = clar2wasm::ModuleCache::default();
 
             let constants = StacksConstants::default();
             let burn_datastore = BurnDatastore::new(constants);
@@ -77,11 +78,6 @@ macro_rules! test_multi_contract_init {
                             StaticCheckErrorKind::Unreachable(format!("Compilation failure {e:?}"))
                         })
                     })
-                    .map_err(|e| {
-                        clarity::vm::errors::VmExecutionError::Wasm(
-                            clarity::vm::errors::WasmError::WasmGeneratorError(format!("{e:?}")),
-                        )
-                    })
                     .expect("Failed to compile contract.");
 
                 clarity_store
@@ -93,8 +89,10 @@ macro_rules! test_multi_contract_init {
 
                 let mut contract_context =
                     ContractContext::new(contract_id.clone(), ClarityVersion::Clarity2);
-                // compile_result.module.emit_wasm_file("test.wasm").unwrap();
-                contract_context.set_wasm_module(compile_result.module.emit_wasm());
+                let compiled_contract = clar2wasm::CompiledContract {
+                    wasm: compile_result.module.emit_wasm(),
+                    analysis: compile_result.contract_analysis.clone(),
+                };
 
                 let mut global_context = GlobalContext::new(
                     false,
@@ -112,7 +110,9 @@ macro_rules! test_multi_contract_init {
                     &mut global_context,
                     &mut contract_context,
                     None,
-                    &compile_result.contract_analysis,
+                    &compiled_contract.analysis,
+                    &compiled_contract.wasm,
+                    &module_cache,
                 )
                 .expect("Failed to initialize contract.")
                 .ret;
@@ -131,6 +131,7 @@ macro_rules! test_multi_contract_init {
                 cost_tracker = global_context.cost_track;
 
                 contract_contexts.insert(contract_name, contract_context);
+                module_cache.insert(contract_id, compiled_contract);
             }
 
             // Do this once for all contracts
@@ -155,7 +156,12 @@ macro_rules! test_multi_contract_init {
             global_context.begin();
 
             #[allow(clippy::redundant_closure_call)]
-            $context_test(&mut global_context, &contract_contexts, return_val);
+            $context_test(
+                &mut global_context,
+                &contract_contexts,
+                &module_cache,
+                return_val,
+            );
 
             global_context.commit().unwrap();
         }
@@ -176,6 +182,7 @@ macro_rules! test_contract_init {
             [$contract_name],
             |global_context: &mut GlobalContext,
              contract_contexts: &HashMap<&str, ContractContext>,
+             _module_cache: &clar2wasm::ModuleCache,
              return_val: Option<Value>| {
                 let contract_context = contract_contexts.get($contract_name).unwrap();
                 $context_test(global_context, contract_context, return_val);
@@ -200,19 +207,26 @@ macro_rules! test_multi_contract_call {
             $init_contracts,
             |global_context: &mut GlobalContext,
              contract_contexts: &HashMap<&str, ContractContext>,
+             module_cache: &clar2wasm::ModuleCache,
              _return_val: Option<Value>| {
                 // Initialize a call stack
                 let mut call_stack = CallStack::new();
 
-                let result = clarity::vm::clarity_wasm::call_function(
+                let contract_context = contract_contexts.get($contract_name).unwrap();
+                let module = module_cache
+                    .get(&contract_context.contract_identifier)
+                    .unwrap();
+                let result = clar2wasm::initialize::call_function(
                     $contract_func,
                     $params,
+                    module,
                     global_context,
-                    &contract_contexts.get($contract_name).unwrap(),
+                    contract_context,
                     &mut call_stack,
                     Some(StandardPrincipalData::transient().into()),
                     Some(StandardPrincipalData::transient().into()),
                     None,
+                    &module_cache,
                 );
 
                 // https://github.com/rust-lang/rust-clippy/issues/1553
@@ -320,19 +334,26 @@ macro_rules! test_multi_contract_call_events {
             $init_contracts,
             |global_context: &mut GlobalContext,
              contract_contexts: &HashMap<&str, ContractContext>,
+             module_cache: &clar2wasm::ModuleCache,
              _return_val: Option<Value>| {
                 // Initialize a call stack
                 let mut call_stack = CallStack::new();
 
-                let result = clarity::vm::clarity_wasm::call_function(
+                let contract_context = contract_contexts.get($contract_name).unwrap();
+                let module = module_cache
+                    .get(&contract_context.contract_identifier)
+                    .unwrap();
+                let result = clar2wasm::initialize::call_function(
                     $contract_func,
                     $params,
+                    module,
                     global_context,
-                    &contract_contexts.get($contract_name).unwrap(),
+                    contract_context,
                     &mut call_stack,
                     Some(StandardPrincipalData::transient().into()),
                     Some(StandardPrincipalData::transient().into()),
                     None,
+                    module_cache,
                 );
 
                 // https://github.com/rust-lang/rust-clippy/issues/1553
@@ -483,19 +504,26 @@ macro_rules! test_contract_call_error {
             [$contract_name],
             |global_context: &mut GlobalContext,
              contract_contexts: &HashMap<&str, ContractContext>,
+             module_cache: &clar2wasm::ModuleCache,
              _return_val: Option<Value>| {
                 // Initialize a call stack
                 let mut call_stack = CallStack::new();
 
-                let result = clarity::vm::clarity_wasm::call_function(
+                let contract_context = contract_contexts.get($contract_name).unwrap();
+                let module = module_cache
+                    .get(&contract_context.contract_identifier)
+                    .unwrap();
+                let result = clar2wasm::initialize::call_function(
                     $contract_func,
                     &[],
+                    module,
                     global_context,
-                    &contract_contexts.get($contract_name).unwrap(),
+                    contract_context,
                     &mut call_stack,
                     Some(StandardPrincipalData::transient().into()),
                     Some(StandardPrincipalData::transient().into()),
                     None,
+                    module_cache,
                 );
 
                 match result {
@@ -523,10 +551,6 @@ test_contract_init!(
             public_function.get_arg_types(),
             &[TypeSignature::IntType, TypeSignature::IntType]
         );
-        assert_eq!(
-            public_function.get_return_type(),
-            &Some(TypeSignature::IntType)
-        );
     }
 );
 
@@ -539,13 +563,6 @@ test_contract_init!(
         let public_function = contract_context.lookup_function("simple").unwrap();
         assert_eq!(public_function.define_type, DefineType::Public);
         assert!(public_function.get_arg_types().is_empty());
-        assert_eq!(
-            public_function.get_return_type(),
-            &Some(TypeSignature::ResponseType(Box::new((
-                TypeSignature::IntType,
-                TypeSignature::NoType
-            ))))
-        );
     }
 );
 

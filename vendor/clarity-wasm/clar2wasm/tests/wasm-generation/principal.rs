@@ -5,7 +5,6 @@
 #[cfg(not(feature = "test-clarity-v1"))]
 mod clarity_v2_v3 {
     use clar2wasm::tools::{crosscheck_with_network, Network};
-    use clarity::address::AddressHashMode;
     use clarity::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
     use clarity::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
     use clarity::vm::types::{
@@ -13,10 +12,13 @@ mod clarity_v2_v3 {
         SequenceData, StandardPrincipalData, TupleData,
     };
     use clarity::vm::{ClarityName, ContractName, Value};
-    use clarity::{C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
     use proptest::prelude::{any, Just, Strategy};
     use proptest::string::string_regex;
     use proptest::{option, prop_assume, prop_oneof, proptest};
+    use stacks_common::address::{
+        AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+        C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+    };
 
     use crate::{buffer, qualified_principal, runtime_config, standard_principal, PropValue};
 

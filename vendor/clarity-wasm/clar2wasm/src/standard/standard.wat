@@ -74,6 +74,7 @@
     (import "clarity" "with_stacking" (func $stdlib.with_stacking (param externref)
                                                                   (param $allowance_lo i64)
                                                                   (param $allowance_hi i64)))
+    (import "clarity" "with_pox" (func $stdlib.with_pox (param externref)))
     (import "clarity" "with_stx" (func $stdlib.with_stx (param externref)
                                                         (param $amount_lo i64)
                                                         (param $amount_hi i64)))
