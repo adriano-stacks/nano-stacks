@@ -1,51 +1,47 @@
 #![forbid(unsafe_code)]
 
-use nano_bitcoin::{BitcoinBlock, BitcoinSource};
-use nano_chainstate::append_stub;
-use nano_sortition::snapshot_for;
+use nano_sync::{FollowedTenure, SyncClient, SyncError, TenureFollower, TenureInfo};
 
-/// Result used by the offline replay harness to name the first divergence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReplayFailure {
-    BitcoinInput,
-    StateRoot,
+/// A node's validated view of a remote Nakamoto tenure stream.
+#[derive(Clone, Debug)]
+pub struct Node {
+    follower: TenureFollower,
 }
 
-/// M0 replay boundary. The expected block cannot be processed until fixtures
-/// and consensus components are implemented, so block one is the baseline.
-pub fn replay_one<S: BitcoinSource>(source: &S, height: u64) -> Result<(), ReplayFailure> {
-    let block = source
-        .block_at(height)
-        .map_err(|_| ReplayFailure::BitcoinInput)?;
-    let snapshot = snapshot_for(&block);
-    let _applied = append_stub(&snapshot);
-    Err(ReplayFailure::StateRoot)
-}
+impl Node {
+    /// Construct a node that follows the supplied HTTP peer.
+    #[must_use]
+    pub const fn new(client: SyncClient) -> Self {
+        Self {
+            follower: TenureFollower::new(client),
+        }
+    }
 
-/// A deterministic fixture source used only by the M0 baseline test.
-pub struct BaselineSource;
+    /// Return the latest validated peer tenure.
+    #[must_use]
+    pub const fn latest_tenure(&self) -> Option<&TenureInfo> {
+        self.follower.latest()
+    }
 
-impl BitcoinSource for BaselineSource {
-    type Error = core::convert::Infallible;
-
-    fn block_at(&self, height: u64) -> Result<BitcoinBlock, Self::Error> {
-        Ok(BitcoinBlock {
-            height,
-            hash: [0; 32],
-            operations: Vec::new(),
-        })
+    /// Fetch and validate the peer's next tenure update.
+    pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
+        self.follower.poll().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BaselineSource, ReplayFailure, replay_one};
+    use nano_sync::SyncClient;
+    use reqwest::Url;
+
+    use super::Node;
 
     #[test]
-    fn baseline_replay_diverges_at_the_state_root() {
-        assert_eq!(
-            replay_one(&BaselineSource, 1),
-            Err(ReplayFailure::StateRoot)
-        );
+    fn node_starts_without_a_followed_tenure() {
+        let client = SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
+            .expect("create sync client");
+        let node = Node::new(client);
+
+        assert!(node.latest_tenure().is_none());
     }
 }

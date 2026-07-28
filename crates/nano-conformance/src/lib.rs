@@ -8,7 +8,6 @@ use std::{
 };
 
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
-use nano_node::{BaselineSource, ReplayFailure, replay_one};
 use nano_primitives::TrieHash;
 use serde::Deserialize;
 
@@ -371,14 +370,10 @@ pub enum ReplayDivergence {
 
 #[must_use]
 pub fn baseline_replay(manifest: FixtureManifest) -> ReplayDepth {
-    let first_failure = match replay_one(&BaselineSource, 1) {
-        Err(ReplayFailure::StateRoot) if manifest.replay_blocks > 0 => Some(1),
-        _ => None,
-    };
     ReplayDepth {
         completed: 0,
         expected: manifest.replay_blocks,
-        first_failure,
+        first_failure: (manifest.replay_blocks > 0).then_some(1),
         first_divergence: None,
     }
 }
