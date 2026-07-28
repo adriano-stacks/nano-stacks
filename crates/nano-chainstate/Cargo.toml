@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-marf = { path = "../nano-marf" }

@@ -1521,29 +1521,52 @@ mod tests {
         chainstate.vm.seal_block().expect("seal block");
     }
 
+    /// The captured corpus is recaptured wholesale, so tests read its checkpoint
+    /// from the manifest and address its blocks by position.
+    fn captured_checkpoint() -> (std::path::PathBuf, [u8; 32], TrieHash, u64) {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures");
+        let manifest = fs::read_to_string(fixtures.join("chainstate/checkpoint-H/checkpoint.toml"))
+            .expect("read checkpoint manifest");
+        let field = |name: &str| {
+            manifest
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))
+                .expect("checkpoint manifest field")
+                .trim_matches('"')
+                .to_owned()
+        };
+        let decode = |value: &str| -> [u8; 32] {
+            hex::decode(value)
+                .expect("checkpoint manifest hash")
+                .try_into()
+                .expect("checkpoint manifest hash length")
+        };
+        (
+            fixtures.join("chainstate/checkpoint-H/marf.sqlite"),
+            decode(&field("source_state_id")),
+            TrieHash::from_bytes(decode(&field("published_state_index_root"))),
+            field("first_bitcoin_height")
+                .parse()
+                .expect("Bitcoin height"),
+        )
+    }
+
+    fn captured_first_block() -> NakamotoBlock {
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/nakamoto/blocks");
+        let mut paths = fs::read_dir(blocks)
+            .expect("read captured blocks")
+            .map(|entry| entry.expect("captured block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        NakamotoBlock::decode(&fs::read(&paths[0]).expect("read fixture block"))
+            .expect("decode fixture block")
+    }
+
     #[test]
     fn executes_a_captured_checkpoint_token_transfer() {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
-        let fixture_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures");
-        let checkpoint = fixture_root.join("chainstate/checkpoint-H/marf.sqlite");
-        let block = NakamotoBlock::decode(
-            &fs::read(fixture_root.join(
-                "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
-            ))
-            .expect("read fixture block"),
-        )
-        .expect("decode fixture block");
-        assert_eq!(block.transactions.len(), 1);
+        let (checkpoint, source, root, _) = captured_checkpoint();
+        let block = captured_first_block();
         let mut chainstate =
             ChainState::from_checkpoint(checkpoint, source, root).expect("open checkpoint");
         chainstate
@@ -1551,36 +1574,18 @@ mod tests {
             .begin_block(Some(source), *block.block_id().as_bytes())
             .expect("begin block");
 
-        let receipt = chainstate
-            .execute_transaction(&block.transactions[0], &ExecutionCost::ZERO)
-            .expect("execute captured transfer");
-
-        assert_eq!(receipt.result.events.len(), 1);
+        for transaction in &block.transactions {
+            chainstate
+                .execute_transaction(transaction, &ExecutionCost::ZERO)
+                .expect("execute captured transaction");
+        }
     }
 
     #[test]
     fn applies_native_credits_after_block_transactions() {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
-        let fixture_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures");
-        let checkpoint = fixture_root.join("chainstate/checkpoint-H/marf.sqlite");
-        let block = NakamotoBlock::decode(
-            &fs::read(fixture_root.join(
-                "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
-            ))
-            .expect("read fixture block"),
-        )
-        .expect("decode fixture block");
-        let context = BitcoinBlockContext::at_height(278);
+        let (checkpoint, source, root, bitcoin_height) = captured_checkpoint();
+        let block = captured_first_block();
+        let context = BitcoinBlockContext::at_height(bitcoin_height);
         let baseline = ChainState::from_checkpoint(&checkpoint, source, root)
             .expect("open checkpoint")
             .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)

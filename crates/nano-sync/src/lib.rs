@@ -808,13 +808,12 @@ mod tests {
             stacker_set: StackerSetWire,
         }
 
-        let fixture: Fixture = serde_json::from_slice(include_bytes!(
-            "../../nano-conformance/fixtures/stacker_set/cycle-18.json"
-        ))
-        .expect("parse recorded stacker set");
+        let fixture: Fixture =
+            serde_json::from_slice(include_bytes!("../tests/waterfall-stacker-set.json"))
+                .expect("parse recorded stacker set");
         let set = parse_stacker_set(fixture.stacker_set).expect("parse active stacker set");
-        assert_eq!(set.pox_ustx_threshold, 11_000_000_000);
-        assert_eq!(set.signer_set.weights(), vec![10, 10, 10]);
+        assert_eq!(set.pox_ustx_threshold, 14_666_666_667);
+        assert_eq!(set.signer_set.weights(), vec![8, 8, 7, 7]);
         assert!(matches!(
             set.sbtc_address,
             nano_address::PoxAddress::Addr32 { .. }

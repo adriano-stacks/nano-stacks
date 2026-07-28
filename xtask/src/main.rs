@@ -249,6 +249,9 @@ impl CaptureConfig {
             &stacker_set,
         )?;
 
+        let first_bitcoin_height =
+            snapshots_by_consensus_hash(&snapshots, &blocks[0].consensus_hash)
+                .ok_or_else(|| "captured first block has no sortition snapshot".to_owned())?;
         let checkpoint = Self::block_at_height(blocks_db, self.checkpoint_height)?;
         let checkpoint_root = self.checkpoint_root(&checkpoint)?;
         let checkpoint_dir = staging.join("chainstate/checkpoint-H");
@@ -259,8 +262,8 @@ impl CaptureConfig {
             &checkpoint_dir,
         )?;
         let checkpoint_manifest = format!(
-            "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\n",
-            checkpoint.height, checkpoint.index_block_hash, checkpoint_root
+            "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = {}\n",
+            checkpoint.height, checkpoint.index_block_hash, checkpoint_root, first_bitcoin_height
         );
         write_file(
             &checkpoint_dir.join("checkpoint.toml"),
@@ -649,6 +652,19 @@ fn copy_clarity_source(source: &Path, destination: &Path) -> Result<(), String> 
     )
     .map_err(io_error("copy raw chainstate blobs"))?;
     Ok(())
+}
+
+/// The Bitcoin height of the sortition that a consensus hash identifies.
+fn snapshots_by_consensus_hash(snapshots: &str, consensus_hash: &str) -> Option<u64> {
+    let needle = format!("\"consensus_hash\":\"{consensus_hash}\"");
+    let entry = snapshots
+        .split("},")
+        .find(|entry| entry.contains(&needle))?;
+    let marker = "\"block_height\":";
+    let start = entry.find(marker)? + marker.len();
+    let rest = &entry[start..];
+    let end = rest.find(|character: char| !character.is_ascii_digit())?;
+    rest[..end].parse().ok()
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -997,27 +997,32 @@ mod tests {
     #[test]
     fn checked_in_fixture_is_a_valid_capture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = FixtureManifest::load(&root.join("manifest.toml")).expect("manifest");
         assert_eq!(
             validate_fixture_tree(&root).expect("captured fixture directory is valid"),
-            FixtureStatus::Captured { replay_blocks: 10 }
+            FixtureStatus::Captured {
+                replay_blocks: manifest.replay_blocks
+            }
         );
         assert!(fs::metadata(root.join("README.md")).is_ok());
     }
 
+    /// The captured corpus is recaptured wholesale, so tests address its blocks
+    /// by position rather than by the name of any one capture.
+    fn captured_block_paths(fixture: &Path) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read captured blocks")
+            .map(|entry| entry.expect("captured block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     #[test]
     fn checkpoint_graph_import_matches_the_published_root() {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
-        let checkpoint = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/chainstate/checkpoint-H/marf.sqlite");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
         let imported = import_checkpoint(checkpoint, source, root).expect("imports checkpoint");
         assert_eq!(imported.root(source), Some(root));
     }
@@ -1026,9 +1031,10 @@ mod tests {
     fn captured_first_block_state_matches_reference() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
-        let path = fixture.join(
-            "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
-        );
+        let path = captured_block_paths(&fixture)
+            .into_iter()
+            .next()
+            .expect("captured block");
         let block =
             NanoNakamotoBlock::decode(&fs::read(&path).expect("read block")).expect("decode block");
         let expected_state = import_checkpoint(
@@ -1091,9 +1097,10 @@ mod tests {
     fn candidate_block_derives_the_captured_state_root_before_finalizing_its_id() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
-        let path = fixture.join(
-            "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
-        );
+        let path = captured_block_paths(&fixture)
+            .into_iter()
+            .next()
+            .expect("captured block");
         let block =
             NanoNakamotoBlock::decode(&fs::read(path).expect("read block")).expect("decode block");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
@@ -1384,16 +1391,8 @@ mod tests {
     #[test]
     fn captured_checkpoint_extension_matches_stacks_core() -> Result<(), Box<dyn std::error::Error>>
     {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
         let temporary = temporary_fixture_root()?;
@@ -1438,16 +1437,8 @@ mod tests {
     #[test]
     fn captured_checkpoint_temporary_execution_id_matches_stacks_core()
     -> Result<(), Box<dyn std::error::Error>> {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
         let temporary = temporary_fixture_root()?;
@@ -1494,16 +1485,8 @@ mod tests {
     #[test]
     fn captured_checkpoint_overwrite_matches_stacks_core() -> Result<(), Box<dyn std::error::Error>>
     {
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
-        let root = TrieHash::from_bytes([
-            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
-            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
-            0x3a, 0x64, 0xc0, 0x71,
-        ]);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
         let temporary = temporary_fixture_root()?;
@@ -1549,8 +1532,9 @@ mod tests {
 
     #[test]
     fn pcs_layout_import_uses_the_manifest_root() -> Result<(), Box<dyn std::error::Error>> {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/chainstate/checkpoint-H");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, published_root) = checkpoint_state(&fixtures).expect("checkpoint metadata");
+        let fixture = fixtures.join("chainstate/checkpoint-H");
         let root = temporary_fixture_root()?;
         let clarity = root.join("chainstate/vm/clarity");
         fs::create_dir_all(&clarity)?;
@@ -1561,14 +1545,13 @@ mod tests {
         )?;
         write_file(
             &root.join("PCS_manifest.toml"),
-            "[snapshot]\nblock_hash = \"0x73d536fd055e083f60be70350e729d99cceac347c5bfaaa79fd462d1b82153f3\"\n\n[roots]\nclarity_archival_marf_root_hash = \"0x8fdff09fd87ae79f970a233627013f09478ee1715379a73442584bb43a64c071\"\n",
+            &format!(
+                "[snapshot]\nblock_hash = \"0x{}\"\n\n[roots]\nclarity_archival_marf_root_hash = \"0x{}\"\n",
+                hex::encode(source),
+                hex::encode(published_root.as_bytes())
+            ),
         )?;
         let imported = import_pcs(&root)?;
-        let source = [
-            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
-            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
-            0xb8, 0x21, 0x53, 0xf3,
-        ];
         assert!(imported.root(source).is_some());
         fs::remove_dir_all(root)?;
         Ok(())
@@ -2176,10 +2159,14 @@ mod tests {
             );
         }
 
-        let reward_set: StackerSetWire = serde_json::from_slice(
-            &fs::read(fixture_root.join("stacker_set/cycle-18.json")).expect("read reward set"),
-        )
-        .expect("parse reward set");
+        let reward_set_path = fs::read_dir(fixture_root.join("stacker_set"))
+            .expect("read reward sets")
+            .map(|entry| entry.expect("reward set entry").path())
+            .next()
+            .expect("captured reward set");
+        let reward_set: StackerSetWire =
+            serde_json::from_slice(&fs::read(reward_set_path).expect("read reward set"))
+                .expect("parse reward set");
         let signers = reward_set
             .stacker_set
             .signers
@@ -2912,9 +2899,11 @@ mod tests {
 
     #[test]
     fn signer_proposal_decoding_matches_stacks_core() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "fixtures/nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
-        );
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let path = captured_block_paths(&fixture)
+            .into_iter()
+            .next()
+            .expect("captured block");
         let bytes = fs::read(path).expect("read captured block");
         let reference_block = ReferenceNakamotoBlock::consensus_deserialize(&mut bytes.as_slice())
             .expect("reference decodes captured block");
