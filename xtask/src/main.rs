@@ -61,6 +61,7 @@ fn validate_fixtures() -> ExitCode {
 }
 
 struct CaptureConfig {
+    out_dir: Option<PathBuf>,
     state_dir: PathBuf,
     events_dir: PathBuf,
     bitcoin_rpc: String,
@@ -72,7 +73,9 @@ struct CaptureConfig {
 }
 
 fn capture_fixtures(arguments: &[String]) -> ExitCode {
-    match CaptureConfig::parse(arguments).and_then(|config| config.capture(&fixture_root())) {
+    match CaptureConfig::parse(arguments)
+        .and_then(|config| config.capture(&config.out_dir.clone().unwrap_or_else(fixture_root)))
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("fixture capture failed: {error}");
@@ -84,6 +87,7 @@ fn capture_fixtures(arguments: &[String]) -> ExitCode {
 impl CaptureConfig {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let mut values = arguments.iter();
+        let mut out_dir = None;
         let mut state_dir = None;
         let mut events_dir = None;
         let mut bitcoin_rpc = None;
@@ -98,6 +102,7 @@ impl CaptureConfig {
                 .next()
                 .ok_or_else(|| format!("missing value for {flag}"))?;
             match flag.as_str() {
+                "--out-dir" => out_dir = Some(PathBuf::from(value)),
                 "--state-dir" => state_dir = Some(PathBuf::from(value)),
                 "--events-dir" => events_dir = Some(PathBuf::from(value)),
                 "--bitcoin-rpc" => bitcoin_rpc = Some(value.to_owned()),
@@ -111,6 +116,7 @@ impl CaptureConfig {
         }
 
         Ok(Self {
+            out_dir,
             state_dir: state_dir.ok_or_else(|| "--state-dir is required".to_owned())?,
             events_dir: events_dir.ok_or_else(|| "--events-dir is required".to_owned())?,
             bitcoin_rpc: bitcoin_rpc.ok_or_else(|| "--bitcoin-rpc is required".to_owned())?,
@@ -144,6 +150,7 @@ impl CaptureConfig {
             ));
         }
 
+        fs::create_dir_all(root).map_err(io_error("create capture output directory"))?;
         let staging = root.join(".capture-staging");
         if staging.exists() {
             fs::remove_dir_all(&staging).map_err(io_error("remove prior capture staging"))?;

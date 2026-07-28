@@ -223,7 +223,16 @@ async fn sync_chainstate(
             .validator_mut()
             .validator_mut()
             .observe(block, sortition.bitcoin_height)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "canonical block {} at height {} failed to validate: {error}",
+                        block.block_id(),
+                        block.header.chain_length
+                    ),
+                )
+            })?;
     }
     Ok(())
 }
