@@ -11,7 +11,7 @@ use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::Value;
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use clarity::vm::contexts::{AssetMap, AssetMapEntry};
 use clarity::vm::representations::ClarityName;
@@ -52,6 +52,56 @@ pub struct NativeStxCredit {
     pub amount: u128,
 }
 
+/// Number of sortition-created tenures before a miner reward matures.
+pub const MINER_REWARD_MATURITY: u64 = 100;
+
+/// Checkpointed native accounting required to finalize future tenure-start blocks.
+#[derive(Clone, Debug, Default)]
+pub struct TenureAccounting {
+    matured_effects: BTreeMap<u64, NativeBlockEffects>,
+}
+
+impl TenureAccounting {
+    /// Record the effects that mature when the given coinbase height is reached.
+    pub fn record_matured_effects(
+        &mut self,
+        coinbase_height: u64,
+        effects: NativeBlockEffects,
+    ) -> Result<(), TenureAccountingError> {
+        if self
+            .matured_effects
+            .insert(coinbase_height, effects)
+            .is_some()
+        {
+            return Err(TenureAccountingError::DuplicateCoinbaseHeight);
+        }
+        Ok(())
+    }
+
+    /// Return the effects that mature at this tenure start.
+    #[must_use]
+    pub fn effects_for_tenure(&self, coinbase_height: u64) -> NativeBlockEffects {
+        self.matured_effects
+            .get(&coinbase_height)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Errors raised while loading checkpointed tenure accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TenureAccountingError {
+    DuplicateCoinbaseHeight,
+}
+
+impl std::fmt::Display for TenureAccountingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("duplicate matured accounting entry for a coinbase height")
+    }
+}
+
+impl std::error::Error for TenureAccountingError {}
+
 /// A transaction result retained while applying a Nakamoto block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransactionReceipt {
@@ -81,6 +131,7 @@ enum PayloadOutcome {
 #[derive(Debug)]
 pub struct ChainState {
     vm: Vm,
+    accounting: TenureAccounting,
 }
 
 #[derive(Debug)]
@@ -154,7 +205,10 @@ impl From<VmExecutionError> for ChainStateError {
 impl ChainState {
     /// Create an empty chainstate.
     pub fn new() -> Result<Self, ChainStateError> {
-        Ok(Self { vm: Vm::new()? })
+        Ok(Self {
+            vm: Vm::new()?,
+            accounting: TenureAccounting::default(),
+        })
     }
 
     /// Open chainstate from a checkpointed Clarity MARF.
@@ -165,7 +219,13 @@ impl ChainState {
     ) -> Result<Self, ChainStateError> {
         Ok(Self {
             vm: Vm::from_checkpoint(path, source, expected_root)?,
+            accounting: TenureAccounting::default(),
         })
+    }
+
+    /// Access the portable accounting ledger associated with this chainstate.
+    pub const fn accounting_mut(&mut self) -> &mut TenureAccounting {
+        &mut self.accounting
     }
 
     /// Return the committed MARF leaves for a block state.
@@ -322,6 +382,7 @@ impl ChainState {
         }
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
+        let mut effects = effects;
         let result = (|| {
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
@@ -329,6 +390,16 @@ impl ChainState {
                     ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
                 })?;
                 self.vm.set_tenure_height(next_height)?;
+                let matured = self.accounting.effects_for_tenure(u64::from(next_height));
+                effects.credits.extend(matured.credits);
+                effects.liquid_supply_increase = effects
+                    .liquid_supply_increase
+                    .checked_add(matured.liquid_supply_increase)
+                    .ok_or_else(|| {
+                        ChainStateError::InvalidTransaction(
+                            "native liquid supply increase overflow".to_owned(),
+                        )
+                    })?;
             }
             let mut execution_cost = ExecutionCost::ZERO;
             let mut receipts = Vec::with_capacity(block.transactions.len());
@@ -1012,7 +1083,8 @@ mod tests {
 
     use super::{
         BitcoinBlockContext, ChainState, NakamotoBlock, NativeBlockEffects, NativeStxCredit,
-        TransactionStatus, check_postconditions, principal_from_address,
+        TenureAccounting, TenureAccountingError, TransactionStatus, check_postconditions,
+        principal_from_address,
     };
 
     #[test]
@@ -1142,6 +1214,33 @@ mod tests {
             .expect("execute native effects");
 
         assert_ne!(baseline.execution.state_root, applied.execution.state_root);
+    }
+
+    #[test]
+    fn tenure_accounting_applies_effects_at_the_recorded_height() {
+        let recipient =
+            PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid recipient");
+        let effects = NativeBlockEffects {
+            credits: vec![NativeStxCredit {
+                recipient,
+                amount: 42,
+            }],
+            liquid_supply_increase: 42,
+        };
+        let mut accounting = TenureAccounting::default();
+
+        accounting
+            .record_matured_effects(100, effects.clone())
+            .expect("record effects");
+        assert_eq!(
+            accounting.effects_for_tenure(99),
+            NativeBlockEffects::default()
+        );
+        assert_eq!(accounting.effects_for_tenure(100), effects);
+        assert_eq!(
+            accounting.record_matured_effects(100, NativeBlockEffects::default()),
+            Err(TenureAccountingError::DuplicateCoinbaseHeight)
+        );
     }
 
     #[test]
