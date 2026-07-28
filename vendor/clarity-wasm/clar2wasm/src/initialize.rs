@@ -70,6 +70,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_run(
         global_context: &'a mut GlobalContext<'b, 'hooks>,
         contract_context: &'a ContractContext,
@@ -427,7 +428,7 @@ pub fn initialize_contract(
         .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
             "cost-*".to_string(),
         )))?
-        .to_cost_meter(&mut store)
+        .remaining_costs(&mut store)
         .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
     let cost = CostMeter::used_from_remaining(remaining);
 

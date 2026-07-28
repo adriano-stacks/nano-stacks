@@ -111,7 +111,7 @@ pub struct CostGlobals {
 }
 
 impl CostGlobals {
-    pub fn to_cost_meter<T>(
+    pub fn remaining_costs<T>(
         &self,
         store: &mut impl AsContextMut<Data = T>,
     ) -> wasmtime::Result<CostMeter> {
@@ -144,7 +144,7 @@ impl CostGlobals {
         })
     }
 
-    pub fn from_cost_meter<T>(
+    pub fn set_remaining_costs<T>(
         &self,
         store: &mut impl AsContextMut<Data = T>,
         meter: &CostMeter,
@@ -778,7 +778,7 @@ mod caf {
         let cost_globals =
             link_cost_globals(&mut linker, &mut store).expect("host globals should be linked");
         cost_globals
-            .from_cost_meter(
+            .set_remaining_costs(
                 &mut store,
                 &CostMeter {
                     runtime: initial,
@@ -798,7 +798,7 @@ mod caf {
         let err_code = instance.get_global(&mut store, "err-code").unwrap();
 
         match func.call(&mut store, arg) {
-            Ok(_) => Ok(cost_globals.to_cost_meter(&mut store).unwrap().runtime),
+            Ok(_) => Ok(cost_globals.remaining_costs(&mut store).unwrap().runtime),
             Err(_) => Err(err_code.get(&mut store).unwrap_i64()),
         }
     }

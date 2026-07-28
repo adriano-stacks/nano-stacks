@@ -29,6 +29,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::{Keccak256Hash, Sha512Sum, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{secp256k1_recover, secp256k1_verify, Secp256k1PublicKey};
+use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
     AsContextMut, Caller, Engine, ExternRef, Global, GlobalType, Instance, Linker, Memory, Module,
     Store, Val,
@@ -351,6 +352,7 @@ pub fn link_host_functions(
     link_sha512_256_fn(linker)?;
     link_secp256k1_recover_fn(linker)?;
     link_secp256k1_verify_fn(linker)?;
+    link_secp256r1_verify_fn(linker)?;
     link_principal_of_fn(linker)?;
     link_save_constant_fn(linker)?;
     link_load_constant_fn(linker)?;
@@ -5458,7 +5460,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         .ok_or(WasmError::GlobalNotFound("cost globals not found".into()))?;
                     // We set the cost meter in the global context. global context which is shared by all environments.
                     caller.data_mut().global_context.cost_meter =
-                        cost_globals.to_cost_meter(&mut caller.as_context_mut())?;
+                        cost_globals.remaining_costs(&mut caller.as_context_mut())?;
 
                     let mut exec_state = ExecutionState {
                         global_context: caller.data_mut().global_context,
@@ -5493,7 +5495,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     // We then simply retrieve it to update the current WASM's cost global with the updated costs.
                     let updated_cost_meter = caller.data_mut().global_context.cost_meter;
                     cost_globals
-                        .from_cost_meter(&mut caller.as_context_mut(), &updated_cost_meter)?;
+                        .set_remaining_costs(&mut caller.as_context_mut(), &updated_cost_meter)?;
 
                     // Write the result to the return buffer
                     let return_ty = if trait_id_length == 0 {
@@ -6335,6 +6337,69 @@ fn link_secp256k1_verify_fn(
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "secp256k1_verify".to_string(),
                 e,
+            ))
+        })
+}
+
+fn link_secp256r1_verify_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "secp256r1_verify",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             message_offset: i32,
+             message_length: i32,
+             signature_offset: i32,
+             signature_length: i32,
+             public_key_offset: i32,
+             public_key_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let message =
+                    read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
+                let signature =
+                    read_bytes_from_wasm(memory, &mut caller, signature_offset, signature_length)?;
+                let public_key = read_bytes_from_wasm(
+                    memory,
+                    &mut caller,
+                    public_key_offset,
+                    public_key_length,
+                )?;
+                if message.len() != 32 {
+                    return Err(RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(TypeSignature::BUFFER_32),
+                        Value::buff_from(message)?.to_error_string(),
+                    )
+                    .into());
+                }
+                if signature.len() != 64 {
+                    return Ok(0i32);
+                }
+                if public_key.len() != 33 {
+                    return Err(RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(TypeSignature::BUFFER_33),
+                        Value::buff_from(public_key)?.to_error_string(),
+                    )
+                    .into());
+                }
+                let version = *caller.data().contract_context().get_clarity_version();
+                let valid = if version.uses_secp256r1_double_hashing() {
+                    secp256r1_verify(&message, &signature, &public_key).is_ok()
+                } else {
+                    secp256r1_verify_digest(&message, &signature, &public_key).is_ok()
+                };
+                Ok(if valid { 1i32 } else { 0i32 })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "secp256r1_verify".into(),
+                error,
             ))
         })
 }
