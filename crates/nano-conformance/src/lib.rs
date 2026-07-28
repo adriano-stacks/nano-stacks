@@ -2164,6 +2164,21 @@ mod tests {
                     NanoTransaction::decode(&reference).expect("decode transaction");
                 assert_eq!(consumed, reference.len());
                 assert_eq!(nano.encode(), reference);
+                nano.verify_authorization()
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                let authorization_end = 5 + nano.auth().encode().len();
+                let rejects_tampering = (6..authorization_end).any(|index| {
+                    let mut mutated = reference.clone();
+                    mutated[index] ^= 1;
+                    NanoTransaction::decode(&mutated).is_ok_and(|(transaction, consumed)| {
+                        consumed == mutated.len() && transaction.verify_authorization().is_err()
+                    })
+                });
+                assert!(
+                    rejects_tampering,
+                    "{} has no authorization byte protected by verification",
+                    path.display()
+                );
                 assert_eq!(nano.txid().as_bytes(), transaction.txid().as_bytes());
                 assert_eq!(
                     nano.origin_address().map(|address| address.to_string()),

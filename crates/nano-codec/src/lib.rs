@@ -3,8 +3,10 @@
 use std::fmt;
 
 use nano_address::StacksAddress;
-use nano_crypto::{MessageSignature, VrfProof};
-use nano_primitives::{ConsensusHash, Hash160, Sha256Sum, StacksBlockId, sha512_256};
+use nano_crypto::{MessageSignature, StacksPublicKey, VrfProof};
+use nano_primitives::{
+    ConsensusHash, Hash160, Sha256Sum, StacksBlockId, hash160, sha256, sha512_256,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecError {
@@ -242,6 +244,31 @@ impl TransactionAuth {
             Self::Standard(origin) => origin,
             Self::Sponsored { sponsor, .. } => sponsor,
         }
+    }
+
+    const fn initial_sighash_auth(&self) -> Self {
+        match self {
+            Self::Standard(origin) => Self::Standard(origin.cleared()),
+            Self::Sponsored { origin, .. } => Self::Sponsored {
+                origin: origin.cleared(),
+                sponsor: SpendingCondition::Singlesig(SinglesigCondition {
+                    hash_mode: SinglesigHashMode::P2pkh,
+                    signer: Hash160::from_bytes([0; 20]),
+                    nonce: 0,
+                    fee: 0,
+                    key_encoding: KeyEncoding::Compressed,
+                    signature: MessageSignature::from_bytes([0; 65]),
+                }),
+            },
+        }
+    }
+
+    fn verify(&self, initial_sighash: Sha256Sum) -> Result<(), CodecError> {
+        let origin_sighash = self.origin().verify(initial_sighash, 4)?;
+        if let Some(sponsor) = self.sponsor() {
+            sponsor.verify(origin_sighash, 5)?;
+        }
+        Ok(())
     }
 }
 
@@ -757,6 +784,13 @@ impl Transaction {
     #[must_use]
     pub fn txid(&self) -> Sha256Sum {
         sha512_256(&self.encode())
+    }
+
+    /// Verify the origin and, when present, sponsor authorizations for this transaction.
+    pub fn verify_authorization(&self) -> Result<(), CodecError> {
+        let mut initial = self.clone();
+        initial.auth = self.auth.initial_sighash_auth();
+        self.auth.verify(initial.txid())
     }
 
     /// Return the origin address implied by the authorization and transaction network.
@@ -1304,6 +1338,92 @@ impl SpendingCondition {
         StacksAddress::new(version, signer).expect("protocol address versions are valid")
     }
 
+    const fn cleared(&self) -> Self {
+        match self {
+            Self::Singlesig(condition) => Self::Singlesig(SinglesigCondition {
+                hash_mode: condition.hash_mode,
+                signer: condition.signer,
+                nonce: 0,
+                fee: 0,
+                key_encoding: condition.key_encoding,
+                signature: MessageSignature::from_bytes([0; 65]),
+            }),
+            Self::Multisig(condition) => Self::Multisig(MultisigCondition {
+                hash_mode: condition.hash_mode,
+                signer: condition.signer,
+                nonce: 0,
+                fee: 0,
+                fields: Vec::new(),
+                signatures_required: condition.signatures_required,
+            }),
+            Self::OrderIndependentMultisig(condition) => {
+                Self::OrderIndependentMultisig(OrderIndependentMultisigCondition {
+                    hash_mode: condition.hash_mode,
+                    signer: condition.signer,
+                    nonce: 0,
+                    fee: 0,
+                    fields: Vec::new(),
+                    signatures_required: condition.signatures_required,
+                })
+            }
+        }
+    }
+
+    fn verify(&self, initial_sighash: Sha256Sum, auth_flag: u8) -> Result<Sha256Sum, CodecError> {
+        match self {
+            Self::Singlesig(condition) => {
+                let (key, next_sighash) = recover_key(
+                    initial_sighash,
+                    auth_flag,
+                    condition.fee,
+                    condition.nonce,
+                    condition.key_encoding,
+                    &condition.signature,
+                )?;
+                let mode = match condition.hash_mode {
+                    SinglesigHashMode::P2pkh => AddressHashMode::P2pkh,
+                    SinglesigHashMode::P2wpkh => AddressHashMode::P2wpkh,
+                };
+                if address_hash(mode, 1, &[key])? != condition.signer {
+                    return Err(CodecError::InvalidAuth);
+                }
+                Ok(next_sighash)
+            }
+            Self::Multisig(condition) => verify_multisig(
+                initial_sighash,
+                auth_flag,
+                MultisigVerification {
+                    signer: condition.signer,
+                    fee: condition.fee,
+                    nonce: condition.nonce,
+                    fields: &condition.fields,
+                    signatures_required: condition.signatures_required,
+                    mode: match condition.hash_mode {
+                        MultisigHashMode::P2sh => AddressHashMode::P2sh,
+                        MultisigHashMode::P2wsh => AddressHashMode::P2wsh,
+                    },
+                    order_independent: false,
+                },
+            ),
+            Self::OrderIndependentMultisig(condition) => verify_multisig(
+                initial_sighash,
+                auth_flag,
+                MultisigVerification {
+                    signer: condition.signer,
+                    fee: condition.fee,
+                    nonce: condition.nonce,
+                    fields: &condition.fields,
+                    signatures_required: condition.signatures_required,
+                    mode: match condition.hash_mode {
+                        OrderIndependentMultisigHashMode::P2sh => AddressHashMode::P2sh,
+                        OrderIndependentMultisigHashMode::P2wsh => AddressHashMode::P2wsh,
+                    },
+                    order_independent: true,
+                },
+            ),
+        }
+    }
+
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let mode = reader.byte()?;
         match mode {
@@ -1367,6 +1487,190 @@ impl SpendingCondition {
             ),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum AddressHashMode {
+    P2pkh,
+    P2sh,
+    P2wpkh,
+    P2wsh,
+}
+
+#[derive(Clone, Copy)]
+struct MultisigVerification<'a> {
+    signer: Hash160,
+    fee: u64,
+    nonce: u64,
+    fields: &'a [AuthField],
+    signatures_required: u16,
+    mode: AddressHashMode,
+    order_independent: bool,
+}
+
+fn recover_key(
+    current: Sha256Sum,
+    auth_flag: u8,
+    fee: u64,
+    nonce: u64,
+    encoding: KeyEncoding,
+    signature: &MessageSignature,
+) -> Result<(Vec<u8>, Sha256Sum), CodecError> {
+    if !signature.is_low_s().map_err(|_| CodecError::InvalidAuth)? {
+        return Err(CodecError::InvalidAuth);
+    }
+    let presign = presign_sighash(current, auth_flag, fee, nonce);
+    let key = signature
+        .recover(presign.as_bytes())
+        .map_err(|_| CodecError::InvalidAuth)?;
+    let key = encoded_key(&key, encoding);
+    let next = postsign_sighash(presign, encoding, signature);
+    Ok((key, next))
+}
+
+fn verify_multisig(
+    initial_sighash: Sha256Sum,
+    auth_flag: u8,
+    verification: MultisigVerification<'_>,
+) -> Result<Sha256Sum, CodecError> {
+    let mut keys = Vec::with_capacity(verification.fields.len());
+    let mut current = initial_sighash;
+    let mut signatures = 0_u16;
+    for field in verification.fields {
+        let key = match field {
+            AuthField::PublicKey { encoding, bytes } => {
+                let key =
+                    StacksPublicKey::from_bytes(bytes).map_err(|_| CodecError::InvalidAuth)?;
+                if encoded_key(&key, *encoding) != *bytes {
+                    return Err(CodecError::InvalidAuth);
+                }
+                bytes.clone()
+            }
+            AuthField::Signature {
+                encoding,
+                signature,
+            } => {
+                let (key, next) = recover_key(
+                    current,
+                    auth_flag,
+                    verification.fee,
+                    verification.nonce,
+                    *encoding,
+                    signature,
+                )?;
+                if !verification.order_independent {
+                    current = next;
+                }
+                signatures = signatures.checked_add(1).ok_or(CodecError::InvalidAuth)?;
+                key
+            }
+        };
+        keys.push(key);
+    }
+    let signatures_match = if verification.order_independent {
+        signatures >= verification.signatures_required
+    } else {
+        signatures == verification.signatures_required
+    };
+    if !signatures_match
+        || address_hash(verification.mode, verification.signatures_required, &keys)?
+            != verification.signer
+    {
+        return Err(CodecError::InvalidAuth);
+    }
+    Ok(if verification.order_independent {
+        initial_sighash
+    } else {
+        current
+    })
+}
+
+fn encoded_key(key: &StacksPublicKey, encoding: KeyEncoding) -> Vec<u8> {
+    match encoding {
+        KeyEncoding::Compressed => key.to_bytes_compressed().to_vec(),
+        KeyEncoding::Uncompressed => key.to_bytes_uncompressed().to_vec(),
+    }
+}
+
+fn presign_sighash(current: Sha256Sum, auth_flag: u8, fee: u64, nonce: u64) -> Sha256Sum {
+    let mut bytes = Vec::with_capacity(49);
+    bytes.extend_from_slice(current.as_bytes());
+    bytes.push(auth_flag);
+    bytes.extend_from_slice(&fee.to_be_bytes());
+    bytes.extend_from_slice(&nonce.to_be_bytes());
+    sha512_256(&bytes)
+}
+
+fn postsign_sighash(
+    current: Sha256Sum,
+    encoding: KeyEncoding,
+    signature: &MessageSignature,
+) -> Sha256Sum {
+    let mut bytes = Vec::with_capacity(98);
+    bytes.extend_from_slice(current.as_bytes());
+    bytes.push(encoding.byte());
+    bytes.extend_from_slice(signature.as_bytes());
+    sha512_256(&bytes)
+}
+
+fn address_hash(
+    mode: AddressHashMode,
+    signatures_required: u16,
+    keys: &[Vec<u8>],
+) -> Result<Hash160, CodecError> {
+    let signatures_required = usize::from(signatures_required);
+    if signatures_required == 0 || keys.len() < signatures_required || keys.len() > 16 {
+        return Err(CodecError::InvalidAuth);
+    }
+    match mode {
+        AddressHashMode::P2pkh => {
+            if signatures_required != 1 || keys.len() != 1 {
+                return Err(CodecError::InvalidAuth);
+            }
+            Ok(hash160(&keys[0]))
+        }
+        AddressHashMode::P2wpkh => {
+            if signatures_required != 1 || keys.len() != 1 || keys[0].len() != 33 {
+                return Err(CodecError::InvalidAuth);
+            }
+            let key_hash = hash160(&keys[0]);
+            let mut script = vec![0, 20];
+            script.extend_from_slice(key_hash.as_bytes());
+            Ok(hash160(&script))
+        }
+        AddressHashMode::P2sh => Ok(hash160(&multisig_script(signatures_required, keys)?)),
+        AddressHashMode::P2wsh => {
+            if keys.iter().any(|key| key.len() != 33) {
+                return Err(CodecError::InvalidAuth);
+            }
+            let script_hash = sha256(&multisig_script(signatures_required, keys)?);
+            let mut script = vec![0, 32];
+            script.extend_from_slice(script_hash.as_bytes());
+            Ok(hash160(&script))
+        }
+    }
+}
+
+fn multisig_script(signatures_required: usize, keys: &[Vec<u8>]) -> Result<Vec<u8>, CodecError> {
+    let required = script_small_int(signatures_required)?;
+    let key_count = script_small_int(keys.len())?;
+    let mut script = Vec::with_capacity(3 + keys.iter().map(Vec::len).sum::<usize>() + keys.len());
+    script.push(required);
+    for key in keys {
+        let length = u8::try_from(key.len()).map_err(|_| CodecError::InvalidAuth)?;
+        script.push(length);
+        script.extend_from_slice(key);
+    }
+    script.extend_from_slice(&[key_count, 0xae]);
+    Ok(script)
+}
+
+fn script_small_int(value: usize) -> Result<u8, CodecError> {
+    u8::try_from(value)
+        .ok()
+        .filter(|value| (1..=16).contains(value))
+        .map(|value| 0x50 + value)
+        .ok_or(CodecError::InvalidAuth)
 }
 
 fn decode_multisig(

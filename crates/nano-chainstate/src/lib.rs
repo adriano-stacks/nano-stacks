@@ -212,6 +212,11 @@ impl ChainState {
             let mut execution_cost = ExecutionCost::ZERO;
             let mut receipts = Vec::with_capacity(block.transactions.len());
             for transaction in &block.transactions {
+                transaction.verify_authorization().map_err(|error| {
+                    ChainStateError::InvalidTransaction(format!(
+                        "transaction authorization failed: {error}"
+                    ))
+                })?;
                 let receipt = self.execute_transaction(transaction, &execution_cost)?;
                 execution_cost.add(&receipt.result.cost).map_err(|error| {
                     ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))

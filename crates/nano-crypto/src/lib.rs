@@ -68,6 +68,11 @@ impl StacksPublicKey {
         self.0.serialize()
     }
 
+    #[must_use]
+    pub fn to_bytes_uncompressed(&self) -> [u8; 65] {
+        self.0.serialize_uncompressed()
+    }
+
     pub fn verify_transaction(
         &self,
         digest: &[u8; 32],
