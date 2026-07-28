@@ -437,6 +437,13 @@ pub enum NonFungibleCondition {
     DoesSend,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoxCondition {
+    NotPerformed,
+    MaybePerformed,
+    Performed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PostConditionData {
     Stx {
@@ -455,6 +462,15 @@ pub enum PostConditionData {
         asset: AssetInfo,
         asset_value: ClarityValue,
         condition: NonFungibleCondition,
+    },
+    Staking {
+        principal: PostConditionPrincipal,
+        condition: FungibleCondition,
+        amount: u64,
+    },
+    Pox {
+        principal: PostConditionPrincipal,
+        condition: PoxCondition,
     },
 }
 
@@ -981,6 +997,20 @@ fn read_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionData, Cod
                 _ => return Err(CodecError::InvalidPostCondition),
             },
         }),
+        3 => Ok(PostConditionData::Staking {
+            principal: read_post_condition_principal(reader)?,
+            condition: read_fungible_condition(reader)?,
+            amount: reader.u64()?,
+        }),
+        4 => Ok(PostConditionData::Pox {
+            principal: read_post_condition_principal(reader)?,
+            condition: match reader.byte()? {
+                0x30 => PoxCondition::NotPerformed,
+                0x31 => PoxCondition::MaybePerformed,
+                0x32 => PoxCondition::Performed,
+                _ => return Err(CodecError::InvalidPostCondition),
+            },
+        }),
         _ => Err(CodecError::InvalidPostCondition),
     }
 }
@@ -1161,6 +1191,28 @@ fn encode_post_condition(writer: &mut Writer, post_condition: &PostConditionData
             writer.byte(match condition {
                 NonFungibleCondition::DoesSend => 0x10,
                 NonFungibleCondition::DoesNotSend => 0x11,
+            });
+        }
+        PostConditionData::Staking {
+            principal,
+            condition,
+            amount,
+        } => {
+            writer.byte(3);
+            encode_post_condition_principal(writer, principal);
+            encode_fungible_condition(writer, *condition);
+            writer.u64(*amount);
+        }
+        PostConditionData::Pox {
+            principal,
+            condition,
+        } => {
+            writer.byte(4);
+            encode_post_condition_principal(writer, principal);
+            writer.byte(match condition {
+                PoxCondition::NotPerformed => 0x30,
+                PoxCondition::MaybePerformed => 0x31,
+                PoxCondition::Performed => 0x32,
             });
         }
     }

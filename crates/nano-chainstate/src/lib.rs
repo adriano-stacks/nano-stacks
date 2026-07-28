@@ -18,8 +18,8 @@ use clarity::vm::representations::ClarityName;
 use clarity::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier};
 use nano_codec::{
     AssetInfo, ClarityVersion, FungibleCondition, NonFungibleCondition, PostConditionData,
-    PostConditionMode, PostConditionPrincipal, Principal, TenureChangeCause, Transaction,
-    TransactionPayloadData,
+    PostConditionMode, PostConditionPrincipal, PoxCondition, Principal, TenureChangeCause,
+    Transaction, TransactionPayloadData,
 };
 use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
@@ -564,6 +564,8 @@ fn check_postconditions(
     let mut checked_fungible = HashMap::<PrincipalData, HashSet<AssetIdentifier>>::new();
     let mut checked_nonfungible =
         HashMap::<PrincipalData, HashMap<AssetIdentifier, Vec<Value>>>::new();
+    let mut checked_staking = HashSet::new();
+    let mut checked_pox = HashSet::new();
 
     for postcondition in transaction.post_conditions() {
         match postcondition.data() {
@@ -638,16 +640,114 @@ fn check_postconditions(
                     .or_default()
                     .push(value);
             }
+            PostConditionData::Staking { .. } | PostConditionData::Pox { .. } => {
+                if let Some(reason) = check_epoch4_postcondition(
+                    postcondition.data(),
+                    origin,
+                    assets,
+                    &mut checked_staking,
+                    &mut checked_pox,
+                )? {
+                    return Ok(Some(reason));
+                }
+            }
         }
     }
 
-    Ok(check_unchecked_assets(
+    Ok(finish_postconditions(
         transaction.post_condition_mode(),
         origin,
         assets,
         &checked_fungible,
         &checked_nonfungible,
+        &checked_staking,
+        &checked_pox,
     ))
+}
+
+fn finish_postconditions(
+    mode: PostConditionMode,
+    origin: &PrincipalData,
+    assets: &AssetMap,
+    checked_fungible: &HashMap<PrincipalData, HashSet<AssetIdentifier>>,
+    checked_nonfungible: &HashMap<PrincipalData, HashMap<AssetIdentifier, Vec<Value>>>,
+    checked_staking: &HashSet<PrincipalData>,
+    checked_pox: &HashSet<PrincipalData>,
+) -> Option<String> {
+    check_unchecked_assets(mode, origin, assets, checked_fungible, checked_nonfungible)
+        .or_else(|| check_unchecked_pox_actions(mode, origin, assets, checked_staking, checked_pox))
+}
+
+fn check_epoch4_postcondition(
+    postcondition: &PostConditionData,
+    origin: &PrincipalData,
+    assets: &AssetMap,
+    checked_staking: &mut HashSet<PrincipalData>,
+    checked_pox: &mut HashSet<PrincipalData>,
+) -> Result<Option<String>, ChainStateError> {
+    match postcondition {
+        PostConditionData::Staking {
+            principal,
+            condition,
+            amount,
+        } => {
+            let principal = postcondition_principal(principal, origin)?;
+            let staked = assets.get_stacking(&principal).unwrap_or(0);
+            if !matches_fungible_condition(*condition, u128::from(*amount), staked) {
+                return Ok(Some(format!(
+                    "staking post-condition failed for {principal}: expected {condition:?} {amount}, got {staked}"
+                )));
+            }
+            checked_staking.insert(principal);
+        }
+        PostConditionData::Pox {
+            principal,
+            condition,
+        } => {
+            let principal = postcondition_principal(principal, origin)?;
+            let performed = assets.did_pox_action(&principal);
+            let passes = match condition {
+                PoxCondition::NotPerformed => !performed,
+                PoxCondition::MaybePerformed => true,
+                PoxCondition::Performed => performed,
+            };
+            if !passes {
+                return Ok(Some(format!("PoX post-condition failed for {principal}")));
+            }
+            checked_pox.insert(principal);
+        }
+        _ => unreachable!("only epoch 4 post-conditions are dispatched here"),
+    }
+    Ok(None)
+}
+
+fn check_unchecked_pox_actions(
+    mode: PostConditionMode,
+    origin: &PrincipalData,
+    assets: &AssetMap,
+    checked_staking: &HashSet<PrincipalData>,
+    checked_pox: &HashSet<PrincipalData>,
+) -> Option<String> {
+    if mode == PostConditionMode::Allow {
+        return None;
+    }
+    let requires_check =
+        |principal: &PrincipalData| mode == PostConditionMode::Deny || principal == origin;
+    if assets
+        .get_all_stacking()
+        .keys()
+        .any(|principal| requires_check(principal) && !checked_staking.contains(principal))
+    {
+        return Some("staking action was not covered by a post-condition".to_owned());
+    }
+    if assets
+        .get_all_pox_actions()
+        .iter()
+        .any(|principal| requires_check(principal) && !checked_pox.contains(principal))
+    {
+        return Some("PoX action was not covered by a post-condition".to_owned());
+    }
+    None
 }
 
 fn check_unchecked_assets(
