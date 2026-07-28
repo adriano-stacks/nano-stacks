@@ -814,6 +814,7 @@ mod tests {
         ops_hash: String,
         sortition: u8,
         sortition_hash: String,
+        winning_block_txid: String,
     }
 
     struct EmptyReferenceBlockMap;
@@ -2180,7 +2181,8 @@ mod tests {
 
     #[test]
     fn captured_sortition_hashes_form_the_reference_bitcoin_chain() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sortition/snapshots.json");
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let path = fixture_root.join("sortition/snapshots.json");
         let snapshots: Vec<CapturedSortitionSnapshot> =
             serde_json::from_slice(&fs::read(&path).expect("read captured sortition snapshots"))
                 .expect("parse captured sortition snapshots");
@@ -2198,21 +2200,56 @@ mod tests {
             &hex_array(&genesis.sortition_hash)
         );
 
+        let mut pre_stx_cache = PreStxCache::new();
         for snapshot in snapshots.iter().skip(1) {
-            if snapshot.sortition != 0 {
-                break;
-            }
             assert_eq!(
                 chain.tip().bitcoin_header_hash.as_bytes(),
                 &hex_array(&snapshot.parent_burn_header_hash)
             );
-            let block = nano_bitcoin::BitcoinBlock {
-                height: snapshot.block_height,
-                hash: hex_array(&snapshot.burn_header_hash),
-                operations: Vec::new(),
-            };
+            let raw = fs::read_to_string(
+                fixture_root
+                    .join("bitcoin/blocks")
+                    .join(format!("{}.hex", snapshot.burn_header_hash)),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "missing Bitcoin block at height {}: {error}",
+                    snapshot.block_height
+                )
+            });
+            let block = decode_block_with_pre_stx(
+                snapshot.block_height,
+                &hex::decode(raw.trim()).expect("decode captured Bitcoin block"),
+                *b"T3",
+                &mut pre_stx_cache,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "decode captured Bitcoin block at height {}: {error}",
+                    snapshot.block_height
+                )
+            });
+            let winner_vrf_seed = (snapshot.sortition != 0).then(|| {
+                let winning_txid = hex_array(&snapshot.winning_block_txid);
+                block
+                    .operations
+                    .iter()
+                    .find(|operation| operation.txid == winning_txid)
+                    .and_then(|operation| match operation.kind {
+                        nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                            new_seed, ..
+                        } => Some(new_seed),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing winning commitment at Bitcoin height {}",
+                            snapshot.block_height
+                        )
+                    })
+            });
             let derived = chain
-                .append(&block, 0, nano_sortition::PoxId::initial())
+                .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner_vrf_seed)
                 .expect("contiguous captured Bitcoin block");
             assert_eq!(
                 derived.sortition_hash.as_bytes(),
