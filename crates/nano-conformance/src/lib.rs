@@ -804,6 +804,7 @@ mod tests {
             StacksTransaction as ReferenceStacksTransaction,
             StacksTransactionSigner as ReferenceStacksTransactionSigner, TokenTransferMemo,
             TransactionAuth as ReferenceTransactionAuth,
+            TransactionAuthVerificationMode,
             TransactionPayload as ReferenceTransactionPayload,
             TransactionVersion as ReferenceTransactionVersion,
         },
@@ -2616,6 +2617,56 @@ mod tests {
             assert_eq!(
                 transaction_merkle_root(&nano_transactions).as_bytes(),
                 &block.header.tx_merkle_root.0
+            );
+        }
+    }
+
+    #[test]
+    fn nano_signed_transactions_verify_in_stacks_core() {
+        let key = StacksPrivateKey::from_seed(b"nano-transaction-signer");
+        let blocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/nakamoto/blocks");
+        let mut payloads = Vec::new();
+        for entry in fs::read_dir(blocks).expect("read fixture blocks") {
+            let bytes = fs::read(entry.expect("fixture entry").path()).expect("read fixture block");
+            let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
+                .expect("decode fixture block");
+            for transaction in block.txs {
+                let mut encoded = Vec::new();
+                transaction
+                    .consensus_serialize(&mut encoded)
+                    .expect("serialize fixture transaction");
+                let (nano, _) = NanoTransaction::decode(&encoded).expect("decode fixture");
+                payloads.push(nano.payload().data().clone());
+            }
+        }
+        assert!(!payloads.is_empty(), "fixture corpus contains transactions");
+
+        for (nonce, payload) in payloads.into_iter().enumerate() {
+            let signed = NanoTransaction::sign_standard(
+                nano_codec::TransactionVersion::Testnet,
+                0x8000_0000,
+                nano_codec::AnchorMode::OnChainOnly,
+                &key,
+                nonce as u64,
+                180,
+                payload,
+            )
+            .expect("nano signs a standard transaction");
+            let encoded = signed.encode();
+            let reference =
+                ReferenceStacksTransaction::consensus_deserialize(&mut Cursor::new(&encoded))
+                    .expect("stacks-core decodes the nano-signed transaction");
+
+            reference
+                .verify(TransactionAuthVerificationMode::EnforceLowS)
+                .expect("stacks-core accepts the nano-signed authorization");
+            assert_eq!(reference.txid().as_bytes(), signed.txid().as_bytes());
+            assert_eq!(
+                reference.origin_address().to_string(),
+                signed
+                    .origin_address()
+                    .expect("nano transaction has an origin")
+                    .to_string()
             );
         }
     }

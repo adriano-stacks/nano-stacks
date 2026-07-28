@@ -3,7 +3,7 @@
 use std::fmt;
 
 use nano_address::StacksAddress;
-use nano_crypto::{MessageSignature, StacksPublicKey, VrfProof};
+use nano_crypto::{MessageSignature, StacksPrivateKey, StacksPublicKey, VrfProof};
 use nano_primitives::{
     ConsensusHash, Hash160, Sha256Sum, StacksBlockId, hash160, sha256, sha512_256,
 };
@@ -264,9 +264,9 @@ impl TransactionAuth {
     }
 
     fn verify(&self, initial_sighash: Sha256Sum) -> Result<(), CodecError> {
-        let origin_sighash = self.origin().verify(initial_sighash, 4)?;
+        let origin_sighash = self.origin().verify(initial_sighash, ORIGIN_AUTH_FLAG)?;
         if let Some(sponsor) = self.sponsor() {
-            sponsor.verify(origin_sighash, 5)?;
+            sponsor.verify(origin_sighash, SPONSOR_AUTH_FLAG)?;
         }
         Ok(())
     }
@@ -648,6 +648,17 @@ pub struct TransactionPayload {
 }
 
 impl TransactionPayload {
+    /// Encode a payload so it can be placed in a newly built transaction.
+    #[must_use]
+    pub fn new(data: TransactionPayloadData) -> Self {
+        let mut writer = Writer::default();
+        encode_payload(&mut writer, &data);
+        Self {
+            bytes: writer.finish(),
+            data,
+        }
+    }
+
     #[must_use]
     pub const fn data(&self) -> &TransactionPayloadData {
         &self.data
@@ -803,6 +814,49 @@ impl Transaction {
     #[must_use]
     pub fn txid(&self) -> Sha256Sum {
         sha512_256(&self.encode())
+    }
+
+    /// Build a transaction authorized by one standard, compressed secp256k1 key.
+    pub fn sign_standard(
+        version: TransactionVersion,
+        chain_id: u32,
+        anchor_mode: AnchorMode,
+        key: &StacksPrivateKey,
+        nonce: u64,
+        fee: u64,
+        payload: TransactionPayloadData,
+    ) -> Result<Self, CodecError> {
+        let public_key = key.public_key().to_bytes_compressed().to_vec();
+        let mut transaction = Self {
+            bytes: Vec::new(),
+            version,
+            chain_id,
+            auth: TransactionAuth::Standard(SpendingCondition::Singlesig(SinglesigCondition {
+                hash_mode: SinglesigHashMode::P2pkh,
+                signer: address_hash(AddressHashMode::P2pkh, 1, &[public_key])?,
+                nonce,
+                fee,
+                key_encoding: KeyEncoding::Compressed,
+                signature: MessageSignature::from_bytes([0; 65]),
+            })),
+            anchor_mode,
+            post_condition_mode: PostConditionMode::Deny,
+            post_conditions: Vec::new(),
+            payload: TransactionPayload::new(payload),
+        };
+        let mut cleared = transaction.clone();
+        cleared.auth = transaction.auth.initial_sighash_auth();
+        let presign = presign_sighash(cleared.txid(), ORIGIN_AUTH_FLAG, fee, nonce);
+        let signature = key.sign(presign.as_bytes());
+        let TransactionAuth::Standard(SpendingCondition::Singlesig(condition)) =
+            &mut transaction.auth
+        else {
+            unreachable!("the authorization was just built as a standard single signature")
+        };
+        condition.signature = signature;
+        transaction.bytes = transaction.encode();
+        transaction.verify_authorization()?;
+        Ok(transaction)
     }
 
     /// Verify the origin and, when present, sponsor authorizations for this transaction.
@@ -1646,6 +1700,10 @@ fn encoded_key(key: &StacksPublicKey, encoding: KeyEncoding) -> Vec<u8> {
         KeyEncoding::Uncompressed => key.to_bytes_uncompressed().to_vec(),
     }
 }
+
+/// Authorization flags separating the origin and sponsor signature chains.
+const ORIGIN_AUTH_FLAG: u8 = 0x04;
+const SPONSOR_AUTH_FLAG: u8 = 0x05;
 
 fn presign_sighash(current: Sha256Sum, auth_flag: u8, fee: u64, nonce: u64) -> Sha256Sum {
     let mut bytes = Vec::with_capacity(49);
