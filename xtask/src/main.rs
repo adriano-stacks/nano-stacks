@@ -31,6 +31,14 @@ const MINER_REWARD_MATURITY: u64 = 100;
 /// Testnet boot address, which receives a parent share that has no tenure.
 const BOOT_ADDRESS: &str = "ST000000000000000000002AMW42H";
 
+/// The reward one tenure earned, as stacks-core scheduled it.
+struct ScheduledPayment {
+    recipient: String,
+    coinbase: u128,
+    anchored: u128,
+    nakamoto: bool,
+}
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures")
 }
@@ -301,7 +309,7 @@ impl CaptureConfig {
     fn scheduled_payment(
         chainstate_db: &Path,
         coinbase_height: u64,
-    ) -> Result<Option<(String, u128, u128)>, String> {
+    ) -> Result<Option<ScheduledPayment>, String> {
         if coinbase_height == 0 {
             return Ok(None);
         }
@@ -319,8 +327,8 @@ impl CaptureConfig {
         let payment = sqlite(
             chainstate_db,
             &format!(
-                "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored FROM payments \
-                 WHERE {selector} AND miner = 1 ORDER BY rowid LIMIT 1"
+                "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored, schedule_type \
+                 FROM payments WHERE {selector} AND miner = 1 ORDER BY rowid LIMIT 1"
             ),
         )?;
         let Some(payment) = payment.lines().next() else {
@@ -333,7 +341,13 @@ impl CaptureConfig {
             .to_owned();
         let coinbase = parse_u128("scheduled payment coinbase", fields.next())?;
         let anchored = parse_u128("scheduled payment anchored fees", fields.next())?;
-        Ok(Some((recipient, coinbase, anchored)))
+        let nakamoto = fields.next() == Some("nakamoto");
+        Ok(Some(ScheduledPayment {
+            recipient,
+            coinbase,
+            anchored,
+            nakamoto,
+        }))
     }
 
     fn write_native_effects(
@@ -366,19 +380,27 @@ impl CaptureConfig {
             // A tenure's coinbase pays its own recipient and its anchored fees pay
             // the previous tenure's. Both are credited even when zero, because the
             // write itself is consensus state.
-            let mut credits = vec![json!({ "recipient": earned.0, "amount": earned.1 })];
-            // Without a preceding tenure the parent share still lands, on the
-            // boot address, because stacks-core credits it unconditionally.
+            // A Nakamoto tenure hands its anchored fees to the previous tenure;
+            // before Nakamoto the miner kept them. Without a preceding tenure the
+            // parent share still lands, on the boot address, because stacks-core
+            // credits it unconditionally.
+            let (own, parent) = if earned.nakamoto {
+                (earned.coinbase, earned.anchored)
+            } else {
+                (earned.coinbase + earned.anchored, 0)
+            };
             let previous = Self::scheduled_payment(
                 chainstate_db,
                 coinbase_height.saturating_sub(MINER_REWARD_MATURITY + 1),
             )?
-            .map_or_else(|| BOOT_ADDRESS.to_owned(), |payment| payment.0);
-            credits.push(json!({ "recipient": previous, "amount": earned.2 }));
+            .map_or_else(|| BOOT_ADDRESS.to_owned(), |payment| payment.recipient);
             effects.push(json!({
                 "coinbase_height": coinbase_height,
-                "credits": credits,
-                "liquid_supply_increase": earned.1,
+                "credits": [
+                    json!({ "recipient": earned.recipient, "amount": own }),
+                    json!({ "recipient": previous, "amount": parent }),
+                ],
+                "liquid_supply_increase": earned.coinbase,
             }));
         }
         let contents = serde_json::to_vec_pretty(&json!({ "matured_effects": effects }))

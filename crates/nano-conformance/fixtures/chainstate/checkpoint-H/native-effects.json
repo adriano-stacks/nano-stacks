@@ -116,11 +116,11 @@
       "coinbase_height": 109,
       "credits": [
         {
-          "amount": 1020400000,
+          "amount": 1020403003,
           "recipient": "ST1XVSVQN0KP5SDYFNT8E5TXWVW0XZVQEDBMCJ3XM"
         },
         {
-          "amount": 3003,
+          "amount": 0,
           "recipient": "ST1XVSVQN0KP5SDYFNT8E5TXWVW0XZVQEDBMCJ3XM"
         }
       ],
@@ -256,11 +256,11 @@
       "coinbase_height": 119,
       "credits": [
         {
-          "amount": 1020400000,
+          "amount": 1020403012,
           "recipient": "ST2MES40ZEXTX9M4YXW9QSWHRVC9HYT419S198VPM"
         },
         {
-          "amount": 3012,
+          "amount": 0,
           "recipient": "ST1XVSVQN0KP5SDYFNT8E5TXWVW0XZVQEDBMCJ3XM"
         }
       ],

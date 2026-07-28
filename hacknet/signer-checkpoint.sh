@@ -76,7 +76,7 @@ def scheduled_payment(coinbase_height):
     # Before Nakamoto a tenure is one block, so the schedule is keyed by height.
     return connection.execute(
         "SELECT COALESCE(recipient, address), CAST(coinbase AS INTEGER), "
-        "CAST(tx_fees_anchored AS INTEGER) FROM payments "
+        "CAST(tx_fees_anchored AS INTEGER), schedule_type FROM payments "
         "WHERE stacks_block_height = ? AND miner = 1 ORDER BY rowid LIMIT 1",
         (coinbase_height,),
     ).fetchone()
@@ -90,15 +90,19 @@ for coinbase_height in range(first_height, first_height + span + 1):
     if earned is None:
         continue
     previous = scheduled_payment(coinbase_height - MATURITY - 1)
-    # Both shares are credited even when zero: the write itself is consensus
-    # state. Without a preceding tenure the parent share lands on the boot address.
-    credits = [{"recipient": earned[0], "amount": earned[1]}]
+    # A Nakamoto tenure hands its anchored fees to the previous tenure; before
+    # Nakamoto the miner kept them. Both shares are credited even when zero,
+    # because the write itself is consensus state, and a parent share with no
+    # tenure lands on the boot address.
+    own, parent = (earned[1], earned[2]) if earned[3] == "nakamoto" else (earned[1] + earned[2], 0)
     recipient = previous[0] if previous is not None else "ST000000000000000000002AMW42H"
-    credits.append({"recipient": recipient, "amount": earned[2]})
     effects.append(
         {
             "coinbase_height": coinbase_height,
-            "credits": credits,
+            "credits": [
+                {"recipient": earned[0], "amount": own},
+                {"recipient": recipient, "amount": parent},
+            ],
             "liquid_supply_increase": earned[1],
         }
     )
