@@ -1,4 +1,4 @@
 format = "stacks-core-marf-sqlite-v2"
-checkpoint_stacks_height = 109
-source_state_id = "73d536fd055e083f60be70350e729d99cceac347c5bfaaa79fd462d1b82153f3"
-published_state_index_root = "8fdff09fd87ae79f970a233627013f09478ee1715379a73442584bb43a64c071"
+checkpoint_stacks_height = 690
+source_state_id = "71b14b87fdef8621647cecf524c0974981f8001dc874a2cb38c9149d8733f1e5"
+published_state_index_root = "2091cfceef9c5577376bb927f2e56ad4a714eac3881f1e96bdb6778d57174edc"

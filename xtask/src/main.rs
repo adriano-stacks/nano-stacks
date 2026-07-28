@@ -25,6 +25,9 @@ fn main() -> ExitCode {
     }
 }
 
+/// Tenures between a reward being earned and paid, mirroring stacks-core.
+const MINER_REWARD_MATURITY: u64 = 100;
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures")
 }
@@ -285,6 +288,48 @@ impl CaptureConfig {
         Ok(())
     }
 
+    /// The reward a tenure earned: its recipient, its coinbase, and its anchored fees.
+    ///
+    /// Before Nakamoto a tenure was a single block, so its schedule is keyed by
+    /// height rather than by a tenure event.
+    fn scheduled_payment(
+        chainstate_db: &Path,
+        coinbase_height: u64,
+    ) -> Result<Option<(String, u128, u128)>, String> {
+        if coinbase_height == 0 {
+            return Ok(None);
+        }
+        let tenure = sqlite(
+            chainstate_db,
+            &format!(
+                "SELECT block_id FROM nakamoto_tenure_events \
+                 WHERE cause = 0 AND coinbase_height = {coinbase_height} LIMIT 1"
+            ),
+        )?;
+        let selector = tenure.lines().next().map_or_else(
+            || format!("stacks_block_height = {coinbase_height}"),
+            |block_id| format!("index_block_hash = '{block_id}'"),
+        );
+        let payment = sqlite(
+            chainstate_db,
+            &format!(
+                "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored FROM payments \
+                 WHERE {selector} AND miner = 1 ORDER BY rowid LIMIT 1"
+            ),
+        )?;
+        let Some(payment) = payment.lines().next() else {
+            return Ok(None);
+        };
+        let mut fields = payment.split('|');
+        let recipient = fields
+            .next()
+            .ok_or_else(|| "scheduled payment has no recipient".to_owned())?
+            .to_owned();
+        let coinbase = parse_u128("scheduled payment coinbase", fields.next())?;
+        let anchored = parse_u128("scheduled payment anchored fees", fields.next())?;
+        Ok(Some((recipient, coinbase, anchored)))
+    }
+
     fn write_native_effects(
         chainstate_db: &Path,
         blocks: &[CapturedBlock],
@@ -305,56 +350,27 @@ impl CaptureConfig {
         let mut effects = Vec::new();
         for height in heights.lines().filter(|height| !height.is_empty()) {
             let coinbase_height = parse_u64("coinbase height", height)?;
-            let matured_height = coinbase_height.saturating_sub(100);
-            let matured_block = sqlite(
+            let Some(earned) = Self::scheduled_payment(
                 chainstate_db,
-                &format!(
-                    "SELECT block_id FROM nakamoto_tenure_events \
-                     WHERE cause = 0 AND coinbase_height = {matured_height} LIMIT 1"
-                ),
-            )?;
-            let Some(matured_block) = matured_block.lines().next() else {
+                coinbase_height.saturating_sub(MINER_REWARD_MATURITY),
+            )?
+            else {
                 continue;
             };
-            let rewards = sqlite(
+            // A tenure's coinbase pays its own recipient and its anchored fees pay
+            // the previous tenure's. Both are credited even when zero, because the
+            // write itself is consensus state.
+            let mut credits = vec![json!({ "recipient": earned.0, "amount": earned.1 })];
+            if let Some(previous) = Self::scheduled_payment(
                 chainstate_db,
-                &format!(
-                    "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored, \
-                     tx_fees_streamed_confirmed, tx_fees_streamed_produced \
-                     FROM matured_rewards WHERE child_index_block_hash = '{matured_block}' \
-                     ORDER BY vtxindex, CAST(coinbase AS INTEGER) DESC"
-                ),
-            )?;
-            let mut credits = Vec::new();
-            let mut liquid_supply_increase = 0_u128;
-            for reward in rewards.lines().filter(|reward| !reward.is_empty()) {
-                let mut fields = reward.split('|');
-                let recipient = fields
-                    .next()
-                    .ok_or_else(|| "matured reward has no recipient".to_owned())?;
-                let coinbase = parse_u128("matured reward coinbase", fields.next())?;
-                let anchored = parse_u128("matured reward anchored fees", fields.next())?;
-                let confirmed = parse_u128("matured reward confirmed fees", fields.next())?;
-                let produced = parse_u128("matured reward produced fees", fields.next())?;
-                if fields.next().is_some() {
-                    return Err("matured reward has unexpected fields".to_owned());
-                }
-                let amount = coinbase
-                    .checked_add(anchored)
-                    .and_then(|amount| amount.checked_add(confirmed))
-                    .and_then(|amount| amount.checked_add(produced))
-                    .ok_or_else(|| "matured reward amount overflow".to_owned())?;
-                // stacks-core credits both matured shares unconditionally, and a
-                // zero credit still writes the recipient's balance into the block.
-                credits.push(json!({ "recipient": recipient, "amount": amount }));
-                liquid_supply_increase = liquid_supply_increase
-                    .checked_add(coinbase)
-                    .ok_or_else(|| "matured liquid supply overflow".to_owned())?;
+                coinbase_height.saturating_sub(MINER_REWARD_MATURITY + 1),
+            )? {
+                credits.push(json!({ "recipient": previous.0, "amount": earned.2 }));
             }
             effects.push(json!({
                 "coinbase_height": coinbase_height,
                 "credits": credits,
-                "liquid_supply_increase": liquid_supply_increase,
+                "liquid_supply_increase": earned.1,
             }));
         }
         let contents = serde_json::to_vec_pretty(&json!({ "matured_effects": effects }))
