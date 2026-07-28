@@ -462,6 +462,9 @@ pub struct ProposalCoordinator {
     miner_key: StacksPrivateKey,
 }
 
+/// Miners alternate between two writer slots by sortition parity, and each
+/// writer holds one slot per message kind.
+const MINER_SLOTS_PER_WRITER: u32 = 2;
 const MINER_PROPOSAL_SLOT: u32 = 0;
 const MINER_PUSHED_BLOCK_SLOT: u32 = 1;
 
@@ -536,30 +539,39 @@ impl ProposalCoordinator {
         Ok(block)
     }
 
+    /// Write to whichever writer slot this miner's key owns.
+    ///
+    /// A miner's slot depends on the parity of the sortition it won, which the
+    /// contract enforces through the slot's writer key, so the parity is found
+    /// by offering the chunk to each candidate slot.
     async fn write_miner_message(
         &self,
-        slot_id: u32,
+        message_slot: u32,
         message: SignerMessage,
     ) -> Result<ChunkAck, ProposalError> {
-        let slot_version = self
-            .client
-            .slot_versions(&self.miner_contract)
-            .await?
-            .into_iter()
-            .find(|slot| slot.slot_id == slot_id)
-            .map_or(0, |slot| slot.slot_version)
-            .checked_add(1)
-            .ok_or(ProposalError::SlotVersionOverflow)?;
-        let mut chunk = Chunk::new(slot_id, slot_version, message.encode()?);
-        chunk.sign(&self.miner_key)?;
-        let acknowledgement = self.client.put_chunk(&self.miner_contract, &chunk).await?;
-        if !acknowledgement.accepted {
-            return Err(ProposalError::Rejected {
+        let data = message.encode()?;
+        let versions = self.client.slot_versions(&self.miner_contract).await?;
+        let mut rejection = None;
+        for parity in 0..MINER_SLOTS_PER_WRITER {
+            let slot_id = parity * MINER_SLOTS_PER_WRITER + message_slot;
+            let slot_version = versions
+                .iter()
+                .find(|slot| slot.slot_id == slot_id)
+                .map_or(0, |slot| slot.slot_version)
+                .checked_add(1)
+                .ok_or(ProposalError::SlotVersionOverflow)?;
+            let mut chunk = Chunk::new(slot_id, slot_version, data.clone());
+            chunk.sign(&self.miner_key)?;
+            let acknowledgement = self.client.put_chunk(&self.miner_contract, &chunk).await?;
+            if acknowledgement.accepted {
+                return Ok(acknowledgement);
+            }
+            rejection = Some(ProposalError::Rejected {
                 reason: acknowledgement.reason,
                 code: acknowledgement.code,
             });
         }
-        Ok(acknowledgement)
+        Err(rejection.unwrap_or(ProposalError::SlotVersionOverflow))
     }
 }
 

@@ -37,9 +37,9 @@ struct Cli {
     /// Miner `StackerDB` contract as ADDRESS/name.
     #[arg(long)]
     miner_contract: String,
-    /// Signer `StackerDB` contract carrying block responses, as ADDRESS/name.
-    #[arg(long)]
-    signer_contract: String,
+    /// Boot address hosting the per-cycle signer `StackerDB` contracts.
+    #[arg(long, default_value = "ST000000000000000000002AMW42H")]
+    signer_contract_address: String,
     /// File containing the hex-encoded 32-byte block-signing private key.
     #[arg(long)]
     block_signing_private_key_file: PathBuf,
@@ -220,7 +220,12 @@ async fn coordinate(
     let coordinator = ProposalCoordinator::new(
         StackerDbClient::new(Url::parse(&cli.peer)?)?,
         parse_contract(&cli.miner_contract)?,
-        parse_contract(&cli.signer_contract)?,
+        StackerDbContract {
+            address: StacksAddress::from_str(&cli.signer_contract_address)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
+            // Signer contracts are named by reward-cycle parity and message id.
+            name: format!("signers-{}-1", reward_cycle % 2),
+        },
         miner_key,
     );
     coordinator.publish_proposal(&proposal).await?;
