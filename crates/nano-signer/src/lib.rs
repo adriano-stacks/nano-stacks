@@ -785,7 +785,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
     }
 }
 
-impl<V: ProposalValidator + Send + Sync> SignerService<V> {
+impl<V: ProposalValidator + Send> SignerService<V> {
     /// Construct a service for the miner proposal and signer response contracts of one cycle.
     #[must_use]
     pub const fn new(
@@ -812,12 +812,15 @@ impl<V: ProposalValidator + Send + Sync> SignerService<V> {
     }
 
     /// Fetch and decode a miner proposal that has not already been answered.
-    pub async fn next_proposal(&self) -> Result<Option<PendingProposal>, SignerServiceError> {
-        let Some(bytes) = self.client.latest_chunk(&self.miner_contract, 0).await? else {
+    pub async fn next_proposal(&mut self) -> Result<Option<PendingProposal>, SignerServiceError> {
+        let client = self.client.clone();
+        let miner_contract = self.miner_contract.clone();
+        let last_proposal = self.last_proposal;
+        let Some(bytes) = client.latest_chunk(&miner_contract, 0).await? else {
             return Ok(None);
         };
         let proposal_hash = nano_primitives::sha512_256(&bytes);
-        if self.last_proposal == Some(proposal_hash) {
+        if last_proposal == Some(proposal_hash) {
             return Ok(None);
         }
         let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
@@ -838,7 +841,9 @@ impl<V: ProposalValidator + Send + Sync> SignerService<V> {
         let chunk = self
             .signer
             .sign_after_slot_version(&pending.proposal, remote_slot_version)?;
-        let acknowledgement = self.client.put_chunk(&self.signer_contract, &chunk).await?;
+        let client = self.client.clone();
+        let signer_contract = self.signer_contract.clone();
+        let acknowledgement = client.put_chunk(&signer_contract, &chunk).await?;
         if !acknowledgement.accepted {
             return Err(SignerServiceError::Rejected {
                 reason: acknowledgement.reason,
@@ -851,12 +856,14 @@ impl<V: ProposalValidator + Send + Sync> SignerService<V> {
 
     /// Advance the local writer version to the latest version accepted by `StackerDB`.
     pub async fn reconcile_writer_slot(&mut self) -> Result<u32, SignerServiceError> {
-        let version = self
-            .client
-            .slot_versions(&self.signer_contract)
+        let client = self.client.clone();
+        let signer_contract = self.signer_contract.clone();
+        let writer_slot = self.signer.writer_slot();
+        let version = client
+            .slot_versions(&signer_contract)
             .await?
             .into_iter()
-            .find(|slot| slot.slot_id == self.signer.writer_slot())
+            .find(|slot| slot.slot_id == writer_slot)
             .map_or(0, |slot| slot.slot_version);
         let next = version
             .checked_add(1)
