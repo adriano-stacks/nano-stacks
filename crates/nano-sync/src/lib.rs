@@ -11,7 +11,7 @@ use nano_crypto::{CryptoError, StacksPublicKey};
 use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
 };
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -92,6 +92,13 @@ pub struct StackerSet {
     pub signer_set: SignerSet,
 }
 
+/// A stock node's acknowledgement of a finalized block upload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockUpload {
+    pub accepted: bool,
+    pub block_id: StacksBlockId,
+}
+
 impl PoxInfo {
     /// Convert the node response into the context required for VM execution.
     #[must_use]
@@ -124,6 +131,7 @@ pub enum SyncError {
     InvalidRewardSet,
     Crypto(CryptoError),
     SignerSet(SignerSetError),
+    BlockUploadRejected,
     UnstableTip,
     Fork,
 }
@@ -143,6 +151,7 @@ impl fmt::Display for SyncError {
             Self::InvalidRewardSet => formatter.write_str("reward set response is invalid"),
             Self::Crypto(error) => write!(formatter, "invalid signer key: {error}"),
             Self::SignerSet(error) => write!(formatter, "invalid signer set: {error}"),
+            Self::BlockUploadRejected => formatter.write_str("node rejected uploaded block"),
             Self::UnstableTip => formatter.write_str("peer tip changed during tenure download"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
         }
@@ -164,6 +173,7 @@ impl std::error::Error for SyncError {
             | Self::EmptySortition
             | Self::InvalidSortition
             | Self::InvalidRewardSet
+            | Self::BlockUploadRejected
             | Self::UnstableTip
             | Self::Fork => None,
         }
@@ -292,6 +302,32 @@ impl SyncClient {
     pub async fn block(&self, block_id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
         let bytes = self.bytes(&format!("v3/blocks/{block_id}")).await?;
         NakamotoBlock::decode(&bytes).map_err(SyncError::Block)
+    }
+
+    /// Upload a finalized block to a stock node and require its exact acknowledgement.
+    pub async fn upload_block(&self, block: &NakamotoBlock) -> Result<BlockUpload, SyncError> {
+        let url = self
+            .base_url
+            .join("v3/blocks/upload")
+            .map_err(|_| SyncError::InvalidBaseUrl)?;
+        let response: BlockUploadWire = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(block.encode())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let upload = BlockUpload {
+            accepted: response.accepted,
+            block_id: parse_block_id(&response.stacks_block_id)?,
+        };
+        if !upload.accepted || upload.block_id != block.block_id() {
+            return Err(SyncError::BlockUploadRejected);
+        }
+        Ok(upload)
     }
 
     /// Download and validate all Nakamoto blocks in a tenure.
@@ -549,6 +585,12 @@ struct StackerWire {
 }
 
 #[derive(Deserialize)]
+struct BlockUploadWire {
+    accepted: bool,
+    stacks_block_id: String,
+}
+
+#[derive(Deserialize)]
 struct SortitionInfoWire {
     burn_block_hash: String,
     burn_block_height: u64,
@@ -653,7 +695,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        StackerSetWire, SyncClient, SyncError, parse_block_hash, parse_block_id,
+        BlockUploadWire, StackerSetWire, SyncClient, SyncError, parse_block_hash, parse_block_id,
         parse_consensus_hash, parse_prefixed_hash160, parse_stacker_set, validate_tenure,
         validate_tenure_transition,
     };
@@ -714,6 +756,21 @@ mod tests {
             set.sbtc_address,
             nano_address::PoxAddress::Addr32 { .. }
         ));
+    }
+
+    #[test]
+    fn block_upload_acknowledgement_requires_a_valid_block_id() {
+        let acknowledgement: BlockUploadWire = serde_json::from_str(
+            r#"{"accepted":true,"stacks_block_id":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        )
+        .expect("parse upload acknowledgement");
+        assert!(acknowledgement.accepted);
+        assert_eq!(
+            parse_block_id(&acknowledgement.stacks_block_id)
+                .expect("valid block ID")
+                .as_bytes(),
+            &[0; 32]
+        );
     }
 
     #[test]
