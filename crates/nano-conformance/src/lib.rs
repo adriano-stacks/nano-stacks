@@ -762,7 +762,7 @@ mod tests {
         internal_node_hash, key_path, leaf_hash,
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
-    use nano_stackerdb::Chunk;
+    use nano_stackerdb::{BlockAcceptance, Chunk, SignerMessage};
     use proptest::prelude::*;
     use serde::Deserialize;
     use stacks_common::util::{
@@ -2356,6 +2356,36 @@ mod tests {
             .consensus_serialize(&mut reference_encoded)
             .expect("reference encodes chunk");
         assert_eq!(reference_encoded, encoded);
+    }
+
+    #[test]
+    fn signer_acceptance_encoding_matches_stacks_core() {
+        let key = StacksPrivateKey::from_seed(b"signer acceptance conformance");
+        let digest = sha512_256(b"candidate block");
+        let signature = key.sign(digest.as_bytes());
+        let message = SignerMessage::BlockResponse(BlockAcceptance::new(
+            digest,
+            signature,
+        ));
+        let encoded = message.encode().expect("encode signer message");
+
+        let reference = libsigner::v0::messages::SignerMessage::consensus_deserialize(
+            &mut encoded.as_slice(),
+        )
+        .expect("reference decodes signer message");
+        let libsigner::v0::messages::SignerMessage::BlockResponse(
+            libsigner::v0::messages::BlockResponse::Accepted(accepted),
+        ) = reference
+        else {
+            panic!("reference did not decode an accepted response");
+        };
+        assert_eq!(accepted.signer_signature_hash.0, *digest.as_bytes());
+        assert_eq!(accepted.signature.as_bytes(), signature.as_bytes());
+        assert_eq!(accepted.response_data.tenure_extend_timestamp, u64::MAX);
+        assert_eq!(
+            accepted.response_data.tenure_extend_read_count_timestamp,
+            u64::MAX
+        );
     }
 
     #[test]

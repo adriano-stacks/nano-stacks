@@ -6,6 +6,12 @@ use nano_address::StacksAddress;
 use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey};
 use nano_primitives::{Hash160, Sha256Sum, hash160, sha512_256};
 
+mod signer_message;
+
+pub use signer_message::{
+    BlockAcceptance, BlockProposal, SignerMessage, SignerMessageError, SignerMessageType,
+};
+
 /// Maximum wire payload for a signer `StackerDB` chunk.
 pub const MAX_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -216,9 +222,11 @@ impl<'a> ChunkReader<'a> {
 #[cfg(test)]
 mod tests {
     use nano_crypto::StacksPrivateKey;
-    use nano_primitives::hash160;
+    use nano_primitives::{hash160, sha512_256};
 
-    use super::{Chunk, MAX_CHUNK_SIZE, StackerDbError};
+    use super::{
+        BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbError,
+    };
 
     #[test]
     fn signed_chunks_round_trip_and_verify() {
@@ -237,5 +245,17 @@ mod tests {
     fn chunks_reject_oversized_payloads() {
         let chunk = Chunk::new(0, 0, vec![0; MAX_CHUNK_SIZE + 1]);
         assert!(matches!(chunk.encode(), Err(StackerDbError::ChunkTooLarge)));
+    }
+
+    #[test]
+    fn block_acceptance_messages_round_trip() {
+        let key = StacksPrivateKey::from_seed(b"signer-message");
+        let digest = sha512_256(b"proposed block");
+        let response = BlockAcceptance::new(digest, key.sign(digest.as_bytes()));
+        let message = SignerMessage::BlockResponse(response);
+
+        let decoded = SignerMessage::decode(&message.encode().expect("encode message"))
+            .expect("decode message");
+        assert_eq!(decoded, message);
     }
 }
