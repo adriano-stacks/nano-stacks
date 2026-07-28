@@ -585,7 +585,11 @@ mod clarity_v2_v3 {
 
             let (expected, el) = {
                 // collect an element from the sequence at 'source' position.
-                let el = seq_data.clone().element_at(source).expect("element_at failed").map_or_else(Value::none, |value| value);
+                let el = seq_data
+                    .clone()
+                    .element_at(source)
+                    .expect("element_at failed")
+                    .unwrap_or_else(Value::none);
                 // replace the element at 'dest' position
                 // with the collected element from the 'source' position.
                 (seq_data.replace_at(

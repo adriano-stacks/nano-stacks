@@ -112,7 +112,7 @@ mod clarity_v2_v3 {
     // should be a valid contract name.
     fn valid_contract_principal_name(s: &str) -> bool {
         if let Some(part) = s.split('.').nth(1) {
-            !(part.starts_with('u') && part.chars().nth(1).map_or(false, |c| c.is_ascii_digit()))
+            !(part.starts_with('u') && part.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
         } else {
             true
         }
