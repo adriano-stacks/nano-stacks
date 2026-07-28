@@ -22,7 +22,7 @@ using persistent writer-slot state and authenticated live Bitcoin context.
 - [x] Persist signer responses and writer-slot versions before publication.
 - [x] Authenticate each live proposal against its current Bitcoin sortition and reward cycle.
 - [x] Wire a checkpoint-backed signer process from explicit local configuration.
-- [ ] Confirm a response from a separately registered nano signer is accepted in Hacknet.
+- [x] Confirm a response from a separately registered nano signer is accepted in Hacknet.
 
 ## Acceptance Criteria
 

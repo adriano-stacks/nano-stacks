@@ -1213,6 +1213,42 @@ impl<V: ProposalValidator + Send> LiveSigner<V> {
 
 #[cfg(test)]
 mod tests {
+    /// A nano signature only counts once a stock miner has put it in a block
+    /// the network accepted, which is what this reads back off the chain.
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node and NANO_SIGNER_PUBLIC_KEY"]
+    async fn hacknet_accepts_a_nano_signature_in_a_block() {
+        let expected = nano_crypto::StacksPublicKey::from_bytes(
+            &hex::decode(std::env::var("NANO_SIGNER_PUBLIC_KEY").expect("signer public key"))
+                .expect("hexadecimal public key"),
+        )
+        .expect("valid public key");
+        let client = crate::SyncClient::new(
+            reqwest::Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"),
+        )
+        .expect("create sync client");
+        let tenure = client.tenure_info().await.expect("fetch tenure info");
+        let blocks = client
+            .tenure(tenure.tenure_start_block_id, None)
+            .await
+            .expect("download the canonical tenure");
+
+        let signed = blocks.iter().find(|block| {
+            let digest = block.header.signer_signature_hash();
+            block
+                .header
+                .signer_signatures
+                .iter()
+                .any(|signature| signature.recover(digest.as_bytes()).as_ref() == Ok(&expected))
+        });
+        let block = signed.expect("no accepted block carries this signer's signature");
+        println!(
+            "accepted block {} at height {} carries the nano signature",
+            block.block_id(),
+            block.header.chain_length
+        );
+    }
+
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{
