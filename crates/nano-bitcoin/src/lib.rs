@@ -3,10 +3,12 @@
 use std::{collections::HashMap, fmt};
 
 use bitcoin::{
-    Block,
+    Amount, Block, Transaction, TxIn, TxOut,
+    absolute::LockTime,
     consensus::deserialize,
     hashes::Hash,
-    script::{Instruction, Script},
+    script::{Instruction, PushBytesBuf, Script, ScriptBuf},
+    transaction::Version as TransactionVersion,
 };
 use nano_address::PoxAddress;
 
@@ -116,6 +118,92 @@ impl LeaderBlockCommitment {
         bytes[76] = (self.memo << 3) | self.parent_modulus;
         Ok(bytes)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaderCommitmentTransactionError {
+    ZeroCommitmentAmount,
+    ZeroChangeAmount,
+    InvalidProtocolPayload,
+    Commitment(LeaderCommitmentError),
+}
+
+impl fmt::Display for LeaderCommitmentTransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCommitmentAmount => {
+                formatter.write_str("leader commitment amount must be greater than zero")
+            }
+            Self::ZeroChangeAmount => {
+                formatter.write_str("change amount must be greater than zero")
+            }
+            Self::InvalidProtocolPayload => {
+                formatter.write_str("invalid leader commitment payload")
+            }
+            Self::Commitment(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LeaderCommitmentTransactionError {}
+
+impl From<LeaderCommitmentError> for LeaderCommitmentTransactionError {
+    fn from(error: LeaderCommitmentError) -> Self {
+        Self::Commitment(error)
+    }
+}
+
+/// Construct an unsigned waterfall leader-commitment transaction.
+///
+/// The payout is always the first spendable output. An optional change output
+/// follows it, so wallet funding cannot alter the protocol output ordering.
+/// Callers that fund the returned transaction through Bitcoin Core may leave
+/// `inputs` empty.
+pub fn build_leader_commitment_transaction(
+    magic: [u8; 2],
+    commitment: LeaderBlockCommitment,
+    inputs: Vec<TxIn>,
+    sbtc_address: &PoxAddress,
+    commitment_amount: Amount,
+    change: Option<(&PoxAddress, Amount)>,
+) -> Result<Transaction, LeaderCommitmentTransactionError> {
+    if commitment_amount == Amount::ZERO {
+        return Err(LeaderCommitmentTransactionError::ZeroCommitmentAmount);
+    }
+    if change.is_some_and(|(_, amount)| amount == Amount::ZERO) {
+        return Err(LeaderCommitmentTransactionError::ZeroChangeAmount);
+    }
+
+    let mut protocol_payload = Vec::with_capacity(80);
+    protocol_payload.extend_from_slice(&magic);
+    protocol_payload.push(b'[');
+    protocol_payload.extend_from_slice(&commitment.encode()?);
+    let protocol_payload = PushBytesBuf::try_from(protocol_payload)
+        .map_err(|_| LeaderCommitmentTransactionError::InvalidProtocolPayload)?;
+
+    let mut output = vec![
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(protocol_payload),
+        },
+        TxOut {
+            value: commitment_amount,
+            script_pubkey: sbtc_address.script_pubkey(),
+        },
+    ];
+    if let Some((address, amount)) = change {
+        output.push(TxOut {
+            value: amount,
+            script_pubkey: address.script_pubkey(),
+        });
+    }
+
+    Ok(Transaction {
+        version: TransactionVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: inputs,
+        output,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -447,7 +535,8 @@ mod tests {
     };
 
     use super::{
-        BitcoinOperationKind, PreStxCache, decode_block, parse_leader_block_commit,
+        BitcoinOperationKind, LeaderBlockCommitment, LeaderCommitmentTransactionError, PreStxCache,
+        build_leader_commitment_transaction, decode_block, parse_leader_block_commit,
         parse_leader_key_registration,
     };
 
@@ -526,7 +615,7 @@ mod tests {
 
     #[test]
     fn leader_commitment_payload_round_trips_through_the_parser() {
-        let commitment = super::LeaderBlockCommitment {
+        let commitment = LeaderBlockCommitment {
             block_header_hash: [1; 32],
             new_seed: [2; 32],
             parent_block_height: 3,
@@ -560,6 +649,78 @@ mod tests {
         assert_eq!(parent_modulus, 4);
     }
 
+    #[test]
+    fn waterfall_commitment_places_the_payout_before_change() {
+        let commitment = LeaderBlockCommitment {
+            block_header_hash: [1; 32],
+            new_seed: [2; 32],
+            parent_block_height: 3,
+            parent_transaction_index: 4,
+            key_block_height: 5,
+            key_transaction_index: 6,
+            memo: 7,
+            parent_modulus: 4,
+        };
+        let payout = p2tr_address(0x42);
+        let change = p2wpkh_address(0x24);
+        let transaction = build_leader_commitment_transaction(
+            *b"T3",
+            commitment,
+            vec![TxIn::default()],
+            &payout,
+            Amount::from_sat(12_345),
+            Some((&change, Amount::from_sat(54_321))),
+        )
+        .expect("build leader commitment");
+
+        assert_eq!(transaction.output.len(), 3);
+        assert_eq!(transaction.output[1].value, Amount::from_sat(12_345));
+        assert_eq!(transaction.output[1].script_pubkey, payout.script_pubkey());
+        assert_eq!(transaction.output[2].value, Amount::from_sat(54_321));
+        assert_eq!(transaction.output[2].script_pubkey, change.script_pubkey());
+        let (opcode, payload) =
+            super::protocol_payload(transaction.output[0].script_pubkey.as_script(), *b"T3")
+                .expect("protocol payload");
+        assert_eq!(opcode, b'[');
+        assert_eq!(payload, commitment.encode().expect("commitment payload"));
+    }
+
+    #[test]
+    fn waterfall_commitment_allows_wallet_funding_and_rejects_zero_amounts() {
+        let commitment = LeaderBlockCommitment {
+            block_header_hash: [1; 32],
+            new_seed: [2; 32],
+            parent_block_height: 3,
+            parent_transaction_index: 4,
+            key_block_height: 5,
+            key_transaction_index: 6,
+            memo: 7,
+            parent_modulus: 4,
+        };
+        let payout = p2tr_address(0x42);
+        let template = build_leader_commitment_transaction(
+            *b"T3",
+            commitment,
+            vec![],
+            &payout,
+            Amount::from_sat(1),
+            None,
+        )
+        .expect("build fundable transaction template");
+        assert!(template.input.is_empty());
+        assert_eq!(
+            build_leader_commitment_transaction(
+                *b"T3",
+                commitment,
+                vec![TxIn::default()],
+                &payout,
+                Amount::ZERO,
+                None,
+            ),
+            Err(LeaderCommitmentTransactionError::ZeroCommitmentAmount)
+        );
+    }
+
     fn transaction(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
         Transaction {
             version: TransactionVersion::TWO,
@@ -587,6 +748,22 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(
                 [vec![0x76, 0xa9, 0x14], vec![byte; 20], vec![0x88, 0xac]].concat(),
             ),
+        }
+    }
+
+    fn p2tr_address(byte: u8) -> nano_address::PoxAddress {
+        nano_address::PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: nano_address::PoxAddressType32::P2tr,
+            bytes: [byte; 32],
+        }
+    }
+
+    fn p2wpkh_address(byte: u8) -> nano_address::PoxAddress {
+        nano_address::PoxAddress::Addr20 {
+            mainnet: false,
+            address_type: nano_address::PoxAddressType20::P2wpkh,
+            bytes: [byte; 20],
         }
     }
 
