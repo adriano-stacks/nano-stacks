@@ -17,7 +17,7 @@ use nano_stackerdb::{
     BlockAcceptance, BlockProposal, Chunk, ChunkAck, SignerMessage, StackerDbClient,
     StackerDbClientError, StackerDbContract, StackerDbError,
 };
-use nano_sync::SortitionInfo;
+use nano_sync::{SortitionInfo, SyncClient, SyncError};
 use serde::{Deserialize, Serialize};
 
 /// Checks a miner proposal against the node's current chain and sortition view.
@@ -568,6 +568,55 @@ pub struct PendingProposal {
     pub proposal: BlockProposal,
 }
 
+/// Couples a signer service to live, authenticated Bitcoin sortition data.
+pub struct LiveSigner<V> {
+    client: SyncClient,
+    service: SignerService<ActiveSortitionValidator<V>>,
+}
+
+/// Errors raised while refreshing and responding to a live miner proposal.
+#[derive(Debug)]
+pub enum LiveSignerError {
+    Sync(SyncError),
+    Service(SignerServiceError),
+    RewardCycle { expected: u64, actual: u64 },
+}
+
+impl fmt::Display for LiveSignerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sync(error) => write!(formatter, "live signer synchronization failed: {error}"),
+            Self::Service(error) => write!(formatter, "live signer service failed: {error}"),
+            Self::RewardCycle { expected, actual } => write!(
+                formatter,
+                "proposal reward cycle {actual} does not match the active cycle {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LiveSignerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sync(error) => Some(error),
+            Self::Service(error) => Some(error),
+            Self::RewardCycle { .. } => None,
+        }
+    }
+}
+
+impl From<SyncError> for LiveSignerError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(error)
+    }
+}
+
+impl From<SignerServiceError> for LiveSignerError {
+    fn from(error: SignerServiceError) -> Self {
+        Self::Service(error)
+    }
+}
+
 /// Errors while transporting signer messages.
 #[derive(Debug)]
 pub enum SignerServiceError {
@@ -876,6 +925,44 @@ impl<V: ProposalValidator + Send> SignerService<V> {
     #[must_use]
     pub const fn signer_mut(&mut self) -> &mut EmbeddedSigner<V> {
         &mut self.signer
+    }
+}
+
+impl<V: ProposalValidator + Send> LiveSigner<V> {
+    /// Construct a live signer from an HTTP peer and its `StackerDB` service.
+    #[must_use]
+    pub const fn new(
+        client: SyncClient,
+        service: SignerService<ActiveSortitionValidator<V>>,
+    ) -> Self {
+        Self { client, service }
+    }
+
+    /// Fetch, authenticate, validate, and answer the latest miner proposal once.
+    pub async fn poll(&mut self) -> Result<Option<ChunkAck>, LiveSignerError> {
+        let Some(pending) = self.service.next_proposal().await? else {
+            return Ok(None);
+        };
+        let tenure = self.client.tenure_info().await?;
+        if pending.proposal.reward_cycle != tenure.reward_cycle {
+            return Err(LiveSignerError::RewardCycle {
+                expected: tenure.reward_cycle,
+                actual: pending.proposal.reward_cycle,
+            });
+        }
+        let sortition = self
+            .client
+            .sortition(pending.proposal.block.header.consensus_hash)
+            .await?;
+        self.service
+            .signer_mut()
+            .validator_mut()
+            .set_context(sortition, tenure.reward_cycle);
+        self.service
+            .respond(pending)
+            .await
+            .map(Some)
+            .map_err(Into::into)
     }
 }
 
