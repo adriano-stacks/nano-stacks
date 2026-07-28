@@ -13,6 +13,7 @@ hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-chainstate = { path = "../nano-chainstate" }
+nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 nano-stackerdb = { path = "../nano-stackerdb" }
@@ -32,3 +33,7 @@ path = "src/main.rs"
 [[bin]]
 name = "stacks-register-leader-key"
 path = "src/bin/register_leader_key.rs"
+
+[[bin]]
+name = "stacks-commit-block"
+path = "src/bin/commit_block.rs"

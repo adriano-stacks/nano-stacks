@@ -2,6 +2,12 @@
 
 //! Bitcoin wallet integration for nano-stacks mining.
 
+mod commitment;
+
+pub use commitment::{
+    CommitmentPlan, CommitmentPlanError, EPOCH_4_MARKER, RegisteredLeaderKey, plan_commitment,
+};
+
 use std::fmt;
 
 use bitcoin::{Amount, Transaction, Txid, consensus::encode::serialize_hex};
@@ -33,6 +39,7 @@ pub enum MinerError {
     UnexpectedChangePosition(i32),
     IncompleteSignature,
     MempoolRejected(String),
+    Unconfirmed,
 }
 
 impl fmt::Display for MinerError {
@@ -60,6 +67,9 @@ impl fmt::Display for MinerError {
             Self::MempoolRejected(reason) => {
                 write!(formatter, "Bitcoin mempool rejected transaction: {reason}")
             }
+            Self::Unconfirmed => {
+                formatter.write_str("Bitcoin transaction is not in a confirmed block")
+            }
         }
     }
 }
@@ -75,7 +85,8 @@ impl std::error::Error for MinerError {
             | Self::AlteredProtocolOutputs
             | Self::UnexpectedChangePosition(_)
             | Self::IncompleteSignature
-            | Self::MempoolRejected(_) => None,
+            | Self::MempoolRejected(_)
+            | Self::Unconfirmed => None,
         }
     }
 }
@@ -195,6 +206,22 @@ impl BitcoinWallet {
             fee: submitted.fee,
             change_output: submitted.change_output,
         })
+    }
+
+    /// Locate a confirmed transaction by the Bitcoin block and position that contain it.
+    pub fn confirmed_position(&self, transaction_id: Txid) -> Result<(u64, u32), MinerError> {
+        let transaction = self.rpc.get_raw_transaction_info(&transaction_id, None)?;
+        let block_hash = transaction.blockhash.ok_or(MinerError::Unconfirmed)?;
+        let block = self.rpc.get_block_info(&block_hash)?;
+        let index = block
+            .tx
+            .iter()
+            .position(|candidate| *candidate == transaction_id)
+            .ok_or(MinerError::Unconfirmed)?;
+        Ok((
+            u64::try_from(block.height).map_err(|_| MinerError::Unconfirmed)?,
+            u32::try_from(index).map_err(|_| MinerError::Unconfirmed)?,
+        ))
     }
 
     /// Replace an unconfirmed commitment at a higher fee rate.
