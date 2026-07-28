@@ -162,7 +162,9 @@ where
     pub fn observe(&mut self, block: &NakamotoBlock, bitcoin_height: u64) -> Result<(), String> {
         let block_id = block.block_id();
         if let Some(candidate) = self.candidates.remove(&block_id) {
-            if candidate != block.header {
+            // A proposal carries no signer signatures, so only the miner-signed
+            // content can be compared against the block that was accepted.
+            if candidate.miner_signature_hash() != block.header.miner_signature_hash() {
                 return Err("observed block differs from the validated candidate".to_owned());
             }
         } else {
