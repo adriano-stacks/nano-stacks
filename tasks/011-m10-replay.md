@@ -1,12 +1,13 @@
 ---
 id: "011"
 title: "M10: implement full block execution and fixture replay"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["008", "009", "010"]
 tags: ["m10", "replay"]
 created_at: 2026-07-27
+completed_at: 2026-07-28
 ---
 
 # M10: implement full block execution and fixture replay
