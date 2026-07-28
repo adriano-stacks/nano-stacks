@@ -46,7 +46,7 @@ impl PreStxCache {
 pub trait BitcoinSource {
     type Error;
 
-    fn block_at(&self, height: u64) -> Result<BitcoinBlock, Self::Error>;
+    fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error>;
 }
 
 /// Bitcoin Core RPC-backed protocol-operation source.
@@ -126,6 +126,14 @@ impl BitcoinRpcSource {
         }
         self.last_height = Some(height);
         current.ok_or_else(|| BitcoinParseError::InvalidBlock.into())
+    }
+}
+
+impl BitcoinSource for BitcoinRpcSource {
+    type Error = BitcoinRpcSourceError;
+
+    fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error> {
+        Self::block_at(self, height)
     }
 }
 

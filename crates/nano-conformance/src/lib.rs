@@ -762,6 +762,8 @@ fn decode_hash(value: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, checkpoint_state,
@@ -805,7 +807,8 @@ mod tests {
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::{
-        PreStxCache, decode_block as decode_bitcoin_block, decode_block_with_pre_stx,
+        BitcoinBlock, BitcoinSource, PreStxCache, decode_block as decode_bitcoin_block,
+        decode_block_with_pre_stx,
     };
     use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, SignerSet};
     use nano_codec::{
@@ -850,6 +853,22 @@ mod tests {
         util::uint::Uint256 as ReferenceUint256,
         util::vrf::VRFProof as ReferenceVrfProof,
     };
+
+    #[derive(Debug)]
+    struct FixtureBitcoinSource {
+        blocks: BTreeMap<u64, BitcoinBlock>,
+    }
+
+    impl BitcoinSource for FixtureBitcoinSource {
+        type Error = String;
+
+        fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error> {
+            self.blocks
+                .get(&height)
+                .cloned()
+                .ok_or_else(|| format!("missing captured Bitcoin block at height {height}"))
+        }
+    }
     use stacks_common::{
         deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize,
         types::chainstate::{
@@ -1112,6 +1131,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
             .expect("read blocks")
             .map(|entry| entry.expect("block entry").path())
@@ -1133,10 +1153,40 @@ mod tests {
             root,
         )
         .expect("open checkpoint");
+        let mut bitcoin = FixtureBitcoinSource {
+            blocks: [
+                (first_context.height, &first.header.consensus_hash),
+                (second_context.height, &second.header.consensus_hash),
+            ]
+            .into_iter()
+            .map(|(height, consensus_hash)| {
+                (
+                    height,
+                    BitcoinBlock {
+                        height,
+                        hash: [0; 32],
+                        operations: bitcoin_operations
+                            .get(&consensus_hash.to_string())
+                            .expect("Bitcoin operations")
+                            .clone(),
+                    },
+                )
+            })
+            .collect(),
+        };
+        let first_operations = bitcoin
+            .block_at(first_context.height)
+            .expect("first Bitcoin operations");
         chainstate
-            .append_nakamoto_block_with_bitcoin_context(first_context, Some(source), &first)
+            .append_nakamoto_block_with_bitcoin_operations(
+                first_context,
+                &first_operations.operations,
+                Some(source),
+                &first,
+            )
             .expect("apply anchor block");
-        let mut validator = ChainstateProposalValidator::new(chainstate, &first, first_context);
+        let mut validator =
+            ChainstateProposalValidator::new(chainstate, &first, first_context, bitcoin);
         let proposal = BlockProposal {
             block: second.clone(),
             bitcoin_height: second_context.height,

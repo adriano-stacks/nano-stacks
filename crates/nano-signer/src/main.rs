@@ -4,6 +4,7 @@ use std::{error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use nano_address::StacksAddress;
+use nano_bitcoin::BitcoinRpcSource;
 use nano_chainstate::{ChainState, NakamotoBlock, TenureAccounting};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::TrieHash;
@@ -29,6 +30,12 @@ enum Command {
     Run {
         #[arg(long, default_value = "http://127.0.0.1:20443/")]
         peer: String,
+        #[arg(long)]
+        bitcoin_rpc: String,
+        #[arg(long)]
+        bitcoin_rpc_user: String,
+        #[arg(long)]
+        bitcoin_rpc_password_file: PathBuf,
         #[arg(long)]
         miner_contract: String,
         #[arg(long)]
@@ -81,6 +88,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         command:
             Command::Run {
                 peer,
+                bitcoin_rpc,
+                bitcoin_rpc_user,
+                bitcoin_rpc_password_file,
                 miner_contract,
                 signer_contract,
                 private_key,
@@ -103,6 +113,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } = Cli::parse();
     let client = SyncClient::new(Url::parse(&peer)?)?;
     let pox = client.pox_info().await?;
+    let password = fs::read_to_string(bitcoin_rpc_password_file)?;
+    let mut bitcoin =
+        BitcoinRpcSource::new(&bitcoin_rpc, bitcoin_rpc_user, password.trim_end(), *b"T3")?;
     let mut bitcoin_context = pox.bitcoin_context();
     bitcoin_context.height = anchor_bitcoin_height;
     bitcoin_context.v1_unlock_height = pox_v1_unlock_height;
@@ -118,12 +131,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(path) = tenure_accounting {
         *chainstate.accounting_mut() = TenureAccounting::from_json(&fs::read(path)?)?;
     }
-    chainstate.append_nakamoto_block_with_bitcoin_context(
+    let anchor_operations = bitcoin.block_at(anchor_bitcoin_height)?;
+    chainstate.append_nakamoto_block_with_bitcoin_operations(
         bitcoin_context,
+        &anchor_operations.operations,
         Some(source),
         &anchor,
     )?;
-    let validator = ChainstateProposalValidator::new(chainstate, &anchor, bitcoin_context);
+    let validator = ChainstateProposalValidator::new(chainstate, &anchor, bitcoin_context, bitcoin);
     let signer = EmbeddedSigner::from_state_file(
         SignerConfig {
             private_key: StacksPrivateKey::from_bytes(parse_array(&private_key)?)?,
@@ -159,7 +174,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn sync_chainstate(
     client: &SyncClient,
-    signer: &mut LiveSigner<ChainstateProposalValidator>,
+    signer: &mut LiveSigner<ChainstateProposalValidator<BitcoinRpcSource>>,
     max_blocks: usize,
 ) -> Result<(), Box<dyn Error>> {
     let tip = client.tenure_info().await?.tip_block_id;

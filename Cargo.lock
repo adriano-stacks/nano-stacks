@@ -2672,6 +2672,7 @@ dependencies = [
  "fs2",
  "hex",
  "nano-address",
+ "nano-bitcoin",
  "nano-chainstate",
  "nano-crypto",
  "nano-primitives",

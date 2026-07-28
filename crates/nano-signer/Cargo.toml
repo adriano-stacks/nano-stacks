@@ -11,6 +11,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 fs2 = "0.4.3"
 hex = "0.4.3"
 nano-address = { path = "../nano-address" }
+nano-bitcoin = { path = "../nano-bitcoin" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 nano-stackerdb = { path = "../nano-stackerdb" }

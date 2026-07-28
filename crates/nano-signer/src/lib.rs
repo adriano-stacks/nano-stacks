@@ -10,6 +10,7 @@ use std::{
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use fs2::FileExt;
+use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
@@ -124,26 +125,33 @@ impl<V: ProposalValidator> ProposalValidator for ActiveSortitionValidator<V> {
 
 /// Validates proposal execution from a trusted, checkpointed chain state.
 #[derive(Debug)]
-pub struct ChainstateProposalValidator {
+pub struct ChainstateProposalValidator<S> {
     chainstate: ChainState,
     bitcoin_context: BitcoinBlockContext,
+    bitcoin: S,
     trusted: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
     candidates: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
 }
 
-impl ChainstateProposalValidator {
-    /// Start validating proposals from a block whose state is already present in `chainstate`.
+impl<S> ChainstateProposalValidator<S>
+where
+    S: BitcoinSource,
+    S::Error: fmt::Display,
+{
+    /// Start validating proposals using the authoritative Bitcoin operation source.
     #[must_use]
     pub fn new(
         chainstate: ChainState,
         anchor: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
+        bitcoin: S,
     ) -> Self {
         let mut trusted = BTreeMap::new();
         trusted.insert(anchor.block_id(), anchor.header.clone());
         Self {
             chainstate,
             bitcoin_context,
+            bitcoin,
             trusted,
             candidates: BTreeMap::new(),
         }
@@ -188,9 +196,14 @@ impl ChainstateProposalValidator {
         block
             .validate_successor(parent)
             .map_err(|error| format!("proposal does not extend its parent: {error}"))?;
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| format!("could not load Bitcoin operations: {error}"))?;
         self.chainstate
-            .append_nakamoto_block_with_bitcoin_context(
+            .append_nakamoto_block_with_bitcoin_operations(
                 bitcoin_context,
+                &operations.operations,
                 Some(*block.header.parent_block_id.as_bytes()),
                 block,
             )
@@ -199,7 +212,11 @@ impl ChainstateProposalValidator {
     }
 }
 
-impl ProposalValidator for ChainstateProposalValidator {
+impl<S> ProposalValidator for ChainstateProposalValidator<S>
+where
+    S: BitcoinSource,
+    S::Error: fmt::Display,
+{
     fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
         let block_id = proposal.block.block_id();
         if self.candidates.get(&block_id) == Some(&proposal.block.header) {
