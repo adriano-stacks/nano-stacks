@@ -145,7 +145,12 @@ async fn sync_chainstate(
     let mut blocks = Vec::new();
     let mut block_id = tip;
     for _ in 0..max_blocks {
-        let block = client.block(block_id).await?;
+        let block = client.block(block_id).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not decode canonical block {block_id}: {error}"),
+            )
+        })?;
         if signer
             .validator_mut()
             .validator_mut()
