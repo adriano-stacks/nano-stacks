@@ -1,12 +1,13 @@
 ---
 id: "011"
 title: "M10: implement full block execution and fixture replay"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["008", "009", "010"]
 tags: ["m10", "replay"]
 created_at: 2026-07-27
+completed_at: 2026-07-28
 ---
 
 # M10: implement full block execution and fixture replay
@@ -22,7 +23,7 @@ Clarity receipts and state roots as stacks-core.
 - [x] Execute decoded token-transfer payloads through the Epoch 4 VM.
 - [x] Apply transaction fees and account nonces.
 - [x] Apply coinbase and tenure changes.
-- [ ] Enforce post-conditions and transaction-level runtime error semantics.
+- [x] Enforce post-conditions and transaction-level runtime error semantics.
 - [x] Carry block-level cost limits and receipt costs/events through execution.
 - [x] Replay captured blocks from the checkpoint and report the exact first divergence.
 
