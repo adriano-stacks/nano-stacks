@@ -464,6 +464,26 @@ impl ChainState {
         Ok((block, applied))
     }
 
+    /// Execute a block candidate with the decoded Bitcoin operations for its tenure start.
+    pub fn assemble_nakamoto_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        mut block: NakamotoBlock,
+        miner_key: &StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        let applied = self.execute_nakamoto_block(
+            bitcoin_context,
+            operations,
+            parent,
+            &mut block,
+            Some(miner_key),
+            NativeBlockEffects::default(),
+        )?;
+        Ok((block, applied))
+    }
+
     fn execute_nakamoto_block(
         &mut self,
         bitcoin_context: BitcoinBlockContext,
