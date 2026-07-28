@@ -252,6 +252,34 @@ impl SignerSet {
         }
         Ok(signed_weight)
     }
+
+    /// Order valid signer responses by reward-set index and require threshold weight.
+    pub fn order_responses(
+        &self,
+        header: &NakamotoBlockHeader,
+        responses: impl IntoIterator<Item = MessageSignature>,
+    ) -> Result<Vec<MessageSignature>, SignerSetError> {
+        let digest = *header.signer_signature_hash().as_bytes();
+        let mut ordered = BTreeMap::new();
+        for signature in responses {
+            let public_key = signature
+                .recover(&digest)
+                .map_err(SignerSetError::Signature)?;
+            let index = self
+                .signers
+                .iter()
+                .position(|signer| signer.public_key == public_key)
+                .ok_or(SignerSetError::UnknownOrUnorderedSigner)?;
+            if ordered.insert(index, signature).is_some() {
+                return Err(SignerSetError::UnknownOrUnorderedSigner);
+            }
+        }
+        let signatures = ordered.into_values().collect::<Vec<_>>();
+        let mut candidate = header.clone();
+        candidate.signer_signatures.clone_from(&signatures);
+        self.verify(&candidate)?;
+        Ok(signatures)
+    }
 }
 
 /// Errors raised while constructing or applying a signer reward set.
@@ -410,8 +438,9 @@ impl std::error::Error for TenureError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{SignerSet, SignerSetError};
+    use super::{NakamotoBlockHeader, Signer, SignerSet, SignerSetError};
     use nano_crypto::StacksPrivateKey;
+    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
 
     #[test]
     fn reward_set_rejects_zero_threshold() {
@@ -450,6 +479,55 @@ mod tests {
 
         assert_eq!(threshold, 2);
         assert_eq!(signer_set.weights(), vec![3]);
+    }
+
+    #[test]
+    fn signer_responses_are_ordered_and_threshold_checked() {
+        let first = StacksPrivateKey::from_seed(b"first signer");
+        let second = StacksPrivateKey::from_seed(b"second signer");
+        let third = StacksPrivateKey::from_seed(b"third signer");
+        let set = SignerSet::new(vec![
+            Signer {
+                public_key: first.public_key(),
+                weight: 3,
+            },
+            Signer {
+                public_key: second.public_key(),
+                weight: 4,
+            },
+            Signer {
+                public_key: third.public_key(),
+                weight: 3,
+            },
+        ])
+        .expect("valid signer set");
+        let header = NakamotoBlockHeader {
+            version: 1,
+            chain_length: 1,
+            bitcoin_spent: 0,
+            consensus_hash: ConsensusHash::from_bytes([1; 20]),
+            parent_block_id: StacksBlockId::from_bytes([2; 32]),
+            transaction_merkle_root: Sha256Sum::from_bytes([3; 32]),
+            state_index_root: TrieHash::from_bytes([4; 32]),
+            timestamp: 5,
+            miner_signature: first.sign(&[5; 32]),
+            signer_signatures: Vec::new(),
+            pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+        };
+        let digest = header.signer_signature_hash();
+        let first_response = first.sign(digest.as_bytes());
+        let second_response = second.sign(digest.as_bytes());
+        let third_response = third.sign(digest.as_bytes());
+        let ordered = set
+            .order_responses(
+                &header,
+                vec![third_response, first_response, second_response],
+            )
+            .expect("threshold response set");
+        assert_eq!(
+            ordered,
+            vec![first_response, second_response, third_response]
+        );
     }
 }
 
