@@ -10,7 +10,7 @@ use nano_crypto::StacksPrivateKey;
 use nano_primitives::TrieHash;
 use nano_signer::{
     ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner, LiveSigner,
-    SignerConfig, SignerService,
+    SignerConfig, SignerService, StateAnnouncer,
 };
 use nano_stackerdb::{StackerDbClient, StackerDbContract};
 use nano_sync::SyncClient;
@@ -40,6 +40,9 @@ enum Command {
         miner_contract: String,
         #[arg(long)]
         signer_contract: String,
+        /// Signer `StackerDB` contract carrying state machine updates, as ADDRESS/name.
+        #[arg(long)]
+        state_contract: String,
         #[arg(long)]
         private_key: String,
         #[arg(long)]
@@ -93,6 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 bitcoin_rpc_password_file,
                 miner_contract,
                 signer_contract,
+                state_contract,
                 private_key,
                 writer_slot,
                 state_file,
@@ -155,11 +159,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         signer,
     );
     let mut signer = LiveSigner::new(client.clone(), service);
+    let mut announcer = StateAnnouncer::new(
+        StackerDbClient::new(Url::parse(&peer)?)?,
+        parse_contract(&state_contract)?,
+        writer_slot,
+        StacksPrivateKey::from_bytes(parse_array(&private_key)?)?,
+    );
     if sync_only {
         sync_chainstate(&client, &mut signer, max_sync_blocks).await?;
         return Ok(());
     }
     loop {
+        if let Err(error) = announcer.announce(&client).await {
+            eprintln!("signer state announcement failed: {error}");
+        }
         if let Err(error) = sync_chainstate(&client, &mut signer, max_sync_blocks).await {
             eprintln!("signer chainstate sync failed: {error}");
             sleep(Duration::from_secs(poll_interval_secs)).await;

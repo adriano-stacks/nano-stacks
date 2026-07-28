@@ -15,8 +15,9 @@ use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
-    BlockAcceptance, BlockProposal, BlockResponse, Chunk, ChunkAck, SignerMessage, StackerDbClient,
-    StackerDbClientError, StackerDbContract, StackerDbError,
+    BlockAcceptance, BlockProposal, BlockResponse, Chunk, ChunkAck, CurrentMiner,
+    LATEST_SIGNER_PROTOCOL_VERSION, SignerMessage, StackerDbClient, StackerDbClientError,
+    StackerDbContract, StackerDbError, StateMachineUpdate,
 };
 use nano_sync::{SortitionInfo, SyncClient, SyncError};
 use serde::{Deserialize, Serialize};
@@ -959,6 +960,127 @@ impl<V: ProposalValidator + Send> SignerService<V> {
     #[must_use]
     pub const fn signer_mut(&mut self) -> &mut EmbeddedSigner<V> {
         &mut self.signer
+    }
+}
+
+/// Publishes this signer's protocol version and miner view to the reward set.
+///
+/// Stock signers will not validate a block until a weighted majority of the
+/// reward set has announced a protocol version, so a signer that only responds
+/// to proposals blocks the network instead of abstaining from it.
+pub struct StateAnnouncer {
+    client: StackerDbClient,
+    contract: StackerDbContract,
+    writer_slot: u32,
+    private_key: StacksPrivateKey,
+    announced: Option<StateMachineUpdate>,
+}
+
+impl StateAnnouncer {
+    #[must_use]
+    pub const fn new(
+        client: StackerDbClient,
+        contract: StackerDbContract,
+        writer_slot: u32,
+        private_key: StacksPrivateKey,
+    ) -> Self {
+        Self {
+            client,
+            contract,
+            writer_slot,
+            private_key,
+            announced: None,
+        }
+    }
+
+    /// Publish this signer's view of the peer's Bitcoin tip, unless it is unchanged.
+    pub async fn announce(
+        &mut self,
+        node: &SyncClient,
+    ) -> Result<Option<ChunkAck>, LiveSignerError> {
+        let update = Self::derive(node).await?;
+        if self.announced.as_ref() == Some(&update) {
+            return Ok(None);
+        }
+        let slot_version = self
+            .client
+            .slot_versions(&self.contract)
+            .await
+            .map_err(SignerServiceError::from)?
+            .into_iter()
+            .find(|slot| slot.slot_id == self.writer_slot)
+            .map_or(0, |slot| slot.slot_version)
+            .checked_add(1)
+            .ok_or(SignerServiceError::Signer(SignerError::SlotVersionOverflow))?;
+        let mut chunk = Chunk::new(
+            self.writer_slot,
+            slot_version,
+            SignerMessage::StateMachineUpdate(update.clone())
+                .encode()
+                .map_err(SignerServiceError::from)?,
+        );
+        chunk
+            .sign(&self.private_key)
+            .map_err(|error| SignerServiceError::Signer(SignerError::Chunk(error)))?;
+        let acknowledgement = self
+            .client
+            .put_chunk(&self.contract, &chunk)
+            .await
+            .map_err(SignerServiceError::from)?;
+        if !acknowledgement.accepted {
+            return Err(SignerServiceError::Rejected {
+                reason: acknowledgement.reason,
+                code: acknowledgement.code,
+            }
+            .into());
+        }
+        self.announced = Some(update);
+        Ok(Some(acknowledgement))
+    }
+
+    async fn derive(node: &SyncClient) -> Result<StateMachineUpdate, LiveSignerError> {
+        let bitcoin_tip = node.sortition_tip().await?;
+        let current_miner = Self::current_miner(node, &bitcoin_tip).await?;
+        Ok(StateMachineUpdate {
+            active_protocol_version: LATEST_SIGNER_PROTOCOL_VERSION,
+            local_supported_protocol_version: LATEST_SIGNER_PROTOCOL_VERSION,
+            bitcoin_consensus_hash: bitcoin_tip.consensus_hash,
+            bitcoin_height: bitcoin_tip.bitcoin_height,
+            current_miner,
+            replay_transactions: Vec::new(),
+        })
+    }
+
+    async fn current_miner(
+        node: &SyncClient,
+        bitcoin_tip: &SortitionInfo,
+    ) -> Result<CurrentMiner, LiveSignerError> {
+        let (Some(public_key_hash), Some(parent_tenure_consensus_hash)) = (
+            bitcoin_tip.miner_public_key_hash,
+            bitcoin_tip.stacks_parent_consensus_hash,
+        ) else {
+            return Ok(CurrentMiner::None);
+        };
+        let tenure = node.tenure_info().await?;
+        // The winner starts its tenure from the last block of the parent tenure,
+        // which is this tenure's start block's parent once that block exists.
+        let (parent_tenure_last_block, parent_tenure_last_block_height) =
+            if tenure.consensus_hash == bitcoin_tip.consensus_hash {
+                let start = node.block(tenure.tenure_start_block_id).await?;
+                (
+                    start.header.parent_block_id,
+                    start.header.chain_length.saturating_sub(1),
+                )
+            } else {
+                (tenure.tip_block_id, tenure.tip_height)
+            };
+        Ok(CurrentMiner::Active {
+            public_key_hash,
+            tenure_consensus_hash: bitcoin_tip.consensus_hash,
+            parent_tenure_consensus_hash,
+            parent_tenure_last_block,
+            parent_tenure_last_block_height,
+        })
     }
 }
 
