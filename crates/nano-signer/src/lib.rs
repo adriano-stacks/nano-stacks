@@ -4,7 +4,10 @@ use std::{collections::BTreeMap, fmt};
 
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum};
-use nano_stackerdb::{BlockAcceptance, BlockProposal, Chunk, SignerMessage, StackerDbError};
+use nano_stackerdb::{
+    BlockAcceptance, BlockProposal, Chunk, ChunkAck, SignerMessage, StackerDbClient,
+    StackerDbClientError, StackerDbContract, StackerDbError,
+};
 
 /// Checks a miner proposal against the node's current chain and sortition view.
 pub trait ProposalValidator {
@@ -26,7 +29,12 @@ pub struct EmbeddedSigner<V> {
     validator: V,
     writer_slot: u32,
     next_slot_version: u32,
-    signed: BTreeMap<(ConsensusHash, u64), Sha256Sum>,
+    signed: BTreeMap<(ConsensusHash, u64), SignedBlock>,
+}
+
+struct SignedBlock {
+    signature_hash: Sha256Sum,
+    chunk: Chunk,
 }
 
 /// Errors while validating or signing a proposal.
@@ -73,6 +81,78 @@ impl From<StackerDbError> for SignerError {
     }
 }
 
+/// Polls miner proposals and publishes accepted responses.
+pub struct SignerService<V> {
+    client: StackerDbClient,
+    miner_contract: StackerDbContract,
+    signer_contract: StackerDbContract,
+    signer: EmbeddedSigner<V>,
+    last_proposal: Option<Sha256Sum>,
+}
+
+/// Errors while transporting signer messages.
+#[derive(Debug)]
+pub enum SignerServiceError {
+    Client(StackerDbClientError),
+    Message(nano_stackerdb::SignerMessageError),
+    Signer(SignerError),
+    UnexpectedMessage,
+    Rejected {
+        reason: Option<String>,
+        code: Option<u32>,
+    },
+}
+
+impl fmt::Display for SignerServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client(error) => write!(formatter, "StackerDB client error: {error}"),
+            Self::Message(error) => write!(formatter, "signer message error: {error}"),
+            Self::Signer(error) => write!(formatter, "signer error: {error}"),
+            Self::UnexpectedMessage => formatter.write_str("miner slot did not contain a proposal"),
+            Self::Rejected { reason, code } => {
+                write!(formatter, "StackerDB rejected signer chunk")?;
+                if let Some(code) = code {
+                    write!(formatter, " (code {code})")?;
+                }
+                if let Some(reason) = reason {
+                    write!(formatter, ": {reason}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SignerServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(error) => Some(error),
+            Self::Message(error) => Some(error),
+            Self::Signer(error) => Some(error),
+            Self::UnexpectedMessage | Self::Rejected { .. } => None,
+        }
+    }
+}
+
+impl From<StackerDbClientError> for SignerServiceError {
+    fn from(error: StackerDbClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
+impl From<nano_stackerdb::SignerMessageError> for SignerServiceError {
+    fn from(error: nano_stackerdb::SignerMessageError) -> Self {
+        Self::Message(error)
+    }
+}
+
+impl From<SignerError> for SignerServiceError {
+    fn from(error: SignerError) -> Self {
+        Self::Signer(error)
+    }
+}
+
 impl<V: ProposalValidator> EmbeddedSigner<V> {
     /// Construct a signer from a persistent writer-slot configuration.
     #[must_use]
@@ -96,15 +176,12 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             proposal.block.header.chain_length,
         );
         let signature_hash = proposal.block.header.signer_signature_hash();
-        if self
-            .signed
-            .get(&position)
-            .is_some_and(|signed| *signed != signature_hash)
-        {
-            return Err(SignerError::Equivocation);
-        }
-        if self.signed.contains_key(&position) {
-            return Err(SignerError::Equivocation);
+        if let Some(signed) = self.signed.get(&position) {
+            return if signed.signature_hash == signature_hash {
+                Ok(signed.chunk.clone())
+            } else {
+                Err(SignerError::Equivocation)
+            };
         }
         let next_slot_version = self
             .next_slot_version
@@ -114,7 +191,13 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         let message = SignerMessage::BlockResponse(BlockAcceptance::new(signature_hash, signature));
         let mut chunk = Chunk::new(self.writer_slot, self.next_slot_version, message.encode()?);
         chunk.sign(&self.private_key)?;
-        self.signed.insert(position, signature_hash);
+        self.signed.insert(
+            position,
+            SignedBlock {
+                signature_hash,
+                chunk: chunk.clone(),
+            },
+        );
         self.next_slot_version = next_slot_version;
         Ok(chunk)
     }
@@ -123,6 +206,49 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
     #[must_use]
     pub const fn next_slot_version(&self) -> u32 {
         self.next_slot_version
+    }
+}
+
+impl<V: ProposalValidator> SignerService<V> {
+    /// Construct a service for the miner proposal and signer response contracts of one cycle.
+    #[must_use]
+    pub const fn new(
+        client: StackerDbClient,
+        miner_contract: StackerDbContract,
+        signer_contract: StackerDbContract,
+        signer: EmbeddedSigner<V>,
+    ) -> Self {
+        Self {
+            client,
+            miner_contract,
+            signer_contract,
+            signer,
+            last_proposal: None,
+        }
+    }
+
+    /// Process the latest miner proposal once and upload an acceptance response when needed.
+    pub async fn poll(&mut self) -> Result<Option<ChunkAck>, SignerServiceError> {
+        let Some(bytes) = self.client.latest_chunk(&self.miner_contract, 0).await? else {
+            return Ok(None);
+        };
+        let proposal_hash = nano_primitives::sha512_256(&bytes);
+        if self.last_proposal == Some(proposal_hash) {
+            return Ok(None);
+        }
+        let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
+            return Err(SignerServiceError::UnexpectedMessage);
+        };
+        let chunk = self.signer.sign(&proposal)?;
+        let acknowledgement = self.client.put_chunk(&self.signer_contract, &chunk).await?;
+        if !acknowledgement.accepted {
+            return Err(SignerServiceError::Rejected {
+                reason: acknowledgement.reason,
+                code: acknowledgement.code,
+            });
+        }
+        self.last_proposal = Some(proposal_hash);
+        Ok(Some(acknowledgement))
     }
 }
 
@@ -223,5 +349,23 @@ mod tests {
             Err(SignerError::Validation(_))
         ));
         assert_eq!(signer.next_slot_version(), 3);
+    }
+
+    #[test]
+    fn repeated_proposals_reuse_the_original_response() {
+        let mut signer = EmbeddedSigner::new(
+            SignerConfig {
+                private_key: StacksPrivateKey::from_seed(b"signer"),
+                writer_slot: 7,
+                next_slot_version: 3,
+            },
+            Accept,
+        );
+        let proposal = proposal();
+        let first = signer.sign(&proposal).expect("sign proposal");
+        let repeated = signer.sign(&proposal).expect("repeat proposal");
+
+        assert_eq!(repeated, first);
+        assert_eq!(signer.next_slot_version(), 4);
     }
 }
