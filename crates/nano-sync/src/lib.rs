@@ -55,6 +55,7 @@ pub struct SortitionInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FollowedTenure {
     pub info: TenureInfo,
+    pub sortition: SortitionInfo,
     pub blocks: Vec<NakamotoBlock>,
 }
 
@@ -63,6 +64,7 @@ pub struct FollowedTenure {
 pub struct TenureFollower {
     client: SyncClient,
     latest: Option<TenureInfo>,
+    history: Vec<FollowedTenure>,
 }
 
 /// Bitcoin calendar and stacking parameters advertised by a node.
@@ -311,6 +313,7 @@ impl TenureFollower {
         Self {
             client,
             latest: None,
+            history: Vec::new(),
         }
     }
 
@@ -318,6 +321,12 @@ impl TenureFollower {
     #[must_use]
     pub const fn latest(&self) -> Option<&TenureInfo> {
         self.latest.as_ref()
+    }
+
+    /// Return the validated tenure history retained by this follower.
+    #[must_use]
+    pub fn history(&self) -> &[FollowedTenure] {
+        &self.history
     }
 
     /// Download the current tenure when the peer's tip has advanced.
@@ -330,15 +339,46 @@ impl TenureFollower {
         {
             return Ok(None);
         }
-        if let Some(latest) = &self.latest {
-            validate_tenure_transition(latest, &info)?;
-        }
-        let blocks = self.client.tenure(info.tenure_start_block_id, None).await?;
+        let blocks = self
+            .client
+            .tenure(info.tenure_start_block_id, Some(info.tip_block_id))
+            .await?;
         if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
             return Err(SyncError::TenureStart);
         }
+        if let Some(latest) = &self.latest {
+            validate_tenure_transition(latest, &info)?;
+            if latest.tenure_start_block_id != info.tenure_start_block_id
+                && blocks
+                    .first()
+                    .is_none_or(|block| block.header.parent_block_id != latest.tip_block_id)
+            {
+                return Err(SyncError::Fork);
+            }
+        }
+        let block_consensus_hash = blocks
+            .last()
+            .map(|block| block.header.consensus_hash)
+            .ok_or(SyncError::EmptyTenure)?;
+        let sortition = self.client.sortition(block_consensus_hash).await?;
+        if !sortition.was_sortition {
+            return Err(SyncError::InvalidSortition);
+        }
+        let followed = FollowedTenure {
+            info: info.clone(),
+            sortition,
+            blocks,
+        };
+        if self
+            .history
+            .last()
+            .is_some_and(|latest| latest.info.tenure_start_block_id == info.tenure_start_block_id)
+        {
+            self.history.pop();
+        }
+        self.history.push(followed.clone());
         self.latest = Some(info.clone());
-        Ok(Some(FollowedTenure { info, blocks }))
+        Ok(Some(followed))
     }
 }
 
@@ -470,11 +510,11 @@ mod tests {
 
     use reqwest::Url;
 
-    use super::TenureInfo;
     use super::{
         SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
         parse_prefixed_hash160, validate_tenure, validate_tenure_transition,
     };
+    use super::{TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
     use nano_primitives::{ConsensusHash, StacksBlockId};
 
@@ -637,17 +677,47 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_follower_retains_an_authenticated_tenure() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let mut follower = TenureFollower::new(client);
+        let tenure = follower
+            .poll()
+            .await
+            .expect("follow current tenure")
+            .expect("initial tenure");
+
+        assert_eq!(follower.history(), std::slice::from_ref(&tenure));
+        assert_eq!(
+            tenure.sortition.consensus_hash,
+            tenure
+                .blocks
+                .last()
+                .expect("non-empty tenure")
+                .header
+                .consensus_hash
+        );
+        assert!(tenure.sortition.was_sortition);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
     async fn hacknet_sortition_authenticates_the_current_tenure() {
         let client =
             SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
                 .expect("create sync client");
         let tenure = client.tenure_info().await.expect("fetch tenure info");
+        let block = client
+            .block(tenure.tip_block_id)
+            .await
+            .expect("fetch tip block");
         let sortition = client
-            .sortition(tenure.consensus_hash)
+            .sortition(block.header.consensus_hash)
             .await
             .expect("fetch tenure sortition");
 
-        assert_eq!(sortition.consensus_hash, tenure.consensus_hash);
+        assert_eq!(sortition.consensus_hash, block.header.consensus_hash);
         assert!(sortition.was_sortition);
         assert!(sortition.miner_public_key_hash.is_some());
     }
