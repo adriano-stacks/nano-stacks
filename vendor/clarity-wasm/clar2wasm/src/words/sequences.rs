@@ -47,10 +47,10 @@ impl ComplexWord for ListCons {
                 )));
             };
 
-        self.charge(generator, builder, list.len() as u32)?;
-
         // Allocate space on the data stack for the entire list
         let (offset, _size) = generator.create_call_stack_local(builder, &ty, false, true);
+        let total_serialized_size = generator.borrow_local(ValType::I32);
+        builder.i32_const(0).local_set(*total_serialized_size);
 
         // Loop through the expressions in the list and store them onto the
         // data stack.
@@ -64,10 +64,21 @@ impl ComplexWord for ListCons {
             generator.set_expr_type(expr, elem_ty.clone())?;
 
             generator.traverse_expr(builder, expr)?;
+            generator.serialization_size(builder, elem_ty)?;
+            let element_size = generator.borrow_local(ValType::I32);
+            builder.local_set(*element_size);
+            builder
+                .local_get(*total_serialized_size)
+                .local_get(*element_size)
+                .binop(BinaryOp::I32Add)
+                .local_set(*total_serialized_size);
+
             // Write this element to memory
             let elem_size = generator.write_to_memory(builder, offset, total_size, elem_ty)?;
             total_size += elem_size;
         }
+
+        self.charge(generator, builder, *total_serialized_size)?;
 
         // Push the offset and size to the data stack
         builder.local_get(offset).i32_const(total_size as i32);
