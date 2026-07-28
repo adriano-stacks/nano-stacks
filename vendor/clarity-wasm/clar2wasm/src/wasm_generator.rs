@@ -1729,6 +1729,8 @@ impl WasmGenerator {
                 self.duck_type(builder, &cst_ty, &expected_ty, Some(result_local))?;
             }
 
+            self.charge_lookup_variable_depth(builder, 0)?;
+
             Ok(true)
         } else {
             Ok(false)
