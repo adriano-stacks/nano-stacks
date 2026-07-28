@@ -450,6 +450,21 @@ impl Vm {
         self.store.abort()
     }
 
+    /// Begin an atomic transaction within the active block state.
+    pub fn begin_transaction(&mut self) -> Result<(), MarfStoreError> {
+        self.store.begin_transaction()
+    }
+
+    /// Commit the active transaction's writes to the block state.
+    pub fn commit_transaction(&mut self) -> Result<(), MarfStoreError> {
+        self.store.commit_transaction()
+    }
+
+    /// Discard the active transaction's writes while keeping the block active.
+    pub fn rollback_transaction(&mut self) -> Result<(), MarfStoreError> {
+        self.store.rollback_transaction()
+    }
+
     /// Access the state root for a sealed block.
     #[must_use]
     pub fn root(&self, block: [u8; 32]) -> Option<StateRoot> {
@@ -498,6 +513,7 @@ pub struct MarfStore {
     heights: BTreeMap<[u8; 32], u32>,
     read_block: Option<[u8; 32]>,
     active: Option<ActiveStore>,
+    transaction: Option<StoreTransaction>,
 }
 
 #[derive(Clone, Debug)]
@@ -506,6 +522,13 @@ struct ActiveStore {
     parent: Option<[u8; 32]>,
     height: u32,
     state: StoreState,
+}
+
+#[derive(Clone, Debug)]
+struct StoreTransaction {
+    marf: VersionedMarf,
+    read_block: Option<[u8; 32]>,
+    active: Option<ActiveStore>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -520,6 +543,8 @@ pub enum MarfStoreError {
     Checkpoint(CheckpointError),
     Sql(rusqlite::Error),
     NoActiveState,
+    TransactionInProgress,
+    NoTransaction,
     BitcoinHeightOverflow(u64),
 }
 
@@ -530,6 +555,8 @@ impl std::fmt::Display for MarfStoreError {
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
             Self::NoActiveState => formatter.write_str("no active VM state"),
+            Self::TransactionInProgress => formatter.write_str("VM transaction is already active"),
+            Self::NoTransaction => formatter.write_str("no active VM transaction"),
             Self::BitcoinHeightOverflow(height) => {
                 write!(formatter, "Bitcoin height {height} exceeds u32")
             }
@@ -568,6 +595,7 @@ impl MarfStore {
             heights: BTreeMap::new(),
             read_block: None,
             active: None,
+            transaction: None,
         })
     }
 
@@ -591,6 +619,7 @@ impl MarfStore {
             heights: BTreeMap::new(),
             read_block: Some(source),
             active: None,
+            transaction: None,
         })
     }
 
@@ -627,6 +656,39 @@ impl MarfStore {
         Ok(())
     }
 
+    /// Start an atomic transaction within the active block state.
+    pub fn begin_transaction(&mut self) -> Result<(), MarfStoreError> {
+        if self.transaction.is_some() {
+            return Err(MarfStoreError::TransactionInProgress);
+        }
+        self.transaction = Some(StoreTransaction {
+            marf: self.marf.clone(),
+            read_block: self.read_block,
+            active: self.active.clone(),
+        });
+        Ok(())
+    }
+
+    /// Commit the active transaction's writes to the current block state.
+    pub fn commit_transaction(&mut self) -> Result<(), MarfStoreError> {
+        self.transaction
+            .take()
+            .map(|_| ())
+            .ok_or(MarfStoreError::NoTransaction)
+    }
+
+    /// Restore the active block state to its state before the transaction began.
+    pub fn rollback_transaction(&mut self) -> Result<(), MarfStoreError> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or(MarfStoreError::NoTransaction)?;
+        self.marf = transaction.marf;
+        self.read_block = transaction.read_block;
+        self.active = transaction.active;
+        Ok(())
+    }
+
     /// Persist a Clarity database key and commit its value hash into the active MARF.
     pub fn put(&mut self, key: String, value: String) -> Result<(), MarfStoreError> {
         let value_hash = MarfValue::from_value(value.as_bytes());
@@ -658,6 +720,9 @@ impl MarfStore {
 
     /// Seal the active state and register it under its committed block ID.
     pub fn seal_to(&mut self, block: [u8; 32]) -> Result<StateRoot, MarfStoreError> {
+        if self.transaction.is_some() {
+            return Err(MarfStoreError::TransactionInProgress);
+        }
         let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
         let root = self.marf.seal_to(block)?;
         self.parents.insert(block, active.parent);
@@ -1687,6 +1752,25 @@ mod tests {
         assert_eq!(value, Some(Value::UInt(2)));
         store.seal().expect("seal state");
         assert!(store.root(block).is_some());
+    }
+
+    #[test]
+    fn transaction_rollback_restores_active_state() {
+        let block = [1; 32];
+        let mut store = MarfStore::new().expect("create MARF store");
+        store.begin(None, block).expect("begin block");
+        store
+            .put("counter".to_owned(), "one".to_owned())
+            .expect("write baseline value");
+
+        store.begin_transaction().expect("begin transaction");
+        store
+            .put("counter".to_owned(), "two".to_owned())
+            .expect("write transactional value");
+        store.rollback_transaction().expect("roll back transaction");
+        store.seal().expect("seal block");
+
+        assert_eq!(store.get(block, "counter"), Some("one"));
     }
 
     #[test]

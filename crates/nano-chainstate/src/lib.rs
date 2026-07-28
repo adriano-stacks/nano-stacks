@@ -244,6 +244,25 @@ impl ChainState {
         transaction: &Transaction,
         execution_cost: &ExecutionCost,
     ) -> Result<TransactionReceipt, ChainStateError> {
+        self.vm.begin_transaction()?;
+        let result = self.execute_transaction_in_transaction(transaction, execution_cost);
+        match result {
+            Ok(receipt) => {
+                self.vm.commit_transaction()?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.vm.rollback_transaction()?;
+                Err(error)
+            }
+        }
+    }
+
+    fn execute_transaction_in_transaction(
+        &mut self,
+        transaction: &Transaction,
+        execution_cost: &ExecutionCost,
+    ) -> Result<TransactionReceipt, ChainStateError> {
         let origin = transaction.origin_address().ok_or_else(|| {
             ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
         })?;
