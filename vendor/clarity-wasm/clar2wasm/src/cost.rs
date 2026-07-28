@@ -241,12 +241,7 @@ impl WasmGenerator {
         argument_count: u32,
     ) -> Result<()> {
         if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(
-                instrs,
-                module,
-                Caf::Linear { a: 26, b: 5 },
-                argument_count,
-            )?;
+            context.emit_runtime(instrs, module, Caf::Linear { a: 26, b: 5 }, argument_count)?;
         }
         Ok(())
     }

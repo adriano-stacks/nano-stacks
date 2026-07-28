@@ -727,8 +727,7 @@ impl WasmGenerator {
             for local in locals {
                 func_body.local_get(*local);
             }
-            let serialization_type = self.type_for_serialization(parameter_type);
-            self.serialization_size(&mut func_body, &serialization_type)?;
+            self.clarity_value_size_on_stack(&mut func_body, parameter_type)?;
             let size = self.borrow_local(ValType::I32);
             func_body.local_set(*size);
             for _ in clar2wasm_ty(parameter_type) {
@@ -897,6 +896,66 @@ impl WasmGenerator {
             ),
             t => t.clone(),
         }
+    }
+
+    pub fn clarity_value_size(&self, ty: &TypeSignature) -> Result<u32, GeneratorError> {
+        ty.size()
+            .map_err(|error| GeneratorError::TypeError(error.to_string()))
+    }
+
+    pub fn clarity_value_size_on_stack(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let values = self.save_to_locals(builder, ty, true);
+        let size = self.borrow_local(ValType::I32);
+
+        match ty {
+            TypeSignature::OptionalType(inner) => {
+                let some_size = 1 + self.clarity_value_size(inner)?;
+                builder
+                    .local_get(values[0])
+                    .if_else(
+                        ValType::I32,
+                        |then| {
+                            then.i32_const(some_size as i32);
+                        },
+                        |else_| {
+                            else_.i32_const(2);
+                        },
+                    )
+                    .local_set(*size);
+            }
+            TypeSignature::ResponseType(response) => {
+                let ok_size = 2 + self.clarity_value_size(&response.0)?;
+                let err_size = 2 + self.clarity_value_size(&response.1)?;
+                builder
+                    .local_get(values[0])
+                    .if_else(
+                        ValType::I32,
+                        |then| {
+                            then.i32_const(ok_size as i32);
+                        },
+                        |else_| {
+                            else_.i32_const(err_size as i32);
+                        },
+                    )
+                    .local_set(*size);
+            }
+            _ => {
+                builder
+                    .i32_const(self.clarity_value_size(ty)? as i32)
+                    .local_set(*size);
+            }
+        }
+
+        for value in values {
+            builder.local_get(value);
+        }
+        builder.local_get(*size);
+
+        Ok(())
     }
 
     /// Gets the result type of the given `SymbolicExpression`.
@@ -1844,8 +1903,7 @@ impl WasmGenerator {
             builder.local_get(value);
         }
         self.charge_lookup_variable_depth(builder, 0)?;
-        let serialization_type = self.type_for_serialization(&ty);
-        self.serialization_size(builder, &serialization_type)?;
+        self.clarity_value_size_on_stack(builder, &ty)?;
         let size = self.borrow_local(ValType::I32);
         builder.local_set(*size);
         self.charge_lookup_variable_size(builder, *size)?;

@@ -685,7 +685,7 @@ lazy_static! {
         map.insert(
             GetDataVar.name(),
             WordCost {
-                runtime: Linear { a: 1, b: 151 },
+                runtime: Linear { a: 1, b: 468 },
                 read_count: Constant(1),
                 read_length: Linear { a: 1, b: 1 },
                 write_count: None,
