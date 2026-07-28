@@ -577,10 +577,17 @@ fn compare_receipts(
         ));
     }
     for (expected, actual) in event.transactions.iter().zip(receipts) {
-        if expected.status != "success" {
-            return Err(ReplayDivergence::Receipt(
-                "non-success receipt is not implemented".to_owned(),
-            ));
+        let status = match actual.status {
+            nano_chainstate::TransactionStatus::Success => "success",
+            nano_chainstate::TransactionStatus::PostConditionAborted(_) => {
+                "abort_by_post_condition"
+            }
+        };
+        if expected.status != status {
+            return Err(ReplayDivergence::Receipt(format!(
+                "transaction status differs: expected {}, got {status}",
+                expected.status
+            )));
         }
         if expected.txid != format!("0x{:?}", actual.txid) {
             return Err(ReplayDivergence::Receipt(
@@ -627,10 +634,10 @@ fn compare_receipts(
                 .result
                 .events
                 .iter()
-                .map(move |entry| (entry, receipt.txid))
+                .map(move |entry| (entry, receipt.txid, receipt.committed))
         })
         .enumerate()
-        .map(|(index, (entry, txid))| entry.json_serialize(index, &txid, true))
+        .map(|(index, (entry, txid, committed))| entry.json_serialize(index, &txid, committed))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ReplayDivergence::Receipt("event cannot serialize".to_owned()))?;
     let mut expected_events = event.events.clone();

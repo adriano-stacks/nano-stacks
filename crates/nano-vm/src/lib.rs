@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use clarity::vm::ast::build_ast;
-use clarity::vm::contexts::{ContractContext, GlobalContext, OwnedEnvironment};
+use clarity::vm::contexts::{AssetMap, ContractContext, GlobalContext, OwnedEnvironment};
 use clarity::vm::costs::{CostErrors, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
@@ -59,6 +59,7 @@ pub struct Evaluation {
 pub struct TransactionResult {
     pub value: Option<Value>,
     pub cost: ExecutionCost,
+    pub assets: AssetMap,
     pub events: Vec<StacksTransactionEvent>,
 }
 
@@ -1238,12 +1239,13 @@ fn deploy_contract_in_context(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
-    let ((), _, events) =
+    let ((), assets, events) =
         environment.initialize_versioned_contract(contract, version, source, None)?;
 
     Ok(TransactionResult {
         value: None,
         cost: environment.get_cost_total(),
+        assets,
         events,
     })
 }
@@ -1325,11 +1327,12 @@ fn execute_contract_call_in_context(
         ))
     })?;
     match result {
-        Ok((value, _, events)) => {
+        Ok((value, assets, events)) => {
             database.commit()?;
             Ok(TransactionResult {
                 value: Some(value),
                 cost: cost_tracker.get_total(),
+                assets,
                 events,
             })
         }
@@ -1377,7 +1380,7 @@ fn transfer_stx_in_context(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
-    let (value, _, events) = environment.stx_transfer(
+    let (value, assets, events) = environment.stx_transfer(
         sender,
         recipient,
         amount,
@@ -1389,6 +1392,7 @@ fn transfer_stx_in_context(
     Ok(TransactionResult {
         value: Some(value),
         cost: environment.get_cost_total(),
+        assets,
         events,
     })
 }

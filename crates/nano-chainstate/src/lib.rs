@@ -11,9 +11,15 @@ use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::Value;
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use std::collections::{HashMap, HashSet};
+
+use clarity::vm::contexts::{AssetMap, AssetMapEntry};
+use clarity::vm::representations::ClarityName;
+use clarity::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier};
 use nano_codec::{
-    ClarityVersion, Principal, TenureChangeCause, Transaction, TransactionPayloadData,
+    AssetInfo, ClarityVersion, FungibleCondition, NonFungibleCondition, PostConditionData,
+    PostConditionMode, PostConditionPrincipal, Principal, TenureChangeCause, Transaction,
+    TransactionPayloadData,
 };
 use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
@@ -35,7 +41,16 @@ pub struct AppliedBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransactionReceipt {
     pub txid: Sha256Sum,
+    pub status: TransactionStatus,
+    pub committed: bool,
     pub result: TransactionResult,
+}
+
+/// The canonical outcome of executing a transaction in a block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionStatus {
+    Success,
+    PostConditionAborted(String),
 }
 
 /// A chainstate execution context backed by versioned VM state.
@@ -50,6 +65,10 @@ pub enum ChainStateError {
     Evaluation(ClarityEvalError),
     Execution(VmExecutionError),
     InvalidTransaction(String),
+    PostConditionFailure {
+        result: Box<TransactionResult>,
+        reason: String,
+    },
     UnsupportedPayload,
     StateRootMismatch {
         expected: TrieHash,
@@ -64,6 +83,9 @@ impl std::fmt::Display for ChainStateError {
             Self::Evaluation(error) => write!(formatter, "Clarity evaluation error: {error}"),
             Self::Execution(error) => write!(formatter, "Clarity execution error: {error}"),
             Self::InvalidTransaction(error) => write!(formatter, "invalid transaction: {error}"),
+            Self::PostConditionFailure { reason, .. } => {
+                write!(formatter, "post-condition failure: {reason}")
+            }
             Self::UnsupportedPayload => formatter.write_str("unsupported transaction payload"),
             Self::StateRootMismatch { expected, actual } => write!(
                 formatter,
@@ -80,6 +102,7 @@ impl std::error::Error for ChainStateError {
             Self::Evaluation(_)
             | Self::Execution(_)
             | Self::InvalidTransaction(_)
+            | Self::PostConditionFailure { .. }
             | Self::UnsupportedPayload
             | Self::StateRootMismatch { .. } => None,
         }
@@ -251,6 +274,21 @@ impl ChainState {
                 self.vm.commit_transaction()?;
                 Ok(receipt)
             }
+            Err(ChainStateError::PostConditionFailure { result, reason }) => {
+                self.vm.rollback_transaction()?;
+                self.vm.begin_transaction()?;
+                let receipt = self.apply_post_condition_abort(transaction, *result, reason);
+                match receipt {
+                    Ok(receipt) => {
+                        self.vm.commit_transaction()?;
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        self.vm.rollback_transaction()?;
+                        Err(error)
+                    }
+                }
+            }
             Err(error) => {
                 self.vm.rollback_transaction()?;
                 Err(error)
@@ -295,9 +333,51 @@ impl ChainState {
             sponsor.as_ref(),
             execution_cost,
         )?;
+        if matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::TokenTransfer { .. }
+        ) {
+            if !transaction.post_conditions().is_empty() {
+                return Err(ChainStateError::InvalidTransaction(
+                    "token transfers cannot have post-conditions".to_owned(),
+                ));
+            }
+        } else if let Some(reason) = check_postconditions(transaction, &sender, &result.assets)? {
+            return Err(ChainStateError::PostConditionFailure {
+                result: Box::new(result),
+                reason,
+            });
+        }
         self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
         Ok(TransactionReceipt {
             txid: transaction.txid(),
+            status: TransactionStatus::Success,
+            committed: true,
+            result,
+        })
+    }
+
+    fn apply_post_condition_abort(
+        &mut self,
+        transaction: &Transaction,
+        result: TransactionResult,
+        reason: String,
+    ) -> Result<TransactionReceipt, ChainStateError> {
+        let origin = transaction.origin_address().ok_or_else(|| {
+            ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
+        })?;
+        let sender = principal_from_address(origin)?;
+        let sponsor = transaction
+            .sponsor_address()
+            .map(principal_from_address)
+            .transpose()?;
+        let payer = sponsor.as_ref().unwrap_or(&sender);
+        self.vm.debit_fee(payer, transaction.auth().payer().fee())?;
+        self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
+        Ok(TransactionReceipt {
+            txid: transaction.txid(),
+            status: TransactionStatus::PostConditionAborted(reason),
+            committed: false,
             result,
         })
     }
@@ -432,12 +512,207 @@ fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
     )
     .then(|| TransactionReceipt {
         txid: transaction.txid(),
+        status: TransactionStatus::Success,
+        committed: true,
         result: TransactionResult {
             value: Some(Value::okay(Value::Bool(true)).expect("boolean is a valid response")),
             cost: ExecutionCost::ZERO,
+            assets: AssetMap::new(),
             events: Vec::new(),
         },
     })
+}
+
+fn check_postconditions(
+    transaction: &Transaction,
+    origin: &PrincipalData,
+    assets: &AssetMap,
+) -> Result<Option<String>, ChainStateError> {
+    let mut checked_fungible = HashMap::<PrincipalData, HashSet<AssetIdentifier>>::new();
+    let mut checked_nonfungible =
+        HashMap::<PrincipalData, HashMap<AssetIdentifier, Vec<Value>>>::new();
+
+    for postcondition in transaction.post_conditions() {
+        match postcondition.data() {
+            PostConditionData::Stx {
+                principal,
+                condition,
+                amount,
+            } => {
+                let principal = postcondition_principal(principal, origin)?;
+                let transferred = assets.get_stx(&principal).unwrap_or(0);
+                let burned = assets.get_stx_burned(&principal).unwrap_or(0);
+                let sent = transferred.checked_add(burned).ok_or_else(|| {
+                    ChainStateError::InvalidTransaction(
+                        "STX post-condition amount overflow".to_owned(),
+                    )
+                })?;
+                if !matches_fungible_condition(*condition, u128::from(*amount), sent) {
+                    return Ok(Some(format!(
+                        "STX post-condition failed for {principal}: expected {condition:?} {amount}, got {sent}"
+                    )));
+                }
+                let covered = checked_fungible.entry(principal).or_default();
+                if transferred > 0 {
+                    covered.insert(AssetIdentifier::STX());
+                }
+                if burned > 0 {
+                    covered.insert(AssetIdentifier::STX_burned());
+                }
+            }
+            PostConditionData::Fungible {
+                principal,
+                asset,
+                condition,
+                amount,
+            } => {
+                let principal = postcondition_principal(principal, origin)?;
+                let asset = asset_identifier(asset)?;
+                let sent = assets.get_fungible_tokens(&principal, &asset).unwrap_or(0);
+                if !matches_fungible_condition(*condition, u128::from(*amount), sent) {
+                    return Ok(Some(format!(
+                        "fungible post-condition failed for {asset} owned by {principal}: expected {condition:?} {amount}, got {sent}"
+                    )));
+                }
+                checked_fungible.entry(principal).or_default().insert(asset);
+            }
+            PostConditionData::NonFungible {
+                principal,
+                asset,
+                asset_value,
+                condition,
+            } => {
+                let principal = postcondition_principal(principal, origin)?;
+                let asset = asset_identifier(asset)?;
+                let value = deserialize_clarity_value(asset_value.as_bytes())?;
+                let sent = assets
+                    .get_nonfungible_tokens(&principal, &asset)
+                    .map_or(&[][..], Vec::as_slice);
+                let moved = sent.contains(&value);
+                let passes = match condition {
+                    NonFungibleCondition::DoesSend => moved,
+                    NonFungibleCondition::DoesNotSend => !moved,
+                };
+                if !passes {
+                    return Ok(Some(format!(
+                        "non-fungible post-condition failed for {asset} owned by {principal}"
+                    )));
+                }
+                checked_nonfungible
+                    .entry(principal)
+                    .or_default()
+                    .entry(asset)
+                    .or_default()
+                    .push(value);
+            }
+        }
+    }
+
+    Ok(check_unchecked_assets(
+        transaction.post_condition_mode(),
+        origin,
+        assets,
+        &checked_fungible,
+        &checked_nonfungible,
+    ))
+}
+
+fn check_unchecked_assets(
+    mode: PostConditionMode,
+    origin: &PrincipalData,
+    assets: &AssetMap,
+    checked_fungible: &HashMap<PrincipalData, HashSet<AssetIdentifier>>,
+    checked_nonfungible: &HashMap<PrincipalData, HashMap<AssetIdentifier, Vec<Value>>>,
+) -> Option<String> {
+    if mode == PostConditionMode::Allow {
+        return None;
+    }
+    for (principal, assets) in assets.clone().to_table() {
+        if mode == PostConditionMode::Originator && principal != *origin {
+            continue;
+        }
+        for (asset, entry) in assets {
+            match entry {
+                AssetMapEntry::Asset(values) => {
+                    let covered = checked_nonfungible
+                        .get(&principal)
+                        .and_then(|assets| assets.get(&asset));
+                    if values
+                        .iter()
+                        .any(|value| !covered.is_some_and(|covered| covered.contains(value)))
+                    {
+                        return Some(format!(
+                            "non-fungible asset {asset} moved by {principal} was not covered"
+                        ));
+                    }
+                }
+                _ => {
+                    if !checked_fungible
+                        .get(&principal)
+                        .is_some_and(|covered| covered.contains(&asset))
+                    {
+                        return Some(format!(
+                            "fungible asset {asset} moved by {principal} was not covered"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn postcondition_principal(
+    principal: &PostConditionPrincipal,
+    origin: &PrincipalData,
+) -> Result<PrincipalData, ChainStateError> {
+    match principal {
+        PostConditionPrincipal::Origin => Ok(origin.clone()),
+        PostConditionPrincipal::Standard(address) => principal_from_address(*address),
+        PostConditionPrincipal::Contract {
+            address,
+            contract_name,
+        } => principal_from_codec(&Principal::Contract {
+            address: *address,
+            contract_name: contract_name.clone(),
+        }),
+    }
+}
+
+fn asset_identifier(asset: &AssetInfo) -> Result<AssetIdentifier, ChainStateError> {
+    let asset_name = ClarityName::try_from(asset.asset_name.clone())
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    Ok(AssetIdentifier {
+        contract_identifier: contract_identifier(asset.address, &asset.contract_name)?,
+        asset_name,
+    })
+}
+
+fn deserialize_clarity_value(bytes: &[u8]) -> Result<Value, ChainStateError> {
+    let mut bytes = bytes;
+    let value = Value::deserialize_read(&mut bytes, None, false)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    if bytes.is_empty() {
+        Ok(value)
+    } else {
+        Err(ChainStateError::InvalidTransaction(
+            "non-fungible post-condition value has trailing bytes".to_owned(),
+        ))
+    }
+}
+
+const fn matches_fungible_condition(
+    condition: FungibleCondition,
+    expected: u128,
+    actual: u128,
+) -> bool {
+    match condition {
+        FungibleCondition::SentEqual => actual == expected,
+        FungibleCondition::SentGreater => actual > expected,
+        FungibleCondition::SentGreaterEqual => actual >= expected,
+        FungibleCondition::SentLess => actual < expected,
+        FungibleCondition::SentLessEqual => actual <= expected,
+    }
 }
 
 fn principal_from_address(
@@ -492,14 +767,18 @@ pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
 
 #[cfg(test)]
 mod tests {
+    use clarity::vm::contexts::AssetMap;
     use clarity::vm::costs::ExecutionCost;
     use std::{fs, path::Path};
 
+    use nano_address::StacksAddress;
     use nano_codec::Transaction;
-    use nano_primitives::{BitcoinHeaderHash, TrieHash};
+    use nano_primitives::{BitcoinHeaderHash, Hash160, TrieHash};
     use nano_sortition::SortitionSnapshot;
 
-    use super::{ChainState, NakamotoBlock};
+    use super::{
+        ChainState, NakamotoBlock, TransactionStatus, check_postconditions, principal_from_address,
+    };
 
     #[test]
     fn append_program_seals_the_vm_state_root() {
@@ -587,7 +866,96 @@ mod tests {
         assert_eq!(receipt.result.events.len(), 1);
     }
 
+    #[test]
+    fn checks_strict_stx_postconditions_against_clarity_asset_accounting() {
+        let transaction = decoded_transaction_with_postconditions(
+            &token_transfer_payload(),
+            2,
+            &[stx_postcondition(1, 10)],
+            0,
+            0,
+        );
+        let origin = principal_from_address(
+            StacksAddress::new(26, Hash160::from_bytes([0; 20])).expect("testnet address"),
+        )
+        .expect("origin");
+        let mut assets = AssetMap::new();
+        assets
+            .add_stx_transfer(&origin, 10)
+            .expect("record transfer");
+
+        assert_eq!(
+            check_postconditions(&transaction, &origin, &assets).expect("check postconditions"),
+            None
+        );
+
+        let unchecked =
+            decoded_transaction_with_postconditions(&token_transfer_payload(), 2, &[], 0, 0);
+        assert!(
+            check_postconditions(&unchecked, &origin, &assets)
+                .expect("check postconditions")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_postcondition_rolls_back_contract_writes_and_consumes_nonce() {
+        let mut chainstate = ChainState::new().expect("create chainstate");
+        chainstate
+            .vm
+            .begin_block(None, [2; 32])
+            .expect("begin block");
+
+        let deployment = decoded_transaction(
+            &versioned_contract_payload(
+                "counter",
+                "(define-data-var counter uint u0) (define-public (increment) (begin (var-set counter (+ (var-get counter) u1)) (ok (var-get counter)))) (define-read-only (read-counter) (var-get counter))",
+            ),
+            0,
+            0,
+        );
+        let deployed = chainstate
+            .execute_transaction(&deployment, &ExecutionCost::ZERO)
+            .expect("deploy contract");
+
+        let failed = decoded_transaction_with_postconditions(
+            &contract_call_payload_without_arguments("counter", "increment"),
+            2,
+            &[stx_postcondition(1, 1)],
+            1,
+            0,
+        );
+        let failed = chainstate
+            .execute_transaction(&failed, &deployed.result.cost)
+            .expect("abort transaction");
+        assert!(matches!(
+            failed.status,
+            TransactionStatus::PostConditionAborted(_)
+        ));
+        assert!(!failed.committed);
+
+        let get = decoded_transaction(
+            &contract_call_payload_without_arguments("counter", "read-counter"),
+            2,
+            0,
+        );
+        let read = chainstate
+            .execute_transaction(&get, &failed.result.cost)
+            .expect("read contract state");
+        assert_eq!(read.result.value, Some(clarity::vm::Value::UInt(0)));
+    }
+
     fn decoded_transaction(payload: &[u8], nonce: u64, fee: u64) -> Transaction {
+        decoded_transaction_with_postconditions(payload, 1, &[], nonce, fee)
+    }
+
+    fn decoded_transaction_with_postconditions(
+        payload: &[u8],
+        post_condition_mode: u8,
+        post_conditions: &[Vec<u8>],
+        nonce: u64,
+        fee: u64,
+    ) -> Transaction {
         let mut bytes = vec![0x80];
         bytes.extend_from_slice(&0x8000_0000_u32.to_be_bytes());
         bytes.push(4);
@@ -598,10 +966,31 @@ mod tests {
         bytes.push(0);
         bytes.extend_from_slice(&[0; 65]);
         bytes.push(3);
-        bytes.push(1);
-        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.push(post_condition_mode);
+        bytes.extend_from_slice(
+            &u32::try_from(post_conditions.len())
+                .expect("short post-condition list")
+                .to_be_bytes(),
+        );
+        for post_condition in post_conditions {
+            bytes.extend_from_slice(post_condition);
+        }
         bytes.extend_from_slice(payload);
         Transaction::decode(&bytes).expect("decode transaction").0
+    }
+
+    fn stx_postcondition(condition: u8, amount: u64) -> Vec<u8> {
+        let mut postcondition = vec![0, 1, condition];
+        postcondition.extend_from_slice(&amount.to_be_bytes());
+        postcondition
+    }
+
+    fn token_transfer_payload() -> Vec<u8> {
+        let mut payload = vec![0, 5, 26];
+        payload.extend_from_slice(&[0; 20]);
+        payload.extend_from_slice(&0_u64.to_be_bytes());
+        payload.extend_from_slice(&[0; 34]);
+        payload
     }
 
     fn versioned_contract_payload(name: &str, source: &str) -> Vec<u8> {
@@ -626,6 +1015,17 @@ mod tests {
         payload.extend_from_slice(&1_u32.to_be_bytes());
         payload.push(1);
         payload.extend_from_slice(&value.to_be_bytes());
+        payload
+    }
+
+    fn contract_call_payload_without_arguments(contract: &str, function: &str) -> Vec<u8> {
+        let mut payload = vec![2, 26];
+        payload.extend_from_slice(&[0; 20]);
+        payload.push(u8::try_from(contract.len()).expect("short contract name"));
+        payload.extend_from_slice(contract.as_bytes());
+        payload.push(u8::try_from(function.len()).expect("short function name"));
+        payload.extend_from_slice(function.as_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
         payload
     }
 }
