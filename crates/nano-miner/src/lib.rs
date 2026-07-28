@@ -172,6 +172,10 @@ impl BitcoinWallet {
     }
 
     /// Fund, sign, verify, and broadcast a replaceable waterfall commitment.
+    ///
+    /// Consecutive commitments must spend one another's change so the sortition
+    /// can attribute them to the same miner; a commitment that starts a fresh
+    /// chain counts as a first-time miner and is weighted as such.
     pub fn submit_leader_commitment(
         &self,
         magic: [u8; 2],
@@ -179,11 +183,20 @@ impl BitcoinWallet {
         sbtc_address: &PoxAddress,
         commitment_amount: Amount,
         fee_rate_sats_per_vbyte: Option<u64>,
+        previous_change: Option<OutPoint>,
     ) -> Result<SubmittedCommitment, MinerError> {
+        let input = match previous_change {
+            Some(previous_output) => TxIn {
+                previous_output,
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..TxIn::default()
+            },
+            None => self.funding_input()?,
+        };
         let template = build_leader_commitment_transaction(
             magic,
             commitment,
-            vec![self.funding_input()?],
+            vec![input],
             sbtc_address,
             commitment_amount,
             None,

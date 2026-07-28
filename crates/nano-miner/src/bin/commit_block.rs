@@ -50,6 +50,10 @@ struct Cli {
     /// Two hexadecimal magic bytes for the target network.
     #[arg(long, default_value = "5433")]
     magic: String,
+    /// File holding the previous commitment's change output, which the next
+    /// commitment must spend so the sortition attributes them to one miner.
+    #[arg(long)]
+    commitment_chain_file: Option<PathBuf>,
     /// Wait for the next Bitcoin block before deriving the commitment.
     #[arg(long)]
     after_new_block: bool,
@@ -103,13 +107,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let previous_change = cli
+        .commitment_chain_file
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|value| parse_outpoint(value.trim()));
     let submitted = wallet.submit_leader_commitment(
         magic,
         plan.commitment,
         &plan.sbtc_address,
         Amount::from_sat(cli.commitment_sats),
         cli.fee_rate_sats_per_vbyte,
+        previous_change,
     )?;
+    if let Some(path) = &cli.commitment_chain_file {
+        fs::write(
+            path,
+            format!("{}:{}", submitted.transaction_id, submitted.change_output),
+        )?;
+    }
     println!(
         "submitted leader commitment {} paying {} sats with fee {}",
         submitted.transaction_id, cli.commitment_sats, submitted.fee
@@ -153,6 +169,14 @@ fn leader_key(cli: &Cli, wallet: &BitcoinWallet) -> Result<RegisteredLeaderKey, 
     Ok(RegisteredLeaderKey {
         bitcoin_height: u32::try_from(height)?,
         transaction_index: u16::try_from(index)?,
+    })
+}
+
+fn parse_outpoint(value: &str) -> Option<bitcoin::OutPoint> {
+    let (transaction_id, index) = value.split_once(':')?;
+    Some(bitcoin::OutPoint {
+        txid: Txid::from_str(transaction_id).ok()?,
+        vout: index.parse().ok()?,
     })
 }
 
