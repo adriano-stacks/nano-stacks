@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use nano_bitcoin::{BitcoinOperation, PreStxCache, decode_block_with_pre_stx};
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
 use nano_primitives::TrieHash;
 use serde::Deserialize;
@@ -455,62 +456,18 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
 }
 
 fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
-    let Some((source, state_root)) = checkpoint_state(root) else {
-        return ReplayDepth {
-            completed: 0,
-            expected: manifest.replay_blocks,
-            first_failure: Some(1),
-            first_divergence: Some(ReplayDivergence::Fixture(
-                "checkpoint metadata is unavailable".to_owned(),
-            )),
-        };
+    let (mut chainstate, source) = match replay_chainstate(root) {
+        Ok(chainstate) => chainstate,
+        Err(message) => return replay_fixture_failure(manifest, message),
     };
-    let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
-    let Ok(mut chainstate) = ChainState::from_checkpoint(checkpoint, source, state_root) else {
-        return ReplayDepth {
-            completed: 0,
-            expected: manifest.replay_blocks,
-            first_failure: Some(1),
-            first_divergence: Some(ReplayDivergence::Fixture(
-                "checkpoint cannot be opened".to_owned(),
-            )),
-        };
-    };
-    let accounting_path = root.join("chainstate/checkpoint-H/native-effects.json");
-    let Ok(accounting) = fs::read(&accounting_path)
-        .ok()
-        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
-        .ok_or(())
-    else {
-        return ReplayDepth {
-            completed: 0,
-            expected: manifest.replay_blocks,
-            first_failure: Some(1),
-            first_divergence: Some(ReplayDivergence::Fixture(
-                "native accounting fixture cannot be loaded".to_owned(),
-            )),
-        };
-    };
-    *chainstate.accounting_mut() = accounting;
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
-        return ReplayDepth {
-            completed: 0,
-            expected: manifest.replay_blocks,
-            first_failure: Some(1),
-            first_divergence: Some(ReplayDivergence::Fixture(
-                "captured Bitcoin snapshots are unavailable".to_owned(),
-            )),
-        };
+        return replay_fixture_failure(manifest, "captured Bitcoin snapshots are unavailable");
+    };
+    let Some(bitcoin_operations) = captured_bitcoin_operations(root) else {
+        return replay_fixture_failure(manifest, "captured Bitcoin operations are unavailable");
     };
     let Ok(mut entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
-        return ReplayDepth {
-            completed: 0,
-            expected: manifest.replay_blocks,
-            first_failure: Some(1),
-            first_divergence: Some(ReplayDivergence::Fixture(
-                "captured blocks are unavailable".to_owned(),
-            )),
-        };
+        return replay_fixture_failure(manifest, "captured blocks are unavailable");
     };
     let mut paths = entries
         .by_ref()
@@ -526,7 +483,14 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let block = match apply_captured_block(root, &mut chainstate, &snapshots, parent, &path) {
+        let block = match apply_captured_block(
+            root,
+            &mut chainstate,
+            &snapshots,
+            &bitcoin_operations,
+            parent,
+            &path,
+        ) {
             Ok(block) => block,
             Err(divergence) => {
                 return ReplayDepth {
@@ -548,10 +512,34 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
     }
 }
 
+fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static str> {
+    let (source, state_root) =
+        checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
+    let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
+    let mut chainstate = ChainState::from_checkpoint(checkpoint, source, state_root)
+        .map_err(|_| "checkpoint cannot be opened")?;
+    let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
+        .ok()
+        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
+        .ok_or("native accounting fixture cannot be loaded")?;
+    *chainstate.accounting_mut() = accounting;
+    Ok((chainstate, source))
+}
+
+fn replay_fixture_failure(manifest: FixtureManifest, message: &str) -> ReplayDepth {
+    ReplayDepth {
+        completed: 0,
+        expected: manifest.replay_blocks,
+        first_failure: Some(1),
+        first_divergence: Some(ReplayDivergence::Fixture(message.to_owned())),
+    }
+}
+
 fn apply_captured_block(
     root: &Path,
     chainstate: &mut ChainState,
     snapshots: &BTreeMap<String, BitcoinBlockContext>,
+    bitcoin_operations: &BTreeMap<String, Vec<BitcoinOperation>>,
     parent: Option<[u8; 32]>,
     path: &Path,
 ) -> Result<NakamotoBlock, ReplayDivergence> {
@@ -580,8 +568,15 @@ fn apply_captured_block(
     bitcoin_context.v2_unlock_height = event.v2;
     bitcoin_context.v3_unlock_height = event.v3;
     bitcoin_context.pox_5_activation_height = event.v4;
+    let operations = bitcoin_operations
+        .get(&block.header.consensus_hash.to_string())
+        .ok_or_else(|| {
+            ReplayDivergence::Fixture(
+                "block consensus hash is absent from captured Bitcoin operations".to_owned(),
+            )
+        })?;
     let applied = chainstate
-        .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
+        .execute_nakamoto_block_with_bitcoin_operations(bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
     compare_receipts(&event, &applied.receipts)?;
     let actual = TrieHash::from_bytes(applied.execution.state_root.0);
@@ -715,6 +710,27 @@ fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlo
         .collect()
 }
 
+fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<BitcoinOperation>>> {
+    let mut snapshots: Vec<CapturedBitcoinSnapshot> =
+        serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
+    snapshots.sort_by_key(|snapshot| snapshot.block_height);
+    let mut cache = PreStxCache::new();
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let encoded = fs::read_to_string(
+                root.join("bitcoin/blocks")
+                    .join(format!("{}.hex", snapshot.burn_header_hash)),
+            )
+            .ok()?;
+            let raw = hex::decode(encoded.trim()).ok()?;
+            let block =
+                decode_block_with_pre_stx(snapshot.block_height, &raw, *b"T3", &mut cache).ok()?;
+            Some((snapshot.consensus_hash, block.operations))
+        })
+        .collect()
+}
+
 fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
     let contents = fs::read_to_string(root.join("chainstate/checkpoint-H/checkpoint.toml")).ok()?;
     let source = checkpoint_field(&contents, "source_state_id")?;
@@ -748,8 +764,8 @@ fn decode_hash(value: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
-        baseline_replay, captured_bitcoin_snapshots, checkpoint_state, scoreboard,
-        validate_fixture_tree,
+        baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, checkpoint_state,
+        scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -997,6 +1013,7 @@ mod tests {
         )
         .expect("import expected state");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut chainstate = ChainState::from_checkpoint(
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
@@ -1007,7 +1024,14 @@ mod tests {
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
         let applied = chainstate
-            .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, Some(source), &block)
+            .execute_nakamoto_block_with_bitcoin_operations(
+                bitcoin_context,
+                bitcoin_operations
+                    .get(&block.header.consensus_hash.to_string())
+                    .expect("Bitcoin operations"),
+                Some(source),
+                &block,
+            )
             .expect("execute block");
         assert_eq!(
             TrieHash::from_bytes(applied.execution.state_root.0),
@@ -1166,6 +1190,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut chainstate = ChainState::from_checkpoint(
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
@@ -1182,8 +1207,15 @@ mod tests {
         for path in paths.into_iter().take(4) {
             let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
                 .expect("decode block");
-            apply_captured_block(&fixture, &mut chainstate, &snapshots, parent, &path)
-                .expect("apply captured block");
+            apply_captured_block(
+                &fixture,
+                &mut chainstate,
+                &snapshots,
+                &bitcoin_operations,
+                parent,
+                &path,
+            )
+            .expect("apply captured block");
             parent = Some(*block.block_id().as_bytes());
             fourth = Some(block);
         }
