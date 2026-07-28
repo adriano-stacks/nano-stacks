@@ -2385,6 +2385,36 @@ mod tests {
     }
 
     #[test]
+    fn signer_proposal_decoding_matches_stacks_core() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "fixtures/nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
+        );
+        let bytes = fs::read(path).expect("read captured block");
+        let reference_block = ReferenceNakamotoBlock::consensus_deserialize(&mut bytes.as_slice())
+            .expect("reference decodes captured block");
+        let message =
+            libsigner::v0::messages::SignerMessage::BlockProposal(libsigner::BlockProposal {
+                block: reference_block,
+                burn_height: 1_110,
+                reward_cycle: 1,
+                block_proposal_data: libsigner::BlockProposalData::empty(),
+            });
+        let mut encoded = Vec::new();
+        message
+            .consensus_serialize(&mut encoded)
+            .expect("reference encodes proposal");
+
+        let SignerMessage::BlockProposal(proposal) =
+            SignerMessage::decode(&encoded).expect("nano decodes proposal")
+        else {
+            panic!("nano did not decode a proposal");
+        };
+        assert_eq!(proposal.block.encode(), bytes);
+        assert_eq!(proposal.bitcoin_height, 1_110);
+        assert_eq!(proposal.reward_cycle, 1);
+    }
+
+    #[test]
     fn secp256k1_matches_stacks_core() {
         let seed = b"nano-stacks compatibility";
         let digest = *sha256(b"signed payload").as_bytes();

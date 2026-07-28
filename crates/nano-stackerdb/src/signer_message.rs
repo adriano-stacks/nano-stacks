@@ -100,12 +100,19 @@ impl SignerMessage {
         }
         let mut reader = Reader::new(bytes);
         let message = match reader.byte()? {
-            0 => Self::BlockProposal(BlockProposal {
-                block: reader.block()?,
-                bitcoin_height: reader.u64()?,
-                reward_cycle: reader.u64()?,
-                data: reader.remaining().to_vec(),
-            }),
+            0 => {
+                let block = reader.block()?;
+                let bitcoin_height = reader.u64()?;
+                let reward_cycle = reader.u64()?;
+                let remaining = reader.remaining().len();
+                let data = reader.take(remaining)?.to_vec();
+                Self::BlockProposal(BlockProposal {
+                    block,
+                    bitcoin_height,
+                    reward_cycle,
+                    data,
+                })
+            }
             1 => {
                 let response_type = reader.byte()?;
                 if response_type != 0 {
