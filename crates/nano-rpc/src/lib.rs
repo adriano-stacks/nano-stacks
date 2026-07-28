@@ -22,6 +22,7 @@ pub fn router(node: SharedNode) -> Router {
     Router::new()
         .route("/v2/info", get(node_info))
         .route("/v2/pox", get(pox_info))
+        .route("/v3/sortitions/consensus/{consensus_hash}", get(sortition))
         .route("/v3/tenures/info", get(tenure_info))
         .route("/v3/tenures/{start_block_id}", get(tenure))
         .route("/v3/blocks/{block_id}", get(block))
@@ -87,6 +88,20 @@ async fn tenure_info(
         .info
         .clone();
     Ok(axum::Json(TenureInfoWire::from(latest)))
+}
+
+async fn sortition(
+    State(node): State<SharedNode>,
+    Path(consensus_hash): Path<String>,
+) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
+    let sortition = view(&node)
+        .await?
+        .tenures
+        .into_iter()
+        .map(|tenure| tenure.sortition)
+        .find(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
+        .ok_or(RpcError::NotFound)?;
+    Ok(axum::Json(vec![SortitionInfoWire::from(sortition)]))
 }
 
 #[derive(Deserialize)]
@@ -189,6 +204,47 @@ impl From<nano_sync::TenureInfo> for TenureInfoWire {
     }
 }
 
+#[derive(Serialize)]
+struct SortitionInfoWire {
+    burn_block_hash: String,
+    burn_block_height: u64,
+    burn_header_timestamp: u64,
+    sortition_id: String,
+    parent_sortition_id: String,
+    consensus_hash: String,
+    was_sortition: bool,
+    miner_pk_hash160: Option<String>,
+    stacks_parent_ch: Option<String>,
+    last_sortition_ch: Option<String>,
+    committed_block_hash: Option<String>,
+}
+
+impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
+    fn from(sortition: nano_sync::SortitionInfo) -> Self {
+        Self {
+            burn_block_hash: format!("0x{}", sortition.bitcoin_block_hash),
+            burn_block_height: sortition.bitcoin_height,
+            burn_header_timestamp: sortition.bitcoin_timestamp,
+            sortition_id: format!("0x{}", sortition.sortition_id),
+            parent_sortition_id: format!("0x{}", sortition.parent_sortition_id),
+            consensus_hash: format!("0x{}", sortition.consensus_hash),
+            was_sortition: sortition.was_sortition,
+            miner_pk_hash160: sortition
+                .miner_public_key_hash
+                .map(|hash| format!("0x{hash}")),
+            stacks_parent_ch: sortition
+                .stacks_parent_consensus_hash
+                .map(|hash| format!("0x{hash}")),
+            last_sortition_ch: sortition
+                .last_sortition_consensus_hash
+                .map(|hash| format!("0x{hash}")),
+            committed_block_hash: sortition
+                .committed_block_hash
+                .map(|hash| format!("0x{hash}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -236,6 +292,15 @@ mod tests {
             .expect("followed tenure")
             .tip_block_id
             .to_string();
+        let consensus_hash = node
+            .view()
+            .expect("node view")
+            .tenures
+            .last()
+            .expect("followed tenure")
+            .sortition
+            .consensus_hash
+            .to_string();
         let app = router(Arc::new(RwLock::new(node)));
 
         let info = app
@@ -251,6 +316,7 @@ mod tests {
         assert_eq!(info.status(), StatusCode::OK);
 
         let block = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/v3/blocks/{block_id}"))
@@ -260,5 +326,16 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(block.status(), StatusCode::OK);
+
+        let sortition = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v3/sortitions/consensus/{consensus_hash}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(sortition.status(), StatusCode::OK);
     }
 }
