@@ -16,6 +16,7 @@ use nano_stackerdb::{
     BlockProposal, Chunk, ChunkAck, SignerMessage, SignerMessageError, StackerDbClient,
     StackerDbClientError, StackerDbContract, StackerDbError,
 };
+use nano_sync::{SyncClient, SyncError};
 use serde::Deserialize;
 use serde_json::{Value, json as json_value};
 
@@ -246,6 +247,7 @@ pub enum ProposalError {
     Chunk(StackerDbError),
     Message(SignerMessageError),
     SignerSet(SignerSetError),
+    Sync(SyncError),
     SlotVersionOverflow,
     Rejected {
         reason: Option<String>,
@@ -260,6 +262,7 @@ impl fmt::Display for ProposalError {
             Self::Chunk(error) => write!(formatter, "StackerDB chunk error: {error}"),
             Self::Message(error) => write!(formatter, "signer message error: {error}"),
             Self::SignerSet(error) => write!(formatter, "invalid signer response set: {error}"),
+            Self::Sync(error) => write!(formatter, "block upload failed: {error}"),
             Self::SlotVersionOverflow => formatter.write_str("StackerDB slot version overflow"),
             Self::Rejected { reason, code } => {
                 formatter.write_str("StackerDB rejected miner chunk")?;
@@ -282,6 +285,7 @@ impl std::error::Error for ProposalError {
             Self::Chunk(error) => Some(error),
             Self::Message(error) => Some(error),
             Self::SignerSet(error) => Some(error),
+            Self::Sync(error) => Some(error),
             Self::SlotVersionOverflow | Self::Rejected { .. } => None,
         }
     }
@@ -308,6 +312,12 @@ impl From<SignerMessageError> for ProposalError {
 impl From<SignerSetError> for ProposalError {
     fn from(error: SignerSetError) -> Self {
         Self::SignerSet(error)
+    }
+}
+
+impl From<SyncError> for ProposalError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(error)
     }
 }
 
@@ -386,6 +396,20 @@ impl ProposalCoordinator {
             .await
     }
 
+    /// Finalize signer responses, submit the block to a node, then notify signers.
+    pub async fn finalize_and_submit(
+        &self,
+        proposal: &BlockProposal,
+        signer_set: &SignerSet,
+        node: &SyncClient,
+    ) -> Result<nano_chainstate::NakamotoBlock, ProposalError> {
+        let signatures = self.collect_signatures(proposal, signer_set).await?;
+        let block = finalize_block(proposal, signatures);
+        node.upload_block(&block).await?;
+        self.publish_block(block.clone()).await?;
+        Ok(block)
+    }
+
     async fn write_miner_message(
         &self,
         slot_id: u32,
@@ -431,6 +455,15 @@ fn response_signatures(
     Ok(signer_set.order_responses(&proposal.block.header, signatures)?)
 }
 
+fn finalize_block(
+    proposal: &BlockProposal,
+    signatures: Vec<MessageSignature>,
+) -> nano_chainstate::NakamotoBlock {
+    let mut block = proposal.block.clone();
+    block.header.signer_signatures = signatures;
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{Amount, OutPoint, TxIn};
@@ -439,7 +472,10 @@ mod tests {
     use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
     use nano_stackerdb::{BlockAcceptance, BlockProposal, SignerMessage};
 
-    use super::{MinerError, funding_options, response_signatures, validate_funded_transaction};
+    use super::{
+        MinerError, finalize_block, funding_options, response_signatures,
+        validate_funded_transaction,
+    };
 
     #[test]
     fn funding_requests_rbf_with_change_after_protocol_outputs() {
@@ -514,10 +550,11 @@ mod tests {
             .encode()
             .expect("encode active response");
 
-        assert_eq!(
-            response_signatures(&proposal, &set, vec![stale, active]).expect("threshold response"),
-            vec![second_response]
-        );
+        let signatures =
+            response_signatures(&proposal, &set, vec![stale, active]).expect("threshold response");
+        assert_eq!(signatures, vec![second_response]);
+        let finalized = finalize_block(&proposal, signatures);
+        assert_eq!(finalized.header.signer_signatures, vec![second_response]);
     }
 
     fn proposal(miner: &StacksPrivateKey) -> BlockProposal {

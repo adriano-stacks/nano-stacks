@@ -1792,6 +1792,7 @@ dependencies = [
  "nano-crypto",
  "nano-primitives",
  "nano-stackerdb",
+ "nano-sync",
  "serde",
  "serde_json",
 ]
