@@ -1786,6 +1786,8 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "bitcoincore-rpc",
+ "clap",
+ "hex",
  "nano-address",
  "nano-bitcoin",
  "nano-chainstate",
@@ -1793,8 +1795,10 @@ dependencies = [
  "nano-primitives",
  "nano-stackerdb",
  "nano-sync",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
