@@ -27,6 +27,7 @@ use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
+use serde::Deserialize;
 use std::path::Path;
 
 /// M0 boundary that makes the final validation stage explicit.
@@ -62,6 +63,35 @@ pub struct TenureAccounting {
 }
 
 impl TenureAccounting {
+    /// Decode portable checkpoint accounting from JSON.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, TenureAccountingError> {
+        let checkpoint: TenureAccountingCheckpoint = serde_json::from_slice(bytes)
+            .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))?;
+        let mut accounting = Self::default();
+        for entry in checkpoint.matured_effects {
+            let credits = entry
+                .credits
+                .into_iter()
+                .map(|credit| {
+                    Ok(NativeStxCredit {
+                        recipient: PrincipalData::parse(&credit.recipient).map_err(|error| {
+                            TenureAccountingError::InvalidCheckpoint(error.to_string())
+                        })?,
+                        amount: credit.amount,
+                    })
+                })
+                .collect::<Result<Vec<_>, TenureAccountingError>>()?;
+            accounting.record_matured_effects(
+                entry.coinbase_height,
+                NativeBlockEffects {
+                    credits,
+                    liquid_supply_increase: entry.liquid_supply_increase,
+                },
+            )?;
+        }
+        Ok(accounting)
+    }
+
     /// Record the effects that mature when the given coinbase height is reached.
     pub fn record_matured_effects(
         &mut self,
@@ -89,18 +119,47 @@ impl TenureAccounting {
 }
 
 /// Errors raised while loading checkpointed tenure accounting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TenureAccountingError {
     DuplicateCoinbaseHeight,
+    InvalidCheckpoint(String),
 }
 
 impl std::fmt::Display for TenureAccountingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("duplicate matured accounting entry for a coinbase height")
+        match self {
+            Self::DuplicateCoinbaseHeight => {
+                formatter.write_str("duplicate matured accounting entry for a coinbase height")
+            }
+            Self::InvalidCheckpoint(error) => {
+                write!(formatter, "invalid tenure accounting checkpoint: {error}")
+            }
+        }
     }
 }
 
 impl std::error::Error for TenureAccountingError {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenureAccountingCheckpoint {
+    matured_effects: Vec<TenureAccountingCheckpointEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenureAccountingCheckpointEntry {
+    coinbase_height: u64,
+    credits: Vec<TenureAccountingCheckpointCredit>,
+    liquid_supply_increase: u128,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenureAccountingCheckpointCredit {
+    recipient: String,
+    amount: u128,
+}
 
 /// A transaction result retained while applying a Nakamoto block.
 #[derive(Clone, Debug, PartialEq)]
@@ -1241,6 +1300,29 @@ mod tests {
             accounting.record_matured_effects(100, NativeBlockEffects::default()),
             Err(TenureAccountingError::DuplicateCoinbaseHeight)
         );
+    }
+
+    #[test]
+    fn loads_portable_tenure_accounting() {
+        let accounting = TenureAccounting::from_json(
+            br#"{
+                "matured_effects": [{
+                    "coinbase_height": 100,
+                    "credits": [{
+                        "recipient": "ST000000000000000000002AMW42H",
+                        "amount": 42
+                    }],
+                    "liquid_supply_increase": 42
+                }]
+            }"#,
+        )
+        .expect("parse accounting checkpoint");
+
+        assert_eq!(
+            accounting.effects_for_tenure(100).liquid_supply_increase,
+            42
+        );
+        assert!(TenureAccounting::from_json(br#"{"matured_effects": [], "extra": 1}"#).is_err());
     }
 
     #[test]

@@ -2543,6 +2543,8 @@ dependencies = [
  "nano-primitives",
  "nano-sortition",
  "nano-vm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
