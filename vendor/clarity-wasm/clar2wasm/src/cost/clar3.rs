@@ -696,7 +696,7 @@ lazy_static! {
             SetDataVar.name(),
             WordCost {
                 runtime: Linear { a: 5, b: 655 },
-                read_count: None,
+                read_count: Constant(1),
                 read_length: None,
                 write_count: Constant(1),
                 write_length: Linear { a: 1, b: 1 },

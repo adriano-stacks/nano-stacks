@@ -213,8 +213,6 @@ impl ComplexWord for GetDataVar {
             .clone();
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, true);
 
-        self.charge(generator, builder, size as u32)?;
-
         // Push the identifier offset and length onto the data stack
         builder
             .i32_const(id_offset as i32)
@@ -237,6 +235,10 @@ impl ComplexWord for GetDataVar {
         // Host interface fills the result into the specified memory. Read it
         // back out, and place the value on the data stack.
         generator.read_from_memory(builder, offset, 0, &ty)?;
+        generator.serialization_size(builder, &ty)?;
+        let value_size = generator.borrow_local(ValType::I32);
+        builder.local_set(*value_size);
+        self.charge(generator, builder, *value_size)?;
 
         Ok(())
     }
