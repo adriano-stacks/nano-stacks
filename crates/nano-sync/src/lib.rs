@@ -33,6 +33,20 @@ pub struct TenureInfo {
     pub reward_cycle: u64,
 }
 
+/// A locally validated tenure downloaded from a peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FollowedTenure {
+    pub info: TenureInfo,
+    pub blocks: Vec<NakamotoBlock>,
+}
+
+/// Stateful HTTP follower for the peer's current tenure.
+#[derive(Clone, Debug)]
+pub struct TenureFollower {
+    client: SyncClient,
+    latest: Option<TenureInfo>,
+}
+
 /// Bitcoin calendar and stacking parameters advertised by a node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoxInfo {
@@ -71,6 +85,7 @@ pub enum SyncError {
     TenureStart,
     TenureLink(TenureError),
     InvalidHash,
+    Fork,
 }
 
 impl fmt::Display for SyncError {
@@ -83,6 +98,7 @@ impl fmt::Display for SyncError {
             Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
             Self::TenureLink(error) => write!(formatter, "invalid tenure link: {error}"),
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
+            Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
         }
     }
 }
@@ -93,9 +109,11 @@ impl std::error::Error for SyncError {
             Self::Http(error) => Some(error),
             Self::Block(error) => Some(error),
             Self::TenureLink(error) => Some(error),
-            Self::InvalidBaseUrl | Self::EmptyTenure | Self::TenureStart | Self::InvalidHash => {
-                None
-            }
+            Self::InvalidBaseUrl
+            | Self::EmptyTenure
+            | Self::TenureStart
+            | Self::InvalidHash
+            | Self::Fork => None,
         }
     }
 }
@@ -218,6 +236,44 @@ impl SyncClient {
     }
 }
 
+impl TenureFollower {
+    /// Start following a peer without assuming an initial tenure.
+    #[must_use]
+    pub const fn new(client: SyncClient) -> Self {
+        Self {
+            client,
+            latest: None,
+        }
+    }
+
+    /// Return the latest tenure accepted from the peer.
+    #[must_use]
+    pub const fn latest(&self) -> Option<&TenureInfo> {
+        self.latest.as_ref()
+    }
+
+    /// Download the current tenure when the peer's tip has advanced.
+    pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
+        let info = self.client.tenure_info().await?;
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|latest| latest.tip_block_id == info.tip_block_id)
+        {
+            return Ok(None);
+        }
+        if let Some(latest) = &self.latest {
+            validate_tenure_transition(latest, &info)?;
+        }
+        let blocks = self.client.tenure(info.tenure_start_block_id, None).await?;
+        if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
+            return Err(SyncError::TenureStart);
+        }
+        self.latest = Some(info.clone());
+        Ok(Some(FollowedTenure { info, blocks }))
+    }
+}
+
 fn validate_tenure(
     start_block_id: StacksBlockId,
     blocks: &[NakamotoBlock],
@@ -232,6 +288,19 @@ fn validate_tenure(
             .map_err(SyncError::TenureLink)?;
     }
     Ok(())
+}
+
+fn validate_tenure_transition(previous: &TenureInfo, next: &TenureInfo) -> Result<(), SyncError> {
+    if previous.tenure_start_block_id == next.tenure_start_block_id {
+        return Ok(());
+    }
+    if next.parent_consensus_hash == previous.consensus_hash
+        && next.parent_tenure_start_block_id == previous.tenure_start_block_id
+    {
+        Ok(())
+    } else {
+        Err(SyncError::Fork)
+    }
 }
 
 #[derive(Deserialize)]
@@ -294,12 +363,13 @@ mod tests {
 
     use reqwest::Url;
 
+    use super::TenureInfo;
     use super::{
         SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
-        validate_tenure,
+        validate_tenure, validate_tenure_transition,
     };
     use nano_chainstate::{NakamotoBlock, TenureError};
-    use nano_primitives::StacksBlockId;
+    use nano_primitives::{ConsensusHash, StacksBlockId};
 
     #[test]
     fn hashes_must_be_exact_lower_or_upper_hex() {
@@ -356,6 +426,45 @@ mod tests {
             validate_tenure(blocks[0].block_id(), &invalid),
             Err(SyncError::TenureLink(TenureError::ParentBlockId))
         ));
+    }
+
+    #[test]
+    fn follower_requires_new_tenures_to_extend_the_previous_one() {
+        let previous = tenure_info([1; 20], [1; 32], [2; 32]);
+        let extension = tenure_info([1; 20], [1; 32], [3; 32]);
+        let successor = TenureInfo {
+            consensus_hash: ConsensusHash::from_bytes([4; 20]),
+            tenure_start_block_id: StacksBlockId::from_bytes([4; 32]),
+            parent_consensus_hash: previous.consensus_hash,
+            parent_tenure_start_block_id: previous.tenure_start_block_id,
+            tip_block_id: StacksBlockId::from_bytes([5; 32]),
+            tip_height: 2,
+            reward_cycle: 1,
+        };
+        let fork = tenure_info([6; 20], [6; 32], [7; 32]);
+
+        assert!(validate_tenure_transition(&previous, &extension).is_ok());
+        assert!(validate_tenure_transition(&previous, &successor).is_ok());
+        assert!(matches!(
+            validate_tenure_transition(&previous, &fork),
+            Err(SyncError::Fork)
+        ));
+    }
+
+    fn tenure_info(
+        consensus_hash: [u8; 20],
+        tenure_start_block_id: [u8; 32],
+        tip_block_id: [u8; 32],
+    ) -> TenureInfo {
+        TenureInfo {
+            consensus_hash: ConsensusHash::from_bytes(consensus_hash),
+            tenure_start_block_id: StacksBlockId::from_bytes(tenure_start_block_id),
+            parent_consensus_hash: ConsensusHash::from_bytes([0; 20]),
+            parent_tenure_start_block_id: StacksBlockId::from_bytes([0; 32]),
+            tip_block_id: StacksBlockId::from_bytes(tip_block_id),
+            tip_height: 1,
+            reward_cycle: 1,
+        }
     }
 
     #[tokio::test]
