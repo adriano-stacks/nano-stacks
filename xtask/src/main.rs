@@ -10,6 +10,7 @@ use std::{
 };
 
 use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
+use serde_json::json;
 
 fn main() -> ExitCode {
     let command = env::args().nth(1);
@@ -242,6 +243,11 @@ impl CaptureConfig {
         let checkpoint_root = self.checkpoint_root(&checkpoint)?;
         let checkpoint_dir = staging.join("chainstate/checkpoint-H");
         copy_clarity_source(&node_root.join("chainstate/vm/clarity"), &checkpoint_dir)?;
+        Self::write_native_effects(
+            &node_root.join("chainstate/vm/index.sqlite"),
+            blocks,
+            &checkpoint_dir,
+        )?;
         let checkpoint_manifest = format!(
             "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\n",
             checkpoint.height, checkpoint.index_block_hash, checkpoint_root
@@ -270,6 +276,83 @@ impl CaptureConfig {
             return Err("captured block disappeared from the staging database".to_owned());
         }
         Ok(())
+    }
+
+    fn write_native_effects(
+        chainstate_db: &Path,
+        blocks: &[CapturedBlock],
+        checkpoint_dir: &Path,
+    ) -> Result<(), String> {
+        let block_ids = blocks
+            .iter()
+            .map(|block| format!("'{}'", block.index_block_hash))
+            .collect::<Vec<_>>()
+            .join(",");
+        let heights = sqlite(
+            chainstate_db,
+            &format!(
+                "SELECT DISTINCT coinbase_height FROM nakamoto_tenure_events \
+                 WHERE cause = 0 AND block_id IN ({block_ids}) ORDER BY coinbase_height"
+            ),
+        )?;
+        let mut effects = Vec::new();
+        for height in heights.lines().filter(|height| !height.is_empty()) {
+            let coinbase_height = parse_u64("coinbase height", height)?;
+            let matured_height = coinbase_height.saturating_sub(100);
+            let matured_block = sqlite(
+                chainstate_db,
+                &format!(
+                    "SELECT block_id FROM nakamoto_tenure_events \
+                     WHERE cause = 0 AND coinbase_height = {matured_height} LIMIT 1"
+                ),
+            )?;
+            let Some(matured_block) = matured_block.lines().next() else {
+                continue;
+            };
+            let rewards = sqlite(
+                chainstate_db,
+                &format!(
+                    "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored, \
+                     tx_fees_streamed_confirmed, tx_fees_streamed_produced \
+                     FROM matured_rewards WHERE child_index_block_hash = '{matured_block}' \
+                     ORDER BY vtxindex, CAST(coinbase AS INTEGER) DESC"
+                ),
+            )?;
+            let mut credits = Vec::new();
+            let mut liquid_supply_increase = 0_u128;
+            for reward in rewards.lines().filter(|reward| !reward.is_empty()) {
+                let mut fields = reward.split('|');
+                let recipient = fields
+                    .next()
+                    .ok_or_else(|| "matured reward has no recipient".to_owned())?;
+                let coinbase = parse_u128("matured reward coinbase", fields.next())?;
+                let anchored = parse_u128("matured reward anchored fees", fields.next())?;
+                let confirmed = parse_u128("matured reward confirmed fees", fields.next())?;
+                let produced = parse_u128("matured reward produced fees", fields.next())?;
+                if fields.next().is_some() {
+                    return Err("matured reward has unexpected fields".to_owned());
+                }
+                let amount = coinbase
+                    .checked_add(anchored)
+                    .and_then(|amount| amount.checked_add(confirmed))
+                    .and_then(|amount| amount.checked_add(produced))
+                    .ok_or_else(|| "matured reward amount overflow".to_owned())?;
+                if amount != 0 {
+                    credits.push(json!({ "recipient": recipient, "amount": amount }));
+                }
+                liquid_supply_increase = liquid_supply_increase
+                    .checked_add(coinbase)
+                    .ok_or_else(|| "matured liquid supply overflow".to_owned())?;
+            }
+            effects.push(json!({
+                "coinbase_height": coinbase_height,
+                "credits": credits,
+                "liquid_supply_increase": liquid_supply_increase,
+            }));
+        }
+        let contents = serde_json::to_vec_pretty(&json!({ "matured_effects": effects }))
+            .map_err(|error| format!("serialize native accounting: {error}"))?;
+        write_file(&checkpoint_dir.join("native-effects.json"), &contents)
     }
 
     fn event_for(&self, block_hash: &str) -> Result<String, String> {
@@ -448,6 +531,13 @@ fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|error| format!("invalid {flag} value {value:?}: {error}"))
+}
+
+fn parse_u128(field: &str, value: Option<&str>) -> Result<u128, String> {
+    value
+        .ok_or_else(|| format!("{field} is missing"))?
+        .parse()
+        .map_err(|error| format!("invalid {field}: {error}"))
 }
 
 fn sqlite(database: &Path, query: &str) -> Result<String, String> {

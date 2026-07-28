@@ -32,6 +32,7 @@ A complete capture contains:
 - `nakamoto/blocks/*.bin`
 - `events/new_block/*.json`
 - `chainstate/checkpoint-H/`
+- `chainstate/checkpoint-H/native-effects.json`
 - `stacker_set/cycle-N.json`
 
 Replace `manifest.toml`'s `replay_blocks` with the captured block count in the

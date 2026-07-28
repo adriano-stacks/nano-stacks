@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
+use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
 use nano_primitives::TrieHash;
 use serde::Deserialize;
 
@@ -158,7 +158,11 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
         }
     }
 
-    for relative_path in ["sortition/snapshots.json", "provenance.toml"] {
+    for relative_path in [
+        "sortition/snapshots.json",
+        "provenance.toml",
+        "chainstate/checkpoint-H/native-effects.json",
+    ] {
         let path = root.join(relative_path);
         if !is_nonempty_file(&path)? {
             return Err(FixtureValidationError::MissingOrEmptyFile(path));
@@ -204,6 +208,12 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             ));
         }
     }
+    let accounting_path = checkpoint.join("native-effects.json");
+    TenureAccounting::from_json(
+        &fs::read(&accounting_path)
+            .map_err(|_| FixtureValidationError::MissingOrEmptyFile(accounting_path.clone()))?,
+    )
+    .map_err(|_| FixtureValidationError::InvalidNativeAccounting(accounting_path))?;
 
     Ok(FixtureStatus::Captured {
         replay_blocks: manifest.replay_blocks,
@@ -266,6 +276,7 @@ pub enum FixtureValidationError {
     MissingOrEmptyFile(PathBuf),
     EmptyCheckpoint(PathBuf),
     InvalidCheckpointManifest(PathBuf),
+    InvalidNativeAccounting(PathBuf),
     InvalidSnapshotFile(PathBuf),
     EmptyCapture,
     Metadata {
@@ -303,6 +314,11 @@ impl std::fmt::Display for FixtureValidationError {
             Self::InvalidCheckpointManifest(path) => write!(
                 formatter,
                 "invalid portable MARF checkpoint manifest: {}",
+                path.display()
+            ),
+            Self::InvalidNativeAccounting(path) => write!(
+                formatter,
+                "invalid native accounting fixture: {}",
                 path.display()
             ),
             Self::InvalidSnapshotFile(path) => {
@@ -460,6 +476,22 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             )),
         };
     };
+    let accounting_path = root.join("chainstate/checkpoint-H/native-effects.json");
+    let Ok(accounting) = fs::read(&accounting_path)
+        .ok()
+        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
+        .ok_or(())
+    else {
+        return ReplayDepth {
+            completed: 0,
+            expected: manifest.replay_blocks,
+            first_failure: Some(1),
+            first_divergence: Some(ReplayDivergence::Fixture(
+                "native accounting fixture cannot be loaded".to_owned(),
+            )),
+        };
+    };
+    *chainstate.accounting_mut() = accounting;
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
         return ReplayDepth {
             completed: 0,
@@ -1549,6 +1581,10 @@ mod tests {
             &root.join("chainstate/checkpoint-H/checkpoint.toml"),
             "format = \"stacks-core-marf-sqlite-v2\"\nsource_state_id = \"id\"\npublished_state_index_root = \"root\"\n",
         )?;
+        write_file(
+            &root.join("chainstate/checkpoint-H/native-effects.json"),
+            "{\"matured_effects\":[]}",
+        )?;
         write_file(&root.join("provenance.toml"), "hacknet_commit = \"test\"\n")?;
 
         assert_eq!(
@@ -2234,29 +2270,7 @@ mod tests {
                 chain.tip().bitcoin_header_hash.as_bytes(),
                 &hex_array(&snapshot.parent_burn_header_hash)
             );
-            let raw = fs::read_to_string(
-                fixture_root
-                    .join("bitcoin/blocks")
-                    .join(format!("{}.hex", snapshot.burn_header_hash)),
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "missing Bitcoin block at height {}: {error}",
-                    snapshot.block_height
-                )
-            });
-            let block = decode_block_with_pre_stx(
-                snapshot.block_height,
-                &hex::decode(raw.trim()).expect("decode captured Bitcoin block"),
-                *b"T3",
-                &mut pre_stx_cache,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "decode captured Bitcoin block at height {}: {error}",
-                    snapshot.block_height
-                )
-            });
+            let block = captured_bitcoin_block(&fixture_root, snapshot, &mut pre_stx_cache);
             let winner = (snapshot.sortition != 0).then(|| {
                 let winning_txid = hex_array(&snapshot.winning_block_txid);
                 block
@@ -2290,44 +2304,75 @@ mod tests {
             let derived = chain
                 .append_with_winner(&block, total_burn, pox_id, winner)
                 .expect("contiguous captured Bitcoin block");
-            assert_eq!(derived.total_burn, total_burn, "{}", snapshot.block_height);
-            assert_eq!(
-                derived.operations_hash.as_bytes(),
-                &hex_array(&snapshot.ops_hash),
-                "{}",
-                snapshot.block_height
-            );
-            assert_eq!(
-                derived.winner_txid,
-                (snapshot.sortition != 0).then(|| hex_array(&snapshot.winning_block_txid)),
-                "{}",
-                snapshot.block_height
-            );
-            assert_eq!(
-                derived.consensus_hash.as_bytes(),
-                &hex_array(&snapshot.consensus_hash),
-                "{}",
-                snapshot.block_height
-            );
-            assert_eq!(
-                derived.sortition_id.as_bytes(),
-                &hex_array(&snapshot.sortition_id),
-                "{}",
-                snapshot.block_height
-            );
-            assert_eq!(
-                derived.parent_sortition_id.as_bytes(),
-                &hex_array(&snapshot.parent_sortition_id),
-                "{}",
-                snapshot.block_height
-            );
-            assert_eq!(
-                derived.sortition_hash.as_bytes(),
-                &hex_array(&snapshot.sortition_hash),
-                "{}",
-                snapshot.block_height
-            );
+            assert_captured_snapshot(derived, snapshot, total_burn);
         }
+    }
+
+    fn captured_bitcoin_block(
+        fixture_root: &Path,
+        snapshot: &CapturedSortitionSnapshot,
+        pre_stx_cache: &mut PreStxCache,
+    ) -> nano_bitcoin::BitcoinBlock {
+        let path = fixture_root
+            .join("bitcoin/blocks")
+            .join(format!("{}.hex", snapshot.burn_header_hash));
+        let raw = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "missing Bitcoin block at height {}: {error}",
+                snapshot.block_height
+            )
+        });
+        decode_block_with_pre_stx(
+            snapshot.block_height,
+            &hex::decode(raw.trim()).expect("decode captured Bitcoin block"),
+            *b"T3",
+            pre_stx_cache,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "decode captured Bitcoin block at height {}: {error}",
+                snapshot.block_height
+            )
+        })
+    }
+
+    fn assert_captured_snapshot(
+        derived: &nano_sortition::SortitionSnapshot,
+        snapshot: &CapturedSortitionSnapshot,
+        total_burn: u64,
+    ) {
+        let height = snapshot.block_height;
+        assert_eq!(derived.total_burn, total_burn, "{height}");
+        assert_eq!(
+            derived.operations_hash.as_bytes(),
+            &hex_array(&snapshot.ops_hash),
+            "{height}"
+        );
+        assert_eq!(
+            derived.winner_txid,
+            (snapshot.sortition != 0).then(|| hex_array(&snapshot.winning_block_txid)),
+            "{height}"
+        );
+        assert_eq!(
+            derived.consensus_hash.as_bytes(),
+            &hex_array(&snapshot.consensus_hash),
+            "{height}"
+        );
+        assert_eq!(
+            derived.sortition_id.as_bytes(),
+            &hex_array(&snapshot.sortition_id),
+            "{height}"
+        );
+        assert_eq!(
+            derived.parent_sortition_id.as_bytes(),
+            &hex_array(&snapshot.parent_sortition_id),
+            "{height}"
+        );
+        assert_eq!(
+            derived.sortition_hash.as_bytes(),
+            &hex_array(&snapshot.sortition_hash),
+            "{height}"
+        );
     }
 
     #[test]
