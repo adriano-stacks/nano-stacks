@@ -1,12 +1,13 @@
 ---
 id: "014"
 title: "M13: implement mining and hacknet interop"
-status: in-progress
+status: completed
 priority: high
 effort: large
 dependencies: ["013"]
 tags: ["m13", "miner", "hacknet"]
 created_at: 2026-07-27
+completed_at: 2026-07-28
 ---
 
 # M13: implement mining and hacknet interop
