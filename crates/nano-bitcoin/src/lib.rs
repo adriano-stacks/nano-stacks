@@ -67,6 +67,57 @@ pub struct BitcoinOutput {
     pub recipient: PoxAddress,
 }
 
+/// The canonical payload for a Bitcoin leader-block commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeaderBlockCommitment {
+    pub block_header_hash: [u8; 32],
+    pub new_seed: [u8; 32],
+    pub parent_block_height: u32,
+    pub parent_transaction_index: u16,
+    pub key_block_height: u32,
+    pub key_transaction_index: u16,
+    pub memo: u8,
+    pub parent_modulus: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaderCommitmentError {
+    MemoTooLarge,
+    InvalidParentModulus,
+}
+
+impl fmt::Display for LeaderCommitmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MemoTooLarge => "leader commitment memo exceeds five bits",
+            Self::InvalidParentModulus => "leader commitment parent modulus exceeds four",
+        })
+    }
+}
+
+impl std::error::Error for LeaderCommitmentError {}
+
+impl LeaderBlockCommitment {
+    /// Encode the protocol payload following the leader-commit opcode.
+    pub fn encode(self) -> Result<[u8; 77], LeaderCommitmentError> {
+        if self.memo > 0b1_1111 {
+            return Err(LeaderCommitmentError::MemoTooLarge);
+        }
+        if self.parent_modulus > 4 {
+            return Err(LeaderCommitmentError::InvalidParentModulus);
+        }
+        let mut bytes = [0; 77];
+        bytes[..32].copy_from_slice(&self.block_header_hash);
+        bytes[32..64].copy_from_slice(&self.new_seed);
+        bytes[64..68].copy_from_slice(&self.parent_block_height.to_be_bytes());
+        bytes[68..70].copy_from_slice(&self.parent_transaction_index.to_be_bytes());
+        bytes[70..74].copy_from_slice(&self.key_block_height.to_be_bytes());
+        bytes[74..76].copy_from_slice(&self.key_transaction_index.to_be_bytes());
+        bytes[76] = (self.memo << 3) | self.parent_modulus;
+        Ok(bytes)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitcoinOperationKind {
     LeaderBlockCommit {
@@ -395,7 +446,10 @@ mod tests {
         transaction::Version as TransactionVersion,
     };
 
-    use super::{BitcoinOperationKind, PreStxCache, decode_block, parse_leader_key_registration};
+    use super::{
+        BitcoinOperationKind, PreStxCache, decode_block, parse_leader_block_commit,
+        parse_leader_key_registration,
+    };
 
     #[test]
     fn captured_bitcoin_blocks_decode_with_hacknet_magic() {
@@ -468,6 +522,42 @@ mod tests {
     #[test]
     fn leader_key_registration_requires_a_valid_vrf_key() {
         assert!(parse_leader_key_registration(&[0; 52]).is_none());
+    }
+
+    #[test]
+    fn leader_commitment_payload_round_trips_through_the_parser() {
+        let commitment = super::LeaderBlockCommitment {
+            block_header_hash: [1; 32],
+            new_seed: [2; 32],
+            parent_block_height: 3,
+            parent_transaction_index: 4,
+            key_block_height: 5,
+            key_transaction_index: 6,
+            memo: 7,
+            parent_modulus: 4,
+        };
+        let payload = commitment.encode().expect("encode commitment");
+        let Some(BitcoinOperationKind::LeaderBlockCommit {
+            block_header_hash,
+            new_seed,
+            parent_block_height,
+            parent_transaction_index,
+            key_block_height,
+            key_transaction_index,
+            memo,
+            parent_modulus,
+        }) = parse_leader_block_commit(&payload)
+        else {
+            panic!("parse leader commitment");
+        };
+        assert_eq!(block_header_hash, [1; 32]);
+        assert_eq!(new_seed, [2; 32]);
+        assert_eq!(parent_block_height, 3);
+        assert_eq!(parent_transaction_index, 4);
+        assert_eq!(key_block_height, 5);
+        assert_eq!(key_transaction_index, 6);
+        assert_eq!(memo, 7);
+        assert_eq!(parent_modulus, 4);
     }
 
     fn transaction(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
