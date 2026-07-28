@@ -74,10 +74,9 @@ for coinbase_height in range(first_height, first_height + span + 1):
     if earned is None:
         break
     previous = scheduled_payment(coinbase_height - MATURITY - 1)
-    credits = []
-    if earned[1]:
-        credits.append({"recipient": earned[0], "amount": earned[1]})
-    if earned[2] and previous is not None:
+    # Both shares are credited even when zero: the write itself is consensus state.
+    credits = [{"recipient": earned[0], "amount": earned[1]}]
+    if previous is not None:
         credits.append({"recipient": previous[0], "amount": earned[2]})
     effects.append(
         {

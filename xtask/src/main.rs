@@ -344,9 +344,9 @@ impl CaptureConfig {
                     .and_then(|amount| amount.checked_add(confirmed))
                     .and_then(|amount| amount.checked_add(produced))
                     .ok_or_else(|| "matured reward amount overflow".to_owned())?;
-                if amount != 0 {
-                    credits.push(json!({ "recipient": recipient, "amount": amount }));
-                }
+                // stacks-core credits both matured shares unconditionally, and a
+                // zero credit still writes the recipient's balance into the block.
+                credits.push(json!({ "recipient": recipient, "amount": amount }));
                 liquid_supply_increase = liquid_supply_increase
                     .checked_add(coinbase)
                     .ok_or_else(|| "matured liquid supply overflow".to_owned())?;
