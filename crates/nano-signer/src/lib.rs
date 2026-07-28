@@ -222,7 +222,10 @@ where
 {
     fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
         let block_id = proposal.block.block_id();
-        if self.candidates.get(&block_id) == Some(&proposal.block.header) {
+        // A block already executed into the trusted view cannot be executed twice.
+        if self.trusted.contains_key(&block_id)
+            || self.candidates.get(&block_id) == Some(&proposal.block.header)
+        {
             return Ok(());
         }
         self.validate_block(&proposal.block, self.context_at(proposal.bitcoin_height))?;

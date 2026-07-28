@@ -564,7 +564,8 @@ impl ChainState {
             })
         })();
         if result.is_err() {
-            self.vm.abort_block()?;
+            // Report why execution failed, not why the rollback did.
+            drop(self.vm.abort_block());
         }
         result
     }

@@ -229,7 +229,11 @@ async fn sync_chainstate(
         .into());
     }
 
-    eprintln!("validating {} canonical blocks", blocks.len());
+    eprintln!(
+        "validating {} canonical blocks from height {:?}",
+        blocks.len(),
+        blocks.last().map(|block| block.header.chain_length)
+    );
     for block in blocks.iter().rev() {
         let sortition = client.sortition(block.header.consensus_hash).await?;
         signer

@@ -806,8 +806,13 @@ impl MarfStore {
         if self.transaction.is_some() {
             return Err(MarfStoreError::TransactionInProgress);
         }
-        let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        if self.active.is_none() {
+            return Err(MarfStoreError::NoActiveState);
+        }
+        // Seal the MARF first: a failure here must leave the active state intact
+        // so the caller can still abort it.
         let root = self.marf.seal_to(block)?;
+        let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
         self.parents.insert(block, active.parent);
         self.heights.insert(block, active.height);
         self.states.insert(block, active.state);
