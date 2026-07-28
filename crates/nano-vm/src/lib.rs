@@ -2217,4 +2217,37 @@ mod tests {
             .expect("write extension");
         store.seal().expect("seal checkpoint extension");
     }
+
+    #[test]
+    fn hydrates_a_wasm_module_from_checkpoint_contract_source() {
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        let root = TrieHash::from_bytes([
+            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
+            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
+            0x3a, 0x64, 0xc0, 0x71,
+        ]);
+        let checkpoint = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/chainstate/checkpoint-H/marf.sqlite");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
+            .expect("valid checkpoint contract identifier");
+        let sender = contract.issuer.clone().into();
+        let mut vm = Vm::from_checkpoint(checkpoint, source, root).expect("load checkpoint");
+        vm.begin_block(Some(source), [0x43; 32])
+            .expect("extend checkpoint state");
+
+        let result = vm.execute_contract_call(
+            sender,
+            None,
+            contract,
+            "get-stacking-minimum",
+            &[],
+            LimitedCostTracker::new_free(),
+        );
+
+        assert!(matches!(result, Ok(result) if matches!(result.value, Some(Value::UInt(_)))));
+    }
 }
