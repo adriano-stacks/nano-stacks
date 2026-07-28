@@ -587,6 +587,7 @@ impl From<SignerStateError> for SignerError {
 pub struct SignerService<V> {
     client: StackerDbClient,
     miner_contract: StackerDbContract,
+    miner_proposal_slot: u32,
     signer_contract: StackerDbContract,
     signer: EmbeddedSigner<V>,
     last_proposal: Option<Sha256Sum>,
@@ -877,13 +878,32 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         signer_contract: StackerDbContract,
         signer: EmbeddedSigner<V>,
     ) -> Self {
+        Self::with_miner_proposal_slot(client, miner_contract, 0, signer_contract, signer)
+    }
+
+    /// Construct a service that watches a specific registered miner proposal slot.
+    #[must_use]
+    pub const fn with_miner_proposal_slot(
+        client: StackerDbClient,
+        miner_contract: StackerDbContract,
+        miner_proposal_slot: u32,
+        signer_contract: StackerDbContract,
+        signer: EmbeddedSigner<V>,
+    ) -> Self {
         Self {
             client,
             miner_contract,
+            miner_proposal_slot,
             signer_contract,
             signer,
             last_proposal: None,
         }
+    }
+
+    /// Return the miner slot watched for proposals.
+    #[must_use]
+    pub const fn miner_proposal_slot(&self) -> u32 {
+        self.miner_proposal_slot
     }
 
     /// Process the latest miner proposal once and upload an acceptance response when needed.
@@ -899,7 +919,10 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         let client = self.client.clone();
         let miner_contract = self.miner_contract.clone();
         let last_proposal = self.last_proposal;
-        let Some(bytes) = client.latest_chunk(&miner_contract, 0).await? else {
+        let Some(bytes) = client
+            .latest_chunk(&miner_contract, self.miner_proposal_slot)
+            .await?
+        else {
             return Ok(None);
         };
         let proposal_hash = nano_primitives::sha512_256(&bytes);
@@ -1008,19 +1031,21 @@ impl<V: ProposalValidator + Send> LiveSigner<V> {
 
 #[cfg(test)]
 mod tests {
+    use nano_address::StacksAddress;
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{
         BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId, StacksBlockId,
         TrieHash, hash160,
     };
-    use nano_stackerdb::{BlockProposal, SignerMessage};
+    use nano_stackerdb::{BlockProposal, SignerMessage, StackerDbClient, StackerDbContract};
     use nano_sync::SortitionInfo;
+    use reqwest::Url;
     use tempfile::tempdir;
 
     use super::{
         ActiveSortitionValidator, EmbeddedSigner, ProposalValidator, SignerConfig, SignerError,
-        SortitionProposalValidator,
+        SignerService, SortitionProposalValidator,
     };
 
     struct Accept;
@@ -1084,6 +1109,32 @@ mod tests {
             committed_block_hash: None,
         };
         (proposal, sortition)
+    }
+
+    #[test]
+    fn signer_service_watches_the_configured_miner_slot() {
+        let contract = StackerDbContract {
+            address: StacksAddress::new(26, Hash160::from_bytes([0x42; 20]))
+                .expect("valid Stacks address"),
+            name: "miners".to_owned(),
+        };
+        let service = SignerService::with_miner_proposal_slot(
+            StackerDbClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
+                .expect("create client"),
+            contract.clone(),
+            4,
+            contract,
+            EmbeddedSigner::new(
+                SignerConfig {
+                    private_key: StacksPrivateKey::from_seed(b"signer"),
+                    writer_slot: 7,
+                    next_slot_version: 3,
+                },
+                Accept,
+            ),
+        );
+
+        assert_eq!(service.miner_proposal_slot(), 4);
     }
 
     #[test]
