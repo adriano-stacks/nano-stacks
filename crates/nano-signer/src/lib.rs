@@ -634,13 +634,56 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         self.validator
             .validate(proposal)
             .map_err(SignerError::Validation)?;
-        let next_slot_version = self
-            .next_slot_version
-            .checked_add(1)
-            .ok_or(SignerError::SlotVersionOverflow)?;
+        let next_slot_version = self.next_slot_version;
         let signature = self.private_key.sign(signature_hash.as_bytes());
         let message = SignerMessage::BlockResponse(BlockAcceptance::new(signature_hash, signature));
-        let mut chunk = Chunk::new(self.writer_slot, self.next_slot_version, message.encode()?);
+        self.record(
+            position,
+            signature_hash,
+            message.encode()?,
+            next_slot_version,
+        )
+    }
+
+    /// Reissue an existing acceptance only when `StackerDB` has consumed its slot version.
+    pub fn sign_after_slot_version(
+        &mut self,
+        proposal: &BlockProposal,
+        remote_slot_version: u32,
+    ) -> Result<Chunk, SignerError> {
+        let position = (
+            proposal.block.header.consensus_hash,
+            proposal.block.header.chain_length,
+        );
+        let signature_hash = proposal.block.header.signer_signature_hash();
+        let Some(signed) = self.signed.get(&position) else {
+            return self.sign(proposal);
+        };
+        if signed.signature_hash != signature_hash {
+            return Err(SignerError::Equivocation);
+        }
+        if signed.chunk.slot_version > remote_slot_version {
+            return Ok(signed.chunk.clone());
+        }
+        self.record(
+            position,
+            signature_hash,
+            signed.chunk.data.clone(),
+            self.next_slot_version,
+        )
+    }
+
+    fn record(
+        &mut self,
+        position: (ConsensusHash, u64),
+        signature_hash: Sha256Sum,
+        data: Vec<u8>,
+        slot_version: u32,
+    ) -> Result<Chunk, SignerError> {
+        let next_slot_version = slot_version
+            .checked_add(1)
+            .ok_or(SignerError::SlotVersionOverflow)?;
+        let mut chunk = Chunk::new(self.writer_slot, slot_version, data);
         chunk.sign(&self.private_key)?;
         let signed = SignedBlock {
             signature_hash,
@@ -721,8 +764,10 @@ impl<V: ProposalValidator> SignerService<V> {
         let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
             return Err(SignerServiceError::UnexpectedMessage);
         };
-        self.reconcile_writer_slot().await?;
-        let chunk = self.signer.sign(&proposal)?;
+        let remote_slot_version = self.reconcile_writer_slot().await?;
+        let chunk = self
+            .signer
+            .sign_after_slot_version(&proposal, remote_slot_version)?;
         let acknowledgement = self.client.put_chunk(&self.signer_contract, &chunk).await?;
         if !acknowledgement.accepted {
             return Err(SignerServiceError::Rejected {
@@ -735,7 +780,7 @@ impl<V: ProposalValidator> SignerService<V> {
     }
 
     /// Advance the local writer version to the latest version accepted by `StackerDB`.
-    pub async fn reconcile_writer_slot(&mut self) -> Result<(), SignerServiceError> {
+    pub async fn reconcile_writer_slot(&mut self) -> Result<u32, SignerServiceError> {
         let version = self
             .client
             .slot_versions(&self.signer_contract)
@@ -747,7 +792,7 @@ impl<V: ProposalValidator> SignerService<V> {
             .checked_add(1)
             .ok_or(SignerError::SlotVersionOverflow)?;
         self.signer.advance_next_slot_version(next)?;
-        Ok(())
+        Ok(version)
     }
 }
 
@@ -907,6 +952,27 @@ mod tests {
 
         assert_eq!(repeated, first);
         assert_eq!(signer.next_slot_version(), 4);
+    }
+
+    #[test]
+    fn consumed_slot_reissues_the_same_acceptance_at_the_next_version() {
+        let mut signer = EmbeddedSigner::new(
+            SignerConfig {
+                private_key: StacksPrivateKey::from_seed(b"signer"),
+                writer_slot: 7,
+                next_slot_version: 3,
+            },
+            Accept,
+        );
+        let proposal = proposal();
+        let first = signer.sign(&proposal).expect("sign proposal");
+        let repeated = signer
+            .sign_after_slot_version(&proposal, first.slot_version)
+            .expect("reissue accepted proposal");
+
+        assert_eq!(repeated.slot_version, 4);
+        assert_eq!(repeated.data, first.data);
+        assert_eq!(signer.next_slot_version(), 5);
     }
 
     #[test]

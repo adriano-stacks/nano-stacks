@@ -1,7 +1,7 @@
 ---
 id: "013"
 title: "M12: implement StackerDB and embedded signer"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["012"]
