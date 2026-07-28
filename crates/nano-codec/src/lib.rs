@@ -344,6 +344,7 @@ impl AnchorMode {
 pub enum PostConditionMode {
     Deny,
     Allow,
+    Originator,
 }
 
 impl PostConditionMode {
@@ -351,6 +352,7 @@ impl PostConditionMode {
         match value {
             1 => Ok(Self::Allow),
             2 => Ok(Self::Deny),
+            3 => Ok(Self::Originator),
             _ => Err(CodecError::InvalidTransaction),
         }
     }
@@ -359,6 +361,7 @@ impl PostConditionMode {
         match self {
             Self::Allow => 1,
             Self::Deny => 2,
+            Self::Originator => 3,
         }
     }
 }
@@ -973,8 +976,8 @@ fn read_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionData, Cod
             asset: read_asset_info(reader)?,
             asset_value: read_clarity_value(reader)?,
             condition: match reader.byte()? {
-                0x10 => NonFungibleCondition::DoesNotSend,
-                0x11 => NonFungibleCondition::DoesSend,
+                0x10 => NonFungibleCondition::DoesSend,
+                0x11 => NonFungibleCondition::DoesNotSend,
                 _ => return Err(CodecError::InvalidPostCondition),
             },
         }),
@@ -1156,8 +1159,8 @@ fn encode_post_condition(writer: &mut Writer, post_condition: &PostConditionData
             encode_asset_info(writer, asset);
             writer.raw(asset_value.as_bytes());
             writer.byte(match condition {
-                NonFungibleCondition::DoesNotSend => 0x10,
-                NonFungibleCondition::DoesSend => 0x11,
+                NonFungibleCondition::DoesSend => 0x10,
+                NonFungibleCondition::DoesNotSend => 0x11,
             });
         }
     }
@@ -1908,5 +1911,68 @@ impl Writer {
                 self.signature(*signature);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NonFungibleCondition, PostConditionData, PostConditionMode, Transaction};
+
+    #[test]
+    fn sip040_post_condition_tags_match_the_protocol() {
+        for (mode, tag, expected) in [
+            (1, 0x10, NonFungibleCondition::DoesSend),
+            (2, 0x11, NonFungibleCondition::DoesNotSend),
+            (3, 0x10, NonFungibleCondition::DoesSend),
+        ] {
+            let bytes = encoded_post_condition_transaction(mode, tag);
+            let (transaction, consumed) = Transaction::decode(&bytes).expect("decode transaction");
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                transaction.post_condition_mode(),
+                match mode {
+                    1 => PostConditionMode::Allow,
+                    2 => PostConditionMode::Deny,
+                    3 => PostConditionMode::Originator,
+                    _ => unreachable!(),
+                }
+            );
+            assert!(matches!(
+                transaction.post_conditions()[0].data(),
+                PostConditionData::NonFungible { condition, .. } if *condition == expected
+            ));
+            assert_eq!(transaction.encode(), bytes);
+        }
+    }
+
+    fn encoded_post_condition_transaction(mode: u8, nft_tag: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0x80);
+        bytes.extend_from_slice(&0x8000_0000_u32.to_be_bytes());
+        bytes.push(4);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0; 20]);
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0; 65]);
+        bytes.push(3);
+        bytes.push(mode);
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.push(2);
+        bytes.push(1);
+        bytes.push(26);
+        bytes.extend_from_slice(&[0; 20]);
+        bytes.extend_from_slice(&[1, b'a', 1, b'b']);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.push(nft_tag);
+        bytes.push(0);
+        bytes.push(5);
+        bytes.push(26);
+        bytes.extend_from_slice(&[0; 20]);
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0; 34]);
+        bytes
     }
 }
