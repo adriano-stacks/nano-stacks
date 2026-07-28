@@ -1,0 +1,21 @@
+[package]
+name = "nano-rpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+nano-node = { path = "../nano-node" }
+nano-sync = { path = "../nano-sync" }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.13.4", default-features = false }
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

@@ -14,6 +14,7 @@ members = [
     "crates/nano-stackerdb",
     "crates/nano-signer",
     "crates/nano-node",
+    "crates/nano-rpc",
     "crates/nano-conformance",
     "xtask",
 ]
