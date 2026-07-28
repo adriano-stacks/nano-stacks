@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 mod signer_message;
 
 pub use signer_message::{
-    BlockAcceptance, BlockProposal, SignerMessage, SignerMessageError, SignerMessageType,
+    BlockAcceptance, BlockProposal, BlockRejection, BlockResponse, SignerMessage,
+    SignerMessageError, SignerMessageType,
 };
 
 /// A `StackerDB` contract address and name.
@@ -416,8 +417,8 @@ mod tests {
     use reqwest::Url;
 
     use super::{
-        BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbClient, StackerDbContract,
-        StackerDbError,
+        BlockAcceptance, BlockResponse, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbClient,
+        StackerDbContract, StackerDbError,
     };
 
     #[test]
@@ -444,7 +445,7 @@ mod tests {
         let key = StacksPrivateKey::from_seed(b"signer-message");
         let digest = sha512_256(b"proposed block");
         let response = BlockAcceptance::new(digest, key.sign(digest.as_bytes()));
-        let message = SignerMessage::BlockResponse(response);
+        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(response));
 
         let decoded = SignerMessage::decode(&message.encode().expect("encode message"))
             .expect("decode message");
@@ -455,8 +456,10 @@ mod tests {
     fn block_acceptance_rejects_unused_response_data() {
         let key = StacksPrivateKey::from_seed(b"signer-message");
         let digest = sha512_256(b"proposed block");
-        let message =
-            SignerMessage::BlockResponse(BlockAcceptance::new(digest, key.sign(digest.as_bytes())));
+        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
+            digest,
+            key.sign(digest.as_bytes()),
+        )));
         let mut bytes = message.encode().expect("encode message");
         let server_version_length_offset = 2 + 32 + 65;
         let server_version_length = usize::try_from(u32::from_be_bytes(

@@ -51,12 +51,31 @@ impl BlockAcceptance {
     }
 }
 
+/// A signed signer rejection, preserving its versioned response data verbatim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockRejection {
+    pub reason: String,
+    pub reason_code: Vec<u8>,
+    pub signer_signature_hash: Sha256Sum,
+    pub chain_id: u32,
+    pub signature: MessageSignature,
+    pub server_version: String,
+    pub data: Vec<u8>,
+}
+
 /// Signer messages used by the epoch-4 `StackerDB` protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SignerMessage {
     BlockProposal(BlockProposal),
-    BlockResponse(BlockAcceptance),
+    BlockResponse(BlockResponse),
     BlockPushed(NakamotoBlock),
+}
+
+/// A signer's response to a proposed block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockResponse {
+    Accepted(BlockAcceptance),
+    Rejected(BlockRejection),
 }
 
 /// Wire prefixes for the signer messages this node consumes and produces.
@@ -125,20 +144,31 @@ impl SignerMessage {
             }
             1 => {
                 let response_type = reader.byte()?;
-                if response_type != 0 {
-                    return Err(SignerMessageError::InvalidResponseType(response_type));
-                }
-                let signer_signature_hash = Sha256Sum::from_bytes(reader.array()?);
-                let signature = MessageSignature::from_bytes(reader.array()?);
-                let server_version = reader.text()?;
-                let (full_extend_timestamp, read_count_extend_timestamp) =
-                    reader.response_data()?;
-                Self::BlockResponse(BlockAcceptance {
-                    signer_signature_hash,
-                    signature,
-                    server_version,
-                    full_extend_timestamp,
-                    read_count_extend_timestamp,
+                Self::BlockResponse(match response_type {
+                    0 => {
+                        let signer_signature_hash = Sha256Sum::from_bytes(reader.array()?);
+                        let signature = MessageSignature::from_bytes(reader.array()?);
+                        let server_version = reader.text()?;
+                        let (full_extend_timestamp, read_count_extend_timestamp) =
+                            reader.response_data()?;
+                        BlockResponse::Accepted(BlockAcceptance {
+                            signer_signature_hash,
+                            signature,
+                            server_version,
+                            full_extend_timestamp,
+                            read_count_extend_timestamp,
+                        })
+                    }
+                    1 => BlockResponse::Rejected(BlockRejection {
+                        reason: reader.text()?,
+                        reason_code: reader.rejection_code()?,
+                        signer_signature_hash: Sha256Sum::from_bytes(reader.array()?),
+                        chain_id: reader.u32()?,
+                        signature: MessageSignature::from_bytes(reader.array()?),
+                        server_version: reader.text()?,
+                        data: reader.rejection_data()?,
+                    }),
+                    kind => return Err(SignerMessageError::InvalidResponseType(kind)),
                 })
             }
             2 => Self::BlockPushed(reader.block()?),
@@ -164,13 +194,24 @@ impl SignerMessage {
                 writer.u64(proposal.reward_cycle);
                 writer.raw(&proposal.data);
             }
-            Self::BlockResponse(response) => {
+            Self::BlockResponse(BlockResponse::Accepted(response)) => {
                 writer.byte(SignerMessageType::BlockResponse as u8);
                 writer.byte(0);
                 writer.raw(response.signer_signature_hash.as_bytes());
                 writer.raw(response.signature.as_bytes());
                 writer.bytes(response.server_version.as_bytes())?;
                 writer.response_data(response)?;
+            }
+            Self::BlockResponse(BlockResponse::Rejected(response)) => {
+                writer.byte(SignerMessageType::BlockResponse as u8);
+                writer.byte(1);
+                writer.bytes(response.reason.as_bytes())?;
+                writer.raw(&response.reason_code);
+                writer.raw(response.signer_signature_hash.as_bytes());
+                writer.u32(response.chain_id);
+                writer.raw(response.signature.as_bytes());
+                writer.bytes(response.server_version.as_bytes())?;
+                writer.raw(&response.data);
             }
             Self::BlockPushed(block) => {
                 writer.byte(SignerMessageType::BlockPushed as u8);
@@ -299,6 +340,25 @@ impl<'a> Reader<'a> {
             return Err(SignerMessageError::TrailingBytes);
         }
         Ok((timestamp, read_count_timestamp))
+    }
+
+    fn rejection_code(&mut self) -> Result<Vec<u8>, SignerMessageError> {
+        let code = self.byte()?;
+        if code > 5 {
+            return Err(SignerMessageError::InvalidResponseType(code));
+        }
+        let mut bytes = vec![code];
+        if code == 0 {
+            bytes.push(self.byte()?);
+        }
+        Ok(bytes)
+    }
+
+    fn rejection_data(&mut self) -> Result<Vec<u8>, SignerMessageError> {
+        let start = self.offset;
+        self.byte()?;
+        self.bytes()?;
+        Ok(self.bytes[start..self.offset].to_vec())
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], SignerMessageError> {

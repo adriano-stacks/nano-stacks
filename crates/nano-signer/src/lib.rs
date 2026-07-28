@@ -14,7 +14,7 @@ use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
-    BlockAcceptance, BlockProposal, Chunk, ChunkAck, SignerMessage, StackerDbClient,
+    BlockAcceptance, BlockProposal, BlockResponse, Chunk, ChunkAck, SignerMessage, StackerDbClient,
     StackerDbClientError, StackerDbContract, StackerDbError,
 };
 use nano_sync::{SortitionInfo, SyncClient, SyncError};
@@ -395,7 +395,9 @@ impl SignerStateStore {
                     "stored chunk was not signed by this signer".to_owned(),
                 ));
             }
-            let SignerMessage::BlockResponse(response) = SignerMessage::decode(&chunk.data)? else {
+            let SignerMessage::BlockResponse(BlockResponse::Accepted(response)) =
+                SignerMessage::decode(&chunk.data)?
+            else {
                 return Err(SignerStateError::Invalid(
                     "stored chunk is not a block response".to_owned(),
                 ));
@@ -730,7 +732,10 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             .map_err(SignerError::Validation)?;
         let next_slot_version = self.next_slot_version;
         let signature = self.private_key.sign(signature_hash.as_bytes());
-        let message = SignerMessage::BlockResponse(BlockAcceptance::new(signature_hash, signature));
+        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
+            signature_hash,
+            signature,
+        )));
         self.record(
             position,
             signature_hash,

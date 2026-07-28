@@ -764,7 +764,7 @@ mod tests {
     use nano_node::CheckpointExecutor;
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use nano_signer::{ChainstateProposalValidator, ProposalValidator};
-    use nano_stackerdb::{BlockAcceptance, BlockProposal, Chunk, SignerMessage};
+    use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, Chunk, SignerMessage};
     use proptest::prelude::*;
     use serde::Deserialize;
     use stacks_common::util::{
@@ -2488,7 +2488,9 @@ mod tests {
         let key = StacksPrivateKey::from_seed(b"signer acceptance conformance");
         let digest = sha512_256(b"candidate block");
         let signature = key.sign(digest.as_bytes());
-        let message = SignerMessage::BlockResponse(BlockAcceptance::new(digest, signature));
+        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
+            digest, signature,
+        )));
         let encoded = message.encode().expect("encode signer message");
 
         let reference =
@@ -2507,6 +2509,33 @@ mod tests {
             accepted.response_data.tenure_extend_read_count_timestamp,
             u64::MAX
         );
+    }
+
+    #[test]
+    fn signer_rejection_round_trips_stacks_core() {
+        let key = ReferenceSecp256k1PrivateKey::from_seed(b"signer rejection conformance");
+        let digest = Sha512Trunc256Sum(*sha512_256(b"candidate block").as_bytes());
+        let response = libsigner::v0::messages::BlockResponse::rejected(
+            digest.clone(),
+            libsigner::v0::messages::RejectReason::InvalidMiner,
+            &key,
+            false,
+            17,
+            19,
+        );
+        let reference = libsigner::v0::messages::SignerMessage::BlockResponse(response);
+        let mut encoded = Vec::new();
+        reference
+            .consensus_serialize(&mut encoded)
+            .expect("encode stock rejection");
+
+        let decoded = SignerMessage::decode(&encoded).expect("nano decodes stock rejection");
+        let SignerMessage::BlockResponse(BlockResponse::Rejected(rejection)) = &decoded else {
+            panic!("nano did not decode a rejected response");
+        };
+        assert_eq!(rejection.reason, "The miner has been marked as invalid.");
+        assert_eq!(rejection.signer_signature_hash.as_bytes(), &digest.0);
+        assert_eq!(decoded.encode().expect("nano reencodes rejection"), encoded);
     }
 
     #[test]

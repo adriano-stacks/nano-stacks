@@ -13,8 +13,8 @@ use nano_bitcoin::{
 use nano_chainstate::{SignerSet, SignerSetError};
 use nano_crypto::{MessageSignature, StacksPrivateKey};
 use nano_stackerdb::{
-    BlockProposal, Chunk, ChunkAck, SignerMessage, SignerMessageError, StackerDbClient,
-    StackerDbClientError, StackerDbContract, StackerDbError,
+    BlockProposal, BlockResponse, Chunk, ChunkAck, SignerMessage, SignerMessageError,
+    StackerDbClient, StackerDbClientError, StackerDbContract, StackerDbError,
 };
 use nano_sync::{SyncClient, SyncError};
 use serde::Deserialize;
@@ -445,7 +445,9 @@ fn response_signatures(
     let expected_hash = proposal.block.header.signer_signature_hash();
     let mut signatures = Vec::new();
     for bytes in messages {
-        let SignerMessage::BlockResponse(response) = SignerMessage::decode(&bytes)? else {
+        let SignerMessage::BlockResponse(BlockResponse::Accepted(response)) =
+            SignerMessage::decode(&bytes)?
+        else {
             continue;
         };
         if response.signer_signature_hash == expected_hash {
@@ -470,7 +472,7 @@ mod tests {
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader, Signer, SignerSet};
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
-    use nano_stackerdb::{BlockAcceptance, BlockProposal, SignerMessage};
+    use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, SignerMessage};
 
     use super::{
         MinerError, finalize_block, funding_options, response_signatures,
@@ -539,16 +541,19 @@ mod tests {
             },
         ])
         .expect("valid signer set");
-        let stale = SignerMessage::BlockResponse(BlockAcceptance::new(
+        let stale = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
             Sha256Sum::from_bytes([9; 32]),
             first.sign(digest.as_bytes()),
-        ))
+        )))
         .encode()
         .expect("encode stale response");
         let second_response = second.sign(digest.as_bytes());
-        let active = SignerMessage::BlockResponse(BlockAcceptance::new(digest, second_response))
-            .encode()
-            .expect("encode active response");
+        let active = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
+            digest,
+            second_response,
+        )))
+        .encode()
+        .expect("encode active response");
 
         let signatures =
             response_signatures(&proposal, &set, vec![stale, active]).expect("threshold response");
