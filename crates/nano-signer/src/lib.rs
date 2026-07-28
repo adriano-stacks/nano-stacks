@@ -3,16 +3,69 @@
 use std::{collections::BTreeMap, fmt};
 
 use nano_crypto::StacksPrivateKey;
-use nano_primitives::{ConsensusHash, Sha256Sum};
+use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
     BlockAcceptance, BlockProposal, Chunk, ChunkAck, SignerMessage, StackerDbClient,
     StackerDbClientError, StackerDbContract, StackerDbError,
 };
+use nano_sync::SortitionInfo;
 
 /// Checks a miner proposal against the node's current chain and sortition view.
 pub trait ProposalValidator {
     /// Return an explanation when a proposal must not be signed.
     fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String>;
+}
+
+/// Validates that a proposal belongs to the expected Bitcoin sortition winner.
+#[derive(Clone, Debug)]
+pub struct SortitionProposalValidator {
+    sortition: SortitionInfo,
+    reward_cycle: u64,
+}
+
+impl SortitionProposalValidator {
+    /// Construct a validator for one reward cycle and its active sortition.
+    #[must_use]
+    pub const fn new(sortition: SortitionInfo, reward_cycle: u64) -> Self {
+        Self {
+            sortition,
+            reward_cycle,
+        }
+    }
+}
+
+impl ProposalValidator for SortitionProposalValidator {
+    fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
+        if proposal.reward_cycle != self.reward_cycle {
+            return Err("proposal reward cycle does not match the active cycle".to_owned());
+        }
+        if proposal.bitcoin_height != self.sortition.bitcoin_height {
+            return Err("proposal Bitcoin height does not match its sortition".to_owned());
+        }
+        if proposal.block.header.consensus_hash != self.sortition.consensus_hash {
+            return Err("proposal consensus hash does not match its sortition".to_owned());
+        }
+        if !self.sortition.was_sortition {
+            return Err("proposal consensus hash does not select a miner".to_owned());
+        }
+        let expected_key = self
+            .sortition
+            .miner_public_key_hash
+            .ok_or_else(|| "sortition does not identify a miner key".to_owned())?;
+        if !proposal.block.header.signer_signatures.is_empty() {
+            return Err("proposal already includes signer signatures".to_owned());
+        }
+        let miner_key = proposal
+            .block
+            .header
+            .miner_signature
+            .recover(proposal.block.header.miner_signature_hash().as_bytes())
+            .map_err(|error| format!("invalid miner signature: {error}"))?;
+        if hash160(&miner_key.to_bytes_compressed()) != expected_key {
+            return Err("proposal miner does not match the sortition winner".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for one signer writer slot.
@@ -168,9 +221,6 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
 
     /// Validate a proposed block and return the signed response chunk to upload.
     pub fn sign(&mut self, proposal: &BlockProposal) -> Result<Chunk, SignerError> {
-        self.validator
-            .validate(proposal)
-            .map_err(SignerError::Validation)?;
         let position = (
             proposal.block.header.consensus_hash,
             proposal.block.header.chain_length,
@@ -183,6 +233,9 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
                 Err(SignerError::Equivocation)
             };
         }
+        self.validator
+            .validate(proposal)
+            .map_err(SignerError::Validation)?;
         let next_slot_version = self
             .next_slot_version
             .checked_add(1)
@@ -256,10 +309,16 @@ impl<V: ProposalValidator> SignerService<V> {
 mod tests {
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
     use nano_crypto::StacksPrivateKey;
-    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
+    use nano_primitives::{
+        BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId, StacksBlockId,
+        TrieHash, hash160,
+    };
     use nano_stackerdb::{BlockProposal, SignerMessage};
+    use nano_sync::SortitionInfo;
 
-    use super::{EmbeddedSigner, ProposalValidator, SignerConfig, SignerError};
+    use super::{
+        EmbeddedSigner, ProposalValidator, SignerConfig, SignerError, SortitionProposalValidator,
+    };
 
     struct Accept;
 
@@ -301,6 +360,40 @@ mod tests {
             reward_cycle: 1,
             data: Vec::new(),
         }
+    }
+
+    fn valid_sortition_proposal() -> (BlockProposal, SortitionInfo) {
+        let miner = StacksPrivateKey::from_seed(b"miner");
+        let mut proposal = proposal();
+        proposal.block.header.miner_signature =
+            miner.sign(proposal.block.header.miner_signature_hash().as_bytes());
+        let sortition = SortitionInfo {
+            bitcoin_block_hash: BitcoinHeaderHash::from_bytes([1; 32]),
+            bitcoin_height: proposal.bitcoin_height,
+            bitcoin_timestamp: 1,
+            sortition_id: SortitionId::from_bytes([2; 32]),
+            parent_sortition_id: SortitionId::from_bytes([3; 32]),
+            consensus_hash: proposal.block.header.consensus_hash,
+            was_sortition: true,
+            miner_public_key_hash: Some(hash160(&miner.public_key().to_bytes_compressed())),
+            stacks_parent_consensus_hash: None,
+            last_sortition_consensus_hash: None,
+            committed_block_hash: None,
+        };
+        (proposal, sortition)
+    }
+
+    #[test]
+    fn sortition_validator_authenticates_the_winning_miner() {
+        let (proposal, sortition) = valid_sortition_proposal();
+        let mut validator = SortitionProposalValidator::new(sortition.clone(), 1);
+
+        validator.validate(&proposal).expect("valid proposal");
+
+        let mut unexpected_miner = sortition;
+        unexpected_miner.miner_public_key_hash = Some(Hash160::from_bytes([0; 20]));
+        let mut validator = SortitionProposalValidator::new(unexpected_miner, 1);
+        assert!(validator.validate(&proposal).is_err());
     }
 
     #[test]

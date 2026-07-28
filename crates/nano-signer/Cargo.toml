@@ -9,6 +9,7 @@ rust-version.workspace = true
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 nano-stackerdb = { path = "../nano-stackerdb" }
+nano-sync = { path = "../nano-sync" }
 
 [dev-dependencies]
 nano-chainstate = { path = "../nano-chainstate" }

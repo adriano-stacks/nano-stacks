@@ -1543,6 +1543,7 @@ dependencies = [
  "nano-crypto",
  "nano-primitives",
  "nano-stackerdb",
+ "nano-sync",
 ]
 
 [[package]]
