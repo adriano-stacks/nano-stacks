@@ -1220,12 +1220,35 @@ mod tests {
         let second_context = *snapshots
             .get(&second.header.consensus_hash.to_string())
             .expect("second Bitcoin context");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let bitcoin = FixtureBitcoinSource {
+            blocks: [
+                (first_context.height, &first.header.consensus_hash),
+                (second_context.height, &second.header.consensus_hash),
+            ]
+            .into_iter()
+            .map(|(height, consensus_hash)| {
+                (
+                    height,
+                    BitcoinBlock {
+                        height,
+                        hash: [0; 32],
+                        operations: bitcoin_operations
+                            .get(&consensus_hash.to_string())
+                            .expect("Bitcoin operations")
+                            .clone(),
+                    },
+                )
+            })
+            .collect(),
+        };
         let mut executor = CheckpointExecutor::from_checkpoint(
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
             root,
             first,
             first_context,
+            bitcoin,
         )
         .expect("open checkpoint executor");
 

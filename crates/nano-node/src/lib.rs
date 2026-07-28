@@ -2,6 +2,7 @@
 
 use std::{fmt, path::Path};
 
+use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
     AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
 };
@@ -29,16 +30,17 @@ pub struct NodeView {
 
 /// Executes a validated tenure stream from an imported checkpoint state.
 #[derive(Debug)]
-pub struct CheckpointExecutor {
+pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
     tip: NakamotoBlock,
+    bitcoin: S,
 }
 
 /// A follower that executes each accepted tenure update from a checkpointed state.
 #[derive(Debug)]
-pub struct ExecutingNode {
+pub struct ExecutingNode<S> {
     node: Node,
-    executor: CheckpointExecutor,
+    executor: CheckpointExecutor<S>,
     executed_view: Option<NodeView>,
 }
 
@@ -84,6 +86,7 @@ impl From<CheckpointExecutionError> for NodeExecutionError {
 #[derive(Debug)]
 pub enum CheckpointExecutionError {
     ChainState(ChainStateError),
+    Bitcoin(String),
     Link(String),
 }
 
@@ -91,6 +94,7 @@ impl fmt::Display for CheckpointExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChainState(error) => write!(formatter, "checkpoint execution failed: {error}"),
+            Self::Bitcoin(error) => write!(formatter, "Bitcoin operation loading failed: {error}"),
             Self::Link(error) => {
                 write!(formatter, "checkpoint execution chain link failed: {error}")
             }
@@ -102,7 +106,7 @@ impl std::error::Error for CheckpointExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ChainState(error) => Some(error),
-            Self::Link(_) => None,
+            Self::Bitcoin(_) | Self::Link(_) => None,
         }
     }
 }
@@ -113,7 +117,11 @@ impl From<ChainStateError> for CheckpointExecutionError {
     }
 }
 
-impl CheckpointExecutor {
+impl<S> CheckpointExecutor<S>
+where
+    S: BitcoinSource,
+    S::Error: fmt::Display,
+{
     /// Import a checkpoint and apply its first known descendant as the execution anchor.
     pub fn from_checkpoint(
         path: impl AsRef<Path>,
@@ -121,16 +129,22 @@ impl CheckpointExecutor {
         state_root: TrieHash,
         anchor: NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
+        mut bitcoin: S,
     ) -> Result<Self, CheckpointExecutionError> {
         let mut chainstate = ChainState::from_checkpoint(path, source, state_root)?;
-        chainstate.append_nakamoto_block_with_bitcoin_context(
+        let operations = bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        chainstate.append_nakamoto_block_with_bitcoin_operations(
             bitcoin_context,
+            &operations.operations,
             Some(source),
             &anchor,
         )?;
         Ok(Self {
             chainstate,
             tip: anchor,
+            bitcoin,
         })
     }
 
@@ -152,8 +166,16 @@ impl CheckpointExecutor {
             blocks.next();
         }
         let mut applied = Vec::new();
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
         for block in blocks {
-            applied.push(self.apply(block, bitcoin_context)?);
+            applied.push(self.apply_with_operations(
+                block,
+                bitcoin_context,
+                &operations.operations,
+            )?);
         }
         Ok(applied)
     }
@@ -164,14 +186,31 @@ impl CheckpointExecutor {
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        self.apply_with_operations(block, bitcoin_context, &operations.operations)
+    }
+
+    /// Validate and execute one direct descendant with decoded Bitcoin operations.
+    pub fn apply_with_operations(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[nano_bitcoin::BitcoinOperation],
+    ) -> Result<AppliedBlock, CheckpointExecutionError> {
         block
             .validate_successor(&self.tip.header)
             .map_err(|error| CheckpointExecutionError::Link(error.to_string()))?;
-        let applied = self.chainstate.append_nakamoto_block_with_bitcoin_context(
-            bitcoin_context,
-            Some(*self.tip.block_id().as_bytes()),
-            block,
-        )?;
+        let applied = self
+            .chainstate
+            .append_nakamoto_block_with_bitcoin_operations(
+                bitcoin_context,
+                operations,
+                Some(*self.tip.block_id().as_bytes()),
+                block,
+            )?;
         self.tip = block.clone();
         Ok(applied)
     }
@@ -220,10 +259,14 @@ impl Node {
     }
 }
 
-impl ExecutingNode {
+impl<S> ExecutingNode<S>
+where
+    S: BitcoinSource,
+    S::Error: fmt::Display,
+{
     /// Couple a peer follower to a checkpoint executor.
     #[must_use]
-    pub const fn new(node: Node, executor: CheckpointExecutor) -> Self {
+    pub const fn new(node: Node, executor: CheckpointExecutor<S>) -> Self {
         Self {
             node,
             executor,
