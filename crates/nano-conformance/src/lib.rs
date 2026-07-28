@@ -2537,6 +2537,12 @@ mod tests {
         assert_eq!(proposal.block.encode(), bytes);
         assert_eq!(proposal.bitcoin_height, 1_110);
         assert_eq!(proposal.reward_cycle, 1);
+        assert_eq!(
+            SignerMessage::BlockProposal(proposal)
+                .encode()
+                .expect("nano encodes proposal"),
+            encoded
+        );
     }
 
     #[test]
