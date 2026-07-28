@@ -27,8 +27,11 @@ use stacks_common::address::{
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
+use stacks_common::util::ed25519::ed25519_verify;
 use stacks_common::util::hash::{Keccak256Hash, Sha512Sum, Sha512Trunc256Sum};
-use stacks_common::util::secp256k1::{secp256k1_recover, secp256k1_verify, Secp256k1PublicKey};
+use stacks_common::util::secp256k1::{
+    secp256k1_decompress, secp256k1_recover, secp256k1_verify, Secp256k1PublicKey,
+};
 use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
     AsContextMut, Caller, Engine, ExternRef, Global, GlobalType, Instance, Linker, Memory, Module,
@@ -353,6 +356,8 @@ pub fn link_host_functions(
     link_secp256k1_recover_fn(linker)?;
     link_secp256k1_verify_fn(linker)?;
     link_secp256r1_verify_fn(linker)?;
+    link_ed25519_verify_fn(linker)?;
+    link_secp256k1_decompress_fn(linker)?;
     link_principal_of_fn(linker)?;
     link_save_constant_fn(linker)?;
     link_load_constant_fn(linker)?;
@@ -6399,6 +6404,124 @@ fn link_secp256r1_verify_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "secp256r1_verify".into(),
+                error,
+            ))
+        })
+}
+
+fn link_ed25519_verify_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "ed25519_verify",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             message_offset: i32,
+             message_length: i32,
+             signature_offset: i32,
+             signature_length: i32,
+             public_key_offset: i32,
+             public_key_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let message =
+                    read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
+                let signature =
+                    read_bytes_from_wasm(memory, &mut caller, signature_offset, signature_length)?;
+                let public_key = read_bytes_from_wasm(
+                    memory,
+                    &mut caller,
+                    public_key_offset,
+                    public_key_length,
+                )?;
+                if signature.len() != 64 {
+                    return Err(RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(TypeSignature::BUFFER_64),
+                        Value::buff_from(signature)?.to_error_string(),
+                    )
+                    .into());
+                }
+                if public_key.len() != 32 {
+                    return Err(RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(TypeSignature::BUFFER_32),
+                        Value::buff_from(public_key)?.to_error_string(),
+                    )
+                    .into());
+                }
+                let signature: [u8; 64] = signature.try_into().map_err(|_| {
+                    crate::error::wasm_error(WasmError::Expect("signature length changed".into()))
+                })?;
+                let public_key: [u8; 32] = public_key.try_into().map_err(|_| {
+                    crate::error::wasm_error(WasmError::Expect("public key length changed".into()))
+                })?;
+                Ok(ed25519_verify(&message, &signature, &public_key).is_ok() as i32)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "ed25519_verify".into(),
+                error,
+            ))
+        })
+}
+
+fn link_secp256k1_decompress_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "secp256k1_decompress",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             public_key_offset: i32,
+             public_key_length: i32,
+             return_offset: i32,
+             _return_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let public_key = read_bytes_from_wasm(
+                    memory,
+                    &mut caller,
+                    public_key_offset,
+                    public_key_length,
+                )?;
+                if public_key.len() != 33 {
+                    return Err(RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(TypeSignature::BUFFER_33),
+                        Value::buff_from(public_key)?.to_error_string(),
+                    )
+                    .into());
+                }
+                let return_type = TypeSignature::new_response(
+                    TypeSignature::SequenceType(SequenceSubtype::BufferType(
+                        BufferLength::try_from(65usize)?,
+                    )),
+                    TypeSignature::UIntType,
+                )?;
+                let result = match secp256k1_decompress(&public_key) {
+                    Ok(key) => Value::okay(Value::buff_from(key.to_vec())?)?,
+                    Err(_) => Value::err_uint(1),
+                };
+                write_to_wasm(
+                    caller,
+                    memory,
+                    &return_type,
+                    return_offset,
+                    return_offset + get_type_size(&return_type),
+                    &result,
+                    true,
+                )?;
+                Ok(())
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "secp256k1_decompress".into(),
                 error,
             ))
         })

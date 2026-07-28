@@ -1,5 +1,6 @@
 use clar2wasm::tools::TestEnvironment;
 use clarity::types::StacksEpochId;
+use clarity::vm::types::ResponseData;
 use clarity::vm::{ClarityVersion, Value};
 use stacks_common::util::secp256r1::{Secp256r1PrivateKey, Secp256r1PublicKey};
 
@@ -57,4 +58,24 @@ fn evaluates_secp256r1_verify_in_wasm() {
         environment.call_contract("snippet", "verify", &[]),
         Ok(Value::Bool(true))
     );
+}
+
+#[test]
+fn evaluates_clarity6_crypto_words_in_wasm() {
+    let source = "
+        (define-read-only (ed) (ed25519-verify 0x00 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 0x0000000000000000000000000000000000000000000000000000000000000000))
+        (define-read-only (uncompress) (secp256k1-decompress? 0x03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110))";
+    let mut environment = TestEnvironment::new(StacksEpochId::Epoch40, ClarityVersion::Clarity6);
+    assert_eq!(environment.evaluate(source), Ok(None));
+    assert_eq!(
+        environment.call_contract("snippet", "ed", &[]),
+        Ok(Value::Bool(false))
+    );
+    assert!(matches!(
+        environment.call_contract("snippet", "uncompress", &[]),
+        Ok(Value::Response(ResponseData {
+            committed: true,
+            ..
+        }))
+    ));
 }
