@@ -21,7 +21,7 @@ Clarity receipts and state roots as stacks-core.
 - [x] Execute decoded contract deployments and contract calls through the Epoch 4 VM.
 - [x] Execute decoded token-transfer payloads through the Epoch 4 VM.
 - [x] Apply transaction fees and account nonces.
-- [ ] Apply coinbase and tenure changes.
+- [x] Apply coinbase and tenure changes.
 - [ ] Enforce post-conditions and transaction-level runtime error semantics.
 - [ ] Carry block-level cost limits and receipt costs/events through execution.
 - [x] Replay captured blocks from the checkpoint and report the exact first divergence.
