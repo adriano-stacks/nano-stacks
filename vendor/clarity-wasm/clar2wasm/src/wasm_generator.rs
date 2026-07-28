@@ -105,8 +105,13 @@ impl Bindings {
         self.0.contains_key(name)
     }
 
-    pub(crate) fn get_locals(&self, name: &ClarityName) -> Option<&[LocalId]> {
-        self.0.get(name).map(|b| b.locals.as_slice())
+    pub(crate) fn get_locals_and_type(
+        &self,
+        name: &ClarityName,
+    ) -> Option<(Vec<LocalId>, TypeSignature)> {
+        self.0
+            .get(name)
+            .map(|binding| (binding.locals.clone(), binding.ty.clone()))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -681,6 +686,7 @@ impl WasmGenerator {
         // Setup the parameters
         let mut param_locals = Vec::new();
         let mut params_types = Vec::new();
+        let mut parameters = Vec::new();
         let mut reused_arg = None;
         for param in function_type.args.iter() {
             // Interpreter returns the first reused arg as NameAlreadyUsed argument
@@ -696,7 +702,8 @@ impl WasmGenerator {
                 plocals.push(local);
                 params_types.push(ty);
             }
-            bindings.insert(param.name.clone(), param.signature.clone(), plocals);
+            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone());
+            parameters.push((param.signature.clone(), plocals));
         }
 
         let results_types = clar2wasm_ty(&function_type.returns);
@@ -714,6 +721,20 @@ impl WasmGenerator {
         func_body
             .global_get(self.stack_pointer)
             .local_set(frame_pointer);
+        self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
+        for (parameter_type, locals) in &parameters {
+            for local in locals {
+                func_body.local_get(*local);
+            }
+            let serialization_type = self.type_for_serialization(parameter_type);
+            self.serialization_size(&mut func_body, &serialization_type)?;
+            let size = self.borrow_local(ValType::I32);
+            func_body.local_set(*size);
+            for _ in clar2wasm_ty(parameter_type) {
+                func_body.drop();
+            }
+            self.charge_inner_type_check(&mut func_body, *size)?;
+        }
 
         // Setup the locals map for this function, saving the top-level map to
         // restore after.
@@ -1812,13 +1833,19 @@ impl WasmGenerator {
         }
 
         // Handle parameters and local bindings
-        let values = self.bindings.get_locals(atom).ok_or_else(|| {
+        let (values, ty) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
 
         for value in values {
-            builder.local_get(*value);
+            builder.local_get(value);
         }
+        self.charge_lookup_variable_depth(builder, 0)?;
+        let serialization_type = self.type_for_serialization(&ty);
+        self.serialization_size(builder, &serialization_type)?;
+        let size = self.borrow_local(ValType::I32);
+        builder.local_set(*size);
+        self.charge_lookup_variable_size(builder, *size)?;
 
         Ok(())
     }
@@ -1860,6 +1887,7 @@ impl WasmGenerator {
                 )));
             }
         };
+        self.charge_lookup_function(builder)?;
         self.traverse_args(builder, args)?;
 
         let expected_ty = self

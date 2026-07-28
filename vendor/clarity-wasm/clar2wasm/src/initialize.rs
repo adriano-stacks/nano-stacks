@@ -1,6 +1,7 @@
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::contexts::GlobalContext;
-use clarity::vm::costs::CostTracker;
+use clarity::vm::costs::cost_functions::ClarityCostFunction;
+use clarity::vm::costs::{CostTracker, runtime_cost};
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
@@ -450,6 +451,14 @@ pub fn call_function(
     sponsor: Option<PrincipalData>,
     module_cache: &ModuleCache,
 ) -> Result<Value, VmExecutionError> {
+    let contract_size = global_context
+        .database
+        .get_contract_size(&contract_context.contract_identifier)?;
+    runtime_cost(
+        ClarityCostFunction::LoadContract,
+        global_context,
+        contract_size,
+    )?;
     let function = contract_context
         .lookup_function(function_name)
         .ok_or_else(|| {
@@ -491,9 +500,9 @@ pub fn call_function(
         global_context,
         contract_context,
         call_stack,
-        sender,
+        sender.clone(),
         caller,
-        sponsor,
+        sponsor.clone(),
         Some(&module.analysis),
         module_cache,
     );
@@ -553,19 +562,33 @@ pub fn call_function(
         )))?
         .remaining_costs(&mut store)
         .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    let cost = CostMeter::used_from_remaining(remaining);
     store
         .data_mut()
         .global_context
         .cost_track
-        .add_cost(CostMeter::used_from_remaining(remaining).into())?;
+        .add_cost(cost.into())?;
     call_result.map_err(|error| {
         error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
     })?;
     let (value, _) =
         wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?;
-    value.ok_or(crate::error::wasm_error(WasmError::Expect(
+    drop(store);
+    let value = value.ok_or(crate::error::wasm_error(WasmError::Expect(
         "function returned no value".into(),
-    )))
+    )))?;
+    if let Some(handler) = global_context.database.get_cc_special_cases_handler() {
+        handler(
+            global_context,
+            sender.as_ref(),
+            sponsor.as_ref(),
+            &contract_context.contract_identifier,
+            function_name,
+            arguments,
+            &value,
+        )?;
+    }
+    Ok(value)
 }
 
 fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Value {

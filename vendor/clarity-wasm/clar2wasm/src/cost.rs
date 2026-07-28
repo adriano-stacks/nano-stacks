@@ -234,6 +234,64 @@ impl ChargeGenerator for WasmGenerator {
     }
 }
 
+impl WasmGenerator {
+    pub fn charge_user_function_application(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        argument_count: u32,
+    ) -> Result<()> {
+        if let Some((context, module)) = self.cost_context() {
+            context.emit_runtime(
+                instrs,
+                module,
+                Caf::Linear { a: 26, b: 5 },
+                argument_count,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn charge_inner_type_check(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        size: LocalId,
+    ) -> Result<()> {
+        if let Some((context, module)) = self.cost_context() {
+            context.emit_runtime(instrs, module, Caf::Linear { a: 2, b: 5 }, size)?;
+        }
+        Ok(())
+    }
+
+    pub fn charge_lookup_function(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
+        if let Some((context, module)) = self.cost_context() {
+            context.emit_runtime(instrs, module, Caf::Constant(16), 0_u32)?;
+        }
+        Ok(())
+    }
+
+    pub fn charge_lookup_variable_depth(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        depth: u32,
+    ) -> Result<()> {
+        if let Some((context, module)) = self.cost_context() {
+            context.emit_runtime(instrs, module, Caf::Linear { a: 1, b: 1 }, depth)?;
+        }
+        Ok(())
+    }
+
+    pub fn charge_lookup_variable_size(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        size: LocalId,
+    ) -> Result<()> {
+        if let Some((context, module)) = self.cost_context() {
+            context.emit_runtime(instrs, module, Caf::Linear { a: 2, b: 1 }, size)?;
+        }
+        Ok(())
+    }
+}
+
 /// A 32-bit unsigned integer to be resolved at either compile-time or run-time.
 #[derive(Clone, Copy)]
 pub enum Scalar {
@@ -297,6 +355,23 @@ pub struct ChargeContext {
 }
 
 impl ChargeContext {
+    fn emit_runtime(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        module: &Module,
+        cost: Caf,
+        n: impl Into<Scalar>,
+    ) -> Result<()> {
+        self.emit_with_caf(
+            instrs,
+            module,
+            cost,
+            self.runtime,
+            ErrorMap::CostOverrunRuntime as _,
+            n,
+        )
+    }
+
     fn word_cost(&self, name: &ClarityName) -> Option<&WordCost> {
         match self.epoch {
             StacksEpochId::Epoch10 => panic!("clarity did not exist in epoch 1"),
