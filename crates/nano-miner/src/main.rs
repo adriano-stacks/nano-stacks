@@ -52,7 +52,7 @@ struct Cli {
     anchor_bitcoin_height: u64,
     /// Bitcoin height at which PoX-5 activates.
     #[arg(long)]
-    pox_5_activation_height: u32,
+    pox_5_activation_height: Option<u32>,
     /// Bitcoin height used when evaluating PoX-1 STX locks.
     #[arg(long)]
     pox_v1_unlock_height: u32,
@@ -89,7 +89,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     anchor_context.v1_unlock_height = cli.pox_v1_unlock_height;
     anchor_context.v2_unlock_height = cli.pox_v2_unlock_height;
     anchor_context.v3_unlock_height = cli.pox_v3_unlock_height;
-    anchor_context.pox_5_activation_height = cli.pox_5_activation_height;
+    if let Some(height) = cli.pox_5_activation_height {
+        anchor_context.pox_5_activation_height = height;
+    }
 
     let source = parse_array(&cli.source_state_id)?;
     let root = TrieHash::from_bytes(parse_array(&cli.state_root)?);
@@ -114,7 +116,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     candidate_context.v1_unlock_height = cli.pox_v1_unlock_height;
     candidate_context.v2_unlock_height = cli.pox_v2_unlock_height;
     candidate_context.v3_unlock_height = cli.pox_v3_unlock_height;
-    candidate_context.pox_5_activation_height = cli.pox_5_activation_height;
+    if let Some(height) = cli.pox_5_activation_height {
+        candidate_context.pox_5_activation_height = height;
+    }
     let miner_key = StacksPrivateKey::from_bytes(parse_array(&cli.private_key)?)?;
     let (block, applied) = chainstate.assemble_nakamoto_block_with_bitcoin_context(
         candidate_context,

@@ -51,7 +51,7 @@ enum Command {
         anchor_bitcoin_height: u64,
         /// Bitcoin height at which PoX-5 activates for this network.
         #[arg(long)]
-        pox_5_activation_height: u32,
+        pox_5_activation_height: Option<u32>,
         /// Bitcoin height used when evaluating PoX-1 STX locks.
         #[arg(long)]
         pox_v1_unlock_height: u32,
@@ -104,7 +104,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bitcoin_context.v1_unlock_height = pox_v1_unlock_height;
     bitcoin_context.v2_unlock_height = pox_v2_unlock_height;
     bitcoin_context.v3_unlock_height = pox_v3_unlock_height;
-    bitcoin_context.pox_5_activation_height = pox_5_activation_height;
+    if let Some(height) = pox_5_activation_height {
+        bitcoin_context.pox_5_activation_height = height;
+    }
     let source = parse_array(&source_state_id)?;
     let root = TrieHash::from_bytes(parse_array(&state_root)?);
     let anchor = NakamotoBlock::decode(&fs::read(anchor_block)?)?;

@@ -136,6 +136,15 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWir
         reward_phase_block_length: pox.reward_phase_length,
         reward_slots: pox.reward_slots,
         rejection_fraction: pox.rejection_fraction,
+        contract_versions: pox
+            .pox_5_activation_height
+            .map(|height| {
+                vec![PoxContractVersionWire {
+                    activation_burnchain_block_height: height,
+                    contract_id: "ST000000000000000000002AMW42H.pox-5".to_owned(),
+                }]
+            })
+            .unwrap_or_default(),
     }))
 }
 
@@ -252,6 +261,13 @@ struct PoxInfoWire {
     reward_phase_block_length: u32,
     reward_slots: u32,
     rejection_fraction: Option<u64>,
+    contract_versions: Vec<PoxContractVersionWire>,
+}
+
+#[derive(Serialize)]
+struct PoxContractVersionWire {
+    activation_burnchain_block_height: u32,
+    contract_id: String,
 }
 
 #[derive(Serialize)]
@@ -352,6 +368,7 @@ mod tests {
                 reward_phase_length: 15,
                 reward_slots: 2,
                 rejection_fraction: None,
+                pox_5_activation_height: Some(262),
             },
             tenures: vec![FollowedTenure {
                 info: TenureInfo {

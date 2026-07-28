@@ -82,6 +82,7 @@ pub struct PoxInfo {
     pub reward_phase_length: u32,
     pub reward_slots: u32,
     pub rejection_fraction: Option<u64>,
+    pub pox_5_activation_height: Option<u32>,
 }
 
 /// The active waterfall payout address and threshold signer set for one reward cycle.
@@ -112,7 +113,7 @@ impl PoxInfo {
             v1_unlock_height: u32::MAX,
             v2_unlock_height: u32::MAX,
             v3_unlock_height: u32::MAX,
-            pox_5_activation_height: u32::MAX,
+            pox_5_activation_height: self.pox_5_activation_height.unwrap_or(u32::MAX),
         }
     }
 }
@@ -244,6 +245,11 @@ impl SyncClient {
             reward_phase_length: response.reward_phase_block_length,
             reward_slots: response.reward_slots,
             rejection_fraction: response.rejection_fraction,
+            pox_5_activation_height: response
+                .contract_versions
+                .iter()
+                .find(|version| version.contract_id.ends_with(".pox-5"))
+                .map(|version| version.activation_burnchain_block_height),
         })
     }
 
@@ -564,6 +570,14 @@ struct PoxInfoWire {
     reward_phase_block_length: u32,
     reward_slots: u32,
     rejection_fraction: Option<u64>,
+    #[serde(default)]
+    contract_versions: Vec<PoxContractVersionWire>,
+}
+
+#[derive(Deserialize)]
+struct PoxContractVersionWire {
+    activation_burnchain_block_height: u32,
+    contract_id: String,
 }
 
 #[derive(Deserialize)]
