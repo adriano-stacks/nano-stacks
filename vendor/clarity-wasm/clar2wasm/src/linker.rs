@@ -7292,6 +7292,12 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
 
     linker.func_wrap(
         "clarity",
+        "with_pox",
+        |_allowance_ref: Option<ExternRef>| Ok(()),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
         "with_stx",
         |_allowance_ref: Option<ExternRef>, _amount_lo: i64, _amount_hi: i64| {
             println!("with_stx: enter");
@@ -7774,6 +7780,60 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
             println!("secp256k1_verify");
             Ok(0i32)
         },
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "secp256r1_verify",
+        |_msg_offset: i32,
+         _msg_length: i32,
+         _sig_offset: i32,
+         _sig_length: i32,
+         _pk_offset: i32,
+         _pk_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "ed25519_verify",
+        |_msg_offset: i32,
+         _msg_length: i32,
+         _sig_offset: i32,
+         _sig_length: i32,
+         _pk_offset: i32,
+         _pk_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "secp256k1_decompress",
+        |_pk_offset: i32, _pk_length: i32, _return_offset: i32, _return_length: i32| Ok(()),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "verify_merkle_proof",
+        |_leaf_offset: i32,
+         _leaf_length: i32,
+         _root_offset: i32,
+         _root_length: i32,
+         _index_low: i64,
+         _index_high: i64,
+         _count_low: i64,
+         _count_high: i64,
+         _siblings_offset: i32,
+         _siblings_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "get_bitcoin_tx_output",
+        |_tx_offset: i32,
+         _tx_length: i32,
+         _vout_low: i64,
+         _vout_high: i64,
+         _return_offset: i32,
+         _return_length: i32| Ok(()),
     )?;
 
     linker.func_wrap(

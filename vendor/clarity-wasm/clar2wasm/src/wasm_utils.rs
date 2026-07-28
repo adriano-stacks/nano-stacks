@@ -18,6 +18,29 @@ use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
 
+fn invalid_utf8_scalar_representation() -> VmExecutionError {
+    crate::error::wasm_error(WasmError::WasmGeneratorError(
+        "invalid string-utf8 scalar representation".into(),
+    ))
+}
+
+fn clarity_utf8_from_wasm_scalars(scalars: &[u8]) -> Result<Value, VmExecutionError> {
+    let chunks = scalars.chunks_exact(4);
+    if !chunks.remainder().is_empty() {
+        return Err(invalid_utf8_scalar_representation());
+    }
+
+    let mut bytes = Vec::with_capacity(scalars.len());
+    for scalar in chunks {
+        let code_point = u32::from_be_bytes([scalar[0], scalar[1], scalar[2], scalar[3]]);
+        let character =
+            char::from_u32(code_point).ok_or_else(invalid_utf8_scalar_representation)?;
+        let mut encoded = [0; 4];
+        bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+    }
+    Value::string_utf8_from_bytes(bytes).map_err(Into::into)
+}
+
 #[allow(non_snake_case)]
 pub enum MintAssetErrorCodes {
     ALREADY_EXIST = 1,
@@ -220,7 +243,7 @@ pub fn wasm_to_clarity_value(
             memory
                 .read(store, offset as usize, &mut string_buffer)
                 .map_err(|e| crate::error::wasm_error(WasmError::UnableToReadMemory(e.into())))?;
-            Ok((Some(Value::string_utf8_from_bytes(string_buffer)?), 2))
+            Ok((Some(clarity_utf8_from_wasm_scalars(&string_buffer)?), 2))
         }
         TypeSignature::SequenceType(SequenceSubtype::BufferType(_buffer_length)) => {
             let offset = buffer[value_index]
@@ -420,7 +443,7 @@ pub fn read_from_wasm(
             memory
                 .read(store, offset as usize, &mut buffer)
                 .map_err(|e| crate::error::wasm_error(WasmError::Runtime(e.into())))?;
-            Value::string_utf8_from_bytes(buffer).map_err(|e| e.into())
+            clarity_utf8_from_wasm_scalars(&buffer)
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
