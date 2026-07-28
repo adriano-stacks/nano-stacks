@@ -567,7 +567,13 @@ impl ComplexWord for Concat {
         expr: &SymbolicExpression,
         args: &[clarity::vm::SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
+        check_args!(
+            generator,
+            builder,
+            2,
+            args.len(),
+            ArgumentCountCheck::AtLeast
+        );
 
         let memory = generator.get_memory()?;
 
@@ -578,53 +584,37 @@ impl ComplexWord for Concat {
             .clone();
         let (offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
 
-        builder.local_get(offset);
+        let length = generator.module.locals.add(ValType::I32);
+        builder.i32_const(0).local_set(length);
 
-        // Traverse the lhs, leaving it on the data stack (offset, size)
-        let lhs = args.get_expr(0)?;
-        // WORKAROUND: typechecker issue for lists
-        generator.set_expr_type(lhs, ty.clone())?;
-        generator.traverse_expr(builder, lhs)?;
+        for arg in args {
+            // WORKAROUND: typechecker issue for lists
+            generator.set_expr_type(arg, ty.clone())?;
+            generator.traverse_expr(builder, arg)?;
 
-        // Save the length of the lhs
-        let lhs_length = generator.module.locals.add(ValType::I32);
-        builder.local_tee(lhs_length);
+            let arg_length = generator.module.locals.add(ValType::I32);
+            let arg_offset = generator.module.locals.add(ValType::I32);
+            builder.local_set(arg_length).local_set(arg_offset);
 
-        // Copy the lhs to the new sequence
-        builder.memory_copy(memory, memory);
+            builder
+                .local_get(offset)
+                .local_get(length)
+                .binop(BinaryOp::I32Add)
+                .local_get(arg_offset)
+                .local_get(arg_length)
+                .memory_copy(memory, memory);
 
-        // Load the adjusted destination offset
-        builder
-            .local_get(offset)
-            .local_get(lhs_length)
-            .binop(BinaryOp::I32Add);
+            builder
+                .local_get(length)
+                .local_get(arg_length)
+                .binop(BinaryOp::I32Add)
+                .local_set(length);
+        }
 
-        // Traverse the rhs, leaving it on the data stack (offset, size)
-        let rhs = args.get_expr(1)?;
-        // WORKAROUND: typechecker issue for lists
-        generator.set_expr_type(rhs, ty.clone())?;
-        generator.traverse_expr(builder, rhs)?;
-
-        // Save the length of the rhs
-        let rhs_length = generator.module.locals.add(ValType::I32);
-        builder.local_tee(rhs_length);
-
-        // Copy the rhs to the new sequence
-        builder.memory_copy(memory, memory);
-
-        // Load the offset of the new sequence
-        builder.local_get(offset);
-
-        // Total size = lhs_length + rhs_length
-        builder
-            .local_get(lhs_length)
-            .local_get(rhs_length)
-            .binop(BinaryOp::I32Add);
+        builder.local_get(offset).local_get(length);
 
         // we charge after the operation since that's the only time we have the
         // length of the resulting list
-        let length = generator.module.locals.add(ValType::I32);
-        builder.local_tee(length);
         self.charge(generator, builder, length)?;
 
         Ok(())

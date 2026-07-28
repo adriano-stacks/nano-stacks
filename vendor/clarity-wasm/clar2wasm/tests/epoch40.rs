@@ -110,3 +110,16 @@ fn evaluates_clarity6_bitcoin_words_in_wasm() {
         "{output:?}"
     );
 }
+
+#[test]
+fn evaluates_variadic_concat_in_wasm() {
+    let mut environment = TestEnvironment::new(StacksEpochId::Epoch40, ClarityVersion::Clarity6);
+    assert_eq!(
+        environment.evaluate("(define-read-only (join) (concat 0x01 0x0203 0x04))"),
+        Ok(None)
+    );
+    assert_eq!(
+        environment.call_contract("snippet", "join", &[]),
+        Ok(Value::buff_from(vec![1, 2, 3, 4]).unwrap())
+    );
+}
