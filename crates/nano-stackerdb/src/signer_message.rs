@@ -273,11 +273,17 @@ impl<'a> Reader<'a> {
             return Err(SignerMessageError::InvalidResponseType(1));
         }
         if version < 4 {
+            if !data.is_empty() {
+                return Err(SignerMessageError::TrailingBytes);
+            }
             return Ok((timestamp, u64::MAX));
         }
         let read_count_timestamp = data.u64()?;
         if version >= 5 && data.byte()? != 0 {
             data.take(32)?;
+        }
+        if !data.is_empty() {
+            return Err(SignerMessageError::TrailingBytes);
         }
         Ok((timestamp, read_count_timestamp))
     }

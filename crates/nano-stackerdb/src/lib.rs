@@ -451,6 +451,37 @@ mod tests {
         assert_eq!(decoded, message);
     }
 
+    #[test]
+    fn block_acceptance_rejects_unused_response_data() {
+        let key = StacksPrivateKey::from_seed(b"signer-message");
+        let digest = sha512_256(b"proposed block");
+        let message =
+            SignerMessage::BlockResponse(BlockAcceptance::new(digest, key.sign(digest.as_bytes())));
+        let mut bytes = message.encode().expect("encode message");
+        let server_version_length_offset = 2 + 32 + 65;
+        let server_version_length = usize::try_from(u32::from_be_bytes(
+            bytes[server_version_length_offset..server_version_length_offset + 4]
+                .try_into()
+                .expect("server version length"),
+        ))
+        .expect("u32 fits usize");
+        let response_data_length_offset =
+            server_version_length_offset + 4 + server_version_length + 1;
+        let response_data_length = u32::from_be_bytes(
+            bytes[response_data_length_offset..response_data_length_offset + 4]
+                .try_into()
+                .expect("response data length"),
+        );
+        bytes[response_data_length_offset..response_data_length_offset + 4]
+            .copy_from_slice(&(response_data_length + 1).to_be_bytes());
+        bytes.push(0);
+
+        assert!(matches!(
+            SignerMessage::decode(&bytes),
+            Err(super::SignerMessageError::TrailingBytes)
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires a local Hacknet node on port 20443"]
     async fn hacknet_miners_stackerdb_is_readable() {
