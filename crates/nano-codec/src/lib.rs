@@ -1091,7 +1091,7 @@ fn read_stacks_string(reader: &mut Reader<'_>) -> Result<String, CodecError> {
     let bytes = reader.take(length)?;
     if !bytes
         .iter()
-        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        .all(|byte| byte.is_ascii_graphic() || matches!(*byte, b' ' | b'\t' | b'\n'))
     {
         return Err(CodecError::InvalidString);
     }
@@ -1968,7 +1968,25 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use super::{NonFungibleCondition, PostConditionData, PostConditionMode, Transaction};
+    use super::{
+        CodecError, NonFungibleCondition, PostConditionData, PostConditionMode, Reader,
+        Transaction, read_stacks_string,
+    };
+
+    #[test]
+    fn stacks_strings_allow_tabs_and_newlines() {
+        let mut reader = Reader::new(b"\0\0\0\x0aline\n\ttext");
+        assert_eq!(
+            read_stacks_string(&mut reader).expect("valid source string"),
+            "line\n\ttext"
+        );
+
+        let mut reader = Reader::new(b"\0\0\0\x0aline\r\ttext");
+        assert_eq!(
+            read_stacks_string(&mut reader),
+            Err(CodecError::InvalidString)
+        );
+    }
 
     #[test]
     fn sip040_post_condition_tags_match_the_protocol() {
