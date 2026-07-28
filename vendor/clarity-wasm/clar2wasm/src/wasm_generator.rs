@@ -93,6 +93,7 @@ pub(crate) struct Bindings {
 struct InnerBindings {
     locals: Vec<LocalId>,
     ty: TypeSignature,
+    value_ty: TypeSignature,
 }
 
 impl Bindings {
@@ -101,7 +102,24 @@ impl Bindings {
     }
 
     pub(crate) fn insert(&mut self, name: ClarityName, ty: TypeSignature, locals: Vec<LocalId>) {
-        self.values.insert(name, InnerBindings { locals, ty });
+        self.insert_with_value_type(name, ty.clone(), ty, locals);
+    }
+
+    pub(crate) fn insert_with_value_type(
+        &mut self,
+        name: ClarityName,
+        ty: TypeSignature,
+        value_ty: TypeSignature,
+        locals: Vec<LocalId>,
+    ) {
+        self.values.insert(
+            name,
+            InnerBindings {
+                locals,
+                ty,
+                value_ty,
+            },
+        );
     }
 
     pub(crate) fn enter_scope(&mut self) -> Result<(), GeneratorError> {
@@ -126,7 +144,7 @@ impl Bindings {
     ) -> Option<(Vec<LocalId>, TypeSignature)> {
         self.values
             .get(name)
-            .map(|binding| (binding.locals.clone(), binding.ty.clone()))
+            .map(|binding| (binding.locals.clone(), binding.value_ty.clone()))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -725,8 +743,22 @@ impl WasmGenerator {
                 plocals.push(local);
                 params_types.push(ty);
             }
-            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone());
-            parameters.push((param.signature.clone(), plocals));
+            let value_ty = if matches!(&kind, FunctionKind::Public)
+                && matches!(
+                    &param.signature,
+                    TypeSignature::CallableType(CallableSubtype::Trait(_))
+                ) {
+                TypeSignature::PrincipalType
+            } else {
+                param.signature.clone()
+            };
+            bindings.insert_with_value_type(
+                param.name.clone(),
+                param.signature.clone(),
+                value_ty.clone(),
+                plocals.clone(),
+            );
+            parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
         let results_types = clar2wasm_ty(&function_type.returns);
@@ -745,11 +777,11 @@ impl WasmGenerator {
             .global_get(self.stack_pointer)
             .local_set(frame_pointer);
         self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
-        for (parameter_type, locals) in &parameters {
+        for (parameter_type, value_type, locals) in &parameters {
             for local in locals {
                 func_body.local_get(*local);
             }
-            self.clarity_value_size_on_stack(&mut func_body, parameter_type)?;
+            self.clarity_value_size_on_stack(&mut func_body, value_type)?;
             let size = self.borrow_local(ValType::I32);
             func_body.local_set(*size);
             for _ in clar2wasm_ty(parameter_type) {
@@ -1966,7 +1998,9 @@ impl WasmGenerator {
                     .iter()
                     .zip(function_args.into_iter().map(|a| a.signature))
                 {
-                    self.set_expr_type(arg, signature)?;
+                    if self.get_expr_type(arg).is_none() {
+                        self.set_expr_type(arg, signature)?;
+                    }
                 }
                 returns
             }
