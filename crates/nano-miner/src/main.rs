@@ -53,6 +53,9 @@ struct Cli {
     /// Consensus-encoded candidate block with its transactions selected already.
     #[arg(long)]
     candidate_block: PathBuf,
+    /// Bitcoin height for an offline dry run when the peer no longer retains the sortition.
+    #[arg(long, requires = "dry_run")]
+    candidate_bitcoin_height: Option<u64>,
     /// Validate and assemble locally without publishing anything.
     #[arg(long)]
     dry_run: bool,
@@ -69,7 +72,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let client = SyncClient::new(Url::parse(&cli.peer)?)?;
     let pox = client.pox_info().await?;
-    let tenure = client.tenure_info().await?;
     let mut anchor_context = pox.bitcoin_context();
     anchor_context.height = cli.anchor_bitcoin_height;
 
@@ -77,18 +79,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let root = TrieHash::from_bytes(parse_array(&cli.state_root)?);
     let anchor = NakamotoBlock::decode(&fs::read(cli.anchor_block)?)?;
     let candidate = NakamotoBlock::decode(&fs::read(cli.candidate_block)?)?;
-    let sortition = client.sortition(candidate.header.consensus_hash).await?;
-    if !sortition.was_sortition {
-        return Err(
-            "candidate consensus hash does not identify a winning Bitcoin sortition".into(),
-        );
-    }
-    let reward_set = client.stacker_set(tenure.reward_cycle).await?;
+    let bitcoin_height = if let Some(height) = cli.candidate_bitcoin_height {
+        height
+    } else {
+        let sortition = client.sortition(candidate.header.consensus_hash).await?;
+        if !sortition.was_sortition {
+            return Err(
+                "candidate consensus hash does not identify a winning Bitcoin sortition".into(),
+            );
+        }
+        sortition.bitcoin_height
+    };
 
     let mut chainstate = ChainState::from_checkpoint(cli.checkpoint, source, root)?;
     chainstate.append_nakamoto_block_with_bitcoin_context(anchor_context, Some(source), &anchor)?;
     let mut candidate_context = pox.bitcoin_context();
-    candidate_context.height = sortition.bitcoin_height;
+    candidate_context.height = bitcoin_height;
     let miner_key = StacksPrivateKey::from_bytes(parse_array(&cli.private_key)?)?;
     let (block, applied) = chainstate.assemble_nakamoto_block_with_bitcoin_context(
         candidate_context,
@@ -96,23 +102,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         candidate,
         &miner_key,
     )?;
-    let proposal = BlockProposal {
-        block,
-        bitcoin_height: sortition.bitcoin_height,
-        reward_cycle: tenure.reward_cycle,
-        data: BlockProposal::empty_data(),
-    };
-
     println!(
         "assembled block {} with state root {} at Bitcoin height {}",
-        proposal.block.block_id(),
+        block.block_id(),
         hex::encode(applied.execution.state_root.0),
-        sortition.bitcoin_height
+        bitcoin_height
     );
     if cli.dry_run {
         return Ok(());
     }
 
+    let tenure = client.tenure_info().await?;
+    let reward_set = client.stacker_set(tenure.reward_cycle).await?;
+    let proposal = BlockProposal {
+        block,
+        bitcoin_height,
+        reward_cycle: tenure.reward_cycle,
+        data: BlockProposal::empty_data(),
+    };
     let coordinator = ProposalCoordinator::new(
         StackerDbClient::new(Url::parse(&cli.peer)?)?,
         parse_contract(&cli.miner_contract)?,
