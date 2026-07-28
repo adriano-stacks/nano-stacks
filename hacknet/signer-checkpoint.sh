@@ -70,7 +70,8 @@ def scheduled_payment(coinbase_height):
     if tenure is not None:
         return connection.execute(
             "SELECT COALESCE(recipient, address), CAST(coinbase AS INTEGER), "
-            "CAST(tx_fees_anchored AS INTEGER) FROM payments WHERE index_block_hash = ? AND miner = 1",
+            "CAST(tx_fees_anchored AS INTEGER), schedule_type FROM payments "
+            "WHERE index_block_hash = ? AND miner = 1",
             (tenure[0],),
         ).fetchone()
     # Before Nakamoto a tenure is one block, so the schedule is keyed by height.
