@@ -49,6 +49,9 @@ enum Command {
         anchor_block: PathBuf,
         #[arg(long)]
         anchor_bitcoin_height: u64,
+        /// Bitcoin height at which PoX-5 activates for this network.
+        #[arg(long)]
+        pox_5_activation_height: u32,
         #[arg(long, default_value_t = 1)]
         poll_interval_secs: u64,
         /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
@@ -76,6 +79,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 state_root,
                 anchor_block,
                 anchor_bitcoin_height,
+                pox_5_activation_height,
                 poll_interval_secs,
                 max_sync_blocks,
                 sync_only,
@@ -85,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pox = client.pox_info().await?;
     let mut bitcoin_context = pox.bitcoin_context();
     bitcoin_context.height = anchor_bitcoin_height;
+    bitcoin_context.v4_unlock_height = pox_5_activation_height;
     let source = parse_array(&source_state_id)?;
     let root = TrieHash::from_bytes(parse_array(&state_root)?);
     let anchor = NakamotoBlock::decode(&fs::read(anchor_block)?)?;
