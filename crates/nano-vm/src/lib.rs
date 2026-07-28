@@ -474,6 +474,11 @@ impl Vm {
         self.store.seal()
     }
 
+    /// Return the root that would be committed by sealing the active block.
+    pub fn pending_state_root(&self) -> Result<StateRoot, MarfStoreError> {
+        Ok(StateRoot(*self.store.pending_root()?.as_bytes()))
+    }
+
     /// Seal the active state and store it under the committed block ID.
     pub fn seal_block_to(&mut self, block: [u8; 32]) -> Result<StateRoot, MarfStoreError> {
         self.store.seal_to(block)
@@ -750,6 +755,11 @@ impl MarfStore {
             .ok_or(MarfStoreError::NoActiveState)?
             .block;
         self.seal_to(block)
+    }
+
+    /// Return the active state's root without sealing it.
+    pub fn pending_root(&self) -> Result<TrieHash, MarfStoreError> {
+        self.marf.pending_root().map_err(MarfStoreError::from)
     }
 
     /// Seal the active state and register it under its committed block ID.
@@ -1767,7 +1777,9 @@ mod tests {
         store
             .put("counter".to_owned(), "one".to_owned())
             .expect("write first state");
+        let pending_first_root = store.pending_root().expect("derive first state root");
         let first_root = store.seal().expect("seal first state");
+        assert_eq!(pending_first_root.as_bytes(), &first_root.0);
 
         store
             .begin(Some(first), second)

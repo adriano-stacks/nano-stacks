@@ -634,6 +634,15 @@ impl VersionedMarf {
         self.seal_to(block)
     }
 
+    /// Return the root that would be produced by sealing the active state.
+    pub fn pending_root(&self) -> Result<TrieHash, MarfError> {
+        let active = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?;
+        Ok(state_root(
+            active.trie.root_hash(),
+            &self.ancestor_roots(active.parent)?,
+        ))
+    }
+
     /// Seal the active state while registering it under its committed block ID.
     ///
     /// Block execution uses a stable temporary ID so the MARF's height keys do
