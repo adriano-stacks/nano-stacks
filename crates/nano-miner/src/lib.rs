@@ -627,6 +627,46 @@ fn finalize_block(
 
 #[cfg(test)]
 mod tests {
+    /// A nano-mined block only counts once the network made it canonical, which
+    /// is what this reads back from a stock node.
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node and NANO_MINER_BLOCK_ID"]
+    async fn hacknet_accepts_a_nano_mined_block() {
+        let block_id = nano_primitives::StacksBlockId::from_bytes(
+            hex::decode(std::env::var("NANO_MINER_BLOCK_ID").expect("mined block id"))
+                .expect("hexadecimal block id")
+                .try_into()
+                .expect("32-byte block id"),
+        );
+        let node = nano_sync::SyncClient::new(
+            reqwest::Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"),
+        )
+        .expect("create sync client");
+        let block = node
+            .block(block_id)
+            .await
+            .expect("stock node holds the block");
+        let tenure = node
+            .tenure(block_id, None)
+            .await
+            .expect("stock node serves the tenure this block starts");
+
+        assert_eq!(block.block_id(), block_id);
+        assert_eq!(
+            tenure.first().expect("non-empty tenure").block_id(),
+            block_id
+        );
+        assert!(
+            !block.header.signer_signatures.is_empty(),
+            "an accepted block carries the signer set's signatures"
+        );
+        println!(
+            "block {block_id} at height {} carries {} signer signatures",
+            block.header.chain_length,
+            block.header.signer_signatures.len()
+        );
+    }
+
     use bitcoin::{Amount, OutPoint, TxIn};
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader, Signer, SignerSet};
     use nano_crypto::StacksPrivateKey;

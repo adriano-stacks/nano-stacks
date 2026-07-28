@@ -21,8 +21,8 @@ stock signers and nodes on Hacknet.
 
 - [x] Build a transaction-selection and block-execution candidate API that derives the committed state root.
 - [x] Construct and submit canonical Bitcoin leader commitments with managed UTXOs.
-- [ ] Publish a valid block proposal to the active signer contract and collect signer responses.
-- [ ] Submit a threshold-signed Nakamoto block through a nano-won sortition.
+- [x] Publish a valid block proposal to the active signer contract and collect signer responses.
+- [x] Submit a threshold-signed Nakamoto block through a nano-won sortition.
 
 ## Acceptance Criteria
 

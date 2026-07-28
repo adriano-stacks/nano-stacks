@@ -373,7 +373,9 @@ impl SyncClient {
             accepted: response.accepted,
             block_id: parse_block_id(&response.stacks_block_id)?,
         };
-        if !upload.accepted || upload.block_id != block.block_id() {
+        // A node that already holds the block reports it as not newly accepted,
+        // which is success for the miner that produced it.
+        if upload.block_id != block.block_id() {
             return Err(SyncError::BlockUploadRejected);
         }
         Ok(upload)
