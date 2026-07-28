@@ -192,6 +192,14 @@ where
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<(), String> {
+        // Sealing only happens once a block's committed state root has been
+        // verified, so a block already in the state was already validated.
+        if self
+            .chainstate
+            .has_block_state(*block.block_id().as_bytes())
+        {
+            return Ok(());
+        }
         let parent = self
             .trusted
             .get(&block.header.parent_block_id)

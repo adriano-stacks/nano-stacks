@@ -32,6 +32,17 @@ use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionR
 use serde::Deserialize;
 use std::path::Path;
 
+/// How a block's committed state root is established during execution.
+#[derive(Clone, Copy)]
+enum RootPolicy<'a> {
+    /// Derive the root, write it into the header, and sign as the miner.
+    Mine(&'a StacksPrivateKey),
+    /// Reject the block before sealing when the derived root disagrees.
+    Verify,
+    /// Accept whatever root execution produces.
+    Trust,
+}
+
 /// M0 boundary that makes the final validation stage explicit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedBlock {
@@ -295,6 +306,12 @@ impl ChainState {
         self.vm.state_leaves(block)
     }
 
+    /// Whether this block's state has already been executed and sealed.
+    #[must_use]
+    pub fn has_block_state(&self, block: [u8; 32]) -> bool {
+        self.vm.content_root(block).is_some()
+    }
+
     /// Return the MARF content hash before ancestry is incorporated.
     #[must_use]
     pub fn state_content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
@@ -363,20 +380,15 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
-        let applied = self.execute_nakamoto_block_with_bitcoin_operations(
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
             bitcoin_context,
             operations,
             parent,
-            block,
-        )?;
-        let actual = TrieHash::from_bytes(applied.execution.state_root.0);
-        if actual != block.header.state_index_root {
-            return Err(ChainStateError::StateRootMismatch {
-                expected: block.header.state_index_root,
-                actual,
-            });
-        }
-        Ok(applied)
+            &mut block,
+            RootPolicy::Verify,
+            NativeBlockEffects::default(),
+        )
     }
 
     /// Execute native accounting and verify the state root committed by a Nakamoto block.
@@ -387,16 +399,15 @@ impl ChainState {
         block: &NakamotoBlock,
         effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
-        let applied =
-            self.execute_nakamoto_block_with_effects(bitcoin_context, parent, block, effects)?;
-        let actual = TrieHash::from_bytes(applied.execution.state_root.0);
-        if actual != block.header.state_index_root {
-            return Err(ChainStateError::StateRootMismatch {
-                expected: block.header.state_index_root,
-                actual,
-            });
-        }
-        Ok(applied)
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            bitcoin_context,
+            &[],
+            parent,
+            &mut block,
+            RootPolicy::Verify,
+            effects,
+        )
     }
 
     /// Execute a Nakamoto block without checking its header's committed state root.
@@ -428,7 +439,7 @@ impl ChainState {
             operations,
             parent,
             &mut block,
-            None,
+            RootPolicy::Trust,
             NativeBlockEffects::default(),
         )
     }
@@ -442,7 +453,14 @@ impl ChainState {
         effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
-        self.execute_nakamoto_block(bitcoin_context, &[], parent, &mut block, None, effects)
+        self.execute_nakamoto_block(
+            bitcoin_context,
+            &[],
+            parent,
+            &mut block,
+            RootPolicy::Trust,
+            effects,
+        )
     }
 
     /// Execute a block candidate, derive its committed state root, and finalize its block ID.
@@ -458,7 +476,7 @@ impl ChainState {
             &[],
             parent,
             &mut block,
-            Some(miner_key),
+            RootPolicy::Mine(miner_key),
             NativeBlockEffects::default(),
         )?;
         Ok((block, applied))
@@ -478,19 +496,21 @@ impl ChainState {
             operations,
             parent,
             &mut block,
-            Some(miner_key),
+            RootPolicy::Mine(miner_key),
             NativeBlockEffects::default(),
         )?;
         Ok((block, applied))
     }
 
+    /// Execute one block, optionally rejecting it before it is sealed when the
+    /// state it produces does not match the root its header commits to.
     fn execute_nakamoto_block(
         &mut self,
         bitcoin_context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
         parent: Option<[u8; 32]>,
         block: &mut NakamotoBlock,
-        miner_key: Option<&StacksPrivateKey>,
+        root: RootPolicy<'_>,
         effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
         if let Some(parent) = parent {
@@ -549,11 +569,23 @@ impl ChainState {
                 .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
-            if let Some(miner_key) = miner_key {
-                block.header.state_index_root =
-                    TrieHash::from_bytes(self.vm.pending_state_root()?.0);
-                block.header.miner_signature =
-                    miner_key.sign(block.header.miner_signature_hash().as_bytes());
+            match root {
+                RootPolicy::Mine(miner_key) => {
+                    block.header.state_index_root =
+                        TrieHash::from_bytes(self.vm.pending_state_root()?.0);
+                    block.header.miner_signature =
+                        miner_key.sign(block.header.miner_signature_hash().as_bytes());
+                }
+                RootPolicy::Verify => {
+                    let actual = TrieHash::from_bytes(self.vm.pending_state_root()?.0);
+                    if actual != block.header.state_index_root {
+                        return Err(ChainStateError::StateRootMismatch {
+                            expected: block.header.state_index_root,
+                            actual,
+                        });
+                    }
+                }
+                RootPolicy::Trust => {}
             }
             let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
             Ok(AppliedBlock {
