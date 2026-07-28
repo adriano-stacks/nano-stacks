@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod nakamoto;
+mod signers;
 
 pub use nakamoto::{
     NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, Signer, SignerSet, SignerSetError,
@@ -548,6 +549,10 @@ impl ChainState {
                         )
                     })?;
             }
+            // The signer set is written before the block's transactions, so it
+            // must be computed here rather than alongside the matured rewards.
+            let coinbase_height = u64::from(self.vm.tenure_height()?);
+            signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
             let mut execution_cost = ExecutionCost::ZERO;
             let mut receipts = Vec::with_capacity(block.transactions.len());
             for transaction in &block.transactions {

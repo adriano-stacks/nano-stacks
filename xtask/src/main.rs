@@ -436,6 +436,22 @@ impl CaptureConfig {
         json_unsigned_field(&response, "reward_cycle")
     }
 
+    /// The stacking calendar a replay needs to place a block in its reward cycle.
+    fn pox_calendar(&self) -> Result<(u64, u32, u32), String> {
+        let response = String::from_utf8(http_get(&format!("{}/v2/pox", self.stacks_rpc))?)
+            .map_err(|error| format!("PoX response was not UTF-8: {error}"))?;
+        Ok((
+            json_unsigned_field(&response, "first_burnchain_block_height")?,
+            u32::try_from(json_unsigned_field(
+                &response,
+                "prepare_phase_block_length",
+            )?)
+            .map_err(|error| error.to_string())?,
+            u32::try_from(json_unsigned_field(&response, "reward_phase_block_length")?)
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+
     fn write_provenance(
         &self,
         staging: &Path,
@@ -447,8 +463,9 @@ impl CaptureConfig {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| format!("system time precedes Unix epoch: {error}"))?
             .as_secs();
+        let (pox_first_height, prepare_phase_length, reward_phase_length) = self.pox_calendar()?;
         let contents = format!(
-            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\n",
+            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}\n",
             self.hacknet_commit,
             checkpoint.height,
             checkpoint.index_block_hash,

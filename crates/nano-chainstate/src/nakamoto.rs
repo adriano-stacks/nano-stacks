@@ -207,6 +207,12 @@ impl SignerSet {
         Ok((Self::new(signers)?, threshold))
     }
 
+    /// Return the signer entries in consensus order.
+    #[must_use]
+    pub fn signers(&self) -> &[Signer] {
+        &self.signers
+    }
+
     /// Return the signer weights in consensus order.
     #[must_use]
     pub fn weights(&self) -> Vec<u32> {

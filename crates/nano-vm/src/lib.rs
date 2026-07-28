@@ -403,6 +403,39 @@ impl Vm {
         }
     }
 
+    /// Invoke a contract function, including a private one, as the given sender.
+    ///
+    /// The node itself calls private boot-contract functions when it maintains
+    /// consensus state that no transaction owns.
+    pub fn call_contract_values(
+        &mut self,
+        sender: PrincipalData,
+        contract: &QualifiedContractIdentifier,
+        function: &str,
+        arguments: &[Value],
+    ) -> Result<Value, VmExecutionError> {
+        let Self {
+            store,
+            context,
+            modules,
+        } = self;
+        match call_contract_values_in_context(
+            store,
+            context,
+            modules,
+            sender,
+            contract,
+            function,
+            arguments,
+            LimitedCostTracker::new_free(),
+        )? {
+            ContractCallOutcome::Success(result) => result.value.ok_or(
+                VmInternalError::Expect("contract call returned no value".to_owned()).into(),
+            ),
+            ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
+        }
+    }
+
     /// Invoke a contract and retain acceptable runtime failures as transaction outcomes.
     pub fn execute_contract_call_outcome(
         &mut self,
@@ -1576,13 +1609,36 @@ fn execute_contract_call_outcome_with_wasm_in_context(
             Ok(value)
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
-    for contract in arguments.iter().filter_map(contract_argument) {
-        ensure_wasm_module(store, bitcoin_context, modules, contract)?;
+    call_contract_values_in_context(
+        store,
+        bitcoin_context,
+        modules,
+        call.sender,
+        &call.contract,
+        call.function,
+        &arguments,
+        cost_tracker,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_contract_values_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    modules: &mut ModuleCache,
+    sender: PrincipalData,
+    contract: &QualifiedContractIdentifier,
+    function: &str,
+    arguments: &[Value],
+    cost_tracker: LimitedCostTracker,
+) -> Result<ContractCallOutcome, VmExecutionError> {
+    for argument in arguments.iter().filter_map(contract_argument) {
+        ensure_wasm_module(store, bitcoin_context, modules, argument)?;
     }
-    ensure_wasm_module(store, bitcoin_context, modules, &call.contract)?;
-    let module = modules.get(&call.contract).ok_or_else(|| {
-        VmInternalError::Expect(format!("missing WASM module for {}", call.contract))
-    })?;
+    ensure_wasm_module(store, bitcoin_context, modules, contract)?;
+    let module = modules
+        .get(contract)
+        .ok_or_else(|| VmInternalError::Expect(format!("missing WASM module for {contract}")))?;
     let database = clarity_database(store, bitcoin_context);
     let mut global = GlobalContext::new(
         false,
@@ -1592,18 +1648,18 @@ fn execute_contract_call_outcome_with_wasm_in_context(
         StacksEpochId::Epoch40,
     );
     global.begin();
-    let contract_context = global.database.get_contract(&call.contract)?;
+    let contract_context = global.database.get_contract(contract)?;
     let mut call_stack = CallStack::new();
     let result = clar2wasm::initialize::call_function(
-        call.function,
-        &arguments,
+        function,
+        arguments,
         module,
         &mut global,
         &contract_context,
         &mut call_stack,
-        Some(call.sender),
+        Some(sender),
         None,
-        call.sponsor,
+        None,
         modules,
     );
     match result {

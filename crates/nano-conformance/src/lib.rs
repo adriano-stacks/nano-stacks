@@ -705,12 +705,30 @@ impl std::fmt::Display for ReplayDivergence {
 fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlockContext>> {
     let snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
+    // A block's reward cycle position decides whether it sets up a signer set,
+    // so replay needs the captured network's stacking calendar.
+    let provenance = fs::read_to_string(root.join("provenance.toml")).ok()?;
+    let field = |name: &str| -> Option<u64> {
+        provenance
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))?
+            .parse()
+            .ok()
+    };
+    let first_height = field("pox_first_bitcoin_height")?;
+    let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
+    let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
     snapshots
         .into_iter()
         .map(|snapshot| {
             Some((
                 snapshot.consensus_hash,
-                BitcoinBlockContext::at_height(snapshot.block_height),
+                BitcoinBlockContext {
+                    first_height,
+                    prepare_phase_length,
+                    reward_phase_length,
+                    ..BitcoinBlockContext::at_height(snapshot.block_height)
+                },
             ))
         })
         .collect()
