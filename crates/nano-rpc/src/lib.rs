@@ -1,24 +1,85 @@
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Router,
     body::Bytes,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::get,
 };
 use nano_node::NodeView;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
-/// Shared validated snapshot served by the HTTP API.
-pub type SharedView = Arc<RwLock<Option<NodeView>>>;
+/// The validated node state exposed by the public HTTP API.
+#[derive(Clone, Debug)]
+pub struct RpcState {
+    view: Arc<RwLock<Option<NodeView>>>,
+    events: broadcast::Sender<NodeEvent>,
+}
+
+/// A validated block that became visible through the public API.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NodeEvent {
+    pub block_id: String,
+    pub stacks_height: u64,
+    pub bitcoin_height: u64,
+}
+
+impl RpcState {
+    /// Construct initially unavailable public state.
+    #[must_use]
+    pub fn new() -> Self {
+        let (events, _) = broadcast::channel(256);
+        Self {
+            view: Arc::new(RwLock::new(None)),
+            events,
+        }
+    }
+
+    /// Publish a fully validated snapshot and notify subscribers about a new tip.
+    pub async fn publish(&self, view: NodeView) {
+        let event = NodeEvent::from_view(&view);
+        let changed = self
+            .view
+            .read()
+            .await
+            .as_ref()
+            .and_then(NodeEvent::from_view)
+            != event;
+        *self.view.write().await = Some(view);
+        if changed && let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+    }
+}
+
+impl Default for RpcState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeEvent {
+    fn from_view(view: &NodeView) -> Option<Self> {
+        let tenure = view.tenures.last()?;
+        Some(Self {
+            block_id: tenure.info.tip_block_id.to_string(),
+            stacks_height: tenure.info.tip_height,
+            bitcoin_height: tenure.sortition.bitcoin_height,
+        })
+    }
+}
 
 /// Build the read-only RPC routes backed by the node's latest validated view.
-pub fn router(node: SharedView) -> Router {
+pub fn router(state: RpcState) -> Router {
     Router::new()
         .route("/v2/info", get(node_info))
         .route("/v2/pox", get(pox_info))
@@ -26,12 +87,13 @@ pub fn router(node: SharedView) -> Router {
         .route("/v3/tenures/info", get(tenure_info))
         .route("/v3/tenures/{start_block_id}", get(tenure))
         .route("/v3/blocks/{block_id}", get(block))
-        .with_state(node)
+        .route("/events", get(events))
+        .with_state(state)
 }
 
 /// Serve the public RPC until the listener is stopped.
-pub async fn serve(listener: tokio::net::TcpListener, node: SharedView) -> std::io::Result<()> {
-    axum::serve(listener, router(node)).await
+pub async fn serve(listener: tokio::net::TcpListener, state: RpcState) -> std::io::Result<()> {
+    axum::serve(listener, router(state)).await
 }
 
 #[derive(Debug)]
@@ -50,12 +112,12 @@ impl IntoResponse for RpcError {
     }
 }
 
-async fn view(node: &SharedView) -> Result<NodeView, RpcError> {
-    node.read().await.clone().ok_or(RpcError::Unavailable)
+async fn view(state: &RpcState) -> Result<NodeView, RpcError> {
+    state.view.read().await.clone().ok_or(RpcError::Unavailable)
 }
 
-async fn node_info(State(node): State<SharedView>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
-    let info = view(&node).await?.node_info;
+async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
+    let info = view(&state).await?.node_info;
     Ok(axum::Json(NodeInfoWire {
         burn_block_height: info.bitcoin_height,
         stacks_tip_height: info.stacks_height,
@@ -65,8 +127,8 @@ async fn node_info(State(node): State<SharedView>) -> Result<axum::Json<NodeInfo
     }))
 }
 
-async fn pox_info(State(node): State<SharedView>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
-    let pox = view(&node).await?.pox_info;
+async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
+    let pox = view(&state).await?.pox_info;
     Ok(axum::Json(PoxInfoWire {
         first_burnchain_block_height: pox.first_bitcoin_height,
         current_burnchain_block_height: pox.bitcoin_height,
@@ -78,9 +140,9 @@ async fn pox_info(State(node): State<SharedView>) -> Result<axum::Json<PoxInfoWi
 }
 
 async fn tenure_info(
-    State(node): State<SharedView>,
+    State(state): State<RpcState>,
 ) -> Result<axum::Json<TenureInfoWire>, RpcError> {
-    let latest = view(&node)
+    let latest = view(&state)
         .await?
         .tenures
         .last()
@@ -91,10 +153,10 @@ async fn tenure_info(
 }
 
 async fn sortition(
-    State(node): State<SharedView>,
+    State(state): State<RpcState>,
     Path(consensus_hash): Path<String>,
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
-    let sortition = view(&node)
+    let sortition = view(&state)
         .await?
         .tenures
         .into_iter()
@@ -110,11 +172,11 @@ struct TenureQuery {
 }
 
 async fn tenure(
-    State(node): State<SharedView>,
+    State(state): State<RpcState>,
     Path(start_block_id): Path<String>,
     Query(query): Query<TenureQuery>,
 ) -> Result<RawBlockStream, RpcError> {
-    let tenure = view(&node)
+    let tenure = view(&state)
         .await?
         .tenures
         .into_iter()
@@ -135,10 +197,10 @@ async fn tenure(
 }
 
 async fn block(
-    State(node): State<SharedView>,
+    State(state): State<RpcState>,
     Path(block_id): Path<String>,
 ) -> Result<RawBlockStream, RpcError> {
-    let block = view(&node)
+    let block = view(&state)
         .await?
         .tenures
         .into_iter()
@@ -146,6 +208,19 @@ async fn block(
         .find(|block| block.block_id().to_string() == block_id)
         .ok_or(RpcError::NotFound)?;
     Ok(RawBlockStream(block.encode()))
+}
+
+async fn events(
+    State(state): State<RpcState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|event| {
+        event.ok().and_then(|event| {
+            serde_json::to_string(&event)
+                .ok()
+                .map(|data| Ok(Event::default().event("new_block").data(data)))
+        })
+    });
+    Sse::new(stream)
 }
 
 struct RawBlockStream(Vec<u8>);
@@ -247,23 +322,68 @@ impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use nano_node::Node;
-    use nano_sync::SyncClient;
+    use nano_node::{Node, NodeView};
+    use nano_primitives::{
+        BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
+    };
+    use nano_sync::{FollowedTenure, NodeInfo, PoxInfo, SortitionInfo, SyncClient, TenureInfo};
     use reqwest::Url;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    use super::router;
+    use super::{RpcState, router};
+
+    fn captured_view() -> NodeView {
+        NodeView {
+            node_info: NodeInfo {
+                bitcoin_height: 11,
+                stacks_height: 12,
+                stacks_tip: BlockHeaderHash::from_bytes([1; 32]),
+                consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                network_id: 2_147_483_648,
+            },
+            pox_info: PoxInfo {
+                first_bitcoin_height: 0,
+                bitcoin_height: 11,
+                prepare_phase_length: 5,
+                reward_phase_length: 15,
+                reward_slots: 2,
+                rejection_fraction: None,
+            },
+            tenures: vec![FollowedTenure {
+                info: TenureInfo {
+                    consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                    tenure_start_block_id: StacksBlockId::from_bytes([3; 32]),
+                    parent_consensus_hash: ConsensusHash::from_bytes([4; 20]),
+                    parent_tenure_start_block_id: StacksBlockId::from_bytes([5; 32]),
+                    tip_block_id: StacksBlockId::from_bytes([6; 32]),
+                    tip_height: 12,
+                    reward_cycle: 1,
+                },
+                sortition: SortitionInfo {
+                    bitcoin_block_hash: BitcoinHeaderHash::from_bytes([7; 32]),
+                    bitcoin_height: 11,
+                    bitcoin_timestamp: 0,
+                    sortition_id: SortitionId::from_bytes([8; 32]),
+                    parent_sortition_id: SortitionId::from_bytes([9; 32]),
+                    consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                    was_sortition: true,
+                    miner_public_key_hash: None,
+                    stacks_parent_consensus_hash: None,
+                    last_sortition_consensus_hash: None,
+                    committed_block_hash: None,
+                },
+                blocks: Vec::new(),
+            }],
+        }
+    }
 
     #[tokio::test]
     async fn rejects_requests_until_the_node_has_a_validated_view() {
-        let app = router(Arc::new(RwLock::new(None)));
+        let app = router(RpcState::new());
 
         let response = app
             .oneshot(
@@ -276,6 +396,19 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn publishes_one_event_per_new_tip() {
+        let state = RpcState::new();
+        let mut events = state.events.subscribe();
+        state.publish(captured_view()).await;
+        let event = events.try_recv().expect("new tip event");
+        assert_eq!(event.stacks_height, 12);
+        assert_eq!(event.bitcoin_height, 11);
+
+        state.publish(captured_view()).await;
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -299,7 +432,9 @@ mod tests {
             .sortition
             .consensus_hash
             .to_string();
-        let app = router(Arc::new(RwLock::new(node.view())));
+        let state = RpcState::new();
+        state.publish(node.view().expect("node view")).await;
+        let app = router(state);
 
         let info = app
             .clone()

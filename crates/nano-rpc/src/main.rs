@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
+use std::{error::Error, io, net::SocketAddr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use nano_node::Node;
-use nano_rpc::{SharedView, serve};
+use nano_rpc::{RpcState, serve};
 use nano_sync::SyncClient;
 use reqwest::Url;
-use tokio::{net::TcpListener, sync::RwLock, time::sleep};
+use tokio::{net::TcpListener, time::sleep};
 
 #[derive(Parser)]
 #[command(name = "stacks-node")]
@@ -42,20 +42,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = SyncClient::new(Url::parse(&peer)?)?;
     let mut node = Node::new(client);
     node.poll().await?;
-    let view = Arc::new(RwLock::new(node.view()));
+    let state = RpcState::new();
+    state
+        .publish(
+            node.view()
+                .ok_or_else(|| io::Error::other("node has no view"))?,
+        )
+        .await;
     let listener = TcpListener::bind(listen).await?;
-    let poller = poll(node, view.clone(), Duration::from_secs(poll_interval_secs));
+    let poller = poll(node, state.clone(), Duration::from_secs(poll_interval_secs));
 
     tokio::select! {
-        result = serve(listener, view) => result.map_err(Into::into),
+        result = serve(listener, state) => result.map_err(Into::into),
         result = poller => result,
     }
 }
 
-async fn poll(mut node: Node, view: SharedView, interval: Duration) -> Result<(), Box<dyn Error>> {
+async fn poll(mut node: Node, state: RpcState, interval: Duration) -> Result<(), Box<dyn Error>> {
     loop {
         sleep(interval).await;
         node.poll().await?;
-        *view.write().await = node.view();
+        state
+            .publish(
+                node.view()
+                    .ok_or_else(|| io::Error::other("node has no view"))?,
+            )
+            .await;
     }
 }

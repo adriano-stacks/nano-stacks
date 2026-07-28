@@ -12,9 +12,12 @@ nano-node = { path = "../nano-node" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
+nano-primitives = { path = "../nano-primitives" }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
 
