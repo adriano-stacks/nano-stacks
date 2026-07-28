@@ -567,6 +567,7 @@ impl WasmGenerator {
                 },
                 args,
             )) => {
+                self.charge_lookup_function(builder)?;
                 // Extract the types from the args and return
                 let get_types = || {
                     let arg_types: Result<Vec<TypeSignature>, GeneratorError> = args
@@ -1887,7 +1888,6 @@ impl WasmGenerator {
                 )));
             }
         };
-        self.charge_lookup_function(builder)?;
         self.traverse_args(builder, args)?;
 
         let expected_ty = self
