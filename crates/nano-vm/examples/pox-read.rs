@@ -2,10 +2,7 @@
 
 use std::{env, path::Path};
 
-use clarity::vm::{
-    Value,
-    types::{PrincipalData, QualifiedContractIdentifier},
-};
+use clarity::vm::{Value, types::PrincipalData};
 use nano_primitives::TrieHash;
 use nano_vm::{BitcoinBlockContext, Vm};
 

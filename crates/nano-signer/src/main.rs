@@ -17,6 +17,10 @@ use nano_sync::SyncClient;
 use reqwest::Url;
 use tokio::time::sleep;
 
+/// `StackerDB` message identifiers for block responses and state updates.
+const RESPONSE_MESSAGE_ID: u32 = 1;
+const STATE_MESSAGE_ID: u32 = 6;
+
 #[derive(Parser)]
 #[command(name = "stacks-signer")]
 struct Cli {
@@ -38,15 +42,11 @@ enum Command {
         bitcoin_rpc_password_file: PathBuf,
         #[arg(long)]
         miner_contract: String,
-        #[arg(long)]
-        signer_contract: String,
-        /// Signer `StackerDB` contract carrying state machine updates, as ADDRESS/name.
-        #[arg(long)]
-        state_contract: String,
+        /// Boot address hosting the per-cycle signer `StackerDB` contracts.
+        #[arg(long, default_value = "ST000000000000000000002AMW42H")]
+        signer_contract_address: String,
         #[arg(long)]
         private_key: String,
-        #[arg(long)]
-        writer_slot: u32,
         #[arg(long)]
         state_file: PathBuf,
         #[arg(long)]
@@ -95,10 +95,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 bitcoin_rpc_user,
                 bitcoin_rpc_password_file,
                 miner_contract,
-                signer_contract,
-                state_contract,
+                signer_contract_address,
                 private_key,
-                writer_slot,
                 state_file,
                 checkpoint,
                 tenure_accounting,
@@ -143,40 +141,84 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &anchor,
     )?;
     let validator = ChainstateProposalValidator::new(chainstate, &anchor, bitcoin_context, bitcoin);
+    let key = StacksPrivateKey::from_bytes(parse_array(&private_key)?)?;
     let signer = EmbeddedSigner::from_state_file(
         SignerConfig {
-            private_key: StacksPrivateKey::from_bytes(parse_array(&private_key)?)?,
-            writer_slot,
+            private_key: key.clone(),
+            writer_slot: 0,
             next_slot_version: 1,
         },
         ActiveSortitionValidator::new(validator),
         state_file,
     )?;
+    let boot_address = StacksAddress::from_str(&signer_contract_address)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let service = SignerService::new(
         StackerDbClient::new(Url::parse(&peer)?)?,
         parse_contract(&miner_contract)?,
-        parse_contract(&signer_contract)?,
+        cycle_contract(boot_address, 0, RESPONSE_MESSAGE_ID),
         signer,
     );
     let mut signer = LiveSigner::new(client.clone(), service);
     let mut announcer = StateAnnouncer::new(
         StackerDbClient::new(Url::parse(&peer)?)?,
-        parse_contract(&state_contract)?,
-        writer_slot,
-        StacksPrivateKey::from_bytes(parse_array(&private_key)?)?,
+        cycle_contract(boot_address, 0, STATE_MESSAGE_ID),
+        0,
+        key.clone(),
     );
     if sync_only {
         sync_chainstate(&client, &mut signer, max_sync_blocks).await?;
         return Ok(());
     }
+    run(
+        &client,
+        &mut signer,
+        &mut announcer,
+        boot_address,
+        &key,
+        poll_interval_secs,
+        max_sync_blocks,
+    )
+    .await
+}
+
+/// Sign for whichever reward cycle is active, rebinding across rollovers.
+#[allow(clippy::too_many_arguments)]
+async fn run(
+    client: &SyncClient,
+    signer: &mut LiveSigner<ChainstateProposalValidator<BitcoinRpcSource>>,
+    announcer: &mut StateAnnouncer,
+    boot_address: StacksAddress,
+    key: &StacksPrivateKey,
+    poll_interval_secs: u64,
+    max_sync_blocks: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut bound_cycle = None;
     loop {
-        if let Err(error) = announcer.announce(&client).await {
+        match reward_cycle_binding(client, boot_address, key).await {
+            Ok((cycle, contract, state, slot)) if bound_cycle != Some(cycle) => {
+                eprintln!("signing reward cycle {cycle} from slot {slot}");
+                signer.service_mut().rebind(contract, slot);
+                announcer.rebind(state, slot);
+                bound_cycle = Some(cycle);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("signer is not in the active reward set: {error}");
+                sleep(Duration::from_secs(poll_interval_secs)).await;
+                continue;
+            }
+        }
+        if let Err(error) = announcer.announce(client).await {
             eprintln!("signer state announcement failed: {error}");
         }
-        if let Err(error) = sync_chainstate(&client, &mut signer, max_sync_blocks).await {
-            eprintln!("signer chainstate sync failed: {error}");
-            sleep(Duration::from_secs(poll_interval_secs)).await;
-            continue;
+        match sync_chainstate(client, signer, max_sync_blocks).await {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("signer chainstate sync failed: {error}");
+                sleep(Duration::from_secs(poll_interval_secs)).await;
+                continue;
+            }
         }
         if let Err(error) = signer.poll().await {
             eprintln!("signer poll failed: {error}");
@@ -185,12 +227,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// The contracts and slot the active reward cycle assigns this signer.
+async fn reward_cycle_binding(
+    client: &SyncClient,
+    boot_address: StacksAddress,
+    key: &StacksPrivateKey,
+) -> Result<(u64, StackerDbContract, StackerDbContract, u32), String> {
+    let cycle = client
+        .tenure_info()
+        .await
+        .map_err(|error| error.to_string())?
+        .reward_cycle;
+    let public_key = key.public_key().to_bytes_compressed();
+    let slot = client
+        .stacker_set(cycle)
+        .await
+        .map_err(|error| error.to_string())?
+        .signer_set
+        .signers()
+        .iter()
+        .position(|signer| signer.public_key.to_bytes_compressed() == public_key)
+        .ok_or_else(|| "this signer holds no slot in the active reward set".to_owned())?;
+    Ok((
+        cycle,
+        cycle_contract(boot_address, cycle, RESPONSE_MESSAGE_ID),
+        cycle_contract(boot_address, cycle, STATE_MESSAGE_ID),
+        u32::try_from(slot).map_err(|error| error.to_string())?,
+    ))
+}
+
+/// Signer contracts are named by reward-cycle parity and message identifier.
+fn cycle_contract(address: StacksAddress, cycle: u64, message: u32) -> StackerDbContract {
+    StackerDbContract {
+        address,
+        name: format!("signers-{}-{message}", cycle % 2),
+    }
+}
+
 async fn sync_chainstate(
     client: &SyncClient,
     signer: &mut LiveSigner<ChainstateProposalValidator<BitcoinRpcSource>>,
     max_blocks: usize,
-) -> Result<(), Box<dyn Error>> {
-    let tip = client.tenure_info().await?.tip_block_id;
+) -> Result<(), String> {
+    let tip = client
+        .tenure_info()
+        .await
+        .map_err(|error| error.to_string())?
+        .tip_block_id;
     if signer
         .validator_mut()
         .validator_mut()
@@ -202,12 +285,10 @@ async fn sync_chainstate(
     let mut blocks = Vec::new();
     let mut block_id = tip;
     for _ in 0..max_blocks {
-        let block = client.block(block_id).await.map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("could not decode canonical block {block_id}: {error}"),
-            )
-        })?;
+        let block = client
+            .block(block_id)
+            .await
+            .map_err(|error| format!("could not decode canonical block {block_id}: {error}"))?;
         if signer
             .validator_mut()
             .validator_mut()
@@ -222,11 +303,7 @@ async fn sync_chainstate(
         }
     }
     if blocks.len() == max_blocks {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "checkpoint is farther from the canonical tip than max_sync_blocks",
-        )
-        .into());
+        return Err("checkpoint is farther from the canonical tip than max_sync_blocks".to_owned());
     }
 
     eprintln!(
@@ -235,19 +312,19 @@ async fn sync_chainstate(
         blocks.last().map(|block| block.header.chain_length)
     );
     for block in blocks.iter().rev() {
-        let sortition = client.sortition(block.header.consensus_hash).await?;
+        let sortition = client
+            .sortition(block.header.consensus_hash)
+            .await
+            .map_err(|error| error.to_string())?;
         signer
             .validator_mut()
             .validator_mut()
             .observe(block, sortition.bitcoin_height)
             .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "canonical block {} at height {} failed to validate: {error}",
-                        block.block_id(),
-                        block.header.chain_length
-                    ),
+                format!(
+                    "canonical block {} at height {} failed to validate: {error}",
+                    block.block_id(),
+                    block.header.chain_length
                 )
             })?;
     }

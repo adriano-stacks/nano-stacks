@@ -858,6 +858,15 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         self.writer_slot
     }
 
+    /// Move this signer to the slot a new reward cycle assigned it.
+    pub fn set_writer_slot(&mut self, writer_slot: u32) {
+        if self.writer_slot != writer_slot {
+            self.writer_slot = writer_slot;
+            self.next_slot_version = 1;
+            self.signed = SignedBlocks::default();
+        }
+    }
+
     /// Persistently advance the writer version when the remote slot is newer.
     pub fn advance_next_slot_version(&mut self, next_slot_version: u32) -> Result<(), SignerError> {
         if next_slot_version <= self.next_slot_version {
@@ -974,6 +983,13 @@ impl<V: ProposalValidator + Send> SignerService<V> {
     pub const fn signer_mut(&mut self) -> &mut EmbeddedSigner<V> {
         &mut self.signer
     }
+
+    /// Rebind the contract and slot a new reward cycle assigns this signer.
+    pub fn rebind(&mut self, signer_contract: StackerDbContract, writer_slot: u32) {
+        self.signer_contract = signer_contract;
+        self.signer.set_writer_slot(writer_slot);
+        self.last_proposal = None;
+    }
 }
 
 /// Publishes this signer's protocol version and miner view to the reward set.
@@ -1004,6 +1020,13 @@ impl StateAnnouncer {
             private_key,
             announced: None,
         }
+    }
+
+    /// Rebind the contract and slot a new reward cycle assigns this signer.
+    pub fn rebind(&mut self, contract: StackerDbContract, writer_slot: u32) {
+        self.contract = contract;
+        self.writer_slot = writer_slot;
+        self.announced = None;
     }
 
     /// Publish this signer's view of the peer's Bitcoin tip, unless it is unchanged.
@@ -1105,6 +1128,11 @@ impl<V: ProposalValidator + Send> LiveSigner<V> {
         service: SignerService<ActiveSortitionValidator<V>>,
     ) -> Self {
         Self { client, service }
+    }
+
+    /// Return the signer service so a new reward cycle can rebind it.
+    pub const fn service_mut(&mut self) -> &mut SignerService<ActiveSortitionValidator<V>> {
+        &mut self.service
     }
 
     /// Return the active validator so its independently verified chain view can advance.
