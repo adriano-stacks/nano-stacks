@@ -946,25 +946,38 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         self.respond(pending).await.map(Some)
     }
 
-    /// Fetch and decode a miner proposal that has not already been answered.
+    /// Fetch and decode the newest miner proposal that has not been answered.
+    ///
+    /// Miners alternate between proposal slots by sortition parity, so the
+    /// newest proposal is whichever slot carries the highest Bitcoin height.
     pub async fn next_proposal(&mut self) -> Result<Option<PendingProposal>, SignerServiceError> {
         let client = self.client.clone();
         let miner_contract = self.miner_contract.clone();
-        let last_proposal = self.last_proposal;
-        let Some(bytes) = client.latest_chunk(&miner_contract, 0).await? else {
-            return Ok(None);
-        };
-        let proposal_hash = nano_primitives::sha512_256(&bytes);
-        if last_proposal == Some(proposal_hash) {
-            return Ok(None);
+        let mut newest: Option<PendingProposal> = None;
+        for slot in client.slot_versions(&miner_contract).await? {
+            let Some(bytes) = client.latest_chunk(&miner_contract, slot.slot_id).await? else {
+                continue;
+            };
+            let Ok(SignerMessage::BlockProposal(proposal)) = SignerMessage::decode(&bytes) else {
+                continue;
+            };
+            let candidate = PendingProposal {
+                hash: nano_primitives::sha512_256(&bytes),
+                proposal,
+            };
+            if newest.as_ref().is_none_or(|current| {
+                (
+                    current.proposal.bitcoin_height,
+                    current.proposal.block.header.chain_length,
+                ) < (
+                    candidate.proposal.bitcoin_height,
+                    candidate.proposal.block.header.chain_length,
+                )
+            }) {
+                newest = Some(candidate);
+            }
         }
-        let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
-            return Err(SignerServiceError::UnexpectedMessage);
-        };
-        Ok(Some(PendingProposal {
-            hash: proposal_hash,
-            proposal,
-        }))
+        Ok(newest.filter(|proposal| self.last_proposal != Some(proposal.hash)))
     }
 
     /// Validate and publish a response for a previously fetched miner proposal.
