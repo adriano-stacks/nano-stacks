@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use clarity::vm::contexts::{AssetMap, AssetMapEntry};
 use clarity::vm::representations::ClarityName;
-use clarity::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier, TupleData};
+use nano_address::PoxAddress;
+use nano_bitcoin::{BitcoinOperation, BitcoinOperationKind};
 use nano_codec::{
     AssetInfo, ClarityVersion, FungibleCondition, NonFungibleCondition, PostConditionData,
     PostConditionMode, PostConditionPrincipal, PoxCondition, Principal, TenureChangeCause,
@@ -353,6 +355,30 @@ impl ChainState {
         )
     }
 
+    /// Execute a Nakamoto block with the decoded Bitcoin operations for its tenure start.
+    pub fn append_nakamoto_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let applied = self.execute_nakamoto_block_with_bitcoin_operations(
+            bitcoin_context,
+            operations,
+            parent,
+            block,
+        )?;
+        let actual = TrieHash::from_bytes(applied.execution.state_root.0);
+        if actual != block.header.state_index_root {
+            return Err(ChainStateError::StateRootMismatch {
+                expected: block.header.state_index_root,
+                actual,
+            });
+        }
+        Ok(applied)
+    }
+
     /// Execute native accounting and verify the state root committed by a Nakamoto block.
     pub fn append_nakamoto_block_with_effects(
         &mut self,
@@ -388,6 +414,25 @@ impl ChainState {
         )
     }
 
+    /// Execute a Nakamoto block with the decoded Bitcoin operations for its tenure start.
+    pub fn execute_nakamoto_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            bitcoin_context,
+            operations,
+            parent,
+            &mut block,
+            None,
+            NativeBlockEffects::default(),
+        )
+    }
+
     /// Execute a Nakamoto block with native accounting effects derived from its Bitcoin context.
     pub fn execute_nakamoto_block_with_effects(
         &mut self,
@@ -397,7 +442,7 @@ impl ChainState {
         effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
-        self.execute_nakamoto_block(bitcoin_context, parent, &mut block, None, effects)
+        self.execute_nakamoto_block(bitcoin_context, &[], parent, &mut block, None, effects)
     }
 
     /// Execute a block candidate, derive its committed state root, and finalize its block ID.
@@ -410,6 +455,7 @@ impl ChainState {
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
         let applied = self.execute_nakamoto_block(
             bitcoin_context,
+            &[],
             parent,
             &mut block,
             Some(miner_key),
@@ -421,6 +467,7 @@ impl ChainState {
     fn execute_nakamoto_block(
         &mut self,
         bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
         parent: Option<[u8; 32]>,
         block: &mut NakamotoBlock,
         miner_key: Option<&StacksPrivateKey>,
@@ -449,6 +496,7 @@ impl ChainState {
                     ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
                 })?;
                 self.vm.set_tenure_height(next_height)?;
+                self.execute_bitcoin_operations(operations, bitcoin_context.height)?;
                 let matured = self.accounting.effects_for_tenure(u64::from(next_height));
                 effects.credits.extend(matured.credits);
                 effects.liquid_supply_increase = effects
@@ -499,6 +547,133 @@ impl ChainState {
             self.vm.abort_block()?;
         }
         result
+    }
+
+    fn execute_bitcoin_operations(
+        &mut self,
+        operations: &[BitcoinOperation],
+        bitcoin_height: u64,
+    ) -> Result<(), ChainStateError> {
+        for kind in [
+            BitcoinOperationClass::Stack,
+            BitcoinOperationClass::Transfer,
+            BitcoinOperationClass::Delegate,
+            BitcoinOperationClass::Vote,
+        ] {
+            for operation in operations
+                .iter()
+                .filter(|operation| kind.matches(operation))
+            {
+                self.execute_bitcoin_operation(operation, bitcoin_height)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_bitcoin_operation(
+        &mut self,
+        operation: &BitcoinOperation,
+        bitcoin_height: u64,
+    ) -> Result<(), ChainStateError> {
+        match &operation.kind {
+            BitcoinOperationKind::StackStx {
+                sender,
+                reward_address,
+                amount,
+                cycles,
+                ..
+            } => self.execute_native_contract_call(
+                principal_from_address(*sender)?,
+                "ST000000000000000000002AMW42H.pox-5",
+                "stack-stx",
+                &[
+                    Value::UInt(*amount),
+                    pox_address_value(reward_address)?,
+                    Value::UInt(u128::from(bitcoin_height)),
+                    Value::UInt(u128::from(*cycles)),
+                ],
+            ),
+            BitcoinOperationKind::TransferStx {
+                sender,
+                recipient,
+                amount,
+                memo,
+            } => {
+                self.vm.begin_transaction()?;
+                let result = self.vm.transfer_stx(
+                    &principal_from_address(*sender)?,
+                    &principal_from_address(*recipient)?,
+                    *amount,
+                    memo,
+                    LimitedCostTracker::new_free(),
+                );
+                finalize_native_transfer(&mut self.vm, &result)
+            }
+            BitcoinOperationKind::DelegateStx {
+                sender,
+                delegate,
+                amount,
+                reward_address,
+                until_bitcoin_height,
+                ..
+            } => self.execute_native_contract_call(
+                principal_from_address(*sender)?,
+                "ST000000000000000000002AMW42H.pox-5",
+                "delegate-stx",
+                &[
+                    Value::UInt(*amount),
+                    Value::Principal(principal_from_address(*delegate)?),
+                    optional_uint(*until_bitcoin_height)?,
+                    optional_pox_address(reward_address.as_ref())?,
+                ],
+            ),
+            BitcoinOperationKind::VoteForAggregateKey {
+                sender,
+                signer_index,
+                aggregate_key,
+                round,
+                reward_cycle,
+            } => self.execute_native_contract_call(
+                principal_from_address(*sender)?,
+                "ST000000000000000000002AMW42H.signers-voting",
+                "vote-for-aggregate-public-key",
+                &[
+                    Value::UInt(u128::from(*signer_index)),
+                    Value::buff_from(aggregate_key.to_vec())
+                        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?,
+                    Value::UInt(u128::from(*round)),
+                    Value::UInt(u128::from(*reward_cycle)),
+                ],
+            ),
+            BitcoinOperationKind::LeaderBlockCommit { .. }
+            | BitcoinOperationKind::LeaderKeyRegistration { .. }
+            | BitcoinOperationKind::PreStx { .. } => Ok(()),
+        }
+    }
+
+    fn execute_native_contract_call(
+        &mut self,
+        sender: PrincipalData,
+        contract: &str,
+        function: &str,
+        arguments: &[Value],
+    ) -> Result<(), ChainStateError> {
+        let arguments = arguments
+            .iter()
+            .map(Value::serialize_to_vec)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        self.vm.begin_transaction()?;
+        let result = self.vm.execute_contract_call_outcome(
+            sender,
+            None,
+            QualifiedContractIdentifier::parse(contract)
+                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?,
+            function,
+            &arguments,
+            LimitedCostTracker::new_free(),
+        );
+        finalize_native_contract_call(&mut self.vm, &result)
     }
 
     fn execute_transaction(
@@ -742,6 +917,104 @@ impl ChainState {
                 .set_account_nonce(payer, increment_nonce(transaction.auth().payer().nonce())?)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BitcoinOperationClass {
+    Stack,
+    Transfer,
+    Delegate,
+    Vote,
+}
+
+impl BitcoinOperationClass {
+    const fn matches(self, operation: &BitcoinOperation) -> bool {
+        matches!(
+            (self, &operation.kind),
+            (Self::Stack, BitcoinOperationKind::StackStx { .. })
+                | (Self::Transfer, BitcoinOperationKind::TransferStx { .. })
+                | (Self::Delegate, BitcoinOperationKind::DelegateStx { .. })
+                | (Self::Vote, BitcoinOperationKind::VoteForAggregateKey { .. })
+        )
+    }
+}
+
+fn pox_address_value(address: &PoxAddress) -> Result<Value, ChainStateError> {
+    let (version, hashbytes) = match address {
+        PoxAddress::Standard { address, hash_mode } => {
+            let hash_mode = hash_mode.ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "Bitcoin operation has no address hash mode".to_owned(),
+                )
+            })?;
+            (hash_mode as u8, address.hash160().as_bytes().to_vec())
+        }
+        PoxAddress::Addr20 {
+            address_type,
+            bytes,
+            ..
+        } => (*address_type as u8, bytes.to_vec()),
+        PoxAddress::Addr32 {
+            address_type,
+            bytes,
+            ..
+        } => (*address_type as u8, bytes.to_vec()),
+    };
+    let hashbytes = Value::buff_from(hashbytes)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    let tuple = TupleData::from_data(vec![
+        (
+            ClarityName::from_literal("version"),
+            Value::buff_from_byte(version),
+        ),
+        (ClarityName::from_literal("hashbytes"), hashbytes),
+    ])
+    .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    Ok(Value::Tuple(tuple))
+}
+
+fn optional_uint(height: Option<u64>) -> Result<Value, ChainStateError> {
+    height.map_or_else(
+        || Ok(Value::none()),
+        |height| {
+            Value::some(Value::UInt(u128::from(height)))
+                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
+        },
+    )
+}
+
+fn optional_pox_address(address: Option<&PoxAddress>) -> Result<Value, ChainStateError> {
+    address.map_or_else(
+        || Ok(Value::none()),
+        |address| {
+            Value::some(pox_address_value(address)?)
+                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
+        },
+    )
+}
+
+fn finalize_native_transfer(
+    vm: &mut Vm,
+    result: &Result<TransactionResult, VmExecutionError>,
+) -> Result<(), ChainStateError> {
+    match result {
+        Ok(_) => vm.commit_transaction().map_err(ChainStateError::from),
+        Err(_) => vm.rollback_transaction().map_err(ChainStateError::from),
+    }
+}
+
+fn finalize_native_contract_call(
+    vm: &mut Vm,
+    result: &Result<ContractCallOutcome, VmExecutionError>,
+) -> Result<(), ChainStateError> {
+    match result {
+        Ok(ContractCallOutcome::Success(_)) => {
+            vm.commit_transaction().map_err(ChainStateError::from)
+        }
+        Ok(ContractCallOutcome::RuntimeFailure { .. }) | Err(_) => {
+            vm.rollback_transaction().map_err(ChainStateError::from)
+        }
     }
 }
 
