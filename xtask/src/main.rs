@@ -28,6 +28,9 @@ fn main() -> ExitCode {
 /// Tenures between a reward being earned and paid, mirroring stacks-core.
 const MINER_REWARD_MATURITY: u64 = 100;
 
+/// Testnet boot address, which receives a parent share that has no tenure.
+const BOOT_ADDRESS: &str = "ST000000000000000000002AMW42H";
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures")
 }
@@ -364,12 +367,14 @@ impl CaptureConfig {
             // the previous tenure's. Both are credited even when zero, because the
             // write itself is consensus state.
             let mut credits = vec![json!({ "recipient": earned.0, "amount": earned.1 })];
-            if let Some(previous) = Self::scheduled_payment(
+            // Without a preceding tenure the parent share still lands, on the
+            // boot address, because stacks-core credits it unconditionally.
+            let previous = Self::scheduled_payment(
                 chainstate_db,
                 coinbase_height.saturating_sub(MINER_REWARD_MATURITY + 1),
-            )? {
-                credits.push(json!({ "recipient": previous.0, "amount": earned.2 }));
-            }
+            )?
+            .map_or_else(|| BOOT_ADDRESS.to_owned(), |payment| payment.0);
+            credits.push(json!({ "recipient": previous, "amount": earned.2 }));
             effects.push(json!({
                 "coinbase_height": coinbase_height,
                 "credits": credits,

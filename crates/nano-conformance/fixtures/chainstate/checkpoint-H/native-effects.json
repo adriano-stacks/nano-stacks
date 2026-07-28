@@ -6,6 +6,10 @@
         {
           "amount": 1020400000,
           "recipient": "ST1XVSVQN0KP5SDYFNT8E5TXWVW0XZVQEDBMCJ3XM"
+        },
+        {
+          "amount": 0,
+          "recipient": "ST000000000000000000002AMW42H"
         }
       ],
       "liquid_supply_increase": 1020400000

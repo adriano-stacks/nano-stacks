@@ -90,10 +90,11 @@ for coinbase_height in range(first_height, first_height + span + 1):
     if earned is None:
         continue
     previous = scheduled_payment(coinbase_height - MATURITY - 1)
-    # Both shares are credited even when zero: the write itself is consensus state.
+    # Both shares are credited even when zero: the write itself is consensus
+    # state. Without a preceding tenure the parent share lands on the boot address.
     credits = [{"recipient": earned[0], "amount": earned[1]}]
-    if previous is not None:
-        credits.append({"recipient": previous[0], "amount": earned[2]})
+    recipient = previous[0] if previous is not None else "ST000000000000000000002AMW42H"
+    credits.append({"recipient": recipient, "amount": earned[2]})
     effects.append(
         {
             "coinbase_height": coinbase_height,
