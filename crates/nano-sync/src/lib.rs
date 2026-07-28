@@ -55,6 +55,8 @@ pub struct SortitionInfo {
     pub stacks_parent_consensus_hash: Option<ConsensusHash>,
     pub last_sortition_consensus_hash: Option<ConsensusHash>,
     pub committed_block_hash: Option<BlockHeaderHash>,
+    /// The winning commitment's new seed, which seeds the next sortition hash.
+    pub vrf_seed: Option<[u8; 32]>,
 }
 
 /// A locally validated tenure downloaded from a peer.
@@ -101,6 +103,13 @@ pub struct BlockUpload {
 }
 
 impl PoxInfo {
+    /// The reward cycle a Bitcoin height belongs to.
+    #[must_use]
+    pub fn reward_cycle(&self, bitcoin_height: u64) -> u64 {
+        let length = u64::from(self.prepare_phase_length) + u64::from(self.reward_phase_length);
+        bitcoin_height.saturating_sub(self.first_bitcoin_height) / length.max(1)
+    }
+
     /// Convert the node response into the context required for VM execution.
     #[must_use]
     pub fn bitcoin_context(&self) -> BitcoinBlockContext {
@@ -265,12 +274,35 @@ impl SyncClient {
         &self,
         consensus_hash: ConsensusHash,
     ) -> Result<SortitionInfo, SyncError> {
-        let mut sortitions: Vec<SortitionInfoWire> = self
-            .get(&format!("v3/sortitions/consensus/{consensus_hash}"))
+        let sortition = self
+            .single_sortition(&format!("v3/sortitions/consensus/{consensus_hash}"))
             .await?;
+        if sortition.consensus_hash != consensus_hash {
+            return Err(SyncError::InvalidSortition);
+        }
+        Ok(sortition)
+    }
+
+    /// Fetch the sortition of the peer's current Bitcoin tip.
+    pub async fn sortition_tip(&self) -> Result<SortitionInfo, SyncError> {
+        self.single_sortition("v3/sortitions").await
+    }
+
+    /// Fetch the sortition recorded for one Bitcoin height.
+    pub async fn sortition_at_height(&self, height: u64) -> Result<SortitionInfo, SyncError> {
+        let sortition = self
+            .single_sortition(&format!("v3/sortitions/burn_height/{height}"))
+            .await?;
+        if sortition.bitcoin_height != height {
+            return Err(SyncError::InvalidSortition);
+        }
+        Ok(sortition)
+    }
+
+    async fn single_sortition(&self, path: &str) -> Result<SortitionInfo, SyncError> {
+        let mut sortitions: Vec<SortitionInfoWire> = self.get(path).await?;
         let sortition = sortitions.pop().ok_or(SyncError::EmptySortition)?;
-        let response_consensus_hash = parse_prefixed_consensus_hash(&sortition.consensus_hash)?;
-        if !sortitions.is_empty() || response_consensus_hash != consensus_hash {
+        if !sortitions.is_empty() {
             return Err(SyncError::InvalidSortition);
         }
         Ok(SortitionInfo {
@@ -279,7 +311,7 @@ impl SyncClient {
             bitcoin_timestamp: sortition.burn_header_timestamp,
             sortition_id: parse_prefixed_sortition_id(&sortition.sortition_id)?,
             parent_sortition_id: parse_prefixed_sortition_id(&sortition.parent_sortition_id)?,
-            consensus_hash: response_consensus_hash,
+            consensus_hash: parse_prefixed_consensus_hash(&sortition.consensus_hash)?,
             was_sortition: sortition.was_sortition,
             miner_public_key_hash: sortition
                 .miner_pk_hash160
@@ -300,6 +332,11 @@ impl SyncClient {
                 .committed_block_hash
                 .as_deref()
                 .map(parse_prefixed_block_hash)
+                .transpose()?,
+            vrf_seed: sortition
+                .vrf_seed
+                .as_deref()
+                .map(parse_prefixed_hex)
                 .transpose()?,
         })
     }
@@ -617,6 +654,7 @@ struct SortitionInfoWire {
     stacks_parent_ch: Option<String>,
     last_sortition_ch: Option<String>,
     committed_block_hash: Option<String>,
+    vrf_seed: Option<String>,
 }
 
 fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {

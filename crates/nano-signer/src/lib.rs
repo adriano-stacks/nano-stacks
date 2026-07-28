@@ -1082,6 +1082,7 @@ mod tests {
             stacks_parent_consensus_hash: None,
             last_sortition_consensus_hash: None,
             committed_block_hash: None,
+            vrf_seed: None,
         };
         (proposal, sortition)
     }
