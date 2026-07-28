@@ -1,11 +1,13 @@
 use clarity::vm::types::{SequenceSubtype, StringSubtype, TypeSignature};
-use clarity::vm::ClarityName;
+use clarity::vm::{ClarityName, SymbolicExpression};
 
-use super::{SimpleWord, Word};
+use super::{ComplexWord, Word};
+use crate::check_args;
 use crate::cost::WordCharge;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
+use crate::wasm_utils::ArgumentCountCheck;
 
-trait CmpWord: SimpleWord {
+trait CmpWord: ComplexWord {
     fn fn_name(&self) -> &'static str;
 }
 
@@ -13,9 +15,17 @@ fn traverse_comparison(
     word: &impl CmpWord,
     generator: &mut WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    arg_types: &[TypeSignature],
-    _return_type: &TypeSignature,
+    args: &[SymbolicExpression],
 ) -> Result<(), GeneratorError> {
+    check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
+    let arg_types = args
+        .iter()
+        .map(|arg| {
+            generator.get_expr_type(arg).cloned().ok_or_else(|| {
+                GeneratorError::TypeError("comparison argument must be typed".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let cost_size = arg_types
         .iter()
         .map(|ty| {
@@ -59,6 +69,9 @@ fn traverse_comparison(
             GeneratorError::InternalError(format!("function not found: {name}-{type_suffix}"))
         })?;
 
+    for arg in args {
+        generator.traverse_expr_as_borrowed_value(builder, arg)?;
+    }
     builder.call(func);
 
     Ok(())
@@ -73,15 +86,15 @@ impl Word for CmpLess {
     }
 }
 
-impl SimpleWord for CmpLess {
-    fn visit(
+impl ComplexWord for CmpLess {
+    fn traverse(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        arg_types: &[TypeSignature],
-        return_type: &TypeSignature,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, arg_types, return_type)
+        traverse_comparison(self, generator, builder, args)
     }
 }
 
@@ -100,15 +113,15 @@ impl Word for CmpLeq {
     }
 }
 
-impl SimpleWord for CmpLeq {
-    fn visit(
+impl ComplexWord for CmpLeq {
+    fn traverse(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        arg_types: &[TypeSignature],
-        return_type: &TypeSignature,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, arg_types, return_type)
+        traverse_comparison(self, generator, builder, args)
     }
 }
 
@@ -127,15 +140,15 @@ impl Word for CmpGreater {
     }
 }
 
-impl SimpleWord for CmpGreater {
-    fn visit(
+impl ComplexWord for CmpGreater {
+    fn traverse(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        arg_types: &[TypeSignature],
-        return_type: &TypeSignature,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, arg_types, return_type)
+        traverse_comparison(self, generator, builder, args)
     }
 }
 
@@ -154,15 +167,15 @@ impl Word for CmpGeq {
     }
 }
 
-impl SimpleWord for CmpGeq {
-    fn visit(
+impl ComplexWord for CmpGeq {
+    fn traverse(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        arg_types: &[TypeSignature],
-        return_type: &TypeSignature,
+        _expr: &SymbolicExpression,
+        args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, arg_types, return_type)
+        traverse_comparison(self, generator, builder, args)
     }
 }
 

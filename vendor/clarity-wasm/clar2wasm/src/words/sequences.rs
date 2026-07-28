@@ -542,7 +542,7 @@ impl ComplexWord for AsMaxLen {
 
         // Traverse the second argument, the desired length, leaving the low
         // and high parts on the stack, then drop the high part.
-        generator.traverse_expr(builder, args.get_expr(1)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
         builder.drop();
 
         // Compare the length of the list to the desired length.
@@ -1719,7 +1719,7 @@ impl ComplexWord for Slice {
         builder.local_get(length_local);
 
         // Traverse the right position, leaving it on the stack.
-        generator.traverse_expr(builder, args.get_expr(2)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(2)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);

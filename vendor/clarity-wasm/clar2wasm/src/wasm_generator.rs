@@ -96,7 +96,6 @@ pub(crate) struct Bindings {
 struct InnerBindings {
     locals: Vec<LocalId>,
     ty: TypeSignature,
-    value_ty: TypeSignature,
 }
 
 impl Bindings {
@@ -105,24 +104,7 @@ impl Bindings {
     }
 
     pub(crate) fn insert(&mut self, name: ClarityName, ty: TypeSignature, locals: Vec<LocalId>) {
-        self.insert_with_value_type(name, ty.clone(), ty, locals);
-    }
-
-    pub(crate) fn insert_with_value_type(
-        &mut self,
-        name: ClarityName,
-        ty: TypeSignature,
-        value_ty: TypeSignature,
-        locals: Vec<LocalId>,
-    ) {
-        self.values.insert(
-            name,
-            InnerBindings {
-                locals,
-                ty,
-                value_ty,
-            },
-        );
+        self.values.insert(name, InnerBindings { locals, ty });
     }
 
     pub(crate) fn enter_scope(&mut self) -> Result<(), GeneratorError> {
@@ -147,7 +129,7 @@ impl Bindings {
     ) -> Option<(Vec<LocalId>, TypeSignature)> {
         self.values
             .get(name)
-            .map(|binding| (binding.locals.clone(), binding.value_ty.clone()))
+            .map(|binding| (binding.locals.clone(), binding.ty.clone()))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -608,6 +590,18 @@ impl WasmGenerator {
         result
     }
 
+    pub fn traverse_expr_as_borrowed_value(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+    ) -> Result<(), GeneratorError> {
+        if matches!(expr.expr, SymbolicExpressionType::Atom(_)) {
+            self.traverse_expr_without_value_copy_charge(builder, expr)
+        } else {
+            self.traverse_expr(builder, expr)
+        }
+    }
+
     fn traverse_list(
         &mut self,
         builder: &mut InstrSeqBuilder,
@@ -767,12 +761,7 @@ impl WasmGenerator {
             } else {
                 param.signature.clone()
             };
-            bindings.insert_with_value_type(
-                param.name.clone(),
-                param.signature.clone(),
-                value_ty.clone(),
-                plocals.clone(),
-            );
+            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone());
             parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
@@ -997,8 +986,8 @@ impl WasmGenerator {
                     .local_set(*size);
             }
             TypeSignature::ResponseType(response) => {
-                let ok_size = 2 + self.clarity_value_size(&response.0)?;
-                let err_size = 2 + self.clarity_value_size(&response.1)?;
+                let ok_size = 1 + self.clarity_value_size(&response.0)?;
+                let err_size = 1 + self.clarity_value_size(&response.1)?;
                 builder
                     .local_get(values[0])
                     .if_else(
@@ -1864,7 +1853,17 @@ impl WasmGenerator {
             }
 
             self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
-
+            if self.charge_local_value_copy {
+                let value_ty = if need_ducktyping(&cst_ty, &expected_ty) {
+                    &expected_ty
+                } else {
+                    &cst_ty
+                };
+                self.clarity_value_size_on_stack(builder, value_ty)?;
+                let size = self.borrow_local(ValType::I32);
+                builder.local_set(*size);
+                self.charge_lookup_variable_size(builder, *size)?;
+            }
             Ok(true)
         } else {
             Ok(false)

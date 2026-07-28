@@ -948,7 +948,7 @@ impl ComplexWord for Asserts {
         let predicate_expr = args.get_expr(0)?;
         let thrown = args.get_expr(1)?;
 
-        generator.traverse_expr(builder, predicate_expr)?;
+        generator.traverse_expr_as_borrowed_value(builder, predicate_expr)?;
         let predicate = generator.module.locals.add(ValType::I32);
         builder.local_set(predicate);
 
@@ -959,21 +959,24 @@ impl ComplexWord for Asserts {
                 GeneratorError::TypeError("Thrown value in an asserts! should be typed".to_owned())
             })
             .cloned()?;
+        let mut failure = builder.dangling_instr_seq(None);
         generator.set_expr_type(thrown, thrown_type.clone())?;
-        generator.traverse_expr(builder, thrown)?;
-
-        // we save the thrown as a short-returnable, and we handle its short-return.
+        generator.traverse_expr(&mut failure, thrown)?;
         let short_returnable_thrown = ShortReturnable::new_any(
             generator,
-            builder,
+            &mut failure,
             &thrown_type,
             ErrorMap::ShortReturnAssertionFailure,
         );
-
-        short_returnable_thrown.handle_short_return(generator, builder, |instrs| {
-            // we need to short return if predicate is false.
-            instrs.local_get(predicate).unop(UnaryOp::I32Eqz);
+        short_returnable_thrown.handle_short_return(generator, &mut failure, |instrs| {
+            instrs.i32_const(1);
         })?;
+        let failure = failure.id();
+        let success = builder.dangling_instr_seq(None).id();
+        builder.local_get(predicate).instr(IfElse {
+            consequent: success,
+            alternative: failure,
+        });
 
         // if we didn't short-return, the result is always `true`
         builder.i32_const(1);
