@@ -13,6 +13,7 @@ nano-codec = { path = "../nano-codec" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-crypto = { path = "../nano-crypto" }
 nano-marf = { path = "../nano-marf" }
+nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
 nano-signer = { path = "../nano-signer" }
 nano-sortition = { path = "../nano-sortition" }

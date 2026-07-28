@@ -1686,6 +1686,7 @@ dependencies = [
  "nano-codec",
  "nano-crypto",
  "nano-marf",
+ "nano-node",
  "nano-primitives",
  "nano-signer",
  "nano-sortition",
@@ -1722,6 +1723,8 @@ dependencies = [
 name = "nano-node"
 version = "0.1.0"
 dependencies = [
+ "nano-chainstate",
+ "nano-primitives",
  "nano-sync",
  "reqwest",
 ]

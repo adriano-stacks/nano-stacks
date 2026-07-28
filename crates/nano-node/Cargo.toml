@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+nano-chainstate = { path = "../nano-chainstate" }
+nano-primitives = { path = "../nano-primitives" }
 nano-sync = { path = "../nano-sync" }
 
 [dev-dependencies]

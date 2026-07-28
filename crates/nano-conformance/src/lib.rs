@@ -761,6 +761,7 @@ mod tests {
         MarfTrie, MarfValue, TrieNodeId, TriePointer, VersionedMarf, import_checkpoint, import_pcs,
         internal_node_hash, key_path, leaf_hash,
     };
+    use nano_node::CheckpointExecutor;
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
     use nano_signer::{ChainstateProposalValidator, ProposalValidator};
     use nano_stackerdb::{BlockAcceptance, BlockProposal, Chunk, SignerMessage};
@@ -1029,6 +1030,41 @@ mod tests {
         validator
             .observe(&second, second_context.height)
             .expect("observe candidate");
+    }
+
+    #[test]
+    fn checkpoint_executor_executes_captured_descendants() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read blocks")
+            .map(|entry| entry.expect("block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let first = NanoNakamotoBlock::decode(&fs::read(&paths[0]).expect("read first block"))
+            .expect("decode first block");
+        let second = NanoNakamotoBlock::decode(&fs::read(&paths[1]).expect("read second block"))
+            .expect("decode second block");
+        let first_context = *snapshots
+            .get(&first.header.consensus_hash.to_string())
+            .expect("first Bitcoin context");
+        let second_context = *snapshots
+            .get(&second.header.consensus_hash.to_string())
+            .expect("second Bitcoin context");
+        let mut executor = CheckpointExecutor::from_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+            first,
+            first_context,
+        )
+        .expect("open checkpoint executor");
+
+        executor
+            .apply(&second, second_context)
+            .expect("execute descendant");
+        assert_eq!(executor.tip().block_id(), second.block_id());
     }
 
     #[test]

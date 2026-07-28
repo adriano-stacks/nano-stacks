@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::{fmt, path::Path};
+
+use nano_chainstate::{
+    AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
+};
+use nano_primitives::TrieHash;
 use nano_sync::{
     FollowedTenure, NodeInfo, PoxInfo, SyncClient, SyncError, TenureFollower, TenureInfo,
 };
@@ -19,6 +25,115 @@ pub struct NodeView {
     pub node_info: NodeInfo,
     pub pox_info: PoxInfo,
     pub tenures: Vec<FollowedTenure>,
+}
+
+/// Executes a validated tenure stream from an imported checkpoint state.
+#[derive(Debug)]
+pub struct CheckpointExecutor {
+    chainstate: ChainState,
+    tip: NakamotoBlock,
+}
+
+#[derive(Debug)]
+pub enum CheckpointExecutionError {
+    ChainState(ChainStateError),
+    Link(String),
+}
+
+impl fmt::Display for CheckpointExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChainState(error) => write!(formatter, "checkpoint execution failed: {error}"),
+            Self::Link(error) => {
+                write!(formatter, "checkpoint execution chain link failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CheckpointExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ChainState(error) => Some(error),
+            Self::Link(_) => None,
+        }
+    }
+}
+
+impl From<ChainStateError> for CheckpointExecutionError {
+    fn from(error: ChainStateError) -> Self {
+        Self::ChainState(error)
+    }
+}
+
+impl CheckpointExecutor {
+    /// Import a checkpoint and apply its first known descendant as the execution anchor.
+    pub fn from_checkpoint(
+        path: impl AsRef<Path>,
+        source: [u8; 32],
+        state_root: TrieHash,
+        anchor: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<Self, CheckpointExecutionError> {
+        let mut chainstate = ChainState::from_checkpoint(path, source, state_root)?;
+        chainstate.append_nakamoto_block_with_bitcoin_context(
+            bitcoin_context,
+            Some(source),
+            &anchor,
+        )?;
+        Ok(Self {
+            chainstate,
+            tip: anchor,
+        })
+    }
+
+    /// Apply the blocks in a followed tenure that extend the current execution tip.
+    pub fn apply_followed_tenure(
+        &mut self,
+        tenure: &FollowedTenure,
+        pox: &PoxInfo,
+    ) -> Result<Vec<AppliedBlock>, CheckpointExecutionError> {
+        let mut bitcoin_context = pox.bitcoin_context();
+        bitcoin_context.height = tenure.sortition.bitcoin_height;
+        let current_tip = self.tip.block_id();
+        let blocks = tenure
+            .blocks
+            .iter()
+            .skip_while(|block| block.block_id() != current_tip);
+        let mut blocks = blocks.peekable();
+        if blocks.peek().is_some() {
+            blocks.next();
+        }
+        let mut applied = Vec::new();
+        for block in blocks {
+            applied.push(self.apply(block, bitcoin_context)?);
+        }
+        Ok(applied)
+    }
+
+    /// Validate and execute one direct descendant of the current execution tip.
+    pub fn apply(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        block
+            .validate_successor(&self.tip.header)
+            .map_err(|error| CheckpointExecutionError::Link(error.to_string()))?;
+        let applied = self.chainstate.append_nakamoto_block_with_bitcoin_context(
+            bitcoin_context,
+            Some(*self.tip.block_id().as_bytes()),
+            block,
+        )?;
+        self.tip = block.clone();
+        Ok(applied)
+    }
+
+    /// Return the most recently executed block.
+    #[must_use]
+    pub const fn tip(&self) -> &NakamotoBlock {
+        &self.tip
+    }
 }
 
 impl Node {
