@@ -1979,15 +1979,18 @@ mod tests {
     use std::path::Path;
 
     use clar2wasm::ModuleCache;
-    use clarity::vm::Value;
     use clarity::vm::database::ClarityBackingStore;
     use clarity::vm::database::clarity_store::make_contract_hash_key;
-    use clarity::vm::types::QualifiedContractIdentifier;
+    use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+    use clarity::vm::{ClarityVersion, Value};
     use nano_primitives::TrieHash;
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
-    use super::{MarfStore, Vm, evaluate, evaluate_in_store};
+    use super::{
+        ContractCallOutcome, MarfStore, Vm, deploy_contract, evaluate, evaluate_in_store,
+        execute_contract_call, execute_contract_call_outcome,
+    };
     use clarity::vm::costs::LimitedCostTracker;
 
     #[test]
@@ -2133,7 +2136,7 @@ mod tests {
         let block = [9; 32];
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
             .expect("valid contract identifier");
-        let sender = contract.issuer.clone().into();
+        let sender: PrincipalData = contract.issuer.clone().into();
         let mut argument = Vec::new();
         Value::UInt(41)
             .consensus_serialize(&mut argument)
@@ -2195,6 +2198,154 @@ mod tests {
             .expect("call contract");
 
         assert_eq!(result.value, Some(Value::err_uint(1)));
+    }
+
+    fn assert_successful_wasm_call_matches_interpreter(
+        wasm: &mut Vm,
+        store: &mut MarfStore,
+        sender: PrincipalData,
+        contract: QualifiedContractIdentifier,
+        function: &str,
+        arguments: &[Vec<u8>],
+    ) {
+        let wasm_result = wasm
+            .execute_contract_call(
+                sender.clone(),
+                None,
+                contract.clone(),
+                function,
+                arguments,
+                LimitedCostTracker::new_free(),
+            )
+            .expect("call WASM contract");
+        let interpreter_result = execute_contract_call(
+            store,
+            sender,
+            None,
+            contract,
+            function,
+            arguments,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("call interpreter contract");
+
+        assert_eq!(wasm_result.value, interpreter_result.value);
+        assert_eq!(wasm_result.cost, interpreter_result.cost);
+        assert_eq!(wasm_result.assets, interpreter_result.assets);
+        assert_eq!(wasm_result.events, interpreter_result.events);
+    }
+
+    fn assert_wasm_failure_matches_interpreter(
+        wasm: &mut Vm,
+        store: &mut MarfStore,
+        sender: PrincipalData,
+        contract: QualifiedContractIdentifier,
+        function: &str,
+        arguments: &[Vec<u8>],
+    ) {
+        let wasm_failure = wasm
+            .execute_contract_call_outcome(
+                sender.clone(),
+                None,
+                contract.clone(),
+                function,
+                arguments,
+                LimitedCostTracker::new_free(),
+            )
+            .expect("execute WASM failure");
+        let interpreter_failure = execute_contract_call_outcome(
+            store,
+            sender,
+            None,
+            contract,
+            function,
+            arguments,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("execute interpreter failure");
+        let (
+            ContractCallOutcome::RuntimeFailure {
+                cost: wasm_cost,
+                error: wasm_error,
+            },
+            ContractCallOutcome::RuntimeFailure {
+                cost: interpreter_cost,
+                error: interpreter_error,
+            },
+        ) = (wasm_failure, interpreter_failure)
+        else {
+            panic!("{function} should fail at runtime")
+        };
+        assert_eq!(wasm_cost, interpreter_cost);
+        assert_eq!(wasm_error.to_string(), interpreter_error.to_string());
+    }
+
+    #[test]
+    fn wasm_calls_match_the_clarity_six_interpreter() {
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.crosscheck")
+                .expect("valid contract identifier");
+        let source = "
+            (define-public (describe (value (optional int)) (items (list 3 int)))
+                (let ((count (len items)) (number (default-to 0 value)))
+                    (ok (tuple (count count) (number number)))))
+            (define-public (must-have (value (optional int)))
+                (ok (unwrap-panic value)))
+        ";
+        let arguments = [
+            Value::some(Value::Int(7))
+                .expect("valid optional")
+                .serialize_to_vec()
+                .expect("serialize optional"),
+            Value::list_from(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+                .expect("valid list")
+                .serialize_to_vec()
+                .expect("serialize list"),
+        ];
+        let sender: PrincipalData = contract.issuer.clone().into();
+
+        let mut wasm = Vm::new().expect("create WASM VM");
+        wasm.begin_block(None, [0x71; 32])
+            .expect("begin WASM block");
+        wasm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            source,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy WASM contract");
+        let mut store = MarfStore::new().expect("create interpreter store");
+        store
+            .begin(None, [0x72; 32])
+            .expect("begin interpreter block");
+        deploy_contract(
+            &mut store,
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            source,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy interpreter contract");
+        assert_successful_wasm_call_matches_interpreter(
+            &mut wasm,
+            &mut store,
+            sender,
+            contract.clone(),
+            "describe",
+            &arguments,
+        );
+
+        let none = Value::none()
+            .serialize_to_vec()
+            .expect("serialize optional none");
+        assert_wasm_failure_matches_interpreter(
+            &mut wasm,
+            &mut store,
+            contract.issuer.clone().into(),
+            contract,
+            "must-have",
+            std::slice::from_ref(&none),
+        );
     }
 
     #[test]
