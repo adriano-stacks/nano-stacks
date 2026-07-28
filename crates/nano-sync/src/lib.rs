@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use nano_address::{PoxAddress, PoxAddressType32};
 use nano_chainstate::{
@@ -204,7 +204,7 @@ impl SyncClient {
             Err(SyncError::InvalidBaseUrl)
         } else {
             Ok(Self {
-                client: Client::new(),
+                client: Client::builder().timeout(Duration::from_secs(30)).build()?,
                 base_url,
             })
         }

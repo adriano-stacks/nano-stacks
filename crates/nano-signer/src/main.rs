@@ -54,6 +54,9 @@ enum Command {
         /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
         #[arg(long, default_value_t = 20_000)]
         max_sync_blocks: usize,
+        /// Verify checkpoint-to-tip execution without polling or publishing signer messages.
+        #[arg(long)]
+        sync_only: bool,
     },
 }
 
@@ -75,6 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 anchor_bitcoin_height,
                 poll_interval_secs,
                 max_sync_blocks,
+                sync_only,
             },
     } = Cli::parse();
     let client = SyncClient::new(Url::parse(&peer)?)?;
@@ -107,6 +111,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         signer,
     );
     let mut signer = LiveSigner::new(client.clone(), service);
+    if sync_only {
+        sync_chainstate(&client, &mut signer, max_sync_blocks).await?;
+        return Ok(());
+    }
     loop {
         if let Err(error) = sync_chainstate(&client, &mut signer, max_sync_blocks).await {
             eprintln!("signer chainstate sync failed: {error}");
@@ -147,6 +155,9 @@ async fn sync_chainstate(
         }
         block_id = block.header.parent_block_id;
         blocks.push(block);
+        if blocks.len() % 1_000 == 0 {
+            eprintln!("downloaded {} canonical blocks", blocks.len());
+        }
     }
     if blocks.len() == max_blocks {
         return Err(io::Error::new(
@@ -156,6 +167,7 @@ async fn sync_chainstate(
         .into());
     }
 
+    eprintln!("validating {} canonical blocks", blocks.len());
     for block in blocks.iter().rev() {
         let sortition = client.sortition(block.header.consensus_hash).await?;
         signer
