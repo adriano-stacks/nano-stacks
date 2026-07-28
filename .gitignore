@@ -1,2 +1,4 @@
 /target/
 /flake.lock
+.direnv
+/.hacknet/

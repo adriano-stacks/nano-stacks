@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fs, io, path::PathBuf, str::FromStr};
+use std::{error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use bitcoin::{Amount, Txid};
 use bitcoincore_rpc::Auth;
 use clap::Parser;
 use nano_bitcoin::BitcoinRpcSource;
-use nano_miner::{BitcoinWallet, RegisteredLeaderKey, plan_commitment};
+use nano_miner::{
+    BitcoinWallet, CommitmentPlan, CommitmentPlanError, RegisteredLeaderKey, plan_commitment,
+};
 use nano_sync::SyncClient;
 use reqwest::Url;
+use tokio::time::{Instant, sleep};
 
 #[derive(Parser)]
 #[command(name = "stacks-commit-block")]
@@ -47,6 +50,9 @@ struct Cli {
     /// Two hexadecimal magic bytes for the target network.
     #[arg(long, default_value = "5433")]
     magic: String,
+    /// Seconds to wait for the peer to catch up with the Bitcoin tip.
+    #[arg(long, default_value_t = 30)]
+    peer_timeout_secs: u64,
     /// Derive and print the commitment without broadcasting it.
     #[arg(long)]
     dry_run: bool,
@@ -76,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let key = leader_key(&cli, &wallet)?;
     let node = SyncClient::new(Url::parse(&cli.peer)?)?;
-    let plan = plan_commitment(&node, &mut bitcoin, key).await?;
+    let plan = synchronized_plan(&node, &mut bitcoin, &wallet, key, cli.peer_timeout_secs).await?;
     println!(
         "committing to tenure {} at Bitcoin height {} in reward cycle {}",
         hex::encode(plan.commitment.block_header_hash),
@@ -100,6 +106,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         submitted.transaction_id, cli.commitment_sats, submitted.fee
     );
     Ok(())
+}
+
+/// Derive a commitment once the peer has processed the Bitcoin tip it targets.
+async fn synchronized_plan(
+    node: &SyncClient,
+    bitcoin: &mut BitcoinRpcSource,
+    wallet: &BitcoinWallet,
+    key: RegisteredLeaderKey,
+    timeout_secs: u64,
+) -> Result<CommitmentPlan, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match plan_commitment(node, bitcoin, key, wallet.block_count()?).await {
+            Err(CommitmentPlanError::StaleNodeView { node, bitcoin }) => {
+                if Instant::now() >= deadline {
+                    return Err(CommitmentPlanError::StaleNodeView { node, bitcoin }.into());
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+            result => return Ok(result?),
+        }
+    }
 }
 
 fn leader_key(cli: &Cli, wallet: &BitcoinWallet) -> Result<RegisteredLeaderKey, Box<dyn Error>> {

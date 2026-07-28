@@ -10,7 +10,7 @@ pub use commitment::{
 
 use std::fmt;
 
-use bitcoin::{Amount, Transaction, Txid, consensus::encode::serialize_hex};
+use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, Txid, consensus::encode::serialize_hex};
 use bitcoincore_rpc::{Auth, Client, RpcApi, json};
 use nano_address::PoxAddress;
 use nano_bitcoin::{
@@ -176,7 +176,7 @@ impl BitcoinWallet {
         let template = build_leader_commitment_transaction(
             magic,
             commitment,
-            Vec::new(),
+            vec![self.funding_input()?],
             sbtc_address,
             commitment_amount,
             None,
@@ -198,13 +198,43 @@ impl BitcoinWallet {
         registration: &LeaderKeyRegistration,
         fee_rate_sats_per_vbyte: Option<u64>,
     ) -> Result<SubmittedLeaderKeyRegistration, MinerError> {
-        let template = build_leader_key_registration_transaction(magic, registration, Vec::new())?;
+        let template = build_leader_key_registration_transaction(
+            magic,
+            registration,
+            vec![self.funding_input()?],
+        )?;
         let submitted = self.submit_protocol_transaction(&template, 1, fee_rate_sats_per_vbyte)?;
         Ok(SubmittedLeaderKeyRegistration {
             transaction_id: submitted.transaction_id,
             transaction: submitted.transaction,
             fee: submitted.fee,
             change_output: submitted.change_output,
+        })
+    }
+
+    /// The Bitcoin height this wallet's node has accepted.
+    pub fn block_count(&self) -> Result<u64, MinerError> {
+        Ok(self.rpc.get_block_count()?)
+    }
+
+    /// Reserve the wallet's largest confirmed output as a transaction's first input.
+    ///
+    /// Bitcoin Core cannot decode an input-less transaction, so funding always
+    /// starts from a concrete output rather than an empty template.
+    fn funding_input(&self) -> Result<TxIn, MinerError> {
+        let largest = self
+            .rpc
+            .list_unspent(Some(1), None, None, None, None)?
+            .into_iter()
+            .max_by_key(|output| output.amount)
+            .ok_or(MinerError::MissingInputs)?;
+        Ok(TxIn {
+            previous_output: OutPoint {
+                txid: largest.txid,
+                vout: largest.vout,
+            },
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..TxIn::default()
         })
     }
 
