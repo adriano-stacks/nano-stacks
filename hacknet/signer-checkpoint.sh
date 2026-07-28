@@ -16,7 +16,15 @@ BLOCKS_DB=$NODE/chainstate/blocks/nakamoto.sqlite
 INDEX_DB=$NODE/chainstate/vm/index.sqlite
 CLARITY=$NODE/chainstate/vm/clarity
 
+# Copy each database first: the live files hold recent commits in their
+# write-ahead log, which an immutable read would silently miss.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+snapshot() { sqlite3 "$1" ".backup $WORK/$2"; echo "$WORK/$2"; }
 query() { sqlite3 "file:$1?immutable=1" "$2"; }
+
+BLOCKS_DB=$(snapshot "$BLOCKS_DB" blocks.sqlite)
+INDEX_DB=$(snapshot "$INDEX_DB" index.sqlite)
 
 tip_height=$(curl -sf "$PEER/v2/info" | python3 -c 'import sys,json;print(json.load(sys.stdin)["stacks_tip_height"])')
 checkpoint_height=$((tip_height - DEPTH))
@@ -41,7 +49,7 @@ cp "$CLARITY/marf.sqlite.blobs" "$OUT/marf.sqlite.blobs"
 tenure_height=$(curl -sf "$PEER/v2/info" | python3 -c 'import sys,json;print(json.load(sys.stdin)["tenure_height"])')
 # Replaying from the checkpoint re-executes tenures the peer already passed, so
 # the window starts below the current tenure by more than the checkpoint depth.
-python3 - "$INDEX_DB" "$((tenure_height - DEPTH - 10))" "$((DEPTH + 10 + MATURITY))" > "$OUT/native-effects.json" <<'PY'
+python3 - "$INDEX_DB" "$((tenure_height > DEPTH + 10 ? tenure_height - DEPTH - 10 : 1))" "$((DEPTH + 10 + MATURITY))" > "$OUT/native-effects.json" <<'PY'
 import json, sqlite3, sys
 
 # A tenure's own reward matures 100 tenures later: the coinbase pays the tenure's
@@ -59,20 +67,28 @@ def scheduled_payment(coinbase_height):
         "SELECT block_id FROM nakamoto_tenure_events WHERE cause = 0 AND coinbase_height = ? LIMIT 1",
         (coinbase_height,),
     ).fetchone()
-    if tenure is None:
-        return None
+    if tenure is not None:
+        return connection.execute(
+            "SELECT COALESCE(recipient, address), CAST(coinbase AS INTEGER), "
+            "CAST(tx_fees_anchored AS INTEGER) FROM payments WHERE index_block_hash = ? AND miner = 1",
+            (tenure[0],),
+        ).fetchone()
+    # Before Nakamoto a tenure is one block, so the schedule is keyed by height.
     return connection.execute(
         "SELECT COALESCE(recipient, address), CAST(coinbase AS INTEGER), "
-        "CAST(tx_fees_anchored AS INTEGER) FROM payments WHERE index_block_hash = ? AND miner = 1",
-        (tenure[0],),
+        "CAST(tx_fees_anchored AS INTEGER) FROM payments "
+        "WHERE stacks_block_height = ? AND miner = 1 ORDER BY rowid LIMIT 1",
+        (coinbase_height,),
     ).fetchone()
 
 
 effects = []
 for coinbase_height in range(first_height, first_height + span + 1):
+    if coinbase_height <= MATURITY:
+        continue
     earned = scheduled_payment(coinbase_height - MATURITY)
     if earned is None:
-        break
+        continue
     previous = scheduled_payment(coinbase_height - MATURITY - 1)
     # Both shares are credited even when zero: the write itself is consensus state.
     credits = [{"recipient": earned[0], "amount": earned[1]}]
