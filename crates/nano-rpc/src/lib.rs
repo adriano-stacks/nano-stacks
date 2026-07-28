@@ -10,15 +10,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use nano_node::{Node, NodeView};
+use nano_node::NodeView;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-/// Shared local node state served by the HTTP API.
-pub type SharedNode = Arc<RwLock<Node>>;
+/// Shared validated snapshot served by the HTTP API.
+pub type SharedView = Arc<RwLock<Option<NodeView>>>;
 
 /// Build the read-only RPC routes backed by the node's latest validated view.
-pub fn router(node: SharedNode) -> Router {
+pub fn router(node: SharedView) -> Router {
     Router::new()
         .route("/v2/info", get(node_info))
         .route("/v2/pox", get(pox_info))
@@ -30,7 +30,7 @@ pub fn router(node: SharedNode) -> Router {
 }
 
 /// Serve the public RPC until the listener is stopped.
-pub async fn serve(listener: tokio::net::TcpListener, node: SharedNode) -> std::io::Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, node: SharedView) -> std::io::Result<()> {
     axum::serve(listener, router(node)).await
 }
 
@@ -50,11 +50,11 @@ impl IntoResponse for RpcError {
     }
 }
 
-async fn view(node: &SharedNode) -> Result<NodeView, RpcError> {
-    node.read().await.view().ok_or(RpcError::Unavailable)
+async fn view(node: &SharedView) -> Result<NodeView, RpcError> {
+    node.read().await.clone().ok_or(RpcError::Unavailable)
 }
 
-async fn node_info(State(node): State<SharedNode>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
+async fn node_info(State(node): State<SharedView>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
     let info = view(&node).await?.node_info;
     Ok(axum::Json(NodeInfoWire {
         burn_block_height: info.bitcoin_height,
@@ -65,7 +65,7 @@ async fn node_info(State(node): State<SharedNode>) -> Result<axum::Json<NodeInfo
     }))
 }
 
-async fn pox_info(State(node): State<SharedNode>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
+async fn pox_info(State(node): State<SharedView>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
     let pox = view(&node).await?.pox_info;
     Ok(axum::Json(PoxInfoWire {
         first_burnchain_block_height: pox.first_bitcoin_height,
@@ -78,7 +78,7 @@ async fn pox_info(State(node): State<SharedNode>) -> Result<axum::Json<PoxInfoWi
 }
 
 async fn tenure_info(
-    State(node): State<SharedNode>,
+    State(node): State<SharedView>,
 ) -> Result<axum::Json<TenureInfoWire>, RpcError> {
     let latest = view(&node)
         .await?
@@ -91,7 +91,7 @@ async fn tenure_info(
 }
 
 async fn sortition(
-    State(node): State<SharedNode>,
+    State(node): State<SharedView>,
     Path(consensus_hash): Path<String>,
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
     let sortition = view(&node)
@@ -110,7 +110,7 @@ struct TenureQuery {
 }
 
 async fn tenure(
-    State(node): State<SharedNode>,
+    State(node): State<SharedView>,
     Path(start_block_id): Path<String>,
     Query(query): Query<TenureQuery>,
 ) -> Result<RawBlockStream, RpcError> {
@@ -135,7 +135,7 @@ async fn tenure(
 }
 
 async fn block(
-    State(node): State<SharedNode>,
+    State(node): State<SharedView>,
     Path(block_id): Path<String>,
 ) -> Result<RawBlockStream, RpcError> {
     let block = view(&node)
@@ -263,9 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_requests_until_the_node_has_a_validated_view() {
-        let client = SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
-            .expect("create client");
-        let app = router(Arc::new(RwLock::new(Node::new(client))));
+        let app = router(Arc::new(RwLock::new(None)));
 
         let response = app
             .oneshot(
@@ -301,7 +299,7 @@ mod tests {
             .sortition
             .consensus_hash
             .to_string();
-        let app = router(Arc::new(RwLock::new(node)));
+        let app = router(Arc::new(RwLock::new(node.view())));
 
         let info = app
             .clone()

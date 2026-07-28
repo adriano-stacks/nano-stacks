@@ -4,7 +4,7 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
 use nano_node::Node;
-use nano_rpc::{SharedNode, serve};
+use nano_rpc::{SharedView, serve};
 use nano_sync::SyncClient;
 use reqwest::Url;
 use tokio::{net::TcpListener, sync::RwLock, time::sleep};
@@ -40,20 +40,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             },
     } = Cli::parse();
     let client = SyncClient::new(Url::parse(&peer)?)?;
-    let node = Arc::new(RwLock::new(Node::new(client)));
-    node.write().await.poll().await?;
+    let mut node = Node::new(client);
+    node.poll().await?;
+    let view = Arc::new(RwLock::new(node.view()));
     let listener = TcpListener::bind(listen).await?;
-    let poller = poll(node.clone(), Duration::from_secs(poll_interval_secs));
+    let poller = poll(node, view.clone(), Duration::from_secs(poll_interval_secs));
 
     tokio::select! {
-        result = serve(listener, node) => result.map_err(Into::into),
+        result = serve(listener, view) => result.map_err(Into::into),
         result = poller => result,
     }
 }
 
-async fn poll(node: SharedNode, interval: Duration) -> Result<(), Box<dyn Error>> {
+async fn poll(mut node: Node, view: SharedView, interval: Duration) -> Result<(), Box<dyn Error>> {
     loop {
         sleep(interval).await;
-        node.write().await.poll().await?;
+        node.poll().await?;
+        *view.write().await = node.view();
     }
 }

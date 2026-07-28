@@ -39,6 +39,7 @@ pub struct CheckpointExecutor {
 pub struct ExecutingNode {
     node: Node,
     executor: CheckpointExecutor,
+    executed_view: Option<NodeView>,
 }
 
 #[derive(Debug)]
@@ -223,16 +224,33 @@ impl ExecutingNode {
     /// Couple a peer follower to a checkpoint executor.
     #[must_use]
     pub const fn new(node: Node, executor: CheckpointExecutor) -> Self {
-        Self { node, executor }
+        Self {
+            node,
+            executor,
+            executed_view: None,
+        }
     }
 
     /// Follow, validate, and execute the peer's next tenure update.
     pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, NodeExecutionError> {
         let followed = self.node.poll().await?;
         let view = self.node.view().ok_or(NodeExecutionError::MissingView)?;
-        let tenure = view.tenures.last().ok_or(NodeExecutionError::MissingView)?;
-        self.executor
-            .apply_followed_tenure(tenure, &view.pox_info)?;
+        let current_tip = self.executor.tip().block_id();
+        let first_tenure = view
+            .tenures
+            .iter()
+            .position(|tenure| {
+                tenure
+                    .blocks
+                    .iter()
+                    .any(|block| block.block_id() == current_tip)
+            })
+            .unwrap_or_else(|| view.tenures.len().saturating_sub(1));
+        for tenure in &view.tenures[first_tenure..] {
+            self.executor
+                .apply_followed_tenure(tenure, &view.pox_info)?;
+        }
+        self.executed_view = Some(view);
         Ok(followed)
     }
 
@@ -242,10 +260,10 @@ impl ExecutingNode {
         self.executor.tip()
     }
 
-    /// Return the current validated node view.
+    /// Return the latest completely executed node view.
     #[must_use]
     pub fn view(&self) -> Option<NodeView> {
-        self.node.view()
+        self.executed_view.clone()
     }
 }
 
