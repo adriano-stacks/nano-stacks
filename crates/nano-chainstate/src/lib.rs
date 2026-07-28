@@ -255,6 +255,19 @@ impl ChainState {
         block: &mut NakamotoBlock,
         miner_key: Option<&StacksPrivateKey>,
     ) -> Result<AppliedBlock, ChainStateError> {
+        if let Some(parent) = parent {
+            let parent_height = block.header.chain_length.checked_sub(1).ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "Nakamoto block has no parent height".to_owned(),
+                )
+            })?;
+            self.vm.set_checkpoint_height(
+                parent,
+                u32::try_from(parent_height).map_err(|_| {
+                    ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
+                })?,
+            );
+        }
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         let result = (|| {

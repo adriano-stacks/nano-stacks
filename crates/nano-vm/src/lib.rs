@@ -311,6 +311,11 @@ impl Vm {
         self.begin_block_with_bitcoin_context(parent, temporary_state_id, bitcoin_context)
     }
 
+    /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.
+    pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
+        self.store.set_checkpoint_height(block, height);
+    }
+
     /// Execute a Clarity 6 program with the supplied consensus cost tracker.
     pub fn execute(
         &mut self,
@@ -465,6 +470,16 @@ impl Vm {
     pub fn touch_stx_balance(&mut self, principal: &PrincipalData) -> Result<(), VmExecutionError> {
         let Self { store, context, .. } = self;
         touch_stx_balance_in_context(store, context, principal)
+    }
+
+    /// Credit liquid STX without emitting a transaction event.
+    pub fn credit_stx(
+        &mut self,
+        principal: &PrincipalData,
+        amount: u128,
+    ) -> Result<(), VmExecutionError> {
+        let Self { store, context, .. } = self;
+        credit_stx_in_context(store, context, principal, amount)
     }
 
     /// Create a consensus cost tracker from the active chain state.
@@ -816,6 +831,11 @@ impl MarfStore {
             .map(|root: TrieHash| StateRoot(*root.as_bytes()))
     }
 
+    /// Record an imported checkpoint's Stacks height for Clarity balance history lookups.
+    pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
+        self.heights.entry(block).or_insert(height);
+    }
+
     /// Return the MARF content hash before ancestry is incorporated.
     #[must_use]
     pub fn content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
@@ -849,6 +869,13 @@ impl MarfStore {
     }
 
     fn block_at_height(&self, mut block: [u8; 32], height: u32) -> Option<[u8; 32]> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.block == block && active.height == height)
+        {
+            return Some(block);
+        }
         loop {
             if self.heights.get(&block).copied() == Some(height) {
                 return Some(block);
@@ -1783,6 +1810,27 @@ fn touch_stx_balance_in_context(
     })
 }
 
+fn credit_stx_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    principal: &PrincipalData,
+    amount: u128,
+) -> Result<(), VmExecutionError> {
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        false,
+        CHAIN_ID_TESTNET,
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        let mut balance = global.database.get_stx_balance_snapshot(principal)?;
+        balance.credit(amount)?;
+        balance.save()
+    })
+}
+
 fn transaction_cost_tracker_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
@@ -2075,6 +2123,27 @@ mod tests {
 
         assert_eq!(value, Some(Value::UInt(42)));
         store.seal().expect("seal state");
+    }
+
+    #[test]
+    fn credits_liquid_stx_without_a_transaction_event() {
+        let principal =
+            PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid principal");
+        let mut vm = Vm::new().expect("create VM");
+        vm.begin_block(None, [1; 32]).expect("begin checkpoint");
+        vm.seal_block().expect("seal checkpoint");
+        vm.begin_block(Some([1; 32]), [2; 32])
+            .expect("begin successor");
+        vm.credit_stx(&principal, 42).expect("credit STX");
+
+        let value = vm
+            .execute(
+                "(stx-get-balance 'ST000000000000000000002AMW42H)",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("read balance");
+
+        assert_eq!(value.value, Some(Value::UInt(42)));
     }
 
     #[test]
