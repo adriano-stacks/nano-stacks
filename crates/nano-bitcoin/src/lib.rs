@@ -56,6 +56,7 @@ pub struct BitcoinRpcSource {
     magic: [u8; 2],
     pre_stx: PreStxCache,
     last_height: Option<u64>,
+    last_block: Option<BitcoinBlock>,
 }
 
 #[derive(Debug)]
@@ -107,11 +108,22 @@ impl BitcoinRpcSource {
             magic,
             pre_stx: PreStxCache::new(),
             last_height: None,
+            last_block: None,
         })
     }
 
     /// Decode the protocol operations in a Bitcoin block, retaining required prior `PreStx` outputs.
     pub fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, BitcoinRpcSourceError> {
+        if let Some(block) = self
+            .last_block
+            .as_ref()
+            .filter(|block| block.height == height)
+        {
+            return Ok(block.clone());
+        }
+        if self.last_height.is_some_and(|last| height < last) {
+            self.pre_stx = PreStxCache::new();
+        }
         let first_height = self.last_height.filter(|last| *last < height).map_or_else(
             || height.saturating_sub(PRE_STX_WINDOW_BLOCKS),
             |last| last + 1,
@@ -125,7 +137,9 @@ impl BitcoinRpcSource {
             current = Some(block);
         }
         self.last_height = Some(height);
-        current.ok_or_else(|| BitcoinParseError::InvalidBlock.into())
+        let block = current.ok_or(BitcoinParseError::InvalidBlock)?;
+        self.last_block = Some(block.clone());
+        Ok(block)
     }
 }
 
@@ -624,9 +638,9 @@ mod tests {
     };
 
     use super::{
-        BitcoinOperationKind, LeaderBlockCommitment, LeaderCommitmentTransactionError, PreStxCache,
-        build_leader_commitment_transaction, decode_block, parse_leader_block_commit,
-        parse_leader_key_registration,
+        BitcoinBlock, BitcoinOperationKind, BitcoinRpcSource, LeaderBlockCommitment,
+        LeaderCommitmentTransactionError, PreStxCache, build_leader_commitment_transaction,
+        decode_block, parse_leader_block_commit, parse_leader_key_registration,
     };
 
     #[test]
@@ -644,6 +658,21 @@ mod tests {
             operation_count += block.operations.len();
         }
         assert!(operation_count > 0);
+    }
+
+    #[test]
+    fn rpc_source_reuses_the_current_block_without_another_request() {
+        let mut source =
+            BitcoinRpcSource::new("http://127.0.0.1:18443", "user", "password", *b"T3")
+                .expect("create RPC source");
+        source.last_height = Some(123);
+        source.last_block = Some(BitcoinBlock {
+            height: 123,
+            hash: [0x42; 32],
+            operations: Vec::new(),
+        });
+
+        assert_eq!(source.block_at(123).expect("cached block").hash, [0x42; 32]);
     }
 
     #[test]
