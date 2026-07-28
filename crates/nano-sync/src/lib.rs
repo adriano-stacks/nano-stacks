@@ -3,7 +3,9 @@
 use std::fmt;
 
 use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, TenureError};
-use nano_primitives::{BlockHeaderHash, ConsensusHash, StacksBlockId};
+use nano_primitives::{
+    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
+};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 
@@ -31,6 +33,22 @@ pub struct TenureInfo {
     pub tip_block_id: StacksBlockId,
     pub tip_height: u64,
     pub reward_cycle: u64,
+}
+
+/// Bitcoin sortition data used to authenticate a Nakamoto tenure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortitionInfo {
+    pub bitcoin_block_hash: BitcoinHeaderHash,
+    pub bitcoin_height: u64,
+    pub bitcoin_timestamp: u64,
+    pub sortition_id: SortitionId,
+    pub parent_sortition_id: SortitionId,
+    pub consensus_hash: ConsensusHash,
+    pub was_sortition: bool,
+    pub miner_public_key_hash: Option<Hash160>,
+    pub stacks_parent_consensus_hash: Option<ConsensusHash>,
+    pub last_sortition_consensus_hash: Option<ConsensusHash>,
+    pub committed_block_hash: Option<BlockHeaderHash>,
 }
 
 /// A locally validated tenure downloaded from a peer.
@@ -85,6 +103,8 @@ pub enum SyncError {
     TenureStart,
     TenureLink(TenureError),
     InvalidHash,
+    EmptySortition,
+    InvalidSortition,
     Fork,
 }
 
@@ -98,6 +118,8 @@ impl fmt::Display for SyncError {
             Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
             Self::TenureLink(error) => write!(formatter, "invalid tenure link: {error}"),
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
+            Self::EmptySortition => formatter.write_str("sortition response contains no entries"),
+            Self::InvalidSortition => formatter.write_str("sortition response is inconsistent"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
         }
     }
@@ -113,6 +135,8 @@ impl std::error::Error for SyncError {
             | Self::EmptyTenure
             | Self::TenureStart
             | Self::InvalidHash
+            | Self::EmptySortition
+            | Self::InvalidSortition
             | Self::Fork => None,
         }
     }
@@ -170,6 +194,50 @@ impl SyncClient {
             reward_phase_length: response.reward_phase_block_length,
             reward_slots: response.reward_slots,
             rejection_fraction: response.rejection_fraction,
+        })
+    }
+
+    /// Fetch the Bitcoin sortition identified by its consensus hash.
+    pub async fn sortition(
+        &self,
+        consensus_hash: ConsensusHash,
+    ) -> Result<SortitionInfo, SyncError> {
+        let mut sortitions: Vec<SortitionInfoWire> = self
+            .get(&format!("v3/sortitions/consensus/{consensus_hash}"))
+            .await?;
+        let sortition = sortitions.pop().ok_or(SyncError::EmptySortition)?;
+        let response_consensus_hash = parse_prefixed_consensus_hash(&sortition.consensus_hash)?;
+        if !sortitions.is_empty() || response_consensus_hash != consensus_hash {
+            return Err(SyncError::InvalidSortition);
+        }
+        Ok(SortitionInfo {
+            bitcoin_block_hash: parse_prefixed_bitcoin_block_hash(&sortition.burn_block_hash)?,
+            bitcoin_height: sortition.burn_block_height,
+            bitcoin_timestamp: sortition.burn_header_timestamp,
+            sortition_id: parse_prefixed_sortition_id(&sortition.sortition_id)?,
+            parent_sortition_id: parse_prefixed_sortition_id(&sortition.parent_sortition_id)?,
+            consensus_hash: response_consensus_hash,
+            was_sortition: sortition.was_sortition,
+            miner_public_key_hash: sortition
+                .miner_pk_hash160
+                .as_deref()
+                .map(parse_prefixed_hash160)
+                .transpose()?,
+            stacks_parent_consensus_hash: sortition
+                .stacks_parent_ch
+                .as_deref()
+                .map(parse_prefixed_consensus_hash)
+                .transpose()?,
+            last_sortition_consensus_hash: sortition
+                .last_sortition_ch
+                .as_deref()
+                .map(parse_prefixed_consensus_hash)
+                .transpose()?,
+            committed_block_hash: sortition
+                .committed_block_hash
+                .as_deref()
+                .map(parse_prefixed_block_hash)
+                .transpose()?,
         })
     }
 
@@ -333,6 +401,21 @@ struct PoxInfoWire {
     rejection_fraction: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct SortitionInfoWire {
+    burn_block_hash: String,
+    burn_block_height: u64,
+    burn_header_timestamp: u64,
+    sortition_id: String,
+    parent_sortition_id: String,
+    consensus_hash: String,
+    was_sortition: bool,
+    miner_pk_hash160: Option<String>,
+    stacks_parent_ch: Option<String>,
+    last_sortition_ch: Option<String>,
+    committed_block_hash: Option<String>,
+}
+
 fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {
     parse_hex(value).map(StacksBlockId::from_bytes)
 }
@@ -343,6 +426,30 @@ fn parse_block_hash(value: &str) -> Result<BlockHeaderHash, SyncError> {
 
 fn parse_consensus_hash(value: &str) -> Result<ConsensusHash, SyncError> {
     parse_hex(value).map(ConsensusHash::from_bytes)
+}
+
+fn parse_prefixed_block_hash(value: &str) -> Result<BlockHeaderHash, SyncError> {
+    parse_prefixed_hex(value).map(BlockHeaderHash::from_bytes)
+}
+
+fn parse_prefixed_bitcoin_block_hash(value: &str) -> Result<BitcoinHeaderHash, SyncError> {
+    parse_prefixed_hex(value).map(BitcoinHeaderHash::from_bytes)
+}
+
+fn parse_prefixed_sortition_id(value: &str) -> Result<SortitionId, SyncError> {
+    parse_prefixed_hex(value).map(SortitionId::from_bytes)
+}
+
+fn parse_prefixed_consensus_hash(value: &str) -> Result<ConsensusHash, SyncError> {
+    parse_prefixed_hex(value).map(ConsensusHash::from_bytes)
+}
+
+fn parse_prefixed_hash160(value: &str) -> Result<Hash160, SyncError> {
+    parse_prefixed_hex(value).map(Hash160::from_bytes)
+}
+
+fn parse_prefixed_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError> {
+    parse_hex(value.strip_prefix("0x").ok_or(SyncError::InvalidHash)?)
 }
 
 fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError> {
@@ -366,7 +473,7 @@ mod tests {
     use super::TenureInfo;
     use super::{
         SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
-        validate_tenure, validate_tenure_transition,
+        parse_prefixed_hash160, validate_tenure, validate_tenure_transition,
     };
     use nano_chainstate::{NakamotoBlock, TenureError};
     use nano_primitives::{ConsensusHash, StacksBlockId};
@@ -397,6 +504,13 @@ mod tests {
             parse_consensus_hash("00"),
             Err(SyncError::InvalidHash)
         ));
+        assert_eq!(
+            parse_prefixed_hash160("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid prefixed hash")
+                .as_bytes(),
+            &[0xaa; 20]
+        );
+        assert!(parse_prefixed_hash160("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
     }
 
     #[test]
@@ -519,5 +633,22 @@ mod tests {
                 .validate_successor(&pair[0].header)
                 .expect("tenure blocks link");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_sortition_authenticates_the_current_tenure() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let tenure = client.tenure_info().await.expect("fetch tenure info");
+        let sortition = client
+            .sortition(tenure.consensus_hash)
+            .await
+            .expect("fetch tenure sortition");
+
+        assert_eq!(sortition.consensus_hash, tenure.consensus_hash);
+        assert!(sortition.was_sortition);
+        assert!(sortition.miner_public_key_hash.is_some());
     }
 }
