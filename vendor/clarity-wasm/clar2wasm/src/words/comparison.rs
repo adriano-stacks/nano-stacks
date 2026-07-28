@@ -16,7 +16,17 @@ fn traverse_comparison(
     arg_types: &[TypeSignature],
     _return_type: &TypeSignature,
 ) -> Result<(), GeneratorError> {
-    word.charge(generator, builder, arg_types.len() as u32)?;
+    let cost_size = arg_types
+        .iter()
+        .map(|ty| {
+            ty.size()
+                .map_err(|error| GeneratorError::TypeError(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min()
+        .ok_or_else(|| GeneratorError::InternalError("comparison requires arguments".to_owned()))?;
+    word.charge(generator, builder, cost_size)?;
 
     let name = word.fn_name();
 

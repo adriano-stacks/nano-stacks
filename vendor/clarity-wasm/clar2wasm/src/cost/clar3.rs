@@ -595,7 +595,7 @@ lazy_static! {
         map.insert(
             Unwrap.name(),
             WordCost {
-                runtime: Constant(252),
+                runtime: Constant(274),
                 read_count: None,
                 read_length: None,
                 write_count: None,
@@ -625,7 +625,7 @@ lazy_static! {
         map.insert(
             UnwrapPanic.name(),
             WordCost {
-                runtime: Constant(274),
+                runtime: Constant(252),
                 read_count: None,
                 read_length: None,
                 write_count: None,
@@ -765,7 +765,7 @@ lazy_static! {
         map.insert(
             IsEq.name(),
             WordCost {
-                runtime: Linear { a: 1, b: 151 },
+                runtime: Linear { a: 7, b: 151 },
                 read_count: None,
                 read_length: None,
                 write_count: None,
@@ -1007,7 +1007,7 @@ lazy_static! {
         map.insert(
             Slice.name(),
             WordCost {
-                runtime: Constant(498),
+                runtime: Constant(448),
                 read_count: None,
                 read_length: None,
                 write_count: None,

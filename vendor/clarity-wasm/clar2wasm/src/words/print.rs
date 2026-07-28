@@ -28,16 +28,20 @@ impl ComplexWord for Print {
 
         let value = args.get_expr(0)?;
 
-        // Traverse the value, leaving it on the data stack
-        generator.traverse_expr(builder, value)?;
-
-        // Save the value to locals
         let ty = generator
             .get_expr_type(value)
             .ok_or_else(|| {
                 GeneratorError::TypeError("print value expression must be typed".to_owned())
             })?
             .clone();
+
+        // Traverse the value, leaving it on the data stack.
+        generator.traverse_expr(builder, value)?;
+        generator.clarity_value_size_on_stack(builder, &ty)?;
+        let value_size = generator.borrow_local(walrus::ValType::I32);
+        builder.local_set(*value_size);
+
+        // Save the value to locals
         let val_locals = generator.save_to_locals(builder, &ty, true);
 
         let ty_for_serde = generator.type_for_serialization(&ty);
@@ -58,7 +62,7 @@ impl ComplexWord for Print {
                 data: serialized_ty,
             }))?;
 
-        self.charge(generator, builder, serialized_ty_len)?;
+        self.charge(generator, builder, *value_size)?;
 
         // Push the value back onto the data stack
         for val_local in &val_locals {

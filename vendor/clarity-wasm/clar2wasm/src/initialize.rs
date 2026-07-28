@@ -464,6 +464,7 @@ pub fn call_function(
         .ok_or_else(|| {
             clarity::vm::errors::RuntimeCheckErrorKind::UndefinedFunction(function_name.into())
         })?;
+    runtime_cost(ClarityCostFunction::LookupFunction, global_context, 0)?;
     let function_type = module
         .analysis
         .get_public_function_type(function_name)

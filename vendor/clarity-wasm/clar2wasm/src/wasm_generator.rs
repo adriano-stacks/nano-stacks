@@ -21,7 +21,7 @@ use walrus::{
     MemoryId, Module, ValType,
 };
 
-use crate::cost::{ChargeContext, WordCharge};
+use crate::cost::{ChargeContext, ChargeGenerator, WordCharge};
 use crate::duck_type::need_ducktyping;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_utils::{
@@ -84,7 +84,10 @@ pub struct WasmGenerator {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Bindings(HashMap<ClarityName, InnerBindings>);
+pub(crate) struct Bindings {
+    values: HashMap<ClarityName, InnerBindings>,
+    depth: u32,
+}
 
 #[derive(Debug, Clone)]
 struct InnerBindings {
@@ -98,24 +101,36 @@ impl Bindings {
     }
 
     pub(crate) fn insert(&mut self, name: ClarityName, ty: TypeSignature, locals: Vec<LocalId>) {
-        self.0.insert(name, InnerBindings { locals, ty });
+        self.values.insert(name, InnerBindings { locals, ty });
+    }
+
+    pub(crate) fn enter_scope(&mut self) -> Result<(), GeneratorError> {
+        self.depth = self
+            .depth
+            .checked_add(1)
+            .ok_or_else(|| GeneratorError::InternalError("binding depth overflow".to_owned()))?;
+        Ok(())
+    }
+
+    pub(crate) fn depth(&self) -> u32 {
+        self.depth
     }
 
     pub(crate) fn contains(&mut self, name: &ClarityName) -> bool {
-        self.0.contains_key(name)
+        self.values.contains_key(name)
     }
 
     pub(crate) fn get_locals_and_type(
         &self,
         name: &ClarityName,
     ) -> Option<(Vec<LocalId>, TypeSignature)> {
-        self.0
+        self.values
             .get(name)
             .map(|binding| (binding.locals.clone(), binding.ty.clone()))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
-        self.0.get(name).and_then(|b| match &b.ty {
+        self.values.get(name).and_then(|b| match &b.ty {
             TypeSignature::CallableType(CallableSubtype::Trait(t)) => Some(t),
             _ => None,
         })
@@ -383,6 +398,13 @@ impl Deref for BorrowedLocal {
 }
 
 impl WasmGenerator {
+    fn charge_reserved_variable_fetch(
+        &self,
+        builder: &mut InstrSeqBuilder,
+    ) -> Result<(), GeneratorError> {
+        self.charge(builder, ClarityName::from_literal("var-get"), 1_u32)
+    }
+
     pub fn new(contract_analysis: ContractAnalysis) -> Result<WasmGenerator, GeneratorError> {
         let standard_lib_wasm: &[u8] = include_bytes!("standard/standard.wasm");
 
@@ -1644,21 +1666,25 @@ impl WasmGenerator {
                     Ok(true)
                 }
                 NativeVariables::BlockHeight => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `block_height`
                     builder.call(self.func_by_name("stdlib.block_height"));
                     Ok(true)
                 }
                 NativeVariables::StacksBlockHeight => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `stacks_block_height`
                     builder.call(self.func_by_name("stdlib.stacks_block_height"));
                     Ok(true)
                 }
                 NativeVariables::TenureHeight => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `tenure_height`
                     builder.call(self.func_by_name("stdlib.tenure_height"));
                     Ok(true)
                 }
                 NativeVariables::BurnBlockHeight => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `burn_block_height`
                     builder.call(self.func_by_name("stdlib.burn_block_height"));
                     Ok(true)
@@ -1679,6 +1705,7 @@ impl WasmGenerator {
                     Ok(true)
                 }
                 NativeVariables::TotalLiquidMicroSTX => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `stx_liquid_supply`
                     builder.call(self.func_by_name("stdlib.stx_liquid_supply"));
                     Ok(true)
@@ -1699,6 +1726,7 @@ impl WasmGenerator {
                     Ok(true)
                 }
                 NativeVariables::StacksBlockTime => {
+                    self.charge_reserved_variable_fetch(builder)?;
                     // Call the host interface function, `stacks_block_time`
                     builder.call(self.func_by_name("stdlib.stacks_block_time"));
                     Ok(true)
@@ -1788,7 +1816,7 @@ impl WasmGenerator {
                 self.duck_type(builder, &cst_ty, &expected_ty, Some(result_local))?;
             }
 
-            self.charge_lookup_variable_depth(builder, 0)?;
+            self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
 
             Ok(true)
         } else {
@@ -1902,7 +1930,7 @@ impl WasmGenerator {
         for value in values {
             builder.local_get(value);
         }
-        self.charge_lookup_variable_depth(builder, 0)?;
+        self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
         self.clarity_value_size_on_stack(builder, &ty)?;
         let size = self.borrow_local(ValType::I32);
         builder.local_set(*size);

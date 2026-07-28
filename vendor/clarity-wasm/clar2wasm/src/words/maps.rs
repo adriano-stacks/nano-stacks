@@ -314,6 +314,8 @@ impl ComplexWord for MapSet {
         if let Some(cost_local) = &post205_cost_local {
             generator.serialization_size(builder, &value_type)?;
             builder
+                .i32_const(1)
+                .binop(BinaryOp::I32Add)
                 .local_get(**cost_local)
                 .binop(BinaryOp::I32Add)
                 .local_set(**cost_local);

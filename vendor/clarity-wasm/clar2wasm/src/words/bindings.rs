@@ -28,10 +28,11 @@ impl ComplexWord for Let {
         check_args!(generator, builder, 2, args_len, ArgumentCountCheck::AtLeast);
 
         let bindings = args.get_list(0)?;
-        self.charge(generator, builder, args_len as u32)?;
+        self.charge(generator, builder, bindings.len() as u32)?;
 
         // Save the current named locals
         let saved_locals = generator.bindings.clone();
+        generator.bindings.enter_scope()?;
 
         // Traverse the bindings
         for i in 0..bindings.len() {

@@ -64,7 +64,7 @@ impl ComplexWord for ListCons {
             generator.set_expr_type(expr, elem_ty.clone())?;
 
             generator.traverse_expr(builder, expr)?;
-            generator.serialization_size(builder, elem_ty)?;
+            generator.clarity_value_size_on_stack(builder, elem_ty)?;
             let element_size = generator.borrow_local(ValType::I32);
             builder.local_set(*element_size);
             builder
