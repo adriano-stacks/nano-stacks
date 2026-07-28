@@ -1788,6 +1788,10 @@ dependencies = [
  "bitcoincore-rpc",
  "nano-address",
  "nano-bitcoin",
+ "nano-chainstate",
+ "nano-crypto",
+ "nano-primitives",
+ "nano-stackerdb",
  "serde",
  "serde_json",
 ]

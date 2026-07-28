@@ -10,6 +10,10 @@ bitcoin = "0.32.8"
 bitcoincore-rpc = "0.19.0"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
+nano-chainstate = { path = "../nano-chainstate" }
+nano-crypto = { path = "../nano-crypto" }
+nano-primitives = { path = "../nano-primitives" }
+nano-stackerdb = { path = "../nano-stackerdb" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 

@@ -10,6 +10,12 @@ use nano_address::PoxAddress;
 use nano_bitcoin::{
     LeaderBlockCommitment, LeaderCommitmentTransactionError, build_leader_commitment_transaction,
 };
+use nano_chainstate::{SignerSet, SignerSetError};
+use nano_crypto::{MessageSignature, StacksPrivateKey};
+use nano_stackerdb::{
+    BlockProposal, Chunk, ChunkAck, SignerMessage, SignerMessageError, StackerDbClient,
+    StackerDbClientError, StackerDbContract, StackerDbError,
+};
 use serde::Deserialize;
 use serde_json::{Value, json as json_value};
 
@@ -233,11 +239,194 @@ struct BumpFeeResponse {
     transaction_id: Txid,
 }
 
+/// Errors raised while publishing a miner proposal or collecting signer responses.
+#[derive(Debug)]
+pub enum ProposalError {
+    Client(StackerDbClientError),
+    Chunk(StackerDbError),
+    Message(SignerMessageError),
+    SignerSet(SignerSetError),
+    SlotVersionOverflow,
+    Rejected {
+        reason: Option<String>,
+        code: Option<u32>,
+    },
+}
+
+impl fmt::Display for ProposalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client(error) => write!(formatter, "StackerDB client error: {error}"),
+            Self::Chunk(error) => write!(formatter, "StackerDB chunk error: {error}"),
+            Self::Message(error) => write!(formatter, "signer message error: {error}"),
+            Self::SignerSet(error) => write!(formatter, "invalid signer response set: {error}"),
+            Self::SlotVersionOverflow => formatter.write_str("StackerDB slot version overflow"),
+            Self::Rejected { reason, code } => {
+                formatter.write_str("StackerDB rejected miner chunk")?;
+                if let Some(code) = code {
+                    write!(formatter, " (code {code})")?;
+                }
+                if let Some(reason) = reason {
+                    write!(formatter, ": {reason}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProposalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(error) => Some(error),
+            Self::Chunk(error) => Some(error),
+            Self::Message(error) => Some(error),
+            Self::SignerSet(error) => Some(error),
+            Self::SlotVersionOverflow | Self::Rejected { .. } => None,
+        }
+    }
+}
+
+impl From<StackerDbClientError> for ProposalError {
+    fn from(error: StackerDbClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
+impl From<StackerDbError> for ProposalError {
+    fn from(error: StackerDbError) -> Self {
+        Self::Chunk(error)
+    }
+}
+
+impl From<SignerMessageError> for ProposalError {
+    fn from(error: SignerMessageError) -> Self {
+        Self::Message(error)
+    }
+}
+
+impl From<SignerSetError> for ProposalError {
+    fn from(error: SignerSetError) -> Self {
+        Self::SignerSet(error)
+    }
+}
+
+/// Coordinates a miner's proposal and finalized-block `StackerDB` slots.
+pub struct ProposalCoordinator {
+    client: StackerDbClient,
+    miner_contract: StackerDbContract,
+    signer_contract: StackerDbContract,
+    miner_key: StacksPrivateKey,
+}
+
+impl ProposalCoordinator {
+    #[must_use]
+    pub const fn new(
+        client: StackerDbClient,
+        miner_contract: StackerDbContract,
+        signer_contract: StackerDbContract,
+        miner_key: StacksPrivateKey,
+    ) -> Self {
+        Self {
+            client,
+            miner_contract,
+            signer_contract,
+            miner_key,
+        }
+    }
+
+    /// Write a proposal to the active miner proposal slot.
+    pub async fn publish_proposal(
+        &self,
+        proposal: &BlockProposal,
+    ) -> Result<ChunkAck, ProposalError> {
+        self.write_miner_message(0, SignerMessage::BlockProposal(proposal.clone()))
+            .await
+    }
+
+    /// Read all current signer responses and return ordered threshold signatures.
+    pub async fn collect_signatures(
+        &self,
+        proposal: &BlockProposal,
+        signer_set: &SignerSet,
+    ) -> Result<Vec<MessageSignature>, ProposalError> {
+        let slots = self.client.slot_versions(&self.signer_contract).await?;
+        let mut messages = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if let Some(bytes) = self
+                .client
+                .latest_chunk(&self.signer_contract, slot.slot_id)
+                .await?
+            {
+                messages.push(bytes);
+            }
+        }
+        response_signatures(proposal, signer_set, messages)
+    }
+
+    /// Announce a threshold-signed block through the miner's pushed-block slot.
+    pub async fn publish_block(
+        &self,
+        block: nano_chainstate::NakamotoBlock,
+    ) -> Result<ChunkAck, ProposalError> {
+        self.write_miner_message(1, SignerMessage::BlockPushed(block))
+            .await
+    }
+
+    async fn write_miner_message(
+        &self,
+        slot_id: u32,
+        message: SignerMessage,
+    ) -> Result<ChunkAck, ProposalError> {
+        let slot_version = self
+            .client
+            .slot_versions(&self.miner_contract)
+            .await?
+            .into_iter()
+            .find(|slot| slot.slot_id == slot_id)
+            .map_or(0, |slot| slot.slot_version)
+            .checked_add(1)
+            .ok_or(ProposalError::SlotVersionOverflow)?;
+        let mut chunk = Chunk::new(slot_id, slot_version, message.encode()?);
+        chunk.sign(&self.miner_key)?;
+        let acknowledgement = self.client.put_chunk(&self.miner_contract, &chunk).await?;
+        if !acknowledgement.accepted {
+            return Err(ProposalError::Rejected {
+                reason: acknowledgement.reason,
+                code: acknowledgement.code,
+            });
+        }
+        Ok(acknowledgement)
+    }
+}
+
+fn response_signatures(
+    proposal: &BlockProposal,
+    signer_set: &SignerSet,
+    messages: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<Vec<MessageSignature>, ProposalError> {
+    let expected_hash = proposal.block.header.signer_signature_hash();
+    let mut signatures = Vec::new();
+    for bytes in messages {
+        let SignerMessage::BlockResponse(response) = SignerMessage::decode(&bytes)? else {
+            continue;
+        };
+        if response.signer_signature_hash == expected_hash {
+            signatures.push(response.signature);
+        }
+    }
+    Ok(signer_set.order_responses(&proposal.block.header, signatures)?)
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{Amount, OutPoint, TxIn};
+    use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader, Signer, SignerSet};
+    use nano_crypto::StacksPrivateKey;
+    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
+    use nano_stackerdb::{BlockAcceptance, BlockProposal, SignerMessage};
 
-    use super::{MinerError, funding_options, validate_funded_transaction};
+    use super::{MinerError, funding_options, response_signatures, validate_funded_transaction};
 
     #[test]
     fn funding_requests_rbf_with_change_after_protocol_outputs() {
@@ -282,5 +471,63 @@ mod tests {
             validate_funded_transaction(&template, &funded, 2),
             Err(MinerError::AlteredProtocolOutputs)
         ));
+    }
+
+    #[test]
+    fn response_collection_uses_only_the_active_proposal_and_reward_set() {
+        let first = StacksPrivateKey::from_seed(b"first signer");
+        let second = StacksPrivateKey::from_seed(b"second signer");
+        let proposal = proposal(&first);
+        let digest = proposal.block.header.signer_signature_hash();
+        let set = SignerSet::new(vec![
+            Signer {
+                public_key: first.public_key(),
+                weight: 3,
+            },
+            Signer {
+                public_key: second.public_key(),
+                weight: 7,
+            },
+        ])
+        .expect("valid signer set");
+        let stale = SignerMessage::BlockResponse(BlockAcceptance::new(
+            Sha256Sum::from_bytes([9; 32]),
+            first.sign(digest.as_bytes()),
+        ))
+        .encode()
+        .expect("encode stale response");
+        let second_response = second.sign(digest.as_bytes());
+        let active = SignerMessage::BlockResponse(BlockAcceptance::new(digest, second_response))
+            .encode()
+            .expect("encode active response");
+
+        assert_eq!(
+            response_signatures(&proposal, &set, vec![stale, active]).expect("threshold response"),
+            vec![second_response]
+        );
+    }
+
+    fn proposal(miner: &StacksPrivateKey) -> BlockProposal {
+        BlockProposal {
+            block: NakamotoBlock {
+                header: NakamotoBlockHeader {
+                    version: 1,
+                    chain_length: 1,
+                    bitcoin_spent: 0,
+                    consensus_hash: ConsensusHash::from_bytes([1; 20]),
+                    parent_block_id: StacksBlockId::from_bytes([2; 32]),
+                    transaction_merkle_root: Sha256Sum::from_bytes([3; 32]),
+                    state_index_root: TrieHash::from_bytes([4; 32]),
+                    timestamp: 5,
+                    miner_signature: miner.sign(&[6; 32]),
+                    signer_signatures: Vec::new(),
+                    pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+                },
+                transactions: Vec::new(),
+            },
+            bitcoin_height: 1,
+            reward_cycle: 1,
+            data: Vec::new(),
+        }
     }
 }
