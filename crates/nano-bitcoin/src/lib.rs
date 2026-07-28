@@ -10,6 +10,7 @@ use bitcoin::{
     script::{Instruction, PushBytesBuf, Script, ScriptBuf},
     transaction::Version as TransactionVersion,
 };
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use nano_address::PoxAddress;
 
 /// A Bitcoin block accepted by the HTTP/RPC ingest boundary.
@@ -46,6 +47,86 @@ pub trait BitcoinSource {
     type Error;
 
     fn block_at(&self, height: u64) -> Result<BitcoinBlock, Self::Error>;
+}
+
+/// Bitcoin Core RPC-backed protocol-operation source.
+#[derive(Debug)]
+pub struct BitcoinRpcSource {
+    client: Client,
+    magic: [u8; 2],
+    pre_stx: PreStxCache,
+    last_height: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum BitcoinRpcSourceError {
+    Rpc(bitcoincore_rpc::Error),
+    Parse(BitcoinParseError),
+}
+
+impl std::fmt::Display for BitcoinRpcSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rpc(error) => error.fmt(formatter),
+            Self::Parse(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BitcoinRpcSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rpc(error) => Some(error),
+            Self::Parse(error) => Some(error),
+        }
+    }
+}
+
+impl From<bitcoincore_rpc::Error> for BitcoinRpcSourceError {
+    fn from(error: bitcoincore_rpc::Error) -> Self {
+        Self::Rpc(error)
+    }
+}
+
+impl From<BitcoinParseError> for BitcoinRpcSourceError {
+    fn from(error: BitcoinParseError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl BitcoinRpcSource {
+    /// Connect to Bitcoin Core with explicit RPC credentials.
+    pub fn new(
+        endpoint: &str,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        magic: [u8; 2],
+    ) -> Result<Self, BitcoinRpcSourceError> {
+        Ok(Self {
+            client: Client::new(endpoint, Auth::UserPass(username.into(), password.into()))?,
+            magic,
+            pre_stx: PreStxCache::new(),
+            last_height: None,
+        })
+    }
+
+    /// Decode the protocol operations in a Bitcoin block, retaining required prior `PreStx` outputs.
+    pub fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, BitcoinRpcSourceError> {
+        let first_height = self.last_height.filter(|last| *last < height).map_or_else(
+            || height.saturating_sub(PRE_STX_WINDOW_BLOCKS),
+            |last| last + 1,
+        );
+        let mut current = None;
+        for current_height in first_height..=height {
+            let hash = self.client.get_block_hash(current_height)?;
+            let raw = bitcoin::consensus::serialize(&self.client.get_block(&hash)?);
+            let block =
+                decode_block_with_pre_stx(current_height, &raw, self.magic, &mut self.pre_stx)?;
+            current = Some(block);
+        }
+        self.last_height = Some(height);
+        current.ok_or_else(|| BitcoinParseError::InvalidBlock.into())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

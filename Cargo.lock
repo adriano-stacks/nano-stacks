@@ -2525,6 +2525,7 @@ name = "nano-bitcoin"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "bitcoincore-rpc",
  "hex",
  "nano-address",
  "nano-crypto",
