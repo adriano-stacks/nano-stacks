@@ -4,7 +4,7 @@ use std::{error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::Parser;
 use nano_address::StacksAddress;
-use nano_chainstate::{ChainState, NakamotoBlock, SignerSetError};
+use nano_chainstate::{ChainState, NakamotoBlock, SignerSetError, TenureAccounting};
 use nano_crypto::StacksPrivateKey;
 use nano_miner::{MinerSlots, ProposalCoordinator, ProposalError};
 use nano_primitives::TrieHash;
@@ -38,6 +38,9 @@ struct Cli {
     /// `SQLite` MARF checkpoint path.
     #[arg(long)]
     checkpoint: PathBuf,
+    /// Optional portable tenure-accounting checkpoint for matured native rewards.
+    #[arg(long)]
+    tenure_accounting: Option<PathBuf>,
     /// Hex-encoded 32-byte checkpoint state ID.
     #[arg(long)]
     source_state_id: String,
@@ -110,6 +113,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let mut chainstate = ChainState::from_checkpoint(cli.checkpoint, source, root)?;
+    if let Some(path) = cli.tenure_accounting {
+        *chainstate.accounting_mut() = TenureAccounting::from_json(&fs::read(path)?)?;
+    }
     chainstate.append_nakamoto_block_with_bitcoin_context(anchor_context, Some(source), &anchor)?;
     let mut candidate_context = pox.bitcoin_context();
     candidate_context.height = bitcoin_height;

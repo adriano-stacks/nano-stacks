@@ -4,7 +4,7 @@ use std::{error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use nano_address::StacksAddress;
-use nano_chainstate::{ChainState, NakamotoBlock};
+use nano_chainstate::{ChainState, NakamotoBlock, TenureAccounting};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::TrieHash;
 use nano_signer::{
@@ -41,6 +41,9 @@ enum Command {
         state_file: PathBuf,
         #[arg(long)]
         checkpoint: PathBuf,
+        /// Optional portable tenure-accounting checkpoint for matured native rewards.
+        #[arg(long)]
+        tenure_accounting: Option<PathBuf>,
         #[arg(long)]
         source_state_id: String,
         #[arg(long)]
@@ -84,6 +87,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 writer_slot,
                 state_file,
                 checkpoint,
+                tenure_accounting,
                 source_state_id,
                 state_root,
                 anchor_block,
@@ -111,6 +115,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let root = TrieHash::from_bytes(parse_array(&state_root)?);
     let anchor = NakamotoBlock::decode(&fs::read(anchor_block)?)?;
     let mut chainstate = ChainState::from_checkpoint(checkpoint, source, root)?;
+    if let Some(path) = tenure_accounting {
+        *chainstate.accounting_mut() = TenureAccounting::from_json(&fs::read(path)?)?;
+    }
     chainstate.append_nakamoto_block_with_bitcoin_context(
         bitcoin_context,
         Some(source),
