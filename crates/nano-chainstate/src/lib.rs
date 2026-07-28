@@ -21,6 +21,7 @@ use nano_codec::{
     PostConditionMode, PostConditionPrincipal, PoxCondition, Principal, TenureChangeCause,
     Transaction, TransactionPayloadData,
 };
+use nano_crypto::StacksPrivateKey;
 use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
@@ -230,7 +231,30 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
-        let block_id = *block.block_id().as_bytes();
+        let mut block = block.clone();
+        self.execute_nakamoto_block(bitcoin_context, parent, &mut block, None)
+    }
+
+    /// Execute a block candidate, derive its committed state root, and finalize its block ID.
+    pub fn assemble_nakamoto_block_with_bitcoin_context(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        mut block: NakamotoBlock,
+        miner_key: &StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        let applied =
+            self.execute_nakamoto_block(bitcoin_context, parent, &mut block, Some(miner_key))?;
+        Ok((block, applied))
+    }
+
+    fn execute_nakamoto_block(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &mut NakamotoBlock,
+        miner_key: Option<&StacksPrivateKey>,
+    ) -> Result<AppliedBlock, ChainStateError> {
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         let result = (|| {
@@ -257,7 +281,13 @@ impl ChainState {
             }
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
-            let state_root = self.vm.seal_block_to(block_id)?;
+            if let Some(miner_key) = miner_key {
+                block.header.state_index_root =
+                    TrieHash::from_bytes(self.vm.pending_state_root()?.0);
+                block.header.miner_signature =
+                    miner_key.sign(block.header.miner_signature_hash().as_bytes());
+            }
+            let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
             Ok(AppliedBlock {
                 bitcoin_height: bitcoin_context.height,
                 execution: ExecutionResult { state_root },

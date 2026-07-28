@@ -990,6 +990,51 @@ mod tests {
     }
 
     #[test]
+    fn candidate_block_derives_the_captured_state_root_before_finalizing_its_id() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let path = fixture.join(
+            "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
+        );
+        let block =
+            NanoNakamotoBlock::decode(&fs::read(path).expect("read block")).expect("decode block");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_context = *snapshots
+            .get(&block.header.consensus_hash.to_string())
+            .expect("Bitcoin context");
+        let mut chainstate = ChainState::from_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+        let miner = StacksPrivateKey::from_seed(b"candidate miner");
+        let expected_root = block.header.state_index_root;
+        let (candidate, applied) = chainstate
+            .assemble_nakamoto_block_with_bitcoin_context(
+                bitcoin_context,
+                Some(source),
+                block,
+                &miner,
+            )
+            .expect("assemble candidate");
+
+        assert_eq!(candidate.header.state_index_root, expected_root);
+        assert_eq!(
+            TrieHash::from_bytes(applied.execution.state_root.0),
+            expected_root
+        );
+        assert_eq!(
+            candidate
+                .header
+                .miner_signature
+                .recover(candidate.header.miner_signature_hash().as_bytes())
+                .expect("recover candidate miner"),
+            miner.public_key()
+        );
+    }
+
+    #[test]
     fn signer_validator_executes_a_captured_proposal() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
