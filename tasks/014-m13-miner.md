@@ -19,7 +19,7 @@ stock signers and nodes on Hacknet.
 
 ## Tasks
 
-- [ ] Build a transaction-selection and block-execution candidate API that derives the committed state root.
+- [x] Build a transaction-selection and block-execution candidate API that derives the committed state root.
 - [ ] Construct and submit canonical Bitcoin leader commitments with managed UTXOs.
 - [ ] Publish a valid block proposal to the active signer contract and collect signer responses.
 - [ ] Submit a threshold-signed Nakamoto block through a nano-won sortition.
