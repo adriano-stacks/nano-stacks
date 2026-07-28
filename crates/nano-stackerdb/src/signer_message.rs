@@ -78,8 +78,12 @@ impl fmt::Display for SignerMessageError {
             Self::Truncated => formatter.write_str("truncated signer message"),
             Self::TrailingBytes => formatter.write_str("signer message has trailing bytes"),
             Self::Oversized => formatter.write_str("signer message exceeds the protocol limit"),
-            Self::InvalidMessageType(kind) => write!(formatter, "unsupported signer message type {kind}"),
-            Self::InvalidResponseType(kind) => write!(formatter, "unsupported block response type {kind}"),
+            Self::InvalidMessageType(kind) => {
+                write!(formatter, "unsupported signer message type {kind}")
+            }
+            Self::InvalidResponseType(kind) => {
+                write!(formatter, "unsupported block response type {kind}")
+            }
             Self::InvalidText => formatter.write_str("signer message contains invalid UTF-8"),
             Self::Block(error) => write!(formatter, "invalid proposed block: {error}"),
         }
@@ -110,7 +114,8 @@ impl SignerMessage {
                 let signer_signature_hash = Sha256Sum::from_bytes(reader.array()?);
                 let signature = MessageSignature::from_bytes(reader.array()?);
                 let server_version = reader.text()?;
-                let (full_extend_timestamp, read_count_extend_timestamp) = reader.response_data()?;
+                let (full_extend_timestamp, read_count_extend_timestamp) =
+                    reader.response_data()?;
                 Self::BlockResponse(BlockAcceptance {
                     signer_signature_hash,
                     signature,
@@ -271,7 +276,10 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], SignerMessageError> {
-        let end = self.offset.checked_add(length).ok_or(SignerMessageError::Truncated)?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(SignerMessageError::Truncated)?;
         let value = self
             .bytes
             .get(self.offset..end)

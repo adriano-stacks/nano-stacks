@@ -1536,6 +1536,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-signer"
+version = "0.1.0"
+dependencies = [
+ "nano-chainstate",
+ "nano-crypto",
+ "nano-primitives",
+ "nano-stackerdb",
+]
+
+[[package]]
 name = "nano-sortition"
 version = "0.1.0"
 dependencies = [

@@ -224,9 +224,7 @@ mod tests {
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{hash160, sha512_256};
 
-    use super::{
-        BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbError,
-    };
+    use super::{BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbError};
 
     #[test]
     fn signed_chunks_round_trip_and_verify() {

@@ -2363,16 +2363,12 @@ mod tests {
         let key = StacksPrivateKey::from_seed(b"signer acceptance conformance");
         let digest = sha512_256(b"candidate block");
         let signature = key.sign(digest.as_bytes());
-        let message = SignerMessage::BlockResponse(BlockAcceptance::new(
-            digest,
-            signature,
-        ));
+        let message = SignerMessage::BlockResponse(BlockAcceptance::new(digest, signature));
         let encoded = message.encode().expect("encode signer message");
 
-        let reference = libsigner::v0::messages::SignerMessage::consensus_deserialize(
-            &mut encoded.as_slice(),
-        )
-        .expect("reference decodes signer message");
+        let reference =
+            libsigner::v0::messages::SignerMessage::consensus_deserialize(&mut encoded.as_slice())
+                .expect("reference decodes signer message");
         let libsigner::v0::messages::SignerMessage::BlockResponse(
             libsigner::v0::messages::BlockResponse::Accepted(accepted),
         ) = reference
