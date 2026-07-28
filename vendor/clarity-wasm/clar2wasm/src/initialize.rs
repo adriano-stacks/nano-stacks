@@ -1,7 +1,7 @@
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::contexts::GlobalContext;
 use clarity::vm::costs::cost_functions::ClarityCostFunction;
-use clarity::vm::costs::{CostTracker, runtime_cost};
+use clarity::vm::costs::{runtime_cost, CostTracker};
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
