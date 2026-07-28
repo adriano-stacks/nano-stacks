@@ -1002,6 +1002,7 @@ pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
 mod tests {
     use clarity::vm::contexts::AssetMap;
     use clarity::vm::costs::ExecutionCost;
+    use clarity::vm::types::PrincipalData;
     use std::{fs, path::Path};
 
     use nano_address::StacksAddress;
@@ -1010,7 +1011,8 @@ mod tests {
     use nano_sortition::SortitionSnapshot;
 
     use super::{
-        ChainState, NakamotoBlock, TransactionStatus, check_postconditions, principal_from_address,
+        BitcoinBlockContext, ChainState, NakamotoBlock, NativeBlockEffects, NativeStxCredit,
+        TransactionStatus, check_postconditions, principal_from_address,
     };
 
     #[test]
@@ -1097,6 +1099,49 @@ mod tests {
             .expect("execute captured transfer");
 
         assert_eq!(receipt.result.events.len(), 1);
+    }
+
+    #[test]
+    fn applies_native_credits_after_block_transactions() {
+        let source = [
+            0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
+            0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
+            0xb8, 0x21, 0x53, 0xf3,
+        ];
+        let root = TrieHash::from_bytes([
+            0x8f, 0xdf, 0xf0, 0x9f, 0xd8, 0x7a, 0xe7, 0x9f, 0x97, 0x0a, 0x23, 0x36, 0x27, 0x01,
+            0x3f, 0x09, 0x47, 0x8e, 0xe1, 0x71, 0x53, 0x79, 0xa7, 0x34, 0x42, 0x58, 0x4b, 0xb4,
+            0x3a, 0x64, 0xc0, 0x71,
+        ]);
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures");
+        let checkpoint = fixture_root.join("chainstate/checkpoint-H/marf.sqlite");
+        let block = NakamotoBlock::decode(
+            &fs::read(fixture_root.join(
+                "nakamoto/blocks/00000110-4c936fa7021a9eed00dc0d6f7fcae52eb610e7f7cf44b2911e8be0c154f9ef9c.bin",
+            ))
+            .expect("read fixture block"),
+        )
+        .expect("decode fixture block");
+        let context = BitcoinBlockContext::at_height(278);
+        let baseline = ChainState::from_checkpoint(&checkpoint, source, root)
+            .expect("open checkpoint")
+            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+            .expect("execute baseline block");
+        let effects = NativeBlockEffects {
+            credits: vec![NativeStxCredit {
+                recipient: PrincipalData::parse("ST000000000000000000002AMW42H")
+                    .expect("valid recipient"),
+                amount: 1,
+            }],
+            liquid_supply_increase: 1,
+        };
+        let applied = ChainState::from_checkpoint(checkpoint, source, root)
+            .expect("open checkpoint")
+            .execute_nakamoto_block_with_effects(context, Some(source), &block, effects)
+            .expect("execute native effects");
+
+        assert_ne!(baseline.execution.state_root, applied.execution.state_root);
     }
 
     #[test]
