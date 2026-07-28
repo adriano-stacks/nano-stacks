@@ -358,6 +358,8 @@ pub fn link_host_functions(
     link_secp256r1_verify_fn(linker)?;
     link_ed25519_verify_fn(linker)?;
     link_secp256k1_decompress_fn(linker)?;
+    link_verify_merkle_proof_fn(linker)?;
+    link_get_bitcoin_tx_output_fn(linker)?;
     link_principal_of_fn(linker)?;
     link_save_constant_fn(linker)?;
     link_load_constant_fn(linker)?;
@@ -6522,6 +6524,132 @@ fn link_secp256k1_decompress_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "secp256k1_decompress".into(),
+                error,
+            ))
+        })
+}
+
+fn link_verify_merkle_proof_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "verify_merkle_proof",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             leaf_offset: i32,
+             leaf_length: i32,
+             root_offset: i32,
+             root_length: i32,
+             index_low: i64,
+             index_high: i64,
+             count_low: i64,
+             count_high: i64,
+             siblings_offset: i32,
+             siblings_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let epoch = caller.data().global_context.epoch_id;
+                let leaf = read_from_wasm(
+                    memory,
+                    &mut caller,
+                    &TypeSignature::BUFFER_32,
+                    leaf_offset,
+                    leaf_length,
+                    epoch,
+                )?;
+                let root = read_from_wasm(
+                    memory,
+                    &mut caller,
+                    &TypeSignature::BUFFER_32,
+                    root_offset,
+                    root_length,
+                    epoch,
+                )?;
+                let sibling_type = TypeSignature::list_of(TypeSignature::BUFFER_32, 24)?;
+                let siblings = read_from_wasm(
+                    memory,
+                    &mut caller,
+                    &sibling_type,
+                    siblings_offset,
+                    siblings_length,
+                    epoch,
+                )?;
+                let index = ((index_high as u128) << 64) | index_low as u64 as u128;
+                let count = ((count_high as u128) << 64) | count_low as u64 as u128;
+                Ok(crate::bitcoin::verify_merkle_proof(leaf, root, index, count, siblings)? as i32)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "verify_merkle_proof".into(),
+                error,
+            ))
+        })
+}
+
+fn link_get_bitcoin_tx_output_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "get_bitcoin_tx_output",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             tx_offset: i32,
+             tx_length: i32,
+             vout_low: i64,
+             vout_high: i64,
+             return_offset: i32,
+             _return_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let epoch = caller.data().global_context.epoch_id;
+                let tx = read_from_wasm(
+                    memory,
+                    &mut caller,
+                    &TypeSignature::BUFFER_MAX,
+                    tx_offset,
+                    tx_length,
+                    epoch,
+                )?;
+                let vout = ((vout_high as u128) << 64) | vout_low as u64 as u128;
+                let result = crate::bitcoin::get_bitcoin_tx_output(tx, vout)?;
+                let tuple_type = TupleTypeSignature::try_from(vec![
+                    (
+                        ClarityName::from_literal("script"),
+                        TypeSignature::SequenceType(SequenceSubtype::BufferType(
+                            BufferLength::try_from(1024usize)?,
+                        )),
+                    ),
+                    (ClarityName::from_literal("amount"), TypeSignature::UIntType),
+                    (ClarityName::from_literal("txid"), TypeSignature::BUFFER_32),
+                ])?;
+                let return_type = TypeSignature::new_response(
+                    TypeSignature::TupleType(tuple_type),
+                    TypeSignature::UIntType,
+                )?;
+                write_to_wasm(
+                    caller,
+                    memory,
+                    &return_type,
+                    return_offset,
+                    return_offset + get_type_size(&return_type),
+                    &result,
+                    true,
+                )?;
+                Ok(())
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "get_bitcoin_tx_output".into(),
                 error,
             ))
         })
