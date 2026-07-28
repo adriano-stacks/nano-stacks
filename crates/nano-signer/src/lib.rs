@@ -1021,7 +1021,7 @@ mod tests {
             },
             bitcoin_height: 10,
             reward_cycle: 1,
-            data: Vec::new(),
+            data: BlockProposal::empty_data(),
         }
     }
 

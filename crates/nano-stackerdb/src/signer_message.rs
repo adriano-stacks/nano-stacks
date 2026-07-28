@@ -19,6 +19,14 @@ pub struct BlockProposal {
     pub data: Vec<u8>,
 }
 
+impl BlockProposal {
+    /// Return the canonical version-1 empty proposal extension accepted by stock signers.
+    #[must_use]
+    pub fn empty_data() -> Vec<u8> {
+        vec![1, 0, 0, 0, 4, 0, 0, 0, 0]
+    }
+}
+
 /// A signer's acceptance of a proposed block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAcceptance {
@@ -69,6 +77,7 @@ pub enum SignerMessageError {
     InvalidMessageType(u8),
     InvalidResponseType(u8),
     InvalidText,
+    InvalidProposalData,
     Block(String),
 }
 
@@ -85,6 +94,7 @@ impl fmt::Display for SignerMessageError {
                 write!(formatter, "unsupported block response type {kind}")
             }
             Self::InvalidText => formatter.write_str("signer message contains invalid UTF-8"),
+            Self::InvalidProposalData => formatter.write_str("invalid block proposal data"),
             Self::Block(error) => write!(formatter, "invalid proposed block: {error}"),
         }
     }
@@ -145,6 +155,9 @@ impl SignerMessage {
         let mut writer = Writer::default();
         match self {
             Self::BlockProposal(proposal) => {
+                if proposal.data.is_empty() {
+                    return Err(SignerMessageError::InvalidProposalData);
+                }
                 writer.byte(SignerMessageType::BlockProposal as u8);
                 writer.raw(&proposal.block.encode());
                 writer.u64(proposal.bitcoin_height);

@@ -1068,7 +1068,7 @@ mod tests {
             block: second.clone(),
             bitcoin_height: second_context.height,
             reward_cycle: 0,
-            data: Vec::new(),
+            data: BlockProposal::empty_data(),
         };
 
         validator.validate(&proposal).expect("proposal state root");
