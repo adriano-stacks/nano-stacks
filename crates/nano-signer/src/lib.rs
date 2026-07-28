@@ -78,6 +78,44 @@ impl ProposalValidator for SortitionProposalValidator {
     }
 }
 
+/// Adds refreshed sortition authentication to another proposal validator.
+pub struct ActiveSortitionValidator<V> {
+    context: Option<SortitionProposalValidator>,
+    validator: V,
+}
+
+impl<V> ActiveSortitionValidator<V> {
+    /// Construct a validator that refuses proposals until its Bitcoin context is refreshed.
+    #[must_use]
+    pub const fn new(validator: V) -> Self {
+        Self {
+            context: None,
+            validator,
+        }
+    }
+
+    /// Replace the active Bitcoin sortition and reward-cycle context.
+    pub const fn set_context(&mut self, sortition: SortitionInfo, reward_cycle: u64) {
+        self.context = Some(SortitionProposalValidator::new(sortition, reward_cycle));
+    }
+
+    /// Return the wrapped validator.
+    #[must_use]
+    pub fn into_inner(self) -> V {
+        self.validator
+    }
+}
+
+impl<V: ProposalValidator> ProposalValidator for ActiveSortitionValidator<V> {
+    fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
+        self.context
+            .as_mut()
+            .ok_or_else(|| "proposal sortition context has not been refreshed".to_owned())?
+            .validate(proposal)?;
+        self.validator.validate(proposal)
+    }
+}
+
 /// Validates proposal execution from a trusted, checkpointed chain state.
 #[derive(Debug)]
 pub struct ChainstateProposalValidator {
@@ -739,6 +777,12 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         self.next_slot_version = next_slot_version;
         Ok(())
     }
+
+    /// Return the proposal validator used before signing.
+    #[must_use]
+    pub const fn validator_mut(&mut self) -> &mut V {
+        &mut self.validator
+    }
 }
 
 impl<V: ProposalValidator + Send + Sync> SignerService<V> {
@@ -820,6 +864,12 @@ impl<V: ProposalValidator + Send + Sync> SignerService<V> {
         self.signer.advance_next_slot_version(next)?;
         Ok(version)
     }
+
+    /// Return the embedded signer so its Bitcoin context can be refreshed before a response.
+    #[must_use]
+    pub const fn signer_mut(&mut self) -> &mut EmbeddedSigner<V> {
+        &mut self.signer
+    }
 }
 
 #[cfg(test)]
@@ -835,7 +885,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        EmbeddedSigner, ProposalValidator, SignerConfig, SignerError, SortitionProposalValidator,
+        ActiveSortitionValidator, EmbeddedSigner, ProposalValidator, SignerConfig, SignerError,
+        SortitionProposalValidator,
     };
 
     struct Accept;
@@ -912,6 +963,16 @@ mod tests {
         unexpected_miner.miner_public_key_hash = Some(Hash160::from_bytes([0; 20]));
         let mut validator = SortitionProposalValidator::new(unexpected_miner, 1);
         assert!(validator.validate(&proposal).is_err());
+    }
+
+    #[test]
+    fn active_sortition_validator_requires_a_refreshed_context() {
+        let (proposal, sortition) = valid_sortition_proposal();
+        let mut validator = ActiveSortitionValidator::new(Accept);
+        assert!(validator.validate(&proposal).is_err());
+
+        validator.set_context(sortition, proposal.reward_cycle);
+        validator.validate(&proposal).expect("refreshed context");
     }
 
     #[test]
