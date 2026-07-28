@@ -762,9 +762,7 @@ impl ComplexWord for ContractCall {
                 ))
             })?;
             builder.i32_const(*offset as i32).i32_const(*len as i32);
-            // Traversing the expression should load the contract identifier
-            // onto the stack.
-            generator.traverse_expr_without_value_copy_charge(builder, contract_expr)?;
+            generator.traverse_callable_reference(builder, contract_expr)?;
         }
 
         // shadow args

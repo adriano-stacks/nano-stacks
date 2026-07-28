@@ -602,6 +602,25 @@ impl WasmGenerator {
         }
     }
 
+    pub fn traverse_callable_reference(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+    ) -> Result<(), GeneratorError> {
+        let SymbolicExpressionType::Atom(atom) = &expr.expr else {
+            return Err(GeneratorError::TypeError(
+                "callable reference must be an atom".to_owned(),
+            ));
+        };
+        let (values, _) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+            GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
+        })?;
+        for value in values {
+            builder.local_get(value);
+        }
+        Ok(())
+    }
+
     fn traverse_list(
         &mut self,
         builder: &mut InstrSeqBuilder,

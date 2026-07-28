@@ -358,6 +358,7 @@ impl ComplexWord for Match {
         let saved_bindings = generator.bindings.clone();
 
         generator.traverse_expr(builder, match_on)?;
+        generator.bindings.enter_scope()?;
 
         match generator.get_expr_type(match_on).cloned() {
             Some(TypeSignature::OptionalType(inner_type)) => {
