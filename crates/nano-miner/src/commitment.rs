@@ -139,8 +139,10 @@ where
             key_block_height: key.bitcoin_height,
             key_transaction_index: key.transaction_index,
             memo: EPOCH_4_MARKER,
-            parent_modulus: u8::try_from(bitcoin_tip.bitcoin_height % BITCOIN_BLOCK_MINED_AT_MODULUS)
-                .expect("a Bitcoin modulus below five fits in a byte"),
+            parent_modulus: u8::try_from(
+                bitcoin_tip.bitcoin_height % BITCOIN_BLOCK_MINED_AT_MODULUS,
+            )
+            .expect("a Bitcoin modulus below five fits in a byte"),
         },
         sbtc_address: node.stacker_set(reward_cycle).await?.sbtc_address,
         target_bitcoin_height,

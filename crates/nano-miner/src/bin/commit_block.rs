@@ -50,6 +50,9 @@ struct Cli {
     /// Two hexadecimal magic bytes for the target network.
     #[arg(long, default_value = "5433")]
     magic: String,
+    /// Wait for the next Bitcoin block before deriving the commitment.
+    #[arg(long)]
+    after_new_block: bool,
     /// Seconds to wait for the peer to catch up with the Bitcoin tip.
     #[arg(long, default_value_t = 30)]
     peer_timeout_secs: u64,
@@ -81,6 +84,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     let key = leader_key(&cli, &wallet)?;
+    if cli.after_new_block {
+        let start = wallet.block_count()?;
+        while wallet.block_count()? == start {
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
     let node = SyncClient::new(Url::parse(&cli.peer)?)?;
     let plan = synchronized_plan(&node, &mut bitcoin, &wallet, key, cli.peer_timeout_secs).await?;
     println!(

@@ -3,14 +3,21 @@
 //! Bitcoin wallet integration for nano-stacks mining.
 
 mod commitment;
+mod tenure;
 
 pub use commitment::{
     CommitmentPlan, CommitmentPlanError, EPOCH_4_MARKER, RegisteredLeaderKey, plan_commitment,
 };
+pub use tenure::{
+    BitcoinTenureView, SortitionHashPoint, TenureStartError, build_tenure_start_block,
+    extend_sortition_hash, total_burn_after,
+};
 
 use std::fmt;
 
-use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, Txid, consensus::encode::serialize_hex};
+use bitcoin::{
+    Amount, OutPoint, Sequence, Transaction, TxIn, Txid, consensus::encode::serialize_hex,
+};
 use bitcoincore_rpc::{Auth, Client, RpcApi, json};
 use nano_address::PoxAddress;
 use nano_bitcoin::{

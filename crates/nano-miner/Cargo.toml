@@ -16,6 +16,7 @@ nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
+nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
 nano-sync = { path = "../nano-sync" }
 serde = { version = "1.0.229", features = ["derive"] }

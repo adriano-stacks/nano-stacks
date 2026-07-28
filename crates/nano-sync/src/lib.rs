@@ -2,7 +2,7 @@
 
 use std::{fmt, time::Duration};
 
-use nano_address::{PoxAddress, PoxAddressType32};
+use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
     BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, Signer, SignerSet, SignerSetError,
     TenureError,
@@ -260,6 +260,12 @@ impl SyncClient {
                 .find(|version| version.contract_id.ends_with(".pox-5"))
                 .map(|version| version.activation_burnchain_block_height),
         })
+    }
+
+    /// Fetch the next nonce an account's transactions must use.
+    pub async fn account_nonce(&self, address: StacksAddress) -> Result<u64, SyncError> {
+        let response: AccountWire = self.get(&format!("v2/accounts/{address}?proof=0")).await?;
+        Ok(response.nonce)
     }
 
     /// Fetch the waterfall reward set active for one reward cycle.
@@ -639,6 +645,11 @@ struct StackerWire {
 struct BlockUploadWire {
     accepted: bool,
     stacks_block_id: String,
+}
+
+#[derive(Deserialize)]
+struct AccountWire {
+    nonce: u64,
 }
 
 #[derive(Deserialize)]

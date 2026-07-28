@@ -51,6 +51,15 @@ impl StacksAddress {
         self.hash160
     }
 
+    /// The standard single-signature address for a compressed secp256k1 key hash.
+    #[must_use]
+    pub const fn single_signature(hash160: Hash160, mainnet: bool) -> Self {
+        Self {
+            version: if mainnet { 22 } else { 26 },
+            hash160,
+        }
+    }
+
     #[must_use]
     pub const fn is_mainnet(self) -> bool {
         matches!(self.version, 20 | 22)

@@ -112,6 +112,13 @@ impl BitcoinRpcSource {
         })
     }
 
+    /// Read one Bitcoin block's header hash without decoding its transactions.
+    pub fn block_hash_at(&self, height: u64) -> Result<[u8; 32], BitcoinRpcSourceError> {
+        Ok(bitcoin_hash_bytes(
+            self.client.get_block_hash(height)?.to_byte_array(),
+        ))
+    }
+
     /// Decode the protocol operations in a Bitcoin block, retaining required prior `PreStx` outputs.
     pub fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, BitcoinRpcSourceError> {
         if let Some(block) = self
