@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -12,6 +12,7 @@ use axum::{
 };
 use nano_node::{Node, NodeView};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Shared local node state served by the HTTP API.
 pub type SharedNode = Arc<RwLock<Node>>;
@@ -36,7 +37,6 @@ pub async fn serve(listener: tokio::net::TcpListener, node: SharedNode) -> std::
 enum RpcError {
     Unavailable,
     NotFound,
-    Poisoned,
 }
 
 impl IntoResponse for RpcError {
@@ -44,21 +44,17 @@ impl IntoResponse for RpcError {
         let status = match self {
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::Poisoned => StatusCode::INTERNAL_SERVER_ERROR,
         };
         status.into_response()
     }
 }
 
-fn view(node: &SharedNode) -> Result<NodeView, RpcError> {
-    node.read()
-        .map_err(|_| RpcError::Poisoned)?
-        .view()
-        .ok_or(RpcError::Unavailable)
+async fn view(node: &SharedNode) -> Result<NodeView, RpcError> {
+    node.read().await.view().ok_or(RpcError::Unavailable)
 }
 
 async fn node_info(State(node): State<SharedNode>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
-    let info = view(&node)?.node_info;
+    let info = view(&node).await?.node_info;
     Ok(axum::Json(NodeInfoWire {
         burn_block_height: info.bitcoin_height,
         stacks_tip_height: info.stacks_height,
@@ -69,7 +65,7 @@ async fn node_info(State(node): State<SharedNode>) -> Result<axum::Json<NodeInfo
 }
 
 async fn pox_info(State(node): State<SharedNode>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
-    let pox = view(&node)?.pox_info;
+    let pox = view(&node).await?.pox_info;
     Ok(axum::Json(PoxInfoWire {
         first_burnchain_block_height: pox.first_bitcoin_height,
         current_burnchain_block_height: pox.bitcoin_height,
@@ -83,7 +79,8 @@ async fn pox_info(State(node): State<SharedNode>) -> Result<axum::Json<PoxInfoWi
 async fn tenure_info(
     State(node): State<SharedNode>,
 ) -> Result<axum::Json<TenureInfoWire>, RpcError> {
-    let latest = view(&node)?
+    let latest = view(&node)
+        .await?
         .tenures
         .last()
         .ok_or(RpcError::Unavailable)?
@@ -102,7 +99,8 @@ async fn tenure(
     Path(start_block_id): Path<String>,
     Query(query): Query<TenureQuery>,
 ) -> Result<RawBlockStream, RpcError> {
-    let tenure = view(&node)?
+    let tenure = view(&node)
+        .await?
         .tenures
         .into_iter()
         .find(|tenure| tenure.info.tenure_start_block_id.to_string() == start_block_id)
@@ -125,7 +123,8 @@ async fn block(
     State(node): State<SharedNode>,
     Path(block_id): Path<String>,
 ) -> Result<RawBlockStream, RpcError> {
-    let block = view(&node)?
+    let block = view(&node)
+        .await?
         .tenures
         .into_iter()
         .flat_map(|tenure| tenure.blocks)
@@ -192,7 +191,7 @@ impl From<nano_sync::TenureInfo> for TenureInfoWire {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use axum::{
         body::Body,
@@ -201,6 +200,7 @@ mod tests {
     use nano_node::Node;
     use nano_sync::SyncClient;
     use reqwest::Url;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     use super::router;
