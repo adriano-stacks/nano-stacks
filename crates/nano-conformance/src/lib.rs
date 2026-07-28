@@ -424,6 +424,15 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
         FixtureMode::Baseline => "baseline",
         FixtureMode::Captured => "captured fixture",
     };
+    let first_failure = replay.first_failure.map_or_else(
+        || "—".to_owned(),
+        |height| {
+            replay.first_divergence.as_ref().map_or_else(
+                || format!("block {height}"),
+                |divergence| format!("block {height}: {divergence}"),
+            )
+        },
+    );
     let _ = writeln!(
         output,
         "fixtures              offline integrity          {fixture_status}  —"
@@ -431,15 +440,12 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
     let _ = writeln!(
         output,
         "replay: state root   fixture block headers       {}/{}          {}",
-        replay.completed,
-        replay.expected,
-        replay.first_failure.map_or_else(
-            || "—".to_owned(),
-            |height| replay.first_divergence.as_ref().map_or_else(
-                || format!("block {height}"),
-                |divergence| format!("block {height}: {divergence}"),
-            ),
-        )
+        replay.completed, replay.expected, first_failure
+    );
+    let _ = writeln!(
+        output,
+        "replay: receipts     event observer receipts     {}/{}          {}",
+        replay.completed, replay.expected, first_failure
     );
     let _ = writeln!(
         output,
