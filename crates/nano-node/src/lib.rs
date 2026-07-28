@@ -4,7 +4,7 @@ use std::{fmt, path::Path};
 
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
-    AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
+    AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock, TenureAccounting,
 };
 use nano_primitives::TrieHash;
 use nano_sync::{
@@ -129,9 +129,33 @@ where
         state_root: TrieHash,
         anchor: NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
+        bitcoin: S,
+    ) -> Result<Self, CheckpointExecutionError> {
+        Self::from_checkpoint_with_accounting(
+            path,
+            source,
+            state_root,
+            anchor,
+            bitcoin_context,
+            bitcoin,
+            None,
+        )
+    }
+
+    /// Import a checkpoint together with the matured native rewards it owes.
+    pub fn from_checkpoint_with_accounting(
+        path: impl AsRef<Path>,
+        source: [u8; 32],
+        state_root: TrieHash,
+        anchor: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
         mut bitcoin: S,
+        accounting: Option<TenureAccounting>,
     ) -> Result<Self, CheckpointExecutionError> {
         let mut chainstate = ChainState::from_checkpoint(path, source, state_root)?;
+        if let Some(accounting) = accounting {
+            *chainstate.accounting_mut() = accounting;
+        }
         let operations = bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
@@ -213,6 +237,73 @@ where
             )?;
         self.tip = block.clone();
         Ok(applied)
+    }
+
+    /// Execute every canonical block between this tip and the peer's, oldest first.
+    ///
+    /// Walking the peer's ancestry backwards from its tip keeps the executed
+    /// chain on the canonical fork even when the peer reorganized.
+    pub async fn follow_to_tip(
+        &mut self,
+        node: &SyncClient,
+        pox: &PoxInfo,
+        max_blocks: usize,
+    ) -> Result<usize, NodeExecutionError> {
+        let mut pending = Vec::new();
+        let mut block_id = node.tenure_info().await?.tip_block_id;
+        while block_id != self.tip.block_id() {
+            if pending.len() == max_blocks {
+                return Err(CheckpointExecutionError::Link(
+                    "checkpoint is farther from the peer tip than the block limit".to_owned(),
+                )
+                .into());
+            }
+            let block = node.block(block_id).await?;
+            block_id = block.header.parent_block_id;
+            pending.push(block);
+        }
+        let executed = pending.len();
+        for block in pending.iter().rev() {
+            let mut bitcoin_context = pox.bitcoin_context();
+            bitcoin_context.height = node
+                .sortition(block.header.consensus_hash)
+                .await?
+                .bitcoin_height;
+            self.apply(block, bitcoin_context)?;
+        }
+        Ok(executed)
+    }
+
+    /// Execute a candidate block on the current tip and seal its committed state root.
+    pub fn assemble(
+        &mut self,
+        candidate: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        miner_key: &nano_crypto::StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), CheckpointExecutionError> {
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        Ok(self
+            .chainstate
+            .assemble_nakamoto_block_with_bitcoin_operations(
+                bitcoin_context,
+                &operations.operations,
+                Some(*self.tip.block_id().as_bytes()),
+                candidate,
+                miner_key,
+            )?)
+    }
+
+    /// Adopt a block this node produced as the new execution tip.
+    pub fn accept_own_block(&mut self, block: NakamotoBlock) {
+        self.tip = block;
+    }
+
+    /// Access the portable accounting ledger backing matured native rewards.
+    pub const fn chainstate_mut(&mut self) -> &mut ChainState {
+        &mut self.chainstate
     }
 
     /// Return the most recently executed block.
