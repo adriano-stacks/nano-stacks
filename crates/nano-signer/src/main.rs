@@ -38,9 +38,6 @@ enum Command {
         bitcoin_rpc_password_file: PathBuf,
         #[arg(long)]
         miner_contract: String,
-        /// Registered miner slot to watch for block proposals.
-        #[arg(long, default_value_t = 0)]
-        miner_proposal_slot: u32,
         #[arg(long)]
         signer_contract: String,
         #[arg(long)]
@@ -95,7 +92,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 bitcoin_rpc_user,
                 bitcoin_rpc_password_file,
                 miner_contract,
-                miner_proposal_slot,
                 signer_contract,
                 private_key,
                 writer_slot,
@@ -152,10 +148,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ActiveSortitionValidator::new(validator),
         state_file,
     )?;
-    let service = SignerService::with_miner_proposal_slot(
+    let service = SignerService::new(
         StackerDbClient::new(Url::parse(&peer)?)?,
         parse_contract(&miner_contract)?,
-        miner_proposal_slot,
         parse_contract(&signer_contract)?,
         signer,
     );

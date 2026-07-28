@@ -9,7 +9,7 @@ use nano_chainstate::{
     BitcoinBlockContext, ChainState, NakamotoBlock, SignerSetError, TenureAccounting,
 };
 use nano_crypto::StacksPrivateKey;
-use nano_miner::{MinerSlots, ProposalCoordinator, ProposalError};
+use nano_miner::{ProposalCoordinator, ProposalError};
 use nano_primitives::TrieHash;
 use nano_stackerdb::{BlockProposal, StackerDbClient, StackerDbContract};
 use nano_sync::{PoxInfo, SyncClient};
@@ -41,12 +41,6 @@ struct Cli {
     /// Hex-encoded 32-byte private key for the registered miner.
     #[arg(long)]
     private_key: String,
-    /// The registered miner slot used for proposals.
-    #[arg(long)]
-    proposal_slot: u32,
-    /// The registered miner slot used for finalized-block notifications.
-    #[arg(long)]
-    pushed_block_slot: u32,
     /// `SQLite` MARF checkpoint path.
     #[arg(long)]
     checkpoint: PathBuf,
@@ -162,10 +156,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         parse_contract(&cli.miner_contract)?,
         parse_contract(&cli.signer_contract)?,
         miner_key,
-        MinerSlots {
-            proposal: cli.proposal_slot,
-            pushed_block: cli.pushed_block_slot,
-        },
     );
     coordinator.publish_proposal(&proposal).await?;
     let deadline = Instant::now() + Duration::from_secs(cli.signer_timeout_secs);
