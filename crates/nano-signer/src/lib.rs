@@ -104,6 +104,12 @@ impl<V> ActiveSortitionValidator<V> {
     pub fn into_inner(self) -> V {
         self.validator
     }
+
+    /// Return the wrapped proposal validator.
+    #[must_use]
+    pub const fn validator_mut(&mut self) -> &mut V {
+        &mut self.validator
+    }
 }
 
 impl<V: ProposalValidator> ProposalValidator for ActiveSortitionValidator<V> {
@@ -155,6 +161,12 @@ impl ChainstateProposalValidator {
         }
         self.trusted.insert(block_id, block.header.clone());
         Ok(())
+    }
+
+    /// Return whether a block is already in the independently verified chain view.
+    #[must_use]
+    pub fn has_trusted_block(&self, block_id: &nano_primitives::StacksBlockId) -> bool {
+        self.trusted.contains_key(block_id)
     }
 
     const fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
@@ -941,6 +953,12 @@ impl<V: ProposalValidator + Send> LiveSigner<V> {
         service: SignerService<ActiveSortitionValidator<V>>,
     ) -> Self {
         Self { client, service }
+    }
+
+    /// Return the active validator so its independently verified chain view can advance.
+    #[must_use]
+    pub const fn validator_mut(&mut self) -> &mut ActiveSortitionValidator<V> {
+        self.service.signer_mut().validator_mut()
     }
 
     /// Fetch, authenticate, validate, and answer the latest miner proposal once.

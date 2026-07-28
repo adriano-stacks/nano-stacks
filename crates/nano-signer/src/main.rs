@@ -51,6 +51,9 @@ enum Command {
         anchor_bitcoin_height: u64,
         #[arg(long, default_value_t = 1)]
         poll_interval_secs: u64,
+        /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
+        #[arg(long, default_value_t = 20_000)]
+        max_sync_blocks: usize,
     },
 }
 
@@ -71,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 anchor_block,
                 anchor_bitcoin_height,
                 poll_interval_secs,
+                max_sync_blocks,
             },
     } = Cli::parse();
     let client = SyncClient::new(Url::parse(&peer)?)?;
@@ -102,13 +106,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
         parse_contract(&signer_contract)?,
         signer,
     );
-    let mut signer = LiveSigner::new(client, service);
+    let mut signer = LiveSigner::new(client.clone(), service);
     loop {
+        if let Err(error) = sync_chainstate(&client, &mut signer, max_sync_blocks).await {
+            eprintln!("signer chainstate sync failed: {error}");
+            sleep(Duration::from_secs(poll_interval_secs)).await;
+            continue;
+        }
         if let Err(error) = signer.poll().await {
             eprintln!("signer poll failed: {error}");
         }
         sleep(Duration::from_secs(poll_interval_secs)).await;
     }
+}
+
+async fn sync_chainstate(
+    client: &SyncClient,
+    signer: &mut LiveSigner<ChainstateProposalValidator>,
+    max_blocks: usize,
+) -> Result<(), Box<dyn Error>> {
+    let tip = client.tenure_info().await?.tip_block_id;
+    if signer
+        .validator_mut()
+        .validator_mut()
+        .has_trusted_block(&tip)
+    {
+        return Ok(());
+    }
+
+    let mut blocks = Vec::new();
+    let mut block_id = tip;
+    for _ in 0..max_blocks {
+        let block = client.block(block_id).await?;
+        if signer
+            .validator_mut()
+            .validator_mut()
+            .has_trusted_block(&block.block_id())
+        {
+            break;
+        }
+        block_id = block.header.parent_block_id;
+        blocks.push(block);
+    }
+    if blocks.len() == max_blocks {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint is farther from the canonical tip than max_sync_blocks",
+        )
+        .into());
+    }
+
+    for block in blocks.iter().rev() {
+        let sortition = client.sortition(block.header.consensus_hash).await?;
+        signer
+            .validator_mut()
+            .validator_mut()
+            .observe(block, sortition.bitcoin_height)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(())
 }
 
 fn parse_contract(value: &str) -> Result<StackerDbContract, io::Error> {

@@ -365,7 +365,7 @@ impl PoxId {
     }
 }
 
-/// Bitcoin reward-cycle rules that determine when the PoX history advances.
+/// Bitcoin reward-cycle rules that determine when the `PoX` history advances.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RewardCycleSchedule {
     first_bitcoin_height: u64,
@@ -374,7 +374,7 @@ pub struct RewardCycleSchedule {
 }
 
 impl RewardCycleSchedule {
-    pub fn new(
+    pub const fn new(
         first_bitcoin_height: u64,
         reward_cycle_length: u64,
         first_waterfall_height: Option<u64>,
@@ -402,7 +402,7 @@ impl RewardCycleSchedule {
     }
 }
 
-/// Tracks the PoX history committed to by each Bitcoin snapshot.
+/// Tracks the `PoX` history committed to by each Bitcoin snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoxIdTracker {
     schedule: RewardCycleSchedule,
@@ -421,7 +421,7 @@ impl PoxIdTracker {
     }
 
     #[must_use]
-    pub fn pox_id(&self) -> &PoxId {
+    pub const fn pox_id(&self) -> &PoxId {
         &self.pox_id
     }
 
