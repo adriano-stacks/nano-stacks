@@ -1,7 +1,7 @@
 ---
 id: "014"
 title: "M13: implement mining and hacknet interop"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["013"]
