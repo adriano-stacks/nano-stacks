@@ -1564,6 +1564,7 @@ dependencies = [
  "nano-primitives",
  "reqwest",
  "serde",
+ "tokio",
 ]
 
 [[package]]

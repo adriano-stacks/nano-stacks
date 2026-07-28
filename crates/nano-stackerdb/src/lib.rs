@@ -408,10 +408,17 @@ impl<'a> ChunkReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use nano_address::StacksAddress;
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{hash160, sha512_256};
+    use reqwest::Url;
 
-    use super::{BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbError};
+    use super::{
+        BlockAcceptance, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbClient, StackerDbContract,
+        StackerDbError,
+    };
 
     #[test]
     fn signed_chunks_round_trip_and_verify() {
@@ -442,5 +449,28 @@ mod tests {
         let decoded = SignerMessage::decode(&message.encode().expect("encode message"))
             .expect("decode message");
         assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Hacknet node on port 20443"]
+    async fn hacknet_miners_stackerdb_is_readable() {
+        let client =
+            StackerDbClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create client");
+        let contract = StackerDbContract {
+            address: StacksAddress::from_str("ST000000000000000000002AMW42H")
+                .expect("system address"),
+            name: "miners".to_owned(),
+        };
+
+        let slots = client.slot_versions(&contract).await.expect("list slots");
+        assert!(slots.iter().any(|slot| slot.slot_id == 0));
+        assert!(
+            client
+                .latest_chunk(&contract, 0)
+                .await
+                .expect("read proposal slot")
+                .is_some()
+        );
     }
 }
