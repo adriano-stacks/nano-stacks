@@ -79,6 +79,9 @@ enum Command {
         /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
         #[arg(long, default_value_t = 20_000)]
         max_sync_blocks: usize,
+        /// Seconds a signed block is protected before its replacement may be signed.
+        #[arg(long, default_value_t = nano_signer::DEFAULT_CONFLICT_TIMEOUT_SECS)]
+        conflict_timeout_secs: u64,
         /// Verify checkpoint-to-tip execution without polling or publishing signer messages.
         #[arg(long)]
         sync_only: bool,
@@ -110,6 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 pox_v3_unlock_height,
                 poll_interval_secs,
                 max_sync_blocks,
+                conflict_timeout_secs,
                 sync_only,
             },
     } = Cli::parse();
@@ -147,6 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             private_key: key.clone(),
             writer_slot: 0,
             next_slot_version: 1,
+            conflict_timeout_secs,
         },
         ActiveSortitionValidator::new(validator),
         state_file,

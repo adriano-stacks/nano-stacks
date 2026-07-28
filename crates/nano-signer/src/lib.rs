@@ -276,6 +276,8 @@ pub struct SignerConfig {
     pub private_key: StacksPrivateKey,
     pub writer_slot: u32,
     pub next_slot_version: u32,
+    /// Seconds a signed block is protected before a replacement may be signed.
+    pub conflict_timeout_secs: u64,
 }
 
 const SIGNER_STATE_VERSION: u8 = 1;
@@ -352,9 +354,20 @@ struct PersistedSignedBlock {
     chain_length: u64,
     signature_hash: String,
     chunk: String,
+    #[serde(default)]
+    signed_at_unix: u64,
 }
 
 type SignedBlocks = BTreeMap<(ConsensusHash, u64), SignedBlock>;
+
+/// Seconds before a signed block is considered replaced by its miner.
+pub const DEFAULT_CONFLICT_TIMEOUT_SECS: u64 = 30;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
 type LoadedSignerState = (u32, SignedBlocks);
 
 struct SignerStateStore {
@@ -468,6 +481,7 @@ impl SignerStateStore {
                     SignedBlock {
                         signature_hash,
                         chunk,
+                        signed_at_unix: entry.signed_at_unix,
                     },
                 )
                 .is_some()
@@ -495,6 +509,7 @@ impl SignerStateStore {
                     chain_length: *chain_length,
                     signature_hash: hex::encode(block.signature_hash.as_bytes()),
                     chunk: hex::encode(block.chunk.encode()?),
+                    signed_at_unix: block.signed_at_unix,
                 })
             })
             .collect::<Result<Vec<_>, StackerDbError>>()?;
@@ -534,6 +549,7 @@ pub struct EmbeddedSigner<V> {
     validator: V,
     writer_slot: u32,
     next_slot_version: u32,
+    conflict_timeout_secs: u64,
     signed: SignedBlocks,
     state: Option<SignerStateStore>,
 }
@@ -542,6 +558,7 @@ pub struct EmbeddedSigner<V> {
 struct SignedBlock {
     signature_hash: Sha256Sum,
     chunk: Chunk,
+    signed_at_unix: u64,
 }
 
 /// Errors while validating or signing a proposal.
@@ -734,6 +751,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             validator,
             writer_slot: config.writer_slot,
             next_slot_version: config.next_slot_version,
+            conflict_timeout_secs: config.conflict_timeout_secs,
             signed: BTreeMap::new(),
             state: None,
         }
@@ -751,6 +769,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             validator,
             writer_slot: config.writer_slot,
             next_slot_version,
+            conflict_timeout_secs: config.conflict_timeout_secs,
             signed,
             state: Some(state),
         })
@@ -766,8 +785,14 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         if let Some(signed) = self.signed.get(&position) {
             return if signed.signature_hash == signature_hash {
                 Ok(signed.chunk.clone())
-            } else {
+            } else if now_unix().saturating_sub(signed.signed_at_unix) < self.conflict_timeout_secs
+            {
                 Err(SignerError::Equivocation)
+            } else {
+                // The block signed earlier never gathered a threshold, so the
+                // miner replaced it; stock signers move on after the same wait.
+                self.signed.remove(&position);
+                self.sign(proposal)
             };
         }
         self.validator
@@ -802,7 +827,10 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             return self.sign(proposal);
         };
         if signed.signature_hash != signature_hash {
-            return Err(SignerError::Equivocation);
+            if now_unix().saturating_sub(signed.signed_at_unix) < self.conflict_timeout_secs {
+                return Err(SignerError::Equivocation);
+            }
+            return self.sign(proposal);
         }
         if signed.chunk.slot_version > remote_slot_version {
             return Ok(signed.chunk.clone());
@@ -830,6 +858,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         let signed = SignedBlock {
             signature_hash,
             chunk: chunk.clone(),
+            signed_at_unix: now_unix(),
         };
         let mut next_signed = self.signed.clone();
         next_signed.insert(position, signed);
@@ -1182,8 +1211,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ActiveSortitionValidator, EmbeddedSigner, ProposalValidator, SignerConfig, SignerError,
-        SortitionProposalValidator,
+        ActiveSortitionValidator, DEFAULT_CONFLICT_TIMEOUT_SECS, EmbeddedSigner, ProposalValidator,
+        SignerConfig, SignerError, SortitionProposalValidator,
     };
 
     struct Accept;
@@ -1278,6 +1307,7 @@ mod tests {
         let key = StacksPrivateKey::from_seed(b"signer");
         let mut signer = EmbeddedSigner::new(
             SignerConfig {
+                conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
                 private_key: key.clone(),
                 writer_slot: 7,
                 next_slot_version: 3,
@@ -1307,6 +1337,7 @@ mod tests {
     fn rejected_proposals_never_advance_the_writer_version() {
         let mut signer = EmbeddedSigner::new(
             SignerConfig {
+                conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
                 private_key: StacksPrivateKey::from_seed(b"signer"),
                 writer_slot: 7,
                 next_slot_version: 3,
@@ -1325,6 +1356,7 @@ mod tests {
     fn repeated_proposals_reuse_the_original_response() {
         let mut signer = EmbeddedSigner::new(
             SignerConfig {
+                conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
                 private_key: StacksPrivateKey::from_seed(b"signer"),
                 writer_slot: 7,
                 next_slot_version: 3,
@@ -1343,6 +1375,7 @@ mod tests {
     fn consumed_slot_reissues_the_same_acceptance_at_the_next_version() {
         let mut signer = EmbeddedSigner::new(
             SignerConfig {
+                conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
                 private_key: StacksPrivateKey::from_seed(b"signer"),
                 writer_slot: 7,
                 next_slot_version: 3,
@@ -1365,6 +1398,7 @@ mod tests {
         let directory = tempdir().expect("create temporary signer directory");
         let path = directory.path().join("signer-state.json");
         let config = SignerConfig {
+            conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
             private_key: StacksPrivateKey::from_seed(b"signer"),
             writer_slot: 7,
             next_slot_version: 3,
@@ -1394,6 +1428,7 @@ mod tests {
         let directory = tempdir().expect("create temporary signer directory");
         let path = directory.path().join("signer-state.json");
         let config = SignerConfig {
+            conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
             private_key: StacksPrivateKey::from_seed(b"signer"),
             writer_slot: 7,
             next_slot_version: 3,
