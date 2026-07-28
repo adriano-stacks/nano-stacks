@@ -28,3 +28,7 @@ workspace = true
 [[bin]]
 name = "stacks-miner"
 path = "src/main.rs"
+
+[[bin]]
+name = "stacks-register-leader-key"
+path = "src/bin/register_leader_key.rs"
