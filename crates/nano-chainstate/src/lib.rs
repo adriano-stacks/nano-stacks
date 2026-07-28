@@ -188,12 +188,15 @@ pub struct TransactionReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransactionStatus {
     Success,
+    /// The contract call returned an error response, discarding its writes.
+    AbortedByResponse,
     PostConditionAborted(String),
     RuntimeFailure(String),
 }
 
 enum PayloadOutcome {
     Success(TransactionResult),
+    AbortedByResponse(TransactionResult),
     RuntimeFailure {
         result: TransactionResult,
         error: String,
@@ -807,6 +810,16 @@ impl ChainState {
         )?;
         let result = match result {
             PayloadOutcome::Success(result) => result,
+            PayloadOutcome::AbortedByResponse(result) => {
+                // The call already discarded its writes; the fee and nonce stand.
+                self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
+                return Ok(TransactionReceipt {
+                    txid: transaction.txid(),
+                    status: TransactionStatus::AbortedByResponse,
+                    committed: false,
+                    result,
+                });
+            }
             PayloadOutcome::RuntimeFailure { result, error } => {
                 return Err(ChainStateError::TransactionFailure {
                     result: Box::new(result),
@@ -894,6 +907,7 @@ impl ChainState {
             .vm
             .transaction_cost_tracker_with_total(execution_cost.clone())?;
         let mut runtime_error = None;
+        let mut aborted_by_response = false;
         let mut result = match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
@@ -940,6 +954,10 @@ impl ChainState {
                 cost_tracker,
             )? {
                 ContractCallOutcome::Success(result) => *result,
+                ContractCallOutcome::AbortedByResponse(result) => {
+                    aborted_by_response = true;
+                    *result
+                }
                 ContractCallOutcome::RuntimeFailure { cost, error } => {
                     runtime_error = Some(error.to_string());
                     TransactionResult {
@@ -957,6 +975,7 @@ impl ChainState {
         })?;
         Ok(match runtime_error {
             Some(error) => PayloadOutcome::RuntimeFailure { result, error },
+            None if aborted_by_response => PayloadOutcome::AbortedByResponse(result),
             None => PayloadOutcome::Success(result),
         })
     }
@@ -1070,9 +1089,10 @@ fn finalize_native_contract_call(
         Ok(ContractCallOutcome::Success(_)) => {
             vm.commit_transaction().map_err(ChainStateError::from)
         }
-        Ok(ContractCallOutcome::RuntimeFailure { .. }) | Err(_) => {
-            vm.rollback_transaction().map_err(ChainStateError::from)
-        }
+        Ok(
+            ContractCallOutcome::AbortedByResponse(_) | ContractCallOutcome::RuntimeFailure { .. },
+        )
+        | Err(_) => vm.rollback_transaction().map_err(ChainStateError::from),
     }
 }
 

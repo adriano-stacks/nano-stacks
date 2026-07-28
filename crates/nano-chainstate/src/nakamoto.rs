@@ -339,6 +339,22 @@ impl std::error::Error for SignerSetError {
 }
 
 impl NakamotoBlock {
+    /// The Bitcoin block a tenure change moves the Clarity burn view to.
+    ///
+    /// A tenure extend advances the burn view without starting a tenure, so a
+    /// block's Clarity burn height is not always its own tenure's sortition.
+    #[must_use]
+    pub fn bitcoin_view_consensus_hash(&self) -> Option<ConsensusHash> {
+        self.transactions
+            .iter()
+            .find_map(|transaction| match transaction.payload().data() {
+                nano_codec::TransactionPayloadData::TenureChange(payload) => {
+                    Some(payload.bitcoin_view_consensus_hash)
+                }
+                _ => None,
+            })
+    }
+
     /// Decode one complete Nakamoto block and validate transaction uniqueness and its Merkle root.
     pub fn decode(bytes: &[u8]) -> Result<Self, NakamotoCodecError> {
         let (block, consumed) = Self::decode_prefix(bytes)?;

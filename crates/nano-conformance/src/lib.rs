@@ -371,6 +371,9 @@ pub struct ReplayDepth {
     pub expected: u64,
     pub first_failure: Option<u64>,
     pub first_divergence: Option<ReplayDivergence>,
+    /// Costs are reported on their own, because they only change consensus when
+    /// a block nears a limit; the state root and receipts do not depend on them.
+    pub first_cost_divergence: Option<(u64, String)>,
 }
 
 /// The precise reason captured replay first diverged from its fixture oracle.
@@ -392,6 +395,7 @@ pub fn baseline_replay(manifest: FixtureManifest) -> ReplayDepth {
         expected: manifest.replay_blocks,
         first_failure: (manifest.replay_blocks > 0).then_some(1),
         first_divergence: None,
+        first_cost_divergence: None,
     }
 }
 
@@ -447,6 +451,20 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
         "replay: receipts     event observer receipts     {}/{}          {}",
         replay.completed, replay.expected, first_failure
     );
+    let costs = replay.first_cost_divergence.as_ref().map_or_else(
+        || format!("{}/{}          —", replay.completed, replay.expected),
+        |(height, reason)| {
+            format!(
+                "{}/{}          block {height}: {reason}",
+                height.saturating_sub(1),
+                replay.expected
+            )
+        },
+    );
+    let _ = writeln!(
+        output,
+        "replay: costs        receipt cost dimensions     {costs}"
+    );
     let _ = writeln!(
         output,
         "\nREPLAY DEPTH: {} / {} ({})",
@@ -484,17 +502,20 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
 
     let mut completed = 0;
     let mut parent = Some(source);
+    let mut bitcoin_view = String::new();
+    let mut first_cost_divergence = None;
     for (offset, path) in paths.into_iter().enumerate() {
         if completed >= manifest.replay_blocks {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let block = match apply_captured_block(
+        let (block, cost_divergence) = match apply_captured_block(
             root,
             &mut chainstate,
             &snapshots,
             &bitcoin_operations,
             parent,
+            &mut bitcoin_view,
             &path,
         ) {
             Ok(block) => block,
@@ -504,9 +525,13 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
                     expected: manifest.replay_blocks,
                     first_failure: Some(block_number),
                     first_divergence: Some(divergence),
+                    first_cost_divergence,
                 };
             }
         };
+        if first_cost_divergence.is_none() {
+            first_cost_divergence = cost_divergence.map(|reason| (block_number, reason));
+        }
         parent = Some(*block.block_id().as_bytes());
         completed += 1;
     }
@@ -515,6 +540,7 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
         expected: manifest.replay_blocks,
         first_failure: (completed < manifest.replay_blocks).then_some(completed + 1),
         first_divergence: None,
+        first_cost_divergence,
     }
 }
 
@@ -538,6 +564,7 @@ fn replay_fixture_failure(manifest: FixtureManifest, message: &str) -> ReplayDep
         expected: manifest.replay_blocks,
         first_failure: Some(1),
         first_divergence: Some(ReplayDivergence::Fixture(message.to_owned())),
+        first_cost_divergence: None,
     }
 }
 
@@ -547,19 +574,26 @@ fn apply_captured_block(
     snapshots: &BTreeMap<String, BitcoinBlockContext>,
     bitcoin_operations: &BTreeMap<String, Vec<BitcoinOperation>>,
     parent: Option<[u8; 32]>,
+    bitcoin_view: &mut String,
     path: &Path,
-) -> Result<NakamotoBlock, ReplayDivergence> {
+) -> Result<(NakamotoBlock, Option<String>), ReplayDivergence> {
     let bytes =
         fs::read(path).map_err(|_| ReplayDivergence::Fixture("block cannot be read".to_owned()))?;
     let block = NakamotoBlock::decode(&bytes)
         .map_err(|_| ReplayDivergence::Fixture("block cannot be decoded".to_owned()))?;
-    let mut bitcoin_context = *snapshots
-        .get(&block.header.consensus_hash.to_string())
-        .ok_or_else(|| {
-            ReplayDivergence::Fixture(
-                "block consensus hash is absent from captured Bitcoin snapshots".to_owned(),
-            )
-        })?;
+    // A tenure extend moves the Clarity burn view without starting a tenure, so
+    // the view carries forward until the next tenure change moves it again.
+    if let Some(view) = block.bitcoin_view_consensus_hash() {
+        *bitcoin_view = view.to_string();
+    } else if bitcoin_view.is_empty() {
+        // Replay can start mid-tenure, where the view is the tenure's own sortition.
+        *bitcoin_view = block.header.consensus_hash.to_string();
+    }
+    let mut bitcoin_context = *snapshots.get(bitcoin_view.as_str()).ok_or_else(|| {
+        ReplayDivergence::Fixture(
+            "block Bitcoin view is absent from captured Bitcoin snapshots".to_owned(),
+        )
+    })?;
     let event_path = root.join("events/new_block").join(
         path.file_stem()
             .map(|name| format!("{}.json", name.to_string_lossy()))
@@ -584,7 +618,7 @@ fn apply_captured_block(
     let applied = chainstate
         .execute_nakamoto_block_with_bitcoin_operations(bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
-    compare_receipts(&event, &applied.receipts)?;
+    let cost_divergence = compare_receipts(&event, &applied.receipts)?;
     let actual = TrieHash::from_bytes(applied.execution.state_root.0);
     if actual != block.header.state_index_root {
         return Err(ReplayDivergence::StateRoot {
@@ -592,13 +626,14 @@ fn apply_captured_block(
             actual,
         });
     }
-    Ok(block)
+    Ok((block, cost_divergence))
 }
 
+/// Compare a block's receipts, returning any cost difference separately.
 fn compare_receipts(
     event: &CapturedBlockEvent,
     receipts: &[nano_chainstate::TransactionReceipt],
-) -> Result<(), ReplayDivergence> {
+) -> Result<Option<String>, ReplayDivergence> {
     if event.transactions.len() != receipts.len() {
         return Err(ReplayDivergence::Receipt(
             "transaction count differs".to_owned(),
@@ -610,7 +645,8 @@ fn compare_receipts(
             nano_chainstate::TransactionStatus::PostConditionAborted(_) => {
                 "abort_by_post_condition"
             }
-            nano_chainstate::TransactionStatus::RuntimeFailure(_) => "abort_by_response",
+            nano_chainstate::TransactionStatus::AbortedByResponse
+            | nano_chainstate::TransactionStatus::RuntimeFailure(_) => "abort_by_response",
         };
         if expected.status != status {
             return Err(ReplayDivergence::Receipt(format!(
@@ -651,7 +687,7 @@ fn compare_receipts(
             expected.execution_cost.write_count,
             expected.execution_cost.write_length,
         ) {
-            return Err(ReplayDivergence::Receipt(format!(
+            return Ok(Some(format!(
                 "transaction {index} ({:?}) cost differs: expected ({}, {}, {}, {}, {}), got ({}, {}, {}, {}, {})",
                 actual.txid,
                 expected.execution_cost.read_count,
@@ -686,7 +722,7 @@ fn compare_receipts(
     if expected_events != actual_events {
         return Err(ReplayDivergence::Receipt("events differ".to_owned()));
     }
-    Ok(())
+    Ok(None)
 }
 
 impl std::fmt::Display for ReplayDivergence {
@@ -1302,6 +1338,7 @@ mod tests {
         )
         .expect("open checkpoint");
         let mut parent = Some(source);
+        let mut bitcoin_view = String::new();
         let mut fourth = None;
         let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
             .expect("read blocks")
@@ -1317,6 +1354,7 @@ mod tests {
                 &snapshots,
                 &bitcoin_operations,
                 parent,
+                &mut bitcoin_view,
                 &path,
             )
             .expect("apply captured block");

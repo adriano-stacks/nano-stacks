@@ -71,6 +71,8 @@ pub struct TransactionResult {
 #[derive(Debug)]
 pub enum ContractCallOutcome {
     Success(Box<TransactionResult>),
+    /// The call returned an error response, so its writes were discarded.
+    AbortedByResponse(Box<TransactionResult>),
     RuntimeFailure {
         cost: ExecutionCost,
         error: VmExecutionError,
@@ -398,7 +400,8 @@ impl Vm {
             arguments,
             cost_tracker,
         )? {
-            ContractCallOutcome::Success(result) => Ok(*result),
+            ContractCallOutcome::Success(result)
+            | ContractCallOutcome::AbortedByResponse(result) => Ok(*result),
             ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
         }
     }
@@ -429,9 +432,10 @@ impl Vm {
             arguments,
             LimitedCostTracker::new_free(),
         )? {
-            ContractCallOutcome::Success(result) => result.value.ok_or(
-                VmInternalError::Expect("contract call returned no value".to_owned()).into(),
-            ),
+            ContractCallOutcome::Success(result)
+            | ContractCallOutcome::AbortedByResponse(result) => result.value.ok_or_else(|| {
+                VmInternalError::Expect("contract call returned no value".to_owned()).into()
+            }),
             ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
         }
     }
@@ -1480,7 +1484,9 @@ pub fn execute_contract_call(
         arguments,
         cost_tracker,
     )? {
-        ContractCallOutcome::Success(result) => Ok(*result),
+        ContractCallOutcome::Success(result) | ContractCallOutcome::AbortedByResponse(result) => {
+            Ok(*result)
+        }
         ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
     }
 }
@@ -1664,13 +1670,26 @@ fn call_contract_values_in_context(
     );
     match result {
         Ok(value) => {
-            let (assets, events) = global.commit()?;
-            Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
+            // A call that returns an error response keeps its cost and its
+            // value, but none of the state it wrote.
+            let aborted = matches!(&value, Value::Response(response) if !response.committed);
+            let (assets, events) = if aborted {
+                global.roll_back()?;
+                (None, None)
+            } else {
+                global.commit()?
+            };
+            let result = Box::new(TransactionResult {
                 value: Some(value),
                 cost: global.cost_track.get_total(),
                 assets: assets.unwrap_or_default(),
                 events: events.map_or_else(Vec::new, |batch| batch.events),
-            })))
+            });
+            Ok(if aborted {
+                ContractCallOutcome::AbortedByResponse(result)
+            } else {
+                ContractCallOutcome::Success(result)
+            })
         }
         Err(error) => {
             let cost = global.cost_track.get_total();
@@ -2298,6 +2317,45 @@ mod tests {
         assert_eq!(
             result.value,
             Some(Value::okay(Value::UInt(42)).expect("valid response"))
+        );
+        vm.seal_block().expect("seal block");
+    }
+
+    /// `unwrap!` in a `let` binding must return from the whole function, not
+    /// just abandon the binding. PoX-5 guards its entry points this way.
+    #[test]
+    fn unwrap_in_a_let_binding_returns_from_the_function() {
+        let block = [11; 32];
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.guard")
+            .expect("valid contract identifier");
+        let sender: PrincipalData = contract.issuer.clone().into();
+        let mut vm = Vm::new().expect("create VM");
+        vm.begin_block(None, block).expect("begin block");
+        vm.deploy_contract(
+            contract.clone(),
+            clarity::vm::ClarityVersion::Clarity6,
+            "(define-map absent uint uint)
+             (define-public (guarded)
+               (let ((value (unwrap! (map-get? absent u1) (err u27)))) (ok value)))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy contract");
+        vm.modules = ModuleCache::default();
+
+        let result = vm
+            .execute_contract_call(
+                sender,
+                None,
+                contract,
+                "guarded",
+                &[],
+                LimitedCostTracker::new_free(),
+            )
+            .expect("call contract");
+
+        assert_eq!(
+            result.value,
+            Some(Value::error(Value::UInt(27)).expect("valid response"))
         );
         vm.seal_block().expect("seal block");
     }

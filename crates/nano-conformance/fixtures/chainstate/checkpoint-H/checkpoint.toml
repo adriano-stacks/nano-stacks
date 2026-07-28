@@ -1,5 +1,5 @@
 format = "stacks-core-marf-sqlite-v2"
-checkpoint_stacks_height = 690
-source_state_id = "71b14b87fdef8621647cecf524c0974981f8001dc874a2cb38c9149d8733f1e5"
-published_state_index_root = "2091cfceef9c5577376bb927f2e56ad4a714eac3881f1e96bdb6778d57174edc"
-first_bitcoin_height = 310
+checkpoint_stacks_height = 400
+source_state_id = "59fddf1616159b7bb601d09936ae9466e82b24ca57a3220fa89354d6262e841a"
+published_state_index_root = "34644adbf8134eae805af21c519549d7d33c319ddc0fd9b2b4c1158abf515845"
+first_bitcoin_height = 277
