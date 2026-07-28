@@ -2537,6 +2537,7 @@ version = "0.1.0"
 dependencies = [
  "clarity",
  "nano-address",
+ "nano-bitcoin",
  "nano-codec",
  "nano-crypto",
  "nano-marf",
