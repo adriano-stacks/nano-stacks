@@ -32,6 +32,15 @@ use stacks_common::types::{
 };
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
+/// The consensus execution-cost limit for an Epoch 4 block.
+pub const EPOCH_4_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
+    write_length: 15_000_000,
+    write_count: 15_000,
+    read_length: 100_000_000,
+    read_count: 15_000,
+    runtime: 5_000_000_000,
+};
+
 /// M0 execution output. M8/M10 replace the marker with Clarity receipts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
@@ -191,7 +200,7 @@ impl BurnStateDB for BitcoinContext {
             epoch_id: StacksEpochId::Epoch40,
             start_height: 0,
             end_height: u64::MAX,
-            block_limit: ExecutionCost::max_value(),
+            block_limit: EPOCH_4_BLOCK_LIMIT,
             network_epoch: 0,
         })
     }
@@ -404,8 +413,16 @@ impl Vm {
     ///
     /// Empty development states do not have the boot cost contracts yet and use a free tracker.
     pub fn transaction_cost_tracker(&mut self) -> Result<LimitedCostTracker, VmExecutionError> {
+        self.transaction_cost_tracker_with_total(ExecutionCost::ZERO)
+    }
+
+    /// Create a consensus cost tracker carrying costs already consumed by this block.
+    pub fn transaction_cost_tracker_with_total(
+        &mut self,
+        total: ExecutionCost,
+    ) -> Result<LimitedCostTracker, VmExecutionError> {
         let Self { store, context } = self;
-        transaction_cost_tracker_in_context(store, context)
+        transaction_cost_tracker_in_context(store, context, total)
     }
 
     /// Store a transaction nonce in the active block state.
@@ -426,6 +443,11 @@ impl Vm {
     /// Seal the active state and store it under the committed block ID.
     pub fn seal_block_to(&mut self, block: [u8; 32]) -> Result<StateRoot, MarfStoreError> {
         self.store.seal_to(block)
+    }
+
+    /// Discard an unsealed block state after execution fails.
+    pub fn abort_block(&mut self) -> Result<(), MarfStoreError> {
+        self.store.abort()
     }
 
     /// Access the state root for a sealed block.
@@ -643,6 +665,14 @@ impl MarfStore {
         self.states.insert(block, active.state);
         self.read_block = Some(block);
         Ok(StateRoot(*root.as_bytes()))
+    }
+
+    /// Discard the active state without registering a new MARF version.
+    pub fn abort(&mut self) -> Result<(), MarfStoreError> {
+        let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.marf.abort()?;
+        self.read_block = active.parent;
+        Ok(())
     }
 
     /// Return a sealed state's MARF root.
@@ -1357,6 +1387,7 @@ fn touch_stx_balance_in_context(
 fn transaction_cost_tracker_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
+    total: ExecutionCost,
 ) -> Result<LimitedCostTracker, VmExecutionError> {
     let mut database = clarity_database(store, bitcoin_context);
     database.begin();
@@ -1364,13 +1395,16 @@ fn transaction_cost_tracker_in_context(
     let result = LimitedCostTracker::new_mid_block(
         false,
         CHAIN_ID_TESTNET,
-        ExecutionCost::max_value(),
+        EPOCH_4_BLOCK_LIMIT,
         &mut database,
         StacksEpochId::Epoch40,
     );
     database.roll_back()?;
     match result {
-        Ok(tracker) => Ok(tracker),
+        Ok(mut tracker) => {
+            tracker.set_total(total);
+            Ok(tracker)
+        }
         Err(CostErrors::CostContractLoadFailure | CostErrors::CostComputationFailed(_)) => {
             Ok(LimitedCostTracker::new_free())
         }

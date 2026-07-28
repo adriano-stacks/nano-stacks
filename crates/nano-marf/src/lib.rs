@@ -659,6 +659,12 @@ impl VersionedMarf {
         Ok(root)
     }
 
+    /// Discard the unsealed state currently being written.
+    pub fn abort(&mut self) -> Result<(), MarfError> {
+        self.active.take().ok_or(MarfError::WriteNotBegun)?;
+        Ok(())
+    }
+
     /// Read a logical key from a sealed state.
     #[must_use]
     pub fn get(&self, block: MarfBlockId, key: &[u8]) -> Option<MarfValue> {
@@ -955,5 +961,23 @@ mod tests {
         assert_eq!(trie.root(first), Some(first_root));
         assert_eq!(trie.root(second), Some(second_root));
         assert_ne!(third_root, second_root);
+    }
+
+    #[test]
+    fn abort_discards_an_unsealed_version() {
+        let block = [1; 32];
+        let replacement = [2; 32];
+        let path = [7; 32];
+        let mut trie = VersionedMarf::default();
+
+        trie.begin(None, block).expect("starts active state");
+        trie.insert_path(path, MarfValue::from_u32(1))
+            .expect("writes active state");
+        trie.abort().expect("discards active state");
+
+        assert_eq!(trie.root(block), None);
+        trie.begin(None, replacement)
+            .expect("starts replacement state");
+        trie.seal().expect("seals replacement state");
     }
 }

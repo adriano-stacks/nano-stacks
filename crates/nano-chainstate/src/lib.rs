@@ -27,6 +27,7 @@ use std::path::Path;
 pub struct AppliedBlock {
     pub bitcoin_height: u64,
     pub execution: ExecutionResult,
+    pub execution_cost: ExecutionCost,
     pub receipts: Vec<TransactionReceipt>,
 }
 
@@ -152,6 +153,7 @@ impl ChainState {
         Ok(AppliedBlock {
             bitcoin_height: snapshot.bitcoin_height,
             execution: ExecutionResult { state_root },
+            execution_cost: ExecutionCost::ZERO,
             receipts: Vec::new(),
         })
     }
@@ -199,31 +201,43 @@ impl ChainState {
         let block_id = *block.block_id().as_bytes();
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
-        self.vm.setup_block_metadata(block.header.timestamp)?;
-        if block_starts_new_tenure(block) {
-            let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
-                ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
-            })?;
-            self.vm.set_tenure_height(next_height)?;
+        let result = (|| {
+            self.vm.setup_block_metadata(block.header.timestamp)?;
+            if block_starts_new_tenure(block) {
+                let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
+                    ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
+                })?;
+                self.vm.set_tenure_height(next_height)?;
+            }
+            let mut execution_cost = ExecutionCost::ZERO;
+            let mut receipts = Vec::with_capacity(block.transactions.len());
+            for transaction in &block.transactions {
+                let receipt = self.execute_transaction(transaction, &execution_cost)?;
+                execution_cost.add(&receipt.result.cost).map_err(|error| {
+                    ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))
+                })?;
+                receipts.push(receipt);
+            }
+            let unlocked = self.vm.process_scheduled_unlocks()?;
+            self.vm.increment_liquid_stx_supply(unlocked)?;
+            let state_root = self.vm.seal_block_to(block_id)?;
+            Ok(AppliedBlock {
+                bitcoin_height: bitcoin_context.height,
+                execution: ExecutionResult { state_root },
+                execution_cost,
+                receipts,
+            })
+        })();
+        if result.is_err() {
+            self.vm.abort_block()?;
         }
-        let receipts = block
-            .transactions
-            .iter()
-            .map(|transaction| self.execute_transaction(transaction))
-            .collect::<Result<Vec<_>, _>>()?;
-        let unlocked = self.vm.process_scheduled_unlocks()?;
-        self.vm.increment_liquid_stx_supply(unlocked)?;
-        let state_root = self.vm.seal_block_to(block_id)?;
-        Ok(AppliedBlock {
-            bitcoin_height: bitcoin_context.height,
-            execution: ExecutionResult { state_root },
-            receipts,
-        })
+        result
     }
 
     fn execute_transaction(
         &mut self,
         transaction: &Transaction,
+        execution_cost: &ExecutionCost,
     ) -> Result<TransactionReceipt, ChainStateError> {
         let origin = transaction.origin_address().ok_or_else(|| {
             ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
@@ -250,7 +264,13 @@ impl ChainState {
             ));
         }
         self.vm.debit_fee(payer, payer_condition.fee())?;
-        let result = self.execute_payload(transaction, origin, &sender, sponsor.as_ref())?;
+        let result = self.execute_payload(
+            transaction,
+            origin,
+            &sender,
+            sponsor.as_ref(),
+            execution_cost,
+        )?;
         self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
         Ok(TransactionReceipt {
             txid: transaction.txid(),
@@ -283,9 +303,12 @@ impl ChainState {
         origin: nano_address::StacksAddress,
         sender: &PrincipalData,
         sponsor: Option<&PrincipalData>,
+        execution_cost: &ExecutionCost,
     ) -> Result<TransactionResult, ChainStateError> {
-        let cost_tracker = self.vm.transaction_cost_tracker()?;
-        Ok(match transaction.payload().data() {
+        let cost_tracker = self
+            .vm
+            .transaction_cost_tracker_with_total(execution_cost.clone())?;
+        let mut result = match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
                 amount,
@@ -331,7 +354,11 @@ impl ChainState {
                 cost_tracker,
             )?,
             _ => return Err(ChainStateError::UnsupportedPayload),
-        })
+        };
+        result.cost.sub(execution_cost).map_err(|error| {
+            ChainStateError::InvalidTransaction(format!("transaction cost underflow: {error}"))
+        })?;
+        Ok(result)
     }
 
     fn update_transaction_nonces(
@@ -434,12 +461,14 @@ pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
         execution: ExecutionResult {
             state_root: nano_marf::StateRoot::empty(),
         },
+        execution_cost: ExecutionCost::ZERO,
         receipts: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use clarity::vm::costs::ExecutionCost;
     use std::{fs, path::Path};
 
     use nano_codec::Transaction;
@@ -483,10 +512,10 @@ mod tests {
         let call = decoded_transaction(&call_payload, 1, 0);
 
         let deployed = chainstate
-            .execute_transaction(&deployment)
+            .execute_transaction(&deployment, &ExecutionCost::ZERO)
             .expect("deploy decoded contract");
         let called = chainstate
-            .execute_transaction(&call)
+            .execute_transaction(&call, &deployed.result.cost)
             .expect("call decoded contract");
 
         assert_eq!(deployed.result.value, None);
@@ -528,7 +557,7 @@ mod tests {
             .expect("begin block");
 
         let receipt = chainstate
-            .execute_transaction(&block.transactions[0])
+            .execute_transaction(&block.transactions[0], &ExecutionCost::ZERO)
             .expect("execute captured transfer");
 
         assert_eq!(receipt.result.events.len(), 1);
