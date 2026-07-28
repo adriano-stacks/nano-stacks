@@ -571,8 +571,8 @@ fn compare_receipts(
             "transaction count differs".to_owned(),
         ));
     }
-    for (expected, actual) in event.transactions.iter().zip(receipts) {
-        let status = match actual.status {
+    for (index, (expected, actual)) in event.transactions.iter().zip(receipts).enumerate() {
+        let status = match &actual.status {
             nano_chainstate::TransactionStatus::Success => "success",
             nano_chainstate::TransactionStatus::PostConditionAborted(_) => {
                 "abort_by_post_condition"
@@ -581,8 +581,8 @@ fn compare_receipts(
         };
         if expected.status != status {
             return Err(ReplayDivergence::Receipt(format!(
-                "transaction status differs: expected {}, got {status}",
-                expected.status
+                "transaction {index} ({:?}) status differs: expected {}, got {status} ({:?})",
+                actual.txid, expected.status, actual.status
             )));
         }
         if expected.txid != format!("0x{:?}", actual.txid) {
@@ -618,9 +618,20 @@ fn compare_receipts(
             expected.execution_cost.write_count,
             expected.execution_cost.write_length,
         ) {
-            return Err(ReplayDivergence::Receipt(
-                "execution cost differs".to_owned(),
-            ));
+            return Err(ReplayDivergence::Receipt(format!(
+                "transaction {index} ({:?}) cost differs: expected ({}, {}, {}, {}, {}), got ({}, {}, {}, {}, {})",
+                actual.txid,
+                expected.execution_cost.read_count,
+                expected.execution_cost.read_length,
+                expected.execution_cost.runtime,
+                expected.execution_cost.write_count,
+                expected.execution_cost.write_length,
+                cost.read_count,
+                cost.read_length,
+                cost.runtime,
+                cost.write_count,
+                cost.write_length,
+            )));
         }
     }
     let actual_events = receipts

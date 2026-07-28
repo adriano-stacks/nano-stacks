@@ -488,8 +488,6 @@ impl ComplexWord for WithFt {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         let token_contract = args.get_expr(0)?;
         let token_name = args.get_expr(1)?;
         let allowance = args.get_expr(2)?;

@@ -460,6 +460,7 @@ impl WasmGenerator {
     }
 
     pub fn generate(mut self) -> Result<Module, GeneratorError> {
+        self.register_defined_traits()?;
         let expressions = std::mem::take(&mut self.contract_analysis.expressions);
 
         // Get the type of the last top-level expression with a return value
@@ -499,6 +500,27 @@ impl WasmGenerator {
         self.module.exports.add("workspace-size", workspace_global);
 
         Ok(self.module)
+    }
+
+    fn register_defined_traits(&mut self) -> Result<(), GeneratorError> {
+        let contract_identifier = self.contract_analysis.contract_identifier.clone();
+        let trait_names: Vec<_> = self
+            .contract_analysis
+            .defined_traits
+            .keys()
+            .cloned()
+            .collect();
+
+        for name in trait_names {
+            let trait_identifier = TraitIdentifier {
+                name,
+                contract_identifier: contract_identifier.clone(),
+            };
+            let offset_length = self.add_trait_identifier(&trait_identifier)?;
+            self.used_traits.insert(trait_identifier, offset_length);
+        }
+
+        Ok(())
     }
 
     pub fn get_memory(&self) -> Result<MemoryId, GeneratorError> {

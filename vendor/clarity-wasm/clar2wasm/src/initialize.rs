@@ -3,9 +3,10 @@ use clarity::vm::contexts::GlobalContext;
 use clarity::vm::costs::CostTracker;
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
+use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{
-    AssetIdentifier, BuffData, FunctionType, PrincipalData, QualifiedContractIdentifier,
-    TypeSignature,
+    AssetIdentifier, BuffData, CallableData, FunctionType, PrincipalData,
+    QualifiedContractIdentifier, TypeSignature,
 };
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
@@ -518,15 +519,16 @@ pub fn call_function(
         .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
     let mut wasm_arguments = Vec::new();
     for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
-        if !expected_type.admits(&epoch, argument)? {
+        let argument = implicit_contract_cast(expected_type, argument);
+        if !expected_type.admits(&epoch, &argument)? {
             return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeError(
                 Box::new(expected_type.clone()),
-                Box::new(TypeSignature::type_of(argument)?),
+                Box::new(TypeSignature::type_of(&argument)?),
             )
             .into());
         }
         let (values, next_offset) =
-            pass_argument_to_wasm(memory, &mut store, expected_type, argument, offset)?;
+            pass_argument_to_wasm(memory, &mut store, expected_type, &argument, offset)?;
         wasm_arguments.extend(values);
         offset = next_offset;
     }
@@ -564,4 +566,17 @@ pub fn call_function(
     value.ok_or(crate::error::wasm_error(WasmError::Expect(
         "function returned no value".into(),
     )))
+}
+
+fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Value {
+    match (expected_type, argument) {
+        (
+            TypeSignature::CallableType(CallableSubtype::Trait(trait_identifier)),
+            Value::Principal(PrincipalData::Contract(contract_identifier)),
+        ) => Value::CallableContract(CallableData {
+            contract_identifier: contract_identifier.clone(),
+            trait_identifier: Some(trait_identifier.clone()),
+        }),
+        _ => argument.clone(),
+    }
 }

@@ -1340,7 +1340,7 @@ fn deploy_contract_with_wasm_in_context(
                     true,
                 )
                 .map_err(|error: clar2wasm::CompileError| {
-                    StaticCheckErrorKind::Unreachable(format!("{error:?}"))
+                    StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
                 })?;
                 analysis_db.insert_contract(&contract, &compiled.contract_analysis)?;
                 Ok(compiled.into_compiled_contract())
@@ -1542,6 +1542,9 @@ fn execute_contract_call_outcome_with_wasm_in_context(
             Ok(value)
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
+    for contract in arguments.iter().filter_map(contract_argument) {
+        ensure_wasm_module(store, bitcoin_context, modules, contract)?;
+    }
     ensure_wasm_module(store, bitcoin_context, modules, &call.contract)?;
     let module = modules.get(&call.contract).ok_or_else(|| {
         VmInternalError::Expect(format!("missing WASM module for {}", call.contract))
@@ -1591,6 +1594,13 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     }
 }
 
+const fn contract_argument(value: &Value) -> Option<&QualifiedContractIdentifier> {
+    match value {
+        Value::Principal(PrincipalData::Contract(contract)) => Some(contract),
+        _ => None,
+    }
+}
+
 fn ensure_wasm_module(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
@@ -1604,13 +1614,23 @@ fn ensure_wasm_module(
     let (source, version) = {
         let mut database = clarity_database(store, bitcoin_context);
         database.begin();
-        let contract_context = database.get_contract(contract)?;
-        let source = database
-            .get_contract_src(contract)
-            .ok_or_else(|| VmInternalError::Expect(format!("missing source for {contract}")))?;
-        let version = *contract_context.get_clarity_version();
-        database.commit()?;
-        (source, version)
+        let result = (|| {
+            let contract_context = database.get_contract(contract)?;
+            let source = database
+                .get_contract_src(contract)
+                .ok_or_else(|| VmInternalError::Expect(format!("missing source for {contract}")))?;
+            Ok((source, *contract_context.get_clarity_version()))
+        })();
+        match result {
+            Ok(value) => {
+                database.commit()?;
+                value
+            }
+            Err(error) => {
+                database.roll_back()?;
+                return Err(error);
+            }
+        }
     };
     let compiled = {
         let mut analysis = AnalysisDatabase::new(store);
@@ -1627,13 +1647,23 @@ fn ensure_wasm_module(
                 )
                 .map(clar2wasm::CompileResult::into_compiled_contract)
                 .map_err(|error: clar2wasm::CompileError| {
-                    StaticCheckErrorKind::Unreachable(format!("{error:?}"))
+                    StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
                 })?)
             })
             .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()))?
     };
     modules.insert(contract.clone(), compiled);
     Ok(())
+}
+
+fn wasm_compile_error(error: clar2wasm::CompileError) -> String {
+    match error {
+        clar2wasm::CompileError::Generic { diagnostics, .. } => diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
 }
 
 fn is_acceptable_runtime_failure(error: &VmExecutionError) -> bool {
@@ -2219,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn hydrates_a_wasm_module_from_checkpoint_contract_source() {
+    fn hydrates_the_pox5_wasm_module_from_checkpoint_contract_source() {
         let source = [
             0x73, 0xd5, 0x36, 0xfd, 0x05, 0x5e, 0x08, 0x3f, 0x60, 0xbe, 0x70, 0x35, 0x0e, 0x72,
             0x9d, 0x99, 0xcc, 0xea, 0xc3, 0x47, 0xc5, 0xbf, 0xaa, 0xa7, 0x9f, 0xd4, 0x62, 0xd1,
@@ -2232,7 +2262,7 @@ mod tests {
         ]);
         let checkpoint = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../nano-conformance/fixtures/chainstate/checkpoint-H/marf.sqlite");
-        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox-5")
             .expect("valid checkpoint contract identifier");
         let sender = contract.issuer.clone().into();
         let mut vm = Vm::from_checkpoint(checkpoint, source, root).expect("load checkpoint");
@@ -2243,11 +2273,14 @@ mod tests {
             sender,
             None,
             contract,
-            "get-stacking-minimum",
+            "get-last-reward-compute-height",
             &[],
             LimitedCostTracker::new_free(),
         );
 
-        assert!(matches!(result, Ok(result) if matches!(result.value, Some(Value::UInt(_)))));
+        assert!(
+            matches!(result, Ok(ref result) if matches!(result.value, Some(Value::UInt(_))),),
+            "{result:?}"
+        );
     }
 }
