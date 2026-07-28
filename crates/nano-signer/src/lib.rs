@@ -523,6 +523,13 @@ pub struct SignerService<V> {
     last_proposal: Option<Sha256Sum>,
 }
 
+/// A decoded miner proposal that has not yet been answered by this signer.
+#[derive(Clone, Debug)]
+pub struct PendingProposal {
+    pub hash: Sha256Sum,
+    pub proposal: BlockProposal,
+}
+
 /// Errors while transporting signer messages.
 #[derive(Debug)]
 pub enum SignerServiceError {
@@ -734,7 +741,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
     }
 }
 
-impl<V: ProposalValidator> SignerService<V> {
+impl<V: ProposalValidator + Send + Sync> SignerService<V> {
     /// Construct a service for the miner proposal and signer response contracts of one cycle.
     #[must_use]
     pub const fn new(
@@ -754,6 +761,14 @@ impl<V: ProposalValidator> SignerService<V> {
 
     /// Process the latest miner proposal once and upload an acceptance response when needed.
     pub async fn poll(&mut self) -> Result<Option<ChunkAck>, SignerServiceError> {
+        let Some(pending) = self.next_proposal().await? else {
+            return Ok(None);
+        };
+        self.respond(pending).await.map(Some)
+    }
+
+    /// Fetch and decode a miner proposal that has not already been answered.
+    pub async fn next_proposal(&self) -> Result<Option<PendingProposal>, SignerServiceError> {
         let Some(bytes) = self.client.latest_chunk(&self.miner_contract, 0).await? else {
             return Ok(None);
         };
@@ -764,10 +779,21 @@ impl<V: ProposalValidator> SignerService<V> {
         let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
             return Err(SignerServiceError::UnexpectedMessage);
         };
+        Ok(Some(PendingProposal {
+            hash: proposal_hash,
+            proposal,
+        }))
+    }
+
+    /// Validate and publish a response for a previously fetched miner proposal.
+    pub async fn respond(
+        &mut self,
+        pending: PendingProposal,
+    ) -> Result<ChunkAck, SignerServiceError> {
         let remote_slot_version = self.reconcile_writer_slot().await?;
         let chunk = self
             .signer
-            .sign_after_slot_version(&proposal, remote_slot_version)?;
+            .sign_after_slot_version(&pending.proposal, remote_slot_version)?;
         let acknowledgement = self.client.put_chunk(&self.signer_contract, &chunk).await?;
         if !acknowledgement.accepted {
             return Err(SignerServiceError::Rejected {
@@ -775,8 +801,8 @@ impl<V: ProposalValidator> SignerService<V> {
                 code: acknowledgement.code,
             });
         }
-        self.last_proposal = Some(proposal_hash);
-        Ok(Some(acknowledgement))
+        self.last_proposal = Some(pending.hash);
+        Ok(acknowledgement)
     }
 
     /// Advance the local writer version to the latest version accepted by `StackerDB`.
