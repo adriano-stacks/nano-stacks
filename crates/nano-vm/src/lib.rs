@@ -1521,7 +1521,7 @@ fn execute_contract_call_outcome_in_context(
 fn execute_contract_call_outcome_with_wasm_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
-    modules: &ModuleCache,
+    modules: &mut ModuleCache,
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
@@ -1542,6 +1542,7 @@ fn execute_contract_call_outcome_with_wasm_in_context(
             Ok(value)
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
+    ensure_wasm_module(store, bitcoin_context, modules, &call.contract)?;
     let module = modules.get(&call.contract).ok_or_else(|| {
         VmInternalError::Expect(format!("missing WASM module for {}", call.contract))
     })?;
@@ -1588,6 +1589,51 @@ fn execute_contract_call_outcome_with_wasm_in_context(
             }
         }
     }
+}
+
+fn ensure_wasm_module(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    modules: &mut ModuleCache,
+    contract: &QualifiedContractIdentifier,
+) -> Result<(), VmExecutionError> {
+    if modules.get(contract).is_some() {
+        return Ok(());
+    }
+
+    let (source, version) = {
+        let mut database = clarity_database(store, bitcoin_context);
+        database.begin();
+        let contract_context = database.get_contract(contract)?;
+        let source = database
+            .get_contract_src(contract)
+            .ok_or_else(|| VmInternalError::Expect(format!("missing source for {contract}")))?;
+        let version = *contract_context.get_clarity_version();
+        database.commit()?;
+        (source, version)
+    };
+    let compiled = {
+        let mut analysis = AnalysisDatabase::new(store);
+        analysis
+            .execute::<_, _, StaticCheckError>(|analysis_db| {
+                Ok(clar2wasm::compile(
+                    &source,
+                    contract,
+                    LimitedCostTracker::new_free(),
+                    version,
+                    StacksEpochId::Epoch40,
+                    analysis_db,
+                    true,
+                )
+                .map(clar2wasm::CompileResult::into_compiled_contract)
+                .map_err(|error: clar2wasm::CompileError| {
+                    StaticCheckErrorKind::Unreachable(format!("{error:?}"))
+                })?)
+            })
+            .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()))?
+    };
+    modules.insert(contract.clone(), compiled);
+    Ok(())
 }
 
 fn is_acceptable_runtime_failure(error: &VmExecutionError) -> bool {
@@ -1902,6 +1948,7 @@ fn set_tenure_height_in_context(
 mod tests {
     use std::path::Path;
 
+    use clar2wasm::ModuleCache;
     use clarity::vm::Value;
     use clarity::vm::database::ClarityBackingStore;
     use clarity::vm::database::clarity_store::make_contract_hash_key;
@@ -2070,6 +2117,7 @@ mod tests {
             LimitedCostTracker::new_free(),
         )
         .expect("deploy contract");
+        vm.modules = ModuleCache::default();
 
         let result = vm
             .execute_contract_call(
