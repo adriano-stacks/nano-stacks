@@ -15,12 +15,14 @@ nano-crypto = { path = "../nano-crypto" }
 nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }
+nano-stackerdb = { path = "../nano-stackerdb" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
 [dev-dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 hex = "0.4.3"
+libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 proptest = "1.11.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
 stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }

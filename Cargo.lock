@@ -1441,6 +1441,7 @@ version = "0.1.0"
 dependencies = [
  "clarity",
  "hex",
+ "libstackerdb",
  "nano-address",
  "nano-bitcoin",
  "nano-chainstate",
@@ -1449,6 +1450,7 @@ dependencies = [
  "nano-marf",
  "nano-primitives",
  "nano-sortition",
+ "nano-stackerdb",
  "proptest",
  "serde",
  "serde_json",
@@ -1500,6 +1502,15 @@ name = "nano-sortition"
 version = "0.1.0"
 dependencies = [
  "nano-bitcoin",
+ "nano-primitives",
+]
+
+[[package]]
+name = "nano-stackerdb"
+version = "0.1.0"
+dependencies = [
+ "nano-address",
+ "nano-crypto",
  "nano-primitives",
 ]
 

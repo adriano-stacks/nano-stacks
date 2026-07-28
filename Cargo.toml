@@ -11,6 +11,7 @@ members = [
     "crates/nano-vm",
     "crates/nano-chainstate",
     "crates/nano-sync",
+    "crates/nano-stackerdb",
     "crates/nano-node",
     "crates/nano-conformance",
     "xtask",

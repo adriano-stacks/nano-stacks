@@ -762,6 +762,7 @@ mod tests {
         internal_node_hash, key_path, leaf_hash,
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
+    use nano_stackerdb::Chunk;
     use proptest::prelude::*;
     use serde::Deserialize;
     use stacks_common::util::{
@@ -2338,6 +2339,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn stackerdb_chunk_encoding_matches_stacks_core() {
+        let key = StacksPrivateKey::from_seed(b"stackerdb conformance");
+        let mut chunk = Chunk::new(7, 11, vec![1, 2, 3, 4, 5]);
+        chunk.sign(&key).expect("sign chunk");
+        let encoded = chunk.encode().expect("encode chunk");
+
+        let mut cursor = Cursor::new(encoded.as_slice());
+        let reference = libstackerdb::StackerDBChunkData::consensus_deserialize(&mut cursor)
+            .expect("reference decodes chunk");
+        let mut reference_encoded = Vec::new();
+        reference
+            .consensus_serialize(&mut reference_encoded)
+            .expect("reference encodes chunk");
+        assert_eq!(reference_encoded, encoded);
     }
 
     #[test]
