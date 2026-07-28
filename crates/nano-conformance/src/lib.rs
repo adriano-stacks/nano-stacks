@@ -1845,16 +1845,56 @@ mod tests {
         }
 
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut reward_sets = fs::read_dir(fixture_root.join("stacker_set"))
+            .expect("read reward sets")
+            .map(|entry| entry.expect("reward set entry").path())
+            .collect::<Vec<_>>();
+        reward_sets.sort();
+        for path in reward_sets {
+            let reward_set: StackerSetWire =
+                serde_json::from_slice(&fs::read(&path).expect("read reward set"))
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let expected_weights = reward_set
+                .stacker_set
+                .signers
+                .iter()
+                .map(|signer| signer.weight)
+                .collect::<Vec<_>>();
+            let signers = reward_set
+                .stacker_set
+                .signers
+                .into_iter()
+                .map(|signer| {
+                    (
+                        StacksPublicKey::from_bytes(
+                            &hex::decode(signer.signing_key).expect("decode signing key"),
+                        )
+                        .expect("valid signer key"),
+                        u128::from(signer.stacked_amt),
+                    )
+                })
+                .collect();
+            let (signer_set, threshold) =
+                SignerSet::from_reward_slots(signers, HACKNET_REWARD_SLOTS)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert_eq!(
+                threshold,
+                u128::from(reward_set.stacker_set.pox_ustx_threshold),
+                "{} stacking threshold",
+                path.display()
+            );
+            assert_eq!(
+                signer_set.weights(),
+                expected_weights,
+                "{} signer weights",
+                path.display()
+            );
+        }
+
         let reward_set: StackerSetWire = serde_json::from_slice(
             &fs::read(fixture_root.join("stacker_set/cycle-18.json")).expect("read reward set"),
         )
         .expect("parse reward set");
-        let expected_weights = reward_set
-            .stacker_set
-            .signers
-            .iter()
-            .map(|signer| signer.weight)
-            .collect::<Vec<_>>();
         let signers = reward_set
             .stacker_set
             .signers
@@ -1869,19 +1909,8 @@ mod tests {
                 )
             })
             .collect();
-        let (signer_set, threshold) =
+        let (signer_set, _) =
             SignerSet::from_reward_slots(signers, HACKNET_REWARD_SLOTS).expect("valid signer set");
-        assert_eq!(
-            threshold,
-            u128::from(reward_set.stacker_set.pox_ustx_threshold),
-            "fixture stacking threshold"
-        );
-        assert_eq!(
-            signer_set.weights(),
-            expected_weights.as_slice(),
-            "fixture signer weights"
-        );
-
         for entry in fs::read_dir(fixture_root.join("nakamoto/blocks")).expect("read blocks") {
             let path = entry.expect("fixture entry").path();
             let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
