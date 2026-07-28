@@ -1,12 +1,13 @@
 ---
 id: "013"
 title: "M12: implement StackerDB and embedded signer"
-status: in-progress
+status: completed
 priority: high
 effort: large
 dependencies: ["012"]
 tags: ["m12", "signer"]
 created_at: 2026-07-27
+completed_at: 2026-07-28
 ---
 
 # M12: implement StackerDB and embedded signer
