@@ -1,10 +1,14 @@
 use std::fmt;
 
 use nano_chainstate::NakamotoBlock;
+use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
-use nano_primitives::Sha256Sum;
+use nano_primitives::{ConsensusHash, Hash160, Sha256Sum, StacksBlockId};
 
 use crate::MAX_CHUNK_SIZE;
+
+/// The newest signer protocol version this node speaks.
+pub const LATEST_SIGNER_PROTOCOL_VERSION: u64 = 2;
 
 const BLOCK_RESPONSE_DATA_VERSION: u8 = 5;
 const NOT_REJECTED: u8 = u8::MAX;
@@ -63,12 +67,39 @@ pub struct BlockRejection {
     pub data: Vec<u8>,
 }
 
+/// The signer state a peer publishes so the reward set can agree on a protocol
+/// version and on who the current miner is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateMachineUpdate {
+    pub active_protocol_version: u64,
+    pub local_supported_protocol_version: u64,
+    pub bitcoin_consensus_hash: ConsensusHash,
+    pub bitcoin_height: u64,
+    pub current_miner: CurrentMiner,
+    /// Transactions the reward set agreed to replay; empty outside a replay.
+    pub replay_transactions: Vec<Transaction>,
+}
+
+/// The miner a signer believes owns the current tenure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentMiner {
+    None,
+    Active {
+        public_key_hash: Hash160,
+        tenure_consensus_hash: ConsensusHash,
+        parent_tenure_consensus_hash: ConsensusHash,
+        parent_tenure_last_block: StacksBlockId,
+        parent_tenure_last_block_height: u64,
+    },
+}
+
 /// Signer messages used by the epoch-4 `StackerDB` protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SignerMessage {
     BlockProposal(BlockProposal),
     BlockResponse(BlockResponse),
     BlockPushed(NakamotoBlock),
+    StateMachineUpdate(StateMachineUpdate),
 }
 
 /// A signer's response to a proposed block.
@@ -85,6 +116,7 @@ pub enum SignerMessageType {
     BlockProposal = 0,
     BlockResponse = 1,
     BlockPushed = 2,
+    StateMachineUpdate = 6,
 }
 
 /// Errors while decoding or encoding signer messages.
@@ -97,6 +129,8 @@ pub enum SignerMessageError {
     InvalidResponseType(u8),
     InvalidText,
     InvalidProposalData,
+    InvalidMinerState(u8),
+    UnsupportedProtocolVersion(u64),
     Block(String),
 }
 
@@ -114,6 +148,12 @@ impl fmt::Display for SignerMessageError {
             }
             Self::InvalidText => formatter.write_str("signer message contains invalid UTF-8"),
             Self::InvalidProposalData => formatter.write_str("invalid block proposal data"),
+            Self::InvalidMinerState(variant) => {
+                write!(formatter, "unsupported signer miner state {variant}")
+            }
+            Self::UnsupportedProtocolVersion(version) => {
+                write!(formatter, "unsupported signer protocol version {version}")
+            }
             Self::Block(error) => write!(formatter, "invalid proposed block: {error}"),
         }
     }
@@ -172,6 +212,7 @@ impl SignerMessage {
                 })
             }
             2 => Self::BlockPushed(reader.block()?),
+            6 => Self::StateMachineUpdate(reader.state_machine_update()?),
             kind => return Err(SignerMessageError::InvalidMessageType(kind)),
         };
         if !reader.is_empty() {
@@ -217,6 +258,10 @@ impl SignerMessage {
                 writer.byte(SignerMessageType::BlockPushed as u8);
                 writer.raw(&block.encode());
             }
+            Self::StateMachineUpdate(update) => {
+                writer.byte(SignerMessageType::StateMachineUpdate as u8);
+                writer.state_machine_update(update)?;
+            }
         }
         let bytes = writer.finish();
         if bytes.len() > MAX_CHUNK_SIZE {
@@ -261,6 +306,50 @@ impl Writer {
         inner.byte(0);
         self.byte(BLOCK_RESPONSE_DATA_VERSION);
         self.bytes(&inner.finish())
+    }
+
+    fn state_machine_update(
+        &mut self,
+        update: &StateMachineUpdate,
+    ) -> Result<(), SignerMessageError> {
+        let version = update
+            .active_protocol_version
+            .min(update.local_supported_protocol_version);
+        if version > LATEST_SIGNER_PROTOCOL_VERSION {
+            return Err(SignerMessageError::UnsupportedProtocolVersion(version));
+        }
+        self.u64(update.active_protocol_version);
+        self.u64(update.local_supported_protocol_version);
+
+        let mut content = Self::default();
+        content.raw(update.bitcoin_consensus_hash.as_bytes());
+        content.u64(update.bitcoin_height);
+        match &update.current_miner {
+            CurrentMiner::None => content.byte(0),
+            CurrentMiner::Active {
+                public_key_hash,
+                tenure_consensus_hash,
+                parent_tenure_consensus_hash,
+                parent_tenure_last_block,
+                parent_tenure_last_block_height,
+            } => {
+                content.byte(1);
+                content.raw(public_key_hash.as_bytes());
+                content.raw(tenure_consensus_hash.as_bytes());
+                content.raw(parent_tenure_consensus_hash.as_bytes());
+                content.raw(parent_tenure_last_block.as_bytes());
+                content.u64(*parent_tenure_last_block_height);
+            }
+        }
+        if version >= 1 {
+            let count = u32::try_from(update.replay_transactions.len())
+                .map_err(|_| SignerMessageError::Oversized)?;
+            content.u32(count);
+            for transaction in &update.replay_transactions {
+                content.raw(transaction.as_bytes());
+            }
+        }
+        self.bytes(&content.finish())
     }
 
     fn finish(self) -> Vec<u8> {
@@ -359,6 +448,51 @@ impl<'a> Reader<'a> {
         self.byte()?;
         self.bytes()?;
         Ok(self.bytes[start..self.offset].to_vec())
+    }
+
+    fn state_machine_update(&mut self) -> Result<StateMachineUpdate, SignerMessageError> {
+        let active_protocol_version = self.u64()?;
+        let local_supported_protocol_version = self.u64()?;
+        let version = active_protocol_version.min(local_supported_protocol_version);
+        if version > LATEST_SIGNER_PROTOCOL_VERSION {
+            return Err(SignerMessageError::UnsupportedProtocolVersion(version));
+        }
+        let length = usize::try_from(self.u32()?).map_err(|_| SignerMessageError::Oversized)?;
+        let mut content = Self::new(self.take(length)?);
+        let bitcoin_consensus_hash = ConsensusHash::from_bytes(content.array()?);
+        let bitcoin_height = content.u64()?;
+        let current_miner = match content.byte()? {
+            0 => CurrentMiner::None,
+            1 => CurrentMiner::Active {
+                public_key_hash: Hash160::from_bytes(content.array()?),
+                tenure_consensus_hash: ConsensusHash::from_bytes(content.array()?),
+                parent_tenure_consensus_hash: ConsensusHash::from_bytes(content.array()?),
+                parent_tenure_last_block: StacksBlockId::from_bytes(content.array()?),
+                parent_tenure_last_block_height: content.u64()?,
+            },
+            variant => return Err(SignerMessageError::InvalidMinerState(variant)),
+        };
+        let mut replay_transactions = Vec::new();
+        if version >= 1 {
+            let count = content.u32()?;
+            for _ in 0..count {
+                let (transaction, consumed) = Transaction::decode(content.remaining())
+                    .map_err(|error| SignerMessageError::Block(error.to_string()))?;
+                content.take(consumed)?;
+                replay_transactions.push(transaction);
+            }
+        }
+        if !content.is_empty() {
+            return Err(SignerMessageError::TrailingBytes);
+        }
+        Ok(StateMachineUpdate {
+            active_protocol_version,
+            local_supported_protocol_version,
+            bitcoin_consensus_hash,
+            bitcoin_height,
+            current_miner,
+            replay_transactions,
+        })
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], SignerMessageError> {

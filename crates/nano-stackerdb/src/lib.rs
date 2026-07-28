@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 mod signer_message;
 
 pub use signer_message::{
-    BlockAcceptance, BlockProposal, BlockRejection, BlockResponse, SignerMessage,
-    SignerMessageError, SignerMessageType,
+    BlockAcceptance, BlockProposal, BlockRejection, BlockResponse, CurrentMiner,
+    LATEST_SIGNER_PROTOCOL_VERSION, SignerMessage, SignerMessageError, SignerMessageType,
+    StateMachineUpdate,
 };
 
 /// A `StackerDB` contract address and name.

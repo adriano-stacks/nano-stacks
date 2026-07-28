@@ -2825,6 +2825,65 @@ mod tests {
     }
 
     #[test]
+    fn state_machine_update_round_trips_stacks_core() {
+        let update = nano_stackerdb::StateMachineUpdate {
+            active_protocol_version: 2,
+            local_supported_protocol_version: 2,
+            bitcoin_consensus_hash: nano_primitives::ConsensusHash::from_bytes([3; 20]),
+            bitcoin_height: 4_242,
+            current_miner: nano_stackerdb::CurrentMiner::Active {
+                public_key_hash: nano_primitives::Hash160::from_bytes([5; 20]),
+                tenure_consensus_hash: nano_primitives::ConsensusHash::from_bytes([6; 20]),
+                parent_tenure_consensus_hash: nano_primitives::ConsensusHash::from_bytes([7; 20]),
+                parent_tenure_last_block: nano_primitives::StacksBlockId::from_bytes([8; 32]),
+                parent_tenure_last_block_height: 909,
+            },
+            replay_transactions: Vec::new(),
+        };
+        let encoded = SignerMessage::StateMachineUpdate(update.clone())
+            .encode()
+            .expect("encode state machine update");
+
+        let reference =
+            libsigner::v0::messages::SignerMessage::consensus_deserialize(&mut encoded.as_slice())
+                .expect("reference decodes state machine update");
+        let libsigner::v0::messages::SignerMessage::StateMachineUpdate(reference_update) =
+            &reference
+        else {
+            panic!("reference did not decode a state machine update");
+        };
+        let libsigner::v0::messages::StateMachineUpdateContent::V2 {
+            burn_block,
+            burn_block_height,
+            current_miner,
+            replay_transactions,
+        } = &reference_update.content
+        else {
+            panic!("reference did not decode version 2 content");
+        };
+        assert_eq!(burn_block.0, *update.bitcoin_consensus_hash.as_bytes());
+        assert_eq!(*burn_block_height, update.bitcoin_height);
+        assert!(replay_transactions.is_empty());
+        assert!(matches!(
+            current_miner,
+            libsigner::v0::messages::StateMachineUpdateMinerState::ActiveMiner {
+                parent_tenure_last_block_height,
+                ..
+            } if *parent_tenure_last_block_height == 909
+        ));
+
+        let mut reference_encoded = Vec::new();
+        reference
+            .consensus_serialize(&mut reference_encoded)
+            .expect("reference re-encodes state machine update");
+        assert_eq!(reference_encoded, encoded);
+        assert_eq!(
+            SignerMessage::decode(&encoded).expect("nano decodes its own update"),
+            SignerMessage::StateMachineUpdate(update)
+        );
+    }
+
+    #[test]
     fn signer_rejection_round_trips_stacks_core() {
         let key = ReferenceSecp256k1PrivateKey::from_seed(b"signer rejection conformance");
         let digest = Sha512Trunc256Sum(*sha512_256(b"candidate block").as_bytes());

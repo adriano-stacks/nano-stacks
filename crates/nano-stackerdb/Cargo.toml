@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
+nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 hex = "0.4.3"
