@@ -6,11 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+atomicwrites = "0.4.4"
+fs2 = "0.4.3"
+hex = "0.4.3"
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 nano-stackerdb = { path = "../nano-stackerdb" }
 nano-sync = { path = "../nano-sync" }
 nano-chainstate = { path = "../nano-chainstate" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

@@ -1,7 +1,15 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+};
 
+use atomicwrites::{AllowOverwrite, AtomicFile};
+use fs2::FileExt;
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
@@ -10,6 +18,7 @@ use nano_stackerdb::{
     StackerDbClientError, StackerDbContract, StackerDbError,
 };
 use nano_sync::SortitionInfo;
+use serde::{Deserialize, Serialize};
 
 /// Checks a miner proposal against the node's current chain and sortition view.
 pub trait ProposalValidator {
@@ -188,15 +197,265 @@ pub struct SignerConfig {
     pub next_slot_version: u32,
 }
 
+const SIGNER_STATE_VERSION: u8 = 1;
+
+#[derive(Debug)]
+pub enum SignerStateError {
+    Io(io::Error),
+    Decode(serde_json::Error),
+    Invalid(String),
+    Chunk(StackerDbError),
+    Message(nano_stackerdb::SignerMessageError),
+}
+
+impl fmt::Display for SignerStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "signer state I/O failed: {error}"),
+            Self::Decode(error) => write!(formatter, "invalid signer state JSON: {error}"),
+            Self::Invalid(error) => write!(formatter, "invalid signer state: {error}"),
+            Self::Chunk(error) => write!(formatter, "invalid signer state chunk: {error}"),
+            Self::Message(error) => write!(formatter, "invalid signer state message: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SignerStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::Chunk(error) => Some(error),
+            Self::Message(error) => Some(error),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for SignerStateError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for SignerStateError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<StackerDbError> for SignerStateError {
+    fn from(error: StackerDbError) -> Self {
+        Self::Chunk(error)
+    }
+}
+
+impl From<nano_stackerdb::SignerMessageError> for SignerStateError {
+    fn from(error: nano_stackerdb::SignerMessageError) -> Self {
+        Self::Message(error)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedSignerState {
+    version: u8,
+    writer_public_key_hash: String,
+    writer_slot: u32,
+    next_slot_version: u32,
+    signed: Vec<PersistedSignedBlock>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedSignedBlock {
+    consensus_hash: String,
+    chain_length: u64,
+    signature_hash: String,
+    chunk: String,
+}
+
+type SignedBlocks = BTreeMap<(ConsensusHash, u64), SignedBlock>;
+type LoadedSignerState = (u32, SignedBlocks);
+
+struct SignerStateStore {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl SignerStateStore {
+    fn open(
+        path: impl AsRef<Path>,
+        config: &SignerConfig,
+    ) -> Result<(Self, u32, SignedBlocks), SignerStateError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))?;
+        lock.try_lock_exclusive()?;
+        let store = Self { path, _lock: lock };
+
+        if !store.path.exists() {
+            return Ok((store, config.next_slot_version, BTreeMap::new()));
+        }
+
+        let persisted = serde_json::from_slice(&fs::read(&store.path)?)?;
+        let signed = Self::validate(persisted, config)?;
+        Ok((store, signed.0, signed.1))
+    }
+
+    fn validate(
+        persisted: PersistedSignerState,
+        config: &SignerConfig,
+    ) -> Result<LoadedSignerState, SignerStateError> {
+        if persisted.version != SIGNER_STATE_VERSION {
+            return Err(SignerStateError::Invalid(format!(
+                "unsupported format version {}",
+                persisted.version
+            )));
+        }
+        let writer = writer_identity(&config.private_key);
+        if persisted.writer_public_key_hash != hex::encode(writer.as_bytes()) {
+            return Err(SignerStateError::Invalid(
+                "writer key does not match this signer".to_owned(),
+            ));
+        }
+        if persisted.writer_slot != config.writer_slot {
+            return Err(SignerStateError::Invalid(
+                "writer slot does not match this signer".to_owned(),
+            ));
+        }
+
+        let mut signed = BTreeMap::new();
+        for entry in persisted.signed {
+            let consensus_hash = ConsensusHash::from_bytes(decode_hex(&entry.consensus_hash)?);
+            let signature_hash = Sha256Sum::from_bytes(decode_hex(&entry.signature_hash)?);
+            let chunk = Chunk::decode(&hex::decode(&entry.chunk).map_err(|error| {
+                SignerStateError::Invalid(format!("invalid chunk hex: {error}"))
+            })?)?;
+            if chunk.slot_id != persisted.writer_slot {
+                return Err(SignerStateError::Invalid(
+                    "stored chunk has the wrong writer slot".to_owned(),
+                ));
+            }
+            if chunk.slot_version >= persisted.next_slot_version {
+                return Err(SignerStateError::Invalid(
+                    "stored chunk version has not been reserved".to_owned(),
+                ));
+            }
+            if !chunk.verify(writer)? {
+                return Err(SignerStateError::Invalid(
+                    "stored chunk was not signed by this signer".to_owned(),
+                ));
+            }
+            let SignerMessage::BlockResponse(response) = SignerMessage::decode(&chunk.data)? else {
+                return Err(SignerStateError::Invalid(
+                    "stored chunk is not a block response".to_owned(),
+                ));
+            };
+            if response.signer_signature_hash != signature_hash {
+                return Err(SignerStateError::Invalid(
+                    "stored response hashes a different block".to_owned(),
+                ));
+            }
+            let response_key = response
+                .signature
+                .recover(signature_hash.as_bytes())
+                .map_err(|error| {
+                    SignerStateError::Invalid(format!("invalid response signature: {error}"))
+                })?;
+            if hash160(&response_key.to_bytes_compressed()) != writer {
+                return Err(SignerStateError::Invalid(
+                    "stored response was not signed by this signer".to_owned(),
+                ));
+            }
+            let position = (consensus_hash, entry.chain_length);
+            if signed
+                .insert(
+                    position,
+                    SignedBlock {
+                        signature_hash,
+                        chunk,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SignerStateError::Invalid(
+                    "duplicate signed block position".to_owned(),
+                ));
+            }
+        }
+        Ok((persisted.next_slot_version, signed))
+    }
+
+    fn persist(
+        &self,
+        private_key: &StacksPrivateKey,
+        writer_slot: u32,
+        next_slot_version: u32,
+        signed: &SignedBlocks,
+    ) -> Result<(), SignerStateError> {
+        let signed = signed
+            .iter()
+            .map(|((consensus_hash, chain_length), block)| {
+                Ok(PersistedSignedBlock {
+                    consensus_hash: hex::encode(consensus_hash.as_bytes()),
+                    chain_length: *chain_length,
+                    signature_hash: hex::encode(block.signature_hash.as_bytes()),
+                    chunk: hex::encode(block.chunk.encode()?),
+                })
+            })
+            .collect::<Result<Vec<_>, StackerDbError>>()?;
+        let bytes = serde_json::to_vec_pretty(&PersistedSignerState {
+            version: SIGNER_STATE_VERSION,
+            writer_public_key_hash: hex::encode(writer_identity(private_key).as_bytes()),
+            writer_slot,
+            next_slot_version,
+            signed,
+        })
+        .map_err(|error| {
+            SignerStateError::Invalid(format!("could not encode signer state: {error}"))
+        })?;
+        AtomicFile::new(&self.path, AllowOverwrite)
+            .write(|file| io::Write::write_all(file, &bytes))
+            .map_err(|error| SignerStateError::Io(error.into()))
+    }
+}
+
+fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N], SignerStateError> {
+    let bytes = hex::decode(value).map_err(|error| {
+        SignerStateError::Invalid(format!("invalid hexadecimal value: {error}"))
+    })?;
+    let length = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| SignerStateError::Invalid(format!("expected {N} bytes, found {length}")))
+}
+
+fn writer_identity(private_key: &StacksPrivateKey) -> nano_primitives::Hash160 {
+    hash160(&private_key.public_key().to_bytes_compressed())
+}
+
 /// A stateful signer that emits authenticated `StackerDB` acceptance chunks.
 pub struct EmbeddedSigner<V> {
     private_key: StacksPrivateKey,
     validator: V,
     writer_slot: u32,
     next_slot_version: u32,
-    signed: BTreeMap<(ConsensusHash, u64), SignedBlock>,
+    signed: SignedBlocks,
+    state: Option<SignerStateStore>,
 }
 
+#[derive(Clone)]
 struct SignedBlock {
     signature_hash: Sha256Sum,
     chunk: Chunk,
@@ -210,6 +469,7 @@ pub enum SignerError {
     SlotVersionOverflow,
     Message(nano_stackerdb::SignerMessageError),
     Chunk(StackerDbError),
+    State(SignerStateError),
 }
 
 impl fmt::Display for SignerError {
@@ -220,6 +480,7 @@ impl fmt::Display for SignerError {
             Self::SlotVersionOverflow => formatter.write_str("StackerDB slot version overflow"),
             Self::Message(error) => write!(formatter, "signer message error: {error}"),
             Self::Chunk(error) => write!(formatter, "StackerDB chunk error: {error}"),
+            Self::State(error) => write!(formatter, "signer state error: {error}"),
         }
     }
 }
@@ -229,6 +490,7 @@ impl std::error::Error for SignerError {
         match self {
             Self::Message(error) => Some(error),
             Self::Chunk(error) => Some(error),
+            Self::State(error) => Some(error),
             Self::Validation(_) | Self::Equivocation | Self::SlotVersionOverflow => None,
         }
     }
@@ -243,6 +505,12 @@ impl From<nano_stackerdb::SignerMessageError> for SignerError {
 impl From<StackerDbError> for SignerError {
     fn from(error: StackerDbError) -> Self {
         Self::Chunk(error)
+    }
+}
+
+impl From<SignerStateError> for SignerError {
+    fn from(error: SignerStateError) -> Self {
+        Self::State(error)
     }
 }
 
@@ -328,7 +596,25 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             writer_slot: config.writer_slot,
             next_slot_version: config.next_slot_version,
             signed: BTreeMap::new(),
+            state: None,
         }
+    }
+
+    /// Reopen a signer journal and retain its lock for this signer's lifetime.
+    pub fn from_state_file(
+        config: SignerConfig,
+        validator: V,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, SignerStateError> {
+        let (state, next_slot_version, signed) = SignerStateStore::open(path, &config)?;
+        Ok(Self {
+            private_key: config.private_key,
+            validator,
+            writer_slot: config.writer_slot,
+            next_slot_version,
+            signed,
+            state: Some(state),
+        })
     }
 
     /// Validate a proposed block and return the signed response chunk to upload.
@@ -356,13 +642,21 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         let message = SignerMessage::BlockResponse(BlockAcceptance::new(signature_hash, signature));
         let mut chunk = Chunk::new(self.writer_slot, self.next_slot_version, message.encode()?);
         chunk.sign(&self.private_key)?;
-        self.signed.insert(
-            position,
-            SignedBlock {
-                signature_hash,
-                chunk: chunk.clone(),
-            },
-        );
+        let signed = SignedBlock {
+            signature_hash,
+            chunk: chunk.clone(),
+        };
+        let mut next_signed = self.signed.clone();
+        next_signed.insert(position, signed);
+        if let Some(state) = &self.state {
+            state.persist(
+                &self.private_key,
+                self.writer_slot,
+                next_slot_version,
+                &next_signed,
+            )?;
+        }
+        self.signed = next_signed;
         self.next_slot_version = next_slot_version;
         Ok(chunk)
     }
@@ -427,6 +721,7 @@ mod tests {
     };
     use nano_stackerdb::{BlockProposal, SignerMessage};
     use nano_sync::SortitionInfo;
+    use tempfile::tempdir;
 
     use super::{
         EmbeddedSigner, ProposalValidator, SignerConfig, SignerError, SortitionProposalValidator,
@@ -572,5 +867,34 @@ mod tests {
 
         assert_eq!(repeated, first);
         assert_eq!(signer.next_slot_version(), 4);
+    }
+
+    #[test]
+    fn signer_journal_restores_signed_responses_after_restart() {
+        let directory = tempdir().expect("create temporary signer directory");
+        let path = directory.path().join("signer-state.json");
+        let config = SignerConfig {
+            private_key: StacksPrivateKey::from_seed(b"signer"),
+            writer_slot: 7,
+            next_slot_version: 3,
+        };
+        let proposal = proposal();
+        let first = {
+            let mut signer = EmbeddedSigner::from_state_file(config.clone(), Accept, &path)
+                .expect("open signer journal");
+            signer.sign(&proposal).expect("sign proposal")
+        };
+
+        let mut signer =
+            EmbeddedSigner::from_state_file(config, Accept, &path).expect("reopen signer journal");
+        assert_eq!(signer.sign(&proposal).expect("reuse response"), first);
+        assert_eq!(signer.next_slot_version(), 4);
+
+        let mut conflicting = proposal;
+        conflicting.block.header.transaction_merkle_root = Sha256Sum::from_bytes([9; 32]);
+        assert!(matches!(
+            signer.sign(&conflicting),
+            Err(SignerError::Equivocation)
+        ));
     }
 }
