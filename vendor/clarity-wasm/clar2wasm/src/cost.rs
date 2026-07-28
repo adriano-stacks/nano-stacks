@@ -6,6 +6,8 @@
 mod clar1;
 mod clar2;
 mod clar3;
+mod clar4;
+mod clar5;
 
 use clarity::types::StacksEpochId;
 use clarity::vm::ClarityName;
@@ -308,10 +310,8 @@ impl ChargeContext {
             | StacksEpochId::Epoch30
             | StacksEpochId::Epoch31
             | StacksEpochId::Epoch32 => clar3::WORD_COSTS.get(name),
-            // From epoch 33 we should use clar4 word costs
-            StacksEpochId::Epoch33 | StacksEpochId::Epoch34 | StacksEpochId::Epoch40 => {
-                clar3::WORD_COSTS.get(name)
-            }
+            StacksEpochId::Epoch33 | StacksEpochId::Epoch34 => clar4::WORD_COSTS.get(name),
+            StacksEpochId::Epoch40 => clar5::WORD_COSTS.get(name),
         }
     }
 }
@@ -334,6 +334,8 @@ enum Caf {
     ///
     /// a * n + b
     Linear { a: u64, b: u64 },
+    /// a * (n >> shift) + b
+    LinearShift { a: u64, b: u64, shift: u32 },
     /// Logarithmic cost, scaling with `n`
     ///
     /// a * log2(n) + b
@@ -420,6 +422,17 @@ impl ChargeContext {
                 n,
                 a,
                 b,
+            ),
+            Caf::LinearShift { a, b, shift } => caf_linear_shift(
+                instrs,
+                module,
+                global,
+                self.runtime_error,
+                err_code,
+                n,
+                a,
+                b,
+                shift,
             ),
             Caf::LogN { a, b } => caf_logn(
                 instrs,
@@ -510,6 +523,46 @@ fn caf_linear(
 
     // global -= cost
     instrs
+        .binop(BinaryOp::I64Sub)
+        .global_set(global)
+        .global_get(global)
+        .i64_const(0)
+        .binop(BinaryOp::I64LtS)
+        .if_else(
+            None,
+            |builder| {
+                builder.i32_const(err_code);
+                builder.call(error);
+            },
+            |_| {},
+        );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn caf_linear_shift(
+    instrs: &mut InstrSeqBuilder,
+    module: &Module,
+    global: GlobalId,
+    error: FunctionId,
+    err_code: i32,
+    n: impl Into<Scalar>,
+    a: u64,
+    b: u64,
+    shift: u32,
+) -> Result<()> {
+    let n = n.into();
+
+    instrs
+        .global_get(global)
+        .scalar_get(module, n)?
+        .i64_const(i64::from(shift))
+        .binop(BinaryOp::I64ShrU)
+        .i64_const(a as _)
+        .binop(BinaryOp::I64Mul)
+        .i64_const(b as _)
+        .binop(BinaryOp::I64Add)
         .binop(BinaryOp::I64Sub)
         .global_set(global)
         .global_get(global)
@@ -687,6 +740,30 @@ mod caf {
     }
 
     #[test]
+    fn linear_shift() {
+        let initial = 1_000_000;
+        let a = 125;
+        let b = 291;
+
+        for n in [0, 1, 1_023, 1_024, 4_095, 4_096] {
+            let cost = a * (n >> 10) + b;
+            let final_cost = execute_with_caf(n, initial, |local| {
+                (
+                    Caf::LinearShift {
+                        a: a as _,
+                        b: b as _,
+                        shift: 10,
+                    },
+                    local,
+                )
+            })
+            .expect("execution with enough fuel should succeed");
+
+            assert_eq!(final_cost, initial - cost as i64);
+        }
+    }
+
+    #[test]
     fn logn() {
         let initial_val = 1000000;
 
@@ -855,6 +932,18 @@ mod caf {
                 b,
             )
             .unwrap(),
+            Caf::LinearShift { a, b, shift } => caf_linear_shift(
+                &mut body,
+                &module,
+                cost_global,
+                error,
+                ERR_CODE,
+                scalar,
+                a,
+                b,
+                shift,
+            )
+            .unwrap(),
             Caf::LogN { a, b } => caf_logn(
                 &mut body,
                 &module,
@@ -935,6 +1024,39 @@ mod word {
                 "'cost' should be at zero when not used"
             );
         }
+    }
+
+    #[test]
+    fn clarity6_new_word_costs_match_costs_5() {
+        use crate::cost::clar5;
+        use crate::words::bitcoin::{GetBitcoinTxOutput, VerifyMerkleProof};
+        use crate::words::secp256k1::{Decompress, Ed25519Verify};
+        use crate::words::secp256r1::Verify as Secp256r1Verify;
+
+        let runtime = |word: &dyn Word| clar5::WORD_COSTS.get(&word.name()).unwrap().runtime;
+
+        assert!(matches!(runtime(&Secp256r1Verify), Caf::Constant(51_750)));
+        assert!(matches!(
+            runtime(&Ed25519Verify),
+            Caf::LinearShift {
+                a: 125,
+                b: 7_880,
+                shift: 10
+            }
+        ));
+        assert!(matches!(runtime(&Decompress), Caf::Constant(1_035)));
+        assert!(matches!(
+            runtime(&VerifyMerkleProof),
+            Caf::Linear { a: 125, b: 502 }
+        ));
+        assert!(matches!(
+            runtime(&GetBitcoinTxOutput),
+            Caf::LinearShift {
+                a: 125,
+                b: 291,
+                shift: 10
+            }
+        ));
     }
 
     macro_rules! epoch_for_cost_version {

@@ -2,6 +2,7 @@ use clarity::vm::{ClarityName, SymbolicExpression};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
+use crate::cost::WordCharge;
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -23,10 +24,20 @@ impl ComplexWord for VerifyMerkleProof {
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 5, args.len(), ArgumentCountCheck::Exact);
-        for argument in args {
+        for argument in args.iter().take(4) {
             generator.traverse_expr(builder, argument)?;
         }
+        generator.traverse_expr(builder, args.get_expr(4)?)?;
+        let siblings_length = generator.module.locals.add(walrus::ValType::I32);
+        builder.local_tee(siblings_length);
         builder.call(generator.func_by_name("stdlib.verify_merkle_proof"));
+        let siblings = generator.module.locals.add(walrus::ValType::I32);
+        builder
+            .local_get(siblings_length)
+            .i32_const(3)
+            .binop(walrus::ir::BinaryOp::I32ShrU)
+            .local_set(siblings);
+        self.charge(generator, builder, siblings)?;
         Ok(())
     }
 }
@@ -50,6 +61,8 @@ impl ComplexWord for GetBitcoinTxOutput {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
         generator.traverse_expr(builder, args.get_expr(0)?)?;
+        let tx_length = generator.module.locals.add(walrus::ValType::I32);
+        builder.local_tee(tx_length);
         generator.traverse_expr(builder, args.get_expr(1)?)?;
         let return_type = generator
             .get_expr_type(expr)
@@ -60,6 +73,7 @@ impl ComplexWord for GetBitcoinTxOutput {
         let (result, size) = generator.create_call_stack_local(builder, &return_type, true, true);
         builder.local_get(result).i32_const(size);
         builder.call(generator.func_by_name("stdlib.get_bitcoin_tx_output"));
+        self.charge(generator, builder, tx_length)?;
         generator
             .read_from_memory(builder, result, 0, &return_type)
             .map(|_| ())

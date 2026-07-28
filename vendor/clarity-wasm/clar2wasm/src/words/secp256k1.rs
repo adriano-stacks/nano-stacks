@@ -86,11 +86,13 @@ impl ComplexWord for Ed25519Verify {
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
-        self.charge(generator, builder, 0)?;
-        for argument in args {
-            generator.traverse_expr(builder, argument)?;
-        }
+        generator.traverse_expr(builder, args.get_expr(0)?)?;
+        let message_length = generator.module.locals.add(walrus::ValType::I32);
+        builder.local_tee(message_length);
+        generator.traverse_expr(builder, args.get_expr(1)?)?;
+        generator.traverse_expr(builder, args.get_expr(2)?)?;
         builder.call(generator.func_by_name("stdlib.ed25519_verify"));
+        self.charge(generator, builder, message_length)?;
         Ok(())
     }
 }
