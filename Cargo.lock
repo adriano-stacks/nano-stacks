@@ -1557,10 +1557,13 @@ dependencies = [
 name = "nano-stackerdb"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nano-address",
  "nano-chainstate",
  "nano-crypto",
  "nano-primitives",
+ "reqwest",
+ "serde",
 ]
 
 [[package]]

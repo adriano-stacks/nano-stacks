@@ -10,6 +10,9 @@ nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
+hex = "0.4.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
 
 [lints]
 workspace = true

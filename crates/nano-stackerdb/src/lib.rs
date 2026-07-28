@@ -5,12 +5,199 @@ use std::fmt;
 use nano_address::StacksAddress;
 use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey};
 use nano_primitives::{Hash160, Sha256Sum, hash160, sha512_256};
+use reqwest::{Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 
 mod signer_message;
 
 pub use signer_message::{
     BlockAcceptance, BlockProposal, SignerMessage, SignerMessageError, SignerMessageType,
 };
+
+/// A `StackerDB` contract address and name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackerDbContract {
+    pub address: StacksAddress,
+    pub name: String,
+}
+
+/// HTTP client for a node's `StackerDB` endpoints.
+#[derive(Clone, Debug)]
+pub struct StackerDbClient {
+    client: Client,
+    base_url: Url,
+}
+
+/// The current version of a `StackerDB` writer slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotVersion {
+    pub slot_id: u32,
+    pub slot_version: u32,
+}
+
+/// Acknowledgement returned after uploading a `StackerDB` chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChunkAck {
+    pub accepted: bool,
+    pub reason: Option<String>,
+    pub code: Option<u32>,
+    pub metadata: Option<SlotVersion>,
+}
+
+/// Errors returned by the `StackerDB` HTTP API.
+#[derive(Debug)]
+pub enum StackerDbClientError {
+    InvalidBaseUrl,
+    Http(reqwest::Error),
+}
+
+impl fmt::Display for StackerDbClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBaseUrl => formatter.write_str("StackerDB base URL cannot be a base"),
+            Self::Http(error) => write!(formatter, "StackerDB HTTP error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StackerDbClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http(error) => Some(error),
+            Self::InvalidBaseUrl => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for StackerDbClientError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error)
+    }
+}
+
+impl StackerDbClient {
+    /// Construct a client for an HTTP node endpoint.
+    pub fn new(base_url: Url) -> Result<Self, StackerDbClientError> {
+        if base_url.cannot_be_a_base() {
+            return Err(StackerDbClientError::InvalidBaseUrl);
+        }
+        Ok(Self {
+            client: Client::new(),
+            base_url,
+        })
+    }
+
+    /// Return current slot versions for a contract.
+    pub async fn slot_versions(
+        &self,
+        contract: &StackerDbContract,
+    ) -> Result<Vec<SlotVersion>, StackerDbClientError> {
+        let path = format!("v2/stackerdb/{}/{}", contract.address, contract.name);
+        let slots: Vec<SlotVersionWire> = self.get_json(&path).await?;
+        Ok(slots
+            .into_iter()
+            .map(|slot| SlotVersion {
+                slot_id: slot.slot_id,
+                slot_version: slot.slot_version,
+            })
+            .collect())
+    }
+
+    /// Fetch the latest bytes written to a slot, if that slot has content.
+    pub async fn latest_chunk(
+        &self,
+        contract: &StackerDbContract,
+        slot: u32,
+    ) -> Result<Option<Vec<u8>>, StackerDbClientError> {
+        let path = chunk_path(contract.address, &contract.name, slot, None);
+        let url = self.url(&path)?;
+        let response = self.client.get(url).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.bytes().await?.to_vec()))
+    }
+
+    /// Upload one signed chunk and return the node's acknowledgement.
+    pub async fn put_chunk(
+        &self,
+        contract: &StackerDbContract,
+        chunk: &Chunk,
+    ) -> Result<ChunkAck, StackerDbClientError> {
+        let path = format!("v2/stackerdb/{}/{}/chunks", contract.address, contract.name);
+        let acknowledgement: ChunkAckWire = self
+            .client
+            .post(self.url(&path)?)
+            .json(&ChunkWire::from(chunk))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(ChunkAck {
+            accepted: acknowledgement.accepted,
+            reason: acknowledgement.reason,
+            code: acknowledgement.code,
+            metadata: acknowledgement.metadata.map(|metadata| SlotVersion {
+                slot_id: metadata.slot_id,
+                slot_version: metadata.slot_version,
+            }),
+        })
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+    ) -> Result<T, StackerDbClientError> {
+        Ok(self
+            .client
+            .get(self.url(path)?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    fn url(&self, path: &str) -> Result<Url, StackerDbClientError> {
+        self.base_url
+            .join(path.trim_start_matches('/'))
+            .map_err(|_| StackerDbClientError::InvalidBaseUrl)
+    }
+}
+
+#[derive(Deserialize)]
+struct SlotVersionWire {
+    slot_id: u32,
+    slot_version: u32,
+}
+
+#[derive(Deserialize)]
+struct ChunkAckWire {
+    accepted: bool,
+    reason: Option<String>,
+    code: Option<u32>,
+    metadata: Option<SlotVersionWire>,
+}
+
+#[derive(Serialize)]
+struct ChunkWire {
+    slot_id: u32,
+    slot_version: u32,
+    sig: String,
+    data: String,
+}
+
+impl From<&Chunk> for ChunkWire {
+    fn from(chunk: &Chunk) -> Self {
+        Self {
+            slot_id: chunk.slot_id,
+            slot_version: chunk.slot_version,
+            sig: hex::encode(chunk.signature.as_bytes()),
+            data: hex::encode(&chunk.data),
+        }
+    }
+}
 
 /// Maximum wire payload for a signer `StackerDB` chunk.
 pub const MAX_CHUNK_SIZE: usize = 2 * 1024 * 1024;
