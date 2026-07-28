@@ -6,10 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
+nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

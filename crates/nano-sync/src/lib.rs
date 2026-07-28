@@ -2,12 +2,18 @@
 
 use std::fmt;
 
-use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, TenureError};
+use nano_address::{PoxAddress, PoxAddressType32};
+use nano_chainstate::{
+    BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, Signer, SignerSet, SignerSetError,
+    TenureError,
+};
+use nano_crypto::{CryptoError, StacksPublicKey};
 use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
 };
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct SyncClient {
@@ -78,6 +84,14 @@ pub struct PoxInfo {
     pub rejection_fraction: Option<u64>,
 }
 
+/// The active waterfall payout address and threshold signer set for one reward cycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackerSet {
+    pub pox_ustx_threshold: u128,
+    pub sbtc_address: PoxAddress,
+    pub signer_set: SignerSet,
+}
+
 impl PoxInfo {
     /// Convert the node response into the context required for VM execution.
     #[must_use]
@@ -107,6 +121,9 @@ pub enum SyncError {
     InvalidHash,
     EmptySortition,
     InvalidSortition,
+    InvalidRewardSet,
+    Crypto(CryptoError),
+    SignerSet(SignerSetError),
     UnstableTip,
     Fork,
 }
@@ -123,6 +140,9 @@ impl fmt::Display for SyncError {
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
             Self::EmptySortition => formatter.write_str("sortition response contains no entries"),
             Self::InvalidSortition => formatter.write_str("sortition response is inconsistent"),
+            Self::InvalidRewardSet => formatter.write_str("reward set response is invalid"),
+            Self::Crypto(error) => write!(formatter, "invalid signer key: {error}"),
+            Self::SignerSet(error) => write!(formatter, "invalid signer set: {error}"),
             Self::UnstableTip => formatter.write_str("peer tip changed during tenure download"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
         }
@@ -135,12 +155,15 @@ impl std::error::Error for SyncError {
             Self::Http(error) => Some(error),
             Self::Block(error) => Some(error),
             Self::TenureLink(error) => Some(error),
+            Self::Crypto(error) => Some(error),
+            Self::SignerSet(error) => Some(error),
             Self::InvalidBaseUrl
             | Self::EmptyTenure
             | Self::TenureStart
             | Self::InvalidHash
             | Self::EmptySortition
             | Self::InvalidSortition
+            | Self::InvalidRewardSet
             | Self::UnstableTip
             | Self::Fork => None,
         }
@@ -150,6 +173,18 @@ impl std::error::Error for SyncError {
 impl From<reqwest::Error> for SyncError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error)
+    }
+}
+
+impl From<CryptoError> for SyncError {
+    fn from(error: CryptoError) -> Self {
+        Self::Crypto(error)
+    }
+}
+
+impl From<SignerSetError> for SyncError {
+    fn from(error: SignerSetError) -> Self {
+        Self::SignerSet(error)
     }
 }
 
@@ -200,6 +235,13 @@ impl SyncClient {
             reward_slots: response.reward_slots,
             rejection_fraction: response.rejection_fraction,
         })
+    }
+
+    /// Fetch the waterfall reward set active for one reward cycle.
+    pub async fn stacker_set(&self, reward_cycle: u64) -> Result<StackerSet, SyncError> {
+        let response: StackerSetResponseWire =
+            self.get(&format!("v3/stacker_set/{reward_cycle}")).await?;
+        parse_stacker_set(response.stacker_set)
     }
 
     /// Fetch the Bitcoin sortition identified by its consensus hash.
@@ -489,6 +531,24 @@ struct PoxInfoWire {
 }
 
 #[derive(Deserialize)]
+struct StackerSetResponseWire {
+    stacker_set: StackerSetWire,
+}
+
+#[derive(Deserialize)]
+struct StackerSetWire {
+    pox_ustx_threshold: u128,
+    sbtc_address: Value,
+    signers: Vec<StackerWire>,
+}
+
+#[derive(Deserialize)]
+struct StackerWire {
+    signing_key: String,
+    weight: u32,
+}
+
+#[derive(Deserialize)]
 struct SortitionInfoWire {
     burn_block_hash: String,
     burn_block_height: u64,
@@ -535,6 +595,40 @@ fn parse_prefixed_hash160(value: &str) -> Result<Hash160, SyncError> {
     parse_prefixed_hex(value).map(Hash160::from_bytes)
 }
 
+fn parse_stacker_set(value: StackerSetWire) -> Result<StackerSet, SyncError> {
+    let sbtc_address = parse_waterfall_address(&value.sbtc_address)?;
+    let mut signers = value
+        .signers
+        .into_iter()
+        .map(|signer| {
+            Ok(Signer {
+                public_key: StacksPublicKey::from_bytes(&parse_hex::<33>(&signer.signing_key)?)?,
+                weight: signer.weight,
+            })
+        })
+        .collect::<Result<Vec<_>, SyncError>>()?;
+    signers.sort_by_key(|signer| signer.public_key.to_bytes_compressed());
+    Ok(StackerSet {
+        pox_ustx_threshold: value.pox_ustx_threshold,
+        sbtc_address,
+        signer_set: SignerSet::new(signers)?,
+    })
+}
+
+fn parse_waterfall_address(value: &Value) -> Result<PoxAddress, SyncError> {
+    let address = value.get("Addr32").ok_or(SyncError::InvalidRewardSet)?;
+    let (mainnet, address_type, bytes): (bool, String, [u8; 32]) =
+        serde_json::from_value(address.clone()).map_err(|_| SyncError::InvalidRewardSet)?;
+    if address_type != "P2TR" {
+        return Err(SyncError::InvalidRewardSet);
+    }
+    Ok(PoxAddress::Addr32 {
+        mainnet,
+        address_type: PoxAddressType32::P2tr,
+        bytes,
+    })
+}
+
 fn parse_prefixed_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError> {
     parse_hex(value.strip_prefix("0x").ok_or(SyncError::InvalidHash)?)
 }
@@ -559,8 +653,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
-        parse_prefixed_hash160, validate_tenure, validate_tenure_transition,
+        StackerSetWire, SyncClient, SyncError, parse_block_hash, parse_block_id,
+        parse_consensus_hash, parse_prefixed_hash160, parse_stacker_set, validate_tenure,
+        validate_tenure_transition,
     };
     use super::{TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -599,6 +694,26 @@ mod tests {
             &[0xaa; 20]
         );
         assert!(parse_prefixed_hash160("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+    }
+
+    #[test]
+    fn recorded_waterfall_stacker_set_parses_and_orders_signers() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            stacker_set: StackerSetWire,
+        }
+
+        let fixture: Fixture = serde_json::from_slice(include_bytes!(
+            "../../nano-conformance/fixtures/stacker_set/cycle-18.json"
+        ))
+        .expect("parse recorded stacker set");
+        let set = parse_stacker_set(fixture.stacker_set).expect("parse active stacker set");
+        assert_eq!(set.pox_ustx_threshold, 11_000_000_000);
+        assert_eq!(set.signer_set.weights(), vec![10, 10, 10]);
+        assert!(matches!(
+            set.sbtc_address,
+            nano_address::PoxAddress::Addr32 { .. }
+        ));
     }
 
     #[test]

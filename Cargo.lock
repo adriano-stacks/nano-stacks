@@ -1880,10 +1880,13 @@ dependencies = [
 name = "nano-sync"
 version = "0.1.0"
 dependencies = [
+ "nano-address",
  "nano-chainstate",
+ "nano-crypto",
  "nano-primitives",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
