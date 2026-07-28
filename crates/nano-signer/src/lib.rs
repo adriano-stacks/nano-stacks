@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
@@ -65,6 +66,117 @@ impl ProposalValidator for SortitionProposalValidator {
             return Err("proposal miner does not match the sortition winner".to_owned());
         }
         Ok(())
+    }
+}
+
+/// Validates proposal execution from a trusted, checkpointed chain state.
+#[derive(Debug)]
+pub struct ChainstateProposalValidator {
+    chainstate: ChainState,
+    bitcoin_context: BitcoinBlockContext,
+    trusted: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
+    candidates: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
+}
+
+impl ChainstateProposalValidator {
+    /// Start validating proposals from a block whose state is already present in `chainstate`.
+    #[must_use]
+    pub fn new(
+        chainstate: ChainState,
+        anchor: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Self {
+        let mut trusted = BTreeMap::new();
+        trusted.insert(anchor.block_id(), anchor.header.clone());
+        Self {
+            chainstate,
+            bitcoin_context,
+            trusted,
+            candidates: BTreeMap::new(),
+        }
+    }
+
+    /// Record an observed block after its state has been independently verified.
+    pub fn observe(&mut self, block: &NakamotoBlock, bitcoin_height: u64) -> Result<(), String> {
+        let block_id = block.block_id();
+        if let Some(candidate) = self.candidates.remove(&block_id) {
+            if candidate != block.header {
+                return Err("observed block differs from the validated candidate".to_owned());
+            }
+        } else {
+            self.validate_block(block, self.context_at(bitcoin_height))?;
+        }
+        self.trusted.insert(block_id, block.header.clone());
+        Ok(())
+    }
+
+    const fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
+        BitcoinBlockContext {
+            height: bitcoin_height,
+            ..self.bitcoin_context
+        }
+    }
+
+    fn validate_block(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), String> {
+        let parent = self
+            .trusted
+            .get(&block.header.parent_block_id)
+            .ok_or_else(|| "proposal parent is not in the trusted chain view".to_owned())?;
+        block
+            .validate_successor(parent)
+            .map_err(|error| format!("proposal does not extend its parent: {error}"))?;
+        self.chainstate
+            .append_nakamoto_block_with_bitcoin_context(
+                bitcoin_context,
+                Some(*block.header.parent_block_id.as_bytes()),
+                block,
+            )
+            .map_err(|error| format!("proposal execution failed: {error}"))?;
+        Ok(())
+    }
+}
+
+impl ProposalValidator for ChainstateProposalValidator {
+    fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
+        let block_id = proposal.block.block_id();
+        if self.candidates.get(&block_id) == Some(&proposal.block.header) {
+            return Ok(());
+        }
+        self.validate_block(&proposal.block, self.context_at(proposal.bitcoin_height))?;
+        self.candidates
+            .insert(block_id, proposal.block.header.clone());
+        Ok(())
+    }
+}
+
+/// Applies two independent proposal validators in order.
+pub struct ProposalValidators<A, B> {
+    first: A,
+    second: B,
+}
+
+impl<A, B> ProposalValidators<A, B> {
+    /// Construct a validator which runs `first` before `second`.
+    #[must_use]
+    pub const fn new(first: A, second: B) -> Self {
+        Self { first, second }
+    }
+
+    /// Return the two component validators.
+    #[must_use]
+    pub fn into_inner(self) -> (A, B) {
+        (self.first, self.second)
+    }
+}
+
+impl<A: ProposalValidator, B: ProposalValidator> ProposalValidator for ProposalValidators<A, B> {
+    fn validate(&mut self, proposal: &BlockProposal) -> Result<(), String> {
+        self.first.validate(proposal)?;
+        self.second.validate(proposal)
     }
 }
 

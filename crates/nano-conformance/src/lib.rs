@@ -762,7 +762,8 @@ mod tests {
         internal_node_hash, key_path, leaf_hash,
     };
     use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
-    use nano_stackerdb::{BlockAcceptance, Chunk, SignerMessage};
+    use nano_signer::{ChainstateProposalValidator, ProposalValidator};
+    use nano_stackerdb::{BlockAcceptance, BlockProposal, Chunk, SignerMessage};
     use proptest::prelude::*;
     use serde::Deserialize;
     use stacks_common::util::{
@@ -985,6 +986,49 @@ mod tests {
                 .leaves(*block.block_id().as_bytes())
                 .expect("expected leaves")
         );
+    }
+
+    #[test]
+    fn signer_validator_executes_a_captured_proposal() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read blocks")
+            .map(|entry| entry.expect("block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let first = NanoNakamotoBlock::decode(&fs::read(&paths[0]).expect("read first block"))
+            .expect("decode first block");
+        let second = NanoNakamotoBlock::decode(&fs::read(&paths[1]).expect("read second block"))
+            .expect("decode second block");
+        let first_context = *snapshots
+            .get(&first.header.consensus_hash.to_string())
+            .expect("first Bitcoin context");
+        let second_context = *snapshots
+            .get(&second.header.consensus_hash.to_string())
+            .expect("second Bitcoin context");
+        let mut chainstate = ChainState::from_checkpoint(
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+        chainstate
+            .append_nakamoto_block_with_bitcoin_context(first_context, Some(source), &first)
+            .expect("apply anchor block");
+        let mut validator = ChainstateProposalValidator::new(chainstate, &first, first_context);
+        let proposal = BlockProposal {
+            block: second.clone(),
+            bitcoin_height: second_context.height,
+            reward_cycle: 0,
+            data: Vec::new(),
+        };
+
+        validator.validate(&proposal).expect("proposal state root");
+        validator
+            .observe(&second, second_context.height)
+            .expect("observe candidate");
     }
 
     #[test]

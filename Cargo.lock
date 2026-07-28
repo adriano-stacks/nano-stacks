@@ -1487,6 +1487,7 @@ dependencies = [
  "nano-crypto",
  "nano-marf",
  "nano-primitives",
+ "nano-signer",
  "nano-sortition",
  "nano-stackerdb",
  "proptest",
