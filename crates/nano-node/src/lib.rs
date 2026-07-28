@@ -34,6 +34,52 @@ pub struct CheckpointExecutor {
     tip: NakamotoBlock,
 }
 
+/// A follower that executes each accepted tenure update from a checkpointed state.
+#[derive(Debug)]
+pub struct ExecutingNode {
+    node: Node,
+    executor: CheckpointExecutor,
+}
+
+#[derive(Debug)]
+pub enum NodeExecutionError {
+    Sync(SyncError),
+    Execution(CheckpointExecutionError),
+    MissingView,
+}
+
+impl fmt::Display for NodeExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sync(error) => write!(formatter, "node synchronization failed: {error}"),
+            Self::Execution(error) => write!(formatter, "node execution failed: {error}"),
+            Self::MissingView => formatter.write_str("node has no complete validated view"),
+        }
+    }
+}
+
+impl std::error::Error for NodeExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sync(error) => Some(error),
+            Self::Execution(error) => Some(error),
+            Self::MissingView => None,
+        }
+    }
+}
+
+impl From<SyncError> for NodeExecutionError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(error)
+    }
+}
+
+impl From<CheckpointExecutionError> for NodeExecutionError {
+    fn from(error: CheckpointExecutionError) -> Self {
+        Self::Execution(error)
+    }
+}
+
 #[derive(Debug)]
 pub enum CheckpointExecutionError {
     ChainState(ChainStateError),
@@ -170,6 +216,37 @@ impl Node {
             pox_info: self.pox_info.clone()?,
             tenures: self.follower.history().to_vec(),
         })
+    }
+}
+
+impl ExecutingNode {
+    /// Couple a peer follower to a checkpoint executor.
+    #[must_use]
+    pub const fn new(node: Node, executor: CheckpointExecutor) -> Self {
+        Self { node, executor }
+    }
+
+    /// Follow, validate, and execute the peer's next tenure update.
+    pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, NodeExecutionError> {
+        let followed = self.node.poll().await?;
+        if let Some(tenure) = &followed {
+            let view = self.node.view().ok_or(NodeExecutionError::MissingView)?;
+            self.executor
+                .apply_followed_tenure(tenure, &view.pox_info)?;
+        }
+        Ok(followed)
+    }
+
+    /// Return the executed chain tip.
+    #[must_use]
+    pub const fn executed_tip(&self) -> &NakamotoBlock {
+        self.executor.tip()
+    }
+
+    /// Return the current validated node view.
+    #[must_use]
+    pub fn view(&self) -> Option<NodeView> {
+        self.node.view()
     }
 }
 
