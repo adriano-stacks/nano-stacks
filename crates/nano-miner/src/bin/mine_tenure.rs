@@ -129,9 +129,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let deadline = Instant::now() + Duration::from_secs(cli.sortition_timeout_secs);
     let won = loop {
+        // A Bitcoin block without a sortition does not end the previous tenure,
+        // so the tenure to mine is the last sortition that chose a miner.
         let tip = node.sortition_tip().await?;
-        if tip.was_sortition && tip.miner_public_key_hash == Some(miner_hash) {
-            break tip;
+        let current = if tip.was_sortition {
+            Some(tip)
+        } else {
+            match tip.last_sortition_consensus_hash {
+                Some(consensus_hash) => Some(node.sortition(consensus_hash).await?),
+                None => None,
+            }
+        };
+        if let Some(current) = current
+            && current.was_sortition
+            && current.miner_public_key_hash == Some(miner_hash)
+        {
+            break current;
         }
         if Instant::now() >= deadline {
             return Err("no sortition was won before the timeout".into());
