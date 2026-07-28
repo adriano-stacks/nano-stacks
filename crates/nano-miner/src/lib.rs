@@ -8,7 +8,9 @@ use bitcoin::{Amount, Transaction, Txid, consensus::encode::serialize_hex};
 use bitcoincore_rpc::{Auth, Client, RpcApi, json};
 use nano_address::PoxAddress;
 use nano_bitcoin::{
-    LeaderBlockCommitment, LeaderCommitmentTransactionError, build_leader_commitment_transaction,
+    LeaderBlockCommitment, LeaderCommitmentTransactionError, LeaderKeyRegistration,
+    LeaderKeyRegistrationTransactionError, build_leader_commitment_transaction,
+    build_leader_key_registration_transaction,
 };
 use nano_chainstate::{SignerSet, SignerSetError};
 use nano_crypto::{MessageSignature, StacksPrivateKey};
@@ -24,6 +26,7 @@ use serde_json::{Value, json as json_value};
 pub enum MinerError {
     BitcoinRpc(bitcoincore_rpc::Error),
     Commitment(LeaderCommitmentTransactionError),
+    Registration(LeaderKeyRegistrationTransactionError),
     TransactionDecode(bitcoin::consensus::encode::Error),
     MissingInputs,
     AlteredProtocolOutputs,
@@ -37,12 +40,13 @@ impl fmt::Display for MinerError {
         match self {
             Self::BitcoinRpc(error) => error.fmt(formatter),
             Self::Commitment(error) => error.fmt(formatter),
+            Self::Registration(error) => error.fmt(formatter),
             Self::TransactionDecode(error) => error.fmt(formatter),
             Self::MissingInputs => {
                 formatter.write_str("Bitcoin wallet did not fund the transaction")
             }
             Self::AlteredProtocolOutputs => {
-                formatter.write_str("Bitcoin wallet altered leader commitment outputs")
+                formatter.write_str("Bitcoin wallet altered protocol outputs")
             }
             Self::UnexpectedChangePosition(position) => {
                 write!(
@@ -65,6 +69,7 @@ impl std::error::Error for MinerError {
         match self {
             Self::BitcoinRpc(error) => Some(error),
             Self::Commitment(error) => Some(error),
+            Self::Registration(error) => Some(error),
             Self::TransactionDecode(error) => Some(error),
             Self::MissingInputs
             | Self::AlteredProtocolOutputs
@@ -87,6 +92,12 @@ impl From<LeaderCommitmentTransactionError> for MinerError {
     }
 }
 
+impl From<LeaderKeyRegistrationTransactionError> for MinerError {
+    fn from(error: LeaderKeyRegistrationTransactionError) -> Self {
+        Self::Registration(error)
+    }
+}
+
 impl From<bitcoin::consensus::encode::Error> for MinerError {
     fn from(error: bitcoin::consensus::encode::Error) -> Self {
         Self::TransactionDecode(error)
@@ -99,13 +110,30 @@ pub struct SubmittedCommitment {
     pub transaction_id: Txid,
     pub transaction: Transaction,
     pub fee: Amount,
-    pub change_output: Option<usize>,
+    pub change_output: usize,
 }
 
 /// The replacement transaction created by Bitcoin Core's `bumpfee` RPC.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacedCommitment {
     pub transaction_id: Txid,
+}
+
+/// A leader-key registration accepted by the local Bitcoin wallet and mempool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmittedLeaderKeyRegistration {
+    pub transaction_id: Txid,
+    pub transaction: Transaction,
+    pub fee: Amount,
+    pub change_output: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WalletSubmission {
+    transaction_id: Txid,
+    transaction: Transaction,
+    fee: Amount,
+    change_output: usize,
 }
 
 /// A wallet-scoped Bitcoin Core RPC client.
@@ -142,44 +170,30 @@ impl BitcoinWallet {
             commitment_amount,
             None,
         )?;
-        let funded: json::FundRawTransactionResult = self.rpc.call(
-            "fundrawtransaction",
-            &[
-                Value::from(serialize_hex(&template)),
-                funding_options(fee_rate_sats_per_vbyte),
-            ],
-        )?;
-        let funded_transaction = funded.transaction()?;
-        let change_output =
-            validate_funded_transaction(&template, &funded_transaction, funded.change_position)?;
-        let signed = self
-            .rpc
-            .sign_raw_transaction_with_wallet(&funded_transaction, None, None)?;
-        if !signed.complete {
-            return Err(MinerError::IncompleteSignature);
-        }
-        let signed_transaction = signed.transaction()?;
-        let acceptance = self.rpc.test_mempool_accept(&[&signed_transaction])?;
-        let Some(result) = acceptance.first() else {
-            return Err(MinerError::MempoolRejected(
-                "Bitcoin Core returned no acceptance result".to_owned(),
-            ));
-        };
-        if !result.allowed {
-            return Err(MinerError::MempoolRejected(
-                result
-                    .reject_reason
-                    .clone()
-                    .unwrap_or_else(|| "unknown rejection".to_owned()),
-            ));
-        }
-        let transaction_id = self.rpc.send_raw_transaction(&signed_transaction)?;
+        let submitted = self.submit_protocol_transaction(&template, 2, fee_rate_sats_per_vbyte)?;
 
         Ok(SubmittedCommitment {
-            transaction_id,
-            transaction: signed_transaction,
-            fee: funded.fee,
-            change_output,
+            transaction_id: submitted.transaction_id,
+            transaction: submitted.transaction,
+            fee: submitted.fee,
+            change_output: submitted.change_output,
+        })
+    }
+
+    /// Fund, sign, verify, and broadcast a leader-key registration.
+    pub fn submit_leader_key_registration(
+        &self,
+        magic: [u8; 2],
+        registration: &LeaderKeyRegistration,
+        fee_rate_sats_per_vbyte: Option<u64>,
+    ) -> Result<SubmittedLeaderKeyRegistration, MinerError> {
+        let template = build_leader_key_registration_transaction(magic, registration, Vec::new())?;
+        let submitted = self.submit_protocol_transaction(&template, 1, fee_rate_sats_per_vbyte)?;
+        Ok(SubmittedLeaderKeyRegistration {
+            transaction_id: submitted.transaction_id,
+            transaction: submitted.transaction,
+            fee: submitted.fee,
+            change_output: submitted.change_output,
         })
     }
 
@@ -203,11 +217,63 @@ impl BitcoinWallet {
             transaction_id: response.transaction_id,
         })
     }
+
+    fn submit_protocol_transaction(
+        &self,
+        template: &Transaction,
+        protocol_output_count: usize,
+        fee_rate_sats_per_vbyte: Option<u64>,
+    ) -> Result<WalletSubmission, MinerError> {
+        let change_position = i32::try_from(protocol_output_count)
+            .map_err(|_| MinerError::UnexpectedChangePosition(i32::MAX))?;
+        let funded: json::FundRawTransactionResult = self.rpc.call(
+            "fundrawtransaction",
+            &[
+                Value::from(serialize_hex(&template)),
+                funding_options(change_position, fee_rate_sats_per_vbyte),
+            ],
+        )?;
+        let funded_transaction = funded.transaction()?;
+        let change_output = validate_funded_transaction(
+            template,
+            &funded_transaction,
+            funded.change_position,
+            change_position,
+        )?;
+        let signed = self
+            .rpc
+            .sign_raw_transaction_with_wallet(&funded_transaction, None, None)?;
+        if !signed.complete {
+            return Err(MinerError::IncompleteSignature);
+        }
+        let transaction = signed.transaction()?;
+        let acceptance = self.rpc.test_mempool_accept(&[&transaction])?;
+        let Some(result) = acceptance.first() else {
+            return Err(MinerError::MempoolRejected(
+                "Bitcoin Core returned no acceptance result".to_owned(),
+            ));
+        };
+        if !result.allowed {
+            return Err(MinerError::MempoolRejected(
+                result
+                    .reject_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown rejection".to_owned()),
+            ));
+        }
+        let transaction_id = self.rpc.send_raw_transaction(&transaction)?;
+        Ok(WalletSubmission {
+            transaction_id,
+            transaction,
+            fee: funded.fee,
+            change_output,
+        })
+    }
 }
 
-fn funding_options(fee_rate_sats_per_vbyte: Option<u64>) -> Value {
+fn funding_options(change_position: i32, fee_rate_sats_per_vbyte: Option<u64>) -> Value {
     let mut options = json_value!({
-        "changePosition": 2,
+        "changePosition": change_position,
         "replaceable": true,
     });
     if let Some(fee_rate) = fee_rate_sats_per_vbyte {
@@ -220,18 +286,21 @@ fn validate_funded_transaction(
     template: &Transaction,
     funded: &Transaction,
     change_position: i32,
-) -> Result<Option<usize>, MinerError> {
+    expected_change_position: i32,
+) -> Result<usize, MinerError> {
     if funded.input.is_empty() {
         return Err(MinerError::MissingInputs);
     }
-    if funded.output.get(..2) != template.output.get(..2) {
+    if funded.output.get(..template.output.len()) != Some(template.output.as_slice()) {
         return Err(MinerError::AlteredProtocolOutputs);
     }
-    match change_position {
-        -1 => Ok(None),
-        2 if funded.output.len() == 3 => Ok(Some(2)),
-        position => Err(MinerError::UnexpectedChangePosition(position)),
+    if change_position != expected_change_position
+        || funded.output.len() != template.output.len() + 1
+    {
+        return Err(MinerError::UnexpectedChangePosition(change_position));
     }
+    usize::try_from(change_position)
+        .map_err(|_| MinerError::UnexpectedChangePosition(change_position))
 }
 
 #[derive(Deserialize)]
@@ -474,7 +543,7 @@ mod tests {
 
     #[test]
     fn funding_requests_rbf_with_change_after_protocol_outputs() {
-        let options = funding_options(Some(7));
+        let options = funding_options(2, Some(7));
         assert_eq!(options["changePosition"], 2);
         assert_eq!(options["replaceable"], true);
         assert_eq!(options["fee_rate"], 7);
@@ -507,12 +576,12 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
         });
         assert!(matches!(
-            validate_funded_transaction(&template, &funded, 2),
-            Ok(Some(2))
+            validate_funded_transaction(&template, &funded, 2, 2),
+            Ok(2)
         ));
         funded.output.swap(1, 2);
         assert!(matches!(
-            validate_funded_transaction(&template, &funded, 2),
+            validate_funded_transaction(&template, &funded, 2, 2),
             Err(MinerError::AlteredProtocolOutputs)
         ));
     }

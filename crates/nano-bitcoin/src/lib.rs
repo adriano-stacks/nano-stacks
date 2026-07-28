@@ -185,6 +185,50 @@ pub struct LeaderBlockCommitment {
     pub parent_modulus: u8,
 }
 
+/// The canonical payload for a Bitcoin leader-key registration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderKeyRegistration {
+    pub consensus_hash: [u8; 20],
+    pub vrf_public_key: [u8; 32],
+    pub block_signing_key_hash: [u8; 20],
+    pub memo: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaderKeyRegistrationError {
+    InvalidVrfPublicKey,
+    MemoTooLarge,
+}
+
+impl fmt::Display for LeaderKeyRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidVrfPublicKey => "invalid leader-key VRF public key",
+            Self::MemoTooLarge => "leader-key registration memo exceeds five bytes",
+        })
+    }
+}
+
+impl std::error::Error for LeaderKeyRegistrationError {}
+
+impl LeaderKeyRegistration {
+    /// Encode the protocol payload following the leader-key opcode.
+    pub fn encode(&self) -> Result<Vec<u8>, LeaderKeyRegistrationError> {
+        if self.memo.len() > 5 {
+            return Err(LeaderKeyRegistrationError::MemoTooLarge);
+        }
+        nano_crypto::VrfPublicKey::from_bytes(self.vrf_public_key)
+            .map_err(|_| LeaderKeyRegistrationError::InvalidVrfPublicKey)?;
+
+        let mut bytes = Vec::with_capacity(72 + self.memo.len());
+        bytes.extend_from_slice(&self.consensus_hash);
+        bytes.extend_from_slice(&self.vrf_public_key);
+        bytes.extend_from_slice(&self.block_signing_key_hash);
+        bytes.extend_from_slice(&self.memo);
+        Ok(bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaderCommitmentError {
     MemoTooLarge,
@@ -254,6 +298,55 @@ impl From<LeaderCommitmentError> for LeaderCommitmentTransactionError {
     fn from(error: LeaderCommitmentError) -> Self {
         Self::Commitment(error)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaderKeyRegistrationTransactionError {
+    InvalidProtocolPayload,
+    Registration(LeaderKeyRegistrationError),
+}
+
+impl fmt::Display for LeaderKeyRegistrationTransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProtocolPayload => {
+                formatter.write_str("invalid leader-key registration payload")
+            }
+            Self::Registration(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LeaderKeyRegistrationTransactionError {}
+
+impl From<LeaderKeyRegistrationError> for LeaderKeyRegistrationTransactionError {
+    fn from(error: LeaderKeyRegistrationError) -> Self {
+        Self::Registration(error)
+    }
+}
+
+/// Construct an unsigned leader-key registration transaction.
+pub fn build_leader_key_registration_transaction(
+    magic: [u8; 2],
+    registration: &LeaderKeyRegistration,
+    inputs: Vec<TxIn>,
+) -> Result<Transaction, LeaderKeyRegistrationTransactionError> {
+    let mut protocol_payload = Vec::with_capacity(80);
+    protocol_payload.extend_from_slice(&magic);
+    protocol_payload.push(b'^');
+    protocol_payload.extend_from_slice(&registration.encode()?);
+    let protocol_payload = PushBytesBuf::try_from(protocol_payload)
+        .map_err(|_| LeaderKeyRegistrationTransactionError::InvalidProtocolPayload)?;
+
+    Ok(Transaction {
+        version: TransactionVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: inputs,
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(protocol_payload),
+        }],
+    })
 }
 
 /// Construct an unsigned waterfall leader-commitment transaction.
@@ -639,8 +732,10 @@ mod tests {
 
     use super::{
         BitcoinBlock, BitcoinOperationKind, BitcoinRpcSource, LeaderBlockCommitment,
-        LeaderCommitmentTransactionError, PreStxCache, build_leader_commitment_transaction,
-        decode_block, parse_leader_block_commit, parse_leader_key_registration,
+        LeaderCommitmentTransactionError, LeaderKeyRegistration, LeaderKeyRegistrationError,
+        PreStxCache, build_leader_commitment_transaction,
+        build_leader_key_registration_transaction, decode_block, parse_leader_block_commit,
+        parse_leader_key_registration, protocol_payload,
     };
 
     #[test]
@@ -729,6 +824,75 @@ mod tests {
     #[test]
     fn leader_key_registration_requires_a_valid_vrf_key() {
         assert!(parse_leader_key_registration(&[0; 52]).is_none());
+    }
+
+    #[test]
+    fn leader_key_registration_round_trips_through_the_parser() {
+        let registration = LeaderKeyRegistration {
+            consensus_hash: [1; 20],
+            vrf_public_key: nano_crypto::VrfPrivateKey::from_bytes([2; 32])
+                .public_key()
+                .to_bytes(),
+            block_signing_key_hash: [3; 20],
+            memo: vec![4; 5],
+        };
+        let payload = registration.encode().expect("encode registration");
+        let Some(BitcoinOperationKind::LeaderKeyRegistration {
+            consensus_hash,
+            vrf_public_key,
+            block_signing_key_hash,
+            memo,
+        }) = parse_leader_key_registration(&payload)
+        else {
+            panic!("parse leader-key registration");
+        };
+        assert_eq!(consensus_hash, registration.consensus_hash);
+        assert_eq!(vrf_public_key, registration.vrf_public_key);
+        assert_eq!(
+            block_signing_key_hash,
+            Some(registration.block_signing_key_hash)
+        );
+        assert_eq!(
+            memo,
+            [registration.block_signing_key_hash.to_vec(), vec![4; 5]].concat()
+        );
+    }
+
+    #[test]
+    fn leader_key_registration_uses_a_single_protocol_output() {
+        let registration = LeaderKeyRegistration {
+            consensus_hash: [1; 20],
+            vrf_public_key: nano_crypto::VrfPrivateKey::from_bytes([2; 32])
+                .public_key()
+                .to_bytes(),
+            block_signing_key_hash: [3; 20],
+            memo: Vec::new(),
+        };
+        let transaction =
+            build_leader_key_registration_transaction(*b"T3", &registration, Vec::new())
+                .expect("build registration");
+        assert_eq!(transaction.output.len(), 1);
+        let (opcode, payload) =
+            protocol_payload(transaction.output[0].script_pubkey.as_script(), *b"T3")
+                .expect("protocol output");
+        assert_eq!(opcode, b'^');
+        assert_eq!(payload, registration.encode().expect("encode registration"));
+    }
+
+    #[test]
+    fn leader_key_registration_rejects_a_memo_that_exceeds_op_return_capacity() {
+        let registration = LeaderKeyRegistration {
+            consensus_hash: [1; 20],
+            vrf_public_key: nano_crypto::VrfPrivateKey::from_bytes([2; 32])
+                .public_key()
+                .to_bytes(),
+            block_signing_key_hash: [3; 20],
+            memo: vec![4; 6],
+        };
+        assert_eq!(
+            registration.encode(),
+            Err(LeaderKeyRegistrationError::MemoTooLarge)
+        );
     }
 
     #[test]
