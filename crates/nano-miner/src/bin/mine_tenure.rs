@@ -228,8 +228,11 @@ async fn coordinate(
         },
         miner_key,
     );
-    coordinator.publish_proposal(&proposal).await?;
-    println!("published the proposal to the miner slot");
+    let published = coordinator.publish_proposal(&proposal).await?;
+    println!(
+        "published the proposal to miner slot {:?}",
+        published.metadata.map(|slot| slot.slot_id)
+    );
 
     let deadline = Instant::now() + Duration::from_secs(cli.signer_timeout_secs);
     loop {

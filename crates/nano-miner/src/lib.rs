@@ -484,7 +484,7 @@ impl ProposalCoordinator {
         }
     }
 
-    /// Write a proposal to the active miner proposal slot.
+    /// Write a proposal to the miner proposal slot this miner owns.
     pub async fn publish_proposal(
         &self,
         proposal: &BlockProposal,
@@ -539,11 +539,11 @@ impl ProposalCoordinator {
         Ok(block)
     }
 
-    /// Write to whichever writer slot this miner's key owns.
+    /// Write to every writer slot this miner's key owns.
     ///
-    /// A miner's slot depends on the parity of the sortition it won, which the
-    /// contract enforces through the slot's writer key, so the parity is found
-    /// by offering the chunk to each candidate slot.
+    /// Signers read the slot matching the current sortition parity, which a
+    /// miner cannot know from the peer alone, so the message goes to each slot
+    /// the contract lets this key write. The contract rejects the rest.
     async fn write_miner_message(
         &self,
         message_slot: u32,
@@ -551,6 +551,7 @@ impl ProposalCoordinator {
     ) -> Result<ChunkAck, ProposalError> {
         let data = message.encode()?;
         let versions = self.client.slot_versions(&self.miner_contract).await?;
+        let mut accepted: Option<ChunkAck> = None;
         let mut rejection = None;
         for parity in 0..MINER_SLOTS_PER_WRITER {
             let slot_id = parity * MINER_SLOTS_PER_WRITER + message_slot;
@@ -564,14 +565,21 @@ impl ProposalCoordinator {
             chunk.sign(&self.miner_key)?;
             let acknowledgement = self.client.put_chunk(&self.miner_contract, &chunk).await?;
             if acknowledgement.accepted {
-                return Ok(acknowledgement);
+                accepted = Some(ChunkAck {
+                    metadata: Some(nano_stackerdb::SlotVersion {
+                        slot_id,
+                        slot_version,
+                    }),
+                    ..acknowledgement
+                });
+            } else {
+                rejection = Some(ProposalError::Rejected {
+                    reason: acknowledgement.reason,
+                    code: acknowledgement.code,
+                });
             }
-            rejection = Some(ProposalError::Rejected {
-                reason: acknowledgement.reason,
-                code: acknowledgement.code,
-            });
         }
-        Err(rejection.unwrap_or(ProposalError::SlotVersionOverflow))
+        accepted.ok_or_else(|| rejection.unwrap_or(ProposalError::SlotVersionOverflow))
     }
 }
 
