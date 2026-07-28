@@ -53,6 +53,15 @@ struct Cli {
     /// Bitcoin height at which PoX-5 activates.
     #[arg(long)]
     pox_5_activation_height: u32,
+    /// Bitcoin height used when evaluating PoX-1 STX locks.
+    #[arg(long)]
+    pox_v1_unlock_height: u32,
+    /// Bitcoin height used when evaluating PoX-2 STX locks.
+    #[arg(long)]
+    pox_v2_unlock_height: u32,
+    /// Bitcoin height used when evaluating PoX-3 STX locks.
+    #[arg(long)]
+    pox_v3_unlock_height: u32,
     /// Consensus-encoded candidate block with its transactions selected already.
     #[arg(long)]
     candidate_block: PathBuf,
@@ -77,7 +86,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pox = client.pox_info().await?;
     let mut anchor_context = pox.bitcoin_context();
     anchor_context.height = cli.anchor_bitcoin_height;
-    anchor_context.v4_unlock_height = cli.pox_5_activation_height;
+    anchor_context.v1_unlock_height = cli.pox_v1_unlock_height;
+    anchor_context.v2_unlock_height = cli.pox_v2_unlock_height;
+    anchor_context.v3_unlock_height = cli.pox_v3_unlock_height;
+    anchor_context.pox_5_activation_height = cli.pox_5_activation_height;
 
     let source = parse_array(&cli.source_state_id)?;
     let root = TrieHash::from_bytes(parse_array(&cli.state_root)?);
@@ -99,7 +111,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     chainstate.append_nakamoto_block_with_bitcoin_context(anchor_context, Some(source), &anchor)?;
     let mut candidate_context = pox.bitcoin_context();
     candidate_context.height = bitcoin_height;
-    candidate_context.v4_unlock_height = cli.pox_5_activation_height;
+    candidate_context.v1_unlock_height = cli.pox_v1_unlock_height;
+    candidate_context.v2_unlock_height = cli.pox_v2_unlock_height;
+    candidate_context.v3_unlock_height = cli.pox_v3_unlock_height;
+    candidate_context.pox_5_activation_height = cli.pox_5_activation_height;
     let miner_key = StacksPrivateKey::from_bytes(parse_array(&cli.private_key)?)?;
     let (block, applied) = chainstate.assemble_nakamoto_block_with_bitcoin_context(
         candidate_context,

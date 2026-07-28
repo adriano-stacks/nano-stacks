@@ -547,7 +547,7 @@ fn apply_captured_block(
     bitcoin_context.v1_unlock_height = event.v1;
     bitcoin_context.v2_unlock_height = event.v2;
     bitcoin_context.v3_unlock_height = event.v3;
-    bitcoin_context.v4_unlock_height = event.v4;
+    bitcoin_context.pox_5_activation_height = event.v4;
     let applied = chainstate
         .execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;

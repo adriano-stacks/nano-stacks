@@ -88,7 +88,7 @@ pub struct BitcoinBlockContext {
     pub v1_unlock_height: u32,
     pub v2_unlock_height: u32,
     pub v3_unlock_height: u32,
-    pub v4_unlock_height: u32,
+    pub pox_5_activation_height: u32,
 }
 
 impl BitcoinBlockContext {
@@ -104,7 +104,7 @@ impl BitcoinBlockContext {
             v1_unlock_height: u32::MAX,
             v2_unlock_height: u32::MAX,
             v3_unlock_height: u32::MAX,
-            v4_unlock_height: u32::MAX,
+            pox_5_activation_height: u32::MAX,
         }
     }
 }
@@ -120,7 +120,7 @@ struct BitcoinContext {
     v1_unlock_height: u32,
     v2_unlock_height: u32,
     v3_unlock_height: u32,
-    v4_unlock_height: u32,
+    pox_5_activation_height: u32,
 }
 
 impl BitcoinContext {
@@ -136,7 +136,7 @@ impl BitcoinContext {
             v1_unlock_height: context.v1_unlock_height,
             v2_unlock_height: context.v2_unlock_height,
             v3_unlock_height: context.v3_unlock_height,
-            v4_unlock_height: context.v4_unlock_height,
+            pox_5_activation_height: context.pox_5_activation_height,
         })
     }
 }
@@ -171,7 +171,7 @@ impl BurnStateDB for BitcoinContext {
     }
 
     fn get_pox_5_activation_height(&self) -> u32 {
-        self.v4_unlock_height
+        self.pox_5_activation_height
     }
 
     fn get_burn_block_height(&self, _sortition_id: &SortitionId) -> Option<u32> {
