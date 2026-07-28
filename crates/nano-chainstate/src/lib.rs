@@ -427,9 +427,9 @@ impl ChainState {
         effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
         if let Some(parent) = parent {
-            let parent_height = block.header.chain_length.checked_sub(1).ok_or_else(|| {
+            let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
                 ChainStateError::InvalidTransaction(
-                    "Nakamoto block has no parent height".to_owned(),
+                    "Nakamoto block cannot extend the genesis height".to_owned(),
                 )
             })?;
             self.vm.set_checkpoint_height(

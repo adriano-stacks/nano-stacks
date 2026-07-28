@@ -833,7 +833,9 @@ impl MarfStore {
 
     /// Record an imported checkpoint's Stacks height for Clarity balance history lookups.
     pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
-        self.heights.entry(block).or_insert(height);
+        if self.marf.height(block).is_none() {
+            self.heights.entry(block).or_insert(height);
+        }
     }
 
     /// Return the MARF content hash before ancestry is incorporated.
