@@ -1,0 +1,58 @@
+name: Property Testings
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  property-testing:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        clarity_version: [1, 2, 3]
+    name: Clarity::V${{ matrix.clarity_version }} Property Tests
+    env:
+      PROPTEST_CASES: 100
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+
+      - name: Use Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@184183c2401be73c3bf42c2e61268aa5855379c1 # v2.78.1
+        with:
+          tool: nextest
+
+      - name: Run Tests
+        run: |
+          cargo nextest run \
+          --features test-clarity-v${{ matrix.clarity_version }} \
+          --test wasm-generation \
+          --test standard
+
+      - name: Send message to Slack
+        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+        if: ${{ failure() }}
+        with:
+          channel-id: ${{ secrets.CHANNEL_ID }}
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "GitHub Actions workflow <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|Property Testing #${{ github.run_number }}> Clarity::V${{ matrix.clarity_version }} failed."
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

@@ -1,0 +1,6 @@
+[workspace]
+members = ["clar2wasm"]
+resolver = "2"
+
+[profile.bench]
+debug = true

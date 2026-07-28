@@ -1,0 +1,71 @@
+[package]
+name = "clar2wasm"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+clap = { version = "4.3.17", features = ["derive"] }
+regex = "1.9.1"
+walrus = "0.20.1"
+lazy_static = "1.4.0"
+wasmtime = "15.0.0"
+sha2 = { version = "0.10.7" }
+chrono = { version = "0.4.20" }
+rusqlite = { version = "0.31.0" }
+
+clarity = { git="https://github.com/stacks-network/stacks-core", branch="feat/clarity-wasm-develop", features = ["testing"] }
+stacks-common = { git="https://github.com/stacks-network/stacks-core", branch="feat/clarity-wasm-develop" }
+clarity-types = { git="https://github.com/stacks-network/stacks-core", branch="feat/clarity-wasm-develop" }
+
+[build-dependencies]
+wat = "1.0.74"
+
+[features]
+flamegraph = []
+pb = []
+
+# Test-specific features
+
+# Clarity version to test - default v2
+test-clarity-v1 = []
+test-clarity-v2 = []
+test-clarity-v3 = []
+test-clarity-v4 = []
+developer-mode = []
+
+[dev-dependencies]
+clar2wasm = {path = ".", features = ["developer-mode"]}
+criterion = "0.5"
+proptest = "1.2.0"
+num-integer = { version = "0.1.45", default-features = false }
+hex = "0.4.3"
+pprof = { version = "0.14", features = [
+  "flamegraph",
+  "protobuf-codec",
+  "criterion",
+  "frame-pointer",
+] }
+assert_fs = "1.1.1"
+assert_cmd = "2.0.14"
+wasmparser = "0.207.0"
+predicates = "3.1.0"
+paste = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "clar2wasm"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "crosscheck"
+path = "src/bin/crosscheck.rs"
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[lints.clippy]
+result_large_err = "allow"
