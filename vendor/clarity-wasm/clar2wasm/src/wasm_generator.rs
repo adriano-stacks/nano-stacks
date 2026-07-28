@@ -69,6 +69,9 @@ pub struct WasmGenerator {
     /// The locals for the current function.
     pub(crate) bindings: Bindings,
 
+    /// Whether local atom reads should charge the value-copy cost.
+    charge_local_value_copy: bool,
+
     /// Emits cost tracking code if set.
     pub(crate) cost_context: Option<ChargeContext>,
 
@@ -444,6 +447,7 @@ impl WasmGenerator {
             literal_memory_offset: HashMap::new(),
             constants: HashMap::new(),
             bindings: Bindings::new(),
+            charge_local_value_copy: true,
             cost_context: None,
             early_return_block_id: None,
             current_function_type: None,
@@ -591,6 +595,17 @@ impl WasmGenerator {
             }
             _ => Ok(()),
         }
+    }
+
+    pub fn traverse_expr_without_value_copy_charge(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+    ) -> Result<(), GeneratorError> {
+        let previous = std::mem::replace(&mut self.charge_local_value_copy, false);
+        let result = self.traverse_expr(builder, expr);
+        self.charge_local_value_copy = previous;
+        result
     }
 
     fn traverse_list(
@@ -1963,10 +1978,12 @@ impl WasmGenerator {
             builder.local_get(value);
         }
         self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
-        self.clarity_value_size_on_stack(builder, &ty)?;
-        let size = self.borrow_local(ValType::I32);
-        builder.local_set(*size);
-        self.charge_lookup_variable_size(builder, *size)?;
+        if self.charge_local_value_copy {
+            self.clarity_value_size_on_stack(builder, &ty)?;
+            let size = self.borrow_local(ValType::I32);
+            builder.local_set(*size);
+            self.charge_lookup_variable_size(builder, *size)?;
+        }
 
         Ok(())
     }

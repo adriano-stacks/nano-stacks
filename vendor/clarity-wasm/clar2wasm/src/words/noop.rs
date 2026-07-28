@@ -84,7 +84,7 @@ impl ComplexWord for ContractOf {
 
         self.charge(generator, builder, 0)?;
 
-        generator.traverse_args(builder, args)?;
+        generator.traverse_expr_without_value_copy_charge(builder, &args[0])?;
 
         Ok(())
     }
