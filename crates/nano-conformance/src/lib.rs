@@ -582,6 +582,7 @@ fn compare_receipts(
             nano_chainstate::TransactionStatus::PostConditionAborted(_) => {
                 "abort_by_post_condition"
             }
+            nano_chainstate::TransactionStatus::RuntimeFailure(_) => "abort_by_response",
         };
         if expected.status != status {
             return Err(ReplayDivergence::Receipt(format!(

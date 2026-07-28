@@ -25,7 +25,7 @@ use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
 pub use nano_vm::BitcoinBlockContext;
-use nano_vm::{ExecutionResult, MarfStoreError, TransactionResult, Vm};
+use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
 use std::path::Path;
 
 /// M0 boundary that makes the final validation stage explicit.
@@ -51,6 +51,15 @@ pub struct TransactionReceipt {
 pub enum TransactionStatus {
     Success,
     PostConditionAborted(String),
+    RuntimeFailure(String),
+}
+
+enum PayloadOutcome {
+    Success(TransactionResult),
+    RuntimeFailure {
+        result: TransactionResult,
+        error: String,
+    },
 }
 
 /// A chainstate execution context backed by versioned VM state.
@@ -65,9 +74,9 @@ pub enum ChainStateError {
     Evaluation(ClarityEvalError),
     Execution(VmExecutionError),
     InvalidTransaction(String),
-    PostConditionFailure {
+    TransactionFailure {
         result: Box<TransactionResult>,
-        reason: String,
+        status: TransactionStatus,
     },
     UnsupportedPayload,
     StateRootMismatch {
@@ -83,8 +92,8 @@ impl std::fmt::Display for ChainStateError {
             Self::Evaluation(error) => write!(formatter, "Clarity evaluation error: {error}"),
             Self::Execution(error) => write!(formatter, "Clarity execution error: {error}"),
             Self::InvalidTransaction(error) => write!(formatter, "invalid transaction: {error}"),
-            Self::PostConditionFailure { reason, .. } => {
-                write!(formatter, "post-condition failure: {reason}")
+            Self::TransactionFailure { status, .. } => {
+                write!(formatter, "transaction failed: {status:?}")
             }
             Self::UnsupportedPayload => formatter.write_str("unsupported transaction payload"),
             Self::StateRootMismatch { expected, actual } => write!(
@@ -102,7 +111,7 @@ impl std::error::Error for ChainStateError {
             Self::Evaluation(_)
             | Self::Execution(_)
             | Self::InvalidTransaction(_)
-            | Self::PostConditionFailure { .. }
+            | Self::TransactionFailure { .. }
             | Self::UnsupportedPayload
             | Self::StateRootMismatch { .. } => None,
         }
@@ -274,10 +283,10 @@ impl ChainState {
                 self.vm.commit_transaction()?;
                 Ok(receipt)
             }
-            Err(ChainStateError::PostConditionFailure { result, reason }) => {
+            Err(ChainStateError::TransactionFailure { result, status }) => {
                 self.vm.rollback_transaction()?;
                 self.vm.begin_transaction()?;
-                let receipt = self.apply_post_condition_abort(transaction, *result, reason);
+                let receipt = self.apply_transaction_failure(transaction, *result, status);
                 match receipt {
                     Ok(receipt) => {
                         self.vm.commit_transaction()?;
@@ -333,6 +342,15 @@ impl ChainState {
             sponsor.as_ref(),
             execution_cost,
         )?;
+        let result = match result {
+            PayloadOutcome::Success(result) => result,
+            PayloadOutcome::RuntimeFailure { result, error } => {
+                return Err(ChainStateError::TransactionFailure {
+                    result: Box::new(result),
+                    status: TransactionStatus::RuntimeFailure(error),
+                });
+            }
+        };
         if matches!(
             transaction.payload().data(),
             TransactionPayloadData::TokenTransfer { .. }
@@ -343,9 +361,9 @@ impl ChainState {
                 ));
             }
         } else if let Some(reason) = check_postconditions(transaction, &sender, &result.assets)? {
-            return Err(ChainStateError::PostConditionFailure {
+            return Err(ChainStateError::TransactionFailure {
                 result: Box::new(result),
-                reason,
+                status: TransactionStatus::PostConditionAborted(reason),
             });
         }
         self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
@@ -357,11 +375,11 @@ impl ChainState {
         })
     }
 
-    fn apply_post_condition_abort(
+    fn apply_transaction_failure(
         &mut self,
         transaction: &Transaction,
         result: TransactionResult,
-        reason: String,
+        status: TransactionStatus,
     ) -> Result<TransactionReceipt, ChainStateError> {
         let origin = transaction.origin_address().ok_or_else(|| {
             ChainStateError::InvalidTransaction("transaction has no recognized network".to_owned())
@@ -376,7 +394,7 @@ impl ChainState {
         self.update_transaction_nonces(&sender, payer, sponsor.is_some(), transaction)?;
         Ok(TransactionReceipt {
             txid: transaction.txid(),
-            status: TransactionStatus::PostConditionAborted(reason),
+            status,
             committed: false,
             result,
         })
@@ -408,10 +426,11 @@ impl ChainState {
         sender: &PrincipalData,
         sponsor: Option<&PrincipalData>,
         execution_cost: &ExecutionCost,
-    ) -> Result<TransactionResult, ChainStateError> {
+    ) -> Result<PayloadOutcome, ChainStateError> {
         let cost_tracker = self
             .vm
             .transaction_cost_tracker_with_total(execution_cost.clone())?;
+        let mut runtime_error = None;
         let mut result = match transaction.payload().data() {
             TransactionPayloadData::TokenTransfer {
                 recipient,
@@ -446,7 +465,7 @@ impl ChainState {
                 contract_name,
                 function_name,
                 arguments,
-            } => self.vm.execute_contract_call(
+            } => match self.vm.execute_contract_call_outcome(
                 sender.clone(),
                 sponsor.cloned(),
                 contract_identifier(*address, contract_name)?,
@@ -456,13 +475,27 @@ impl ChainState {
                     .map(|argument| argument.as_bytes().to_vec())
                     .collect::<Vec<_>>(),
                 cost_tracker,
-            )?,
+            )? {
+                ContractCallOutcome::Success(result) => *result,
+                ContractCallOutcome::RuntimeFailure { cost, error } => {
+                    runtime_error = Some(error.to_string());
+                    TransactionResult {
+                        value: Some(Value::err_none()),
+                        cost,
+                        assets: AssetMap::new(),
+                        events: Vec::new(),
+                    }
+                }
+            },
             _ => return Err(ChainStateError::UnsupportedPayload),
         };
         result.cost.sub(execution_cost).map_err(|error| {
             ChainStateError::InvalidTransaction(format!("transaction cost underflow: {error}"))
         })?;
-        Ok(result)
+        Ok(match runtime_error {
+            Some(error) => PayloadOutcome::RuntimeFailure { result, error },
+            None => PayloadOutcome::Success(result),
+        })
     }
 
     fn update_transaction_nonces(
@@ -933,6 +966,52 @@ mod tests {
             TransactionStatus::PostConditionAborted(_)
         ));
         assert!(!failed.committed);
+
+        let get = decoded_transaction(
+            &contract_call_payload_without_arguments("counter", "read-counter"),
+            2,
+            0,
+        );
+        let read = chainstate
+            .execute_transaction(&get, &failed.result.cost)
+            .expect("read contract state");
+        assert_eq!(read.result.value, Some(clarity::vm::Value::UInt(0)));
+    }
+
+    #[test]
+    fn runtime_failure_rolls_back_contract_writes_and_consumes_nonce() {
+        let mut chainstate = ChainState::new().expect("create chainstate");
+        chainstate
+            .vm
+            .begin_block(None, [3; 32])
+            .expect("begin block");
+
+        let deployment = decoded_transaction(
+            &versioned_contract_payload(
+                "counter",
+                "(define-data-var counter uint u0) (define-public (fail) (begin (var-set counter u1) (ok (/ u1 u0)))) (define-read-only (read-counter) (var-get counter))",
+            ),
+            0,
+            0,
+        );
+        let deployed = chainstate
+            .execute_transaction(&deployment, &ExecutionCost::ZERO)
+            .expect("deploy contract");
+
+        let failed = decoded_transaction(
+            &contract_call_payload_without_arguments("counter", "fail"),
+            1,
+            0,
+        );
+        let failed = chainstate
+            .execute_transaction(&failed, &deployed.result.cost)
+            .expect("accept runtime failure");
+        assert!(matches!(
+            failed.status,
+            TransactionStatus::RuntimeFailure(_)
+        ));
+        assert!(!failed.committed);
+        assert_eq!(failed.result.value, Some(clarity::vm::Value::err_none()));
 
         let get = decoded_transaction(
             &contract_call_payload_without_arguments("counter", "read-counter"),

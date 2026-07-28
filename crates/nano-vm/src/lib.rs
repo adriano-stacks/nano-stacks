@@ -63,6 +63,16 @@ pub struct TransactionResult {
     pub events: Vec<StacksTransactionEvent>,
 }
 
+/// The outcome of invoking a published contract.
+#[derive(Debug)]
+pub enum ContractCallOutcome {
+    Success(Box<TransactionResult>),
+    RuntimeFailure {
+        cost: ExecutionCost,
+        error: VmExecutionError,
+    },
+}
+
 /// Bitcoin context required while executing one block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitcoinBlockContext {
@@ -356,8 +366,31 @@ impl Vm {
         arguments: &[Vec<u8>],
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, VmExecutionError> {
+        match self.execute_contract_call_outcome(
+            sender,
+            sponsor,
+            contract,
+            function,
+            arguments,
+            cost_tracker,
+        )? {
+            ContractCallOutcome::Success(result) => Ok(*result),
+            ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
+        }
+    }
+
+    /// Invoke a contract and retain acceptable runtime failures as transaction outcomes.
+    pub fn execute_contract_call_outcome(
+        &mut self,
+        sender: PrincipalData,
+        sponsor: Option<PrincipalData>,
+        contract: QualifiedContractIdentifier,
+        function: &str,
+        arguments: &[Vec<u8>],
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<ContractCallOutcome, VmExecutionError> {
         let Self { store, context } = self;
-        execute_contract_call_in_context(
+        execute_contract_call_outcome_in_context(
             store,
             context,
             ContractCall {
@@ -1260,7 +1293,31 @@ pub fn execute_contract_call(
     arguments: &[Vec<u8>],
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, VmExecutionError> {
-    execute_contract_call_in_context(
+    match execute_contract_call_outcome(
+        store,
+        sender,
+        sponsor,
+        contract,
+        function,
+        arguments,
+        cost_tracker,
+    )? {
+        ContractCallOutcome::Success(result) => Ok(*result),
+        ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
+    }
+}
+
+/// Call a contract while retaining acceptable runtime failures and their costs.
+pub fn execute_contract_call_outcome(
+    store: &mut MarfStore,
+    sender: PrincipalData,
+    sponsor: Option<PrincipalData>,
+    contract: QualifiedContractIdentifier,
+    function: &str,
+    arguments: &[Vec<u8>],
+    cost_tracker: LimitedCostTracker,
+) -> Result<ContractCallOutcome, VmExecutionError> {
+    execute_contract_call_outcome_in_context(
         store,
         &NULL_BURN_STATE_DB,
         ContractCall {
@@ -1282,12 +1339,12 @@ struct ContractCall<'a> {
     arguments: &'a [Vec<u8>],
 }
 
-fn execute_contract_call_in_context(
+fn execute_contract_call_outcome_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
-) -> Result<TransactionResult, VmExecutionError> {
+) -> Result<ContractCallOutcome, VmExecutionError> {
     let arguments = call
         .arguments
         .iter()
@@ -1329,18 +1386,32 @@ fn execute_contract_call_in_context(
     match result {
         Ok((value, assets, events)) => {
             database.commit()?;
-            Ok(TransactionResult {
+            Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
                 value: Some(value),
                 cost: cost_tracker.get_total(),
                 assets,
                 events,
-            })
+            })))
         }
         Err(error) => {
             database.roll_back()?;
-            Err(error)
+            if is_acceptable_runtime_failure(&error) {
+                Ok(ContractCallOutcome::RuntimeFailure {
+                    cost: cost_tracker.get_total(),
+                    error,
+                })
+            } else {
+                Err(error)
+            }
         }
     }
+}
+
+fn is_acceptable_runtime_failure(error: &VmExecutionError) -> bool {
+    matches!(
+        error,
+        VmExecutionError::Runtime(_, _) | VmExecutionError::EarlyReturn(_)
+    ) || matches!(error, VmExecutionError::RuntimeCheck(error) if !error.rejectable())
 }
 
 /// Transfer STX using the Clarity VM's account and event machinery.
