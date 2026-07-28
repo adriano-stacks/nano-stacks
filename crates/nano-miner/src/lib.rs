@@ -317,6 +317,14 @@ pub struct ProposalCoordinator {
     miner_contract: StackerDbContract,
     signer_contract: StackerDbContract,
     miner_key: StacksPrivateKey,
+    slots: MinerSlots,
+}
+
+/// The two registered `.miners` slots assigned to one miner key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MinerSlots {
+    pub proposal: u32,
+    pub pushed_block: u32,
 }
 
 impl ProposalCoordinator {
@@ -326,12 +334,14 @@ impl ProposalCoordinator {
         miner_contract: StackerDbContract,
         signer_contract: StackerDbContract,
         miner_key: StacksPrivateKey,
+        slots: MinerSlots,
     ) -> Self {
         Self {
             client,
             miner_contract,
             signer_contract,
             miner_key,
+            slots,
         }
     }
 
@@ -340,8 +350,11 @@ impl ProposalCoordinator {
         &self,
         proposal: &BlockProposal,
     ) -> Result<ChunkAck, ProposalError> {
-        self.write_miner_message(0, SignerMessage::BlockProposal(proposal.clone()))
-            .await
+        self.write_miner_message(
+            self.slots.proposal,
+            SignerMessage::BlockProposal(proposal.clone()),
+        )
+        .await
     }
 
     /// Read all current signer responses and return ordered threshold signatures.
@@ -369,7 +382,7 @@ impl ProposalCoordinator {
         &self,
         block: nano_chainstate::NakamotoBlock,
     ) -> Result<ChunkAck, ProposalError> {
-        self.write_miner_message(1, SignerMessage::BlockPushed(block))
+        self.write_miner_message(self.slots.pushed_block, SignerMessage::BlockPushed(block))
             .await
     }
 
