@@ -107,6 +107,7 @@ pub enum SyncError {
     InvalidHash,
     EmptySortition,
     InvalidSortition,
+    UnstableTip,
     Fork,
 }
 
@@ -122,6 +123,7 @@ impl fmt::Display for SyncError {
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
             Self::EmptySortition => formatter.write_str("sortition response contains no entries"),
             Self::InvalidSortition => formatter.write_str("sortition response is inconsistent"),
+            Self::UnstableTip => formatter.write_str("peer tip changed during tenure download"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
         }
     }
@@ -139,6 +141,7 @@ impl std::error::Error for SyncError {
             | Self::InvalidHash
             | Self::EmptySortition
             | Self::InvalidSortition
+            | Self::UnstableTip
             | Self::Fork => None,
         }
     }
@@ -331,54 +334,98 @@ impl TenureFollower {
 
     /// Download the current tenure when the peer's tip has advanced.
     pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
-        let info = self.client.tenure_info().await?;
-        if self
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.tip_block_id == info.tip_block_id)
-        {
-            return Ok(None);
-        }
-        let blocks = self
-            .client
-            .tenure(info.tenure_start_block_id, Some(info.tip_block_id))
-            .await?;
-        if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
-            return Err(SyncError::TenureStart);
-        }
-        if let Some(latest) = &self.latest {
-            validate_tenure_transition(latest, &info)?;
-            if latest.tenure_start_block_id != info.tenure_start_block_id
-                && blocks
+        for _ in 0..3 {
+            let requested_info = self.client.tenure_info().await?;
+            if self
+                .latest
+                .as_ref()
+                .is_some_and(|latest| latest.tip_block_id == requested_info.tip_block_id)
+            {
+                return Ok(None);
+            }
+            if self.latest.as_ref().is_some_and(|latest| {
+                latest.tenure_start_block_id == requested_info.tenure_start_block_id
+            }) {
+                let tip = self.client.block(requested_info.tip_block_id).await?;
+                let previous = self.history.last().ok_or(SyncError::Fork)?;
+                let parent = previous.blocks.last().ok_or(SyncError::EmptyTenure)?;
+                if tip.validate_successor(&parent.header).is_ok() {
+                    let mut blocks = previous.blocks.clone();
+                    blocks.push(tip);
+                    let block_consensus_hash = blocks
+                        .last()
+                        .expect("the appended tip is present")
+                        .header
+                        .consensus_hash;
+                    let sortition = self.client.sortition(block_consensus_hash).await?;
+                    if !sortition.was_sortition {
+                        return Err(SyncError::InvalidSortition);
+                    }
+                    let followed = FollowedTenure {
+                        info: requested_info,
+                        sortition,
+                        blocks,
+                    };
+                    self.record(followed.clone());
+                    return Ok(Some(followed));
+                }
+            }
+            let mut blocks = self
+                .client
+                .tenure(requested_info.tenure_start_block_id, None)
+                .await?;
+            let info = self.client.tenure_info().await?;
+            if info.tenure_start_block_id != requested_info.tenure_start_block_id {
+                continue;
+            }
+            if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
+                let tip = self.client.block(info.tip_block_id).await?;
+                let parent = blocks.last().ok_or(SyncError::EmptyTenure)?;
+                tip.validate_successor(&parent.header)
+                    .map_err(SyncError::TenureLink)?;
+                blocks.push(tip);
+            }
+            if let Some(latest) = &self.latest {
+                validate_tenure_transition(latest, &info)?;
+                if latest.tenure_start_block_id == info.tenure_start_block_id {
+                    let previous = self.history.last().ok_or(SyncError::Fork)?;
+                    if !blocks.starts_with(&previous.blocks) {
+                        return Err(SyncError::Fork);
+                    }
+                } else if blocks
                     .first()
                     .is_none_or(|block| block.header.parent_block_id != latest.tip_block_id)
-            {
-                return Err(SyncError::Fork);
+                {
+                    return Err(SyncError::Fork);
+                }
             }
+            let block_consensus_hash = blocks
+                .last()
+                .map(|block| block.header.consensus_hash)
+                .ok_or(SyncError::EmptyTenure)?;
+            let sortition = self.client.sortition(block_consensus_hash).await?;
+            if !sortition.was_sortition {
+                return Err(SyncError::InvalidSortition);
+            }
+            let followed = FollowedTenure {
+                info: info.clone(),
+                sortition,
+                blocks,
+            };
+            self.record(followed.clone());
+            return Ok(Some(followed));
         }
-        let block_consensus_hash = blocks
-            .last()
-            .map(|block| block.header.consensus_hash)
-            .ok_or(SyncError::EmptyTenure)?;
-        let sortition = self.client.sortition(block_consensus_hash).await?;
-        if !sortition.was_sortition {
-            return Err(SyncError::InvalidSortition);
-        }
-        let followed = FollowedTenure {
-            info: info.clone(),
-            sortition,
-            blocks,
-        };
-        if self
-            .history
-            .last()
-            .is_some_and(|latest| latest.info.tenure_start_block_id == info.tenure_start_block_id)
-        {
+        Err(SyncError::UnstableTip)
+    }
+
+    fn record(&mut self, followed: FollowedTenure) {
+        if self.history.last().is_some_and(|latest| {
+            latest.info.tenure_start_block_id == followed.info.tenure_start_block_id
+        }) {
             self.history.pop();
         }
-        self.history.push(followed.clone());
-        self.latest = Some(info.clone());
-        Ok(Some(followed))
+        self.latest = Some(followed.info.clone());
+        self.history.push(followed);
     }
 }
 
@@ -506,9 +553,10 @@ fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
     use reqwest::Url;
+    use tokio::time::{sleep, timeout};
 
     use super::{
         SyncClient, SyncError, parse_block_hash, parse_block_id, parse_consensus_hash,
@@ -703,6 +751,42 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a running Hacknet node on localhost"]
+    async fn hacknet_follower_spans_prepare_phase_and_reward_cycle_rollover() {
+        let client =
+            SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
+                .expect("create sync client");
+        let mut follower = TenureFollower::new(client.clone());
+        let initial = follower
+            .poll()
+            .await
+            .expect("follow current tenure")
+            .expect("initial tenure");
+        let mut reward_cycles = BTreeSet::from([initial.info.reward_cycle]);
+        let mut saw_prepare_phase = false;
+
+        timeout(Duration::from_secs(75), async {
+            loop {
+                let calendar = client.pox_info().await.expect("fetch stacking calendar");
+                saw_prepare_phase |= is_prepare_phase(&calendar);
+                if let Some(tenure) = follower.poll().await.expect("follow tenure update") {
+                    reward_cycles.insert(tenure.info.reward_cycle);
+                }
+                if saw_prepare_phase && reward_cycles.len() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("span a prepare phase and reward-cycle rollover");
+
+        assert!(saw_prepare_phase);
+        assert!(reward_cycles.len() >= 2);
+        assert!(follower.history().len() >= 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Hacknet node on localhost"]
     async fn hacknet_sortition_authenticates_the_current_tenure() {
         let client =
             SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"))
@@ -720,5 +804,17 @@ mod tests {
         assert_eq!(sortition.consensus_hash, block.header.consensus_hash);
         assert!(sortition.was_sortition);
         assert!(sortition.miner_public_key_hash.is_some());
+    }
+
+    fn is_prepare_phase(calendar: &super::PoxInfo) -> bool {
+        let cycle_length = u64::from(calendar.reward_phase_length)
+            .checked_add(u64::from(calendar.prepare_phase_length))
+            .expect("PoX cycle length fits in u64");
+        let position = calendar
+            .bitcoin_height
+            .checked_sub(calendar.first_bitcoin_height)
+            .expect("Bitcoin height does not predate the first height")
+            % cycle_length;
+        position >= u64::from(calendar.reward_phase_length)
     }
 }

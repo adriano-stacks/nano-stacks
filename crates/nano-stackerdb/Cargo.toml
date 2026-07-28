@@ -18,4 +18,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
