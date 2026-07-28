@@ -666,6 +666,29 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
     pub const fn next_slot_version(&self) -> u32 {
         self.next_slot_version
     }
+
+    /// Return this signer's `StackerDB` writer slot.
+    #[must_use]
+    pub const fn writer_slot(&self) -> u32 {
+        self.writer_slot
+    }
+
+    /// Persistently advance the writer version when the remote slot is newer.
+    pub fn advance_next_slot_version(&mut self, next_slot_version: u32) -> Result<(), SignerError> {
+        if next_slot_version <= self.next_slot_version {
+            return Ok(());
+        }
+        if let Some(state) = &self.state {
+            state.persist(
+                &self.private_key,
+                self.writer_slot,
+                next_slot_version,
+                &self.signed,
+            )?;
+        }
+        self.next_slot_version = next_slot_version;
+        Ok(())
+    }
 }
 
 impl<V: ProposalValidator> SignerService<V> {
@@ -698,6 +721,7 @@ impl<V: ProposalValidator> SignerService<V> {
         let SignerMessage::BlockProposal(proposal) = SignerMessage::decode(&bytes)? else {
             return Err(SignerServiceError::UnexpectedMessage);
         };
+        self.reconcile_writer_slot().await?;
         let chunk = self.signer.sign(&proposal)?;
         let acknowledgement = self.client.put_chunk(&self.signer_contract, &chunk).await?;
         if !acknowledgement.accepted {
@@ -708,6 +732,22 @@ impl<V: ProposalValidator> SignerService<V> {
         }
         self.last_proposal = Some(proposal_hash);
         Ok(Some(acknowledgement))
+    }
+
+    /// Advance the local writer version to the latest version accepted by `StackerDB`.
+    pub async fn reconcile_writer_slot(&mut self) -> Result<(), SignerServiceError> {
+        let version = self
+            .client
+            .slot_versions(&self.signer_contract)
+            .await?
+            .into_iter()
+            .find(|slot| slot.slot_id == self.signer.writer_slot())
+            .map_or(0, |slot| slot.slot_version);
+        let next = version
+            .checked_add(1)
+            .ok_or(SignerError::SlotVersionOverflow)?;
+        self.signer.advance_next_slot_version(next)?;
+        Ok(())
     }
 }
 
@@ -896,5 +936,27 @@ mod tests {
             signer.sign(&conflicting),
             Err(SignerError::Equivocation)
         ));
+    }
+
+    #[test]
+    fn signer_journal_persists_remote_writer_version_advances() {
+        let directory = tempdir().expect("create temporary signer directory");
+        let path = directory.path().join("signer-state.json");
+        let config = SignerConfig {
+            private_key: StacksPrivateKey::from_seed(b"signer"),
+            writer_slot: 7,
+            next_slot_version: 3,
+        };
+        {
+            let mut signer = EmbeddedSigner::from_state_file(config.clone(), Accept, &path)
+                .expect("open signer journal");
+            signer
+                .advance_next_slot_version(9)
+                .expect("advance writer version");
+        }
+
+        let signer =
+            EmbeddedSigner::from_state_file(config, Accept, &path).expect("reopen signer journal");
+        assert_eq!(signer.next_slot_version(), 9);
     }
 }
