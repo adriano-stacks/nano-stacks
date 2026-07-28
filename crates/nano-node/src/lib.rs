@@ -229,11 +229,10 @@ impl ExecutingNode {
     /// Follow, validate, and execute the peer's next tenure update.
     pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, NodeExecutionError> {
         let followed = self.node.poll().await?;
-        if let Some(tenure) = &followed {
-            let view = self.node.view().ok_or(NodeExecutionError::MissingView)?;
-            self.executor
-                .apply_followed_tenure(tenure, &view.pox_info)?;
-        }
+        let view = self.node.view().ok_or(NodeExecutionError::MissingView)?;
+        let tenure = view.tenures.last().ok_or(NodeExecutionError::MissingView)?;
+        self.executor
+            .apply_followed_tenure(tenure, &view.pox_info)?;
         Ok(followed)
     }
 
