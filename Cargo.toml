@@ -13,6 +13,7 @@ members = [
     "crates/nano-sync",
     "crates/nano-stackerdb",
     "crates/nano-signer",
+    "crates/nano-miner",
     "crates/nano-node",
     "crates/nano-rpc",
     "crates/nano-conformance",

@@ -1,0 +1,17 @@
+[package]
+name = "nano-miner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitcoin = "0.32.8"
+bitcoincore-rpc = "0.19.0"
+nano-address = { path = "../nano-address" }
+nano-bitcoin = { path = "../nano-bitcoin" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[lints]
+workspace = true
