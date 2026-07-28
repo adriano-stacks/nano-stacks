@@ -38,6 +38,20 @@ pub struct AppliedBlock {
     pub receipts: Vec<TransactionReceipt>,
 }
 
+/// Native accounting that is applied when an epoch-4 block is finalized.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeBlockEffects {
+    pub credits: Vec<NativeStxCredit>,
+    pub liquid_supply_increase: u128,
+}
+
+/// One liquid-STX credit produced by native chainstate accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeStxCredit {
+    pub recipient: PrincipalData,
+    pub amount: u128,
+}
+
 /// A transaction result retained while applying a Nakamoto block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransactionReceipt {
@@ -212,8 +226,24 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.append_nakamoto_block_with_effects(
+            bitcoin_context,
+            parent,
+            block,
+            NativeBlockEffects::default(),
+        )
+    }
+
+    /// Execute native accounting and verify the state root committed by a Nakamoto block.
+    pub fn append_nakamoto_block_with_effects(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        effects: NativeBlockEffects,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let applied =
-            self.execute_nakamoto_block_with_bitcoin_context(bitcoin_context, parent, block)?;
+            self.execute_nakamoto_block_with_effects(bitcoin_context, parent, block, effects)?;
         let actual = TrieHash::from_bytes(applied.execution.state_root.0);
         if actual != block.header.state_index_root {
             return Err(ChainStateError::StateRootMismatch {
@@ -231,8 +261,24 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.execute_nakamoto_block_with_effects(
+            bitcoin_context,
+            parent,
+            block,
+            NativeBlockEffects::default(),
+        )
+    }
+
+    /// Execute a Nakamoto block with native accounting effects derived from its Bitcoin context.
+    pub fn execute_nakamoto_block_with_effects(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        effects: NativeBlockEffects,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
-        self.execute_nakamoto_block(bitcoin_context, parent, &mut block, None)
+        self.execute_nakamoto_block(bitcoin_context, parent, &mut block, None, effects)
     }
 
     /// Execute a block candidate, derive its committed state root, and finalize its block ID.
@@ -243,8 +289,13 @@ impl ChainState {
         mut block: NakamotoBlock,
         miner_key: &StacksPrivateKey,
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
-        let applied =
-            self.execute_nakamoto_block(bitcoin_context, parent, &mut block, Some(miner_key))?;
+        let applied = self.execute_nakamoto_block(
+            bitcoin_context,
+            parent,
+            &mut block,
+            Some(miner_key),
+            NativeBlockEffects::default(),
+        )?;
         Ok((block, applied))
     }
 
@@ -254,6 +305,7 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &mut NakamotoBlock,
         miner_key: Option<&StacksPrivateKey>,
+        effects: NativeBlockEffects,
     ) -> Result<AppliedBlock, ChainStateError> {
         if let Some(parent) = parent {
             let parent_height = block.header.chain_length.checked_sub(1).ok_or_else(|| {
@@ -292,6 +344,11 @@ impl ChainState {
                 })?;
                 receipts.push(receipt);
             }
+            for credit in effects.credits {
+                self.vm.credit_stx(&credit.recipient, credit.amount)?;
+            }
+            self.vm
+                .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
             if let Some(miner_key) = miner_key {
