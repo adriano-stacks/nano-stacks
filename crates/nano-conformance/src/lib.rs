@@ -822,7 +822,12 @@ mod tests {
         block_height: u64,
         burn_header_hash: String,
         parent_burn_header_hash: String,
+        sortition_id: String,
+        parent_sortition_id: String,
+        consensus_hash: String,
         ops_hash: String,
+        total_burn: String,
+        pox_valid: u8,
         sortition: u8,
         sortition_hash: String,
         winning_block_txid: String,
@@ -2146,8 +2151,12 @@ mod tests {
                 operations: Vec::new(),
             };
             let winner_vrf_seed = (height % 3 == 0).then_some(hash);
+            let winner = winner_vrf_seed.map(|vrf_seed| nano_sortition::SortitionWinner {
+                txid: hash,
+                vrf_seed,
+            });
             let snapshot = chain
-                .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner_vrf_seed)
+                .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner)
                 .expect("contiguous Bitcoin block");
             let reference_header_hash = ReferenceBitcoinHeaderHash(hash);
             let reference_ops_hash = ReferenceOpsHash::from_txids(&[]);
@@ -2191,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_sortition_hashes_form_the_reference_bitcoin_chain() {
+    fn captured_sortition_snapshots_match_the_reference_bitcoin_chain() {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let path = fixture_root.join("sortition/snapshots.json");
         let snapshots: Vec<CapturedSortitionSnapshot> =
@@ -2210,6 +2219,14 @@ mod tests {
             chain.tip().sortition_hash.as_bytes(),
             &hex_array(&genesis.sortition_hash)
         );
+        assert_eq!(
+            chain.tip().sortition_id.as_bytes(),
+            &hex_array(&genesis.sortition_id)
+        );
+
+        let schedule = nano_sortition::RewardCycleSchedule::new(0, 20, Some(280))
+            .expect("captured reward-cycle schedule is valid");
+        let mut pox = nano_sortition::PoxIdTracker::new(schedule);
 
         let mut pre_stx_cache = PreStxCache::new();
         for snapshot in snapshots.iter().skip(1) {
@@ -2240,7 +2257,7 @@ mod tests {
                     snapshot.block_height
                 )
             });
-            let winner_vrf_seed = (snapshot.sortition != 0).then(|| {
+            let winner = (snapshot.sortition != 0).then(|| {
                 let winning_txid = hex_array(&snapshot.winning_block_txid);
                 block
                     .operations
@@ -2249,7 +2266,10 @@ mod tests {
                     .and_then(|operation| match operation.kind {
                         nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
                             new_seed, ..
-                        } => Some(new_seed),
+                        } => Some(nano_sortition::SortitionWinner {
+                            txid: winning_txid,
+                            vrf_seed: new_seed,
+                        }),
                         _ => None,
                     })
                     .unwrap_or_else(|| {
@@ -2259,9 +2279,48 @@ mod tests {
                         )
                     })
             });
+            let pox_id = pox
+                .advance(snapshot.block_height, snapshot.pox_valid != 0)
+                .expect("captured Bitcoin heights are contiguous")
+                .clone();
+            let total_burn = snapshot
+                .total_burn
+                .parse::<u64>()
+                .expect("captured total burn is a u64");
             let derived = chain
-                .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner_vrf_seed)
+                .append_with_winner(&block, total_burn, pox_id, winner)
                 .expect("contiguous captured Bitcoin block");
+            assert_eq!(derived.total_burn, total_burn, "{}", snapshot.block_height);
+            assert_eq!(
+                derived.operations_hash.as_bytes(),
+                &hex_array(&snapshot.ops_hash),
+                "{}",
+                snapshot.block_height
+            );
+            assert_eq!(
+                derived.winner_txid,
+                (snapshot.sortition != 0).then(|| hex_array(&snapshot.winning_block_txid)),
+                "{}",
+                snapshot.block_height
+            );
+            assert_eq!(
+                derived.consensus_hash.as_bytes(),
+                &hex_array(&snapshot.consensus_hash),
+                "{}",
+                snapshot.block_height
+            );
+            assert_eq!(
+                derived.sortition_id.as_bytes(),
+                &hex_array(&snapshot.sortition_id),
+                "{}",
+                snapshot.block_height
+            );
+            assert_eq!(
+                derived.parent_sortition_id.as_bytes(),
+                &hex_array(&snapshot.parent_sortition_id),
+                "{}",
+                snapshot.block_height
+            );
             assert_eq!(
                 derived.sortition_hash.as_bytes(),
                 &hex_array(&snapshot.sortition_hash),
@@ -2707,8 +2766,8 @@ mod tests {
         }
     }
 
-    fn hex_array(value: &str) -> [u8; 32] {
-        let mut bytes = [0; 32];
+    fn hex_array<const N: usize>(value: &str) -> [u8; N] {
+        let mut bytes = [0; N];
         hex::decode_to_slice(value, &mut bytes).expect("fixed-size hex hash");
         bytes
     }

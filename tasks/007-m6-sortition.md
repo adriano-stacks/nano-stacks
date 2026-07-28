@@ -1,12 +1,13 @@
 ---
 id: "007"
 title: "M6: implement sortition"
-status: in-progress
+status: completed
 priority: high
 effort: large
 dependencies: ["006"]
 tags: ["m6", "sortition"]
 created_at: 2026-07-27
+completed_at: 2026-07-28
 ---
 
 # M6: implement sortition
@@ -21,7 +22,7 @@ production dependency on Stacks-Core.
 - [x] Implement operation, consensus, and rolling sortition hashes.
 - [x] Build the six-block commit distribution and assumed-total-commit rules.
 - [x] Select winners and maintain snapshot state across Bitcoin blocks.
-- [ ] Replay captured snapshots and compare every consensus-critical field.
+- [x] Replay captured snapshots and compare every consensus-critical field.
 
 ## Acceptance Criteria
 

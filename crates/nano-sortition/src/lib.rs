@@ -5,7 +5,9 @@ pub(crate) mod carryover;
 use std::{collections::HashMap, fmt};
 
 use nano_bitcoin::BitcoinBlock;
-use nano_primitives::{BitcoinHeaderHash, ConsensusHash, Uint256, Uint512, hash160, sha256};
+use nano_primitives::{
+    BitcoinHeaderHash, ConsensusHash, SortitionId, Uint256, Uint512, hash160, sha256, sha512_256,
+};
 
 const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23, 0, 0, 0];
 
@@ -65,6 +67,12 @@ pub struct MiningCommitment {
     pub spent_txid: [u8; 32],
     pub spent_output: u32,
     pub burn_sats: u64,
+    pub vrf_seed: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SortitionWinner {
+    pub txid: [u8; 32],
     pub vrf_seed: [u8; 32],
 }
 
@@ -344,11 +352,99 @@ impl PoxId {
     }
 
     #[must_use]
+    pub fn bits(&self) -> &[bool] {
+        &self.0
+    }
+
+    #[must_use]
     pub fn as_consensus_bytes(&self) -> Vec<u8> {
         self.0
             .iter()
             .map(|present| if *present { b'1' } else { b'0' })
             .collect()
+    }
+}
+
+/// Bitcoin reward-cycle rules that determine when the PoX history advances.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RewardCycleSchedule {
+    first_bitcoin_height: u64,
+    reward_cycle_length: u64,
+    first_waterfall_height: Option<u64>,
+}
+
+impl RewardCycleSchedule {
+    pub fn new(
+        first_bitcoin_height: u64,
+        reward_cycle_length: u64,
+        first_waterfall_height: Option<u64>,
+    ) -> Result<Self, SortitionError> {
+        if reward_cycle_length == 0 {
+            return Err(SortitionError::ZeroRewardCycleLength);
+        }
+        Ok(Self {
+            first_bitcoin_height,
+            reward_cycle_length,
+            first_waterfall_height,
+        })
+    }
+
+    fn starts_at(&self, bitcoin_height: u64) -> bool {
+        let relative_height = bitcoin_height - self.first_bitcoin_height;
+        if self
+            .first_waterfall_height
+            .is_some_and(|height| bitcoin_height >= height)
+        {
+            relative_height % self.reward_cycle_length == 0
+        } else {
+            relative_height % self.reward_cycle_length == 1
+        }
+    }
+}
+
+/// Tracks the PoX history committed to by each Bitcoin snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoxIdTracker {
+    schedule: RewardCycleSchedule,
+    pox_id: PoxId,
+    bitcoin_height: u64,
+}
+
+impl PoxIdTracker {
+    #[must_use]
+    pub fn new(schedule: RewardCycleSchedule) -> Self {
+        Self {
+            bitcoin_height: schedule.first_bitcoin_height,
+            schedule,
+            pox_id: PoxId::initial(),
+        }
+    }
+
+    #[must_use]
+    pub fn pox_id(&self) -> &PoxId {
+        &self.pox_id
+    }
+
+    pub fn advance(
+        &mut self,
+        bitcoin_height: u64,
+        anchor_known: bool,
+    ) -> Result<&PoxId, SortitionError> {
+        let expected = self
+            .bitcoin_height
+            .checked_add(1)
+            .ok_or(SortitionError::HeightOverflow)?;
+        if bitcoin_height != expected {
+            return Err(SortitionError::UnexpectedHeight {
+                expected,
+                actual: bitcoin_height,
+            });
+        }
+        if self.schedule.starts_at(bitcoin_height) {
+            self.pox_id.extend_with_anchor(anchor_known);
+        }
+        self.bitcoin_height = bitcoin_height;
+        Ok(&self.pox_id)
     }
 }
 
@@ -364,10 +460,13 @@ impl fmt::Display for PoxId {
 pub struct SortitionSnapshot {
     pub bitcoin_height: u64,
     pub bitcoin_header_hash: BitcoinHeaderHash,
+    pub sortition_id: SortitionId,
+    pub parent_sortition_id: SortitionId,
     pub operations_hash: OpsHash,
     pub consensus_hash: ConsensusHash,
     pub total_burn: u64,
     pub sortition_hash: SortitionHash,
+    pub winner_txid: Option<[u8; 32]>,
     pub winner_vrf_seed: Option<[u8; 32]>,
     pub pox_id: PoxId,
 }
@@ -378,10 +477,13 @@ impl SortitionSnapshot {
         Self {
             bitcoin_height,
             bitcoin_header_hash,
+            sortition_id: SortitionId::from_bytes(*bitcoin_header_hash.as_bytes()),
+            parent_sortition_id: SortitionId::from_bytes(*bitcoin_header_hash.as_bytes()),
             operations_hash: OpsHash([0; 32]),
             consensus_hash: ConsensusHash::from_bytes([0; 20]),
             total_burn: 0,
             sortition_hash: SortitionHash::initial(),
+            winner_txid: None,
             winner_vrf_seed: None,
             pox_id: PoxId::initial(),
         }
@@ -425,14 +527,14 @@ impl SnapshotChain {
         block: &BitcoinBlock,
         total_burn: u64,
         pox_id: PoxId,
-        winner_vrf_seed: Option<[u8; 32]>,
+        winner: Option<SortitionWinner>,
     ) -> Result<&SortitionSnapshot, SortitionError> {
         let operation_txids = block
             .operations
             .iter()
             .map(|operation| operation.txid)
             .collect::<Vec<_>>();
-        self.append_with_operations(block, &operation_txids, total_burn, pox_id, winner_vrf_seed)
+        self.append_with_operations(block, &operation_txids, total_burn, pox_id, winner)
     }
 
     pub fn append_with_operations(
@@ -441,7 +543,7 @@ impl SnapshotChain {
         operation_txids: &[[u8; 32]],
         total_burn: u64,
         pox_id: PoxId,
-        winner_vrf_seed: Option<[u8; 32]>,
+        winner: Option<SortitionWinner>,
     ) -> Result<&SortitionSnapshot, SortitionError> {
         let parent = self.tip();
         let expected_height = parent
@@ -470,12 +572,16 @@ impl SnapshotChain {
         let snapshot = SortitionSnapshot {
             bitcoin_height: block.height,
             bitcoin_header_hash,
+            sortition_id: sortition_id(bitcoin_header_hash, &pox_id),
+            parent_sortition_id: parent.sortition_id,
             operations_hash,
             consensus_hash,
             total_burn,
-            sortition_hash: winner_vrf_seed
-                .map_or(sortition_hash, |seed| sortition_hash.mix_vrf_seed(seed)),
-            winner_vrf_seed,
+            sortition_hash: winner.map_or(sortition_hash, |winner| {
+                sortition_hash.mix_vrf_seed(winner.vrf_seed)
+            }),
+            winner_txid: winner.map(|winner| winner.txid),
+            winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             pox_id,
         };
         self.snapshots.push(snapshot);
@@ -496,6 +602,13 @@ impl SnapshotChain {
         }
         hashes
     }
+}
+
+fn sortition_id(bitcoin_header_hash: BitcoinHeaderHash, pox_id: &PoxId) -> SortitionId {
+    let mut bytes = Vec::with_capacity(bitcoin_header_hash.as_bytes().len() + pox_id.0.len());
+    bytes.extend_from_slice(bitcoin_header_hash.as_bytes());
+    bytes.extend_from_slice(&pox_id.as_consensus_bytes());
+    SortitionId::from_bytes(*sha512_256(&bytes).as_bytes())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -566,11 +679,19 @@ impl SortitionEngine {
                 .tip()
                 .total_burn
                 .checked_add(statistics.block_burn)
-                .map(|total_burn| (total_burn, distribution[index].candidate.vrf_seed))
+                .map(|total_burn| {
+                    (
+                        total_burn,
+                        SortitionWinner {
+                            txid: distribution[index].candidate.txid,
+                            vrf_seed: distribution[index].candidate.vrf_seed,
+                        },
+                    )
+                })
         });
-        let (total_burn, winner_vrf_seed) = winner.map_or_else(
+        let (total_burn, winner) = winner.map_or_else(
             || (self.snapshots.tip().total_burn, None),
-            |(total_burn, winner_vrf_seed)| (total_burn, Some(winner_vrf_seed)),
+            |(total_burn, winner)| (total_burn, Some(winner)),
         );
         self.commitment_window = window;
         self.snapshots.append_with_operations(
@@ -578,7 +699,7 @@ impl SortitionEngine {
             accepted_operation_txids,
             total_burn,
             pox_id,
-            winner_vrf_seed,
+            winner,
         )
     }
 }
@@ -616,6 +737,7 @@ pub enum SortitionError {
     WindowTooLong,
     BurnOverflow,
     ZeroBurnDistribution,
+    ZeroRewardCycleLength,
     HeightOverflow,
     UnexpectedHeight { expected: u64, actual: u64 },
 }
@@ -629,6 +751,9 @@ impl fmt::Display for SortitionError {
             Self::BurnOverflow => formatter.write_str("commitment burn amount overflow"),
             Self::ZeroBurnDistribution => {
                 formatter.write_str("commitment distribution has no burn")
+            }
+            Self::ZeroRewardCycleLength => {
+                formatter.write_str("reward cycle length cannot be zero")
             }
             Self::HeightOverflow => formatter.write_str("Bitcoin height overflow"),
             Self::UnexpectedHeight { expected, actual } => {
@@ -653,8 +778,9 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitmentWindowBlock, MiningCommitment, SortitionEngine, SortitionHash, SortitionSnapshot,
-        commitment_burn_statistics, commitment_distribution, select_epoch4_winner, select_winner,
+        CommitmentWindowBlock, MiningCommitment, PoxIdTracker, RewardCycleSchedule,
+        SortitionEngine, SortitionHash, SortitionSnapshot, commitment_burn_statistics,
+        commitment_distribution, select_epoch4_winner, select_winner,
     };
 
     #[test]
@@ -751,6 +877,7 @@ mod tests {
             )
             .expect("first sortition snapshot");
         assert_eq!(snapshot.total_burn, 10);
+        assert_eq!(snapshot.winner_txid, Some(first.txid));
         assert_eq!(snapshot.winner_vrf_seed, Some(first.vrf_seed));
         assert_eq!(
             snapshot.operations_hash,
@@ -771,8 +898,37 @@ mod tests {
             )
             .expect("second sortition snapshot");
         assert_eq!(snapshot.total_burn, 20);
+        assert_eq!(snapshot.winner_txid, Some(second.txid));
         assert_eq!(snapshot.winner_vrf_seed, Some(second.vrf_seed));
         assert_eq!(engine.commitment_window().len(), 2);
+    }
+
+    #[test]
+    fn pox_tracker_uses_classic_and_waterfall_cycle_starts() {
+        let schedule = RewardCycleSchedule::new(0, 20, Some(280)).expect("valid schedule");
+        let mut tracker = PoxIdTracker::new(schedule);
+        for height in 1..=300 {
+            tracker.advance(height, true).expect("contiguous height");
+            let expected_length = if height < 280 {
+                (height - 1) / 20 + 2
+            } else {
+                (height - 280) / 20 + 16
+            };
+            assert_eq!(
+                tracker.pox_id().bits().len(),
+                usize::try_from(expected_length).expect("test length fits usize"),
+                "{height}"
+            );
+            assert!(tracker.pox_id().bits().iter().all(|bit| *bit));
+        }
+    }
+
+    #[test]
+    fn pox_tracker_records_an_unknown_anchor() {
+        let schedule = RewardCycleSchedule::new(0, 20, None).expect("valid schedule");
+        let mut tracker = PoxIdTracker::new(schedule);
+        tracker.advance(1, false).expect("first cycle start");
+        assert_eq!(tracker.pox_id().bits(), &[true, false]);
     }
 
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
