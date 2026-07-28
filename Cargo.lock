@@ -1767,16 +1767,20 @@ name = "nano-signer"
 version = "0.1.0"
 dependencies = [
  "atomicwrites",
+ "clap",
  "fs2",
  "hex",
+ "nano-address",
  "nano-chainstate",
  "nano-crypto",
  "nano-primitives",
  "nano-stackerdb",
  "nano-sync",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
