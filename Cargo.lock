@@ -2579,6 +2579,7 @@ dependencies = [
  "nano-sortition",
  "nano-stackerdb",
  "nano-sync",
+ "nano-vm",
  "proptest",
  "reqwest",
  "serde",
@@ -2639,6 +2640,7 @@ version = "0.1.0"
 dependencies = [
  "nano-bitcoin",
  "nano-chainstate",
+ "nano-codec",
  "nano-crypto",
  "nano-primitives",
  "nano-sync",
@@ -2723,6 +2725,7 @@ version = "0.1.0"
 dependencies = [
  "nano-address",
  "nano-chainstate",
+ "nano-codec",
  "nano-crypto",
  "nano-primitives",
  "reqwest",

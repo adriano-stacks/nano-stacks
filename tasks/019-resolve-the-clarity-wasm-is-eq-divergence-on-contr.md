@@ -1,11 +1,12 @@
 ---
 id: "019"
 title: "Resolve the clarity-wasm is-eq divergence on contract principals"
-status: pending
+status: completed
 priority: medium
 dependencies: []
 tags: []
 created_at: 2026-07-29
+completed_at: 2026-07-29
 ---
 
 # Resolve the clarity-wasm is-eq divergence on contract principals
