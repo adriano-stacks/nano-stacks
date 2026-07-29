@@ -22,6 +22,8 @@ use nano_stackerdb::{
 use nano_sync::{SortitionInfo, SyncClient, SyncError};
 use serde::{Deserialize, Serialize};
 
+pub mod events;
+
 /// Checks a miner proposal against the node's current chain and sortition view.
 pub trait ProposalValidator {
     /// Return an explanation when a proposal must not be signed.
