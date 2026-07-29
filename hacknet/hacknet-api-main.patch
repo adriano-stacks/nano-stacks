@@ -1,0 +1,82 @@
+diff --git a/docker/api/Dockerfile b/docker/api/Dockerfile
+new file mode 100644
+index 0000000..7d5a9cc
+--- /dev/null
++++ b/docker/api/Dockerfile
+@@ -0,0 +1,20 @@
++FROM node:24-bookworm-slim
++
++ARG STACKS_API_REV=da67d3cde83ec0f0275ab418a67fb1b471a4b4e7
++
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends ca-certificates git \
++    && rm -rf /var/lib/apt/lists/*
++
++RUN git clone https://github.com/hirosystems/stacks-blockchain-api.git /app \
++    && cd /app \
++    && git checkout "$STACKS_API_REV"
++
++WORKDIR /app
++COPY pox5-stake-update.patch /tmp/pox5-stake-update.patch
++RUN git apply /tmp/pox5-stake-update.patch \
++    && npm ci --no-audit \
++    && npm run build \
++    && npm prune --production
++
++CMD ["node", "./lib/index.js"]
+diff --git a/docker/api/pox5-stake-update.patch b/docker/api/pox5-stake-update.patch
+new file mode 100644
+index 0000000..c2cc047
+--- /dev/null
++++ b/docker/api/pox5-stake-update.patch
+@@ -0,0 +1,40 @@
++diff --git a/src/event-stream/event-server.ts b/src/event-stream/event-server.ts
++index 084c37b..61173ec 100644
++--- a/src/event-stream/event-server.ts
+++++ b/src/event-stream/event-server.ts
++@@ -60,5 +60,10 @@ import { hexToBuffer, isProdEnv, logger, PINO_LOGGER_CONFIG, stopwatch } from '
++ import { ENV } from '../env.js';
++-import { POX_2_CONTRACT_NAME, POX_3_CONTRACT_NAME, POX_4_CONTRACT_NAME } from './pox-constants.js';
+++import {
+++  POX_2_CONTRACT_NAME,
+++  POX_3_CONTRACT_NAME,
+++  POX_4_CONTRACT_NAME,
+++  POX_5_CONTRACT_NAME,
+++} from './pox-constants.js';
++ import {
++   DropMempoolTxMessage,
++   NewBlockEvent,
++@@ -404,7 +409,22 @@ function parseDataStoreTxEventData(
++         if (isPoxPrintEvent(event)) {
++           const network = getChainIDNetwork(chainId);
++           const [, contractName] = event.contract_event.contract_identifier.split('.');
++-          const poxEvent = decodePoxSyntheticEvent(event.contract_event.raw_value, network);
+++          let poxEvent;
+++          try {
+++            poxEvent = decodePoxSyntheticEvent(event.contract_event.raw_value, network);
+++          } catch (error) {
+++            if (
+++              contractName === POX_5_CONTRACT_NAME &&
+++              error instanceof Error &&
+++              error.message.includes('Missing expected tuple field: prev-unlock-height')
+++            ) {
+++              logger.warn(
+++                'Ignoring unsupported PoX-5 stake-update synthetic event; the raw contract log is retained'
+++              );
+++            } else {
+++              throw error;
+++            }
+++          }
++           if (poxEvent) {
++             logger.debug(`Decoded pox event for ${contractName}:`, poxEvent);
++             switch (poxEvent.pox_version) {
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index 80e030e..b40d84b 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -441,2 +441,4 @@ services:
+   stacks-api:
+-    image: *IMAGE_STACKS_API
++    build:
++      context: api
++    image: hacknet/stacks-api:9.0.1-pox5-core-main

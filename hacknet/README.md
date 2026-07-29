@@ -11,16 +11,19 @@ Hacknet's current default is still a pre-merge PoX-5 integration and API
 `9.0.0-pox5.8`. Apply the compatibility patch before starting a new network:
 
 ```
-git -C ../hacknet apply /home/aldur/nano-stacks/hacknet/hacknet-main.patch
+git -C ../hacknet apply --unidiff-zero /home/aldur/nano-stacks/hacknet/hacknet-main.patch
+git -C ../hacknet apply --unidiff-zero /home/aldur/nano-stacks/hacknet/hacknet-api-main.patch
 (cd ../hacknet && make genesis)
 ```
 
-The patch selects Stacks Core `main` and the stable API `9.0.1`. It preserves
-Hacknet's configured sBTC contracts, so the existing PoX-5 bootstrap and
-Bitcoin-staking helpers keep working. Those sBTC contracts are still external
-dependencies, so `pox5-setup` remains required. It applies to Hacknet commit
-`bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1` and can be removed once upstream
-merges the equivalent change.
+The patches select Stacks Core `main` and stable API `9.0.1`. The second patch
+builds the API from its release commit and retains raw PoX-5 `stake-update`
+events that its bundled codec cannot yet decode after Core renamed
+`prev-unlock-height` to `prev-unlock-cycle`. It preserves Hacknet's configured
+sBTC contracts, so the existing PoX-5 bootstrap and Bitcoin-staking helpers
+keep working. Those sBTC contracts are still external dependencies, so
+`pox5-setup` remains required. They apply to Hacknet commit
+`bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1`.
 
 ## Keys
 
