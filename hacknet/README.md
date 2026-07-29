@@ -5,6 +5,22 @@ an ordinary participant: it holds Stacks and Bitcoin keys of its own, stacks for
 signer slot, and commits on Bitcoin for a tenure. Nothing here is nano-specific
 protocol; it is the same setup a stock signer or miner needs.
 
+## Released PoX-5 baseline
+
+Hacknet's current default is still a pre-merge PoX-5 integration and API
+`9.0.0-pox5.8`. Apply the compatibility patch before starting a new network:
+
+```
+git -C ../hacknet apply /home/aldur/nano-stacks/hacknet/hacknet-main.patch
+(cd ../hacknet && make genesis)
+```
+
+The patch selects Stacks Core `main` and the stable API `9.0.1`. It preserves
+Hacknet's configured sBTC contracts, so the existing PoX-5 bootstrap and
+Bitcoin-staking helpers keep working. It applies to Hacknet commit
+`bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1` and can be removed once upstream
+merges the equivalent change.
+
 ## Keys
 
 Four secrets, kept outside the repository in a gitignored `.hacknet/`:
