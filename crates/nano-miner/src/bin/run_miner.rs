@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match commit(&cli, &node, &wallet, &password, leader_key).await {
                 Ok(()) => committed_at = bitcoin_height,
                 Err(error) => {
-                    eprintln!("committing at Bitcoin height {bitcoin_height} failed: {error}")
+                    eprintln!("committing at Bitcoin height {bitcoin_height} failed: {error}");
                 }
             }
         }

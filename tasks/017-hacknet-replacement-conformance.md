@@ -1,12 +1,13 @@
 ---
 id: "017"
 title: "Run nano-stacks as a Hacknet replacement"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: []
 tags: ["hacknet", "conformance"]
 created_at: 2026-07-29
+completed_at: 2026-07-29
 ---
 
 # Run nano-stacks as a Hacknet replacement
@@ -22,7 +23,7 @@ replaced by nano-stacks, and make that run reproducible as conformance coverage.
 - [x] Add a repeatable replacement harness.
 - [x] Replace a signer and verify continued canonical block production.
 - [x] Replace a miner and verify continued canonical block production.
-- [ ] Run the harness in the test suite and document its prerequisites.
+- [x] Run the harness in the test suite and document its prerequisites.
 
 ## Acceptance Criteria
 
