@@ -1,22 +1,24 @@
 diff --git a/README.md b/README.md
+index df68bf3..9a8723f 100644
 --- a/README.md
 +++ b/README.md
-@@ -53,1 +53,1 @@
+@@ -53 +53 @@ make down
 -Hacknet defaults to the Stacks Core PoX-5 integration SHA configured in `docker/docker-compose.yml`.
 +Hacknet defaults to Stacks Core `main`, which includes the released PoX-5 implementation.
-@@ -262,1 +262,1 @@
+@@ -262 +262 @@ make down-prom
 -- **pox5-setup**: temporary bootstrap that deploys `sbtc-registry` and `sbtc-token` before Epoch 4.0 so `.pox-5` can initialize until those dependencies become boot contracts
 +- **pox5-setup**: deploys the configured non-mainnet `sbtc-registry` and `sbtc-token` contracts before Epoch 4.0 so `.pox-5` can initialize
 diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index 80e030e..241245c 100644
 --- a/docker/docker-compose.yml
 +++ b/docker/docker-compose.yml
-@@ -65,1 +65,1 @@ x-common-vars:
+@@ -65 +65 @@ x-common-vars:
 -  - &IMAGE_STACKS_API hirosystems/stacks-blockchain-api:9.0.0-pox5.8
 +  - &IMAGE_STACKS_API hirosystems/stacks-blockchain-api:9.0.1
-@@ -112,1 +112,1 @@ x-common-vars:
+@@ -112 +112 @@ x-common-vars:
 -  - &STACKS_CORE_BASE_BRANCH ${STACKS_CORE_BASE_BRANCH:-e04ba8e101fe2f71fae9c79a956b599e0523f3ae} # branch, tag, or commit SHA
 +  - &STACKS_CORE_BASE_BRANCH ${STACKS_CORE_BASE_BRANCH:-main} # branch, tag, or commit SHA
-@@ -478,2 +478,1 @@ services:
+@@ -478,2 +478 @@ services:
 -  # Temporary bootstrap for PoX-5 dependency contracts until stacks-core ships
 -  # them as boot contracts.
 +  # Deploy the configured non-mainnet sBTC dependencies before Epoch 4.0.
