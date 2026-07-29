@@ -86,6 +86,39 @@ pub struct ActiveSortitionValidator<V> {
     validator: V,
 }
 
+/// A validator that can be told what a tenure's coinbase accumulated.
+pub trait AccumulatedCoinbase {
+    /// The coinbase schedule in use, if the checkpoint configured one.
+    fn coinbase_schedule(&mut self) -> Option<nano_chainstate::CoinbaseSchedule>;
+    /// Record the accumulation a tenure's Bitcoin height awarded.
+    fn set_accumulated_coinbase(&mut self, bitcoin_height: u64, accumulated: u128);
+}
+
+impl<S> AccumulatedCoinbase for ChainstateProposalValidator<S>
+where
+    S: BitcoinSource,
+    S::Error: fmt::Display,
+{
+    fn coinbase_schedule(&mut self) -> Option<nano_chainstate::CoinbaseSchedule> {
+        self.chainstate.accounting_mut().schedule()
+    }
+
+    fn set_accumulated_coinbase(&mut self, bitcoin_height: u64, accumulated: u128) {
+        self.accumulated.insert(bitcoin_height, accumulated);
+    }
+}
+
+impl<V: AccumulatedCoinbase> AccumulatedCoinbase for ActiveSortitionValidator<V> {
+    fn coinbase_schedule(&mut self) -> Option<nano_chainstate::CoinbaseSchedule> {
+        self.validator.coinbase_schedule()
+    }
+
+    fn set_accumulated_coinbase(&mut self, bitcoin_height: u64, accumulated: u128) {
+        self.validator
+            .set_accumulated_coinbase(bitcoin_height, accumulated);
+    }
+}
+
 impl<V> ActiveSortitionValidator<V> {
     /// Construct a validator that refuses proposals until its Bitcoin context is refreshed.
     #[must_use]
@@ -132,6 +165,8 @@ pub struct ChainstateProposalValidator<S> {
     bitcoin: S,
     trusted: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
     candidates: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
+    /// Coinbase each tenure accumulated, by the Bitcoin height that awarded it.
+    accumulated: BTreeMap<u64, u128>,
 }
 
 impl<S> ChainstateProposalValidator<S>
@@ -155,6 +190,7 @@ where
             bitcoin,
             trusted,
             candidates: BTreeMap::new(),
+            accumulated: BTreeMap::new(),
         }
     }
 
@@ -180,9 +216,14 @@ where
         self.trusted.contains_key(block_id)
     }
 
-    const fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
+    fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
         BitcoinBlockContext {
             height: bitcoin_height,
+            accumulated_coinbase: self
+                .accumulated
+                .get(&bitcoin_height)
+                .copied()
+                .unwrap_or_default(),
             ..self.bitcoin_context
         }
     }
@@ -199,6 +240,18 @@ where
             .has_block_state(*block.block_id().as_bytes())
         {
             return Ok(());
+        }
+        // A tenure's coinbase depends on the burn blocks since the last
+        // sortition, so validating one without that number would seal a state
+        // root that only differs from the network's once it is too late.
+        if nano_chainstate::starts_new_tenure(block)
+            && self.chainstate.accounting_mut().schedule().is_some()
+            && !self.accumulated.contains_key(&bitcoin_context.height)
+        {
+            return Err(format!(
+                "no accumulated coinbase is known for the tenure at Bitcoin height {}",
+                bitcoin_context.height
+            ));
         }
         let parent = self
             .trusted
@@ -1162,7 +1215,7 @@ impl StateAnnouncer {
     }
 }
 
-impl<V: ProposalValidator + Send> LiveSigner<V> {
+impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
     /// Construct a live signer from an HTTP peer and its `StackerDB` service.
     #[must_use]
     pub const fn new(
@@ -1199,6 +1252,25 @@ impl<V: ProposalValidator + Send> LiveSigner<V> {
             .client
             .sortition(pending.proposal.block.header.consensus_hash)
             .await?;
+        let schedule = self
+            .service
+            .signer_mut()
+            .validator_mut()
+            .coinbase_schedule();
+        if let Some(accumulated) = self
+            .client
+            .accumulated_coinbase(
+                &pending.proposal.block,
+                schedule,
+                pending.proposal.bitcoin_height,
+            )
+            .await?
+        {
+            self.service
+                .signer_mut()
+                .validator_mut()
+                .set_accumulated_coinbase(pending.proposal.bitcoin_height, accumulated);
+        }
         self.service
             .signer_mut()
             .validator_mut()

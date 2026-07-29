@@ -269,6 +269,13 @@ where
                 .sortition(block.header.consensus_hash)
                 .await?
                 .bitcoin_height;
+            let bitcoin_context = node
+                .tenure_coinbase_context(
+                    block,
+                    self.chainstate.accounting_mut().schedule(),
+                    bitcoin_context,
+                )
+                .await?;
             self.apply(block, bitcoin_context)?;
         }
         Ok(executed)

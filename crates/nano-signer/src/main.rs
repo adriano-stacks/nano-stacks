@@ -9,8 +9,8 @@ use nano_chainstate::{ChainState, NakamotoBlock, TenureAccounting};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::TrieHash;
 use nano_signer::{
-    ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner, LiveSigner,
-    SignerConfig, SignerService, StateAnnouncer,
+    AccumulatedCoinbase, ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner,
+    LiveSigner, SignerConfig, SignerService, StateAnnouncer,
 };
 use nano_stackerdb::{StackerDbClient, StackerDbContract};
 use nano_sync::SyncClient;
@@ -321,6 +321,16 @@ async fn sync_chainstate(
             .sortition(block.header.consensus_hash)
             .await
             .map_err(|error| error.to_string())?;
+        let schedule = signer.validator_mut().coinbase_schedule();
+        if let Some(accumulated) = client
+            .accumulated_coinbase(block, schedule, sortition.bitcoin_height)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            signer
+                .validator_mut()
+                .set_accumulated_coinbase(sortition.bitcoin_height, accumulated);
+        }
         signer
             .validator_mut()
             .validator_mut()

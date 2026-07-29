@@ -91,6 +91,9 @@ pub struct BitcoinBlockContext {
     pub v2_unlock_height: u32,
     pub v3_unlock_height: u32,
     pub pox_5_activation_height: u32,
+    /// Coinbase a sortition at this height collects beyond its own emission,
+    /// mirroring a snapshot's `accumulated_coinbase_ustx`.
+    pub accumulated_coinbase: u128,
 }
 
 impl BitcoinBlockContext {
@@ -107,6 +110,7 @@ impl BitcoinBlockContext {
             v2_unlock_height: u32::MAX,
             v3_unlock_height: u32::MAX,
             pox_5_activation_height: u32::MAX,
+            accumulated_coinbase: 0,
         }
     }
 }

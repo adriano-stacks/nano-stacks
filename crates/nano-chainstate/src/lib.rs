@@ -70,10 +70,137 @@ pub struct NativeStxCredit {
 /// Number of sortition-created tenures before a miner reward matures.
 pub const MINER_REWARD_MATURITY: u64 = 100;
 
+/// Address that receives a matured share whose earning tenure is unknown.
+const BOOT_ADDRESS: &str = "ST000000000000000000002AMW42H";
+
+/// What a tenure earned for the recipients it pays once it matures.
+///
+/// `MINER_REWARD_MATURITY` tenures later the coinbase lands on the tenure's own
+/// recipient and the fees its transactions paid land on the recipient of the
+/// tenure before it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenureEarnings {
+    pub recipient: PrincipalData,
+    pub coinbase: u128,
+    pub fees: u128,
+}
+
+impl TenureEarnings {
+    /// Read a tenure's reward recipient from the coinbase transaction that
+    /// starts it: the recipient the coinbase names, or else the miner that
+    /// signed it (`nakamoto/tenure.rs`, `make_scheduled_miner_reward`).
+    #[must_use]
+    pub fn from_tenure_start(block: &NakamotoBlock, coinbase: u128) -> Option<Self> {
+        let transaction = block.transactions.iter().find(|transaction| {
+            matches!(
+                transaction.payload().data(),
+                TransactionPayloadData::NakamotoCoinbase { .. }
+                    | TransactionPayloadData::CoinbaseToAltRecipient { .. }
+                    | TransactionPayloadData::Coinbase { .. }
+            )
+        })?;
+        let named = match transaction.payload().data() {
+            TransactionPayloadData::NakamotoCoinbase { recipient, .. } => recipient.clone(),
+            TransactionPayloadData::CoinbaseToAltRecipient { recipient, .. } => {
+                Some(recipient.clone())
+            }
+            _ => None,
+        };
+        let recipient = match named {
+            Some(recipient) => principal_from_codec(&recipient).ok()?,
+            None => principal_from_address(transaction.origin_address()?).ok()?,
+        };
+        Some(Self {
+            recipient,
+            coinbase,
+            fees: 0,
+        })
+    }
+}
+
+/// The coinbase a sortition emits, which the burnchain schedule fixes.
+///
+/// From epoch 3.1 the emission follows SIP-029's interval table, and every
+/// sortition also collects the per-block bonus the pre-mine funded plus the
+/// emissions of the burn blocks since the last sortition
+/// (`burn/sortition.rs`, `accumulated_coinbase_ustx`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoinbaseSchedule {
+    pub mainnet: bool,
+    pub first_bitcoin_height: u64,
+    pub initial_mining_bonus: u128,
+}
+
+/// SIP-029 emissions in uSTX, by effective height, for testnet then mainnet.
+const TESTNET_EMISSIONS: [(u64, u128); 6] = [
+    (0, 1_000_000_000),
+    (77_777, 500_000_000),
+    (77_777 * 7, 250_000_000),
+    (77_777 * 14, 125_000_000),
+    (77_777 * 21, 62_500_000),
+    (3_605_000, 1_000_000_000),
+];
+const MAINNET_EMISSIONS: [(u64, u128); 5] = [
+    (0, 1_000_000_000),
+    (666_050, 500_000_000),
+    (2_197_560, 250_000_000),
+    (4_249_920, 125_000_000),
+    (6_302_280, 62_500_000),
+];
+
+impl CoinbaseSchedule {
+    /// The emission of one sortition at a Bitcoin height.
+    #[must_use]
+    pub fn emission_at(&self, bitcoin_height: u64) -> u128 {
+        let effective = bitcoin_height.saturating_sub(self.first_bitcoin_height);
+        let intervals: &[(u64, u128)] = if self.mainnet {
+            &MAINNET_EMISSIONS
+        } else {
+            &TESTNET_EMISSIONS
+        };
+        intervals
+            .iter()
+            .rev()
+            .find(|(start, _)| effective >= *start)
+            .map_or(0, |(_, emission)| *emission)
+    }
+
+    /// What a sortition collects on top of its own emission: the bonus for
+    /// every burn block since the last sortition, and those blocks' emissions.
+    ///
+    /// `previous_sortition` is the last Bitcoin height that chose a miner, and
+    /// is absent only for the first sortition a chain ever holds.
+    #[must_use]
+    pub fn accumulated_at(&self, bitcoin_height: u64, previous_sortition: Option<u64>) -> u128 {
+        let Some(previous) = previous_sortition else {
+            return 0;
+        };
+        let mut accumulated = 0_u128;
+        let mut height = bitcoin_height;
+        while height > previous {
+            accumulated = accumulated.saturating_add(self.initial_mining_bonus);
+            height -= 1;
+            if height > previous {
+                accumulated = accumulated.saturating_add(self.emission_at(height));
+            }
+        }
+        accumulated
+    }
+}
+
 /// Checkpointed native accounting required to finalize future tenure-start blocks.
+///
+/// A checkpoint carries the effects that mature over the tenures right after it,
+/// because those were earned before nano had any history. Everything later is
+/// derived from the tenures nano executed itself.
 #[derive(Clone, Debug, Default)]
 pub struct TenureAccounting {
     matured_effects: BTreeMap<u64, NativeBlockEffects>,
+    earnings: BTreeMap<u64, TenureEarnings>,
+    schedule: Option<CoinbaseSchedule>,
+    /// The tenure whose own start block was executed here, and so the only one
+    /// whose fees can be counted from the blocks that follow.
+    started: Option<u64>,
 }
 
 impl TenureAccounting {
@@ -81,7 +208,28 @@ impl TenureAccounting {
     pub fn from_json(bytes: &[u8]) -> Result<Self, TenureAccountingError> {
         let checkpoint: TenureAccountingCheckpoint = serde_json::from_slice(bytes)
             .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))?;
-        let mut accounting = Self::default();
+        let mut accounting = Self {
+            schedule: checkpoint
+                .coinbase_schedule
+                .map(|schedule| CoinbaseSchedule {
+                    mainnet: schedule.mainnet,
+                    first_bitcoin_height: schedule.first_bitcoin_height,
+                    initial_mining_bonus: schedule.initial_mining_bonus_ustx,
+                }),
+            ..Self::default()
+        };
+        for tenure in checkpoint.tenures {
+            accounting.seed_earnings(
+                tenure.coinbase_height,
+                TenureEarnings {
+                    recipient: PrincipalData::parse(&tenure.recipient).map_err(|error| {
+                        TenureAccountingError::InvalidCheckpoint(error.to_string())
+                    })?,
+                    coinbase: tenure.coinbase,
+                    fees: tenure.fees,
+                },
+            );
+        }
         for entry in checkpoint.matured_effects {
             let credits = entry
                 .credits
@@ -122,13 +270,74 @@ impl TenureAccounting {
         Ok(())
     }
 
-    /// Return the effects that mature at this tenure start.
+    /// The burnchain coinbase schedule, without which nothing is derived.
     #[must_use]
-    pub fn effects_for_tenure(&self, coinbase_height: u64) -> NativeBlockEffects {
-        self.matured_effects
-            .get(&coinbase_height)
-            .cloned()
-            .unwrap_or_default()
+    pub const fn schedule(&self) -> Option<CoinbaseSchedule> {
+        self.schedule
+    }
+
+    /// Adopt the earnings of a tenure that completed before this checkpoint.
+    ///
+    /// A checkpoint starts mid-tenure, so the fees of the tenure it lands in
+    /// are only knowable from the node that produced the checkpoint.
+    pub fn seed_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
+        self.earnings.insert(coinbase_height, earnings);
+    }
+
+    /// Record a tenure whose start block was executed here.
+    pub fn record_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
+        self.earnings.insert(coinbase_height, earnings);
+        self.started = Some(coinbase_height);
+    }
+
+    /// Add the fees a block paid to the tenure that mined it, which only counts
+    /// for a tenure this accounting saw from its first block.
+    pub fn add_fees(&mut self, coinbase_height: u64, fees: u128) {
+        if self.started != Some(coinbase_height) {
+            return;
+        }
+        if let Some(earnings) = self.earnings.get_mut(&coinbase_height) {
+            earnings.fees = earnings.fees.saturating_add(fees);
+        }
+    }
+
+    /// Return the effects that mature at this tenure start.
+    ///
+    /// Failing loudly matters: a silently empty payout produces a state root
+    /// that differs from the network's only once the block is already sealed.
+    pub fn effects_for_tenure(
+        &self,
+        coinbase_height: u64,
+    ) -> Result<NativeBlockEffects, TenureAccountingError> {
+        if let Some(effects) = self.matured_effects.get(&coinbase_height) {
+            return Ok(effects.clone());
+        }
+        if coinbase_height <= MINER_REWARD_MATURITY {
+            return Ok(NativeBlockEffects::default());
+        }
+        let matured = coinbase_height - MINER_REWARD_MATURITY;
+        let earned = self
+            .earnings
+            .get(&matured)
+            .ok_or(TenureAccountingError::UnknownTenure(matured))?;
+        // The fees a tenure paid mature one tenure after its coinbase, and land
+        // on the boot address when no tenure earned them.
+        let previous = self.earnings.get(&matured.saturating_sub(1));
+        let boot =
+            || PrincipalData::parse(BOOT_ADDRESS).expect("the boot address is a valid principal");
+        Ok(NativeBlockEffects {
+            credits: vec![
+                NativeStxCredit {
+                    recipient: earned.recipient.clone(),
+                    amount: earned.coinbase,
+                },
+                NativeStxCredit {
+                    recipient: previous.map_or_else(boot, |earned| earned.recipient.clone()),
+                    amount: previous.map_or(0, |earned| earned.fees),
+                },
+            ],
+            liquid_supply_increase: earned.coinbase,
+        })
     }
 }
 
@@ -137,6 +346,8 @@ impl TenureAccounting {
 pub enum TenureAccountingError {
     DuplicateCoinbaseHeight,
     InvalidCheckpoint(String),
+    /// A payout matured for a tenure neither the checkpoint nor execution knows.
+    UnknownTenure(u64),
 }
 
 impl std::fmt::Display for TenureAccountingError {
@@ -148,6 +359,10 @@ impl std::fmt::Display for TenureAccountingError {
             Self::InvalidCheckpoint(error) => {
                 write!(formatter, "invalid tenure accounting checkpoint: {error}")
             }
+            Self::UnknownTenure(height) => write!(
+                formatter,
+                "tenure {height} matured without accounting: its rewards are neither checkpointed nor executed"
+            ),
         }
     }
 }
@@ -158,6 +373,29 @@ impl std::error::Error for TenureAccountingError {}
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpoint {
     matured_effects: Vec<TenureAccountingCheckpointEntry>,
+    /// Earnings of the tenures right before the checkpoint, which the first
+    /// payout nano derives itself still has to pay out.
+    #[serde(default)]
+    tenures: Vec<TenureAccountingCheckpointTenure>,
+    /// Burnchain emission schedule, needed to derive later tenures' coinbases.
+    coinbase_schedule: Option<TenureAccountingCheckpointSchedule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenureAccountingCheckpointTenure {
+    coinbase_height: u64,
+    recipient: String,
+    coinbase: u128,
+    fees: u128,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenureAccountingCheckpointSchedule {
+    mainnet: bool,
+    first_bitcoin_height: u64,
+    initial_mining_bonus_ustx: u128,
 }
 
 #[derive(Deserialize)]
@@ -516,6 +754,40 @@ impl ChainState {
         Ok((block, applied))
     }
 
+    /// Advance the tenure a block starts, and return the rewards that mature
+    /// with it.
+    ///
+    /// Recording what the new tenure earns is what lets the payout maturing a
+    /// hundred tenures from now be derived rather than carried in a checkpoint
+    /// of bounded length.
+    fn start_tenure(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        block: &NakamotoBlock,
+    ) -> Result<NativeBlockEffects, ChainStateError> {
+        let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
+            ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
+        })?;
+        self.vm.set_tenure_height(next_height)?;
+        self.execute_bitcoin_operations(operations, bitcoin_context.height)?;
+        if let Some(schedule) = self.accounting.schedule() {
+            let coinbase = schedule
+                .emission_at(bitcoin_context.height)
+                .saturating_add(bitcoin_context.accumulated_coinbase);
+            let earnings = TenureEarnings::from_tenure_start(block, coinbase).ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "tenure-start block has no coinbase transaction".to_owned(),
+                )
+            })?;
+            self.accounting
+                .record_earnings(u64::from(next_height), earnings);
+        }
+        self.accounting
+            .effects_for_tenure(u64::from(next_height))
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
+    }
+
     /// Execute one block, optionally rejecting it before it is sealed when the
     /// state it produces does not match the root its header commits to.
     fn execute_nakamoto_block(
@@ -546,12 +818,7 @@ impl ChainState {
         let result = (|| {
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
-                let next_height = self.vm.tenure_height()?.checked_add(1).ok_or_else(|| {
-                    ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
-                })?;
-                self.vm.set_tenure_height(next_height)?;
-                self.execute_bitcoin_operations(operations, bitcoin_context.height)?;
-                let matured = self.accounting.effects_for_tenure(u64::from(next_height));
+                let matured = self.start_tenure(bitcoin_context, operations, block)?;
                 effects.credits.extend(matured.credits);
                 effects.liquid_supply_increase = effects
                     .liquid_supply_increase
@@ -580,6 +847,8 @@ impl ChainState {
                 })?;
                 receipts.push(receipt);
             }
+            let coinbase_height = u64::from(self.vm.tenure_height()?);
+            self.accounting.add_fees(coinbase_height, block_fees(block));
             for credit in effects.credits {
                 self.vm.credit_stx(&credit.recipient, credit.amount)?;
             }
@@ -1106,6 +1375,21 @@ fn finalize_native_contract_call(
     }
 }
 
+/// The fees a block's transactions paid, which its tenure collects.
+fn block_fees(block: &NakamotoBlock) -> u128 {
+    block
+        .transactions
+        .iter()
+        .map(|transaction| u128::from(transaction.auth().payer().fee()))
+        .sum()
+}
+
+/// Whether a block begins a tenure a sortition awarded, and so pays a coinbase.
+#[must_use]
+pub fn starts_new_tenure(block: &NakamotoBlock) -> bool {
+    block_starts_new_tenure(block)
+}
+
 fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
     block.transactions.iter().any(|transaction| {
         matches!(
@@ -1491,6 +1775,7 @@ pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
 
 #[cfg(test)]
 mod tests {
+    use super::{CoinbaseSchedule, TenureEarnings};
     use clarity::vm::contexts::AssetMap;
     use clarity::vm::costs::ExecutionCost;
     use clarity::vm::types::PrincipalData;
@@ -1659,12 +1944,106 @@ mod tests {
             .expect("record effects");
         assert_eq!(
             accounting.effects_for_tenure(99),
-            NativeBlockEffects::default()
+            Ok(NativeBlockEffects::default())
         );
-        assert_eq!(accounting.effects_for_tenure(100), effects);
+        assert_eq!(accounting.effects_for_tenure(100), Ok(effects));
+        assert_eq!(
+            accounting.effects_for_tenure(101),
+            Err(TenureAccountingError::UnknownTenure(1)),
+            "a payout with neither a checkpoint nor an executed tenure must fail loudly"
+        );
         assert_eq!(
             accounting.record_matured_effects(100, NativeBlockEffects::default()),
             Err(TenureAccountingError::DuplicateCoinbaseHeight)
+        );
+    }
+
+    /// The values a node's own snapshots hold: with a sortition in the parent
+    /// burn block the accumulation is one bonus, and a burn block that chose
+    /// nobody adds its emission and another bonus to the next winner.
+    #[test]
+    fn coinbase_accumulation_matches_a_node_snapshot() {
+        let schedule = CoinbaseSchedule {
+            mainnet: false,
+            first_bitcoin_height: 0,
+            initial_mining_bonus: 20_400_000,
+        };
+
+        assert_eq!(schedule.emission_at(440), 1_000_000_000);
+        assert_eq!(schedule.accumulated_at(440, Some(439)), 20_400_000);
+        // Burn block 441 chose nobody, so the tenure at 442 collects its
+        // emission and a second bonus, as snapshot 442 records.
+        assert_eq!(schedule.accumulated_at(442, Some(440)), 1_040_800_000);
+        assert_eq!(schedule.accumulated_at(440, None), 0);
+    }
+
+    /// Rewards derived from executed tenures pay the coinbase to the tenure
+    /// that earned it and the fees to the tenure before it.
+    #[test]
+    fn derived_effects_split_a_matured_tenure() {
+        let recipient = |address: &str| PrincipalData::parse(address).expect("valid recipient");
+        let mut accounting = TenureAccounting::default();
+        accounting.record_earnings(
+            10,
+            TenureEarnings {
+                recipient: recipient("ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"),
+                coinbase: 7,
+                fees: 3,
+            },
+        );
+        accounting.record_earnings(
+            11,
+            TenureEarnings {
+                recipient: recipient("ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z"),
+                coinbase: 9,
+                fees: 0,
+            },
+        );
+        accounting.add_fees(11, 5);
+        // A tenure seeded from a checkpoint keeps the fees the checkpoint
+        // measured, because the blocks before the checkpoint are not replayed.
+        accounting.seed_earnings(
+            12,
+            TenureEarnings {
+                recipient: recipient("ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"),
+                coinbase: 11,
+                fees: 13,
+            },
+        );
+        accounting.add_fees(12, 17);
+        accounting.record_earnings(
+            13,
+            TenureEarnings {
+                recipient: recipient("ST332DWHNM323264X869MKXFZABSE5WZ60EA07TJ1"),
+                coinbase: 19,
+                fees: 0,
+            },
+        );
+        assert_eq!(
+            accounting
+                .effects_for_tenure(113)
+                .expect("seeded and executed tenures")
+                .credits[1]
+                .amount,
+            13
+        );
+
+        let effects = accounting
+            .effects_for_tenure(111)
+            .expect("both tenures were executed");
+        assert_eq!(effects.liquid_supply_increase, 9);
+        assert_eq!(
+            effects.credits,
+            vec![
+                NativeStxCredit {
+                    recipient: recipient("ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z"),
+                    amount: 9,
+                },
+                NativeStxCredit {
+                    recipient: recipient("ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"),
+                    amount: 3,
+                },
+            ]
         );
     }
 
@@ -1685,7 +2064,10 @@ mod tests {
         .expect("parse accounting checkpoint");
 
         assert_eq!(
-            accounting.effects_for_tenure(100).liquid_supply_increase,
+            accounting
+                .effects_for_tenure(100)
+                .expect("checkpointed effects")
+                .liquid_supply_increase,
             42
         );
         assert!(TenureAccounting::from_json(br#"{"matured_effects": [], "extra": 1}"#).is_err());

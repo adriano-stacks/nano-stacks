@@ -95,6 +95,14 @@ async fn main() {
     for block in pending {
         let mut context = pox.bitcoin_context();
         context.height = bitcoin_height(&client, &block).await;
+        context = client
+            .tenure_coinbase_context(
+                &block,
+                executor.chainstate_mut().accounting_mut().schedule(),
+                context,
+            )
+            .await
+            .expect("read the coinbase a tenure accumulated");
         match executor.apply(&block, context) {
             Ok(_) => parent = block,
             Err(error) => {

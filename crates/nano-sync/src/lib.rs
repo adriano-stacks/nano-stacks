@@ -4,8 +4,8 @@ use std::{fmt, time::Duration};
 
 use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
-    BitcoinBlockContext, NakamotoBlock, NakamotoCodecError, Signer, SignerSet, SignerSetError,
-    TenureError,
+    BitcoinBlockContext, CoinbaseSchedule, NakamotoBlock, NakamotoCodecError, Signer, SignerSet,
+    SignerSetError, TenureError,
 };
 use nano_crypto::{CryptoError, StacksPublicKey};
 use nano_primitives::{
@@ -129,6 +129,9 @@ impl PoxInfo {
             v2_unlock_height: self.v2_unlock_height.unwrap_or(u32::MAX),
             v3_unlock_height: self.v3_unlock_height.unwrap_or(u32::MAX),
             pox_5_activation_height: self.pox_5_activation_height.unwrap_or(u32::MAX),
+            // Only a tenure-start block collects a coinbase, so its caller
+            // fills this in from the sortitions around it.
+            accumulated_coinbase: 0,
         }
     }
 }
@@ -314,6 +317,58 @@ impl SyncClient {
             return Err(SyncError::InvalidSortition);
         }
         Ok(sortition)
+    }
+
+    /// The last Bitcoin height before this one that chose a miner.
+    ///
+    /// A tenure collects the coinbase of every burn block since that height, so
+    /// finding it is what makes a tenure-start block's reward derivable.
+    pub async fn previous_sortition_height(
+        &self,
+        bitcoin_height: u64,
+    ) -> Result<Option<u64>, SyncError> {
+        let Some(parent_height) = bitcoin_height.checked_sub(1) else {
+            return Ok(None);
+        };
+        let parent = self.sortition_at_height(parent_height).await?;
+        if parent.was_sortition {
+            return Ok(Some(parent.bitcoin_height));
+        }
+        match parent.last_sortition_consensus_hash {
+            Some(consensus_hash) => Ok(Some(self.sortition(consensus_hash).await?.bitcoin_height)),
+            None => Ok(None),
+        }
+    }
+
+    /// The coinbase a block's tenure accumulated, or nothing when the block
+    /// starts no tenure or no schedule says what a coinbase is worth.
+    pub async fn accumulated_coinbase(
+        &self,
+        block: &NakamotoBlock,
+        schedule: Option<CoinbaseSchedule>,
+        bitcoin_height: u64,
+    ) -> Result<Option<u128>, SyncError> {
+        let Some(schedule) = schedule.filter(|_| nano_chainstate::starts_new_tenure(block)) else {
+            return Ok(None);
+        };
+        let previous = self.previous_sortition_height(bitcoin_height).await?;
+        Ok(Some(schedule.accumulated_at(bitcoin_height, previous)))
+    }
+
+    /// Complete a block's execution context with the coinbase its tenure earns.
+    pub async fn tenure_coinbase_context(
+        &self,
+        block: &NakamotoBlock,
+        schedule: Option<CoinbaseSchedule>,
+        mut context: BitcoinBlockContext,
+    ) -> Result<BitcoinBlockContext, SyncError> {
+        if let Some(accumulated) = self
+            .accumulated_coinbase(block, schedule, context.height)
+            .await?
+        {
+            context.accumulated_coinbase = accumulated;
+        }
+        Ok(context)
     }
 
     async fn single_sortition(&self, path: &str) -> Result<SortitionInfo, SyncError> {

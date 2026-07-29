@@ -161,6 +161,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut tenure_context = bitcoin_context;
     tenure_context.height = won.bitcoin_height;
+    tenure_context = node
+        .tenure_coinbase_context(
+            &candidate,
+            executor.chainstate_mut().accounting_mut().schedule(),
+            tenure_context,
+        )
+        .await?;
     let (block, applied) = executor.assemble(candidate, tenure_context, &miner_key)?;
     println!(
         "assembled block {} at height {} with state root {}",
