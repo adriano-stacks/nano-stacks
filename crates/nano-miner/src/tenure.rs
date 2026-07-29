@@ -443,7 +443,7 @@ mod tests {
 pub fn build_tenure_continuation_block(
     tenure: &TenureTip,
     transactions: Vec<Transaction>,
-    timestamp: u64,
+    now: u64,
 ) -> NakamotoBlock {
     NakamotoBlock {
         header: NakamotoBlockHeader {
@@ -454,7 +454,9 @@ pub fn build_tenure_continuation_block(
             parent_block_id: tenure.block_id,
             transaction_merkle_root: transaction_merkle_root(&transactions),
             state_index_root: TrieHash::from_bytes([0; 32]),
-            timestamp,
+            // A block's timestamp has to advance on its parent's, and a tenure
+            // can produce more than one block a second.
+            timestamp: now.max(tenure.timestamp.saturating_add(1)),
             miner_signature: MessageSignature::from_bytes([0; 65]),
             signer_signatures: Vec::new(),
             pox_treatment: BitVec::ones(WATERFALL_POX_TREATMENT_LEN)
@@ -501,7 +503,7 @@ pub fn build_tenure_extend_block(
     Ok(build_tenure_continuation_block(
         tenure,
         extended,
-        extension.timestamp,
+        extension.now,
     ))
 }
 
@@ -514,7 +516,8 @@ pub struct TenureExtension {
     pub blocks_in_tenure: u32,
     /// Next nonce the miner key spends.
     pub nonce: u64,
-    pub timestamp: u64,
+    /// Wall-clock time the extension is built at.
+    pub now: u64,
 }
 
 /// The tip of a tenure this miner owns, which its next block builds on.
@@ -525,4 +528,6 @@ pub struct TenureTip {
     pub height: u64,
     /// Burn total the tenure committed to, which its later blocks repeat.
     pub bitcoin_spent: u64,
+    /// Timestamp of the tip, which the next block has to advance on.
+    pub timestamp: u64,
 }

@@ -253,6 +253,7 @@ impl TenureState {
                 block_id: block.block_id(),
                 height: block.header.chain_length,
                 bitcoin_spent: block.header.bitcoin_spent,
+                timestamp: block.header.timestamp,
             },
             blocks: 1,
             nonce,
@@ -264,6 +265,7 @@ impl TenureState {
     fn advance(&mut self, block: &NakamotoBlock) {
         self.tip.block_id = block.block_id();
         self.tip.height = block.header.chain_length;
+        self.tip.timestamp = block.header.timestamp;
         self.blocks = self.blocks.saturating_add(1);
         if nano_chainstate::starts_or_extends_tenure(block) {
             self.nonce = self.nonce.saturating_add(1);
@@ -354,6 +356,7 @@ async fn resume_tenure(
             block_id: info.tip_block_id,
             height: info.tip_height,
             bitcoin_spent: tip.header.bitcoin_spent,
+            timestamp: tip.header.timestamp,
         },
         blocks: u32::try_from(
             info.tip_height
@@ -413,14 +416,14 @@ async fn continue_tenure(
                 burn_view_consensus_hash: burn_view.consensus_hash,
                 blocks_in_tenure: state.blocks,
                 nonce: state.nonce,
-                timestamp: burn_view.bitcoin_timestamp,
+                now: now_unix(),
             },
             cli.chain_id,
             miner_key,
             Vec::new(),
         )?
     } else {
-        build_tenure_continuation_block(&state.tip, Vec::new(), burn_view.bitcoin_timestamp)
+        build_tenure_continuation_block(&state.tip, Vec::new(), now_unix())
     };
 
     let (block, applied) = executor.assemble_selecting(candidate, context, &pending, miner_key)?;
@@ -637,6 +640,13 @@ async fn tenure_view(
         total_burn,
         sortition_hash: point.sortition_hash,
     })
+}
+
+/// Seconds since the epoch, which a block's timestamp is measured in.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn bitcoin_source(cli: &Cli, password: &str) -> Result<BitcoinRpcSource, Box<dyn Error>> {
