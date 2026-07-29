@@ -1,47 +1,98 @@
-# Running nano-stacks against hacknet
+# Replacing a Hacknet participant with nano-stacks
 
-nano joins a [hacknet](https://github.com/stacks-network/hacknet) epoch-4 network as
-an ordinary participant: it holds Stacks and Bitcoin keys of its own, stacks for a
-signer slot, and commits on Bitcoin for a tenure. Nothing here is nano-specific
-protocol; it is the same setup a stock signer or miner needs.
+A Hacknet participant is a `stacks-node` and the `stacks-signer` it feeds. nano
+replaces one of them: it holds the Stacks key that participant staked, executes
+every block from its own checkpoint, and answers the miner over `StackerDB`.
+
+Hacknet stacks three signers of equal weight against a threshold of seven tenths,
+so **no block is accepted without all three**. A network that keeps producing
+blocks with nano in place is therefore proof that nano's signature counted, and
+one that stalls is proof that it did not — the stall is the test.
+
+## Reproducing a run
+
+```
+hacknet/harness.sh setup            # clone Hacknet at the pinned commit and patch it
+hacknet/harness.sh up               # build and boot from genesis
+hacknet/harness.sh wait 285         # epoch 4.0 starts at 262, PoX-5 cycle 14 at 280
+hacknet/harness.sh checkpoint       # export the state nano validates from
+hacknet/harness.sh replace 3        # stop participant 3 and sign in its place
+hacknet/harness.sh verify           # assert the network keeps doing every kind of work
+hacknet/harness.sh restore          # put the stock participant back
+hacknet/harness.sh down
+```
+
+`status` prints the heights of all three participants, the reward cycle, and
+whether nano is running. `wait` fails as soon as Bitcoin advances with a frozen
+Stacks tip, which is what a broken replacement looks like.
+
+Each command is independent, so a run can be inspected or interrupted at any
+stage. The clone, the checkpoint, the signer log and the state file live under
+`~/.cache/nano-stacks/hacknet` (`NANO_HACKNET_HOME`).
+
+Compose is driven directly rather than through Hacknet's Makefile, whose Linux
+path assumes rootful Docker: it removes chainstate with `sudo` and extracts
+archives with `sudo tar`. The commands mirror `make build`, `make genesis`,
+`make down` and `make stop/start` one for one.
+
+## What a passing run shows
+
+`verify` runs `cargo test -p nano-conformance --test hacknet_replacement`, which
+follows the canonical chain until it has both a number of new blocks and a reward
+cycle rollover, then asserts what those blocks contained. A recorded run:
+
+```
+observed 211 canonical blocks across cycles 15..=16
+every one of the 211 blocks carries nano's signature
+152 transfer transactions, including c597a9b3… which the network reports as success
+1 deploy transactions, including 29323532… which the network reports as success
+816 call transactions, including 1abac26b… which the network reports as success
+20 tenure change transactions, including efaee37d… which the network reports as success
+19 coinbase transactions, including 60543126… which the network reports as success
+19 sortitions across 2 distinct miners
+reward cycle 16 pays a waterfall set in which nano holds weight 10 of 30
+```
+
+Every signature is recovered from the block header and checked against the reward
+set, and every receipt is read back from the indexer.
 
 ## Released PoX-5 baseline
 
-Hacknet's current default is still a pre-merge PoX-5 integration and API
-`9.0.0-pox5.8`. Apply the compatibility patch before starting a new network:
-
-```
-git -C ../hacknet apply --unidiff-zero /home/aldur/nano-stacks/hacknet/hacknet-main.patch
-git -C ../hacknet apply --unidiff-zero /home/aldur/nano-stacks/hacknet/hacknet-api-main.patch
-(cd ../hacknet && make genesis)
-```
-
-The patches select Stacks Core `main` and stable API `9.0.1`. The second patch
-builds the API from its release commit and retains raw PoX-5 `stake-update`
-events that its bundled codec cannot yet decode after Core renamed
-`prev-unlock-height` to `prev-unlock-cycle`. It preserves Hacknet's configured
-sBTC contracts, so the existing PoX-5 bootstrap and Bitcoin-staking helpers
-keep working. Those sBTC contracts are still external dependencies, so
-`pox5-setup` remains required. They apply to Hacknet commit
+Hacknet's default is still a pre-merge PoX-5 integration and API
+`9.0.0-pox5.8`. `setup` applies both patches in this directory, which select
+Stacks Core `main` and stable API `9.0.1`, and which apply to Hacknet commit
 `bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1`.
 
-## Keys
+The API patch builds the indexer from its release commit and retains raw PoX-5
+`stake-update` events its bundled codec cannot decode after Core renamed
+`prev-unlock-height` to `prev-unlock-cycle`. Without it the indexer answers
+`/new_block` with HTTP 500, which blocks Core's event dispatcher and stops the
+chain at the first PoX-5 reward set. Both patches preserve Hacknet's configured
+sBTC contracts, so `pox5-setup` still bootstraps `.pox-5`.
 
-Four secrets, kept outside the repository in a gitignored `.hacknet/`:
+## What the checkpoint carries
+
+`signer-checkpoint.sh` exports a node's Clarity MARF at a block below its tip,
+that block's identity and state root, the block after it, and two things nano
+cannot derive for itself:
+
+- the miner rewards that matured before nano had any history, which is the
+  hundred tenures after the checkpoint;
+- the burnchain coinbase schedule — the emission table and the per-block bonus
+  the pre-mine funded — from which nano derives the rewards of every tenure it
+  executes itself, indefinitely.
+
+A payout that neither source covers is an error, not a silently empty write.
+
+## Mining
+
+Registering a leader key and committing on Bitcoin needs keys and a funded
+wallet of its own, kept outside the repository in a gitignored `.hacknet/`:
 
 | File | Purpose |
 |---|---|
-| `signer.key` | 32-byte Stacks key that stacks, and signs block responses |
 | `miner-signing.key` | 32-byte Stacks key that signs blocks and leader-key registrations |
 | `miner-vrf.key` | 32-byte ed25519 key seeding the coinbase VRF proof |
-| `bitcoin-rpc.pass` | Bitcoin Core RPC password |
-
-Generate the three keys with `openssl rand -hex 32`.
-
-## Bitcoin wallet
-
-The miner funds its own commitments, so it needs a wallet that holds private keys —
-not the watch-only wallets hacknet creates for its own miners:
 
 ```
 bitcoin-cli -named createwallet wallet_name=nano-miner descriptors=false
@@ -49,54 +100,13 @@ bitcoin-cli -rpcwallet=nano-miner getnewaddress "nano" legacy
 bitcoin-cli -rpcwallet=depositor sendtoaddress <address> 100
 ```
 
-Do not register this wallet with hacknet's `bitcoin-miner` service: its on-demand
+The miner funds its own commitments, so it needs a wallet that holds private
+keys, not the watch-only wallets Hacknet creates for its own miners. Do not
+register that wallet with Hacknet's `bitcoin-miner` service: its on-demand
 trigger sums confirmations across the wallets it watches, so joining that sum
 suppresses block production for the rest of the network.
 
-## Checkpoint
-
-Both the signer and the miner execute blocks, so they start from a checkpoint of a
-node's Clarity MARF plus the miner rewards that mature over the tenures they will
-validate:
-
-```
-STATE_DIR=<hacknet chainstate> OUT=/tmp/nano-checkpoint ./hacknet/signer-checkpoint.sh
-```
-
-## Signing
-
-The signer derives its contracts and slot from the active reward set, so it only
-needs the boot address:
-
-```
-stacks-signer run --peer http://127.0.0.1:20443/ \
-  --bitcoin-rpc http://127.0.0.1:18443 --bitcoin-rpc-user hacknet \
-  --bitcoin-rpc-password-file .hacknet/bitcoin-rpc.pass \
-  --miner-contract ST000000000000000000002AMW42H/miners \
-  --private-key "$(cat .hacknet/signer.key)" --state-file /tmp/nano-checkpoint/signer.json \
-  --checkpoint /tmp/nano-checkpoint/marf.sqlite \
-  --tenure-accounting /tmp/nano-checkpoint/native-effects.json \
-  --source-state-id <id> --state-root <root> \
-  --anchor-block /tmp/nano-checkpoint/anchor-block.bin --anchor-bitcoin-height <height> \
-  --pox-5-activation-height 262 --pox-v1-unlock-height 205 \
-  --pox-v2-unlock-height 207 --pox-v3-unlock-height 210
-```
-
-The key must be stacked through a PoX-5 signer manager before the cycle it signs
-for. Weight matters in both directions: too little and the stock signers reach the
-threshold without waiting, too much and the network stalls whenever nano is down.
-
-## Mining
-
-Register a leader key once, then commit on every Bitcoin block. Commitments must
-chain through one another's change output, or the sortition treats each one as a
-first-time miner and weights it accordingly:
-
-```
-stacks-register-leader-key --bitcoin-rpc http://127.0.0.1:18443/wallet/nano-miner ...
-stacks-commit-block --commitment-chain-file /tmp/nano-commit-chain.txt --after-new-block ...
-stacks-mine-tenure --sortition-hash-cache /tmp/nano-sortition-hash.json ...
-```
-
-Win a sortition and you owe the network a block: leave the tenure unmined and the
-chain stops until the reward set for the next cycle can be resolved again.
+Commitments must chain through one another's change output, or the sortition
+treats each one as a first-time miner and weights it accordingly. Winning a
+sortition owes the network a block: leave the tenure unmined and the chain stops
+until the next reward set can be resolved.
