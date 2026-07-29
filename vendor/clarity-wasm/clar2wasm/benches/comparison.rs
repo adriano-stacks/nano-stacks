@@ -118,8 +118,7 @@ where
     let args = init(&mut exec_state, &mut invoke_ctx);
 
     b.iter(|| {
-        exec_state
-            .execute_function_as_transaction(&invoke_ctx, &func, &args, None, false)
+        func.execute_apply(&args, &mut exec_state, &invoke_ctx)
             .expect("Function call failed");
     });
 
@@ -208,8 +207,7 @@ where
     let args = init(&mut exec_state, &mut invoke_ctx);
 
     b.iter(|| {
-        exec_state
-            .execute_function_as_transaction(&invoke_ctx, &func, &args, None, false)
+        func.execute_apply(&args, &mut exec_state, &invoke_ctx)
             .expect("Function call failed");
     });
 
@@ -497,18 +495,15 @@ fn add_prices_init(
         .lookup_function("add_source")
         .expect("failed to lookup function");
 
-    execution_state
-        .execute_function_as_transaction(
-            invocation_context,
-            &func,
-            &[
-                Value::UInt(source),
-                Value::buff_from(pk.to_bytes_compressed()).unwrap(),
-            ],
-            None,
-            false,
-        )
-        .expect("Adding source should succeed");
+    func.execute_apply(
+        &[
+            Value::UInt(source),
+            Value::buff_from(pk.to_bytes_compressed()).unwrap(),
+        ],
+        execution_state,
+        invocation_context,
+    )
+    .expect("Adding source should succeed");
 
     Value::cons_list_unsanitized(prices).unwrap()
 }

@@ -98,16 +98,16 @@
     (ok (is-eq 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR))
 )
 
-(define-public (call-principal-equal)
-    (ok (is-eq 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo))
+(define-public (call-principal-equal (principal principal))
+    (ok (is-eq principal principal))
 )
 
-(define-public (call-principal-unequal)
-    (ok (is-eq 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.bar))
+(define-public (call-principal-unequal (first principal) (second principal))
+    (ok (is-eq first second))
 )
 
-(define-public (call-principal-unequal-2)
-    (ok (is-eq 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR.foo))
+(define-public (call-principal-unequal-2 (first principal) (second principal))
+    (ok (is-eq first second))
 )
 
 (define-public (call-optional-equal)

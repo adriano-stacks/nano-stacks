@@ -1542,7 +1542,8 @@ test_contract_call_response_events!(
         assert_eq!(*response.data, Value::UInt(98765));
     },
     |event_batches: &Vec<(EventBatch, u64)>| {
-        assert!(event_batches.is_empty());
+        assert_eq!(event_batches.len(), 1);
+        assert!(event_batches[0].0.events.is_empty());
     }
 );
 
@@ -1596,7 +1597,8 @@ test_contract_call_response_events!(
         );
     },
     |event_batches: &Vec<(EventBatch, u64)>| {
-        assert!(event_batches.is_empty());
+        assert_eq!(event_batches.len(), 1);
+        assert!(event_batches[0].0.events.is_empty());
     }
 );
 
@@ -2593,6 +2595,10 @@ test_contract_call_response!(
     test_call_principal_equal,
     "equal",
     "call-principal-equal",
+    &[Value::Principal(
+        PrincipalData::parse("ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo")
+            .expect("valid contract principal"),
+    )],
     |response: ResponseData| {
         assert!(response.committed);
         assert_eq!(*response.data, Value::Bool(true));
@@ -2603,6 +2609,16 @@ test_contract_call_response!(
     test_call_principal_unequal,
     "equal",
     "call-principal-unequal",
+    &[
+        Value::Principal(
+            PrincipalData::parse("ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo")
+                .expect("valid contract principal"),
+        ),
+        Value::Principal(
+            PrincipalData::parse("ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.bar")
+                .expect("valid contract principal"),
+        ),
+    ],
     |response: ResponseData| {
         assert!(response.committed);
         assert_eq!(*response.data, Value::Bool(false));
@@ -2613,6 +2629,16 @@ test_contract_call_response!(
     test_call_principal_unequal_2,
     "equal",
     "call-principal-unequal-2",
+    &[
+        Value::Principal(
+            PrincipalData::parse("ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo")
+                .expect("valid contract principal"),
+        ),
+        Value::Principal(
+            PrincipalData::parse("SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR.foo")
+                .expect("valid contract principal"),
+        ),
+    ],
     |response: ResponseData| {
         assert!(response.committed);
         assert_eq!(*response.data, Value::Bool(false));
