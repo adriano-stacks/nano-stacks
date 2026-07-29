@@ -703,7 +703,6 @@ pub struct LiveSigner<V> {
 pub enum LiveSignerError {
     Sync(SyncError),
     Service(SignerServiceError),
-    RewardCycle { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for LiveSignerError {
@@ -711,10 +710,6 @@ impl fmt::Display for LiveSignerError {
         match self {
             Self::Sync(error) => write!(formatter, "live signer synchronization failed: {error}"),
             Self::Service(error) => write!(formatter, "live signer service failed: {error}"),
-            Self::RewardCycle { expected, actual } => write!(
-                formatter,
-                "proposal reward cycle {actual} does not match the active cycle {expected}"
-            ),
         }
     }
 }
@@ -724,7 +719,6 @@ impl std::error::Error for LiveSignerError {
         match self {
             Self::Sync(error) => Some(error),
             Self::Service(error) => Some(error),
-            Self::RewardCycle { .. } => None,
         }
     }
 }
@@ -1040,46 +1034,50 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         }
     }
 
-    /// Process the latest miner proposal once and upload an acceptance response when needed.
-    pub async fn poll(&mut self) -> Result<Option<ChunkAck>, SignerServiceError> {
-        let Some(pending) = self.next_proposal().await? else {
+    /// Process the latest proposal of one reward cycle and answer it.
+    pub async fn poll(
+        &mut self,
+        reward_cycle: u64,
+    ) -> Result<Option<ChunkAck>, SignerServiceError> {
+        let Some(pending) = self.next_proposal_for_cycle(reward_cycle).await? else {
             return Ok(None);
         };
         self.respond(pending).await.map(Some)
     }
 
-    /// Fetch and decode the newest miner proposal that has not been answered.
+    /// Fetch and decode the newest proposal of one reward cycle that this signer
+    /// has not answered.
     ///
     /// Miners alternate between proposal slots by sortition parity, so the
     /// newest proposal is whichever slot carries the highest Bitcoin height.
-    pub async fn next_proposal(&mut self) -> Result<Option<PendingProposal>, SignerServiceError> {
+    ///
+    /// Filtering by cycle matters for liveness: a slot keeps its last chunk, so
+    /// a proposal from an earlier cycle stays visible, and taking the newest
+    /// without regard to the cycle would leave a signer answering nothing at
+    /// all once it refuses that one.
+    pub async fn next_proposal_for_cycle(
+        &mut self,
+        reward_cycle: u64,
+    ) -> Result<Option<PendingProposal>, SignerServiceError> {
         let client = self.client.clone();
         let miner_contract = self.miner_contract.clone();
-        let mut newest: Option<PendingProposal> = None;
+        let mut proposals = Vec::new();
         for slot in client.slot_versions(&miner_contract).await? {
             let Some(bytes) = client.latest_chunk(&miner_contract, slot.slot_id).await? else {
                 continue;
             };
-            let Ok(SignerMessage::BlockProposal(proposal)) = SignerMessage::decode(&bytes) else {
-                continue;
-            };
-            let candidate = PendingProposal {
-                hash: nano_primitives::sha512_256(&bytes),
-                proposal,
-            };
-            if newest.as_ref().is_none_or(|current| {
-                (
-                    current.proposal.bitcoin_height,
-                    current.proposal.block.header.chain_length,
-                ) < (
-                    candidate.proposal.bitcoin_height,
-                    candidate.proposal.block.header.chain_length,
-                )
-            }) {
-                newest = Some(candidate);
+            if let Ok(SignerMessage::BlockProposal(proposal)) = SignerMessage::decode(&bytes) {
+                proposals.push(PendingProposal {
+                    hash: nano_primitives::sha512_256(&bytes),
+                    proposal,
+                });
             }
         }
-        Ok(newest.filter(|proposal| self.last_proposal != Some(proposal.hash)))
+        Ok(newest_proposal_for_cycle(
+            proposals,
+            reward_cycle,
+            self.last_proposal,
+        ))
     }
 
     /// Validate and publish a response for a previously fetched miner proposal.
@@ -1184,6 +1182,30 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         self.signer.set_writer_slot(writer_slot);
         self.last_proposal = None;
     }
+}
+
+/// The proposal a signer should answer out of what its miner slots hold.
+///
+/// A slot keeps its last chunk, so a proposal from an earlier reward cycle stays
+/// visible after the cycle rolls over. Answering the newest without regard to
+/// the cycle would leave a signer refusing that one and never reaching the
+/// proposals that matter, which stops the network it is part of.
+#[must_use]
+pub fn newest_proposal_for_cycle(
+    proposals: Vec<PendingProposal>,
+    reward_cycle: u64,
+    answered: Option<Sha256Sum>,
+) -> Option<PendingProposal> {
+    proposals
+        .into_iter()
+        .filter(|pending| pending.proposal.reward_cycle == reward_cycle)
+        .filter(|pending| answered != Some(pending.hash))
+        .max_by_key(|pending| {
+            (
+                pending.proposal.bitcoin_height,
+                pending.proposal.block.header.chain_length,
+            )
+        })
 }
 
 /// The weight of the reward set promising to sign one block.
@@ -1424,16 +1446,14 @@ impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
 
     /// Fetch, authenticate, validate, and answer the latest miner proposal once.
     pub async fn poll(&mut self) -> Result<Option<ChunkAck>, LiveSignerError> {
-        let Some(pending) = self.service.next_proposal().await? else {
+        let tenure = self.client.tenure_info().await?;
+        let Some(pending) = self
+            .service
+            .next_proposal_for_cycle(tenure.reward_cycle)
+            .await?
+        else {
             return Ok(None);
         };
-        let tenure = self.client.tenure_info().await?;
-        if pending.proposal.reward_cycle != tenure.reward_cycle {
-            return Err(LiveSignerError::RewardCycle {
-                expected: tenure.reward_cycle,
-                actual: pending.proposal.reward_cycle,
-            });
-        }
         let sortition = self
             .client
             .sortition(pending.proposal.block.header.consensus_hash)
@@ -1631,6 +1651,40 @@ mod tests {
 
         validator.set_context(sortition, proposal.reward_cycle);
         validator.validate(&proposal).expect("refreshed context");
+    }
+
+    /// A slot keeps its last chunk, so a proposal from a cycle that has rolled
+    /// over stays visible; answering the newest without regard to the cycle
+    /// leaves a signer stuck on it and signing nothing at all.
+    #[test]
+    fn a_stale_cycle_proposal_is_never_the_one_to_answer() {
+        let pending = |reward_cycle: u64, bitcoin_height: u64, hash: u8| super::PendingProposal {
+            hash: Sha256Sum::from_bytes([hash; 32]),
+            proposal: BlockProposal {
+                block: proposal().block,
+                bitcoin_height,
+                reward_cycle,
+                data: BlockProposal::empty_data(),
+            },
+        };
+        let stale = pending(20, 419, 1);
+        let current = pending(21, 425, 2);
+
+        assert_eq!(
+            super::newest_proposal_for_cycle(vec![stale.clone(), current.clone()], 21, None)
+                .expect("the proposal of the active cycle")
+                .hash,
+            current.hash
+        );
+        assert!(
+            super::newest_proposal_for_cycle(vec![stale], 21, None).is_none(),
+            "a proposal from an earlier cycle is not answered"
+        );
+        assert!(
+            super::newest_proposal_for_cycle(vec![current.clone()], 21, Some(current.hash))
+                .is_none(),
+            "a proposal already answered is not answered twice"
+        );
     }
 
     /// A miner extends a tenure once threshold signing power has passed the
