@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 atomicwrites = "0.4.4"
-axum = "0.8.9"
 clap = { version = "4.6.4", features = ["derive"] }
 fs2 = "0.4.3"
 hex = "0.4.3"
@@ -21,11 +20,10 @@ nano-chainstate = { path = "../nano-chainstate" }
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true

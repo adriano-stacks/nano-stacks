@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fs, io, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{error::Error, fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use nano_address::StacksAddress;
@@ -10,12 +10,12 @@ use nano_crypto::StacksPrivateKey;
 use nano_primitives::TrieHash;
 use nano_signer::{
     ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner, LiveSigner,
-    SignerConfig, SignerService, StateAnnouncer, events,
+    SignerConfig, SignerService, StateAnnouncer,
 };
 use nano_stackerdb::{StackerDbClient, StackerDbContract};
 use nano_sync::SyncClient;
 use reqwest::Url;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::time::sleep;
 
 /// `StackerDB` message identifiers for block responses and state updates.
 const RESPONSE_MESSAGE_ID: u32 = 1;
@@ -65,9 +65,15 @@ enum Command {
         /// Bitcoin height at which PoX-5 activates for this network.
         #[arg(long)]
         pox_5_activation_height: Option<u32>,
-        /// Address to serve the replaced signer's event endpoint on.
+        /// Bitcoin height used when evaluating PoX-1 STX locks.
         #[arg(long)]
-        event_endpoint: Option<SocketAddr>,
+        pox_v1_unlock_height: u32,
+        /// Bitcoin height used when evaluating PoX-2 STX locks.
+        #[arg(long)]
+        pox_v2_unlock_height: u32,
+        /// Bitcoin height used when evaluating PoX-3 STX locks.
+        #[arg(long)]
+        pox_v3_unlock_height: u32,
         #[arg(long, default_value_t = 1)]
         poll_interval_secs: u64,
         /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
@@ -102,18 +108,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 anchor_block,
                 anchor_bitcoin_height,
                 pox_5_activation_height,
-                event_endpoint,
+                pox_v1_unlock_height,
+                pox_v2_unlock_height,
+                pox_v3_unlock_height,
                 poll_interval_secs,
                 max_sync_blocks,
                 conflict_timeout_secs,
                 sync_only,
             },
     } = Cli::parse();
-    if let Some(address) = event_endpoint {
-        let listener = TcpListener::bind(address).await?;
-        eprintln!("serving the replaced signer's event endpoint on {address}");
-        tokio::spawn(events::serve(listener, events::EventSink::new()));
-    }
     let client = SyncClient::new(Url::parse(&peer)?)?;
     let pox = client.pox_info().await?;
     let password = fs::read_to_string(bitcoin_rpc_password_file)?;
@@ -121,6 +124,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         BitcoinRpcSource::new(&bitcoin_rpc, bitcoin_rpc_user, password.trim_end(), *b"T3")?;
     let mut bitcoin_context = pox.bitcoin_context();
     bitcoin_context.height = anchor_bitcoin_height;
+    bitcoin_context.v1_unlock_height = pox_v1_unlock_height;
+    bitcoin_context.v2_unlock_height = pox_v2_unlock_height;
+    bitcoin_context.v3_unlock_height = pox_v3_unlock_height;
     if let Some(height) = pox_5_activation_height {
         bitcoin_context.pox_5_activation_height = height;
     }
