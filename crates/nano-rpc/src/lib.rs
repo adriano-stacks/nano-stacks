@@ -369,6 +369,9 @@ mod tests {
                 reward_slots: 2,
                 rejection_fraction: None,
                 pox_5_activation_height: Some(262),
+                v1_unlock_height: Some(205),
+                v2_unlock_height: Some(207),
+                v3_unlock_height: Some(210),
             },
             tenures: vec![FollowedTenure {
                 info: TenureInfo {

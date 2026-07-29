@@ -62,15 +62,6 @@ struct Cli {
     /// Bitcoin height at which PoX-5 activates.
     #[arg(long)]
     pox_5_activation_height: Option<u32>,
-    /// Bitcoin height used when evaluating PoX-1 STX locks.
-    #[arg(long)]
-    pox_v1_unlock_height: u32,
-    /// Bitcoin height used when evaluating PoX-2 STX locks.
-    #[arg(long)]
-    pox_v2_unlock_height: u32,
-    /// Bitcoin height used when evaluating PoX-3 STX locks.
-    #[arg(long)]
-    pox_v3_unlock_height: u32,
     /// Consensus-encoded candidate block with its transactions selected already.
     #[arg(long)]
     candidate_block: PathBuf,
@@ -191,9 +182,6 @@ fn bitcoin_source(cli: &Cli) -> Result<BitcoinRpcSource, Box<dyn Error>> {
 fn execution_context(cli: &Cli, pox: &PoxInfo, height: u64) -> BitcoinBlockContext {
     let mut context = pox.bitcoin_context();
     context.height = height;
-    context.v1_unlock_height = cli.pox_v1_unlock_height;
-    context.v2_unlock_height = cli.pox_v2_unlock_height;
-    context.v3_unlock_height = cli.pox_v3_unlock_height;
     if let Some(activation_height) = cli.pox_5_activation_height {
         context.pox_5_activation_height = activation_height;
     }

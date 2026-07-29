@@ -85,6 +85,12 @@ pub struct PoxInfo {
     pub reward_slots: u32,
     pub rejection_fraction: Option<u64>,
     pub pox_5_activation_height: Option<u32>,
+    /// Height at which PoX-1 locks expire, one block after epoch 2.1 begins.
+    pub v1_unlock_height: Option<u32>,
+    /// Height at which PoX-2 locks expire, one block after epoch 2.2 begins.
+    pub v2_unlock_height: Option<u32>,
+    /// Height at which PoX-3 locks expire, one block after epoch 2.5 begins.
+    pub v3_unlock_height: Option<u32>,
 }
 
 /// The threshold signer set and optional waterfall payout address for one reward cycle.
@@ -119,9 +125,9 @@ impl PoxInfo {
             prepare_phase_length: self.prepare_phase_length,
             reward_phase_length: self.reward_phase_length,
             rejection_fraction: self.rejection_fraction.unwrap_or(0),
-            v1_unlock_height: u32::MAX,
-            v2_unlock_height: u32::MAX,
-            v3_unlock_height: u32::MAX,
+            v1_unlock_height: self.v1_unlock_height.unwrap_or(u32::MAX),
+            v2_unlock_height: self.v2_unlock_height.unwrap_or(u32::MAX),
+            v3_unlock_height: self.v3_unlock_height.unwrap_or(u32::MAX),
             pox_5_activation_height: self.pox_5_activation_height.unwrap_or(u32::MAX),
         }
     }
@@ -259,6 +265,11 @@ impl SyncClient {
                 .iter()
                 .find(|version| version.contract_id.ends_with(".pox-5"))
                 .map(|version| version.activation_burnchain_block_height),
+            // Each legacy PoX version unlocks one block into the epoch that
+            // retires it, which is how a node derives its own constants.
+            v1_unlock_height: response.unlock_height_after("Epoch21"),
+            v2_unlock_height: response.unlock_height_after("Epoch22"),
+            v3_unlock_height: response.unlock_height_after("Epoch25"),
         })
     }
 
@@ -617,12 +628,32 @@ struct PoxInfoWire {
     rejection_fraction: Option<u64>,
     #[serde(default)]
     contract_versions: Vec<PoxContractVersionWire>,
+    #[serde(default)]
+    epochs: Vec<PoxEpochWire>,
+}
+
+impl PoxInfoWire {
+    /// The first height inside a named epoch, which is when the locks the
+    /// preceding `PoX` contract holds expire.
+    fn unlock_height_after(&self, epoch_id: &str) -> Option<u32> {
+        self.epochs
+            .iter()
+            .find(|epoch| epoch.epoch_id == epoch_id)
+            .and_then(|epoch| u32::try_from(epoch.start_height).ok())
+            .map(|height| height.saturating_add(1))
+    }
 }
 
 #[derive(Deserialize)]
 struct PoxContractVersionWire {
     activation_burnchain_block_height: u32,
     contract_id: String,
+}
+
+#[derive(Deserialize)]
+struct PoxEpochWire {
+    epoch_id: String,
+    start_height: u64,
 }
 
 #[derive(Deserialize)]
