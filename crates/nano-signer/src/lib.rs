@@ -416,6 +416,10 @@ type SignedBlocks = BTreeMap<(ConsensusHash, u64), SignedBlock>;
 /// Seconds before a signed block is considered replaced by its miner.
 pub const DEFAULT_CONFLICT_TIMEOUT_SECS: u64 = 30;
 
+/// Seconds a tenure may run before this signer would accept an extension of it,
+/// matching a stock signer's idle timeout and its buffer.
+pub const TENURE_IDLE_TIMEOUT_SECS: u64 = 122;
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -605,6 +609,9 @@ pub struct EmbeddedSigner<V> {
     conflict_timeout_secs: u64,
     signed: SignedBlocks,
     state: Option<SignerStateStore>,
+    /// When each tenure was first answered for, which is what dates the
+    /// extension this signer is willing to accept.
+    tenures_seen: BTreeMap<ConsensusHash, u64>,
 }
 
 #[derive(Clone)]
@@ -809,6 +816,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             conflict_timeout_secs: config.conflict_timeout_secs,
             signed: BTreeMap::new(),
             state: None,
+            tenures_seen: BTreeMap::new(),
         }
     }
 
@@ -827,6 +835,7 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             conflict_timeout_secs: config.conflict_timeout_secs,
             signed,
             state: Some(state),
+            tenures_seen: BTreeMap::new(),
         })
     }
 
@@ -855,16 +864,38 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
             .map_err(SignerError::Validation)?;
         let next_slot_version = self.next_slot_version;
         let signature = self.private_key.sign(signature_hash.as_bytes());
-        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
-            signature_hash,
-            signature,
-        )));
+        let message = SignerMessage::BlockResponse(BlockResponse::Accepted(
+            BlockAcceptance::with_extend_timestamp(
+                signature_hash,
+                signature,
+                self.extend_timestamp(&proposal.block),
+            ),
+        ));
         self.record(
             position,
             signature_hash,
             message.encode()?,
             next_slot_version,
         )
+    }
+
+    /// When this signer would accept a time-based extension of a block's tenure.
+    ///
+    /// A miner extends once threshold signing power has passed its own answer,
+    /// so this dates the tenure from the first block answered for and rolls the
+    /// clock over whenever a tenure change starts or extends one.
+    fn extend_timestamp(&mut self, block: &NakamotoBlock) -> u64 {
+        let now = now_unix();
+        let started = if nano_chainstate::starts_or_extends_tenure(block) {
+            self.tenures_seen.insert(block.header.consensus_hash, now);
+            now
+        } else {
+            *self
+                .tenures_seen
+                .entry(block.header.consensus_hash)
+                .or_insert(now)
+        };
+        started.saturating_add(TENURE_IDLE_TIMEOUT_SECS)
     }
 
     /// Reissue an existing acceptance only when `StackerDB` has consumed its slot version.
@@ -1600,6 +1631,41 @@ mod tests {
 
         validator.set_context(sortition, proposal.reward_cycle);
         validator.validate(&proposal).expect("refreshed context");
+    }
+
+    /// A miner extends a tenure once threshold signing power has passed the
+    /// timestamp each signer answers with, so answering with the maximum would
+    /// stop every miner on the network from extending anything.
+    #[test]
+    fn acceptances_date_the_extension_they_would_allow() {
+        let mut signer = EmbeddedSigner::new(
+            SignerConfig {
+                conflict_timeout_secs: DEFAULT_CONFLICT_TIMEOUT_SECS,
+                private_key: StacksPrivateKey::from_seed(b"signer"),
+                writer_slot: 0,
+                next_slot_version: 1,
+            },
+            Accept,
+        );
+        let chunk = signer.sign(&proposal()).expect("sign proposal");
+
+        let Ok(SignerMessage::BlockResponse(nano_stackerdb::BlockResponse::Accepted(accepted))) =
+            SignerMessage::decode(&chunk.data)
+        else {
+            panic!("the response is an acceptance");
+        };
+        let now = super::now_unix();
+        assert!(
+            accepted.full_extend_timestamp > now
+                && accepted.full_extend_timestamp
+                    <= now.saturating_add(super::TENURE_IDLE_TIMEOUT_SECS),
+            "an extension is offered within one idle timeout, not never: {}",
+            accepted.full_extend_timestamp
+        );
+        assert_eq!(
+            accepted.read_count_extend_timestamp,
+            accepted.full_extend_timestamp
+        );
     }
 
     #[test]

@@ -1390,6 +1390,22 @@ pub fn starts_new_tenure(block: &NakamotoBlock) -> bool {
     block_starts_new_tenure(block)
 }
 
+/// Whether a block begins a tenure or extends the one it belongs to, which is
+/// what restarts the clock a tenure runs against.
+#[must_use]
+pub fn starts_or_extends_tenure(block: &NakamotoBlock) -> bool {
+    block.transactions.iter().any(|transaction| {
+        matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::TenureChange(payload)
+                if matches!(
+                    payload.cause,
+                    TenureChangeCause::BlockFound | TenureChangeCause::Extended
+                )
+        )
+    })
+}
+
 fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
     block.transactions.iter().any(|transaction| {
         matches!(

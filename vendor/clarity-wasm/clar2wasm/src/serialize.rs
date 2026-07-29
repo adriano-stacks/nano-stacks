@@ -1254,11 +1254,6 @@ impl WasmGenerator {
                     builder.binop(BinaryOp::I32Add);
                 }
             }
-            _ => {
-                return Err(GeneratorError::TypeError(format!(
-                    "Unserializable type found for serialization size computation: {ty}"
-                )))
-            }
         }
         Ok(())
     }

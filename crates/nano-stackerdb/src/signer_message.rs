@@ -42,15 +42,31 @@ pub struct BlockAcceptance {
 }
 
 impl BlockAcceptance {
-    /// Construct the current-version acceptance message.
+    /// Construct an acceptance that offers no opinion on tenure extends.
+    ///
+    /// A miner takes the weighted timestamp at which threshold signing power
+    /// would accept an extension, so a signer that answers with the maximum
+    /// keeps every miner on the network from ever extending a tenure. Only use
+    /// this where no tenure is being answered for.
     #[must_use]
     pub fn new(signer_signature_hash: Sha256Sum, signature: MessageSignature) -> Self {
+        Self::with_extend_timestamp(signer_signature_hash, signature, u64::MAX)
+    }
+
+    /// Construct an acceptance that also says when this signer would accept a
+    /// time-based tenure extension.
+    #[must_use]
+    pub fn with_extend_timestamp(
+        signer_signature_hash: Sha256Sum,
+        signature: MessageSignature,
+        extend_timestamp: u64,
+    ) -> Self {
         Self {
             signer_signature_hash,
             signature,
             server_version: format!("nano-stacks/{}", env!("CARGO_PKG_VERSION")),
-            full_extend_timestamp: u64::MAX,
-            read_count_extend_timestamp: u64::MAX,
+            full_extend_timestamp: extend_timestamp,
+            read_count_extend_timestamp: extend_timestamp,
         }
     }
 }
