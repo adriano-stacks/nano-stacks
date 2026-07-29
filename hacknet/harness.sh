@@ -46,6 +46,9 @@ peer_url() {
 
 chainstate_dir() { echo "$SRC/docker/chainstate/genesis"; }
 
+# A participant index nano did not replace, to read the chain from.
+stock_index() { case ${1:?index} in 1) echo 2 ;; *) echo 1 ;; esac; }
+
 # Run docker compose against the project, from the checkout it belongs to.
 compose() {
     (cd "$SRC" && CHAINSTATE_DIR="$(chainstate_dir)" \
@@ -229,7 +232,7 @@ replace() {
     # nano reads the chain from a participant it did not replace: the one it
     # took over no longer serves anything.
     local follow
-    follow=$(peer_url "$([ "$index" = 1 ] && echo 2 || echo 1)")
+    follow=$(peer_url "$(stock_index "$index")")
     log "starting the nano signer for participant $index against $follow"
     echo "$index" > "$RUN/replaced-participant"
     "$ROOT/target/debug/stacks-signer" run \
@@ -250,6 +253,21 @@ replace() {
     echo $! > "$RUN/nano-signer.pid"
     printf 'nano signs for participant %s as pid %s, logging to %s\n' \
         "$index" "$(cat "$RUN/nano-signer.pid")" "$RUN/nano-signer.log" >&2
+}
+
+# Assert the network keeps doing every kind of work while nano signs for it.
+verify() {
+    need_source
+    local index key
+    index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
+    [ -n "$index" ] || die "no participant is replaced"
+    [ "$(nano_state)" != "not running" ] || die "the nano participant is not running"
+    key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    log "verifying the network with participant $index replaced"
+    NANO_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
+    NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
+        cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
+        --test hacknet_replacement -- --ignored --nocapture
 }
 
 # Put the stock participant back and stop nano.
@@ -286,6 +304,7 @@ status) status ;;
 wait) shift && wait_for "$@" ;;
 checkpoint) checkpoint ;;
 replace) shift && replace "$@" ;;
+verify) verify ;;
 restore) restore ;;
 traffic) traffic ;;
 *)
@@ -298,6 +317,7 @@ usage: harness.sh <command>
   checkpoint         export the state a nano participant validates from
   replace <1|2|3>    stop one stock participant and run nano in its place
   traffic            deploy a contract and call it
+  verify             assert the network keeps working with nano in place
   status             heights, reward cycle, and nano state
   restore            put the stock participant back
   down               stop the network

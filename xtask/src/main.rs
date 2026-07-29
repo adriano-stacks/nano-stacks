@@ -18,9 +18,37 @@ fn main() -> ExitCode {
         Some("scoreboard") => print_scoreboard(),
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
         _ => {
-            eprintln!("usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures>");
+            eprintln!(
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key>"
+            );
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Print the compressed public key a private key signs with.
+fn print_public_key(private_key: Option<&str>) -> ExitCode {
+    let Some(bytes) = private_key
+        .map(|key| key.trim().trim_start_matches("0x"))
+        .map(hex::decode)
+        .transpose()
+        .ok()
+        .flatten()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        eprintln!("usage: cargo xtask public-key <32-byte hexadecimal private key>");
+        return ExitCode::from(2);
+    };
+    match nano_crypto::StacksPrivateKey::from_bytes(bytes) {
+        Ok(key) => {
+            println!("{}", hex::encode(key.public_key().to_bytes_compressed()));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
         }
     }
 }

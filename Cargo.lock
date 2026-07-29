@@ -2578,11 +2578,14 @@ dependencies = [
  "nano-signer",
  "nano-sortition",
  "nano-stackerdb",
+ "nano-sync",
  "proptest",
+ "reqwest",
  "serde",
  "serde_json",
  "stacks-common",
  "stackslib",
+ "tokio",
 ]
 
 [[package]]
@@ -5435,7 +5438,9 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nano-conformance",
+ "nano-crypto",
  "serde_json",
 ]
 

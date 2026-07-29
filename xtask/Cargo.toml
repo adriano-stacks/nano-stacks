@@ -7,7 +7,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+hex = "0.4.3"
 nano-conformance = { path = "../crates/nano-conformance" }
+nano-crypto = { path = "../crates/nano-crypto" }
 serde_json = "1.0.151"
 
 [lints]
