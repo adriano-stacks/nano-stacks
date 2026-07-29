@@ -127,11 +127,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
         Auth::UserPass(cli.bitcoin_rpc_user.clone(), password.clone()),
     )?;
-    let (key_height, key_index) = wallet.confirmed_position(Txid::from_str(&cli.key_txid)?)?;
-    let leader_key = RegisteredLeaderKey {
-        bitcoin_height: u32::try_from(key_height)?,
-        transaction_index: u16::try_from(key_index)?,
-    };
+    let leader_key = registered_key(&wallet, &cli).await?;
 
     let mut executor = open_checkpoint(&cli, &pox, &password)?;
     println!("mining as {miner_hash} from the checkpoint");
@@ -212,6 +208,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Err(error) => eprintln!("reading the sortition failed: {error}"),
         }
         sleep(Duration::from_secs(cli.poll_interval_secs)).await;
+    }
+}
+
+/// Locate the leader-key registration once Bitcoin has confirmed it.
+///
+/// A miner is usually started right after registering its key, so the
+/// registration is still in the mempool and has no position to commit against
+/// yet.
+async fn registered_key(
+    wallet: &BitcoinWallet,
+    cli: &Cli,
+) -> Result<RegisteredLeaderKey, Box<dyn Error>> {
+    let txid = Txid::from_str(&cli.key_txid)?;
+    loop {
+        match wallet.confirmed_position(txid) {
+            Ok((bitcoin_height, transaction_index)) => {
+                return Ok(RegisteredLeaderKey {
+                    bitcoin_height: u32::try_from(bitcoin_height)?,
+                    transaction_index: u16::try_from(transaction_index)?,
+                });
+            }
+            Err(nano_miner::MinerError::Unconfirmed) => {
+                println!("waiting for Bitcoin to confirm the leader key {txid}");
+                sleep(Duration::from_secs(cli.poll_interval_secs)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 

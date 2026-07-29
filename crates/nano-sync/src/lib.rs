@@ -333,7 +333,7 @@ impl SyncClient {
     pub async fn mempool_page(
         &self,
         page: Option<Sha256Sum>,
-    ) -> Result<(Vec<Transaction>, Sha256Sum), SyncError> {
+    ) -> Result<(Vec<Transaction>, Option<Sha256Sum>), SyncError> {
         let path = page.map_or_else(
             || "v2/mempool/query".to_owned(),
             |page| format!("v2/mempool/query?page_id={page}"),
@@ -802,24 +802,25 @@ struct SortitionInfoWire {
 /// (`core/mempool.rs`, `MemPoolSyncDataID::TxTags`).
 const MEMPOOL_QUERY_TX_TAGS: u8 = 0x02;
 
-/// Split a mempool page into its transactions and the next page identifier.
-fn decode_mempool_page(body: &[u8]) -> Result<(Vec<Transaction>, Sha256Sum), SyncError> {
-    let (mut stream, page) = body
-        .split_at_checked(
-            body.len()
-                .checked_sub(32)
-                .ok_or(SyncError::InvalidMempool)?,
-        )
-        .ok_or(SyncError::InvalidMempool)?;
-    let page = Sha256Sum::from_bytes(page.try_into().map_err(|_| SyncError::InvalidMempool)?);
+/// Split a mempool page into its transactions and the identifier of the page
+/// after it.
+///
+/// Nothing frames either: the transactions run back to back, and a peer with
+/// more to send appends the next page's identifier, which is why a stream that
+/// ends on a transaction boundary is the last page (`core/mempool.rs`,
+/// `decode_tx_stream`).
+fn decode_mempool_page(body: &[u8]) -> Result<(Vec<Transaction>, Option<Sha256Sum>), SyncError> {
+    let mut stream = body;
     let mut transactions = Vec::new();
     while !stream.is_empty() {
-        let (transaction, consumed) =
-            Transaction::decode(stream).map_err(|_| SyncError::InvalidMempool)?;
+        let Ok((transaction, consumed)) = Transaction::decode(stream) else {
+            let page = stream.try_into().map_err(|_| SyncError::InvalidMempool)?;
+            return Ok((transactions, Some(Sha256Sum::from_bytes(page))));
+        };
         stream = stream.get(consumed..).ok_or(SyncError::InvalidMempool)?;
         transactions.push(transaction);
     }
-    Ok((transactions, page))
+    Ok((transactions, None))
 }
 
 fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {
@@ -1103,7 +1104,14 @@ mod tests {
         let (transactions, next) = super::decode_mempool_page(&page).expect("decode the page");
         assert_eq!(transactions.len(), 2);
         assert_eq!(transactions[0].txid(), transaction.txid());
-        assert_eq!(next, nano_primitives::Sha256Sum::from_bytes([9; 32]));
+        assert_eq!(next, Some(nano_primitives::Sha256Sum::from_bytes([9; 32])));
+
+        // A stream that ends on a transaction boundary is the last page, which
+        // is what a peer sends when its mempool fits in one.
+        let (transactions, next) =
+            super::decode_mempool_page(&transaction.encode()).expect("decode the last page");
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(next, None);
         assert!(super::decode_mempool_page(&[0; 8]).is_err());
     }
 
