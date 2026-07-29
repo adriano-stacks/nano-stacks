@@ -153,60 +153,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        match won_tenure(&node, miner_hash, &mined).await {
-            Ok(Some(won)) => {
-                let consensus_hash = won.consensus_hash;
-                match mine(
-                    &cli,
-                    &node,
-                    &pox,
-                    &password,
-                    &miner_key,
-                    &vrf_key,
-                    &mut executor,
-                    &won,
-                )
-                .await
-                {
-                    Ok(block) => {
-                        println!("the network accepted nano's block {}", block.block_id());
-                        tenure = Some(TenureState::started(
-                            &won,
-                            &block,
-                            node.account_nonce(miner_address).await?,
-                        ));
-                        executor.accept_own_block(block);
-                    }
-                    Err(error) => eprintln!("mining tenure {consensus_hash} failed: {error}"),
-                }
-                mined.push(consensus_hash);
+        tenure = match advance_tenure(
+            &cli,
+            &node,
+            &pox,
+            &password,
+            &miner_key,
+            &vrf_key,
+            &mut executor,
+            Tracked {
+                miner_hash,
+                miner_address,
+                mined: &mut mined,
+                tenure,
+            },
+        )
+        .await
+        {
+            Ok(tenure) => tenure,
+            Err(error) => {
+                eprintln!("advancing the tenure failed: {error}");
+                None
             }
-            // A tenure is not one block: while nano still owns the current
-            // one, it keeps confirming what the mempool holds, and says on
-            // chain when the tenure outlives the budget it started with.
-            Ok(None) => {
-                if let Some(state) = tenure.as_mut() {
-                    match continue_tenure(&cli, &node, &pox, &miner_key, &mut executor, state).await
-                    {
-                        Ok(Some(block)) => {
-                            println!(
-                                "the network accepted nano's block {} at height {}",
-                                block.block_id(),
-                                block.header.chain_length
-                            );
-                            state.advance(&block);
-                            executor.accept_own_block(block);
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            eprintln!("continuing the tenure failed: {error}");
-                            tenure = None;
-                        }
-                    }
-                }
-            }
-            Err(error) => eprintln!("reading the sortition failed: {error}"),
-        }
+        };
         sleep(Duration::from_secs(cli.poll_interval_secs)).await;
     }
 }
@@ -302,6 +271,99 @@ impl TenureState {
             self.extended = true;
         }
     }
+}
+
+/// What the loop knows about this miner and the tenures it has answered for.
+struct Tracked<'a> {
+    miner_hash: nano_primitives::Hash160,
+    miner_address: StacksAddress,
+    /// Tenures already started, so a won sortition is not mined twice.
+    mined: &'a mut Vec<ConsensusHash>,
+    tenure: Option<TenureState>,
+}
+
+/// Start the tenure nano has won, carry on the one it owns, or do neither.
+#[allow(clippy::too_many_arguments)]
+async fn advance_tenure(
+    cli: &Cli,
+    node: &SyncClient,
+    pox: &PoxInfo,
+    password: &str,
+    miner_key: &StacksPrivateKey,
+    vrf_key: &VrfPrivateKey,
+    executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+    tracked: Tracked<'_>,
+) -> Result<Option<TenureState>, Box<dyn Error>> {
+    let Tracked {
+        miner_hash,
+        miner_address,
+        mined,
+        mut tenure,
+    } = tracked;
+    let Some(won) = won_tenure(node, miner_hash, mined).await? else {
+        // A tenure is not one block: while nano still owns the current one, it
+        // keeps confirming what the mempool holds, and says on chain when the
+        // tenure outlives the budget it started with.
+        if let Some(state) = tenure.as_mut()
+            && let Some(block) = continue_tenure(cli, node, pox, miner_key, executor, state).await?
+        {
+            println!(
+                "the network accepted nano's block {} at height {}",
+                block.block_id(),
+                block.header.chain_length
+            );
+            state.advance(&block);
+            executor.accept_own_block(block);
+        }
+        return Ok(tenure);
+    };
+
+    mined.push(won.consensus_hash);
+    let nonce = node.account_nonce(miner_address).await?;
+    // A tenure already under way is one to carry on with, not to start again:
+    // its first block is on the chain, and proposing another would ask the
+    // signers to replace one they have signed.
+    if node.tenure_info().await?.consensus_hash == won.consensus_hash {
+        let resumed = resume_tenure(node, &won, nonce).await?;
+        println!(
+            "carrying on tenure {} from height {}",
+            resumed.tip.consensus_hash, resumed.tip.height
+        );
+        return Ok(Some(resumed));
+    }
+    let block = mine(cli, node, pox, password, miner_key, vrf_key, executor, &won).await?;
+    println!("the network accepted nano's block {}", block.block_id());
+    let started = TenureState::started(&won, &block, nonce);
+    executor.accept_own_block(block);
+    Ok(Some(started))
+}
+
+/// Adopt a tenure this miner started but is no longer tracking, which is what a
+/// restart in the middle of one leaves behind.
+async fn resume_tenure(
+    node: &SyncClient,
+    won: &SortitionInfo,
+    nonce: u64,
+) -> Result<TenureState, Box<dyn Error>> {
+    let info = node.tenure_info().await?;
+    let tip = node.block(info.tip_block_id).await?;
+    let start = node.block(info.tenure_start_block_id).await?;
+    Ok(TenureState {
+        tip: TenureTip {
+            consensus_hash: won.consensus_hash,
+            block_id: info.tip_block_id,
+            height: info.tip_height,
+            bitcoin_spent: tip.header.bitcoin_spent,
+        },
+        blocks: u32::try_from(
+            info.tip_height
+                .saturating_sub(start.header.chain_length)
+                .saturating_add(1),
+        )?,
+        nonce,
+        since: Instant::now(),
+        extended: false,
+    })
 }
 
 /// Mine the next block of a tenure nano still owns, if there is anything to say.
