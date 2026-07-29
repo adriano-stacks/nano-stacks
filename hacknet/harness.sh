@@ -263,6 +263,12 @@ verify() {
     [ -n "$index" ] || die "no participant is replaced"
     [ "$(nano_state)" != "not running" ] || die "the nano participant is not running"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    # The window has to contain a contract deploy and a call, so the traffic
+    # runs alongside the assertions rather than before them.
+    log "generating contract traffic for the verification window"
+    traffic "${VERIFY_TRAFFIC_SECS:-600}" > "$RUN/traffic.log" 2>&1 &
+    local traffic_pid=$!
+    trap 'kill "$traffic_pid" 2>/dev/null || true' RETURN
     log "verifying the network with participant $index replaced"
     NANO_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
@@ -286,13 +292,20 @@ restore() {
 }
 
 # Deploy a contract and call it, using Hacknet's own transaction tooling.
+#
+# The broadcaster image ships the flood script but not the contract it deploys,
+# and the script reads nonces from the indexer, so both are supplied here.
 traffic() {
     need_source
-    local key
-    key=$(sed -n 's/^BOOTSTRAPPER_KEY=//p' "$SRC/docker/stacker/stacking/tx-broadcaster.env")
-    log "deploying a contract and calling it through the Hacknet broadcaster"
+    local key seconds=${1:-120}
+    # The first account the broadcaster already sends transfers from, which the
+    # genesis chainstate funds, unlike the key the flood script defaults to.
+    key=$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)
+    compose cp docker/stacker/stacking/flooder.clar tx-broadcaster:/root/flooder.clar
+    log "deploying a contract and calling it for ${seconds}s"
     compose exec -e NUM_FLOODERS=2 -e TX_PER_FLOOD=3 -e BOOTSTRAPPER_KEY="$key" \
-        tx-broadcaster npx tsx /root/flood.ts
+        -e STACKS_CORE_RPC_HOST=stacks-api -e STACKS_CORE_RPC_PORT=3999 \
+        tx-broadcaster sh -c "cd /root && timeout ${seconds} npx tsx flood.ts || true"
 }
 
 case ${1:-} in
@@ -306,7 +319,7 @@ checkpoint) checkpoint ;;
 replace) shift && replace "$@" ;;
 verify) verify ;;
 restore) restore ;;
-traffic) traffic ;;
+traffic) shift && traffic "$@" ;;
 *)
     cat >&2 <<'USAGE'
 usage: harness.sh <command>
@@ -316,7 +329,7 @@ usage: harness.sh <command>
   wait <height> [s]  wait for a Bitcoin height, failing on a Stacks stall
   checkpoint         export the state a nano participant validates from
   replace <1|2|3>    stop one stock participant and run nano in its place
-  traffic            deploy a contract and call it
+  traffic [seconds]  deploy a contract and call it for a while
   verify             assert the network keeps working with nano in place
   status             heights, reward cycle, and nano state
   restore            put the stock participant back
