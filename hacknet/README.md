@@ -50,26 +50,40 @@ follows the canonical chain until it has both a number of new blocks and a rewar
 cycle rollover, then asserts what those blocks contained. A recorded run:
 
 ```
-observed 60 canonical blocks across cycles 18..=19
-every one of the 60 blocks carries nano's signature
-nano mined 3 of the 60 canonical blocks, at heights [835, 851, 852]
-47 transfer transactions, including 806e50fe… which the network reports as success
-1 deploy transactions, including e1fb874b… which the network reports as success
-267 call transactions, including 25c99734… which the network reports as success
-11 tenure change transactions, including be642b5e… which the network reports as success
-11 coinbase transactions, including 840de077… which the network reports as success
-12 sortitions across 3 distinct miners
-reward cycle 19 pays a waterfall set in which nano holds weight 10 of 30
+observed 30 canonical blocks across cycles 17..=18
+every one of the 30 blocks carries nano's signature
+nano mined 12 of the 30 canonical blocks, at heights [370, 371, 372, 373, 374, 391, …]
+18 transfer transactions, including 2520b739… which the network reports as success
+3 deploy transactions, including 6308c3e5… which the network reports as success
+95 call transactions, including b3778288… which the network reports as success
+7 tenure change transactions, including f5c71522… which the network reports as success
+6 coinbase transactions, including 4855b785… which the network reports as success
+6 sortitions across 2 distinct miners
+reward cycle 18 pays a waterfall set in which nano holds weight 10 of 30
 ```
+
+The consecutive runs of mined heights are whole tenures: nano keeps building on
+its own tip for as long as it owns the tenure, confirming what the mempool holds.
 
 Every signature is recovered from the block header and checked against the reward
 set, every miner signature is recovered the same way, and every receipt is read
 back from the indexer. A signer-only run reports the same lines without the
 mining one.
 
-nano mines the first block of each tenure it wins; the transactions that arrive
-during the rest of its tenure wait for the next miner, and a tenure extend is not
-implemented.
+## Exercising a long tenure
+
+Hacknet produces a sortition roughly every ten seconds, so a tenure rarely lasts
+long enough to need extending. Stopping the Bitcoin miner while nano owns the
+tenure is what a slow burnchain looks like:
+
+```
+docker compose -p hacknet -f docker/docker-compose.yml stop bitcoin-miner
+```
+
+nano then keeps confirming what the mempool holds, and once the tenure has run
+past the idle timeout its signers offer an extension after, it says so on chain.
+A recorded run produced eighteen blocks in one tenure and a `tenure_change` with
+cause `extended` at height 292, all accepted by the stock signers.
 
 ## Released PoX-5 baseline
 
