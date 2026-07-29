@@ -776,6 +776,7 @@ mod tests {
                     miner_signature: miner.sign(&[6; 32]),
                     signer_signatures: Vec::new(),
                     pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+                    problematic_transactions: Vec::new(),
                 },
                 transactions: Vec::new(),
             },

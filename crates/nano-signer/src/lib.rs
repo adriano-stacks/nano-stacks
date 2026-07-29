@@ -1294,6 +1294,7 @@ mod tests {
             miner_signature: key.sign(&[5; 32]),
             signer_signatures: Vec::new(),
             pox_treatment: BitVec::zeros(1).expect("one bit is valid"),
+            problematic_transactions: Vec::new(),
         };
         BlockProposal {
             block: NakamotoBlock {

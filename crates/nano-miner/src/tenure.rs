@@ -271,6 +271,7 @@ pub async fn build_tenure_start_block(
             signer_signatures: Vec::new(),
             pox_treatment: BitVec::ones(WATERFALL_POX_TREATMENT_LEN)
                 .expect("a one-bit vector is valid"),
+            problematic_transactions: Vec::new(),
         },
         transactions,
     })

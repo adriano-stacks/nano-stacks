@@ -813,7 +813,11 @@ impl Transaction {
 
     #[must_use]
     pub fn txid(&self) -> Sha256Sum {
-        sha512_256(&self.encode())
+        if self.bytes.is_empty() {
+            sha512_256(&self.encode())
+        } else {
+            sha512_256(&self.bytes)
+        }
     }
 
     /// Build a transaction authorized by one standard, compressed secp256k1 key.
@@ -863,6 +867,7 @@ impl Transaction {
     pub fn verify_authorization(&self) -> Result<(), CodecError> {
         let mut initial = self.clone();
         initial.auth = self.auth.initial_sighash_auth();
+        initial.bytes.clear();
         self.auth.verify(initial.txid())
     }
 
@@ -2027,9 +2032,11 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodecError, NonFungibleCondition, PostConditionData, PostConditionMode, Reader,
-        Transaction, read_stacks_string,
+        AnchorMode, CodecError, NonFungibleCondition, PostConditionData, PostConditionMode, Reader,
+        Transaction, TransactionPayloadData, TransactionVersion, read_stacks_string,
     };
+    use nano_crypto::StacksPrivateKey;
+    use nano_primitives::sha512_256;
 
     #[test]
     fn stacks_strings_allow_tabs_and_newlines() {
@@ -2071,6 +2078,28 @@ mod tests {
             ));
             assert_eq!(transaction.encode(), bytes);
         }
+    }
+
+    #[test]
+    fn decoded_transactions_keep_their_wire_transaction_id() {
+        let transaction = Transaction::sign_standard(
+            TransactionVersion::Testnet,
+            0x8000_0000,
+            AnchorMode::OnChainOnly,
+            &StacksPrivateKey::from_seed(b"transaction-id"),
+            0,
+            0,
+            TransactionPayloadData::Coinbase { payload: [0; 32] },
+        )
+        .expect("sign transaction");
+        let bytes = transaction.encode();
+        let (decoded, consumed) = Transaction::decode(&bytes).expect("decode transaction");
+
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.txid(), sha512_256(&bytes));
+        decoded
+            .verify_authorization()
+            .expect("verify decoded transaction");
     }
 
     fn encoded_post_condition_transaction(mode: u8, nft_tag: u8) -> Vec<u8> {

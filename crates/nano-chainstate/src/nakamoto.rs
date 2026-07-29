@@ -21,6 +21,13 @@ pub struct NakamotoBlockHeader {
     pub miner_signature: MessageSignature,
     pub signer_signatures: Vec<MessageSignature>,
     pub pox_treatment: BitVec<4000>,
+    pub problematic_transactions: Vec<ProblematicTransaction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProblematicTransaction {
+    pub index: u32,
+    pub category: u8,
 }
 
 impl NakamotoBlockHeader {
@@ -57,6 +64,7 @@ impl NakamotoBlockHeader {
         writer.signature(self.miner_signature);
         writer.signatures(&self.signer_signatures);
         writer.bit_vec(&self.pox_treatment);
+        self.encode_problematic_transactions(writer);
     }
 
     fn signing_bytes(&self, include_miner_signature: bool) -> Vec<u8> {
@@ -66,6 +74,7 @@ impl NakamotoBlockHeader {
             writer.signature(self.miner_signature);
         }
         writer.bit_vec(&self.pox_treatment);
+        self.encode_problematic_transactions(&mut writer);
         writer.finish()
     }
 
@@ -78,6 +87,19 @@ impl NakamotoBlockHeader {
         writer.raw(self.transaction_merkle_root.as_bytes());
         writer.raw(self.state_index_root.as_bytes());
         writer.u64(self.timestamp);
+    }
+
+    fn encode_problematic_transactions(&self, writer: &mut Writer) {
+        if self.version & 0x7f >= 1 {
+            writer.u32(
+                u32::try_from(self.problematic_transactions.len())
+                    .expect("problematic transaction count fits u32"),
+            );
+            for transaction in &self.problematic_transactions {
+                writer.u32(transaction.index);
+                writer.byte(transaction.category);
+            }
+        }
     }
 }
 
@@ -367,8 +389,9 @@ impl NakamotoBlock {
     /// Decode one Nakamoto block from the front of a concatenated block stream.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), NakamotoCodecError> {
         let mut reader = Reader::new(bytes);
+        let version = reader.byte()?;
         let header = NakamotoBlockHeader {
-            version: reader.byte()?,
+            version,
             chain_length: reader.u64()?,
             bitcoin_spent: reader.u64()?,
             consensus_hash: ConsensusHash::from_bytes(reader.array()?),
@@ -379,6 +402,11 @@ impl NakamotoBlock {
             miner_signature: reader.signature()?,
             signer_signatures: reader.signatures()?,
             pox_treatment: reader.bit_vec()?,
+            problematic_transactions: if version & 0x7f >= 1 {
+                reader.problematic_transactions()?
+            } else {
+                Vec::new()
+            },
         };
         let transaction_count = reader.u32()?;
         let count = usize::try_from(transaction_count).map_err(|_| NakamotoCodecError::Length)?;
@@ -460,7 +488,10 @@ impl std::error::Error for TenureError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{NakamotoBlockHeader, Signer, SignerSet, SignerSetError};
+    use super::{
+        NakamotoBlock, NakamotoBlockHeader, ProblematicTransaction, Signer, SignerSet,
+        SignerSetError,
+    };
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
 
@@ -535,6 +566,7 @@ mod tests {
             miner_signature: first.sign(&[5; 32]),
             signer_signatures: Vec::new(),
             pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+            problematic_transactions: Vec::new(),
         };
         let digest = header.signer_signature_hash();
         let first_response = first.sign(digest.as_bytes());
@@ -550,6 +582,33 @@ mod tests {
             ordered,
             vec![first_response, second_response, third_response]
         );
+    }
+
+    #[test]
+    fn epoch_four_headers_round_trip_problematic_transactions() {
+        let block = NakamotoBlock {
+            header: NakamotoBlockHeader {
+                version: 1,
+                chain_length: 1,
+                bitcoin_spent: 0,
+                consensus_hash: ConsensusHash::from_bytes([1; 20]),
+                parent_block_id: StacksBlockId::from_bytes([2; 32]),
+                transaction_merkle_root: Sha256Sum::default(),
+                state_index_root: TrieHash::from_bytes([4; 32]),
+                timestamp: 5,
+                miner_signature: StacksPrivateKey::from_seed(b"miner").sign(&[5; 32]),
+                signer_signatures: Vec::new(),
+                pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+                problematic_transactions: vec![ProblematicTransaction {
+                    index: 3,
+                    category: 1,
+                }],
+            },
+            transactions: Vec::new(),
+        };
+
+        let decoded = NakamotoBlock::decode(&block.encode()).expect("decode block");
+        assert_eq!(decoded, block);
     }
 }
 
@@ -700,6 +759,23 @@ impl<'a> Reader<'a> {
         );
         wire.extend_from_slice(data);
         BitVec::from_wire_bytes(&wire).map_err(NakamotoCodecError::BitVec)
+    }
+
+    fn problematic_transactions(
+        &mut self,
+    ) -> Result<Vec<ProblematicTransaction>, NakamotoCodecError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| NakamotoCodecError::Length)?;
+        if count > self.remaining() / 5 {
+            return Err(NakamotoCodecError::Length);
+        }
+        (0..count)
+            .map(|_| {
+                Ok(ProblematicTransaction {
+                    index: self.u32()?,
+                    category: self.byte()?,
+                })
+            })
+            .collect()
     }
 }
 
