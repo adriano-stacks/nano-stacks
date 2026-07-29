@@ -2096,7 +2096,7 @@ mod tests {
             );
             assert_eq!(
                 ours.transactions.len(),
-                reference.txs.len(),
+                reference.tx_count(),
                 "{}",
                 path.display()
             );
@@ -2596,7 +2596,7 @@ mod tests {
             let bytes = fs::read(&path).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            for transaction in block.txs {
+            for transaction in block.into_executed_and_skipped_txs() {
                 let mut reference = Vec::new();
                 transaction
                     .auth
@@ -2618,8 +2618,8 @@ mod tests {
             let bytes = fs::read(&path).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            let mut nano_transactions = Vec::with_capacity(block.txs.len());
-            for transaction in &block.txs {
+            let mut nano_transactions = Vec::with_capacity(block.tx_count());
+            for transaction in block.executed_and_skipped_txs() {
                 let mut reference = Vec::new();
                 transaction
                     .consensus_serialize(&mut reference)
@@ -2672,7 +2672,7 @@ mod tests {
             let bytes = fs::read(entry.expect("fixture entry").path()).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .expect("decode fixture block");
-            for transaction in block.txs {
+            for transaction in block.into_executed_and_skipped_txs() {
                 let mut encoded = Vec::new();
                 transaction
                     .consensus_serialize(&mut encoded)
@@ -2721,7 +2721,12 @@ mod tests {
             let bytes = fs::read(entry.expect("fixture entry").path()).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .expect("decode fixture block");
-            payloads.extend(block.txs.into_iter().map(|transaction| transaction.payload));
+            payloads.extend(
+                block
+                    .into_executed_and_skipped_txs()
+                    .into_iter()
+                    .map(|transaction| transaction.payload),
+            );
         }
         assert!(
             payloads
@@ -2762,8 +2767,10 @@ mod tests {
             let bytes = fs::read(path).expect("read fixture block");
             let mut block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .expect("decode fixture block");
-            let transaction_index = transaction_index % block.txs.len();
-            let mut transaction = block.txs.remove(transaction_index);
+            let transaction_index = transaction_index % block.tx_count();
+            let mut transaction = block
+                .executed_and_skipped_txs_mut()
+                .remove(transaction_index);
             transaction.chain_id = chain_id;
             let transaction = sign_generated_reference_transaction(transaction, auth_shape, key_material);
 
@@ -2788,7 +2795,11 @@ mod tests {
             let bytes = fs::read(&path).expect("read fixture block");
             let block = ReferenceNakamotoBlock::consensus_deserialize(&mut Cursor::new(&bytes))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            for (transaction_index, transaction) in block.txs.into_iter().enumerate() {
+            for (transaction_index, transaction) in block
+                .into_executed_and_skipped_txs()
+                .into_iter()
+                .enumerate()
+            {
                 let mut encoded = Vec::new();
                 transaction
                     .consensus_serialize(&mut encoded)

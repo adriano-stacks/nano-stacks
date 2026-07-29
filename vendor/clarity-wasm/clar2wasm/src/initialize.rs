@@ -464,7 +464,6 @@ pub fn call_function(
         .ok_or_else(|| {
             clarity::vm::errors::RuntimeCheckErrorKind::UndefinedFunction(function_name.into())
         })?;
-    runtime_cost(ClarityCostFunction::LookupFunction, global_context, 0)?;
     let function_type = module
         .analysis
         .get_public_function_type(function_name)
@@ -482,6 +481,21 @@ pub fn call_function(
         }
     };
     let expected_arguments = function.get_arg_types();
+    let read_only = function.is_read_only();
+    runtime_cost(
+        ClarityCostFunction::UserFunctionApplication,
+        global_context,
+        expected_arguments.len() as u64,
+    )?;
+    if !global_context.epoch_id.uses_arg_size_for_cost() {
+        for argument_type in expected_arguments {
+            runtime_cost(
+                ClarityCostFunction::InnerTypeCheckCost,
+                global_context,
+                argument_type.size()?,
+            )?;
+        }
+    }
     if arguments.len() != expected_arguments.len() {
         return Err(
             clarity::vm::errors::RuntimeCheckErrorKind::IncorrectArgumentCount(
@@ -510,7 +524,8 @@ pub fn call_function(
     let mut store = Store::new(&engine, context);
     let mut linker = Linker::new(&engine);
     link_host_functions(&mut linker)?;
-    store.data_mut().cost_globals = Some(link_cost_globals(&mut linker, &mut store)?);
+    let cost_globals = link_cost_globals(&mut linker, &mut store)?;
+    store.data_mut().cost_globals = Some(cost_globals);
     let instance = linker
         .instantiate(&mut store, &wasm_module)
         .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
@@ -554,30 +569,46 @@ pub fn call_function(
         .into_iter()
         .map(placeholder_for_type)
         .collect::<Vec<_>>();
+    if read_only {
+        store.data_mut().global_context.begin_read_only();
+    } else {
+        store.data_mut().global_context.begin();
+    }
     let call_result = wasm_function.call(&mut store, &wasm_arguments, &mut results);
-    let remaining = store
-        .data()
-        .cost_globals
-        .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
-            "cost-*".to_string(),
-        )))?
-        .remaining_costs(&mut store)
-        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
-    let cost = CostMeter::used_from_remaining(remaining);
-    store
-        .data_mut()
-        .global_context
-        .cost_track
-        .add_cost(cost.into())?;
-    call_result.map_err(|error| {
-        error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
-    })?;
-    let (value, _) =
-        wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?;
+    let execution_result = (|| {
+        let remaining = store
+            .data()
+            .cost_globals
+            .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+                "cost-*".to_string(),
+            )))?
+            .remaining_costs(&mut store)
+            .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+        let cost = CostMeter::used_from_remaining(remaining);
+        store
+            .data_mut()
+            .global_context
+            .cost_track
+            .add_cost(cost.into())?;
+        call_result.map_err(|error| {
+            error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
+        })?;
+        wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?
+            .0
+            .ok_or(crate::error::wasm_error(WasmError::Expect(
+                "function returned no value".into(),
+            )))
+    })();
+    let value = if read_only {
+        store.data_mut().global_context.roll_back()?;
+        execution_result?
+    } else {
+        store
+            .data_mut()
+            .global_context
+            .handle_tx_result(execution_result, false)?
+    };
     drop(store);
-    let value = value.ok_or(crate::error::wasm_error(WasmError::Expect(
-        "function returned no value".into(),
-    )))?;
     if let Some(handler) = global_context.database.get_cc_special_cases_handler() {
         handler(
             global_context,
@@ -599,7 +630,7 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
             Value::Principal(PrincipalData::Contract(contract_identifier)),
         ) => Value::CallableContract(CallableData {
             contract_identifier: contract_identifier.clone(),
-            trait_identifier: Some(trait_identifier.clone()),
+            trait_identifier: Some(Box::new(trait_identifier.clone())),
         }),
         _ => argument.clone(),
     }

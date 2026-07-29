@@ -133,7 +133,7 @@ impl ComplexWord for MapGet {
 
         // Push the key to the data stack
         generator.set_expr_type(key, key_ty.clone())?;
-        generator.traverse_expr_as_borrowed_value(builder, key)?;
+        generator.traverse_expr(builder, key)?;
         // for epoch >= 2.05, we compute the serialization size of the key.
         if let Some(cost_local) = &post205_cost_local {
             generator.serialization_size(builder, &key_ty)?;
@@ -314,8 +314,6 @@ impl ComplexWord for MapSet {
         if let Some(cost_local) = &post205_cost_local {
             generator.serialization_size(builder, &value_type)?;
             builder
-                .i32_const(1)
-                .binop(BinaryOp::I32Add)
                 .local_get(**cost_local)
                 .binop(BinaryOp::I32Add)
                 .local_set(**cost_local);

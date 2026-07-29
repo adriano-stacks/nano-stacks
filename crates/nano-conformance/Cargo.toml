@@ -23,12 +23,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
 [dev-dependencies]
-clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
-libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
-libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 proptest = "1.11.0"
-stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
-stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
 
 [lints]
 workspace = true

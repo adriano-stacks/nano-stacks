@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write as _};
+use std::sync::Mutex;
 
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
-use clarity::vm::costs::{constants as cost_constants, CostTracker};
+use clarity::vm::costs::cost_functions::ClarityCostFunction;
+use clarity::vm::costs::{constants as cost_constants, runtime_cost, CostTracker};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{
     RuntimeCheckErrorKind, RuntimeError, StaticCheckErrorKind, VmExecutionError, VmInternalError,
@@ -35,11 +37,12 @@ use stacks_common::util::secp256k1::{
 use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
     AsContextMut, Caller, Engine, ExternRef, Global, GlobalType, Instance, Linker, Memory, Module,
-    Store, Val,
+    Store, Trap, Val,
 };
 
 use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
+use crate::error_mapping::ErrorMap;
 use crate::initialize::{call_function, ClarityWasmContext};
 use crate::wasm_utils::*;
 
@@ -4037,7 +4040,7 @@ fn handle_vm_execution_errors(
         )))?;
     match linked_error.set(
         caller.as_context_mut(),
-        Val::ExternRef(Some(ExternRef::new(error))),
+        Val::ExternRef(Some(ExternRef::new(Mutex::new(Some(error))))),
     ) {
         Err(error) => Err(crate::error::wasm_error(WasmError::UnableToWriteMemory(
             error,
@@ -5582,7 +5585,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              _args_length: i32,
              return_offset: i32,
              _return_length: i32| {
-                (|| -> Result<(), VmExecutionError> {
+                let result = (|| -> Result<(), VmExecutionError> {
                     let memory = caller
                         .get_export("memory")
                         .and_then(|export| export.into_memory())
@@ -5688,6 +5691,11 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         .contract_identifier
                         .clone()
                         .into();
+                    runtime_cost(
+                        ClarityCostFunction::ContractCall,
+                        caller.data_mut().global_context,
+                        0,
+                    )?;
                     let sender = caller.data().sender.clone();
                     let sponsor = caller.data().sponsor.clone();
                     let module_cache = caller.data().module_cache;
@@ -5716,8 +5724,35 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         true,
                     )?;
                     Ok(())
-                })()
-                .map_err(|error| wasmtime::Error::msg(error.to_string()))
+                })();
+
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        handle_vm_execution_errors(&mut caller, error)
+                            .map_err(wasmtime::Error::new)?;
+                        let runtime_error_code = caller
+                            .get_export("runtime-error-code")
+                            .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+                                "runtime-error-code".to_owned(),
+                            )))?
+                            .into_global()
+                            .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+                                "runtime-error-code".to_owned(),
+                            )))?;
+                        runtime_error_code
+                            .set(
+                                caller.as_context_mut(),
+                                Val::I32(ErrorMap::ExternError as i32),
+                            )
+                            .map_err(|error| {
+                                wasmtime::Error::new(crate::error::wasm_error(
+                                    WasmError::UnableToWriteMemory(error),
+                                ))
+                            })?;
+                        Err(wasmtime::Error::new(Trap::UnreachableCodeReached))
+                    }
+                }
             },
         )
         .map(|_| ())

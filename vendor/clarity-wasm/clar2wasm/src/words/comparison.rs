@@ -1,31 +1,20 @@
 use clarity::vm::types::{SequenceSubtype, StringSubtype, TypeSignature};
-use clarity::vm::{ClarityName, SymbolicExpression};
+use clarity::vm::ClarityName;
 
-use super::{ComplexWord, Word};
-use crate::check_args;
+use super::{SimpleWord, Word};
 use crate::cost::WordCharge;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
-use crate::wasm_utils::ArgumentCountCheck;
 
-trait CmpWord: ComplexWord {
+trait CmpWord: SimpleWord {
     fn fn_name(&self) -> &'static str;
 }
 
-fn traverse_comparison(
+fn visit_comparison(
     word: &impl CmpWord,
     generator: &mut WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    args: &[SymbolicExpression],
+    arg_types: &[TypeSignature],
 ) -> Result<(), GeneratorError> {
-    check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
-    let arg_types = args
-        .iter()
-        .map(|arg| {
-            generator.get_expr_type(arg).cloned().ok_or_else(|| {
-                GeneratorError::TypeError("comparison argument must be typed".to_owned())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let cost_size = arg_types
         .iter()
         .map(|ty| {
@@ -40,7 +29,9 @@ fn traverse_comparison(
 
     let name = word.fn_name();
 
-    let ty = &arg_types[0];
+    let ty = arg_types
+        .first()
+        .ok_or_else(|| GeneratorError::TypeError("comparison requires an argument".to_owned()))?;
 
     let type_suffix = match ty {
         TypeSignature::IntType => "int",
@@ -69,9 +60,6 @@ fn traverse_comparison(
             GeneratorError::InternalError(format!("function not found: {name}-{type_suffix}"))
         })?;
 
-    for arg in args {
-        generator.traverse_expr_as_borrowed_value(builder, arg)?;
-    }
     builder.call(func);
 
     Ok(())
@@ -86,15 +74,15 @@ impl Word for CmpLess {
     }
 }
 
-impl ComplexWord for CmpLess {
-    fn traverse(
+impl SimpleWord for CmpLess {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, args)
+        visit_comparison(self, generator, builder, arg_types)
     }
 }
 
@@ -113,15 +101,15 @@ impl Word for CmpLeq {
     }
 }
 
-impl ComplexWord for CmpLeq {
-    fn traverse(
+impl SimpleWord for CmpLeq {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, args)
+        visit_comparison(self, generator, builder, arg_types)
     }
 }
 
@@ -140,15 +128,15 @@ impl Word for CmpGreater {
     }
 }
 
-impl ComplexWord for CmpGreater {
-    fn traverse(
+impl SimpleWord for CmpGreater {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, args)
+        visit_comparison(self, generator, builder, arg_types)
     }
 }
 
@@ -167,15 +155,15 @@ impl Word for CmpGeq {
     }
 }
 
-impl ComplexWord for CmpGeq {
-    fn traverse(
+impl SimpleWord for CmpGeq {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        traverse_comparison(self, generator, builder, args)
+        visit_comparison(self, generator, builder, arg_types)
     }
 }
 

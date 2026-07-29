@@ -56,6 +56,13 @@ impl WasmGenerator {
         locals: &[LocalId],
         allocated_mem_offset: LocalId,
     ) -> Result<(), GeneratorError> {
+        if is_principal_like(og_ty) && is_principal_like(target_ty) {
+            for &local in locals.iter().rev() {
+                builder.local_set(local);
+            }
+            return Ok(());
+        }
+
         match (og_ty, target_ty) {
             (TypeSignature::NoType, _) | (_, TypeSignature::NoType) => {
                 // drop the useless original value from the stack
@@ -249,11 +256,6 @@ impl WasmGenerator {
                     |_else| {},
                 );
             }
-            (TypeSignature::ListUnionType(_), TypeSignature::ListUnionType(_)) => {
-                return Err(GeneratorError::InternalError(
-                    "Unconcretized ListUnionType".to_owned(),
-                ))
-            }
             _ => {
                 return Err(GeneratorError::TypeError(format!(
                     "Incompatible types for duck typing:\n\t{og_ty:?}\n\t{target_ty:?}"
@@ -279,12 +281,8 @@ pub fn need_ducktyping(og_ty: &TypeSignature, tg_ty: &TypeSignature) -> bool {
         | TypeSignature::UIntType => og_ty != tg_ty,
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
-        | TypeSignature::TraitReferenceType(_) => !matches!(
-            tg_ty,
-            TypeSignature::PrincipalType
-                | TypeSignature::CallableType(_)
-                | TypeSignature::TraitReferenceType(_),
-        ),
+        | TypeSignature::ListUnionType(_)
+        | TypeSignature::TraitReferenceType(_) => !is_principal_like(tg_ty),
         // This is a workaround for SequenceElementType. If I have a string-ascii, its element becomes a Byte,
         // and getting the TypeSignature from a byte gives us a (buff 1). We loose an information here, but it
         // makes the code cleaner everywhere else, so this workaround exist.
@@ -342,10 +340,17 @@ pub fn need_ducktyping(og_ty: &TypeSignature, tg_ty: &TypeSignature) -> bool {
                 false
             }
         }
-        TypeSignature::ListUnionType(_) => {
-            unreachable!("ListUnionType should not exist at this point")
-        }
     }
+}
+
+fn is_principal_like(ty: &TypeSignature) -> bool {
+    matches!(
+        ty,
+        TypeSignature::PrincipalType
+            | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_)
+            | TypeSignature::TraitReferenceType(_)
+    )
 }
 
 pub fn dt_needed_workspace(ty: &TypeSignature) -> u32 {

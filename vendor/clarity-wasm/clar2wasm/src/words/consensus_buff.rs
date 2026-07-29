@@ -41,6 +41,7 @@ impl ComplexWord for ToConsensusBuff {
                 )
             })?
             .clone();
+        let ty = generator.type_for_serialization(&ty);
 
         generator.serialization_size(builder, &ty)?;
         builder.local_set(*length);

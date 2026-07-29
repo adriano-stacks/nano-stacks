@@ -1542,19 +1542,7 @@ test_contract_call_response_events!(
         assert_eq!(*response.data, Value::UInt(98765));
     },
     |event_batches: &Vec<(EventBatch, u64)>| {
-        assert_eq!(event_batches.len(), 1);
-        assert_eq!(event_batches[0].0.events.len(), 1);
-        if let StacksTransactionEvent::SmartContractEvent(event) = &event_batches[0].0.events[0] {
-            let (ref contract, ref label) = &event.key;
-            assert_eq!(
-                contract,
-                &QualifiedContractIdentifier::local("print").unwrap()
-            );
-            assert_eq!(label, "print");
-            assert_eq!(event.value, Value::error(Value::UInt(98765)).unwrap());
-        } else {
-            panic!("Unexpected event received from Wasm function call.");
-        }
+        assert!(event_batches.is_empty());
     }
 );
 
@@ -1608,25 +1596,7 @@ test_contract_call_response_events!(
         );
     },
     |event_batches: &Vec<(EventBatch, u64)>| {
-        assert_eq!(event_batches.len(), 1);
-        assert_eq!(event_batches[0].0.events.len(), 1);
-        if let StacksTransactionEvent::SmartContractEvent(event) = &event_batches[0].0.events[0] {
-            let (ref contract, ref label) = &event.key;
-            assert_eq!(
-                contract,
-                &QualifiedContractIdentifier::local("print").unwrap()
-            );
-            assert_eq!(label, "print");
-            assert_eq!(
-                event.value,
-                Value::error(Value::Principal(
-                    PrincipalData::parse("ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM").unwrap()
-                ))
-                .unwrap()
-            );
-        } else {
-            panic!("Unexpected event received from Wasm function call.");
-        }
+        assert!(event_batches.is_empty());
     }
 );
 

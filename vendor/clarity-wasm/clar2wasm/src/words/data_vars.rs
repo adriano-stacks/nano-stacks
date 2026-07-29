@@ -134,10 +134,6 @@ impl ComplexWord for SetDataVar {
         generator.set_expr_type(value, ty.clone())?;
 
         generator.traverse_expr(builder, value)?;
-        generator.serialization_size(builder, &ty)?;
-        let value_size = generator.borrow_local(ValType::I32);
-        builder.local_set(*value_size);
-        self.charge(generator, builder, *value_size)?;
 
         // Get the offset and length for this identifier in the literal memory
         let id_offset = *generator
@@ -148,6 +144,8 @@ impl ComplexWord for SetDataVar {
 
         // Create space on the call stack to write the value
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, false);
+
+        self.charge(generator, builder, size as u32)?;
 
         // Write the value to the memory, to be read by the host
         generator.write_to_memory(builder, offset, 0, &ty)?;
@@ -198,6 +196,7 @@ impl ComplexWord for GetDataVar {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
 
         let name = args.get_name(0)?;
+
         // Get the offset and length for this identifier in the literal memory
         let id_offset = *generator
             .literal_memory_offset
@@ -213,6 +212,8 @@ impl ComplexWord for GetDataVar {
             })?
             .clone();
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, true);
+
+        self.charge(generator, builder, size as u32)?;
 
         // Push the identifier offset and length onto the data stack
         builder
@@ -236,10 +237,6 @@ impl ComplexWord for GetDataVar {
         // Host interface fills the result into the specified memory. Read it
         // back out, and place the value on the data stack.
         generator.read_from_memory(builder, offset, 0, &ty)?;
-        generator.serialization_size(builder, &ty)?;
-        let value_size = generator.borrow_local(ValType::I32);
-        builder.local_set(*value_size);
-        self.charge(generator, builder, *value_size)?;
 
         Ok(())
     }

@@ -1753,7 +1753,11 @@ mod tests {
 
         #[test]
         fn with_stacking_no_args() {
-            let result = evaluate("(as-contract? ((with-stacking)) (ok true))");
+            let result = crate::tools::evaluate_at(
+                "(as-contract? ((with-stacking)) (ok true))",
+                clarity::types::StacksEpochId::Epoch33,
+                clarity::vm::ClarityVersion::Clarity4,
+            );
             assert!(result.is_err());
             assert!(result
                 .unwrap_err()
@@ -1763,7 +1767,11 @@ mod tests {
 
         #[test]
         fn with_stacking_too_many_args() {
-            let result = evaluate("(as-contract? ((with-stacking u100 u200)) (ok true))");
+            let result = crate::tools::evaluate_at(
+                "(as-contract? ((with-stacking u100 u200)) (ok true))",
+                clarity::types::StacksEpochId::Epoch33,
+                clarity::vm::ClarityVersion::Clarity4,
+            );
             assert!(result.is_err());
             assert!(result
                 .unwrap_err()

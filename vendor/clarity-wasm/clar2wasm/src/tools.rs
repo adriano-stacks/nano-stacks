@@ -16,6 +16,7 @@ use clarity::vm::costs::{CostTracker, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::ClarityDatabase;
 use clarity::vm::errors::{StaticCheckErrorKind, VmExecutionError, VmInternalError};
 use clarity::vm::events::{SmartContractEventData, StacksTransactionEvent};
+use clarity::vm::resource_limiter::ResourceLimiter;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData};
 use clarity::vm::{eval_all, ClarityVersion, ContractContext, ContractName, Value};
 use clarity_types::types::TypeSignature;
@@ -451,6 +452,7 @@ impl TestEnvironment {
                     self.epoch,
                     self.version,
                     true,
+                    ResourceLimiter::unlimited(),
                 )
                 .map_err(|boxed| StaticCheckErrorKind::Unreachable(format!("{:?}", boxed.0)))
             })
@@ -628,6 +630,7 @@ struct CrossEvalResult {
 enum KnownBug {
     /// [https://github.com/stacks-network/stacks-core/issues/4622]
     ListOfQualifiedPrincipal,
+    QualifiedContractPrincipalSerialization,
 }
 
 impl KnownBug {
@@ -641,6 +644,12 @@ impl KnownBug {
 
         if check_predicate(&Self::has_list_of_qualified_principal_issue) {
             Some(KnownBug::ListOfQualifiedPrincipal)
+        } else if interpreted.is_ok()
+            && compiled
+                .as_ref()
+                .is_err_and(Self::has_qualified_contract_principal_serialization_issue)
+        {
+            Some(KnownBug::QualifiedContractPrincipalSerialization)
         } else {
             None
         }
@@ -665,6 +674,14 @@ impl KnownBug {
         } else {
             false
         }
+    }
+
+    fn has_qualified_contract_principal_serialization_issue(err: &VmExecutionError) -> bool {
+        matches!(
+            err,
+            VmExecutionError::Internal(VmInternalError::InvariantViolation(message))
+                if message.contains("Unserializable type found for serialization size computation: (principal ")
+        )
     }
 }
 
@@ -1152,11 +1169,9 @@ pub fn as_oom_check_snippet(
         _ => unreachable!("stack-pointer should be a locally declared global with a i32 value"),
     };
 
-    // WORKAROUND: this is to ignore arguments that are computed at runtime and should be removed after fixing
-    //             [issue #587](https://github.com/stacks-network/clarity-wasm/issues/587)
     let args_space_needed = args_types
         .iter()
-        .map(|ty| get_type_in_memory_size(ty, false))
+        .map(|ty| get_type_in_memory_size(ty, true))
         .sum::<i32>() as usize;
 
     // the free space on the last page that we want to fill is the substraction of the total number of bytes

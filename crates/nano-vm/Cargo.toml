@@ -7,13 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
-clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
 nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
-pox-locking = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+pox-locking = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
-stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 
 [lints]
 workspace = true

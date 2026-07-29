@@ -7,6 +7,7 @@ use clarity::vm::types::ResponseData;
 use clarity::vm::{ClarityVersion, Value};
 use clarity_types::types::{ASCIIData, CharType};
 use clarity_types::{ClarityName, ClarityTypeError};
+use std::sync::Mutex;
 use walrus::InstrSeqBuilder;
 use wasmtime::{AsContextMut, Instance, Trap};
 
@@ -149,24 +150,6 @@ impl From<i32> for ErrorMap {
     }
 }
 
-fn referror_to_error<T>(referror: &T, placeholder_error: T) -> T {
-    // SAFETY:
-    //
-    // This unsafe operation returns the value of a location pointed by `*mut T`.
-    //
-    // The purpose of this code is to take the ownership of the `referror` value
-    // since clarity::vm::errors::Error is not a Clonable type.
-    //
-    // Converting a `&T` (referror) to a `*mut T` doesn't cause any issues here
-    // because the reference is not borrowed elsewhere.
-    //
-    // The replaced `T` value is deallocated after the operation. Therefore, the chosen `T`
-    // is a placeholder value, which avoids having two copies of the same pointer.
-    //
-    // Otherwise we would encounter a double free. For example if we had used core::ptr::read to extract the error
-    // held in the referror.
-    unsafe { core::ptr::replace((referror as *const T) as *mut T, placeholder_error) }
-}
 pub(crate) fn resolve_error(
     e: wasmtime::Error,
     instance: Instance,
@@ -175,23 +158,21 @@ pub(crate) fn resolve_error(
     clarity_version: &ClarityVersion,
 ) -> VmExecutionError {
     if let Some(vm_error) = e.root_cause().downcast_ref::<VmExecutionError>() {
-        return referror_to_error(
-            vm_error,
-            crate::error::wasm_error(WasmError::ModuleNotFound),
-        );
+        if let Some(vm_error) = clone_vm_execution_error(vm_error) {
+            return vm_error;
+        }
+        return crate::error::wasm_error(WasmError::Expect(vm_error.to_string()));
     };
 
     if let Some(vm_error) = e.root_cause().downcast_ref::<RuntimeCheckErrorKind>() {
-        return <RuntimeCheckErrorKind as std::convert::Into<VmExecutionError>>::into(
-            referror_to_error(vm_error, RuntimeCheckErrorKind::AtBlockUnavailable),
-        );
+        if let Some(vm_error) = clone_runtime_check_error(vm_error) {
+            return VmExecutionError::RuntimeCheck(vm_error);
+        }
+        return crate::error::wasm_error(WasmError::Expect(vm_error.to_string()));
     };
 
     if let Some(vm_error) = e.root_cause().downcast_ref::<RuntimeError>() {
-        return <RuntimeError as std::convert::Into<VmExecutionError>>::into(referror_to_error(
-            vm_error,
-            RuntimeError::ArithmeticOverflow,
-        ));
+        return crate::error::wasm_error(WasmError::Expect(vm_error.to_string()));
     };
 
     // Check if the error is caused by
@@ -205,6 +186,27 @@ pub(crate) fn resolve_error(
 
     // All other errors are treated as general runtime errors.
     crate::error::wasm_error(WasmError::Runtime(e))
+}
+
+fn clone_vm_execution_error(error: &VmExecutionError) -> Option<VmExecutionError> {
+    match error {
+        VmExecutionError::RuntimeCheck(error) => {
+            clone_runtime_check_error(error).map(VmExecutionError::RuntimeCheck)
+        }
+        _ => None,
+    }
+}
+
+fn clone_runtime_check_error(error: &RuntimeCheckErrorKind) -> Option<RuntimeCheckErrorKind> {
+    match error {
+        RuntimeCheckErrorKind::TypeValueError(ty, value) => Some(
+            RuntimeCheckErrorKind::TypeValueError(ty.clone(), value.clone()),
+        ),
+        RuntimeCheckErrorKind::UnionTypeValueError(types, value) => Some(
+            RuntimeCheckErrorKind::UnionTypeValueError(types.clone(), value.clone()),
+        ),
+        _ => None,
+    }
 }
 
 /// Converts a WebAssembly runtime error code into a Clarity `Error`.
@@ -332,20 +334,24 @@ fn from_runtime_error_code(
                 )),
                 Some(global) => match global.get(store.as_context_mut()).unwrap_externref() {
                     None => crate::error::wasm_error(WasmError::Expect("".to_owned())),
-                    Some(linked_error_extern) => {
-                        match linked_error_extern
-                            .data()
-                            .downcast_ref::<VmExecutionError>()
-                        {
-                            None => crate::error::wasm_error(WasmError::Expect(
-                                "runtime-error-linked should hold an error type".to_owned(),
+                    Some(linked_error_extern) => match linked_error_extern
+                        .data()
+                        .downcast_ref::<Mutex<Option<VmExecutionError>>>()
+                    {
+                        None => crate::error::wasm_error(WasmError::Expect(
+                            "runtime-error-linked should hold an error type".to_owned(),
+                        )),
+                        Some(error) => match error.lock() {
+                            Ok(mut error) => error.take().unwrap_or_else(|| {
+                                crate::error::wasm_error(WasmError::Expect(
+                                    "runtime-error-linked was already consumed".to_owned(),
+                                ))
+                            }),
+                            Err(_) => crate::error::wasm_error(WasmError::Expect(
+                                "runtime-error-linked is poisoned".to_owned(),
                             )),
-                            Some(ref_error) => referror_to_error(
-                                ref_error,
-                                crate::error::wasm_error(WasmError::ModuleNotFound),
-                            ),
-                        }
-                    }
+                        },
+                    },
                 },
             }
         }

@@ -47,10 +47,10 @@ impl ComplexWord for ListCons {
                 )));
             };
 
+        self.charge(generator, builder, list.len() as u32)?;
+
         // Allocate space on the data stack for the entire list
         let (offset, _size) = generator.create_call_stack_local(builder, &ty, false, true);
-        let total_serialized_size = generator.borrow_local(ValType::I32);
-        builder.i32_const(0).local_set(*total_serialized_size);
 
         // Loop through the expressions in the list and store them onto the
         // data stack.
@@ -64,21 +64,10 @@ impl ComplexWord for ListCons {
             generator.set_expr_type(expr, elem_ty.clone())?;
 
             generator.traverse_expr(builder, expr)?;
-            generator.clarity_value_size_on_stack(builder, elem_ty)?;
-            let element_size = generator.borrow_local(ValType::I32);
-            builder.local_set(*element_size);
-            builder
-                .local_get(*total_serialized_size)
-                .local_get(*element_size)
-                .binop(BinaryOp::I32Add)
-                .local_set(*total_serialized_size);
-
             // Write this element to memory
             let elem_size = generator.write_to_memory(builder, offset, total_size, elem_ty)?;
             total_size += elem_size;
         }
-
-        self.charge(generator, builder, *total_serialized_size)?;
 
         // Push the offset and size to the data stack
         builder.local_get(offset).i32_const(total_size as i32);
@@ -542,7 +531,7 @@ impl ComplexWord for AsMaxLen {
 
         // Traverse the second argument, the desired length, leaving the low
         // and high parts on the stack, then drop the high part.
-        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
+        generator.traverse_expr(builder, args.get_expr(1)?)?;
         builder.drop();
 
         // Compare the length of the list to the desired length.
@@ -1719,7 +1708,7 @@ impl ComplexWord for Slice {
         builder.local_get(length_local);
 
         // Traverse the right position, leaving it on the stack.
-        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(2)?)?;
+        generator.traverse_expr(builder, args.get_expr(2)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
@@ -1922,17 +1911,13 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("expecting 2 arguments, got 1"));
+            .contains("expecting >= 2 arguments, got 1"));
     }
 
     #[test]
-    fn concat_more_than_two_args() {
+    fn concat_multiple_args() {
         let result = evaluate("(concat (list 1 2 3) (list 4 5) (list 6 7))");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("expecting 2 arguments, got 3"));
+        assert_eq!(result, evaluate("(list 1 2 3 4 5 6 7)"));
     }
 
     #[test]

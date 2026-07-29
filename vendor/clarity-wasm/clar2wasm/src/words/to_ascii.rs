@@ -40,7 +40,9 @@ impl ComplexWord for ToAscii {
             TypeSignature::BoolType => to_ascii_bool(generator, builder, expr, arg),
             TypeSignature::IntType => to_ascii_int(generator, builder, expr, arg),
             TypeSignature::UIntType => to_ascii_uint(generator, builder, expr, arg),
-            TypeSignature::PrincipalType => to_ascii_principal(generator, builder, expr, arg),
+            TypeSignature::PrincipalType
+            | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_) => to_ascii_principal(generator, builder, expr, arg),
             TypeSignature::SequenceType(SequenceSubtype::BufferType(_)) => {
                 to_ascii_buffer(generator, builder, expr, arg)
             }

@@ -43,17 +43,15 @@ impl Word for StxGetBalance {
     }
 }
 
-impl ComplexWord for StxGetBalance {
-    fn traverse(
+impl SimpleWord for StxGetBalance {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        _arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
         self.charge(generator, builder, 0)?;
-        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(0)?)?;
         builder.call(generator.func_by_name("stdlib.stx_get_balance"));
         Ok(())
     }
@@ -140,17 +138,15 @@ impl Word for StxGetAccount {
     }
 }
 
-impl ComplexWord for StxGetAccount {
-    fn traverse(
+impl SimpleWord for StxGetAccount {
+    fn visit(
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
-        args: &[SymbolicExpression],
+        _arg_types: &[TypeSignature],
+        _return_type: &TypeSignature,
     ) -> Result<(), GeneratorError> {
-        check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
         self.charge(generator, builder, 0)?;
-        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(0)?)?;
         builder.call(generator.func_by_name("stdlib.stx_account"));
         Ok(())
     }

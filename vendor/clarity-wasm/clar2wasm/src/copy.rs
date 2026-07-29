@@ -91,6 +91,7 @@ impl WasmGenerator {
             TypeSignature::SequenceType(_)
             | TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_)
             | TypeSignature::TraitReferenceType(_) => {
                 let [offset, len] = locals else {
                     return Err(GeneratorError::InternalError(
@@ -170,9 +171,6 @@ impl WasmGenerator {
                     }
                 }
                 Ok(())
-            }
-            TypeSignature::ListUnionType(_) => {
-                unreachable!("ListUnionType is not a value type")
             }
         }
     }

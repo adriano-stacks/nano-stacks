@@ -14,9 +14,9 @@ sha2 = { version = "0.10.7" }
 chrono = { version = "0.4.20" }
 rusqlite = { version = "0.31.0" }
 
-clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae", features = ["testing"] }
-stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
-clarity-types = { git = "https://github.com/stacks-network/stacks-core.git", rev = "e04ba8e101fe2f71fae9c79a956b599e0523f3ae" }
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
+stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+clarity-types = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 
 [build-dependencies]
 wat = "1.0.74"

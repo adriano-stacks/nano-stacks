@@ -271,6 +271,7 @@ pub fn wasm_to_clarity_value(
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
             let offset = buffer[value_index]
                 .i32()
@@ -323,7 +324,7 @@ pub fn wasm_to_clarity_value(
                         {
                             Value::CallableContract(CallableData {
                                 contract_identifier: qualified_id,
-                                trait_identifier: Some(trait_identifier.clone()),
+                                trait_identifier: Some(Box::new(trait_identifier.clone())),
                             })
                         } else {
                             Value::Principal(PrincipalData::Contract(qualified_id))
@@ -352,9 +353,6 @@ pub fn wasm_to_clarity_value(
             let tuple = TupleData::from_data(data_map)?;
             Ok((Some(tuple.into()), index - value_index))
         }
-        TypeSignature::ListUnionType(_subtypes) => Err(crate::error::wasm_error(
-            WasmError::InvalidListUnionTypeInValue,
-        )),
     }
 }
 
@@ -447,6 +445,7 @@ pub fn read_from_wasm(
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
             debug_assert!(
                 length >= STANDARD_PRINCIPAL_BYTES as i32 && length <= PRINCIPAL_BYTES_MAX as i32
@@ -493,7 +492,7 @@ pub fn read_from_wasm(
                     {
                         Value::CallableContract(CallableData {
                             contract_identifier: qualified_id,
-                            trait_identifier: Some(trait_identifier.clone()),
+                            trait_identifier: Some(Box::new(trait_identifier.clone())),
                         })
                     } else {
                         Value::Principal(PrincipalData::Contract(qualified_id))
@@ -619,9 +618,6 @@ pub fn read_from_wasm(
             }
         }
         TypeSignature::NoType => Err(crate::error::wasm_error(WasmError::InvalidNoTypeInValue)),
-        TypeSignature::ListUnionType(_subtypes) => Err(crate::error::wasm_error(
-            WasmError::InvalidListUnionTypeInValue,
-        )),
     }
 }
 
@@ -654,6 +650,7 @@ pub fn get_type_size(ty: &TypeSignature) -> i32 {
         TypeSignature::PrincipalType
         | TypeSignature::SequenceType(_)
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => 8, // offset: i32, length: i32
         TypeSignature::OptionalType(inner) => 4 + get_type_size(inner), // indicator: i32, value: inner
         TypeSignature::TupleType(tuple_ty) => {
@@ -668,9 +665,6 @@ pub fn get_type_size(ty: &TypeSignature) -> i32 {
             4 + get_type_size(&inner_types.0) + get_type_size(&inner_types.1)
         }
         TypeSignature::NoType => 4, // i32
-        TypeSignature::ListUnionType(_) => {
-            unreachable!("not a value type")
-        }
     }
 }
 
@@ -687,6 +681,7 @@ pub fn get_type_in_memory_size(ty: &TypeSignature, include_repr: bool) -> i32 {
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
             // Standard principal is a 1 byte version and a 20 byte Hash160.
             // Then there is an int32 for the contract name length, followed by
@@ -735,7 +730,6 @@ pub fn get_type_in_memory_size(ty: &TypeSignature, include_repr: bool) -> i32 {
             4 + get_type_in_memory_size(&res_types.0, include_repr)
                 + get_type_in_memory_size(&res_types.1, include_repr)
         }
-        TypeSignature::ListUnionType(_) => unreachable!("not a value type"),
     }
 }
 
@@ -1023,6 +1017,7 @@ pub fn write_to_wasm(
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
             let principal = value_as_principal(value)?;
             let (standard, contract_name) = match principal {
@@ -1130,9 +1125,6 @@ pub fn write_to_wasm(
             }
 
             Ok((written, in_mem_written))
-        }
-        TypeSignature::ListUnionType(_) => {
-            unreachable!("not a value type")
         }
     }
 }
@@ -1435,8 +1427,8 @@ pub fn is_in_memory_type(ty: &TypeSignature) -> bool {
         TypeSignature::SequenceType(_)
         | TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => true,
-        TypeSignature::ListUnionType(_) => unreachable!("not a value type"),
     }
 }
 
@@ -1457,7 +1449,9 @@ pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
             ValType::I32, // length
         ],
         TypeSignature::BoolType => vec![ValType::I32],
-        TypeSignature::PrincipalType | TypeSignature::CallableType(_) => vec![
+        TypeSignature::PrincipalType
+        | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_) => vec![
             ValType::I32, // offset
             ValType::I32, // length
         ],

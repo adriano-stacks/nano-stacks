@@ -69,9 +69,6 @@ pub struct WasmGenerator {
     /// The locals for the current function.
     pub(crate) bindings: Bindings,
 
-    /// Whether local atom reads should charge the value-copy cost.
-    charge_local_value_copy: bool,
-
     /// Emits cost tracking code if set.
     pub(crate) cost_context: Option<ChargeContext>,
 
@@ -113,10 +110,6 @@ impl Bindings {
             .checked_add(1)
             .ok_or_else(|| GeneratorError::InternalError("binding depth overflow".to_owned()))?;
         Ok(())
-    }
-
-    pub(crate) fn depth(&self) -> u32 {
-        self.depth
     }
 
     pub(crate) fn contains(&mut self, name: &ClarityName) -> bool {
@@ -429,7 +422,6 @@ impl WasmGenerator {
             literal_memory_offset: HashMap::new(),
             constants: HashMap::new(),
             bindings: Bindings::new(),
-            charge_local_value_copy: true,
             cost_context: None,
             early_return_block_id: None,
             current_function_type: None,
@@ -579,27 +571,12 @@ impl WasmGenerator {
         }
     }
 
-    pub fn traverse_expr_without_value_copy_charge(
-        &mut self,
-        builder: &mut InstrSeqBuilder,
-        expr: &SymbolicExpression,
-    ) -> Result<(), GeneratorError> {
-        let previous = std::mem::replace(&mut self.charge_local_value_copy, false);
-        let result = self.traverse_expr(builder, expr);
-        self.charge_local_value_copy = previous;
-        result
-    }
-
     pub fn traverse_expr_as_borrowed_value(
         &mut self,
         builder: &mut InstrSeqBuilder,
         expr: &SymbolicExpression,
     ) -> Result<(), GeneratorError> {
-        if matches!(expr.expr, SymbolicExpressionType::Atom(_)) {
-            self.traverse_expr_without_value_copy_charge(builder, expr)
-        } else {
-            self.traverse_expr(builder, expr)
-        }
+        self.traverse_expr(builder, expr)
     }
 
     pub fn traverse_callable_reference(
@@ -635,7 +612,6 @@ impl WasmGenerator {
                 },
                 args,
             )) => {
-                self.charge_lookup_function(builder)?;
                 // Extract the types from the args and return
                 let get_types = || {
                     let arg_types: Result<Vec<TypeSignature>, GeneratorError> = args
@@ -755,7 +731,6 @@ impl WasmGenerator {
         // Setup the parameters
         let mut param_locals = Vec::new();
         let mut params_types = Vec::new();
-        let mut parameters = Vec::new();
         let mut reused_arg = None;
         for param in function_type.args.iter() {
             // Interpreter returns the first reused arg as NameAlreadyUsed argument
@@ -771,17 +746,7 @@ impl WasmGenerator {
                 plocals.push(local);
                 params_types.push(ty);
             }
-            let value_ty = if matches!(&kind, FunctionKind::Public)
-                && matches!(
-                    &param.signature,
-                    TypeSignature::CallableType(CallableSubtype::Trait(_))
-                ) {
-                TypeSignature::PrincipalType
-            } else {
-                param.signature.clone()
-            };
             bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone());
-            parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
         let results_types = clar2wasm_ty(&function_type.returns);
@@ -799,19 +764,6 @@ impl WasmGenerator {
         func_body
             .global_get(self.stack_pointer)
             .local_set(frame_pointer);
-        self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
-        for (parameter_type, value_type, locals) in &parameters {
-            for local in locals {
-                func_body.local_get(*local);
-            }
-            self.clarity_value_size_on_stack(&mut func_body, value_type)?;
-            let size = self.borrow_local(ValType::I32);
-            func_body.local_set(*size);
-            for _ in clar2wasm_ty(parameter_type) {
-                func_body.drop();
-            }
-            self.charge_inner_type_check(&mut func_body, *size)?;
-        }
 
         // Setup the locals map for this function, saving the top-level map to
         // restore after.
@@ -944,8 +896,8 @@ impl WasmGenerator {
         match ty {
             // NoType and BoolType have the same size (both type and inner)
             NoType => BoolType,
-            // Avoid serialization like `(list 2 <S1G2081040G2081040G2081040G208105NK8PE5.my-trait.my-trait>)`
-            CallableType(CallableSubtype::Trait(_)) => PrincipalType,
+            // Callable metadata is not part of a serialized principal value.
+            CallableType(_) | ListUnionType(_) => PrincipalType,
             // Recursive types
             ResponseType(types) => ResponseType(Box::new((
                 self.type_for_serialization(&types.0),
@@ -1370,6 +1322,7 @@ impl WasmGenerator {
             }
             TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_)
             | TypeSignature::TraitReferenceType(_)
             | TypeSignature::SequenceType(_) => {
                 // Data stack: TOP | Length | Offset | ...
@@ -1495,9 +1448,6 @@ impl WasmGenerator {
                 }
                 Ok(bytes_written)
             }
-            TypeSignature::ListUnionType(_) => Err(GeneratorError::TypeError(
-                "Not a valid value type: ListUnionType".to_owned(),
-            ))?,
         }
     }
 
@@ -1578,6 +1528,7 @@ impl WasmGenerator {
             // represented by an offset and length.
             TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_)
             | TypeSignature::TraitReferenceType(_)
             | TypeSignature::SequenceType(_) => {
                 // Memory: Offset -> | ValueOffset | ValueLength |
@@ -1625,9 +1576,6 @@ impl WasmGenerator {
                 );
                 Ok(4)
             }
-            TypeSignature::ListUnionType(_) => Err(GeneratorError::TypeError(
-                "Not a valid value type: ListUnionType".to_owned(),
-            ))?,
         }
     }
 
@@ -1871,18 +1819,6 @@ impl WasmGenerator {
                 self.duck_type(builder, &cst_ty, &expected_ty, Some(result_local))?;
             }
 
-            self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
-            if self.charge_local_value_copy {
-                let value_ty = if need_ducktyping(&cst_ty, &expected_ty) {
-                    &expected_ty
-                } else {
-                    &cst_ty
-                };
-                self.clarity_value_size_on_stack(builder, value_ty)?;
-                let size = self.borrow_local(ValType::I32);
-                builder.local_set(*size);
-                self.charge_lookup_variable_size(builder, *size)?;
-            }
             Ok(true)
         } else {
             Ok(false)
@@ -1988,21 +1924,13 @@ impl WasmGenerator {
         }
 
         // Handle parameters and local bindings
-        let (values, ty) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+        let (values, _) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
 
         for value in values {
             builder.local_get(value);
         }
-        self.charge_lookup_variable_depth(builder, self.bindings.depth())?;
-        if self.charge_local_value_copy {
-            self.clarity_value_size_on_stack(builder, &ty)?;
-            let size = self.borrow_local(ValType::I32);
-            builder.local_set(*size);
-            self.charge_lookup_variable_size(builder, *size)?;
-        }
-
         Ok(())
     }
 
@@ -2013,10 +1941,8 @@ impl WasmGenerator {
         name: &ClarityName,
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        // WORKAROUND: the typechecker in epoch < 2.1 fails to set correct types for functions
-        //             arguments. We set them ourselves. We don't make the distinction between
-        //             epochs since it would require a deeper modification and it doesn't impact
-        //             the newer ones.
+        // Epochs before 2.1 leave `none` as `NoType` instead of the optional
+        // parameter type expected by the function ABI.
         let return_ty = match self.get_function_type(name).cloned() {
             Some(FunctionType::Fixed(FixedFunction {
                 args: function_args,
@@ -2033,7 +1959,14 @@ impl WasmGenerator {
                     .iter()
                     .zip(function_args.into_iter().map(|a| a.signature))
                 {
-                    if self.get_expr_type(arg).is_none() {
+                    let needs_expected_type = self.get_expr_type(arg).is_none_or(|ty| match ty {
+                        TypeSignature::NoType => true,
+                        TypeSignature::OptionalType(inner) => {
+                            matches!(inner.as_ref(), TypeSignature::NoType)
+                        }
+                        _ => false,
+                    });
+                    if needs_expected_type {
                         self.set_expr_type(arg, signature)?;
                     }
                 }
@@ -2371,8 +2304,8 @@ pub fn has_in_memory_type(ty: &TypeSignature) -> bool {
         TypeSignature::SequenceType(_)
         | TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => true,
-        TypeSignature::ListUnionType(_) => unreachable!("not a value type"),
     }
 }
 
@@ -2389,6 +2322,7 @@ fn count_in_memory_space(ty: &TypeSignature) -> u32 {
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
+        | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => PRINCIPAL_BYTES_MAX as u32,
         TypeSignature::SequenceType(SequenceSubtype::BufferType(len))
         | TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::ASCII(len))) => {
@@ -2403,7 +2337,6 @@ fn count_in_memory_space(ty: &TypeSignature) -> u32 {
         TypeSignature::TupleType(tup) => {
             tup.get_type_map().values().map(count_in_memory_space).sum()
         }
-        TypeSignature::ListUnionType(_) => unreachable!("not a value type"),
     }
 }
 
@@ -2515,7 +2448,7 @@ mod tests {
         assert!(crate::tools::evaluate_at(
             snippet,
             clarity::types::StacksEpochId::Epoch20,
-            clarity::vm::version::ClarityVersion::latest(),
+            clarity::vm::version::ClarityVersion::Clarity1,
         )
         .is_ok());
     }

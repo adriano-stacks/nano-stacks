@@ -234,59 +234,6 @@ impl ChargeGenerator for WasmGenerator {
     }
 }
 
-impl WasmGenerator {
-    pub fn charge_user_function_application(
-        &self,
-        instrs: &mut InstrSeqBuilder,
-        argument_count: u32,
-    ) -> Result<()> {
-        if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(instrs, module, Caf::Linear { a: 26, b: 5 }, argument_count)?;
-        }
-        Ok(())
-    }
-
-    pub fn charge_inner_type_check(
-        &self,
-        instrs: &mut InstrSeqBuilder,
-        size: LocalId,
-    ) -> Result<()> {
-        if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(instrs, module, Caf::Linear { a: 2, b: 5 }, size)?;
-        }
-        Ok(())
-    }
-
-    pub fn charge_lookup_function(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
-        if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(instrs, module, Caf::Constant(16), 0_u32)?;
-        }
-        Ok(())
-    }
-
-    pub fn charge_lookup_variable_depth(
-        &self,
-        instrs: &mut InstrSeqBuilder,
-        depth: u32,
-    ) -> Result<()> {
-        if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(instrs, module, Caf::Linear { a: 1, b: 1 }, depth)?;
-        }
-        Ok(())
-    }
-
-    pub fn charge_lookup_variable_size(
-        &self,
-        instrs: &mut InstrSeqBuilder,
-        size: LocalId,
-    ) -> Result<()> {
-        if let Some((context, module)) = self.cost_context() {
-            context.emit_runtime(instrs, module, Caf::Linear { a: 2, b: 1 }, size)?;
-        }
-        Ok(())
-    }
-}
-
 /// A 32-bit unsigned integer to be resolved at either compile-time or run-time.
 #[derive(Clone, Copy)]
 pub enum Scalar {
@@ -350,23 +297,6 @@ pub struct ChargeContext {
 }
 
 impl ChargeContext {
-    fn emit_runtime(
-        &self,
-        instrs: &mut InstrSeqBuilder,
-        module: &Module,
-        cost: Caf,
-        n: impl Into<Scalar>,
-    ) -> Result<()> {
-        self.emit_with_caf(
-            instrs,
-            module,
-            cost,
-            self.runtime,
-            ErrorMap::CostOverrunRuntime as _,
-            n,
-        )
-    }
-
     fn word_cost(&self, name: &ClarityName) -> Option<&WordCost> {
         match self.epoch {
             StacksEpochId::Epoch10 => panic!("clarity did not exist in epoch 1"),
@@ -1084,7 +1014,6 @@ mod word {
         let cost_tracker = env.cost_tracker;
 
         let cost = CostMeter::from(cost_tracker.get_total());
-
         if let Some(expected_cost) = expected_cost {
             assert_eq!(cost, expected_cost, "'cost' should match 'expected_cost'");
         } else {
@@ -1731,9 +1660,9 @@ mod word {
         3 => CostMeter { runtime: 429,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("list_cons", "(list 1 2 3)", {
-        1 => CostMeter { runtime: 49016, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 886,   read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 852,   read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 206,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("map", "(define-private (zero-or-one (char (buff 1))) \
                           (if (is-eq char 0x00) 0x00 0x01)) \
@@ -1838,9 +1767,9 @@ mod word {
         ),
         ("caller", "(contract-call? .callee foo (ok true) 2 3 4)"),
         {
-                 1 => CostMeter { runtime: 151000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 2 => CostMeter { runtime: 1229,  read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 3 => CostMeter { runtime: 932,  read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 1 => CostMeter { runtime: 155000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 2 => CostMeter { runtime: 1409, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 3 => CostMeter { runtime: 1081, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
              }
     );
 

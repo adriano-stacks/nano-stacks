@@ -1775,7 +1775,7 @@ impl WasmGenerator {
             IntType | UIntType => {
                 self.deserialize_integer(builder, memory, offset_local, end_local, ty == &IntType)
             }
-            PrincipalType | CallableType(_) | TraitReferenceType(_) => {
+            PrincipalType | CallableType(_) | ListUnionType(_) | TraitReferenceType(_) => {
                 self.deserialize_principal(builder, memory, offset_local, offset_result, end_local)
             }
             ResponseType(types) => self.deserialize_response(
@@ -1837,7 +1837,6 @@ impl WasmGenerator {
                 tuple_ty,
             ),
             NoType => unreachable!("NoType should not be deserialized"),
-            ListUnionType(_) => unreachable!("ListUnionType should not be deserialized"),
         }
     }
 }

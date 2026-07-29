@@ -906,7 +906,7 @@ impl WasmGenerator {
             IntType | UIntType => {
                 self.serialize_integer(builder, memory, offset_local, offset, ty == &IntType)
             }
-            PrincipalType | CallableType(_) | TraitReferenceType(_) => {
+            PrincipalType | CallableType(_) | ListUnionType(_) | TraitReferenceType(_) => {
                 self.serialize_principal(builder, memory, offset_local, offset)
             }
             ResponseType(types) => {
@@ -937,7 +937,6 @@ impl WasmGenerator {
                 // that on top of the stack indicating 0 bytes written.
                 Ok(())
             }
-            ListUnionType(_) => unreachable!("ListUnionType should not be serialized"),
         }
     }
 
