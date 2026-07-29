@@ -1,11 +1,12 @@
 ---
 id: "018"
 title: "Mine a whole tenure, not only its first block"
-status: in-progress
+status: completed
 priority: high
 dependencies: []
 tags: []
 created_at: 2026-07-29
+completed_at: 2026-07-29
 ---
 
 # Mine a whole tenure, not only its first block
@@ -21,7 +22,7 @@ tenure that outlives its Bitcoin block also has to be extended.
 - [x] Take pending transactions from a peer over HTTP and hold them locally.
 - [x] Keep mining blocks through a won tenure under the epoch-4 block limits.
 - [x] Extend a tenure once it outlives the budget it started with.
-- [ ] Assert in the Hacknet verification that a nano tenure carried a user
+- [x] Assert in the Hacknet verification that a nano tenure carried a user
       transaction.
 
 ## Acceptance Criteria
