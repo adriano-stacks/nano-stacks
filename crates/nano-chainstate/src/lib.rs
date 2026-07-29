@@ -441,6 +441,17 @@ enum PayloadOutcome {
     },
 }
 
+/// What executing one block needs beyond the state it runs against.
+struct BlockExecution<'a> {
+    bitcoin_context: BitcoinBlockContext,
+    operations: &'a [BitcoinOperation],
+    parent: Option<[u8; 32]>,
+    root: RootPolicy<'a>,
+    effects: NativeBlockEffects,
+    /// Transactions the block may carry if execution admits them.
+    candidates: &'a [Transaction],
+}
+
 /// A chainstate execution context backed by versioned VM state.
 #[derive(Debug)]
 pub struct ChainState {
@@ -634,12 +645,15 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
-            bitcoin_context,
-            operations,
-            parent,
             &mut block,
-            RootPolicy::Verify,
-            NativeBlockEffects::default(),
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Verify,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+            },
         )
     }
 
@@ -653,12 +667,15 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
-            bitcoin_context,
-            &[],
-            parent,
             &mut block,
-            RootPolicy::Verify,
-            effects,
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Verify,
+                effects,
+                candidates: &[],
+            },
         )
     }
 
@@ -687,12 +704,15 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
-            bitcoin_context,
-            operations,
-            parent,
             &mut block,
-            RootPolicy::Trust,
-            NativeBlockEffects::default(),
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Trust,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+            },
         )
     }
 
@@ -706,12 +726,15 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
-            bitcoin_context,
-            &[],
-            parent,
             &mut block,
-            RootPolicy::Trust,
-            effects,
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Trust,
+                effects,
+                candidates: &[],
+            },
         )
     }
 
@@ -724,12 +747,15 @@ impl ChainState {
         miner_key: &StacksPrivateKey,
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
         let applied = self.execute_nakamoto_block(
-            bitcoin_context,
-            &[],
-            parent,
             &mut block,
-            RootPolicy::Mine(miner_key),
-            NativeBlockEffects::default(),
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Mine(miner_key),
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+            },
         )?;
         Ok((block, applied))
     }
@@ -740,18 +766,82 @@ impl ChainState {
         bitcoin_context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
         parent: Option<[u8; 32]>,
-        mut block: NakamotoBlock,
+        block: NakamotoBlock,
         miner_key: &StacksPrivateKey,
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
-        let applied = self.execute_nakamoto_block(
+        self.assemble_nakamoto_block_selecting(
             bitcoin_context,
             operations,
             parent,
+            block,
+            &[],
+            miner_key,
+        )
+    }
+
+    /// Execute a candidate block together with transactions it may drop.
+    ///
+    /// A miner cannot know whether a pending transaction is admissible until it
+    /// runs against the state the block has built so far — the nonce may have
+    /// moved, the fee may no longer be payable — so a candidate that cannot be
+    /// admitted is left out of the block instead of failing it. The block's
+    /// transaction Merkle root is derived from the transactions that remain.
+    pub fn assemble_nakamoto_block_selecting(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        mut block: NakamotoBlock,
+        candidates: &[Transaction],
+        miner_key: &StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        let applied = self.execute_nakamoto_block(
             &mut block,
-            RootPolicy::Mine(miner_key),
-            NativeBlockEffects::default(),
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Mine(miner_key),
+                effects: NativeBlockEffects::default(),
+                candidates,
+            },
         )?;
         Ok((block, applied))
+    }
+
+    /// Add the candidates execution admits to a block being assembled.
+    ///
+    /// A miner cannot know whether a pending transaction is admissible until it
+    /// runs against the state the block has built so far, so one that is not is
+    /// left out instead of failing the block. Filling stops at the epoch's block
+    /// limit, which is what the network would reject the block for exceeding.
+    fn admit_candidates(
+        &mut self,
+        block: &mut NakamotoBlock,
+        candidates: &[Transaction],
+        execution_cost: &mut ExecutionCost,
+        receipts: &mut Vec<TransactionReceipt>,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        for candidate in candidates {
+            if candidate.verify_authorization().is_err() {
+                continue;
+            }
+            let Ok(receipt) = self.execute_transaction(candidate, execution_cost) else {
+                continue;
+            };
+            if execution_cost.add(&receipt.result.cost).is_err()
+                || execution_cost.exceeds(&nano_vm::EPOCH_4_BLOCK_LIMIT)
+            {
+                break;
+            }
+            block.transactions.push(candidate.clone());
+            receipts.push(receipt);
+        }
+        block.header.transaction_merkle_root =
+            nano_codec::transaction_merkle_root(&block.transactions);
     }
 
     /// Advance the tenure a block starts, and return the rewards that mature
@@ -792,13 +882,17 @@ impl ChainState {
     /// state it produces does not match the root its header commits to.
     fn execute_nakamoto_block(
         &mut self,
-        bitcoin_context: BitcoinBlockContext,
-        operations: &[BitcoinOperation],
-        parent: Option<[u8; 32]>,
         block: &mut NakamotoBlock,
-        root: RootPolicy<'_>,
-        effects: NativeBlockEffects,
+        execution: BlockExecution<'_>,
     ) -> Result<AppliedBlock, ChainStateError> {
+        let BlockExecution {
+            bitcoin_context,
+            operations,
+            parent,
+            root,
+            effects,
+            candidates,
+        } = execution;
         if let Some(parent) = parent {
             let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
                 ChainStateError::InvalidTransaction(
@@ -847,6 +941,7 @@ impl ChainState {
                 })?;
                 receipts.push(receipt);
             }
+            self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             self.accounting.add_fees(coinbase_height, block_fees(block));
             for credit in effects.credits {

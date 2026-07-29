@@ -9,8 +9,9 @@ pub use commitment::{
     CommitmentPlan, CommitmentPlanError, EPOCH_4_MARKER, RegisteredLeaderKey, plan_commitment,
 };
 pub use tenure::{
-    BitcoinTenureView, SortitionHashPoint, TenureStartError, build_tenure_start_block,
-    extend_sortition_hash, total_burn_after,
+    BitcoinTenureView, NAKAMOTO_BLOCK_VERSION_EPOCH_4, SortitionHashPoint, TenureExtension,
+    TenureStartError, TenureTip, build_tenure_continuation_block, build_tenure_extend_block,
+    build_tenure_start_block, extend_sortition_hash, total_burn_after,
 };
 
 use std::fmt;

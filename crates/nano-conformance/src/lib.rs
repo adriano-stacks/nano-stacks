@@ -1640,6 +1640,20 @@ mod tests {
             .expect("read reference state root")
     }
 
+    /// What a block may spend in epoch 4, which the node enforces and a miner
+    /// has to stop filling a block at.
+    #[test]
+    fn epoch_4_block_limit_matches_stacks_core() {
+        let ours = nano_vm::EPOCH_4_BLOCK_LIMIT;
+        let reference = blockstack_lib::core::BLOCK_LIMIT_MAINNET_40;
+
+        assert_eq!(ours.write_length, reference.write_length);
+        assert_eq!(ours.write_count, reference.write_count);
+        assert_eq!(ours.read_length, reference.read_length);
+        assert_eq!(ours.read_count, reference.read_count);
+        assert_eq!(ours.runtime, reference.runtime);
+    }
+
     /// Find keys whose hashed trie paths share a leading prefix.
     ///
     /// A trie only compresses a path when two keys collide over more than one

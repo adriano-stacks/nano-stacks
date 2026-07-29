@@ -10,7 +10,7 @@ use nano_codec::{
     TransactionPayloadData, TransactionVersion, transaction_merkle_root,
 };
 use nano_crypto::{MessageSignature, StacksPrivateKey, Vrf, VrfError, VrfPrivateKey};
-use nano_primitives::{BitVec, BitcoinHeaderHash, TrieHash, hash160};
+use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, StacksBlockId, TrieHash, hash160};
 use nano_sortition::SortitionHash;
 use nano_sync::{SortitionInfo, SyncClient, SyncError};
 use serde::{Deserialize, Serialize};
@@ -191,15 +191,15 @@ where
     Ok(total)
 }
 
-/// Build the unexecuted tenure-start block for a sortition this miner won.
-///
-/// The returned block still needs execution to seal its state root and the
-/// miner's signature, which `nano_chainstate` fills in when it assembles.
 /// Header version an epoch-4 block must carry, which also puts the
 /// miner-flagged transaction list in the hash and signature preimages
 /// (`nakamoto/mod.rs`, `expected_version_for_epoch`).
 pub const NAKAMOTO_BLOCK_VERSION_EPOCH_4: u8 = 1;
 
+/// Build the unexecuted tenure-start block for a sortition this miner won.
+///
+/// The returned block still needs execution to seal its state root and the
+/// miner's signature, which `nano_chainstate` fills in when it assembles.
 pub async fn build_tenure_start_block(
     node: &SyncClient,
     won: &SortitionInfo,
@@ -431,4 +431,98 @@ mod tests {
             .expect("verify the winning VRF proof")
         );
     }
+}
+
+/// Build the unexecuted next block of a tenure this miner already started.
+///
+/// A tenure is not one block: after its first, the miner keeps building on its
+/// own tip for as long as the tenure lasts, which is where the transactions
+/// waiting in the mempool are confirmed. Such a block carries no tenure change
+/// and no coinbase, only the transactions execution admits.
+#[must_use]
+pub fn build_tenure_continuation_block(
+    tenure: &TenureTip,
+    transactions: Vec<Transaction>,
+    timestamp: u64,
+) -> NakamotoBlock {
+    NakamotoBlock {
+        header: NakamotoBlockHeader {
+            version: NAKAMOTO_BLOCK_VERSION_EPOCH_4,
+            chain_length: tenure.height.saturating_add(1),
+            bitcoin_spent: tenure.bitcoin_spent,
+            consensus_hash: tenure.consensus_hash,
+            parent_block_id: tenure.block_id,
+            transaction_merkle_root: transaction_merkle_root(&transactions),
+            state_index_root: TrieHash::from_bytes([0; 32]),
+            timestamp,
+            miner_signature: MessageSignature::from_bytes([0; 65]),
+            signer_signatures: Vec::new(),
+            pox_treatment: BitVec::ones(WATERFALL_POX_TREATMENT_LEN)
+                .expect("a one-bit vector is valid"),
+            problematic_transactions: Vec::new(),
+        },
+        transactions,
+    }
+}
+
+/// Build the unexecuted block that extends a tenure into a later burn view.
+///
+/// A tenure that outlives the Bitcoin block which awarded it has to say so on
+/// chain before it may keep spending a fresh budget, and a signer only accepts
+/// the extension once threshold signing power has offered it. The tenure change
+/// keeps the tenure's own consensus hash on both sides, because an extension
+/// does not change the miner (`nakamoto/mod.rs`,
+/// `is_wellformed_tenure_extend_block`).
+pub fn build_tenure_extend_block(
+    tenure: &TenureTip,
+    extension: TenureExtension,
+    chain_id: u32,
+    miner_key: &StacksPrivateKey,
+    transactions: Vec<Transaction>,
+) -> Result<NakamotoBlock, TenureStartError> {
+    let mut extended = vec![Transaction::sign_standard(
+        TransactionVersion::Testnet,
+        chain_id,
+        AnchorMode::OnChainOnly,
+        miner_key,
+        extension.nonce,
+        0,
+        TransactionPayloadData::TenureChange(TenureChangePayload {
+            tenure_consensus_hash: tenure.consensus_hash,
+            previous_tenure_consensus_hash: tenure.consensus_hash,
+            bitcoin_view_consensus_hash: extension.burn_view_consensus_hash,
+            previous_tenure_end: tenure.block_id,
+            previous_tenure_blocks: extension.blocks_in_tenure,
+            cause: TenureChangeCause::Extended,
+            public_key_hash: hash160(&miner_key.public_key().to_bytes_compressed()),
+        }),
+    )?];
+    extended.extend(transactions);
+    Ok(build_tenure_continuation_block(
+        tenure,
+        extended,
+        extension.timestamp,
+    ))
+}
+
+/// What a tenure extension says about the tenure it continues.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenureExtension {
+    /// Burn view the tenure carries on into.
+    pub burn_view_consensus_hash: ConsensusHash,
+    /// Blocks the tenure has produced so far.
+    pub blocks_in_tenure: u32,
+    /// Next nonce the miner key spends.
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+/// The tip of a tenure this miner owns, which its next block builds on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TenureTip {
+    pub consensus_hash: ConsensusHash,
+    pub block_id: StacksBlockId,
+    pub height: u64,
+    /// Burn total the tenure committed to, which its later blocks repeat.
+    pub bitcoin_spent: u64,
 }

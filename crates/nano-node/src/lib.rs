@@ -303,6 +303,29 @@ where
             )?)
     }
 
+    /// Execute a candidate block together with transactions it may drop, and
+    /// seal the state root the admitted set produces.
+    pub fn assemble_selecting(
+        &mut self,
+        candidate: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        candidates: &[nano_codec::Transaction],
+        miner_key: &nano_crypto::StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), CheckpointExecutionError> {
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        Ok(self.chainstate.assemble_nakamoto_block_selecting(
+            bitcoin_context,
+            &operations.operations,
+            Some(*self.tip.block_id().as_bytes()),
+            candidate,
+            candidates,
+            miner_key,
+        )?)
+    }
+
     /// Adopt a block this node produced as the new execution tip.
     pub fn accept_own_block(&mut self, block: NakamotoBlock) {
         self.tip = block;

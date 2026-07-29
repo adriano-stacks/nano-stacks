@@ -7,9 +7,11 @@ use nano_chainstate::{
     BitcoinBlockContext, CoinbaseSchedule, NakamotoBlock, NakamotoCodecError, Signer, SignerSet,
     SignerSetError, TenureError,
 };
+use nano_codec::Transaction;
 use nano_crypto::{CryptoError, StacksPublicKey};
 use nano_primitives::{
-    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
+    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId,
+    StacksBlockId,
 };
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
@@ -153,6 +155,7 @@ pub enum SyncError {
     BlockUploadRejected,
     UnstableTip,
     Fork,
+    InvalidMempool,
 }
 
 impl fmt::Display for SyncError {
@@ -173,6 +176,7 @@ impl fmt::Display for SyncError {
             Self::BlockUploadRejected => formatter.write_str("node rejected uploaded block"),
             Self::UnstableTip => formatter.write_str("peer tip changed during tenure download"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
+            Self::InvalidMempool => formatter.write_str("mempool page is not a transaction stream"),
         }
     }
 }
@@ -194,7 +198,8 @@ impl std::error::Error for SyncError {
             | Self::InvalidRewardSet
             | Self::BlockUploadRejected
             | Self::UnstableTip
-            | Self::Fork => None,
+            | Self::Fork
+            | Self::InvalidMempool => None,
         }
     }
 }
@@ -317,6 +322,42 @@ impl SyncClient {
             return Err(SyncError::InvalidSortition);
         }
         Ok(sortition)
+    }
+
+    /// Fetch the transactions a peer holds that this node has not seen.
+    ///
+    /// The request says which transactions are already known; asking with an
+    /// empty set of tags asks for everything. The response is the transactions
+    /// back to back with the page identifier for the next request as its last
+    /// thirty-two bytes (`core/mempool.rs`, `decode_tx_stream`).
+    pub async fn mempool_page(
+        &self,
+        page: Option<Sha256Sum>,
+    ) -> Result<(Vec<Transaction>, Sha256Sum), SyncError> {
+        let path = page.map_or_else(
+            || "v2/mempool/query".to_owned(),
+            |page| format!("v2/mempool/query?page_id={page}"),
+        );
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(|_| SyncError::InvalidBaseUrl)?;
+        // An empty tag list under a zero seed claims no knowledge of the peer's
+        // mempool, which is how a node that has just started asks for all of it.
+        let mut query = vec![MEMPOOL_QUERY_TX_TAGS];
+        query.extend_from_slice(&[0; 32]);
+        query.extend_from_slice(&0_u32.to_be_bytes());
+        let body = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(query)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        decode_mempool_page(&body)
     }
 
     /// The last Bitcoin height before this one that chose a miner.
@@ -757,6 +798,30 @@ struct SortitionInfoWire {
     vrf_seed: Option<String>,
 }
 
+/// Wire tag for a mempool query that lists the transactions already known
+/// (`core/mempool.rs`, `MemPoolSyncDataID::TxTags`).
+const MEMPOOL_QUERY_TX_TAGS: u8 = 0x02;
+
+/// Split a mempool page into its transactions and the next page identifier.
+fn decode_mempool_page(body: &[u8]) -> Result<(Vec<Transaction>, Sha256Sum), SyncError> {
+    let (mut stream, page) = body
+        .split_at_checked(
+            body.len()
+                .checked_sub(32)
+                .ok_or(SyncError::InvalidMempool)?,
+        )
+        .ok_or(SyncError::InvalidMempool)?;
+    let page = Sha256Sum::from_bytes(page.try_into().map_err(|_| SyncError::InvalidMempool)?);
+    let mut transactions = Vec::new();
+    while !stream.is_empty() {
+        let (transaction, consumed) =
+            Transaction::decode(stream).map_err(|_| SyncError::InvalidMempool)?;
+        stream = stream.get(consumed..).ok_or(SyncError::InvalidMempool)?;
+        transactions.push(transaction);
+    }
+    Ok((transactions, page))
+}
+
 fn parse_block_id(value: &str) -> Result<StacksBlockId, SyncError> {
     parse_hex(value).map(StacksBlockId::from_bytes)
 }
@@ -1006,6 +1071,40 @@ mod tests {
             tip_height: 1,
             reward_cycle: 1,
         }
+    }
+
+    /// A mempool page is the transactions back to back with the next page
+    /// identifier as its last thirty-two bytes, and nothing frames either.
+    #[test]
+    fn mempool_pages_split_into_transactions_and_a_page_identifier() {
+        let transaction = nano_codec::Transaction::sign_standard(
+            nano_codec::TransactionVersion::Testnet,
+            0x8000_0000,
+            nano_codec::AnchorMode::Any,
+            &nano_crypto::StacksPrivateKey::from_seed(b"mempool"),
+            3,
+            180,
+            nano_codec::TransactionPayloadData::TokenTransfer {
+                recipient: nano_codec::Principal::Standard(
+                    nano_address::StacksAddress::single_signature(
+                        nano_primitives::Hash160::from_bytes([4; 20]),
+                        false,
+                    ),
+                ),
+                amount: 1_000,
+                memo: [0; 34],
+            },
+        )
+        .expect("sign a transfer");
+        let mut page = transaction.encode();
+        page.extend_from_slice(transaction.encode().as_slice());
+        page.extend_from_slice(&[9; 32]);
+
+        let (transactions, next) = super::decode_mempool_page(&page).expect("decode the page");
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0].txid(), transaction.txid());
+        assert_eq!(next, nano_primitives::Sha256Sum::from_bytes([9; 32]));
+        assert!(super::decode_mempool_page(&[0; 8]).is_err());
     }
 
     #[tokio::test]

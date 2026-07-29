@@ -37,11 +37,14 @@ use stacks_common::types::{
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 /// The consensus execution-cost limit for an Epoch 4 block.
+///
+/// Epoch 4 doubles what a block may read and leaves writing and runtime where
+/// Epoch 3 left them (`core/mod.rs`, `BLOCK_LIMIT_MAINNET_40`).
 pub const EPOCH_4_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
     write_length: 15_000_000,
     write_count: 15_000,
-    read_length: 100_000_000,
-    read_count: 15_000,
+    read_length: 200_000_000,
+    read_count: 30_000,
     runtime: 5_000_000_000,
 };
 

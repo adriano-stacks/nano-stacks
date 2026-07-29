@@ -25,8 +25,9 @@ use nano_chainstate::{NakamotoBlock, SignerSetError, TenureAccounting};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use nano_miner::{
     BitcoinTenureView, BitcoinWallet, CommitmentPlanError, ProposalCoordinator, ProposalError,
-    RegisteredLeaderKey, SortitionHashPoint, build_tenure_start_block, extend_sortition_hash,
-    plan_commitment, total_burn_after,
+    RegisteredLeaderKey, SortitionHashPoint, TenureExtension, TenureTip,
+    build_tenure_continuation_block, build_tenure_extend_block, build_tenure_start_block,
+    extend_sortition_hash, plan_commitment, total_burn_after,
 };
 use nano_node::CheckpointExecutor;
 use nano_primitives::{ConsensusHash, TrieHash, hash160};
@@ -98,6 +99,10 @@ struct Cli {
     poll_interval_secs: u64,
     #[arg(long, default_value_t = 20_000)]
     max_sync_blocks: usize,
+    /// Seconds a tenure may run before nano extends it, matching the idle
+    /// timeout a signer offers an extension after.
+    #[arg(long, default_value_t = 122)]
+    tenure_extend_after_secs: u64,
 }
 
 #[tokio::main]
@@ -112,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         StacksPrivateKey::from_bytes(read_hex_array(&cli.block_signing_private_key_file)?)?;
     let vrf_key = VrfPrivateKey::from_bytes(read_hex_array(&cli.vrf_private_key_file)?);
     let miner_hash = hash160(&miner_key.public_key().to_bytes_compressed());
+    let miner_address = StacksAddress::single_signature(miner_hash, false);
 
     let wallet = BitcoinWallet::connect(
         &format!(
@@ -127,27 +133,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         transaction_index: u16::try_from(key_index)?,
     };
 
-    let mut context = pox.bitcoin_context();
-    context.height = cli.anchor_bitcoin_height;
-    if let Some(height) = cli.pox_5_activation_height {
-        context.pox_5_activation_height = height;
-    }
-    let mut executor = CheckpointExecutor::from_checkpoint_with_accounting(
-        &cli.checkpoint,
-        parse_hex_array(&cli.source_state_id)?,
-        TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
-        NakamotoBlock::decode(&fs::read(&cli.anchor_block)?)?,
-        context,
-        bitcoin_source(&cli, &password)?,
-        match &cli.tenure_accounting {
-            Some(path) => Some(TenureAccounting::from_json(&fs::read(path)?)?),
-            None => None,
-        },
-    )?;
+    let mut executor = open_checkpoint(&cli, &pox, &password)?;
     println!("mining as {miner_hash} from the checkpoint");
 
     let mut committed_at = 0;
     let mut mined = Vec::new();
+    let mut tenure: Option<TenureState> = None;
     loop {
         if let Err(error) = executor
             .follow_to_tip(&node, &pox, cli.max_sync_blocks)
@@ -183,17 +174,184 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 {
                     Ok(block) => {
                         println!("the network accepted nano's block {}", block.block_id());
+                        tenure = Some(TenureState::started(
+                            &won,
+                            &block,
+                            node.account_nonce(miner_address).await?,
+                        ));
                         executor.accept_own_block(block);
                     }
                     Err(error) => eprintln!("mining tenure {consensus_hash} failed: {error}"),
                 }
                 mined.push(consensus_hash);
             }
-            Ok(None) => {}
+            // A tenure is not one block: while nano still owns the current
+            // one, it keeps confirming what the mempool holds, and says on
+            // chain when the tenure outlives the budget it started with.
+            Ok(None) => {
+                if let Some(state) = tenure.as_mut() {
+                    match continue_tenure(&cli, &node, &pox, &miner_key, &mut executor, state).await
+                    {
+                        Ok(Some(block)) => {
+                            println!(
+                                "the network accepted nano's block {} at height {}",
+                                block.block_id(),
+                                block.header.chain_length
+                            );
+                            state.advance(&block);
+                            executor.accept_own_block(block);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("continuing the tenure failed: {error}");
+                            tenure = None;
+                        }
+                    }
+                }
+            }
             Err(error) => eprintln!("reading the sortition failed: {error}"),
         }
         sleep(Duration::from_secs(cli.poll_interval_secs)).await;
     }
+}
+
+/// Open the checkpoint the miner extends, with the rewards it still owes.
+fn open_checkpoint(
+    cli: &Cli,
+    pox: &PoxInfo,
+    password: &str,
+) -> Result<CheckpointExecutor<BitcoinRpcSource>, Box<dyn Error>> {
+    let mut context = pox.bitcoin_context();
+    context.height = cli.anchor_bitcoin_height;
+    if let Some(height) = cli.pox_5_activation_height {
+        context.pox_5_activation_height = height;
+    }
+    Ok(CheckpointExecutor::from_checkpoint_with_accounting(
+        &cli.checkpoint,
+        parse_hex_array(&cli.source_state_id)?,
+        TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
+        NakamotoBlock::decode(&fs::read(&cli.anchor_block)?)?,
+        context,
+        bitcoin_source(cli, password)?,
+        match &cli.tenure_accounting {
+            Some(path) => Some(TenureAccounting::from_json(&fs::read(path)?)?),
+            None => None,
+        },
+    )?)
+}
+
+/// A tenure this miner started and is still building on.
+struct TenureState {
+    tip: TenureTip,
+    /// Blocks mined in this tenure, which its next tenure change reports.
+    blocks: u32,
+    /// Next nonce the miner key spends, for the transactions only it signs.
+    nonce: u64,
+    /// When the tenure began or was last extended.
+    since: Instant,
+    /// Whether the tenure has already been extended at its current age.
+    extended: bool,
+}
+
+impl TenureState {
+    fn started(won: &SortitionInfo, block: &NakamotoBlock, nonce: u64) -> Self {
+        Self {
+            tip: TenureTip {
+                consensus_hash: won.consensus_hash,
+                block_id: block.block_id(),
+                height: block.header.chain_length,
+                bitcoin_spent: block.header.bitcoin_spent,
+            },
+            blocks: 1,
+            nonce,
+            since: Instant::now(),
+            extended: false,
+        }
+    }
+
+    fn advance(&mut self, block: &NakamotoBlock) {
+        self.tip.block_id = block.block_id();
+        self.tip.height = block.header.chain_length;
+        self.blocks = self.blocks.saturating_add(1);
+        if nano_chainstate::starts_or_extends_tenure(block) {
+            self.nonce = self.nonce.saturating_add(1);
+            self.since = Instant::now();
+            self.extended = true;
+        }
+    }
+}
+
+/// Mine the next block of a tenure nano still owns, if there is anything to say.
+///
+/// Nothing is proposed when the peer has moved past nano's tenure or its tip,
+/// when the mempool is empty, and when no extension is due: a block with no
+/// transactions and no tenure change would only ask the signers to sign the
+/// state it already agreed to.
+async fn continue_tenure(
+    cli: &Cli,
+    node: &SyncClient,
+    pox: &PoxInfo,
+    miner_key: &StacksPrivateKey,
+    executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+    state: &TenureState,
+) -> Result<Option<NakamotoBlock>, Box<dyn Error>> {
+    let tenure = node.tenure_info().await?;
+    if tenure.consensus_hash != state.tip.consensus_hash
+        || tenure.tip_block_id != state.tip.block_id
+    {
+        return Ok(None);
+    }
+    let (pending, _) = node.mempool_page(None).await?;
+    let extend_due = !state.extended
+        && state.since.elapsed() >= Duration::from_secs(cli.tenure_extend_after_secs);
+    if pending.is_empty() && !extend_due {
+        return Ok(None);
+    }
+
+    let sortition = node.sortition(state.tip.consensus_hash).await?;
+    let mut context = pox.bitcoin_context();
+    context.height = sortition.bitcoin_height;
+    if let Some(height) = cli.pox_5_activation_height {
+        context.pox_5_activation_height = height;
+    }
+    let burn_view = node.sortition_tip().await?;
+    let candidate = if extend_due {
+        println!(
+            "extending tenure {} after {:?} into burn view {}",
+            state.tip.consensus_hash,
+            state.since.elapsed(),
+            burn_view.consensus_hash
+        );
+        build_tenure_extend_block(
+            &state.tip,
+            TenureExtension {
+                burn_view_consensus_hash: burn_view.consensus_hash,
+                blocks_in_tenure: state.blocks,
+                nonce: state.nonce,
+                timestamp: burn_view.bitcoin_timestamp,
+            },
+            cli.chain_id,
+            miner_key,
+            Vec::new(),
+        )?
+    } else {
+        build_tenure_continuation_block(&state.tip, Vec::new(), burn_view.bitcoin_timestamp)
+    };
+
+    let (block, applied) = executor.assemble_selecting(candidate, context, &pending, miner_key)?;
+    if block.transactions.is_empty() {
+        return Ok(None);
+    }
+    println!(
+        "assembled block {} at height {} carrying {} transactions with state root {}",
+        block.block_id(),
+        block.header.chain_length,
+        block.transactions.len(),
+        hex::encode(applied.execution.state_root.0)
+    );
+    submit(cli, node, pox, miner_key, block, sortition.bitcoin_height)
+        .await
+        .map(Some)
 }
 
 /// The tenure this miner has won and not yet mined, if there is one.
@@ -308,11 +466,23 @@ async fn mine(
         hex::encode(applied.execution.state_root.0)
     );
 
-    let reward_cycle = pox.reward_cycle(won.bitcoin_height);
+    submit(cli, node, pox, miner_key, block, won.bitcoin_height).await
+}
+
+/// Publish a block to the signers and submit it once they have signed it.
+async fn submit(
+    cli: &Cli,
+    node: &SyncClient,
+    pox: &PoxInfo,
+    miner_key: &StacksPrivateKey,
+    block: NakamotoBlock,
+    bitcoin_height: u64,
+) -> Result<NakamotoBlock, Box<dyn Error>> {
+    let reward_cycle = pox.reward_cycle(bitcoin_height);
     let reward_set = node.stacker_set(reward_cycle).await?;
     let proposal = BlockProposal {
         block,
-        bitcoin_height: won.bitcoin_height,
+        bitcoin_height,
         reward_cycle,
         data: BlockProposal::empty_data(),
     };
