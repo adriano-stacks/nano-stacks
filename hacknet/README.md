@@ -17,7 +17,8 @@ git -C ../hacknet apply /home/aldur/nano-stacks/hacknet/hacknet-main.patch
 
 The patch selects Stacks Core `main` and the stable API `9.0.1`. It preserves
 Hacknet's configured sBTC contracts, so the existing PoX-5 bootstrap and
-Bitcoin-staking helpers keep working. It applies to Hacknet commit
+Bitcoin-staking helpers keep working. Those sBTC contracts are still external
+dependencies, so `pox5-setup` remains required. It applies to Hacknet commit
 `bf821e9d556eab8c7a30c6e86a7dc1f9b200f1a1` and can be removed once upstream
 merges the equivalent change.
 
