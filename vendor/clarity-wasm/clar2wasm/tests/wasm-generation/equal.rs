@@ -17,6 +17,17 @@ proptest! {
     }
 }
 
+/// Principals of more than one contract unify into a union of callable
+/// subtypes rather than a single callable, which the compiler once refused to
+/// size, so `is-eq` failed to compile while the interpreter answered true.
+#[test]
+fn is_eq_over_a_list_of_contract_principals() {
+    crosscheck(
+        "(is-eq (list 'SH205N8RY76BDEA8Q0VP13GNS70M3CSA42KPRX0MB.A 'S720QWDM2GQYP70TPDH62VHCCTWZ8Q4RC6YFH8BW3.A))",
+        Ok(Some(clarity::vm::Value::Bool(true))),
+    );
+}
+
 proptest! {
     #![proptest_config(super::runtime_config())]
 

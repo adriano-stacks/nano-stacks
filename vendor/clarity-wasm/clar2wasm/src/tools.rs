@@ -630,7 +630,6 @@ struct CrossEvalResult {
 enum KnownBug {
     /// [https://github.com/stacks-network/stacks-core/issues/4622]
     ListOfQualifiedPrincipal,
-    QualifiedContractPrincipalSerialization,
 }
 
 impl KnownBug {
@@ -644,12 +643,6 @@ impl KnownBug {
 
         if check_predicate(&Self::has_list_of_qualified_principal_issue) {
             Some(KnownBug::ListOfQualifiedPrincipal)
-        } else if interpreted.is_ok()
-            && compiled
-                .as_ref()
-                .is_err_and(Self::has_qualified_contract_principal_serialization_issue)
-        {
-            Some(KnownBug::QualifiedContractPrincipalSerialization)
         } else {
             None
         }
@@ -674,14 +667,6 @@ impl KnownBug {
         } else {
             false
         }
-    }
-
-    fn has_qualified_contract_principal_serialization_issue(err: &VmExecutionError) -> bool {
-        matches!(
-            err,
-            VmExecutionError::Internal(VmInternalError::InvariantViolation(message))
-                if message.contains("Unserializable type found for serialization size computation: (principal ")
-        )
     }
 }
 

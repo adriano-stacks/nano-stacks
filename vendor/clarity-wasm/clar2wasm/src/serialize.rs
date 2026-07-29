@@ -1017,7 +1017,14 @@ impl WasmGenerator {
             TypeSignature::IntType | TypeSignature::UIntType => {
                 builder.i32_const(17);
             }
-            TypeSignature::PrincipalType => {
+            // Every principal-like type shares the in-memory representation and
+            // the serialization the serializer itself gives them, including a
+            // list whose items are principals of more than one contract, whose
+            // type unifies into a union rather than a single callable.
+            TypeSignature::PrincipalType
+            | TypeSignature::CallableType(_)
+            | TypeSignature::ListUnionType(_)
+            | TypeSignature::TraitReferenceType(_) => {
                 let &[_offset, length] = value else {
                     return MISMATCHED_TYPE_VALUE(ty);
                 };
@@ -1259,8 +1266,10 @@ impl WasmGenerator {
 
 #[cfg(test)]
 mod tests {
+    use clarity::vm::types::signatures::CallableSubtype;
     use clarity::vm::types::{
-        PrincipalData, SequenceSubtype, TupleData, TupleTypeSignature, TypeSignature,
+        PrincipalData, QualifiedContractIdentifier, SequenceSubtype, TupleData, TupleTypeSignature,
+        TypeSignature,
     };
     use clarity::vm::{ClarityName, Value};
 
@@ -1341,6 +1350,41 @@ mod tests {
             .unwrap()
             .into();
         let ty = TypeSignature::PrincipalType;
+
+        test_serialization_size(value, ty);
+    }
+
+    /// A contract principal's own type, which is callable rather than the plain
+    /// principal type, has the same serialization.
+    #[test]
+    fn serialization_size_callable_principal() {
+        let identifier =
+            QualifiedContractIdentifier::parse("STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6.foobar")
+                .unwrap();
+        let value = PrincipalData::Contract(identifier.clone()).into();
+        let ty = TypeSignature::CallableType(CallableSubtype::Principal(identifier));
+
+        test_serialization_size(value, ty);
+    }
+
+    /// A list of principals from more than one contract unifies into a union of
+    /// callable subtypes, which serializes as a principal all the same.
+    #[test]
+    fn serialization_size_union_of_callable_principals() {
+        let first =
+            QualifiedContractIdentifier::parse("STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6.foobar")
+                .unwrap();
+        let second =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox-5").unwrap();
+        let value = PrincipalData::Contract(first.clone()).into();
+        let ty = TypeSignature::ListUnionType(
+            [
+                CallableSubtype::Principal(first),
+                CallableSubtype::Principal(second),
+            ]
+            .into_iter()
+            .collect(),
+        );
 
         test_serialization_size(value, ty);
     }
