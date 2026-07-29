@@ -41,5 +41,9 @@ name = "stacks-commit-block"
 path = "src/bin/commit_block.rs"
 
 [[bin]]
+name = "stacks-miner-run"
+path = "src/bin/run_miner.rs"
+
+[[bin]]
 name = "stacks-mine-tenure"
 path = "src/bin/mine_tenure.rs"

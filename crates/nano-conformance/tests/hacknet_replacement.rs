@@ -32,6 +32,8 @@ struct Expectation {
     peer: Url,
     api: Url,
     nano_key: StacksPublicKey,
+    /// Key nano mines with, when the participant it replaced also mines.
+    nano_miner_key: Option<StacksPublicKey>,
     blocks: u64,
     cycles: u64,
     timeout: Duration,
@@ -59,6 +61,12 @@ impl Expectation {
                 &hex::decode(key.trim()).expect("NANO_SIGNER_PUBLIC_KEY must be hexadecimal"),
             )
             .expect("NANO_SIGNER_PUBLIC_KEY must be a public key"),
+            nano_miner_key: env::var("NANO_MINER_PUBLIC_KEY").ok().map(|key| {
+                StacksPublicKey::from_bytes(
+                    &hex::decode(key.trim()).expect("NANO_MINER_PUBLIC_KEY must be hexadecimal"),
+                )
+                .expect("NANO_MINER_PUBLIC_KEY must be a public key")
+            }),
             blocks: number("NANO_HACKNET_BLOCKS", 20),
             cycles: number("NANO_HACKNET_CYCLES", 1),
             timeout: Duration::from_secs(number("NANO_HACKNET_TIMEOUT_SECS", 1800)),
@@ -106,6 +114,7 @@ async fn hacknet_keeps_working_with_a_nano_participant() {
         end.reward_cycle
     );
     assert_signed_by_nano(&client, &expectation, &observed).await;
+    assert_mined_by_nano(&expectation, &observed);
     assert_processed_everything(&expectation, &observed).await;
     assert_pox_5_cycle_holds_nano(&client, &expectation, &end).await;
 }
@@ -241,6 +250,43 @@ async fn assert_signed_by_nano(
     }
     println!(
         "every one of the {} blocks carries nano's signature",
+        observed.blocks.len()
+    );
+}
+
+/// Blocks nano mined itself, when it replaced a participant that also mines.
+///
+/// A miner signature only counts once the block carrying it is canonical, which
+/// is what walking the chain back from the tip already established.
+fn assert_mined_by_nano(expectation: &Expectation, observed: &Observed) {
+    let Some(expected) = &expectation.nano_miner_key else {
+        println!("no mining key was given, so only nano's signature was checked");
+        return;
+    };
+    let mined = observed
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .header
+                .miner_signature
+                .recover(block.header.miner_signature_hash().as_bytes())
+                .as_ref()
+                == Ok(expected)
+        })
+        .collect::<Vec<_>>();
+    let heights = mined
+        .iter()
+        .map(|block| block.header.chain_length)
+        .collect::<Vec<_>>();
+    assert!(
+        !mined.is_empty(),
+        "nano mined none of the {} canonical blocks",
+        observed.blocks.len()
+    );
+    println!(
+        "nano mined {} of the {} canonical blocks, at heights {heights:?}",
+        mined.len(),
         observed.blocks.len()
     );
 }

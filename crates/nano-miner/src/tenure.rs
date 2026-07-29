@@ -195,6 +195,11 @@ where
 ///
 /// The returned block still needs execution to seal its state root and the
 /// miner's signature, which `nano_chainstate` fills in when it assembles.
+/// Header version an epoch-4 block must carry, which also puts the
+/// miner-flagged transaction list in the hash and signature preimages
+/// (`nakamoto/mod.rs`, `expected_version_for_epoch`).
+pub const NAKAMOTO_BLOCK_VERSION_EPOCH_4: u8 = 1;
+
 pub async fn build_tenure_start_block(
     node: &SyncClient,
     won: &SortitionInfo,
@@ -259,7 +264,7 @@ pub async fn build_tenure_start_block(
 
     Ok(NakamotoBlock {
         header: NakamotoBlockHeader {
-            version: 0,
+            version: NAKAMOTO_BLOCK_VERSION_EPOCH_4,
             chain_length: parent.header.chain_length.saturating_add(1),
             bitcoin_spent: view.total_burn,
             consensus_hash: won.consensus_hash,

@@ -270,10 +270,92 @@ verify() {
     local traffic_pid=$!
     trap 'kill "$traffic_pid" 2>/dev/null || true' RETURN
     log "verifying the network with participant $index replaced"
+    local miner_key=""
+    [ -s "$RUN/miner-signing.key" ] && miner_key=$(cd "$ROOT" && cargo xtask public-key "$(cat "$RUN/miner-signing.key")")
     NANO_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
+    NANO_MINER_PUBLIC_KEY="$miner_key" \
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
         --test hacknet_replacement -- --ignored --nocapture
+}
+
+# Give nano a Bitcoin identity: a wallet that holds keys, funded by the wallet
+# Hacknet already uses for deposits, and a registered leader key.
+#
+# Hacknet's own miner wallets are watch-only, because a stock node signs its own
+# burnchain transactions; nano funds and signs through the wallet, so it needs
+# one of its own. It is deliberately not registered with the bitcoin-miner
+# service, whose on-demand trigger sums confirmations across the wallets it
+# watches: joining that sum would suppress block production for everyone else.
+fund() {
+    need_source
+    local wallet=${NANO_BITCOIN_WALLET:-nano-miner} funding=${1:-100} address
+    mkdir -p "$RUN"
+    for key in miner-signing miner-vrf; do
+        [ -s "$RUN/$key.key" ] || openssl rand -hex 32 > "$RUN/$key.key"
+    done
+    compose_value BITCOIN_RPC_PASS > "$RUN/bitcoin-rpc.pass"
+    bitcoin -named createwallet "wallet_name=$wallet" descriptors=false > /dev/null 2>&1 || true
+    address=$(bitcoin "-rpcwallet=$wallet" getnewaddress nano legacy)
+    echo "$address" > "$RUN/miner-btc.addr"
+    log "funding nano's Bitcoin wallet $wallet at $address with $funding"
+    bitcoin -rpcwallet=depositor sendtoaddress "$address" "$funding" > /dev/null
+}
+
+bitcoin() {
+    compose exec -T bitcoin bitcoin-cli \
+        "-rpcuser=$(compose_value BITCOIN_RPC_USER)" \
+        "-rpcpassword=$(compose_value BITCOIN_RPC_PASS)" "$@"
+}
+
+# Register the leader key that identifies nano's blocks, once per network.
+register() {
+    need_source
+    [ -s "$RUN/miner-signing.key" ] || die "run 'harness.sh fund' first"
+    local consensus_hash
+    consensus_hash=$(curl -sf "$(peer_url 1)/v2/info" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["pox_consensus"])')
+    log "registering nano's leader key against consensus hash $consensus_hash"
+    "$ROOT/target/debug/stacks-register-leader-key" \
+        --bitcoin-rpc "$BITCOIN_RPC/wallet/${NANO_BITCOIN_WALLET:-nano-miner}" \
+        --bitcoin-rpc-user "$(compose_value BITCOIN_RPC_USER)" \
+        --bitcoin-rpc-password-file "$RUN/bitcoin-rpc.pass" \
+        --consensus-hash "$consensus_hash" \
+        --vrf-private-key-file "$RUN/miner-vrf.key" \
+        --block-signing-private-key-file "$RUN/miner-signing.key" |
+        tee "$RUN/leader-key.txt"
+}
+
+# Commit on every Bitcoin block and mine every tenure nano wins.
+mine() {
+    need_source
+    [ -s "$RUN/leader-key.txt" ] || die "run 'harness.sh register' first"
+    local key_txid
+    key_txid=$(grep -oE '[0-9a-f]{64}' "$RUN/leader-key.txt" | head -1)
+    [ -n "$key_txid" ] || die "could not read the leader-key transaction from $RUN/leader-key.txt"
+    log "committing and mining as nano, logging to $RUN/nano-miner.log"
+    "$ROOT/target/debug/stacks-miner-run" \
+        --peer "$(peer_url 1)/" \
+        --bitcoin-rpc "$BITCOIN_RPC" \
+        --bitcoin-rpc-user "$(compose_value BITCOIN_RPC_USER)" \
+        --bitcoin-rpc-password-file "$RUN/bitcoin-rpc.pass" \
+        --bitcoin-wallet "${NANO_BITCOIN_WALLET:-nano-miner}" \
+        --key-txid "$key_txid" \
+        --commitment-sats "${NANO_COMMITMENT_SATS:-20000}" \
+        --commitment-chain-file "$RUN/commit-chain.txt" \
+        --miner-contract "ST000000000000000000002AMW42H/miners" \
+        --block-signing-private-key-file "$RUN/miner-signing.key" \
+        --vrf-private-key-file "$RUN/miner-vrf.key" \
+        --checkpoint "$RUN/checkpoint/marf.sqlite" \
+        --tenure-accounting "$RUN/checkpoint/native-effects.json" \
+        --source-state-id "$(checkpoint_value source_state_id)" \
+        --state-root "$(checkpoint_value state_index_root)" \
+        --anchor-block "$RUN/checkpoint/anchor-block.bin" \
+        --anchor-bitcoin-height "$(checkpoint_value anchor_bitcoin_height)" \
+        --sortition-hash-cache "$RUN/sortition-hash.json" \
+        >> "$RUN/nano-miner.log" 2>&1 &
+    echo $! > "$RUN/nano-miner.pid"
+    printf 'nano mines as pid %s\n' "$(cat "$RUN/nano-miner.pid")" >&2
 }
 
 # Put the stock participant back and stop nano.
@@ -282,10 +364,13 @@ restore() {
     local index
     index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
     [ -n "$index" ] || die "no participant is replaced"
-    if [ -f "$RUN/nano-signer.pid" ]; then
-        kill "$(cat "$RUN/nano-signer.pid")" 2>/dev/null || true
-        rm -f "$RUN/nano-signer.pid"
-    fi
+    for role in signer miner; do
+        if [ -f "$RUN/nano-$role.pid" ]; then
+            pkill -P "$(cat "$RUN/nano-$role.pid")" 2>/dev/null || true
+            kill "$(cat "$RUN/nano-$role.pid")" 2>/dev/null || true
+            rm -f "$RUN/nano-$role.pid"
+        fi
+    done
     log "restoring stock participant $index"
     compose start "stacks-miner-$index" "stacks-signer-$index"
     rm -f "$RUN/replaced-participant"
@@ -316,6 +401,9 @@ wipe) wipe ;;
 status) status ;;
 wait) shift && wait_for "$@" ;;
 checkpoint) checkpoint ;;
+fund) shift && fund "$@" ;;
+register) register ;;
+mine) mine ;;
 replace) shift && replace "$@" ;;
 verify) verify ;;
 restore) restore ;;
@@ -329,6 +417,9 @@ usage: harness.sh <command>
   wait <height> [s]  wait for a Bitcoin height, failing on a Stacks stall
   checkpoint         export the state a nano participant validates from
   replace <1|2|3>    stop one stock participant and run nano in its place
+  fund [btc]         give nano a funded Bitcoin wallet and miner keys
+  register           register nano's leader key on Bitcoin
+  mine               commit on every Bitcoin block and mine every tenure won
   traffic [seconds]  deploy a contract and call it for a while
   verify             assert the network keeps working with nano in place
   status             heights, reward cycle, and nano state
