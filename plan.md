@@ -329,7 +329,7 @@ Chunk: `{slot_id, slot_version, data, sig}`, signed by the slot's writer key (st
 
 Contracts: `SP000000000000000000002Q6VF78.miners` — 2 slots, parity on `num_sortitions % 2`, writers are the block-signing Hash160s from the winners' leader-key registrations (`make_miners_stackerdb_config`). `.signers-{0,1}-{msg_id}` per message slot per cycle parity.
 
-`MinerSlotID::{BlockProposal=0, BlockPushed=1}`; `MessageSlotID::{BlockResponse=1, StateMachineUpdate=6, BlockPreCommit=7}`. `SignerMessage::{BlockProposal, BlockResponse(Accepted(BlockAccepted)|Rejected(BlockRejection)), BlockPushed, StateMachineUpdate, BlockPreCommit, MockSignature, MockProposal, MockBlock}` with `RejectCode`/`RejectReason`.
+`MinerSlotID::{BlockProposal=0, BlockPushed=1}`; `MessageSlotID::{BlockResponse=1, StateMachineUpdate=2, BlockPreCommit=3}` — the contract index a message travels on, which is not its payload type byte (`SignerMessageTypePrefix::{StateMachineUpdate=6, BlockPreCommit=7}`). `SignerMessage::{BlockProposal, BlockResponse(Accepted(BlockAccepted)|Rejected(BlockRejection)), BlockPushed, StateMachineUpdate, BlockPreCommit, MockSignature, MockProposal, MockBlock}` with `RejectCode`/`RejectReason`.
 
 Signer: read proposals from the miner slot, **fully validate** (envelope + execution + state root), run sortition-view and tenure-fork-info reorg checks, write `BlockResponse::Accepted{signature}`.
 

@@ -11,7 +11,7 @@ use std::{
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use fs2::FileExt;
 use nano_bitcoin::BitcoinSource;
-use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock};
+use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, SignerSet};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
@@ -672,6 +672,8 @@ pub struct SignerService<V> {
     client: StackerDbClient,
     miner_contract: StackerDbContract,
     signer_contract: StackerDbContract,
+    /// Contract carrying the promises signers publish before they sign.
+    pre_commit_contract: StackerDbContract,
     signer: EmbeddedSigner<V>,
     last_proposal: Option<Sha256Sum>,
 }
@@ -934,6 +936,20 @@ impl<V: ProposalValidator> EmbeddedSigner<V> {
         self.next_slot_version
     }
 
+    /// Return the key this signer authenticates its chunks with.
+    #[must_use]
+    pub const fn private_key(&self) -> &StacksPrivateKey {
+        &self.private_key
+    }
+
+    /// Validate a proposal without signing it, so a promise can precede the
+    /// signature. Validation is idempotent for a block already checked.
+    pub fn validate(&mut self, proposal: &BlockProposal) -> Result<(), SignerError> {
+        self.validator
+            .validate(proposal)
+            .map_err(SignerError::Validation)
+    }
+
     /// Return this signer's `StackerDB` writer slot.
     #[must_use]
     pub const fn writer_slot(&self) -> u32 {
@@ -980,12 +996,14 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         client: StackerDbClient,
         miner_contract: StackerDbContract,
         signer_contract: StackerDbContract,
+        pre_commit_contract: StackerDbContract,
         signer: EmbeddedSigner<V>,
     ) -> Self {
         Self {
             client,
             miner_contract,
             signer_contract,
+            pre_commit_contract,
             signer,
             last_proposal: None,
         }
@@ -1034,6 +1052,50 @@ impl<V: ProposalValidator + Send> SignerService<V> {
     }
 
     /// Validate and publish a response for a previously fetched miner proposal.
+    /// Publish this signer's promise to sign a block it has validated.
+    ///
+    /// A stock signer withholds its own signature until the promises it can see
+    /// carry threshold weight, so a signer that never promises leaves the rest
+    /// of the reward set unable to sign at all.
+    pub async fn pre_commit(
+        &mut self,
+        proposal: &BlockProposal,
+    ) -> Result<Sha256Sum, SignerServiceError> {
+        let signature_hash = proposal.block.header.signer_signature_hash();
+        let client = self.client.clone();
+        let contract = self.pre_commit_contract.clone();
+        let writer_slot = self.signer.writer_slot();
+        let key = self.signer.private_key().clone();
+        let version = client
+            .slot_versions(&contract)
+            .await?
+            .into_iter()
+            .find(|slot| slot.slot_id == writer_slot)
+            .map_or(0, |slot| slot.slot_version)
+            .checked_add(1)
+            .ok_or(SignerError::SlotVersionOverflow)?;
+        let mut chunk = Chunk::new(
+            writer_slot,
+            version,
+            SignerMessage::BlockPreCommit(signature_hash).encode()?,
+        );
+        chunk.sign(&key).map_err(SignerError::Chunk)?;
+        let acknowledgement = client.put_chunk(&contract, &chunk).await?;
+        if !acknowledgement.accepted {
+            return Err(SignerServiceError::Rejected {
+                reason: acknowledgement.reason,
+                code: acknowledgement.code,
+            });
+        }
+        Ok(signature_hash)
+    }
+
+    /// The `StackerDB` client and pre-commit contract, for reading promises.
+    #[must_use]
+    pub fn pre_commit_channel(&self) -> (StackerDbClient, StackerDbContract) {
+        (self.client.clone(), self.pre_commit_contract.clone())
+    }
+
     pub async fn respond(
         &mut self,
         pending: PendingProposal,
@@ -1079,19 +1141,51 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         &mut self.signer
     }
 
-    /// Rebind the contract and slot a new reward cycle assigns this signer.
-    pub fn rebind(&mut self, signer_contract: StackerDbContract, writer_slot: u32) {
+    /// Rebind the contracts and slot a new reward cycle assigns this signer.
+    pub fn rebind(
+        &mut self,
+        signer_contract: StackerDbContract,
+        pre_commit_contract: StackerDbContract,
+        writer_slot: u32,
+    ) {
         self.signer_contract = signer_contract;
+        self.pre_commit_contract = pre_commit_contract;
         self.signer.set_writer_slot(writer_slot);
         self.last_proposal = None;
     }
 }
 
+/// The weight of the reward set promising to sign one block.
+pub async fn pre_commit_weight(
+    client: StackerDbClient,
+    contract: StackerDbContract,
+    signature_hash: Sha256Sum,
+    signers: &SignerSet,
+) -> Result<u32, SignerServiceError> {
+    let mut promised = Vec::new();
+    for slot in client.slot_versions(&contract).await? {
+        if let Some(bytes) = client.latest_chunk(&contract, slot.slot_id).await? {
+            promised.push((slot.slot_id, bytes));
+        }
+    }
+    Ok(promised
+        .into_iter()
+        .filter(|(_, bytes)| {
+            SignerMessage::decode(bytes) == Ok(SignerMessage::BlockPreCommit(signature_hash))
+        })
+        .filter_map(|(slot_id, _)| signers.signers().get(slot_id as usize))
+        .fold(0_u32, |total, signer| total.saturating_add(signer.weight)))
+}
+
 /// Publishes this signer's protocol version and miner view to the reward set.
 ///
-/// Stock signers will not validate a block until a weighted majority of the
-/// reward set has announced a protocol version, so a signer that only responds
-/// to proposals blocks the network instead of abstaining from it.
+/// A stock signer refuses to validate any block until a weighted majority of the
+/// reward set has published the *same* view of the burn tip and the miner that
+/// owns the current tenure, so a signer whose view differs stalls the network
+/// just as surely as one that never answers. Which miner is active is a
+/// coordination decision, not a validity rule — every block is still validated
+/// here from nano's own execution — so this adopts the view the rest of the
+/// reward set already agrees on and only derives its own when there is none.
 pub struct StateAnnouncer {
     client: StackerDbClient,
     contract: StackerDbContract,
@@ -1128,8 +1222,12 @@ impl StateAnnouncer {
     pub async fn announce(
         &mut self,
         node: &SyncClient,
+        signers: &SignerSet,
     ) -> Result<Option<ChunkAck>, LiveSignerError> {
-        let update = Self::derive(node).await?;
+        let update = match self.agreed_view(signers).await? {
+            Some(agreed) => agreed,
+            None => Self::derive(node).await?,
+        };
         if self.announced.as_ref() == Some(&update) {
             return Ok(None);
         }
@@ -1167,6 +1265,63 @@ impl StateAnnouncer {
         }
         self.announced = Some(update);
         Ok(Some(acknowledgement))
+    }
+
+    /// The view the rest of the reward set has already agreed on, if its weight
+    /// reaches the threshold a stock signer requires before it validates.
+    async fn agreed_view(
+        &self,
+        signers: &SignerSet,
+    ) -> Result<Option<StateMachineUpdate>, LiveSignerError> {
+        let threshold = signers.approval_threshold().map_err(|error| {
+            SignerServiceError::Signer(SignerError::Validation(error.to_string()))
+        })?;
+        let mut weights: Vec<(StateMachineUpdate, u32)> = Vec::new();
+        for slot in self
+            .client
+            .slot_versions(&self.contract)
+            .await
+            .map_err(SignerServiceError::from)?
+        {
+            if slot.slot_id == self.writer_slot {
+                continue;
+            }
+            let Some(weight) = signers
+                .signers()
+                .get(slot.slot_id as usize)
+                .map(|signer| signer.weight)
+            else {
+                continue;
+            };
+            let Some(bytes) = self
+                .client
+                .latest_chunk(&self.contract, slot.slot_id)
+                .await
+                .map_err(SignerServiceError::from)?
+            else {
+                continue;
+            };
+            let Ok(SignerMessage::StateMachineUpdate(update)) = SignerMessage::decode(&bytes)
+            else {
+                continue;
+            };
+            match weights.iter_mut().find(|(seen, _)| *seen == update) {
+                Some((_, total)) => *total = total.saturating_add(weight),
+                None => weights.push((update, weight)),
+            }
+        }
+        Ok(weights
+            .into_iter()
+            .filter(|(_, weight)| *weight >= threshold.saturating_sub(self.own_weight(signers)))
+            .max_by_key(|(_, weight)| *weight)
+            .map(|(update, _)| update))
+    }
+
+    fn own_weight(&self, signers: &SignerSet) -> u32 {
+        signers
+            .signers()
+            .get(self.writer_slot as usize)
+            .map_or(0, |signer| signer.weight)
     }
 
     async fn derive(node: &SyncClient) -> Result<StateMachineUpdate, LiveSignerError> {
@@ -1275,6 +1430,29 @@ impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
             .signer_mut()
             .validator_mut()
             .set_context(sortition, tenure.reward_cycle);
+
+        // The protocol is two phased: promise to sign a block that validates,
+        // and sign only once the promises carry threshold weight. A stock signer
+        // waits for the same weight before signing, so promising is what lets
+        // the rest of the reward set sign at all.
+        self.service
+            .signer_mut()
+            .validate(&pending.proposal)
+            .map_err(SignerServiceError::Signer)?;
+        let signature_hash = self.service.pre_commit(&pending.proposal).await?;
+        let signers = self
+            .client
+            .stacker_set(tenure.reward_cycle)
+            .await?
+            .signer_set;
+        let (client, contract) = self.service.pre_commit_channel();
+        let promised = pre_commit_weight(client, contract, signature_hash, &signers).await?;
+        let threshold = signers.approval_threshold().map_err(|error| {
+            SignerServiceError::Signer(SignerError::Validation(error.to_string()))
+        })?;
+        if promised < threshold {
+            return Ok(None);
+        }
         self.service
             .respond(pending)
             .await

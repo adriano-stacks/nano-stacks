@@ -100,6 +100,8 @@ pub enum SignerMessage {
     BlockResponse(BlockResponse),
     BlockPushed(NakamotoBlock),
     StateMachineUpdate(StateMachineUpdate),
+    /// A signer's promise to sign a block, published before its signature.
+    BlockPreCommit(Sha256Sum),
 }
 
 /// A signer's response to a proposed block.
@@ -117,6 +119,7 @@ pub enum SignerMessageType {
     BlockResponse = 1,
     BlockPushed = 2,
     StateMachineUpdate = 6,
+    BlockPreCommit = 7,
 }
 
 /// Errors while decoding or encoding signer messages.
@@ -213,6 +216,7 @@ impl SignerMessage {
             }
             2 => Self::BlockPushed(reader.block()?),
             6 => Self::StateMachineUpdate(reader.state_machine_update()?),
+            7 => Self::BlockPreCommit(Sha256Sum::from_bytes(reader.array()?)),
             kind => return Err(SignerMessageError::InvalidMessageType(kind)),
         };
         if !reader.is_empty() {
@@ -257,6 +261,10 @@ impl SignerMessage {
             Self::BlockPushed(block) => {
                 writer.byte(SignerMessageType::BlockPushed as u8);
                 writer.raw(&block.encode());
+            }
+            Self::BlockPreCommit(signer_signature_hash) => {
+                writer.byte(SignerMessageType::BlockPreCommit as u8);
+                writer.raw(signer_signature_hash.as_bytes());
             }
             Self::StateMachineUpdate(update) => {
                 writer.byte(SignerMessageType::StateMachineUpdate as u8);

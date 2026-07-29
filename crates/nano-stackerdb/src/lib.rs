@@ -486,6 +486,60 @@ mod tests {
         ));
     }
 
+    /// A state machine update a stock signer published, byte for byte.
+    ///
+    /// Reading these is what lets nano agree with the reward set on who the
+    /// current miner is, which a stock signer requires before it will validate
+    /// any block at all.
+    #[test]
+    fn decodes_a_stock_signer_state_update() {
+        let bytes = hex::decode(concat!(
+            "060000000000000002000000000000000200000085801d35ade2d7479accc24b209",
+            "303a8024c12118c0000000000000257018585d3e4653be56d6e68e7aa7ddcc5140c",
+            "e8ddccf81dd571922684030c768c95a146e310707733674cdcb7b6b53482907c145",
+            "8503f9a1d0dc948140beaa1c1ec183298cd437ddd5b897943f340a3c4576259f55c",
+            "f32e583441960fad000000000000046d00000000"
+        ))
+        .expect("hexadecimal chunk");
+
+        let SignerMessage::StateMachineUpdate(update) =
+            SignerMessage::decode(&bytes).expect("decode the state update")
+        else {
+            panic!("the chunk is a state machine update");
+        };
+        assert_eq!(update.active_protocol_version, 2);
+        assert_eq!(update.bitcoin_height, 599);
+        assert!(matches!(
+            update.current_miner,
+            super::CurrentMiner::Active {
+                parent_tenure_last_block_height: 1133,
+                ..
+            }
+        ));
+        assert_eq!(
+            SignerMessage::StateMachineUpdate(update)
+                .encode()
+                .expect("re-encode the state update"),
+            bytes
+        );
+    }
+
+    /// The promise a signer publishes before it signs, which the rest of the
+    /// reward set waits for before signing at all.
+    #[test]
+    fn block_pre_commits_round_trip() {
+        let hash = nano_primitives::Sha256Sum::from_bytes([7; 32]);
+        let bytes = SignerMessage::BlockPreCommit(hash)
+            .encode()
+            .expect("encode a pre-commit");
+
+        assert_eq!(bytes[0], 7, "a pre-commit is payload type 7");
+        assert_eq!(
+            SignerMessage::decode(&bytes),
+            Ok(SignerMessage::BlockPreCommit(hash))
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a local Hacknet node on port 20443"]
     async fn hacknet_miners_stackerdb_is_readable() {

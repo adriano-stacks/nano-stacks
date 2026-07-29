@@ -17,9 +17,16 @@ use nano_sync::SyncClient;
 use reqwest::Url;
 use tokio::time::sleep;
 
-/// `StackerDB` message identifiers for block responses and state updates.
+/// `StackerDB` contract indices for block responses, signer state updates, and
+/// the promises signers publish before they sign.
+///
+/// A message's contract index is not its payload type byte: a state machine
+/// update is payload type 6 but travels on `signers-{parity}-2`
+/// (`libsigner/src/v0/messages.rs`, `MessageSlotID` against
+/// `SignerMessageTypePrefix`).
 const RESPONSE_MESSAGE_ID: u32 = 1;
-const STATE_MESSAGE_ID: u32 = 6;
+const STATE_MESSAGE_ID: u32 = 2;
+const PRE_COMMIT_MESSAGE_ID: u32 = 3;
 
 #[derive(Parser)]
 #[command(name = "stacks-signer")]
@@ -147,6 +154,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         StackerDbClient::new(Url::parse(&peer)?)?,
         parse_contract(&miner_contract)?,
         cycle_contract(boot_address, 0, RESPONSE_MESSAGE_ID),
+        cycle_contract(boot_address, 0, PRE_COMMIT_MESSAGE_ID),
         signer,
     );
     let mut signer = LiveSigner::new(client.clone(), service);
@@ -185,21 +193,30 @@ async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let mut bound_cycle = None;
     loop {
-        match reward_cycle_binding(client, boot_address, key).await {
-            Ok((cycle, contract, state, slot)) if bound_cycle != Some(cycle) => {
-                eprintln!("signing reward cycle {cycle} from slot {slot}");
-                signer.service_mut().rebind(contract, slot);
-                announcer.rebind(state, slot);
-                bound_cycle = Some(cycle);
+        let signers = match reward_cycle_binding(client, boot_address, key).await {
+            Ok(binding) => {
+                if bound_cycle != Some(binding.cycle) {
+                    eprintln!(
+                        "signing reward cycle {} from slot {}",
+                        binding.cycle, binding.slot
+                    );
+                    signer.service_mut().rebind(
+                        binding.responses,
+                        binding.pre_commits,
+                        binding.slot,
+                    );
+                    announcer.rebind(binding.states, binding.slot);
+                    bound_cycle = Some(binding.cycle);
+                }
+                binding.signers
             }
-            Ok(_) => {}
             Err(error) => {
                 eprintln!("signer is not in the active reward set: {error}");
                 sleep(Duration::from_secs(poll_interval_secs)).await;
                 continue;
             }
-        }
-        if let Err(error) = announcer.announce(client).await {
+        };
+        if let Err(error) = announcer.announce(client, &signers).await {
             eprintln!("signer state announcement failed: {error}");
         }
         match sync_chainstate(client, signer, max_sync_blocks).await {
@@ -217,33 +234,46 @@ async fn run(
     }
 }
 
-/// The contracts and slot the active reward cycle assigns this signer.
+/// What the active reward cycle assigns this signer.
+struct RewardCycleBinding {
+    cycle: u64,
+    responses: StackerDbContract,
+    pre_commits: StackerDbContract,
+    states: StackerDbContract,
+    slot: u32,
+    signers: nano_chainstate::SignerSet,
+}
+
+/// The contracts, slot, and reward set of the active reward cycle.
 async fn reward_cycle_binding(
     client: &SyncClient,
     boot_address: StacksAddress,
     key: &StacksPrivateKey,
-) -> Result<(u64, StackerDbContract, StackerDbContract, u32), String> {
+) -> Result<RewardCycleBinding, String> {
     let cycle = client
         .tenure_info()
         .await
         .map_err(|error| error.to_string())?
         .reward_cycle;
     let public_key = key.public_key().to_bytes_compressed();
-    let slot = client
+    let signers = client
         .stacker_set(cycle)
         .await
         .map_err(|error| error.to_string())?
-        .signer_set
+        .signer_set;
+    let slot = signers
         .signers()
         .iter()
         .position(|signer| signer.public_key.to_bytes_compressed() == public_key)
         .ok_or_else(|| "this signer holds no slot in the active reward set".to_owned())?;
-    Ok((
+    Ok(RewardCycleBinding {
         cycle,
-        cycle_contract(boot_address, cycle, RESPONSE_MESSAGE_ID),
-        cycle_contract(boot_address, cycle, STATE_MESSAGE_ID),
-        u32::try_from(slot).map_err(|error| error.to_string())?,
-    ))
+        responses: cycle_contract(boot_address, cycle, RESPONSE_MESSAGE_ID),
+        pre_commits: cycle_contract(boot_address, cycle, PRE_COMMIT_MESSAGE_ID),
+        states: cycle_contract(boot_address, cycle, STATE_MESSAGE_ID),
+        slot: u32::try_from(slot).map_err(|error| error.to_string())?,
+        signers,
+    })
 }
 
 /// Signer contracts are named by reward-cycle parity and message identifier.
