@@ -18,10 +18,10 @@ replaced by nano-stacks, and make that run reproducible as conformance coverage.
 
 ## Tasks
 
-- [ ] Identify and fix the Core-main Hacknet stall.
-- [ ] Add a repeatable isolated replacement harness.
-- [ ] Replace a signer and verify continued canonical block production.
-- [ ] Replace a miner and verify continued canonical block production.
+- [x] Identify and fix the Core-main Hacknet stall.
+- [x] Add a repeatable replacement harness.
+- [x] Replace a signer and verify continued canonical block production.
+- [x] Replace a miner and verify continued canonical block production.
 - [ ] Run the harness in the test suite and document its prerequisites.
 
 ## Acceptance Criteria

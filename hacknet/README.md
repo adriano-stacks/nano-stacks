@@ -17,10 +17,18 @@ hacknet/harness.sh up               # build and boot from genesis
 hacknet/harness.sh wait 285         # epoch 4.0 starts at 262, PoX-5 cycle 14 at 280
 hacknet/harness.sh checkpoint       # export the state nano validates from
 hacknet/harness.sh replace 3        # stop participant 3 and sign in its place
+hacknet/harness.sh fund             # give nano a funded Bitcoin wallet and miner keys
+hacknet/harness.sh register         # register nano's leader key on Bitcoin
+hacknet/harness.sh mine             # commit every Bitcoin block, mine every tenure won
 hacknet/harness.sh verify           # assert the network keeps doing every kind of work
 hacknet/harness.sh restore          # put the stock participant back
 hacknet/harness.sh down
 ```
+
+`replace` covers the signer half and is enough on its own: the participant then
+stops competing for tenures and the other two miners carry the chain. `fund`,
+`register` and `mine` add the other half, so nano commits on Bitcoin and mines
+the tenures it wins.
 
 `status` prints the heights of all three participants, the reward cycle, and
 whether nano is running. `wait` fails as soon as Bitcoin advances with a frozen
@@ -42,19 +50,26 @@ follows the canonical chain until it has both a number of new blocks and a rewar
 cycle rollover, then asserts what those blocks contained. A recorded run:
 
 ```
-observed 211 canonical blocks across cycles 15..=16
-every one of the 211 blocks carries nano's signature
-152 transfer transactions, including c597a9b3… which the network reports as success
-1 deploy transactions, including 29323532… which the network reports as success
-816 call transactions, including 1abac26b… which the network reports as success
-20 tenure change transactions, including efaee37d… which the network reports as success
-19 coinbase transactions, including 60543126… which the network reports as success
-19 sortitions across 2 distinct miners
-reward cycle 16 pays a waterfall set in which nano holds weight 10 of 30
+observed 60 canonical blocks across cycles 18..=19
+every one of the 60 blocks carries nano's signature
+nano mined 3 of the 60 canonical blocks, at heights [835, 851, 852]
+47 transfer transactions, including 806e50fe… which the network reports as success
+1 deploy transactions, including e1fb874b… which the network reports as success
+267 call transactions, including 25c99734… which the network reports as success
+11 tenure change transactions, including be642b5e… which the network reports as success
+11 coinbase transactions, including 840de077… which the network reports as success
+12 sortitions across 3 distinct miners
+reward cycle 19 pays a waterfall set in which nano holds weight 10 of 30
 ```
 
 Every signature is recovered from the block header and checked against the reward
-set, and every receipt is read back from the indexer.
+set, every miner signature is recovered the same way, and every receipt is read
+back from the indexer. A signer-only run reports the same lines without the
+mining one.
+
+nano mines the first block of each tenure it wins; the transactions that arrive
+during the rest of its tenure wait for the next miner, and a tenure extend is not
+implemented.
 
 ## Released PoX-5 baseline
 
