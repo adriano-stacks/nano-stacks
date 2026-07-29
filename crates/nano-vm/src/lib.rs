@@ -604,6 +604,16 @@ impl Vm {
         self.store.root_pointers(block)
     }
 
+    /// Return the pointers and child hashes stored under a path prefix.
+    #[must_use]
+    pub fn pointers_at(
+        &self,
+        block: [u8; 32],
+        prefix: &[u8],
+    ) -> Option<Vec<(TriePointer, nano_primitives::TrieHash)>> {
+        self.store.pointers_at(block, prefix)
+    }
+
     /// Access a stored Clarity database value for a sealed block.
     #[must_use]
     pub fn get(&self, block: [u8; 32], key: &str) -> Option<&str> {
@@ -896,6 +906,16 @@ impl MarfStore {
     #[must_use]
     pub fn root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
         self.marf.root_pointers(block)
+    }
+
+    /// Return the pointers and child hashes stored under a path prefix.
+    #[must_use]
+    pub fn pointers_at(
+        &self,
+        block: [u8; 32],
+        prefix: &[u8],
+    ) -> Option<Vec<(TriePointer, nano_primitives::TrieHash)>> {
+        self.marf.pointers_at(block, prefix)
     }
 
     fn read_state(&self) -> Option<&StoreState> {

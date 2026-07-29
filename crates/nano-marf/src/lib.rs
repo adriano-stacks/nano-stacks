@@ -311,22 +311,30 @@ impl MarfTrie {
     /// Return the root pointers in their consensus serialization order.
     #[must_use]
     pub fn root_pointers(&self) -> Vec<TriePointer> {
-        let mut pointers = vec![
-            TriePointer {
-                id: 0,
-                character: 0,
-                referenced_block: None,
-            };
-            TrieNodeId::Node256.pointer_count()
-        ];
-        for child in &self.root_children {
-            pointers[usize::from(child.character)] = TriePointer {
-                id: child.node.node_id() as u8 | u8::from(child.referenced_block.is_some()) << 7,
-                character: child.character,
-                referenced_block: child.referenced_block,
-            };
-        }
-        pointers
+        self.pointers_at(&[])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(pointer, _)| pointer)
+            .collect()
+    }
+
+    /// Return the pointers and child hashes of the node reached by a path prefix.
+    ///
+    /// Two states that hold the same leaves under different roots differ in the
+    /// shape of some node, and descending into the child whose hash differs is
+    /// how that node is found.
+    #[must_use]
+    pub fn pointers_at(&self, prefix: &[u8]) -> Option<Vec<(TriePointer, TrieHash)>> {
+        let Some((character, rest)) = prefix.split_first() else {
+            return Some(pointers_and_hashes(
+                TrieNodeId::Node256,
+                &self.root_children,
+            ));
+        };
+        self.root_children
+            .iter()
+            .find(|child| child.character == *character)
+            .and_then(|child| child.node.pointers_at(rest))
     }
 
     fn prepare_root_for_copy(&mut self, block: [u8; 32]) {
@@ -433,11 +441,14 @@ impl TrieNode {
                         path: path[shared + 1..].to_vec(),
                         value,
                     };
+                    // Splicing a node's compressed path packs the new leaf into
+                    // the first slot and the node it displaced into the second,
+                    // the opposite of the order a split leaf produces.
                     *self = Self::Internal {
                         path: node_path[..shared].to_vec(),
                         children: vec![
-                            TrieChild::local(old_character, old_node),
                             TrieChild::local(new_character, new_leaf),
+                            TrieChild::local(old_character, old_node),
                         ],
                     };
                     return;
@@ -480,6 +491,24 @@ impl TrieNode {
         }
     }
 
+    /// Descend a path prefix and return the node it reaches.
+    fn pointers_at(&self, prefix: &[u8]) -> Option<Vec<(TriePointer, TrieHash)>> {
+        let Self::Internal { path, children } = self else {
+            return None;
+        };
+        let rest = prefix.strip_prefix(path.as_slice())?;
+        let Some((character, rest)) = rest.split_first() else {
+            return Some(pointers_and_hashes(
+                node_id_for_children(children.len()),
+                children,
+            ));
+        };
+        children
+            .iter()
+            .find(|child| child.character == *character)
+            .and_then(|child| child.node.pointers_at(rest))
+    }
+
     fn prepare_for_copy(&mut self, block: [u8; 32]) {
         if let Self::Internal { children, .. } = self {
             for child in children {
@@ -492,40 +521,45 @@ impl TrieNode {
 }
 
 fn hash_children(id: TrieNodeId, path: &[u8], children: &[TrieChild]) -> TrieHash {
-    let mut pointers = vec![
-        TriePointer {
-            id: 0,
-            character: 0,
-            referenced_block: None,
-        };
+    let (pointers, hashes): (Vec<_>, Vec<_>) =
+        pointers_and_hashes(id, children).into_iter().unzip();
+    internal_node_hash(id, &pointers, path, &hashes).expect("internally valid node layout")
+}
+
+/// One node's pointer slots and the hash each slot contributes.
+///
+/// Node256 indexes its slots by character; the smaller layouts pack theirs in
+/// insertion order, which is part of the consensus preimage.
+fn pointers_and_hashes(id: TrieNodeId, children: &[TrieChild]) -> Vec<(TriePointer, TrieHash)> {
+    let mut slots = vec![
+        (
+            TriePointer {
+                id: 0,
+                character: 0,
+                referenced_block: None,
+            },
+            TrieHash::EMPTY
+        );
         id.pointer_count()
     ];
-    let mut hashes = vec![TrieHash::EMPTY; id.pointer_count()];
-    if id == TrieNodeId::Node256 {
-        for child in children {
-            let index = usize::from(child.character);
-            pointers[index] = TriePointer {
+    for (index, child) in children.iter().enumerate() {
+        let index = if id == TrieNodeId::Node256 {
+            usize::from(child.character)
+        } else {
+            index
+        };
+        slots[index] = (
+            TriePointer {
                 id: child.node.node_id() as u8 | u8::from(child.referenced_block.is_some()) << 7,
                 character: child.character,
                 referenced_block: child.referenced_block,
-            };
-            hashes[index] = child
+            },
+            child
                 .referenced_block
-                .map_or_else(|| child.node.hash(), TrieHash::from_bytes);
-        }
-    } else {
-        for (index, child) in children.iter().enumerate() {
-            pointers[index] = TriePointer {
-                id: child.node.node_id() as u8 | u8::from(child.referenced_block.is_some()) << 7,
-                character: child.character,
-                referenced_block: child.referenced_block,
-            };
-            hashes[index] = child
-                .referenced_block
-                .map_or_else(|| child.node.hash(), TrieHash::from_bytes);
-        }
+                .map_or_else(|| child.node.hash(), TrieHash::from_bytes),
+        );
     }
-    internal_node_hash(id, &pointers, path, &hashes).expect("internally valid node layout")
+    slots
 }
 
 const fn node_id_for_children(children: usize) -> TrieNodeId {
@@ -714,6 +748,18 @@ impl VersionedMarf {
         self.versions
             .get(&block)
             .map(|version| version.trie.root_pointers())
+    }
+
+    /// Return the pointers and child hashes a sealed state holds under a prefix.
+    #[must_use]
+    pub fn pointers_at(
+        &self,
+        block: MarfBlockId,
+        prefix: &[u8],
+    ) -> Option<Vec<(TriePointer, TrieHash)>> {
+        self.versions
+            .get(&block)
+            .and_then(|version| version.trie.pointers_at(prefix))
     }
 
     /// Return a sealed state's parent block, if the state exists.

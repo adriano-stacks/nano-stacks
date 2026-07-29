@@ -1640,6 +1640,115 @@ mod tests {
             .expect("read reference state root")
     }
 
+    /// Find keys whose hashed trie paths share a leading prefix.
+    ///
+    /// A trie only compresses a path when two keys collide over more than one
+    /// byte, and hashed keys drawn at random never do, so the layouts that
+    /// compression creates are unreachable without searching for the collision.
+    fn keys_sharing_prefix(prefix: usize, count: usize) -> Vec<String> {
+        let mut groups: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+        for index in 0..2_000_000_u32 {
+            let key = format!("collide-{index}");
+            let path = nano_marf::key_path(key.as_bytes());
+            let group = groups
+                .entry(path.as_bytes()[..prefix].to_vec())
+                .or_default();
+            group.push(key);
+            if group.len() == count {
+                return group.clone();
+            }
+        }
+        panic!("no {count} keys share a {prefix}-byte trie path prefix");
+    }
+
+    /// Find a key whose path shares `prefix` bytes with another but diverges at
+    /// the next byte, which is what splits a compressed path.
+    fn key_diverging_after(reference: &str, prefix: usize) -> String {
+        let target = nano_marf::key_path(reference.as_bytes());
+        for index in 0..2_000_000_u32 {
+            let key = format!("diverge-{index}");
+            let path = nano_marf::key_path(key.as_bytes());
+            let shares = path.as_bytes()[..prefix] == target.as_bytes()[..prefix];
+            if shares && path.as_bytes()[prefix] != target.as_bytes()[prefix] {
+                return key;
+            }
+        }
+        panic!("no key diverges from {reference} after {prefix} bytes");
+    }
+
+    /// Every way one write can reshape a trie that already holds another path.
+    ///
+    /// Two keys sharing a path prefix compress into a node whose own path a
+    /// third key can split, and stacks-core packs that split's pointers in the
+    /// opposite order to the one a split leaf produces.
+    #[test]
+    fn versioned_marf_compressed_path_layouts_match_stacks_core() {
+        let compressed = keys_sharing_prefix(2, 2);
+        let deeply_compressed = keys_sharing_prefix(3, 2);
+        let scripts: Vec<(&str, Vec<String>)> = vec![
+            ("two paths compressing into one node", compressed.clone()),
+            (
+                "a leaf splitting a compressed node path",
+                vec![
+                    compressed[0].clone(),
+                    compressed[1].clone(),
+                    key_diverging_after(&compressed[0], 1),
+                ],
+            ),
+            (
+                "a leaf splitting a compressed leaf path",
+                vec![
+                    compressed[0].clone(),
+                    key_diverging_after(&compressed[0], 1),
+                ],
+            ),
+            (
+                "a split above a deeper split",
+                vec![
+                    deeply_compressed[0].clone(),
+                    deeply_compressed[1].clone(),
+                    key_diverging_after(&deeply_compressed[0], 2),
+                    key_diverging_after(&deeply_compressed[0], 1),
+                ],
+            ),
+            ("children promoting a node around a split", {
+                let mut keys = keys_sharing_prefix(1, 6);
+                keys.push(key_diverging_after(&keys[0], 1));
+                keys
+            }),
+        ];
+
+        for (index, (description, keys)) in scripts.into_iter().enumerate() {
+            let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+                ":memory:",
+                ReferenceMarfOpenOpts::default(),
+            )
+            .expect("open reference MARF");
+            let mut ours = VersionedMarf::default();
+            let mut parent: Option<[u8; 32]> = None;
+            // One key per block also exercises the copy-on-write layouts.
+            for (step, key) in keys.iter().enumerate() {
+                let mut block = [0; 32];
+                block[0] = u8::try_from(index).expect("script index");
+                block[31] = u8::try_from(step + 1).expect("script step");
+                let reference_root = append_reference_marf_state(
+                    &mut reference,
+                    parent.map(ReferenceStacksBlockId).as_ref(),
+                    &ReferenceStacksBlockId(block),
+                    key,
+                    "value",
+                );
+                let root = append_nano_marf_state(&mut ours, parent, block, key, "value");
+                assert_eq!(
+                    root.as_bytes(),
+                    &reference_root.0,
+                    "{description}: state root diverged writing {key} at step {step}"
+                );
+                parent = Some(block);
+            }
+        }
+    }
+
     fn append_nano_marf_state(
         ours: &mut VersionedMarf,
         parent: Option<[u8; 32]>,

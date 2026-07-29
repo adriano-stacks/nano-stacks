@@ -328,6 +328,16 @@ impl ChainState {
         self.vm.root_pointers(block)
     }
 
+    /// Return the pointers and child hashes a block state holds under a prefix.
+    #[must_use]
+    pub fn state_pointers_at(
+        &self,
+        block: [u8; 32],
+        prefix: &[u8],
+    ) -> Option<Vec<(TriePointer, TrieHash)>> {
+        self.vm.pointers_at(block, prefix)
+    }
+
     /// Execute a Clarity program for a block and seal its consensus state root.
     pub fn append_program(
         &mut self,
