@@ -387,10 +387,13 @@ traffic() {
     # genesis chainstate funds, unlike the key the flood script defaults to.
     key=$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)
     compose cp docker/stacker/stacking/flooder.clar tx-broadcaster:/root/flooder.clar
+    # The script deploys once per run and then only calls, so it runs in short
+    # rounds: a verification window has to contain a deploy as well as calls.
     log "deploying a contract and calling it for ${seconds}s"
     compose exec -e NUM_FLOODERS=2 -e TX_PER_FLOOD=3 -e BOOTSTRAPPER_KEY="$key" \
         -e STACKS_CORE_RPC_HOST=stacks-api -e STACKS_CORE_RPC_PORT=3999 \
-        tx-broadcaster sh -c "cd /root && timeout ${seconds} npx tsx flood.ts || true"
+        tx-broadcaster sh -c "cd /root && end=\$((\$(date +%s) + ${seconds})); \
+            while [ \$(date +%s) -lt \$end ]; do timeout 90 npx tsx flood.ts || true; done"
 }
 
 case ${1:-} in
