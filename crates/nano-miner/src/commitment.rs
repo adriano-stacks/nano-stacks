@@ -129,6 +129,8 @@ where
         .ok_or(CommitmentPlanError::HeightOverflow)?;
     let reward_cycle = node.pox_info().await?.reward_cycle(target_bitcoin_height);
 
+    let reward_set = node.stacker_set(reward_cycle).await?;
+
     Ok(CommitmentPlan {
         commitment: LeaderBlockCommitment {
             block_header_hash: *tenure.tenure_start_block_id.as_bytes(),
@@ -144,7 +146,7 @@ where
             )
             .expect("a Bitcoin modulus below five fits in a byte"),
         },
-        sbtc_address: node.stacker_set(reward_cycle).await?.sbtc_address,
+        sbtc_address: reward_set.sbtc_address.ok_or(SyncError::InvalidRewardSet)?,
         target_bitcoin_height,
         reward_cycle,
     })

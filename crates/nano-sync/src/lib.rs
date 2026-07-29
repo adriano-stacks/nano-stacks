@@ -87,11 +87,11 @@ pub struct PoxInfo {
     pub pox_5_activation_height: Option<u32>,
 }
 
-/// The active waterfall payout address and threshold signer set for one reward cycle.
+/// The threshold signer set and optional waterfall payout address for one reward cycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StackerSet {
     pub pox_ustx_threshold: u128,
-    pub sbtc_address: PoxAddress,
+    pub sbtc_address: Option<PoxAddress>,
     pub signer_set: SignerSet,
 }
 
@@ -633,7 +633,8 @@ struct StackerSetResponseWire {
 #[derive(Deserialize)]
 struct StackerSetWire {
     pox_ustx_threshold: u128,
-    sbtc_address: Value,
+    #[serde(default)]
+    sbtc_address: Option<Value>,
     signers: Vec<StackerWire>,
 }
 
@@ -703,7 +704,11 @@ fn parse_prefixed_hash160(value: &str) -> Result<Hash160, SyncError> {
 }
 
 fn parse_stacker_set(value: StackerSetWire) -> Result<StackerSet, SyncError> {
-    let sbtc_address = parse_waterfall_address(&value.sbtc_address)?;
+    let sbtc_address = value
+        .sbtc_address
+        .as_ref()
+        .map(parse_waterfall_address)
+        .transpose()?;
     let mut signers = value
         .signers
         .into_iter()
@@ -760,9 +765,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        BlockUploadWire, StackerSetWire, SyncClient, SyncError, parse_block_hash, parse_block_id,
-        parse_consensus_hash, parse_prefixed_hash160, parse_stacker_set, validate_tenure,
-        validate_tenure_transition,
+        BlockUploadWire, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError,
+        parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
+        parse_stacker_set, validate_tenure, validate_tenure_transition,
     };
     use super::{TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -818,8 +823,20 @@ mod tests {
         assert_eq!(set.signer_set.weights(), vec![8, 8, 7, 7]);
         assert!(matches!(
             set.sbtc_address,
-            nano_address::PoxAddress::Addr32 { .. }
+            Some(nano_address::PoxAddress::Addr32 { .. })
         ));
+    }
+
+    #[test]
+    fn version_zero_stacker_set_parses_without_waterfall_address() {
+        let response: StackerSetResponseWire = serde_json::from_str(
+            r#"{"stacker_set":{"pox_ustx_threshold":50000000000,"reward_set_version":0,"rewarded_addresses":[],"signers":[{"signing_key":"02007311430123d4cad97f4f7e86e023b28143130a18099ecf094d36fef0f6135c","stacked_amt":2566784000000000,"weight":2},{"signing_key":"031a4d9f4903da97498945a4e01a5023a1d53bc96ad670bfe03adf8a06c52e6380","stacked_amt":2566784000000000,"weight":2},{"signing_key":"035249137286c077ccee65ecc43e724b9b9e5a588e3d7f51e3b62f9624c2a49e46","stacked_amt":2566784000000000,"weight":2}]}}"#,
+        )
+        .expect("parse version-zero response");
+        let set = parse_stacker_set(response.stacker_set).expect("parse signer set");
+
+        assert_eq!(set.sbtc_address, None);
+        assert_eq!(set.signer_set.weights(), vec![2, 2, 2]);
     }
 
     #[test]
