@@ -5521,6 +5521,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "nano-chainstate",
  "nano-conformance",
  "nano-crypto",
  "nano-primitives",

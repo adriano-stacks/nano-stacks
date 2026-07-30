@@ -1,0 +1,106 @@
+{
+ "stacker_set": {
+  "signers": [
+   {
+    "signing_key": "022150d4ea6dc60e75e162455553a92adea0a0f3000c192cc55d0bffed22c0a8e0",
+    "weight": 4
+   },
+   {
+    "signing_key": "0228a566db9a7b3212d612aa06e34fa981351a4372737849bfcaa1a28e8a044e5d",
+    "weight": 17
+   },
+   {
+    "signing_key": "02292037d39e7e86b087935d48364ccc0fab52821b8487a78ee936bd1c1d0cd8d1",
+    "weight": 19
+   },
+   {
+    "signing_key": "023d6e4adbd5e7bedd5a1e1b85940e1e8c6c34924fd0d584e5e15d84c8572083d9",
+    "weight": 67
+   },
+   {
+    "signing_key": "023d6ecdc36fa1e1c6a9f116c7f13ae843001ed9d617f66f6c68cabf751bf82555",
+    "weight": 387
+   },
+   {
+    "signing_key": "024f164c6e73df283d34d7d9cc86553a82dce76045ba7dfbf4de0004f89eabb8e0",
+    "weight": 3
+   },
+   {
+    "signing_key": "0268e6f499fca2912488e89fc8b6734cafbe24a4ecbcd3312e4eb27ed8e5cfb4f3",
+    "weight": 498
+   },
+   {
+    "signing_key": "02844807121921880119fe05ae47fccb4945a4bb2f840fe7de66e6f32640bc8169",
+    "weight": 624
+   },
+   {
+    "signing_key": "0284df4505c6318a0017a7848aa0a95bf8cd3db697a89d2ec1978a027bece770ef",
+    "weight": 2
+   },
+   {
+    "signing_key": "02877ce29ba35458b827a6ea18510b9058ae4c30e2c33d288f2982c13497caec6e",
+    "weight": 433
+   },
+   {
+    "signing_key": "02a89cb3164d3dabcb5cf8796bfc28b91fade8c71a64b5a76d94e79cd27cfa8895",
+    "weight": 83
+   },
+   {
+    "signing_key": "02c770af1c0316b42d50bb2f7720f473a7393a53878a212f1f573b23b8fecc1b35",
+    "weight": 75
+   },
+   {
+    "signing_key": "0302328212d5e430a8a880f8e2365a8f976ee50490ff030c106866c0b789eae91a",
+    "weight": 430
+   },
+   {
+    "signing_key": "031b91a32ab90b80d40715e8875fb3dfe996aa1e6f5e62ba05d34542aa58ad43b5",
+    "weight": 37
+   },
+   {
+    "signing_key": "0321129d7a3e14cce66abef68b9a3d31d998f14e9a18b09d66aa1110fc604a3b1f",
+    "weight": 33
+   },
+   {
+    "signing_key": "0371f1960f7ee35710eda09ebbd053ff9c79c0455b034c8dc4931afff111e78b8d",
+    "weight": 1
+   },
+   {
+    "signing_key": "038b9ddb9808631dd75ccb0b6715b36bb1e391d85d40f1a031e98a332890bed2ea",
+    "weight": 8
+   },
+   {
+    "signing_key": "038cb1e945144ca7669b0f33656b8379bcb3c17795b4d8665e42dea76eb3f86d2f",
+    "weight": 428
+   },
+   {
+    "signing_key": "038d545b66cc01a93fe405e14d6432432d81ec03e296d55cf3c07b143a4407aa4a",
+    "weight": 5
+   },
+   {
+    "signing_key": "039262e5a8badd8e49eaa1808a675ad005f7b324bd677576fa670e43e73b166844",
+    "weight": 58
+   },
+   {
+    "signing_key": "03a541c1ec2cfb32da48cfadf439c9b2f27d166bbffa18a178c7a6a0d54cfa7813",
+    "weight": 3
+   },
+   {
+    "signing_key": "03b3b78738abbdc573cdcefd8200b1bca999e2f2fd8ecdf70c64ced1e4105437b7",
+    "weight": 424
+   },
+   {
+    "signing_key": "03bbbe587de8a76343bb9cd4233b3b60962a2ff54677dc564a704c8578a67aa582",
+    "weight": 66
+   },
+   {
+    "signing_key": "03cd46fbbdc76f8576c12f8a07832ad48dd460faf27a9b7c277cd2d2fe411e998d",
+    "weight": 1
+   },
+   {
+    "signing_key": "03e0df37e83e43847625a0320456cb9758050a61ce76c2c130bf50242f27ba6d54",
+    "weight": 6
+   }
+  ]
+ }
+}

@@ -8,6 +8,7 @@ use std::{
 };
 
 use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
+use nano_chainstate::{NakamotoBlock, Signer, SignerSet};
 use nano_primitives::Network;
 use serde_json::json;
 
@@ -18,9 +19,12 @@ fn main() -> ExitCode {
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
+        Some("verify-block") => {
+            verify_block(&env::args().skip(2).collect::<Vec<_>>())
+        }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block>"
             );
             ExitCode::from(2)
         }
@@ -28,6 +32,94 @@ fn main() -> ExitCode {
 }
 
 /// Print the compressed public key a private key signs with.
+/// Check a block against the reward set that was published for its cycle.
+///
+/// Everything this needs is served by any node — the block from
+/// `/v3/blocks/:id` and the set from `/v3/stacker_set/:cycle` — so it works
+/// against mainnet without a chainstate to replay from. It proves the envelope
+/// only: that nano derives the same signer signature hash the network signed,
+/// recovers the same keys from it, and counts the same weight against the same
+/// threshold. It says nothing about execution.
+fn verify_block(arguments: &[String]) -> ExitCode {
+    let [block_path, set_path] = arguments else {
+        eprintln!("usage: cargo xtask verify-block <block.bin> <stacker_set.json>");
+        return ExitCode::from(2);
+    };
+    let block = match fs::read(block_path).map_err(|error| error.to_string()).and_then(
+        |bytes| NakamotoBlock::decode(&bytes).map_err(|error| error.to_string()),
+    ) {
+        Ok(block) => block,
+        Err(error) => {
+            eprintln!("{block_path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let set = match fs::read(set_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| signer_set_from_json(&bytes))
+    {
+        Ok(set) => set,
+        Err(error) => {
+            eprintln!("{set_path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let header = &block.header;
+    println!(
+        "block {} at height {}",
+        hex::encode(header.block_hash().as_bytes()),
+        header.chain_length
+    );
+    println!(
+        "signer signature hash {}",
+        hex::encode(header.signer_signature_hash().as_bytes())
+    );
+    println!(
+        "{} signatures against {} signers",
+        header.signer_signatures.len(),
+        set.signers().len()
+    );
+    match set.verify(header) {
+        Ok(weight) => {
+            let total: u32 = set.signers().iter().map(|signer| signer.weight).sum();
+            println!("accepted with weight {weight} of {total}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("rejected: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Build a signer set from what `/v3/stacker_set/:cycle` serves.
+fn signer_set_from_json(bytes: &[u8]) -> Result<SignerSet, String> {
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let set = document.get("stacker_set").unwrap_or(&document);
+    let entries = set
+        .get("signers")
+        .and_then(|signers| signers.as_array())
+        .ok_or_else(|| "no signers in the reward set".to_owned())?;
+    let mut signers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = entry
+            .get("signing_key")
+            .and_then(|key| key.as_str())
+            .ok_or_else(|| "a signer has no signing key".to_owned())?;
+        let bytes = hex::decode(key.trim_start_matches("0x")).map_err(|error| error.to_string())?;
+        let public_key =
+            nano_crypto::StacksPublicKey::from_bytes(&bytes).map_err(|error| error.to_string())?;
+        let weight = entry
+            .get("weight")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|weight| u32::try_from(weight).ok())
+            .ok_or_else(|| "a signer has no weight".to_owned())?;
+        signers.push(Signer { public_key, weight });
+    }
+    SignerSet::new(signers).map_err(|error| error.to_string())
+}
+
 fn print_public_key(private_key: Option<&str>) -> ExitCode {
     let Some(bytes) = private_key
         .map(|key| key.trim().trim_start_matches("0x"))
