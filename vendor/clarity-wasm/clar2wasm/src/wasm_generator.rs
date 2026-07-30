@@ -1043,13 +1043,35 @@ impl WasmGenerator {
             // the stack, so its size is known here: `4 + len` for a buffer or
             // an ASCII string (`signatures.rs`, `inner_size`). Everything else
             // keeps the declared size, which over-charges but never under.
+            // A byte sequence is `4 + len`, and a UTF-8 string is
+            // `4 + 4 * characters` over four-byte scalars, so both are four
+            // more than the bytes on the stack.
             TypeSignature::SequenceType(
                 SequenceSubtype::BufferType(_)
-                | SequenceSubtype::StringType(StringSubtype::ASCII(_)),
+                | SequenceSubtype::StringType(StringSubtype::ASCII(_) | StringSubtype::UTF8(_)),
             ) => {
                 builder
                     .local_get(values[1])
                     .i32_const(4)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(*size);
+            }
+            // A list is `entry * count + type_size`, and its stack length is
+            // bytes, so the count is that over the entry's in-memory width
+            // (`words/sequences.rs`, `Len`). Everything but the count is known
+            // while compiling.
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                let entry = self.clarity_value_size(list.get_list_item_type())?;
+                let width = get_type_size(list.get_list_item_type());
+                let declared = self.clarity_value_size(ty)?;
+                let type_size = declared.saturating_sub(entry.saturating_mul(list.get_max_len()));
+                builder
+                    .local_get(values[1])
+                    .i32_const(width)
+                    .binop(BinaryOp::I32DivU)
+                    .i32_const(entry as i32)
+                    .binop(BinaryOp::I32Mul)
+                    .i32_const(type_size as i32)
                     .binop(BinaryOp::I32Add)
                     .local_set(*size);
             }

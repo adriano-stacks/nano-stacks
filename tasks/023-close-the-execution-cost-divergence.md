@@ -78,10 +78,19 @@ now done for byte sequences: from epoch 3.3 the interpreter charges
 stack, so `4 + len` is known where the compiler stands. A crosscheck case pins
 it — it fails without the change and passes with it.
 
-What remains, measured against a capture from the pinned revision, is runtime
-high by **843 in 231,186 (0.36%)** at the first divergence:
+Lists and UTF-8 strings now take their runtime size too. A list's stack length
+is bytes over the entry's width (`words/sequences.rs`, `Len`) and a UTF-8
+string is four-byte scalars, which makes it `4 + length` like a buffer. Every
+case is crosschecked against the interpreter.
 
-- lists and UTF-8 strings still take their declared size, because their
-  runtime length is not the byte length on the stack and guessing the
-  conversion would be a consensus bug rather than an over-charge
-- `fold`/`map`/`filter` miss the function-argument lookup, 16 plus 1 per element
+What remains, measured against a capture from the pinned revision, is runtime
+high by **843 in 231,186 — 0.36%** — at the first divergence. That transaction
+is a `.pox-5 stake-update` call, so the residual is somewhere in pox-5's own
+private functions rather than in argument handling: none of the three fixes
+above moved it.
+
+Also still open, and in the other direction: `fold`/`map`/`filter` miss the
+function-argument lookup, 16 plus 1 per element.
+
+Reducing `stake-update` to the snippet that over-charges is the next step, the
+same way the earlier eight were found.
