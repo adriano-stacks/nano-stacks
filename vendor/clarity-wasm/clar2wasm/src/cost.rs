@@ -1742,9 +1742,9 @@ mod word {
         3 => CostMeter { runtime: 8365,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("append", "(append (list 1 2 3 4) 5)", {
-        1 => CostMeter { runtime: 73000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1657,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1742,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 84000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 2438,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 2545,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("as_max_len", "(as-max-len? 0x1234567890 u2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -2078,6 +2078,14 @@ mod crosscheck {
                 vec![Value::Bool(true)],
             ),
             (
+                "(define-public (f (a (buff 4))) (ok (list a 0x01)))",
+                vec![Value::buff_from(vec![1, 2]).expect("buffer")],
+            ),
+            (
+                "(define-public (f (a (list 4 uint))) (ok (append a u1)))",
+                vec![Value::cons_list_unsanitized(vec![Value::UInt(1)]).expect("list")],
+            ),
+            (
                 "(define-public (f (a principal)) (ok (get unlocked (stx-account a))))",
                 vec![Value::Principal(
                     clarity::vm::types::PrincipalData::parse(
@@ -2124,33 +2132,16 @@ mod crosscheck {
         }
     }
 
-    /// What still diverges, both of a kind: an element's *declared* size where
-    /// the interpreter charges what it holds.
-    ///
-    /// - a list of a sequence type charges the element type's maximum, so a
-    ///   short buffer in a wide element over-charges
-    /// - `append` is short by one
-    /// - a fold over a *native* word is short by 32 an element, which nano
-    ///   inlines without paying to apply; over a user-defined function it is
-    ///   exact
+    /// A fold over a *native* word is short by 32 an element: nano inlines the
+    /// word and charges what it does, but never pays to apply it. Over a
+    /// user-defined function a fold is exact, because applying that is a real
+    /// call nano already charges.
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]
-    #[ignore = "known divergence: element sizes in list construction, and a native fold"]
-    fn charges_a_list_of_sequences_and_a_native_fold() {
-        for (snippet, args) in [
-            (
-                "(define-public (f (a (buff 4))) (ok (list a 0x01)))",
-                vec![Value::buff_from(vec![1, 2]).expect("buffer")],
-            ),
-            (
-                "(define-public (f (a (list 4 uint))) (ok (append a u1)))",
-                vec![Value::cons_list_unsanitized(vec![Value::UInt(1)]).expect("list")],
-            ),
-            ("(define-public (f) (ok (fold * (list u2 u2 u2) u1)))", vec![]),
-        ] {
-            crosscheck_cost(snippet, "f", &args);
-        }
+    #[ignore = "known divergence: a fold over a native word does not pay to apply it"]
+    fn charges_a_native_fold() {
+        crosscheck_cost("(define-public (f) (ok (fold * (list u2 u2 u2) u1)))", "f", &[]);
     }
 
     #[test]

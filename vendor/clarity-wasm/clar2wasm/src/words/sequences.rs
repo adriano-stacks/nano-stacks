@@ -48,22 +48,23 @@ impl ComplexWord for ListCons {
                 )));
             };
 
-        // The interpreter charges the sum of the elements' sizes, not how many
-        // there are (`vm/functions/sequences.rs`, `list_cons`).
-        let elem_size = elem_ty
-            .size()
-            .map_err(|error| GeneratorError::TypeError(error.to_string()))?;
-        self.charge(
-            generator,
-            builder,
-            elem_size.saturating_mul(list.len() as u32),
-        )?;
-
         // Allocate space on the data stack for the entire list
         let (offset, _size) = generator.create_call_stack_local(builder, &ty, false, true);
 
         // Loop through the expressions in the list and store them onto the
         // data stack.
+        // The interpreter evaluates the elements, then charges the sum of what
+        // they hold — not how many there are, and not what their type allows
+        // (`vm/functions/sequences.rs`, `list_cons`). A sequence element is
+        // only as big as its contents, so the sum is accumulated as each one
+        // is written.
+        // Only a sequence element needs measuring at runtime; anything else is
+        // the same size every time, and measuring it would burn a local an
+        // element on a list that may hold thousands.
+        let measured = matches!(elem_ty, TypeSignature::SequenceType(_));
+        let charged = generator.module.locals.add(ValType::I32);
+        builder.i32_const(0).local_set(charged);
+
         let mut total_size = 0;
         for expr in list.iter() {
             // WORKAROUND: if you have a list like `(list (some 1) none)`, even if the list elements have type
@@ -74,9 +75,28 @@ impl ComplexWord for ListCons {
             generator.set_expr_type(expr, elem_ty.clone())?;
 
             generator.traverse_expr(builder, expr)?;
+            if measured {
+                generator.clarity_value_size_on_stack(builder, elem_ty)?;
+                builder
+                    .local_get(charged)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(charged);
+            }
             // Write this element to memory
             let elem_size = generator.write_to_memory(builder, offset, total_size, elem_ty)?;
             total_size += elem_size;
+        }
+        if measured {
+            self.charge(generator, builder, charged)?;
+        } else {
+            let elem_size = elem_ty
+                .size()
+                .map_err(|error| GeneratorError::TypeError(error.to_string()))?;
+            self.charge(
+                generator,
+                builder,
+                elem_size.saturating_mul(list.len() as u32),
+            )?;
         }
 
         // Push the offset and size to the data stack
@@ -439,7 +459,15 @@ impl ComplexWord for Append {
             .i32_const(elem_size)
             .binop(BinaryOp::I32DivU)
             .local_set(number_of_elements);
-        self.charge(generator, builder, number_of_elements)?;
+        // The interpreter charges the size of an entry, not how many entries
+        // the result has (`vm/functions/sequences.rs`, `special_append`).
+        self.charge(
+            generator,
+            builder,
+            elem_ty
+                .size()
+                .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+        )?;
 
         // We use the values on the stack to copy the list to its destination
         builder.memory_copy(memory, memory);

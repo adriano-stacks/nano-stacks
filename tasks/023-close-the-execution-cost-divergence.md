@@ -40,10 +40,11 @@ about when a block is full and when a tenure must be extended.
 - [x] Account for `fold`'s function-argument lookup.
 - [x] Charge `asserts!` its predicate copy, and `list` by the size of what it
       holds rather than how many.
-- [ ] Charge a list of a sequence type by the elements' runtime sizes, `append`
-      the one it is short, and a fold over a native word the application it
-      inlines. Then un-ignore
-      `charges_a_list_of_sequences_and_a_native_fold`.
+- [x] Charge a list of a sequence type by the elements' runtime sizes, and
+      `append` by the size of an entry rather than how many there are.
+- [ ] Charge a fold over a native word the application it inlines, 32 an
+      element. Then un-ignore `charges_a_native_fold`.
+- [ ] Find what remains of the 65.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -141,13 +142,23 @@ Fifteen charging bugs are fixed, each a passing crosscheck against the
 interpreter, and the copy cost turns out to be exactly `2n + 1`: a bool 3, a
 uint 33, a principal 297. That is what made each one recognisable.
 
-What is left is 65 in 231,186 — 0.028%, from 0.36% — and it is of one kind: an
-element's *declared* size where the interpreter charges what it holds. A list
-of a sequence type over-charges, `append` is short by one, and a fold over a
-native word is short by 32 an element. All three are in the one `#[ignore]`d
-case.
+Two more followed from the same reading: a list of a sequence type now
+measures its elements at runtime rather than taking the type's maximum — only
+for sequence elements, because measuring a scalar would burn a wasm local an
+element and a large list exceeds the limit — and `append` charges the size of
+an entry rather than how many entries the result has.
 
-The row is not green and the task is not done.
+Seventeen charging bugs are fixed, each a passing crosscheck, and `.pox-5
+stake-update` sits **65 out of 231,186 — 0.028%, from 0.36%**.
+
+One known divergence is left, and it is not the 65: a fold over a *native*
+word is short by 32 an element, because nano inlines the word without paying
+to apply it. Over a user-defined function a fold is exact. Closing it means
+charging a function application per iteration for an inlined native, which is
+compiler surgery rather than a charge input.
+
+What accounts for the 65 itself is not yet identified. The row is not green
+and the task is not done.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.
