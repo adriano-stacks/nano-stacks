@@ -50,8 +50,9 @@ about when a block is full and when a tenure must be extended.
 - [x] Charge `print` for the value rather than for its type's name.
 - [x] Crosscheck against the real `.pox-5` rather than a snippet — it deploys
       into the harness, and found the constants.
-- [ ] Find what remains of the 66, which needs the *state* the diverging call
-      runs against, not just the contract.
+- [x] Seed the state a call runs against, not just the contract — a driver
+      contract over two environments does it, and found another 31.
+- [ ] Bisect `.pox-5 stake` for that 31, and the 66 for `stake-update`.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -244,6 +245,28 @@ read-only functions now crosscheck exactly.
 It does not move this capture, whose `.pox-5` was deployed by stacks-core and
 carries its size — which is also why replaying someone else's chain never
 showed it.
+
+### Seeding the state — where the next one is
+
+The harness runs a *sequence* against the real contract, not just one call:
+build two `TestEnvironment`s, deploy `sbtc-token`, `pox-5`, a signer-manager
+and a driver into both, then call through the driver, snapshotting
+`cost_tracker.get_total()` either side of each call. That seeds `.pox-5`'s own
+maps with `.pox-5`'s own code, which is as close to the real thing as anything
+offline gets.
+
+Doing that turns up **another 31**: `stake` returning `ERR_SIGNER_NOT_FOUND`
+costs 31 too much, while `stake-update` returning `ERR_NOT_STAKING` on the same
+state is exact.
+
+It is not the shapes already fixed. A failing `unwrap!` returning a constant is
+exact, directly and inside a `let`; so is an error propagated by `try!` out of
+another contract, with or without work after it, and so is `unwrap-err!` across
+the same boundary.
+
+So it is somewhere in `stake`'s own path, and finding it means bisecting 3,851
+lines rather than guessing at shapes — the reduction the earlier ones needed,
+against a contract large enough that it wants doing carefully.
 
 ### What the remaining 66 is not
 
