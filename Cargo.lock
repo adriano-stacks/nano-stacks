@@ -2517,7 +2517,6 @@ dependencies = [
  "bs58",
  "c32",
  "nano-primitives",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2530,6 +2529,7 @@ dependencies = [
  "nano-address",
  "nano-crypto",
  "nano-primitives",
+ "sha2 0.10.9",
 ]
 
 [[package]]

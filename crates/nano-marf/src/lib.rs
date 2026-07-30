@@ -484,7 +484,7 @@ impl TrieNode {
         }
     }
 
-    fn node_id(&self) -> TrieNodeId {
+    const fn node_id(&self) -> TrieNodeId {
         match self {
             Self::Leaf { .. } => TrieNodeId::Leaf,
             Self::Internal { children, .. } => node_id_for_children(children.len()),

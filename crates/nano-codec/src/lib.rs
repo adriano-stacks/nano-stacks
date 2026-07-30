@@ -802,7 +802,7 @@ impl Transaction {
     }
 
     #[must_use]
-    pub fn post_condition_count(&self) -> usize {
+    pub const fn post_condition_count(&self) -> usize {
         self.post_conditions.len()
     }
 

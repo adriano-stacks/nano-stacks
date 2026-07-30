@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod sbtc;
+
 use std::{collections::HashMap, fmt};
 
 use bitcoin::{
@@ -620,7 +622,7 @@ pub fn decode_block_with_pre_stx(
     })
 }
 
-fn bitcoin_hash_bytes(mut bytes: [u8; 32]) -> [u8; 32] {
+const fn bitcoin_hash_bytes(mut bytes: [u8; 32]) -> [u8; 32] {
     bytes.reverse();
     bytes
 }

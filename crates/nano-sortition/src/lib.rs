@@ -403,7 +403,7 @@ impl RewardCycleSchedule {
             .first_waterfall_height
             .is_some_and(|height| bitcoin_height >= height)
         {
-            relative_height % self.reward_cycle_length == 0
+            relative_height.is_multiple_of(self.reward_cycle_length)
         } else {
             relative_height % self.reward_cycle_length == 1
         }
@@ -545,13 +545,13 @@ pub struct SortitionReorg {
 impl SortitionReorg {
     /// The number of snapshots the reorganization retracted.
     #[must_use]
-    pub fn depth(&self) -> usize {
+    pub const fn depth(&self) -> usize {
         self.retracted.len()
     }
 
     /// Whether the reorganization retracted nothing.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.retracted.is_empty()
     }
 

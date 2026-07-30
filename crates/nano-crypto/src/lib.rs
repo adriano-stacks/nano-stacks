@@ -113,10 +113,10 @@ impl StacksPrivateKey {
     pub fn from_seed(seed: &[u8]) -> Self {
         let mut candidate = seed.to_vec();
         loop {
-            if let Ok(bytes) = <[u8; 32]>::try_from(candidate.as_slice()) {
-                if let Ok(key) = Self::from_bytes(bytes) {
-                    return key;
-                }
+            if let Ok(bytes) = <[u8; 32]>::try_from(candidate.as_slice())
+                && let Ok(key) = Self::from_bytes(bytes)
+            {
+                return key;
             }
             candidate = sha256(&candidate).as_bytes().to_vec();
         }
