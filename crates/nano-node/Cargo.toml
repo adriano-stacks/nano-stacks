@@ -9,6 +9,7 @@ nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-bitcoin = { path = "../nano-bitcoin" }
+nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sync = { path = "../nano-sync" }
 

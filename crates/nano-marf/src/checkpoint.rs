@@ -10,9 +10,9 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::{
-    ChildTarget, MarfBlockId, MarfError, MarfValue, TrieChild, TrieHash, TrieNode, TrieNodeId,
-    VersionedMarf, internal_node_hash, leaf_hash, node_id_for_children, slots, state_root,
-    storage::TrieStorage,
+    CheckpointManifest, ChildTarget, MarfBlockId, MarfError, MarfValue, TrieChild, TrieHash,
+    TrieNode, TrieNodeId, VersionedMarf, internal_node_hash, leaf_hash, node_id_for_children, slots,
+    state_root, storage::TrieStorage,
 };
 
 const ROOT_OFFSET: usize = 36;
@@ -37,6 +37,14 @@ pub enum CheckpointError {
         expected: TrieHash,
         actual: TrieHash,
     },
+    DeclaredRootMismatch {
+        declared: TrieHash,
+        published: TrieHash,
+    },
+    ProvenanceMismatch {
+        recorded: Box<CheckpointManifest>,
+        configured: Box<CheckpointManifest>,
+    },
     UnsupportedPatch,
 }
 
@@ -58,6 +66,26 @@ impl std::fmt::Display for CheckpointError {
                     "checkpoint root mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::DeclaredRootMismatch {
+                declared,
+                published,
+            } => write!(
+                formatter,
+                "declared checkpoint root {declared} is not the root {published} the checkpoint publishes"
+            ),
+            Self::ProvenanceMismatch {
+                recorded,
+                configured,
+            } => write!(
+                formatter,
+                "state directory was imported from checkpoint {:02x?} (root {} at height {}), not {:02x?} (root {} at height {})",
+                recorded.source_state_id,
+                recorded.state_index_root,
+                recorded.stacks_height,
+                configured.source_state_id,
+                configured.state_index_root,
+                configured.stacks_height
+            ),
             Self::UnsupportedPatch => {
                 formatter.write_str("checkpoint contains unsupported trie patch")
             }
@@ -75,6 +103,8 @@ impl std::error::Error for CheckpointError {
             | Self::InvalidManifest(_)
             | Self::MissingBlock(_)
             | Self::RootMismatch { .. }
+            | Self::DeclaredRootMismatch { .. }
+            | Self::ProvenanceMismatch { .. }
             | Self::UnsupportedPatch => None,
         }
     }
@@ -152,6 +182,9 @@ fn import_into(
     source: MarfBlockId,
     expected_root: TrieHash,
 ) -> Result<VersionedMarf, CheckpointError> {
+    if let Some(manifest) = CheckpointManifest::beside(sqlite_path)? {
+        manifest.check_declared_root(source, expected_root)?;
+    }
     let blobs = Blobs::open(&blob_path(sqlite_path)?)?;
     let records = read_records(sqlite_path, &blobs)?;
     let source_record = records
@@ -785,21 +818,10 @@ fn replace_pointer(
     Ok(())
 }
 
-fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], CheckpointError> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    if value.len() != LENGTH * 2 {
-        return Err(CheckpointError::InvalidCheckpoint(
-            "hash has the wrong length",
-        ));
-    }
+pub fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], CheckpointError> {
     let mut bytes = [0; LENGTH];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let text = value
-            .get(index * 2..index * 2 + 2)
-            .ok_or(CheckpointError::InvalidCheckpoint("hash is truncated"))?;
-        *byte = u8::from_str_radix(text, 16)
-            .map_err(|_| CheckpointError::InvalidCheckpoint("hash is not hexadecimal"))?;
-    }
+    hex::decode_to_slice(value.strip_prefix("0x").unwrap_or(value), &mut bytes)
+        .map_err(|_| CheckpointError::InvalidCheckpoint("value is not a 32-byte hash"))?;
     Ok(bytes)
 }
 
