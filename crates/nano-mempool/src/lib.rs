@@ -478,7 +478,9 @@ impl Mempool {
             )));
         }
 
-        let length = transaction.as_bytes().len() as u64;
+        // A transaction always has bytes; the floor keeps the fee rate a
+        // division rather than a special case.
+        let length = (transaction.as_bytes().len() as u64).max(1);
         let fee = transaction.auth().payer().fee();
         if fee < MINIMUM_TX_FEE || fee / length < MINIMUM_TX_FEE_RATE_PER_BYTE {
             return Err(Rejection::FeeTooLow {
