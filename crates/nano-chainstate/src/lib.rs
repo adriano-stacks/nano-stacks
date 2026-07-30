@@ -647,6 +647,15 @@ impl ChainState {
         self.vm.network()
     }
 
+    /// The executed state, for reads that answer the public RPC.
+    ///
+    /// Handing out the VM is deliberate: a read-only call and an account query
+    /// are evaluations against the state this chainstate has sealed, and
+    /// wrapping each one here would only restate what the VM already offers.
+    pub const fn vm_mut(&mut self) -> &mut Vm {
+        &mut self.vm
+    }
+
     /// Evaluate a read-only Clarity program against the state just executed.
     pub fn evaluate(&mut self, source: &str) -> Result<Option<Value>, ChainStateError> {
         Ok(self

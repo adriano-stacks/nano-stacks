@@ -36,7 +36,7 @@ produces no `new_block` payloads of its own to diff receipts against.
 - [x] Dispatch the event observer POSTs to configured observers.
 - [x] Diff nano's own `new_block` payloads against stacks-core's in
       `nano-conformance`.
-- [ ] Hand the routes a live chain: `ChainState` owns the `Vm` privately and
+- [x] Hand the routes a live chain: `ChainState` owns the `Vm` privately and
       exposes no account nonce, so nothing but a bare `Vm` can implement
       `ChainAccess` yet.
 - [ ] Run the dispatcher from a node: the `stacks-node` binary follows without

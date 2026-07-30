@@ -117,3 +117,15 @@ impl ChainAccess for Vm {
             .ok_or_else(|| ChainAccessError::Failed("call returned no value".to_owned()))
     }
 }
+
+/// An executing chainstate answers from the state it has sealed, which is the
+/// only source the public RPC should ever read.
+impl ChainAccess for nano_chainstate::ChainState {
+    fn account(&mut self, principal: &PrincipalData) -> Result<AccountEntry, ChainAccessError> {
+        self.vm_mut().account(principal)
+    }
+
+    fn call_read_only(&mut self, call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
+        self.vm_mut().call_read_only(call)
+    }
+}
