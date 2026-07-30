@@ -45,7 +45,8 @@ enum RootPolicy<'a> {
     Trust,
 }
 
-/// M0 boundary that makes the final validation stage explicit.
+/// What executing one block produced: its sealed state, what it cost, and the
+/// receipt of every transaction it carried.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedBlock {
     pub bitcoin_height: u64,
@@ -2219,18 +2220,6 @@ const fn clarity_version_to_vm(version: ClarityVersion) -> VmClarityVersion {
         ClarityVersion::Clarity4 => VmClarityVersion::Clarity4,
         ClarityVersion::Clarity5 => VmClarityVersion::Clarity5,
         ClarityVersion::Clarity6 => VmClarityVersion::Clarity6,
-    }
-}
-
-#[must_use]
-pub const fn append_stub(snapshot: &SortitionSnapshot) -> AppliedBlock {
-    AppliedBlock {
-        bitcoin_height: snapshot.bitcoin_height,
-        execution: ExecutionResult {
-            state_root: nano_marf::StateRoot::empty(),
-        },
-        execution_cost: ExecutionCost::ZERO,
-        receipts: Vec::new(),
     }
 }
 

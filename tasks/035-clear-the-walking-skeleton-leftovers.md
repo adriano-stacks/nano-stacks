@@ -1,13 +1,14 @@
 ---
 id: "035"
 title: "Clear the walking-skeleton leftovers"
-status: pending
+status: completed
 priority: low
 effort: small
 type: chore
 dependencies: []
 tags: ["notes"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Clear the walking-skeleton leftovers
@@ -28,11 +29,11 @@ the doc comments:
 
 ## Tasks
 
-- [ ] Remove the stub functions and anything that still calls them.
-- [ ] Rewrite the doc comments to describe the code instead of the milestone
+- [x] Remove the stub functions and anything that still calls them.
+- [x] Rewrite the doc comments to describe the code instead of the milestone
       that produced it.
-- [ ] Remove the empty examples directory.
-- [ ] Check the same for `plan.md` and milestone references elsewhere in the
+- [x] Remove the empty examples directory.
+- [x] Check the same for `plan.md` and milestone references elsewhere in the
       source.
 
 ## Acceptance Criteria
@@ -40,3 +41,9 @@ the doc comments:
 - No milestone identifier appears in a source comment.
 - Nothing named `stub` is exported.
 - The tests and the scoreboard are unchanged.
+
+## Note
+
+`plan.md` keeps its milestone numbers: it is the plan, and M0 means something
+there. The task files reference it deliberately. What is gone is milestone
+numbering in the source, where a reader has no way to look it up.

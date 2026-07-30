@@ -48,7 +48,7 @@ pub const EPOCH_4_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
     runtime: 5_000_000_000,
 };
 
-/// M0 execution output. M8/M10 replace the marker with Clarity receipts.
+/// The MARF root a block sealed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub state_root: StateRoot,
@@ -822,13 +822,6 @@ impl Vm {
     #[must_use]
     pub fn get(&self, block: [u8; 32], key: &str) -> Option<&str> {
         self.store.get(block, key)
-    }
-}
-
-#[must_use]
-pub const fn execute_stub() -> ExecutionResult {
-    ExecutionResult {
-        state_root: StateRoot::empty(),
     }
 }
 

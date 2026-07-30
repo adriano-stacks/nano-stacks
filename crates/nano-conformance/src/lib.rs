@@ -20,8 +20,8 @@ pub struct FixtureManifest {
     pub replay_blocks: u64,
 }
 
-/// Whether the fixture directory contains an explicit M0 baseline or a real
-/// capture that downstream conformance tests may consume.
+/// Whether the fixture directory holds the empty baseline the scoreboard starts
+/// from, or a real capture the conformance tests can consume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FixtureMode {
     Baseline,

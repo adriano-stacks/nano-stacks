@@ -90,7 +90,7 @@ fn validate_fixtures() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(FixtureStatus::Baseline { .. }) => {
-            eprintln!("fixture tree is still the M0 baseline; capture real epoch-4 data first");
+            eprintln!("fixture tree is still the empty baseline; capture real epoch-4 data first");
             ExitCode::FAILURE
         }
         Err(error) => {
