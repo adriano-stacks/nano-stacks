@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Mine as a Hacknet participant for as long as the process runs.
 //!
 //! A tenure has to be proposed within seconds of the sortition that awarded it:

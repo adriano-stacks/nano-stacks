@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 pub mod sbtc;
 
 use std::{collections::HashMap, fmt};

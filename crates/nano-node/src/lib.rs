@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::{fmt, path::Path};
 
 use nano_bitcoin::BitcoinSource;

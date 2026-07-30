@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::{error::Error, fs, io, path::PathBuf};
 
 use bitcoincore_rpc::Auth;

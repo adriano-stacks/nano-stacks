@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 mod chain;
 mod events;
 mod stackerdb;

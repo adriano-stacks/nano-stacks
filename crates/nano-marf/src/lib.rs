@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::{fmt, path::Path, sync::Arc};
 
 use nano_primitives::{TrieHash, sha512_256};

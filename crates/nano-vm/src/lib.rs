@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::{collections::BTreeMap, path::Path};
 
 use clar2wasm::{CompiledContract, ModuleCache};

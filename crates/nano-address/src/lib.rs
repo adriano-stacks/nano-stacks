@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::{fmt, str::FromStr};
 
 use bitcoin::{Address as BitcoinAddress, Network, ScriptBuf};

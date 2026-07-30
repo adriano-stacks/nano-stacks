@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::fmt;
 
 pub use primitive_types::{U256 as Uint256, U512 as Uint512};

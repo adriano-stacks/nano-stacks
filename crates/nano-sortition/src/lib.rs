@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 pub(crate) mod carryover;
 
 use std::{collections::HashMap, fmt};

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Bitcoin wallet integration for nano-stacks mining.
 
 mod commitment;

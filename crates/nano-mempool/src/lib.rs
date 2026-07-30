@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! The transactions a node has accepted and not yet seen mined.
 //!
 //! Admission mirrors stacks-core's (`chainstate/stacks/db/blocks.rs`,
