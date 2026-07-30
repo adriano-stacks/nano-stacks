@@ -15,7 +15,6 @@ nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-mempool = { path = "../nano-mempool" }
-nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
@@ -40,10 +39,4 @@ path = "src/bin/register_leader_key.rs"
 name = "stacks-commit-block"
 path = "src/bin/commit_block.rs"
 
-[[bin]]
-name = "stacks-miner-run"
-path = "src/bin/run_miner.rs"
 
-[[bin]]
-name = "stacks-mine-tenure"
-path = "src/bin/mine_tenure.rs"
