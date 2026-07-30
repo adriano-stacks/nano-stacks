@@ -446,7 +446,8 @@ checkpoint) checkpoint ;;
 fund) shift && fund "$@" ;;
 register) register ;;
 mine) mine ;;
-config) shift && nano_config "${1:-$(cat "$RUN/replaced-participant")}" && cat "$RUN/nano.toml" ;;
+config) shift && nano_config "${1:-$(cat "$RUN/replaced-participant" 2>/dev/null)}" &&
+    cat "$RUN/nano.toml" ;;
 replace) shift && replace "$@" ;;
 verify) verify ;;
 restore) restore ;;
