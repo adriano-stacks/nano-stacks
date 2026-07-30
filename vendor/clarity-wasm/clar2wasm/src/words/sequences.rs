@@ -10,6 +10,7 @@ use crate::check_args;
 use crate::cost::WordCharge;
 use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::error_mapping::ErrorMap;
+use crate::cost::ChargeGenerator;
 use crate::wasm_generator::{
     add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, get_global, has_in_memory_type,
     ArgumentsExt, BorrowedLocal, GeneratorError, SequenceElementType, WasmGenerator,
@@ -96,6 +97,10 @@ impl ComplexWord for Fold {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
 
         self.charge(generator, builder, 0)?;
+        // The name of the folded function is resolved once before the loop
+        // (`vm/functions/sequences.rs`, `special_fold`), which every other
+        // application pays for and this one was not.
+        generator.charge_function_lookup(builder)?;
 
         let func = args.get_name(0)?;
         let sequence = args.get_expr(1)?;

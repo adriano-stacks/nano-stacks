@@ -139,6 +139,10 @@ impl Word for StxGetAccount {
 }
 
 impl SimpleWord for StxGetAccount {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,

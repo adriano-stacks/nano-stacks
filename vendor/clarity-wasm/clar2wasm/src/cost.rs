@@ -1764,10 +1764,12 @@ mod word {
     decl_tests!("element_at_alias", "(element-at? 0x1234567890 u2)", {
         3 => CostMeter { runtime: 514,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
+    // `fold` resolves its function argument before the loop, as every other
+    // application does; these carry that lookup.
     decl_tests!("fold", "(fold * (list 2 2 2) 1)", {
-        1 => CostMeter { runtime: 7000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 755,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 698,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 771,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 714,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("len", "(len 0x010203)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -2050,6 +2052,36 @@ mod crosscheck {
         }
     }
 
+    /// Words that read a bound operand where it is, rather than copying it.
+    ///
+    /// Each of these charged a copy nano's interpreter never makes — small per
+    /// occurrence, but paid once per bound name, which is how a contract that
+    /// reads its arguments as often as pox-5 accumulates a divergence.
+    #[test]
+    fn charges_words_that_read_a_bound_operand_in_place() {
+        for (snippet, args) in [
+            (
+                "(define-public (f (a bool)) (ok (and a true)))",
+                vec![Value::Bool(true)],
+            ),
+            (
+                "(define-public (f (a bool)) (ok (or a false)))",
+                vec![Value::Bool(true)],
+            ),
+            (
+                "(define-public (f (a principal)) (ok (get unlocked (stx-account a))))",
+                vec![Value::Principal(
+                    clarity::vm::types::PrincipalData::parse(
+                        "S1G2081040G2081040G2081040G208105NK8PE5",
+                    )
+                    .expect("principal"),
+                )],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &args);
+        }
+    }
+
     /// A comparison or a branch over a bound name costs what the interpreter
     /// charges.
     ///
@@ -2083,20 +2115,26 @@ mod crosscheck {
         }
     }
 
-    /// `fold` under-charges by the function-argument lookup `special_fold`
-    /// performs — 16 plus one an element — which is the last cost divergence
-    /// this suite knows of and the only one left in the other direction.
+    /// `fold` resolves its function argument once before the loop, which every
+    /// other application pays for and this one did not. Two gaps remain, both
+    /// per element and both under-charges:
+    ///
+    /// - one unit an element folding a user-defined function over a list, and
+    ///   none at all over a buffer
+    /// - a further 32 an element when the folded function is a native word,
+    ///   which nano inlines without paying to apply
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]
-    #[ignore = "known divergence: fold misses the function-argument lookup"]
+    #[ignore = "known divergence: a fold is short per element, more so over a native word"]
     fn charges_folding_a_function_over_a_list() {
-        crosscheck_cost(
+        for snippet in [
             "(define-private (g (i uint) (acc uint)) (+ acc i)) \
              (define-public (f) (ok (fold g (list u1 u2 u3 u4) u0)))",
-            "f",
-            &[],
-        );
+            "(define-public (f) (ok (fold * (list u2 u2 u2) u1)))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
     }
 
     #[test]

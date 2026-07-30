@@ -629,7 +629,9 @@ impl ComplexWord for And {
             block.i32_const(0);
 
             for arg in args {
-                generator.traverse_expr(&mut block, arg)?;
+                // Read in place: `and` and `or` evaluate an operand without
+                // copying it out of its binding.
+                generator.traverse_expr_as_borrowed_value(&mut block, arg)?;
                 // if argument is false, we break early
                 block.unop(UnaryOp::I32Eqz).br_if(block_id);
             }
@@ -708,7 +710,8 @@ impl ComplexWord for Or {
             block.i32_const(1);
 
             for arg in args {
-                generator.traverse_expr(&mut block, arg)?;
+                // Read in place, as `and` does.
+                generator.traverse_expr_as_borrowed_value(&mut block, arg)?;
                 // if argument is true, we break early
                 block.br_if(block_id);
             }

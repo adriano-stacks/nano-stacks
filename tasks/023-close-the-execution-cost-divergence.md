@@ -37,9 +37,11 @@ about when a block is full and when a tenure must be extended.
       regression test.
 - [x] Reduce the remaining divergence to the words that cause it.
 - [x] Stop charging a copy for operands the interpreter reads in place.
-- [ ] Account for `fold`'s function-argument lookup, and un-ignore
-      `charges_folding_a_function_over_a_list`.
-- [ ] Find what remains of the 513 after that.
+- [x] Account for `fold`'s function-argument lookup.
+- [ ] Charge a fold per element — one for a user-defined function, 33 for a
+      native word — and un-ignore `charges_folding_a_function_over_a_list`.
+- [ ] Charge `asserts!` the 3 it is short.
+- [ ] Find what remains of the 545 after those.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -106,10 +108,26 @@ already existed for exactly this and the comparisons did not use it. `<`, `<=`,
 `>`, `>=` and `if`'s condition now do, and every case is a passing crosscheck
 rather than a reproduction.
 
-That took the divergence from **843 to 513** in 231,186 — 0.36% to 0.22%. What
-is left is at least `fold`'s missing function-argument lookup, which
-under-charges in the other direction and is the one case still
-`#[ignore]`d.
+Sweeping the words pox-5 leans on found the same pattern in three more places
+— `and`, `or` and `stx-account` all charged a copy for an operand read in
+place — and one omission: `fold` never paid to resolve the function it folds,
+which every other application pays for.
+
+The comparison and branch fixes took the divergence from **843 to 513**; adding
+the fold lookup put it back to **545**, because that charge was genuinely
+missing and nano over-charges elsewhere. Both are right and the net number is
+not the measure of either.
+
+What is still known and unfixed:
+
+- a fold under-charges **one an element** over a user-defined function, and a
+  further **32 an element** over a native word, which nano inlines without
+  paying to apply. Buffers are exact.
+- `asserts!` under-charges by **3**.
+
+Everything fixed is a passing crosscheck; everything known and unfixed is in
+the one `#[ignore]`d case. What accounts for the rest of the 545 is not yet
+identified, and the sweep that found these is the way to find it.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.
