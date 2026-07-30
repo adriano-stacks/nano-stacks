@@ -1717,9 +1717,9 @@ mod word {
         3 => CostMeter { runtime: 1000,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("print", "(print 0x1234567890)", {
-        1 => CostMeter { runtime: 10000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1453,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1594,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 11000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1456,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1609,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_err", "(is-err (err 1))", {
         1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -2129,6 +2129,28 @@ mod crosscheck {
             ),
         ] {
             crosscheck_cost(snippet, "f", &args);
+        }
+    }
+
+    /// `print` costs what the value costs, not what its type is to write down.
+    ///
+    /// `special_print` charges for `input.size()`. nano charged for the length
+    /// of the type's textual form, which is a different quantity that happens
+    /// to be close for simple values and drifts as soon as a tuple carries
+    /// long field names — the shape every `.pox-5` event print has.
+    #[test]
+    fn charges_print_for_the_value() {
+        for snippet in [
+            "(define-public (f) (ok (print {a: u0, b: u1})))",
+            "(define-public (f) (ok (print {aaaaaaaaaaaaaaaaaaa: u0, bbbbbbbbbbbbbbbb: u1})))",
+            "(define-public (f) (ok (print tx-sender)))",
+            "(define-public (f) (ok (print 0x0011223344)))",
+            "(define-public (f) (ok (print (if false (some 0x00) none))))",
+            "(define-public (f) (ok (print {a: (list u1 u2), b: {c: \"xy\", d: (some tx-sender)}})))",
+            "(define-public (f) (let ((r {aaaaaaaaaaaaaaaaaaa: u1, bbbbbbbbbbbbbbbb: tx-sender}))
+               (begin (print (merge {topic: \"stake-update\"} r)) (ok r))))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
         }
     }
 

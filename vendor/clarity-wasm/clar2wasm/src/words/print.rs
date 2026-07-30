@@ -59,7 +59,12 @@ impl ComplexWord for Print {
                 data: serialized_ty,
             }))?;
 
-        self.charge(generator, builder, serialized_ty_len)?;
+        // `special_print` charges for the size of the value, not for how long
+        // its type is to write down. The two are close for simple values and
+        // drift apart as soon as a tuple has long field names.
+        let size = generator.borrow_local(walrus::ValType::I32);
+        generator.runtime_size(builder, &ty, &val_locals, *size)?;
+        self.charge(generator, builder, *size)?;
 
         // Push the value back onto the data stack
         for val_local in &val_locals {

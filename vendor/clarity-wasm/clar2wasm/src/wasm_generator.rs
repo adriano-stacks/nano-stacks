@@ -1025,7 +1025,7 @@ impl WasmGenerator {
     /// runtime — a discriminant, a sequence length — is on the stack here, so
     /// the size follows it. What cannot be told apart at runtime keeps the
     /// declared size, which over-charges but never under.
-    fn runtime_size(
+    pub(crate) fn runtime_size(
         &mut self,
         builder: &mut InstrSeqBuilder,
         ty: &TypeSignature,
