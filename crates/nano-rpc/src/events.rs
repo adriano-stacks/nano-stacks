@@ -5,11 +5,14 @@
 //! by field name. `new_block` is also nano's own receipt oracle: the captured
 //! fixtures are exactly what this module has to reproduce.
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use clarity::vm::costs::ExecutionCost;
 use nano_chainstate::{AppliedBlock, NakamotoBlock, TransactionReceipt, TransactionStatus};
-use nano_primitives::{BitcoinHeaderHash, BlockHeaderHash, Sha256Sum, StacksBlockId};
+use nano_primitives::{
+    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Sha256Sum, StacksBlockId,
+};
+use nano_stackerdb::Chunk;
 use reqwest::Url;
 use serde_json::{Value, json};
 
@@ -38,12 +41,6 @@ impl EventKind {
             Self::ProposalResponse => "proposal_response",
             Self::MinedNakamotoBlock => "mined_nakamoto_block",
         }
-    }
-}
-
-impl fmt::Display for EventKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.path())
     }
 }
 
@@ -172,7 +169,7 @@ pub fn new_block_payload(
 pub fn new_burn_block_payload(
     bitcoin_block_hash: BitcoinHeaderHash,
     bitcoin_height: u64,
-    consensus_hash: nano_primitives::ConsensusHash,
+    consensus_hash: ConsensusHash,
     parent_bitcoin_block_hash: BitcoinHeaderHash,
     burned: u64,
 ) -> Value {
@@ -190,7 +187,7 @@ pub fn new_burn_block_payload(
 
 /// Build the `stackerdb_chunks` payload for chunks a node accepted.
 #[must_use]
-pub fn stackerdb_chunks_payload(contract_id: &str, chunks: &[nano_stackerdb::Chunk]) -> Value {
+pub fn stackerdb_chunks_payload(contract_id: &str, chunks: &[Chunk]) -> Value {
     json!({
         "contract_id": contract_id,
         "modified_slots": chunks
