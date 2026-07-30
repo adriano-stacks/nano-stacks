@@ -110,3 +110,16 @@ function-argument lookup, 16 plus 1 per element.
 
 Reducing `stake-update` to the snippet that over-charges is the next step, the
 same way the earlier eight were found.
+
+## Hacknet
+
+Not validated on a live chain. The run that would have done it stalled before
+it started: nano's node ended on the resume path because the block its signer
+state was sealed at had been reorganized away
+([[041-walk-back-when-our-tip-left-the-chain]]), and the stock signers were
+rejecting proposals of their own accord with
+`Cannot validate block, no global signer state`.
+
+The offline evidence stands on its own — every cost change here is crosschecked
+against the interpreter, and the 340-block replay matches state roots and
+receipts — but a live chain has not seen these changes.
