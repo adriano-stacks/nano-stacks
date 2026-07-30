@@ -481,7 +481,36 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
     output
 }
 
+/// Replay the captured block stream, handing every executed block and its
+/// receipts to the caller.
+///
+/// The scoreboard only needs the depth; anything that has to see what
+/// execution produced — an event payload, a receipt, a cost — replays through
+/// here rather than rebuilding the checkpoint plumbing.
+pub fn replay_captured_blocks(
+    root: &Path,
+    blocks: u64,
+    visit: &mut dyn FnMut(&NakamotoBlock, &nano_chainstate::AppliedBlock),
+) -> ReplayDepth {
+    captured_replay_visiting(
+        root,
+        FixtureManifest {
+            mode: FixtureMode::Captured,
+            replay_blocks: blocks,
+        },
+        visit,
+    )
+}
+
 fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
+    captured_replay_visiting(root, manifest, &mut |_, _| {})
+}
+
+fn captured_replay_visiting(
+    root: &Path,
+    manifest: FixtureManifest,
+    visit: &mut dyn FnMut(&NakamotoBlock, &nano_chainstate::AppliedBlock),
+) -> ReplayDepth {
     let (mut chainstate, source) = match replay_chainstate(root) {
         Ok(chainstate) => chainstate,
         Err(message) => return replay_fixture_failure(manifest, message),
@@ -511,7 +540,7 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let (block, cost_divergence) = match apply_captured_block(
+        let (block, applied, cost_divergence) = match apply_captured_block(
             root,
             &mut chainstate,
             &snapshots,
@@ -534,6 +563,7 @@ fn captured_replay(root: &Path, manifest: FixtureManifest) -> ReplayDepth {
         if first_cost_divergence.is_none() {
             first_cost_divergence = cost_divergence.map(|reason| (block_number, reason));
         }
+        visit(&block, &applied);
         parent = Some(*block.block_id().as_bytes());
         completed += 1;
     }
@@ -579,7 +609,7 @@ fn apply_captured_block(
     parent: Option<[u8; 32]>,
     bitcoin_view: &mut String,
     path: &Path,
-) -> Result<(NakamotoBlock, Option<String>), ReplayDivergence> {
+) -> Result<(NakamotoBlock, nano_chainstate::AppliedBlock, Option<String>), ReplayDivergence> {
     let bytes =
         fs::read(path).map_err(|_| ReplayDivergence::Fixture("block cannot be read".to_owned()))?;
     let block = NakamotoBlock::decode(&bytes)
@@ -629,7 +659,7 @@ fn apply_captured_block(
             actual,
         });
     }
-    Ok((block, cost_divergence))
+    Ok((block, applied, cost_divergence))
 }
 
 /// Compare a block's receipts, returning any cost difference separately.
