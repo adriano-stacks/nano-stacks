@@ -2132,10 +2132,15 @@ mod crosscheck {
         }
     }
 
-    /// A fold over a *native* word is short by 32 an element: nano inlines the
-    /// word and charges what it does, but never pays to apply it. Over a
+    /// A fold over a *native* word is short by **31 an element**: nano inlines
+    /// the word and charges what it does, but never pays to apply it. Over a
     /// user-defined function a fold is exact, because applying that is a real
     /// call nano already charges.
+    ///
+    /// It is not a user-function application: charging one per element costs
+    /// 57 an element and overshoots. Whatever the interpreter pays to apply a
+    /// native inside `special_fold` has to be identified before this can be
+    /// charged, rather than a constant fitted to the difference.
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]

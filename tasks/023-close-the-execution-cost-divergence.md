@@ -42,8 +42,10 @@ about when a block is full and when a tenure must be extended.
       holds rather than how many.
 - [x] Charge a list of a sequence type by the elements' runtime sizes, and
       `append` by the size of an entry rather than how many there are.
-- [ ] Charge a fold over a native word the application it inlines, 32 an
-      element. Then un-ignore `charges_a_native_fold`.
+- [ ] Charge a fold over a native word the application it inlines, 31 an
+      element. It is *not* a user-function application — charging one costs 57
+      an element and overshoots — so what the interpreter pays there has to be
+      identified first. Then un-ignore `charges_a_native_fold`.
 - [ ] Find what remains of the 65.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
@@ -152,10 +154,12 @@ Seventeen charging bugs are fixed, each a passing crosscheck, and `.pox-5
 stake-update` sits **65 out of 231,186 — 0.028%, from 0.36%**.
 
 One known divergence is left, and it is not the 65: a fold over a *native*
-word is short by 32 an element, because nano inlines the word without paying
-to apply it. Over a user-defined function a fold is exact. Closing it means
-charging a function application per iteration for an inlined native, which is
-compiler surgery rather than a charge input.
+word is short by **31 an element**, because nano inlines the word without
+paying to apply it. Over a user-defined function a fold is exact.
+
+Charging a user-function application per element was the obvious guess and it
+is wrong — that costs 57 an element and overshoots by 26. So the 31 is
+something else, and it needs identifying rather than fitting.
 
 What accounts for the 65 itself is not yet identified. The row is not green
 and the task is not done.
