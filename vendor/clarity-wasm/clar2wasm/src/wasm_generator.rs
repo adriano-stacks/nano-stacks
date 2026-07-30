@@ -1031,6 +1031,28 @@ impl WasmGenerator {
                     )
                     .local_set(*size);
             }
+            // From epoch 3.3 the interpreter charges the size of the *value*,
+            // not of its declared type (`callables.rs`,
+            // `uses_arg_size_for_cost`). A byte sequence carries its length on
+            // the stack, so its size is known here: `4 + len` for a buffer or
+            // an ASCII string (`signatures.rs`, `inner_size`). Everything else
+            // keeps the declared size, which over-charges but never under.
+            // From epoch 3.3 the interpreter charges the size of the *value*,
+            // not of its declared type (`callables.rs`,
+            // `uses_arg_size_for_cost`). A byte sequence carries its length on
+            // the stack, so its size is known here: `4 + len` for a buffer or
+            // an ASCII string (`signatures.rs`, `inner_size`). Everything else
+            // keeps the declared size, which over-charges but never under.
+            TypeSignature::SequenceType(
+                SequenceSubtype::BufferType(_)
+                | SequenceSubtype::StringType(StringSubtype::ASCII(_)),
+            ) => {
+                builder
+                    .local_get(values[1])
+                    .i32_const(4)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(*size);
+            }
             _ => {
                 builder
                     .i32_const(self.clarity_value_size(ty)? as i32)

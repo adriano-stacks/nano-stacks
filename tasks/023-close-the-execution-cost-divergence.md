@@ -72,9 +72,16 @@ runtime differing by 843 in 231,186 — **0.36%**, the residual named below —
 where the stale fixtures differ by a factor of two. See
 [[038-recapture-the-fixtures-from-the-pinned-revision]].
 
-Two known under-charges remain, both measured:
+Charging an argument for what it holds rather than for what its type allows is
+now done for byte sequences: from epoch 3.3 the interpreter charges
+`arg.size()`, and a buffer or ASCII string carries its length on the wasm
+stack, so `4 + len` is known where the compiler stands. A crosscheck case pins
+it — it fails without the change and passes with it.
 
-- runtime is 0.3% low because `InnerTypeCheckCost` and the value-copy cost are
-  charged on the declared type's maximum size rather than the value's actual
-  size, which needs sequence-length arithmetic in the compiler
+What remains, measured against a capture from the pinned revision, is runtime
+high by **843 in 231,186 (0.36%)** at the first divergence:
+
+- lists and UTF-8 strings still take their declared size, because their
+  runtime length is not the byte length on the stack and guessing the
+  conversion would be a consensus bug rather than an over-charge
 - `fold`/`map`/`filter` miss the function-argument lookup, 16 plus 1 per element

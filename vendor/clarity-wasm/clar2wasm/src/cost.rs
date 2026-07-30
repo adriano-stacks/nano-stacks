@@ -1942,6 +1942,37 @@ mod crosscheck {
         }
     }
 
+    /// From epoch 3.3 a function's arguments are type-checked at the size of
+    /// the values passed, not of the types declared, so a short buffer in a
+    /// wide parameter costs what it is rather than what it could have been
+    /// (`callables.rs`, `uses_arg_size_for_cost`).
+    #[test]
+    fn charges_an_argument_for_what_it_holds() {
+        for (snippet, arguments) in [
+            (
+                "(define-public (f (a (buff 100))) (ok a))",
+                vec![Value::buff_from(vec![1, 2, 3, 4]).expect("buffer")],
+            ),
+            (
+                "(define-public (f (a (buff 100))) (ok a))",
+                vec![Value::buff_from(vec![7; 90]).expect("buffer")],
+            ),
+            (
+                "(define-public (f (a (string-ascii 128))) (ok a))",
+                vec![
+                    Value::string_ascii_from_bytes(b"short".to_vec()).expect("ascii"),
+                ],
+            ),
+            (
+                "(define-private (g (a (buff 64))) a) \
+                 (define-public (f (a (buff 64))) (ok (g a)))",
+                vec![Value::buff_from(vec![9; 3]).expect("buffer")],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &arguments);
+        }
+    }
+
     #[test]
     fn charges_entering_a_function_once() {
         for (snippet, arguments) in [
