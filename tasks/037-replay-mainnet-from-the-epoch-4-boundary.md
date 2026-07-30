@@ -66,6 +66,42 @@ at burn 907,740, long past, so every tenure nano executes mints 475 STX to
 `.sip-031`, rising to 1,140 at burn 960,300 — seventy-odd blocks after the fork.
 [[025-apply-the-sip-031-emission]] is load-bearing from the first block.
 
+## The chainstate is obtainable after all
+
+Hiro publishes dated archives of a synced mainnet chainstate, and one of them
+is a **4.0.1 node dated 2026-07-30** — the same day mainnet crossed the epoch
+4.0 boundary at burn 960,230:
+
+```
+https://archive.hiro.so/mainnet/stacks-blockchain/mainnet-stacks-blockchain-4.0.1-20260730.tar.zst
+```
+
+208 GiB compressed, and it holds exactly the three databases a capture reads —
+`chainstate/vm/`, `chainstate/blocks/nakamoto.sqlite` and
+`burnchain/sortition/marf.sqlite`. So "this needs a node nobody here has" was
+wrong: it needs a large download, which is a different kind of problem.
+
+Two things were needed to use it, one of them now done:
+
+- `cargo xtask capture-fixtures` assumed Hacknet's layout, where a node's
+  directories sit under `stacks-miner-1/nakamoto-neon`. **`--node-root` now
+  names the directory directly**, which is what an archive extracts to.
+- Streaming the archive through `zstd | tar` cannot resume, and a 208 GiB
+  stream *will* be interrupted — it was, twice, with `Unexpected EOF in
+  archive`. It has to land on disk first, resumably.
+
+## What the archive still cannot give
+
+**Receipts.** `events/new_block/*.json` come from an event observer attached to
+a running node, and an archive holds no events. So a mainnet capture can carry
+`state_index_root` per header — the claim this task is really about — and not
+the per-transaction receipts that the Hacknet capture checks alongside it.
+
+Getting those means either running a node against the restored chainstate with
+an observer attached, or reading `execution_cost` back from
+`/extended/v1/tx/:txid`, which is a weaker oracle than the event stream and
+covers costs rather than events.
+
 ## What still blocks it
 
 The fixtures this task replays cannot be taken from a public API:
