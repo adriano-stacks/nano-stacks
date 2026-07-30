@@ -2611,6 +2611,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-mempool"
+version = "0.1.0"
+dependencies = [
+ "nano-address",
+ "nano-codec",
+ "nano-crypto",
+ "nano-primitives",
+ "serde_json",
+]
+
+[[package]]
 name = "nano-miner"
 version = "0.1.0"
 dependencies = [
