@@ -68,6 +68,18 @@ impl CostMeter {
         write_length: 0,
     };
 
+    /// The cost between two meter readings, clamped at zero per dimension.
+    #[must_use]
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            runtime: self.runtime.saturating_sub(earlier.runtime),
+            read_count: self.read_count.saturating_sub(earlier.read_count),
+            read_length: self.read_length.saturating_sub(earlier.read_length),
+            write_count: self.write_count.saturating_sub(earlier.write_count),
+            write_length: self.write_length.saturating_sub(earlier.write_length),
+        }
+    }
+
     pub fn used_from_remaining(remaining: Self) -> Self {
         Self {
             runtime: Self::INIT.runtime - remaining.runtime,
