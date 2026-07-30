@@ -1,13 +1,14 @@
 ---
 id: "039"
 title: "Keep the node alive when one role fails"
-status: in-progress
+status: completed
 priority: high
 effort: small
 type: bug
 dependencies: ["030"]
 tags: ["node", "robustness"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Keep the node alive when one role fails
