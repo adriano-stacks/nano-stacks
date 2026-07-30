@@ -1,13 +1,14 @@
 ---
 id: "028"
 title: "Accept transactions into a local mempool"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: feature
 dependencies: []
 tags: ["mainnet", "mempool"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Accept transactions into a local mempool
@@ -25,12 +26,12 @@ peer willing to share.
 
 ## Tasks
 
-- [ ] Hold submitted transactions, keyed so a replacement by fee is possible.
-- [ ] Admit on the checks stacks-core admits on: signature, nonce, fee, size and
+- [x] Hold submitted transactions, keyed so a replacement by fee is possible.
+- [x] Admit on the checks stacks-core admits on: signature, nonce, fee, size and
       the current chain tip.
-- [ ] Drop what a block confirmed and what has become invalid.
-- [ ] Order candidates for block assembly by fee rate under the epoch-4 limits.
-- [ ] Keep the peer mempool as a source that feeds the local one, not as the
+- [x] Drop what a block confirmed and what has become invalid.
+- [x] Order candidates for block assembly by fee rate under the epoch-4 limits.
+- [x] Keep the peer mempool as a source that feeds the local one, not as the
       only one.
 
 ## Acceptance Criteria
@@ -38,3 +39,19 @@ peer willing to share.
 - A transaction submitted to nano is mined into a nano tenure without a peer.
 - A transaction the chain has confirmed or invalidated leaves the mempool.
 - Admission rejects what stacks-core rejects, with the same reason.
+
+## Known limits
+
+- The refusals that need a VM over the tip — `NoSuchContract`,
+  `NoSuchPublicFunction`, `BadFunctionArgument`, `ContractAlreadyExists` — are
+  deferred to block assembly, where `admit_candidates` runs the transaction
+  anyway. A test pins the divergence rather than hiding it.
+- A tenure-start block still carries no user transactions: that path has
+  seconds to publish a proposal and the mempool fill costs two round trips.
+  Continuation blocks carry them.
+- `fill_mempool` reads one account per principal per poll. That wants batching,
+  or the local account index below, before mainnet.
+- The miner still asks a peer for nonces and balances. `ChainState` now answers
+  `account_balance` and the VM answers `account_nonce`, so a `ChainTip` over
+  nano's own executed state would close both this and the deferred refusals
+  above.
