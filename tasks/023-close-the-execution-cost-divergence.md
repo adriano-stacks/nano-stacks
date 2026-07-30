@@ -45,7 +45,10 @@ about when a block is full and when a tenure must be extended.
 - [x] Charge a fold over a native word the application it inlines, and the
       function-argument lookup `map` and `filter` skip. `charges_a_native_fold`
       is un-ignored and covers all three forms.
-- [ ] Find what remains of the 65.
+- [x] Charge an aborted expression for what it did, not for the enclosing work
+      it never reached. One of the nine divergences was this.
+- [ ] Find what remains of the 65, which needs a crosscheck against real
+      `.pox-5` state rather than a snippet.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -171,47 +174,63 @@ to.
 All exact now, on one to forty elements, over natives and user functions alike.
 Eight recorded word-cost snapshots moved with it and were re-recorded.
 
-### What the 65 is not
+### An aborted expression paid for work it never did — fixed
 
-Enumerating every cost divergence across the 340 blocks gives nine, all
-runtime-only, all nano **over**, and all in one contract:
+A word the interpreter treats as a **native function** is charged through
+`dispatch_args`, once its arguments have been evaluated. nano charged several
+of them before. While everything succeeds that is invisible — the same charges
+land, in a different order — and the moment an operand aborts it overcharges,
+because the enclosing work was paid for and never done.
 
-| blocks | function | over by |
-|---|---|---|
-| 76, 134, 177, 237, 339 | `.pox-5 stake-update` | 65 |
-| 77, 79 | `.pox-5 stake-update` | 65 |
-| 146 | `.pox-5 stake-update` | 31 |
-| 179 | `.pox-5 stake` | 32 |
+It compounds with nesting:
 
-That the same function is out by 65 on one path and 31 on another says it is
-charged per *something* the path varies, not once a call.
+| enclosing operations | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| over by | 31 | 62 | 93 | 124 |
 
-`stake-update` takes two trait arguments and `stake` one, which fit 65 and 32
-well enough to be worth testing. They are not the cause: `contract-of`,
-`stx-account`, `merge` and `print` all crosscheck exactly, and so do trait,
-`uint` and `principal` arguments.
+`ok`, `err`, `some` and `begin` now charge after their operands, and the
+variadic dispatcher evaluates every argument before charging rather than
+folding pairwise as it goes. Special forms such as `map` and `if` genuinely do
+charge first, which is why this is per word and not a rule about all of them.
 
-A probe suggesting otherwise was wrong — it called functions with fewer
-arguments than they declare, and `cost_crosscheck`'s argument list has to match
-the signature or both engines are measured doing something other than the work.
-Worth remembering: a divergence that scales with parameter count is the shape
-that artefact produces.
+This is consensus-visible — stacks-core records the lower cost — and it shows
+on real chain data. Block 146 is a `.pox-5 stake-update` that aborts with
+`(err u47)` and was over by exactly 31. It now matches, and the capture's cost
+divergences go from **nine to eight**.
 
-Nor is it dispatch. A `contract-call?` through a trait crosschecks exactly, at
-one trait argument and at two, as does a static one.
+Finding it needed a wrong turn first: a probe showed arithmetic on a
+`burn-block-height` argument diverging, which was the snippet underflowing,
+because `burn-block-height` is zero in the test environment. The divergence was
+real but it was the *abort* it caused, not the arithmetic. Two of the three
+false leads this task has produced were snippets that measured the engines
+doing something other than the work.
 
-Nor is it any single word `stake-update` uses. Sweeping them against the
-interpreter — `map-set` over a scalar and over a tuple, `map-insert`,
-`map-delete`, `var-set`, `var-get`, `get`, nested `get`, `default-to`, tuple
-construction, `let`, `begin`, `match`, `is-some`, `to-uint`, `unwrap!` — every
-one is exact.
+### What the remaining 65 is not
 
-So the remaining 65 is not a word, not an argument and not dispatch. What is
-left is the shape of the whole call: state a fresh environment does not have,
-values the size the real maps hold, or the transaction entry path itself rather
-than the function body. Reducing against a real `.pox-5` state, rather than a
-synthesised snippet, is what the next attempt needs — which is the one thing
-the crosscheck harness cannot set up today.
+The eight that remain are all **successful** transactions: seven `.pox-5
+stake-update` over by 65 and one `.pox-5 stake` over by 32.
+
+Trait arguments fitted those numbers and are not the cause. A probe saying
+otherwise had called the functions with fewer arguments than they declare; with
+the signature matched, traits, `uint` and `principal` arguments all crosscheck
+exactly, as do `contract-of`, `stx-account`, `merge` and `print`.
+
+Nor is it dispatch: a `contract-call?` through a trait crosschecks exactly, at
+one trait argument and at two, as does a static one. Nor read-only calls,
+nested or otherwise, nor the block-height keywords.
+
+Nor is it any single word `stake-update` uses: `map-set` over a scalar and a
+tuple, `map-insert`, `map-delete`, `var-set`, `var-get`, `get`, nested `get`,
+`default-to`, tuple construction, `let`, `begin`, `match`, `is-some`,
+`to-uint`, `unwrap!` — every one exact.
+
+Nano adds nothing outside the VM either: the transaction's cost tracker starts
+at zero, so the 65 is inside the compiler.
+
+What is left is the shape of the whole call: state a fresh environment does not
+have, or values the size the real maps hold. Reducing against a real `.pox-5`
+state, rather than a synthesised snippet, is what the next attempt needs — and
+it is the one thing the crosscheck harness cannot set up today.
 
 ## Hacknet
 
