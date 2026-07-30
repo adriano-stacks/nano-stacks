@@ -118,11 +118,18 @@ def scheduled_payment(coinbase_height):
     ).fetchone()
 
 
-# A tenure's fees are recorded in the *next* tenure's schedule, and the first
-# reward nano derives on its own still pays the tenures either side of the
-# checkpoint, so their earnings travel with it.
+# Every tenure whose reward has not matured yet has to travel with the
+# checkpoint: for the next MATURITY tenures the node pays out tenures it never
+# executed, and it has no other way to know what they earned. Stopping at the
+# first of them strands the node once it runs that far, which on Hacknet
+# appeared as a stalled chain a hundred tenures after the checkpoint.
+#
+# A tenure's fees are recorded in the *next* tenure's schedule, and the payout
+# also credits the tenure before the one maturing, so the window starts one
+# below it.
 tenures = []
-for coinbase_height in range(last_height - MATURITY - 1, last_height - MATURITY + 1):
+checkpoint_tenure = last_height - MATURITY
+for coinbase_height in range(checkpoint_tenure - MATURITY - 1, checkpoint_tenure + 1):
     earned = scheduled_payment(coinbase_height)
     following = scheduled_payment(coinbase_height + 1)
     if earned is None or following is None:
