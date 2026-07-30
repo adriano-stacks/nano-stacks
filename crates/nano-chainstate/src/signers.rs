@@ -61,7 +61,11 @@ pub fn update_signer_set(
     }
 
     let reward_slots = context.reward_phase_length * OUTPUTS_PER_COMMIT;
-    let (set, _) = SignerSet::from_reward_slots(stake_entries(vm, reward_cycle)?, reward_slots)
+    let stakers = stake_entries(vm, reward_cycle)?;
+    if stakers.is_empty() {
+        return Err(ChainStateError::NoSignerSet(reward_cycle));
+    }
+    let (set, _) = SignerSet::from_reward_slots(stakers, reward_slots)
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
     let principals = set
         .signers()

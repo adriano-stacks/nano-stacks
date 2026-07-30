@@ -606,6 +606,14 @@ pub enum ChainStateError {
         status: TransactionStatus,
     },
     UnsupportedPayload,
+    /// Nothing stacked for a reward cycle, so it has no signer set.
+    ///
+    /// Distinct from an invalid transaction: the chain is well-formed and the
+    /// block is honest, there is simply nobody to sign the cycle. It stays
+    /// fatal — a cycle no one signs cannot be extended into — but a node that
+    /// reports it as a consensus fault sends whoever reads the log looking in
+    /// the wrong place, which on Hacknet it did.
+    NoSignerSet(u64),
     StateRootMismatch {
         expected: TrieHash,
         actual: TrieHash,
@@ -623,6 +631,10 @@ impl std::fmt::Display for ChainStateError {
                 write!(formatter, "transaction failed: {status:?}")
             }
             Self::UnsupportedPayload => formatter.write_str("unsupported transaction payload"),
+            Self::NoSignerSet(cycle) => write!(
+                formatter,
+                "reward cycle {cycle} has no signer set: nothing stacked for it"
+            ),
             Self::StateRootMismatch { expected, actual } => write!(
                 formatter,
                 "state root mismatch: expected {expected}, got {actual}"
@@ -640,6 +652,7 @@ impl std::error::Error for ChainStateError {
             | Self::InvalidTransaction(_)
             | Self::TransactionFailure { .. }
             | Self::UnsupportedPayload
+            | Self::NoSignerSet(_)
             | Self::StateRootMismatch { .. } => None,
         }
     }

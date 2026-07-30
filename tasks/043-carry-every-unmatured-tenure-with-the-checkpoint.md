@@ -76,4 +76,5 @@ advancing the tenure failed: checkpoint execution failed:
 invalid transaction: signer set is empty
 ```
 
-which is [[044-derive-the-next-cycle-signer-set-from-a-checkpoint]].
+which is [[044-name-a-reward-cycle-nobody-stacked-for]] — and turned out to be
+the network running out of stacking, not nano.
