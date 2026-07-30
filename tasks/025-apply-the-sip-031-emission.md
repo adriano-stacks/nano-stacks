@@ -1,13 +1,14 @@
 ---
 id: "025"
 title: "Apply the SIP-031 emission"
-status: pending
+status: completed
 priority: high
 effort: small
 type: feature
 dependencies: []
 tags: ["mainnet", "chainstate", "consensus"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Apply the SIP-031 emission

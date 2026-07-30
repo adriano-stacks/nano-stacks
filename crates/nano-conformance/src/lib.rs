@@ -1715,6 +1715,130 @@ mod tests {
         }
     }
 
+    /// A tenure-start block inside the emission schedule moves real STX.
+    ///
+    /// The capture's own burn heights sit far below the schedule, which is why
+    /// replay stays green without the emission at all; executing one of its
+    /// tenure-start blocks against a Bitcoin height inside the schedule is what
+    /// shows the mint lands. The state root is not checked, because the height
+    /// is not the one the block committed to.
+    #[test]
+    fn a_tenure_start_block_mints_the_sip_031_emission() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let network = captured_network(&fixture);
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let block = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .find(nano_chainstate::starts_new_tenure)
+            .expect("a captured tenure-start block");
+
+        // The second testnet interval, so the amount is neither the first
+        // boundary nor zero.
+        let bitcoin_height = 71_525 + 360 * 2;
+        let expected = nano_chainstate::sip_031_emission(network, bitcoin_height);
+        assert!(expected > 0, "the chosen height must be inside the schedule");
+
+        let mut chainstate = ChainState::from_checkpoint(
+            network,
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+        let recipient = clarity::vm::types::PrincipalData::Contract(
+            clarity::vm::types::QualifiedContractIdentifier::parse(
+                &network.boot_contract_id("sip-031"),
+            )
+            .expect("the SIP-031 contract is a valid identifier"),
+        );
+        let before = chainstate
+            .account_balance(&recipient)
+            .expect("read the recipient's balance");
+
+        let mut context = *snapshots
+            .get(&block.header.consensus_hash.to_string())
+            .expect("Bitcoin context");
+        context.height = bitcoin_height;
+        let applied = chainstate
+            .execute_nakamoto_block_with_bitcoin_operations(
+                context,
+                bitcoin_operations
+                    .get(&block.header.consensus_hash.to_string())
+                    .expect("Bitcoin operations"),
+                Some(source),
+                &block,
+            )
+            .expect("execute block");
+
+        let after = chainstate
+            .account_balance(&recipient)
+            .expect("read the recipient's balance");
+        assert_eq!(after - before, expected, "the emission did not land");
+
+        // The mint is reported on the coinbase, which is where stacks-core
+        // attaches it and so where a receipt comparison looks for it.
+        let minted = applied.receipts.iter().any(|receipt| {
+            receipt.result.events.iter().any(|event| {
+                matches!(
+                    event,
+                    clarity::vm::events::StacksTransactionEvent::STXEvent(
+                        clarity::vm::events::STXEventType::STXMintEvent(data),
+                    ) if data.amount == expected && data.recipient == recipient
+                )
+            })
+        });
+        assert!(minted, "the coinbase receipt does not report the mint");
+    }
+
+    /// The emission a tenure-start block mints to `.sip-031`.
+    ///
+    /// stacks-core's release schedule is behind a `testing` feature that swaps
+    /// in an overridable table, so the intervals are compared against the static
+    /// ones the release build uses rather than through the accessor.
+    #[test]
+    fn sip_031_emission_matches_stacks_core() {
+        let reference = |network: Network, height: u64| -> u128 {
+            let intervals: &[stacks_common::types::SIP031EmissionInterval] = if network.is_mainnet()
+            {
+                &*stacks_common::types::SIP031_EMISSION_INTERVALS_MAINNET
+            } else {
+                &*stacks_common::types::SIP031_EMISSION_INTERVALS_TESTNET
+            };
+            intervals
+                .iter()
+                .find(|interval| height >= interval.start_height)
+                .map_or(0, |interval| interval.amount)
+        };
+
+        for network in [Network::MAINNET, Network::TESTNET] {
+            // Every interval boundary, the height either side of it, and the
+            // range below the schedule where nothing is minted at all.
+            let boundaries = if network.is_mainnet() {
+                vec![907_740, 960_300, 1_012_860, 1_065_420, 1_117_980, 1_170_540]
+            } else {
+                (1..=6).map(|step| 71_525 + 360 * step).collect()
+            };
+            let mut heights = vec![0, 1, 100_000];
+            for boundary in boundaries {
+                heights.extend([boundary - 1, boundary, boundary + 1]);
+            }
+            heights.push(u64::from(u32::MAX));
+            for height in heights {
+                assert_eq!(
+                    nano_chainstate::sip_031_emission(network, height),
+                    reference(network, height),
+                    "SIP-031 emission diverges at Bitcoin height {height}"
+                );
+            }
+        }
+    }
+
     /// A peer's reported chain identifier is what decides the network, and only
     /// the mainnet identifier means mainnet.
     #[test]

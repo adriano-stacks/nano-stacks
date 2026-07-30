@@ -12,6 +12,7 @@ use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::Value;
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::{ClarityEvalError, VmExecutionError};
+use clarity::vm::events::{STXEventType, STXMintEventData, StacksTransactionEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use clarity::vm::contexts::{AssetMap, AssetMapEntry};
@@ -183,6 +184,45 @@ impl CoinbaseSchedule {
         }
         accumulated
     }
+}
+
+/// SIP-031 emissions in uSTX, by the Bitcoin height each interval starts at.
+///
+/// Testnet runs the schedule from 71,525 at one interval every 360 burn blocks
+/// (`stacks-common/src/types/mod.rs`, `SIP031_EMISSION_INTERVALS_*`).
+const TESTNET_SIP_031_EMISSIONS: [(u64, u128); 6] = [
+    (71_525 + 360, 1_000),
+    (71_525 + 360 * 2, 2_000),
+    (71_525 + 360 * 3, 3_000),
+    (71_525 + 360 * 4, 4_000),
+    (71_525 + 360 * 5, 5_000),
+    (71_525 + 360 * 6, 0),
+];
+const MAINNET_SIP_031_EMISSIONS: [(u64, u128); 6] = [
+    (907_740, 475_000_000),
+    (960_300, 1_140_000_000),
+    (1_012_860, 1_705_000_000),
+    (1_065_420, 1_305_000_000),
+    (1_117_980, 1_155_000_000),
+    (1_170_540, 0),
+];
+
+/// The SIP-031 emission a tenure starting at this Bitcoin height mints.
+///
+/// Unlike the coinbase, the schedule is keyed on the absolute Bitcoin height
+/// rather than an offset from the chain's first burn block.
+#[must_use]
+pub fn sip_031_emission(network: Network, bitcoin_height: u64) -> u128 {
+    let intervals: &[(u64, u128)] = if network.is_mainnet() {
+        &MAINNET_SIP_031_EMISSIONS
+    } else {
+        &TESTNET_SIP_031_EMISSIONS
+    };
+    intervals
+        .iter()
+        .rev()
+        .find(|(start, _)| bitcoin_height >= *start)
+        .map_or(0, |(_, amount)| *amount)
 }
 
 /// Checkpointed native accounting required to finalize future tenure-start blocks.
@@ -553,6 +593,14 @@ impl ChainState {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.vm.network()
+    }
+
+    /// Read an account's spendable STX at the state this chainstate reads from.
+    pub fn account_balance(
+        &mut self,
+        principal: &PrincipalData,
+    ) -> Result<u128, ChainStateError> {
+        Ok(self.vm.account_balance(principal)?)
     }
 
     /// Access the portable accounting ledger associated with this chainstate.
@@ -958,6 +1006,9 @@ impl ChainState {
                 .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
+            if block_starts_new_tenure(block) {
+                self.mint_sip_031(bitcoin_context.height, block, &mut receipts)?;
+            }
             match root {
                 RootPolicy::Mine(miner_key) => {
                     block.header.state_index_root =
@@ -989,6 +1040,48 @@ impl ChainState {
             drop(self.vm.abort_block());
         }
         result
+    }
+
+    /// Mint the SIP-031 emission a new tenure owes, to the `.sip-031` contract.
+    ///
+    /// The supply is raised before the recipient is credited, and the mint event
+    /// is reported on the coinbase, both because that is the order and the place
+    /// stacks-core uses (`chainstate/nakamoto/mod.rs`,
+    /// `sip_031_mint_and_transfer_on_new_tenure`) and a receipt or a write in the
+    /// wrong order is a divergence.
+    fn mint_sip_031(
+        &mut self,
+        bitcoin_height: u64,
+        block: &NakamotoBlock,
+        receipts: &mut [TransactionReceipt],
+    ) -> Result<(), ChainStateError> {
+        let network = self.vm.network();
+        let amount = sip_031_emission(network, bitcoin_height);
+        if amount == 0 {
+            return Ok(());
+        }
+        let recipient = PrincipalData::Contract(
+            QualifiedContractIdentifier::parse(&network.boot_contract_id("sip-031"))
+                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?,
+        );
+        self.vm.increment_liquid_stx_supply(amount)?;
+        self.vm.credit_stx(&recipient, amount)?;
+        let coinbase_txid = block
+            .transactions
+            .iter()
+            .find(|transaction| is_coinbase(transaction))
+            .map(Transaction::txid);
+        if let Some(coinbase) =
+            coinbase_txid.and_then(|txid| receipts.iter_mut().find(|receipt| receipt.txid == txid))
+        {
+            coinbase
+                .result
+                .events
+                .push(StacksTransactionEvent::STXEvent(
+                    STXEventType::STXMintEvent(STXMintEventData { recipient, amount }),
+                ));
+        }
+        Ok(())
     }
 
     fn execute_bitcoin_operations(
@@ -1522,6 +1615,17 @@ fn temporary_state_id() -> [u8; 32] {
     *sha512_256(&[1; 52]).as_bytes()
 }
 
+/// Whether a transaction is the block's coinbase, which carries the events a
+/// block produces outside any transaction.
+const fn is_coinbase(transaction: &Transaction) -> bool {
+    matches!(
+        transaction.payload().data(),
+        TransactionPayloadData::Coinbase { .. }
+            | TransactionPayloadData::CoinbaseToAltRecipient { .. }
+            | TransactionPayloadData::NakamotoCoinbase { .. }
+    )
+}
+
 fn increment_nonce(nonce: u64) -> Result<u64, ChainStateError> {
     nonce
         .checked_add(1)
@@ -1529,13 +1633,11 @@ fn increment_nonce(nonce: u64) -> Result<u64, ChainStateError> {
 }
 
 fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
-    matches!(
-        transaction.payload().data(),
-        TransactionPayloadData::Coinbase { .. }
-            | TransactionPayloadData::CoinbaseToAltRecipient { .. }
-            | TransactionPayloadData::NakamotoCoinbase { .. }
-            | TransactionPayloadData::TenureChange(_)
-    )
+    (is_coinbase(transaction)
+        || matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::TenureChange(_)
+        ))
     .then(|| TransactionReceipt {
         txid: transaction.txid(),
         status: TransactionStatus::Success,
@@ -2006,7 +2108,8 @@ mod tests {
         let (checkpoint, source, root, _) = captured_checkpoint();
         let block = captured_first_block();
         let mut chainstate =
-            ChainState::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("open checkpoint");
+            ChainState::from_checkpoint(Network::TESTNET, checkpoint, source, root)
+                .expect("open checkpoint");
         chainstate
             .vm
             .begin_block(Some(source), *block.block_id().as_bytes())
@@ -2064,7 +2167,10 @@ mod tests {
             accounting.effects_for_tenure(Network::TESTNET, 99),
             Ok(NativeBlockEffects::default())
         );
-        assert_eq!(accounting.effects_for_tenure(Network::TESTNET, 100), Ok(effects));
+        assert_eq!(
+            accounting.effects_for_tenure(Network::TESTNET, 100),
+            Ok(effects)
+        );
         assert_eq!(
             accounting.effects_for_tenure(Network::TESTNET, 101),
             Err(TenureAccountingError::UnknownTenure(1)),

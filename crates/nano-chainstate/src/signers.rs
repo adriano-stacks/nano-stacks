@@ -10,8 +10,8 @@ use clarity::vm::{
     types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData},
 };
 use nano_crypto::StacksPublicKey;
-use nano_primitives::hash160;
 use nano_primitives::Network;
+use nano_primitives::hash160;
 use nano_vm::{BitcoinBlockContext, Vm};
 
 use crate::{ChainStateError, SignerSet};

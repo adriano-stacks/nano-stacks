@@ -510,6 +510,15 @@ impl Vm {
         account_nonce_in_context(store, context, principal)
     }
 
+    /// Read an account's spendable STX.
+    pub fn account_balance(
+        &mut self,
+        principal: &PrincipalData,
+    ) -> Result<u128, VmExecutionError> {
+        let Self { store, context, .. } = self;
+        account_balance_in_context(store, context, principal)
+    }
+
     /// Debit a transaction fee from an account's available STX balance.
     pub fn debit_fee(&mut self, payer: &PrincipalData, fee: u64) -> Result<(), VmExecutionError> {
         let Self { store, context, .. } = self;
@@ -2061,6 +2070,29 @@ pub fn account_nonce(
     principal: &PrincipalData,
 ) -> Result<u64, VmExecutionError> {
     account_nonce_in_context(store, &NULL_BURN_STATE_DB, principal)
+}
+
+/// Read an account's spendable STX in an isolated database transaction.
+fn account_balance_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn BurnStateDB,
+    principal: &PrincipalData,
+) -> Result<u128, VmExecutionError> {
+    let network = store.network();
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        network.is_mainnet(),
+        network.chain_id(),
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        global
+            .database
+            .get_stx_balance_snapshot(principal)?
+            .get_available_balance()
+    })
 }
 
 fn account_nonce_in_context(
