@@ -394,16 +394,26 @@ impl CaptureConfig {
             .map(|block| format!("'{}'", block.index_block_hash))
             .collect::<Vec<_>>()
             .join(",");
-        let heights = sqlite(
+        // Every tenure the captured blocks *belong to*, not only the ones they
+        // start. A window that opens part way through a tenure still executes
+        // blocks of it, and each of those pays out the tenure a hundred back,
+        // so a tenure whose own start block fell outside the window still owes.
+        let span = sqlite(
             chainstate_db,
             &format!(
-                "SELECT DISTINCT coinbase_height FROM nakamoto_tenure_events \
-                 WHERE cause = 0 AND block_id IN ({block_ids}) ORDER BY coinbase_height"
+                "SELECT MIN(coinbase_height), MAX(coinbase_height) FROM nakamoto_tenure_events \
+                 WHERE block_id IN ({block_ids})"
             ),
         )?;
+        let (first, last) = span
+            .lines()
+            .next()
+            .and_then(|line| line.split_once('|'))
+            .ok_or_else(|| "the captured blocks belong to no tenure".to_owned())?;
         let mut effects = Vec::new();
-        for height in heights.lines().filter(|height| !height.is_empty()) {
-            let coinbase_height = parse_u64("coinbase height", height)?;
+        for coinbase_height in parse_u64("first coinbase height", first)?
+            ..=parse_u64("last coinbase height", last)?
+        {
             let Some(earned) = Self::scheduled_payment(
                 chainstate_db,
                 coinbase_height.saturating_sub(MINER_REWARD_MATURITY),

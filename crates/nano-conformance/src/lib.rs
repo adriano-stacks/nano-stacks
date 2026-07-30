@@ -792,6 +792,29 @@ pub fn captured_network(root: &Path) -> Network {
         .map_or(Network::TESTNET, Network::from_chain_id)
 }
 
+/// Open the captured checkpoint the way replay does, accounting included.
+///
+/// A window that opens part way through the chain owes rewards earned before
+/// it, so a chainstate without the capture's accounting fails the moment one
+/// of those tenures matures.
+#[cfg(test)]
+fn captured_chainstate(root: &Path) -> ChainState {
+    let (source, state_root) = checkpoint_state(root).expect("checkpoint metadata");
+    let mut chainstate = ChainState::from_checkpoint(
+        captured_network(root),
+        root.join("chainstate/checkpoint-H/marf.sqlite"),
+        source,
+        state_root,
+    )
+    .expect("open checkpoint");
+    let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
+        .ok()
+        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
+        .expect("captured native accounting");
+    *chainstate.accounting_mut() = accounting;
+    chainstate
+}
+
 /// The reward set the capture's cycle stacked, as a signer set.
 #[cfg(test)]
 fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
@@ -958,7 +981,8 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_signer_set, checkpoint_manifest, checkpoint_state, decode_hash, scoreboard,
+        captured_chainstate, captured_signer_set, checkpoint_manifest, checkpoint_state,
+        decode_hash, scoreboard,
         validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
@@ -1347,7 +1371,7 @@ mod tests {
     #[test]
     fn captured_first_block_state_matches_reference() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let path = captured_block_paths(&fixture)
             .into_iter()
             .next()
@@ -1362,13 +1386,7 @@ mod tests {
         .expect("import expected state");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
         let bitcoin_context = *snapshots
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
@@ -1414,7 +1432,7 @@ mod tests {
     #[test]
     fn candidate_block_derives_the_captured_state_root_before_finalizing_its_id() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let path = captured_block_paths(&fixture)
             .into_iter()
             .next()
@@ -1425,13 +1443,7 @@ mod tests {
         let bitcoin_context = *snapshots
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
         let miner = StacksPrivateKey::from_seed(b"candidate miner");
         let expected_root = block.header.state_index_root;
         let (candidate, applied) = chainstate
@@ -1461,7 +1473,7 @@ mod tests {
     #[test]
     fn signer_validator_executes_a_captured_proposal() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
@@ -1479,13 +1491,7 @@ mod tests {
         let second_context = *snapshots
             .get(&second.header.consensus_hash.to_string())
             .expect("second Bitcoin context");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
         let mut bitcoin = FixtureBitcoinSource {
             blocks: [
                 (first_context.height, &first.header.consensus_hash),
@@ -1598,16 +1604,10 @@ mod tests {
     #[test]
     fn captured_fourth_block_state_matches_reference() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
         let mut parent = Some(source);
         let mut bitcoin_view = String::new();
         let mut fourth = None;
@@ -2191,16 +2191,10 @@ mod tests {
     #[test]
     fn a_reorganization_retracts_the_tenures_it_invalidated() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
 
         let mut parent = Some(source);
         let mut blocks = Vec::new();
@@ -2284,16 +2278,10 @@ mod tests {
     #[test]
     fn clarity_reads_the_headers_of_executed_blocks() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
-        let mut chainstate = ChainState::from_checkpoint(
-            captured_network(&fixture),
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
 
         // Execute far enough in that the block being read is an ancestor of the
         // state the read runs against, which is what Clarity requires.
@@ -2519,7 +2507,7 @@ mod tests {
     fn a_tenure_start_block_mints_the_sip_031_emission() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let network = captured_network(&fixture);
-        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let block = captured_block_paths(&fixture)
@@ -2537,13 +2525,7 @@ mod tests {
         let expected = nano_chainstate::sip_031_emission(network, bitcoin_height);
         assert!(expected > 0, "the chosen height must be inside the schedule");
 
-        let mut chainstate = ChainState::from_checkpoint(
-            network,
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
-        )
-        .expect("open checkpoint");
+        let mut chainstate = captured_chainstate(&fixture);
         let recipient = clarity::vm::types::PrincipalData::Contract(
             clarity::vm::types::QualifiedContractIdentifier::parse(
                 &network.boot_contract_id("sip-031"),

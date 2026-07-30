@@ -133,9 +133,16 @@ Nakamoto and has no row in `nakamoto_tenure_events`, so `write_native_effects`
 skips it and the replay finds a hole. The old fixtures happen to start late
 enough that every maturing tenure is a Nakamoto one.
 
-The next capture needs `--first-height` chosen so that the earliest maturing
-tenure is at or after the first Nakamoto tenure — or `write_native_effects`
-taught to price a pre-Nakamoto tenure rather than skip it. The Hacknet that
-produced this one stalled at Stacks 809 before a later window was available.
+`write_native_effects` was writing effects only for the tenures a captured
+block *starts*, so a window opening part way through a tenure left a hole. It
+now writes every tenure the window touches, and the replay reaches 340/340.
+
+What is left is the tests, not the capture: eleven failed against the new
+fixtures, six of them fixed here by giving them the capture's accounting
+(`captured_chainstate`). The remaining four assume the window in the tree —
+`PreStx` pairings from before the first burn block, a `stacker_set` for every
+cycle spanned, and accounting on the two paths that take none. That is
+[[040-let-the-conformance-tests-take-any-capture]], and it is what stands
+between a recapture and a command.
 
 The fixtures in the tree are unchanged, and the tree is green at 600/600.
