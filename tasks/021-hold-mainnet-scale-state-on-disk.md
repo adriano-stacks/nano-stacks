@@ -1,7 +1,7 @@
 ---
 id: "021"
 title: "Hold mainnet-scale state on disk"
-status: pending
+status: in_progress
 priority: critical
 effort: large
 type: improvement
@@ -32,13 +32,14 @@ of gigabytes and grows every tenure.
 
 ## Tasks
 
-- [ ] Back MARF nodes and the Clarity side store with durable storage instead of
+- [x] Back MARF nodes and the Clarity side store with durable storage instead of
       `BTreeMap` and a copied `SQLite` connection.
-- [ ] Share unchanged subtries between versions rather than cloning per block.
-- [ ] Bound the read path so a lookup does not walk the chain linearly.
-- [ ] Persist sortition snapshots, tenure accounting and headers.
-- [ ] Import a checkpoint without holding its blobs in memory.
-- [ ] Recover the tip from disk on start, and replay only what is missing.
+- [x] Share unchanged subtries between versions rather than cloning per block.
+- [x] Bound the read path so a lookup does not walk the chain linearly.
+- [ ] Persist sortition snapshots, tenure accounting and headers. These live in
+      `nano-sortition` and `nano-chainstate`, which this change did not touch.
+- [x] Import a checkpoint without holding its blobs in memory.
+- [x] Recover the tip from disk on start, and replay only what is missing.
 
 ## Acceptance Criteria
 
@@ -47,3 +48,10 @@ of gigabytes and grows every tenure.
 - The fixture replay still reports depth 600/600.
 - Replaying from a checkpoint an order of magnitude larger than the Hacknet one
   completes within its own state's footprint.
+
+## Notes
+
+The durable path exists as `MarfStore::open`, `MarfStore::open_from_checkpoint`
+and their `Vm` equivalents. `ChainState` still constructs the in-memory variants,
+so the remaining wiring is a `ChainState::open_from_checkpoint` that forwards to
+`Vm::open_from_checkpoint`, plus a chainstate directory in the node's config.
