@@ -1,7 +1,7 @@
 ---
 id: "022"
 title: "Answer the Clarity headers database"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 type: feature
