@@ -1537,15 +1537,15 @@ mod word {
     });
     decl_tests!("get_data_var", "(define-data-var i int 0) \
                                  (var-get i)", {
-        1 => CostMeter { runtime: 34000, read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 591,  read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 199,  read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 18000, read_count: 1, read_length: 17, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 576,  read_count: 1, read_length: 18, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 184,  read_count: 1, read_length: 18, write_count: 0, write_length: 0 },
     });
     decl_tests!("set_data_var", "(define-data-var i int 0) \
                                  (var-set i 1)", {
         1 => CostMeter { runtime: 18000, read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
-        2 => CostMeter { runtime: 787,  read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
-        3 => CostMeter { runtime: 751,  read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
+        2 => CostMeter { runtime: 792,  read_count: 0, read_length: 0, write_count: 1, write_length: 18 },
+        3 => CostMeter { runtime: 756,  read_count: 0, read_length: 0, write_count: 1, write_length: 18 },
     });
     decl_tests!("default_to", "(default-to 0 none)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1646,57 +1646,57 @@ mod word {
                                         (map-set squares {x: 1} {y : 0})
                                         (map-delete squares { x: 1 })", {
         1 => CostMeter { runtime: 79000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
-        2 => CostMeter { runtime: 8083,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
-        3 => CostMeter { runtime: 9798,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        2 => CostMeter { runtime: 8087,  read_count: 2, read_length: 0, write_count: 2, write_length: 76 },
+        3 => CostMeter { runtime: 9802,  read_count: 2, read_length: 0, write_count: 2, write_length: 76 },
     });
     decl_tests!("map_delete_non_existing", "(define-map squares { x: int } { y: int }) \
                                             (map-set squares {x: 1} {y : 0})
                                             (map-delete squares { x: 0 })", {
         1 => CostMeter { runtime: 79000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
-        2 => CostMeter { runtime: 8079,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
-        3 => CostMeter { runtime: 9794,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
+        2 => CostMeter { runtime: 8083,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        3 => CostMeter { runtime: 9798,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
     });
     decl_tests!("map_get_non_existing", "(define-map squares { x: int } { y: int }) \
                                          (map-set squares {x: 1} {y : 0})
                                          (map-get? squares { x: 0 })", {
         1 => CostMeter { runtime: 102000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
-        2 => CostMeter { runtime: 7342,  read_count: 2, read_length: 25, write_count: 1, write_length: 49 },
-        3 => CostMeter { runtime: 8848,  read_count: 2, read_length: 25, write_count: 1, write_length: 49 },
+        2 => CostMeter { runtime: 7346,  read_count: 2, read_length: 25, write_count: 1, write_length: 50 },
+        3 => CostMeter { runtime: 8852,  read_count: 2, read_length: 25, write_count: 1, write_length: 50 },
     });
     decl_tests!("map_get_existing", "(define-map squares { x: int } { y: int }) \
                                      (map-set squares {x: 1} {y : 0})
                                      (map-get? squares { x : 1 } )", {
         1 => CostMeter { runtime: 102000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
-        2 => CostMeter { runtime: 7367,  read_count: 2, read_length: 50, write_count: 1, write_length: 49 },
-        3 => CostMeter { runtime: 8873,  read_count: 2, read_length: 50, write_count: 1, write_length: 49 },
+        2 => CostMeter { runtime: 7371,  read_count: 2, read_length: 50, write_count: 1, write_length: 50 },
+        3 => CostMeter { runtime: 8877,  read_count: 2, read_length: 50, write_count: 1, write_length: 50 },
     });
     decl_tests!("map_insert_existing", "(define-map squares { x: int } { y: int }) \
                                         (map-set squares {x: 1} {y : 0})
                                         (map-insert squares { x: 1 } { y: 1 })", {
         1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9196,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
-        3 => CostMeter { runtime: 11686,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
+        2 => CostMeter { runtime: 9200,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        3 => CostMeter { runtime: 11690,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
     });
     decl_tests!("map_insert_non_existing", "(define-map squares { x: int } { y: int }) \
                                             (map-set squares {x: 1} {y : 0})
                                             (map-insert squares { x: 0 } { y: 1 })", {
         1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9292,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11782,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        2 => CostMeter { runtime: 9296,  read_count: 2, read_length: 0, write_count: 2, write_length: 99 },
+        3 => CostMeter { runtime: 11786,  read_count: 2, read_length: 0, write_count: 2, write_length: 99 },
     });
     decl_tests!("map_set_existing", "(define-map squares { x: int } { y: int }) \
                                      (map-set squares {x: 1} {y : 0})
                                      (map-set squares { x: 1 } { y: 1 })", {
         1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9292,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11782,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        2 => CostMeter { runtime: 9300,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
+        3 => CostMeter { runtime: 11790,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
     });
     decl_tests!("map_set_non_existing", "(define-map squares { x: int } { y: int }) \
                                          (map-set squares {x: 1} {y : 0})
                                          (map-set squares { x: 0 } { y: 1 })", {
         1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9292,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11782,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        2 => CostMeter { runtime: 9300,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
+        3 => CostMeter { runtime: 11790,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
     });
     decl_tests!("is_none", "(is-none none)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1964,6 +1964,18 @@ mod crosscheck {
         for snippet in [
             "(define-public (f) (ok (let ((a { x: u1, y: u2 })) (get x a))))",
             "(define-private (g (a { x: uint })) (get x a)) (define-public (f) (ok (g { x: u1 })))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_what_a_data_word_serializes_to() {
+        for snippet in [
+            "(define-data-var v uint u0) (define-public (f) (ok (var-get v)))",
+            "(define-data-var v uint u0) (define-public (f) (ok (var-set v u7)))",
+            "(define-data-var v (buff 100) 0x00) (define-public (f) (begin (var-set v 0x0102030405) (ok (var-get v))))",
+            "(define-map m uint { a: uint, b: principal }) (define-public (f) (begin (map-set m u1 { a: u2, b: tx-sender }) (ok (map-get? m u1))))",
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }

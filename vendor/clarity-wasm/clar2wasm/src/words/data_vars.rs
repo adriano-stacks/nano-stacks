@@ -1,3 +1,4 @@
+use clarity::types::StacksEpochId;
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ValType;
@@ -135,6 +136,17 @@ impl ComplexWord for SetDataVar {
 
         generator.traverse_expr(builder, value)?;
 
+        // From epoch 2.05 the interpreter charges what the value serializes to,
+        // which is only known once the value itself is.
+        let serialized = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+            generator.serialization_size(builder, &ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            Some(serialized)
+        } else {
+            None
+        };
+
         // Get the offset and length for this identifier in the literal memory
         let id_offset = *generator
             .literal_memory_offset
@@ -145,7 +157,15 @@ impl ComplexWord for SetDataVar {
         // Create space on the call stack to write the value
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, false);
 
-        self.charge(generator, builder, size as u32)?;
+        match &serialized {
+            Some(serialized) => self.charge(generator, builder, **serialized)?,
+            None => self.charge(
+                generator,
+                builder,
+                ty.size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?,
+        }
 
         // Write the value to the memory, to be read by the host
         generator.write_to_memory(builder, offset, 0, &ty)?;
@@ -213,7 +233,14 @@ impl ComplexWord for GetDataVar {
             .clone();
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, true);
 
-        self.charge(generator, builder, size as u32)?;
+        if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
+            self.charge(
+                generator,
+                builder,
+                ty.size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?;
+        }
 
         // Push the identifier offset and length onto the data stack
         builder
@@ -237,6 +264,15 @@ impl ComplexWord for GetDataVar {
         // Host interface fills the result into the specified memory. Read it
         // back out, and place the value on the data stack.
         generator.read_from_memory(builder, offset, 0, &ty)?;
+
+        // From epoch 2.05 the interpreter charges what the stored value
+        // serializes to, which is only known once it has been read.
+        if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+            generator.serialization_size(builder, &ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            self.charge(generator, builder, *serialized)?;
+        }
 
         Ok(())
     }
