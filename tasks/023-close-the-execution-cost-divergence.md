@@ -197,6 +197,22 @@ the signature or both engines are measured doing something other than the work.
 Worth remembering: a divergence that scales with parameter count is the shape
 that artefact produces.
 
+Nor is it dispatch. A `contract-call?` through a trait crosschecks exactly, at
+one trait argument and at two, as does a static one.
+
+Nor is it any single word `stake-update` uses. Sweeping them against the
+interpreter — `map-set` over a scalar and over a tuple, `map-insert`,
+`map-delete`, `var-set`, `var-get`, `get`, nested `get`, `default-to`, tuple
+construction, `let`, `begin`, `match`, `is-some`, `to-uint`, `unwrap!` — every
+one is exact.
+
+So the remaining 65 is not a word, not an argument and not dispatch. What is
+left is the shape of the whole call: state a fresh environment does not have,
+values the size the real maps hold, or the transaction entry path itself rather
+than the function body. Reducing against a real `.pox-5` state, rather than a
+synthesised snippet, is what the next attempt needs — which is the one thing
+the crosscheck harness cannot set up today.
+
 ## Hacknet
 
 **Validated.** With all seventeen charging fixes in, `harness.sh verify`
