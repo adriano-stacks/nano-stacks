@@ -33,6 +33,7 @@ clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "ef
 libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 proptest = "1.11.0"
+tempfile = "3.27.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
 

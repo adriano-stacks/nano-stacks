@@ -1892,6 +1892,79 @@ mod tests {
         }
     }
 
+    /// A chainstate reopened from disk is the same chainstate.
+    ///
+    /// This is the route a node takes across a restart, so it has to reach the
+    /// same state roots as one that never closed — otherwise a restart is a
+    /// silent fork.
+    #[test]
+    fn a_chainstate_reopened_between_blocks_matches_one_that_never_closed() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let network = captured_network(&fixture);
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let blocks = captured_block_paths(&fixture)
+            .into_iter()
+            .take(3)
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .collect::<Vec<_>>();
+
+        let apply = |chainstate: &mut ChainState, block: &NanoNakamotoBlock, parent| {
+            let view = block.header.consensus_hash.to_string();
+            chainstate
+                .append_nakamoto_block_with_bitcoin_operations(
+                    *snapshots.get(&view).expect("Bitcoin context"),
+                    operations.get(&view).expect("Bitcoin operations"),
+                    parent,
+                    block,
+                )
+                .expect("execute block")
+        };
+
+        // One chainstate that stays open for all three blocks.
+        let mut open = ChainState::from_checkpoint(network, &checkpoint, source, root)
+            .expect("open checkpoint");
+        let mut parent = Some(source);
+        let continuous = blocks
+            .iter()
+            .map(|block| {
+                let applied = apply(&mut open, block, parent);
+                parent = Some(*block.block_id().as_bytes());
+                applied.execution.state_root
+            })
+            .collect::<Vec<_>>();
+
+        // The same three blocks, closing and reopening the directory each time.
+        let directory = tempfile::tempdir().expect("chainstate directory");
+        let mut parent = Some(source);
+        let reopened = blocks
+            .iter()
+            .map(|block| {
+                let mut chainstate = ChainState::open_from_checkpoint(
+                    network,
+                    directory.path(),
+                    &checkpoint,
+                    source,
+                    root,
+                )
+                .expect("reopen chainstate");
+                let applied = apply(&mut chainstate, block, parent);
+                parent = Some(*block.block_id().as_bytes());
+                applied.execution.state_root
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reopened, continuous,
+            "reopening the chainstate between blocks changed the state it produced"
+        );
+    }
+
     /// Fork choice weighs signatures before it compares lengths.
     ///
     /// Following one peer means following whatever it says. A pool has to pick,

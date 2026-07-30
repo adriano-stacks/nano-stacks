@@ -1,13 +1,14 @@
 ---
 id: "029"
 title: "Serve the rest of the node RPC and the event dispatcher"
-status: in-progress
+status: completed
 priority: high
 effort: large
 type: feature
 dependencies: ["028"]
 tags: ["mainnet", "rpc"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Serve the rest of the node RPC and the event dispatcher

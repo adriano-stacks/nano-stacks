@@ -641,6 +641,26 @@ impl ChainState {
         })
     }
 
+    /// Open chainstate that keeps its state in `directory`, importing the
+    /// checkpoint only the first time.
+    ///
+    /// This is the route a node takes: a restart resumes from the tip on disk
+    /// instead of re-importing and replaying everything since.
+    pub fn open_from_checkpoint(
+        network: Network,
+        directory: impl AsRef<Path>,
+        checkpoint: impl AsRef<Path>,
+        source: [u8; 32],
+        expected_root: TrieHash,
+    ) -> Result<Self, ChainStateError> {
+        Ok(Self {
+            vm: Vm::open_from_checkpoint(network, directory, checkpoint, source, expected_root)?,
+            accounting: TenureAccounting::default(),
+            tenure_start_heights: BTreeMap::new(),
+            executed: Vec::new(),
+        })
+    }
+
     /// The chain this state belongs to.
     #[must_use]
     pub const fn network(&self) -> Network {

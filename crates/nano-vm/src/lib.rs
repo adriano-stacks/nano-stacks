@@ -1499,10 +1499,10 @@ impl ClarityBackingStore for MarfStore {
             .current_block()
             .and_then(|block| self.block_at_height(block, height))
             .ok_or_else(|| RuntimeError::BadBlockHeight(height.to_string()))?;
-        if self.active.is_some_and(|active| active.block == block) {
-            if let Some(value) = self.pending_metadata(contract, key) {
-                return Ok(Some(value));
-            }
+        if self.active.is_some_and(|active| active.block == block)
+            && let Some(value) = self.pending_metadata(contract, key)
+        {
+            return Ok(Some(value));
         }
         self.metadata_from_side_store(block, contract, key)
     }

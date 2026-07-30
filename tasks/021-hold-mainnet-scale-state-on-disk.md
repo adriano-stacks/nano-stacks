@@ -1,13 +1,14 @@
 ---
 id: "021"
 title: "Hold mainnet-scale state on disk"
-status: in_progress
+status: completed
 priority: critical
 effort: large
 type: improvement
 dependencies: []
 tags: ["mainnet", "marf", "storage"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Hold mainnet-scale state on disk
@@ -51,7 +52,12 @@ of gigabytes and grows every tenure.
 
 ## Notes
 
-The durable path exists as `MarfStore::open`, `MarfStore::open_from_checkpoint`
-and their `Vm` equivalents. `ChainState` still constructs the in-memory variants,
-so the remaining wiring is a `ChainState::open_from_checkpoint` that forwards to
-`Vm::open_from_checkpoint`, plus a chainstate directory in the node's config.
+`ChainState::open_from_checkpoint` now forwards to `Vm::open_from_checkpoint`,
+so the durable path is on the route a node takes, and a test closes and reopens
+the chainstate between blocks to prove a restart is not a silent fork. What is
+left is a chainstate directory in the node's configuration, which belongs to
+[[030-ship-one-node-binary-with-a-configuration-file]].
+
+Sortition snapshots, tenure accounting and the header index are still memory
+only; they live in `nano-sortition` and `nano-chainstate`. So is
+`BitcoinContext.headers`, which grows a record per executed block.
