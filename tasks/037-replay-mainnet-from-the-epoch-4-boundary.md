@@ -111,6 +111,24 @@ The capture will refuse for want of `--events-dir`, which is the next thing to
 fix and is deliberately left until the refusal is real rather than predicted —
 building for a guessed failure is how the `to-ascii?` detour started.
 
+## The unlock heights the capture needs
+
+Checked against stacks-core rather than transcribed, because a wrong one
+changes what execution sees:
+
+| flag | mainnet |
+|---|---|
+| `--pox-v1-unlock-height` | 781,552 |
+| `--pox-v2-unlock-height` | 787,652 |
+| `--pox-v3-unlock-height` | 840,361 |
+| `--pox-v4-unlock-height` | 960,230 |
+
+The first three are `POX_V{1,2,3}_MAINNET_EARLY_UNLOCK_HEIGHT`, each one past
+its epoch's burn height. The fourth is pox-5's activation, which
+`validate_epochs` ties to the epoch 4.0 boundary and which
+`api.mainnet.hiro.so/v2/pox` reports as the same 960,230.
+`mainnet_unlock_heights_match_stacks_core` pins all four.
+
 ## What the archive still cannot give
 
 **Receipts.** `events/new_block/*.json` come from an event observer attached to

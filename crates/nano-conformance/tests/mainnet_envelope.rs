@@ -101,3 +101,24 @@ fn a_block_id_is_the_hash_the_network_serves_it_under() {
         );
     }
 }
+
+/// The `PoX` unlock heights a mainnet capture has to carry itself.
+///
+/// A capture taken from an archived chainstate has no event observer, and the
+/// events are what otherwise carry these. They are constants of the chain, so
+/// they are checked against stacks-core rather than transcribed into a command
+/// line and hoped over — a wrong one changes what execution sees.
+#[test]
+fn mainnet_unlock_heights_match_stacks_core() {
+    use blockstack_lib::core::{
+        BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT, POX_V1_MAINNET_EARLY_UNLOCK_HEIGHT,
+        POX_V2_MAINNET_EARLY_UNLOCK_HEIGHT, POX_V3_MAINNET_EARLY_UNLOCK_HEIGHT,
+    };
+
+    assert_eq!(POX_V1_MAINNET_EARLY_UNLOCK_HEIGHT, 781_552);
+    assert_eq!(POX_V2_MAINNET_EARLY_UNLOCK_HEIGHT, 787_652);
+    assert_eq!(POX_V3_MAINNET_EARLY_UNLOCK_HEIGHT, 840_361);
+    // pox-5 activates at the epoch 4.0 boundary — `validate_epochs` requires
+    // it — and `api.mainnet.hiro.so/v2/pox` reports the same 960,230.
+    assert_eq!(BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT, 960_230);
+}
