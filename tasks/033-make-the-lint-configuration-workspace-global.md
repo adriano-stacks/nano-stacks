@@ -26,12 +26,25 @@ The review also asks whether the lint set is strict enough to be worth having.
 ## Tasks
 
 - [ ] Drop the per-file `#![forbid(unsafe_code)]` in favour of the workspace lint.
-- [ ] Review the allowed pedantic and nursery lints and justify each one that
+- [x] Review the allowed pedantic and nursery lints and justify each one that
       stays.
-- [ ] Confirm every crate opts into `[lints] workspace = true`.
+- [x] Confirm every crate opts into `[lints] workspace = true`.
 
 ## Acceptance Criteria
 
 - No source file states a lint the workspace already states.
 - `cargo clippy --workspace --all-targets` is clean.
 - Each `allow` in the workspace lint table has a reason next to it.
+
+## Audit result
+
+Every crate opts in, so the workspace `unsafe_code = "forbid"` covers the whole
+tree and the per-file attributes are duplication.
+
+Of the three allowed lints, `module_name_repetitions` fired nowhere at all and
+is gone. `missing_errors_doc` and `missing_panics_doc` fire on nine items
+between them and stay, with the reason written next to them.
+
+Dropping the twenty-odd `#![forbid(unsafe_code)]` lines is deliberately held
+back: it rewrites the first line of nearly every source file, and three agents
+are editing those files. It lands as one sweep once their branches are merged.

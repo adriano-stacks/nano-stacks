@@ -35,7 +35,9 @@ unused_must_use = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-module_name_repetitions = "allow"
+# Every fallible function here returns a domain error whose variants say more
+# than a prose section would, and the panics are `expect`s on invariants the
+# surrounding code has just established. Documenting either would be noise.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
