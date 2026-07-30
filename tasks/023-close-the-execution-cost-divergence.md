@@ -48,8 +48,10 @@ about when a block is full and when a tenure must be extended.
 - [x] Charge an aborted expression for what it did, not for the enclosing work
       it never reached. One of the nine divergences was this.
 - [x] Charge `print` for the value rather than for its type's name.
-- [ ] Find what remains, which needs a crosscheck against real `.pox-5` state
-      rather than a snippet.
+- [x] Crosscheck against the real `.pox-5` rather than a snippet — it deploys
+      into the harness, and found the constants.
+- [ ] Find what remains of the 66, which needs the *state* the diverging call
+      runs against, not just the contract.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -221,6 +223,28 @@ It moves the first divergence from 65 to **66**, because nano was under here
 and is over elsewhere. Both are right and the net is not the measure of either
 — the same thing happened when the fold lookup went in.
 
+### Crosschecking against the real `.pox-5` — and what it found
+
+The harness *can* take the real contract after all. `.pox-5` deploys into it
+with the sBTC literal substituted the way `make_pox_5_body` substitutes it
+off-mainnet, a stub token and a signer-manager beside it — 3,851 lines, both
+engines, no chainstate.
+
+Every read-only function was out by the same **1,032**, whichever one was
+called, which is the shape of a fixed charge rather than of any function body.
+It was the contract load: `save_constant` inserted a constant's value and left
+`data_size` alone, so every constant a contract defines was free to load. The
+deficit is exactly the value's size — a bool 1, a uint 16, a response 17 — and
+`.pox-5` defines around sixty.
+
+A `contract-call?` pays `LoadContract` for the contract's size, so **every call
+into a contract nano deployed was charged less than stacks-core charges**. Its
+read-only functions now crosscheck exactly.
+
+It does not move this capture, whose `.pox-5` was deployed by stacks-core and
+carries its size — which is also why replaying someone else's chain never
+showed it.
+
 ### What the remaining 66 is not
 
 The eight that remain are all **successful** transactions: seven `.pox-5
@@ -248,10 +272,11 @@ whose declared types are far larger than what they hold.
 Nano adds nothing outside the VM either: the transaction's cost tracker starts
 at zero, so what remains is inside the compiler.
 
-What is left is the shape of the whole call: state a fresh environment does not
-have, or values the size the real maps hold. Reducing against a real `.pox-5`
-state, rather than a synthesised snippet, is what the next attempt needs — and
-it is the one thing the crosscheck harness cannot set up today.
+What is left is the state the call runs against. The contract is no longer the
+unknown — it crosschecks exactly on a fresh store — so what differs must be the
+maps `stake-update` reads and writes on a chain that has been running, and the
+sizes of what they hold. Seeding that state, rather than the contract, is the
+next step.
 
 ## Hacknet
 
