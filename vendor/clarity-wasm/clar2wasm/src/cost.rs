@@ -2132,23 +2132,17 @@ mod crosscheck {
         }
     }
 
-    /// A `fold` inside a function costs 33 more than the same `fold` inlined.
+    /// `slice?` reads its positions where they are, as `element-at?` does.
     ///
-    /// This is `.pox-5 remove-staker-from-cycles` reduced: it folds over a
-    /// slice of a ninety-six element list into a response-of-tuple
-    /// accumulator, and `stake-update` is over by exactly this. Calling it
-    /// with no cycles to walk is enough — the fold body never runs — so it is
-    /// the fold's setup or its result crossing the function boundary, not the
-    /// iteration.
+    /// This is `.pox-5 remove-staker-from-cycles` reduced: it slices a
+    /// ninety-six element list by a *bound* count and folds over the result.
+    /// nano charged a copy of that count out of its binding — 33 for a uint —
+    /// where the interpreter reads it in place, so the same fold cost 33 more
+    /// inside a function, which passes the count, than inlined with a literal.
     ///
-    /// Inlining the same expression into the caller is exact, and a function
-    /// returning the same accumulator type without a fold is exact, so it is
-    /// the combination. 33 is a uint's copy cost, `2n + 1`, which is the
-    /// signature the earlier copy bugs had.
-    ///
-    /// Ignored because it fails: it is the reproduction, not a guard.
+    /// `element-at?` beside it was already exact, which is what showed the
+    /// charge was `slice?`'s rather than the fold's.
     #[test]
-    #[ignore = "known divergence: a fold inside a function is charged 33 too much"]
     fn charges_a_wrapped_fold_like_an_inlined_one() {
         let accumulator = "{staker: principal, first-reward-cycle: uint, is-stx-staking: bool}";
         let initial = "{staker: tx-sender, first-reward-cycle: u1, is-stx-staking: true}";

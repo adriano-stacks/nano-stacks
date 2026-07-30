@@ -1660,8 +1660,11 @@ impl ComplexWord for Slice {
         let length_local = generator.module.locals.add(ValType::I64);
         builder.local_tee(length_local);
 
-        // Traverse the left position, leaving it on the stack.
-        generator.traverse_expr(builder, args.get_expr(1)?)?;
+        // Traverse the left position, leaving it on the stack. The
+        // interpreter reads the positions where they are rather than copying
+        // them out of their bindings, so a bound one must not be charged a
+        // copy — `element-at?` next door already reads its index that way.
+        generator.traverse_expr_without_value_copy_charge(builder, args.get_expr(1)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
@@ -1765,7 +1768,7 @@ impl ComplexWord for Slice {
         builder.local_get(length_local);
 
         // Traverse the right position, leaving it on the stack.
-        generator.traverse_expr(builder, args.get_expr(2)?)?;
+        generator.traverse_expr_without_value_copy_charge(builder, args.get_expr(2)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
