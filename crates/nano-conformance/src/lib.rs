@@ -969,7 +969,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    #[derive(Deserialize)]
+    #[derive(Clone, Deserialize)]
     struct CapturedSortitionSnapshot {
         block_height: u64,
         burn_header_hash: String,
@@ -2592,39 +2592,134 @@ mod tests {
     #[test]
     fn captured_sortition_snapshots_match_the_reference_bitcoin_chain() {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let snapshots = captured_sortition_snapshots(&fixture_root);
+        let (genesis, rest) = snapshots.split_first().expect("captured genesis snapshot");
+        let mut replay = CapturedReplay::new(&fixture_root, genesis);
+
+        for snapshot in rest {
+            replay.append(snapshot);
+        }
+    }
+
+    #[test]
+    fn a_reorganized_bitcoin_branch_converges_on_the_captured_snapshots() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let snapshots = captured_sortition_snapshots(&fixture_root);
+        let (genesis, rest) = snapshots.split_first().expect("captured genesis snapshot");
+        let (replayed, discarded) = rest.split_at(200);
+        let mut replay = CapturedReplay::new(&fixture_root, genesis);
+        for snapshot in replayed {
+            replay.append(snapshot);
+        }
+
+        // Bitcoin hands the node three blocks, then replaces them with the
+        // branch the capture recorded.
+        let fork_height = replay.chain.tip().bitcoin_height;
+        let anchors = replay.pox.pox_id().bits().len();
+        for snapshot in discarded.iter().rev().take(3) {
+            replay.append_off_chain(snapshot);
+        }
+        assert!(
+            replay.pox.pox_id().bits().len() > anchors,
+            "the discarded branch has to start a reward cycle to exercise the rewind"
+        );
+        let canonical = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.block_height, hex_array(&snapshot.burn_header_hash)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            replay
+                .chain
+                .find_fork(|height| canonical.get(&height).copied().ok_or(height)),
+            Ok(nano_sortition::Fork::Above(fork_height))
+        );
+
+        let reorg = replay
+            .chain
+            .retract_above(fork_height)
+            .expect("retract the discarded branch");
+        assert_eq!(reorg.depth(), 3);
+        assert_eq!(reorg.resume_bitcoin_height(), fork_height + 1);
+        assert_eq!(
+            reorg.invalidated_consensus_hashes(),
+            reorg
+                .retracted
+                .iter()
+                .map(|snapshot| snapshot.consensus_hash)
+                .collect::<Vec<_>>()
+        );
+        replay
+            .pox
+            .retract_to(fork_height)
+            .expect("rewind the PoX history of the discarded branch");
+        assert_eq!(replay.pox.pox_id().bits().len(), anchors);
+        replay
+            .pre_stx
+            .invalidate_from(reorg.resume_bitcoin_height());
+
+        for snapshot in discarded {
+            replay.append(snapshot);
+        }
+        assert_eq!(
+            replay.chain.tip().bitcoin_height,
+            snapshots.last().expect("captured tip").block_height
+        );
+    }
+
+    fn captured_sortition_snapshots(fixture_root: &Path) -> Vec<CapturedSortitionSnapshot> {
         let path = fixture_root.join("sortition/snapshots.json");
         let snapshots: Vec<CapturedSortitionSnapshot> =
             serde_json::from_slice(&fs::read(&path).expect("read captured sortition snapshots"))
                 .expect("parse captured sortition snapshots");
-        let genesis = snapshots.first().expect("captured genesis snapshot");
-        assert_eq!(genesis.block_height, 0);
-        let mut chain =
-            nano_sortition::SnapshotChain::new(nano_sortition::SortitionSnapshot::genesis(
-                genesis.block_height,
-                nano_primitives::BitcoinHeaderHash::from_bytes(hex_array(
-                    &genesis.burn_header_hash,
-                )),
-            ));
         assert_eq!(
-            chain.tip().sortition_hash.as_bytes(),
-            &hex_array(&genesis.sortition_hash)
+            snapshots.first().map(|snapshot| snapshot.block_height),
+            Some(0)
         );
-        assert_eq!(
-            chain.tip().sortition_id.as_bytes(),
-            &hex_array(&genesis.sortition_id)
-        );
+        snapshots
+    }
 
-        let schedule = nano_sortition::RewardCycleSchedule::new(0, 20, Some(280))
-            .expect("captured reward-cycle schedule is valid");
-        let mut pox = nano_sortition::PoxIdTracker::new(schedule);
+    /// A replay of the captured Bitcoin chain into sortition snapshots.
+    struct CapturedReplay {
+        fixture_root: PathBuf,
+        chain: nano_sortition::SnapshotChain,
+        pox: nano_sortition::PoxIdTracker,
+        pre_stx: PreStxCache,
+    }
 
-        let mut pre_stx_cache = PreStxCache::new();
-        for snapshot in snapshots.iter().skip(1) {
+    impl CapturedReplay {
+        fn new(fixture_root: &Path, genesis: &CapturedSortitionSnapshot) -> Self {
+            let chain =
+                nano_sortition::SnapshotChain::new(nano_sortition::SortitionSnapshot::genesis(
+                    genesis.block_height,
+                    nano_primitives::BitcoinHeaderHash::from_bytes(hex_array(
+                        &genesis.burn_header_hash,
+                    )),
+                ));
             assert_eq!(
-                chain.tip().bitcoin_header_hash.as_bytes(),
+                chain.tip().sortition_hash.as_bytes(),
+                &hex_array(&genesis.sortition_hash)
+            );
+            assert_eq!(
+                chain.tip().sortition_id.as_bytes(),
+                &hex_array(&genesis.sortition_id)
+            );
+            let schedule = nano_sortition::RewardCycleSchedule::new(0, 20, Some(280))
+                .expect("captured reward-cycle schedule is valid");
+            Self {
+                fixture_root: fixture_root.to_path_buf(),
+                chain,
+                pox: nano_sortition::PoxIdTracker::new(schedule),
+                pre_stx: PreStxCache::new(),
+            }
+        }
+
+        /// Replay a captured Bitcoin block, against the snapshot it produced.
+        fn append(&mut self, snapshot: &CapturedSortitionSnapshot) {
+            assert_eq!(
+                self.chain.tip().bitcoin_header_hash.as_bytes(),
                 &hex_array(&snapshot.parent_burn_header_hash)
             );
-            let block = captured_bitcoin_block(&fixture_root, snapshot, &mut pre_stx_cache);
+            let block = captured_bitcoin_block(&self.fixture_root, snapshot, &mut self.pre_stx);
             let winner = (snapshot.sortition != 0).then(|| {
                 let winning_txid = hex_array(&snapshot.winning_block_txid);
                 block
@@ -2647,7 +2742,8 @@ mod tests {
                         )
                     })
             });
-            let pox_id = pox
+            let pox_id = self
+                .pox
                 .advance(snapshot.block_height, snapshot.pox_valid != 0)
                 .expect("captured Bitcoin heights are contiguous")
                 .clone();
@@ -2655,10 +2751,29 @@ mod tests {
                 .total_burn
                 .parse::<u64>()
                 .expect("captured total burn is a u64");
-            let derived = chain
+            let derived = self
+                .chain
                 .append_with_winner(&block, total_burn, pox_id, winner)
                 .expect("contiguous captured Bitcoin block");
             assert_captured_snapshot(derived, snapshot, total_burn);
+        }
+
+        /// Replay a captured Bitcoin block at the tip's next height, standing in
+        /// for a branch Bitcoin later replaces.
+        fn append_off_chain(&mut self, snapshot: &CapturedSortitionSnapshot) {
+            let height = self.chain.tip().bitcoin_height + 1;
+            let mut spliced = snapshot.clone();
+            spliced.block_height = height;
+            let block = captured_bitcoin_block(&self.fixture_root, &spliced, &mut self.pre_stx);
+            let pox_id = self
+                .pox
+                .advance(height, true)
+                .expect("spliced Bitcoin heights are contiguous")
+                .clone();
+            let total_burn = self.chain.tip().total_burn;
+            self.chain
+                .append(&block, total_burn, pox_id)
+                .expect("contiguous spliced Bitcoin block");
         }
     }
 
