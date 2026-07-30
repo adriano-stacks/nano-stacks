@@ -2,6 +2,7 @@
 
 mod chain;
 mod events;
+mod stackerdb;
 
 use std::{
     cell::RefCell,
@@ -26,6 +27,7 @@ use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use nano_address::StacksAddress;
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
+use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
 use nano_node::NodeView;
 use nano_primitives::Network;
@@ -40,6 +42,7 @@ pub use events::{
     RewardSetEvent, RewardSetSigner, mined_nakamoto_block_payload, new_block_payload,
     new_burn_block_payload, stackerdb_chunks_payload,
 };
+pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
 /// The validated node state exposed by the public HTTP API.
 #[derive(Clone)]
@@ -51,6 +54,8 @@ pub struct RpcState {
     mempool: Option<Arc<Mutex<Mempool>>>,
     /// The reward sets this node derived, keyed by cycle.
     stacker_sets: Arc<RwLock<BTreeMap<u64, Value>>>,
+    /// The `StackerDB` contracts this node replicates.
+    stackerdb: Arc<RwLock<StackerDbStore>>,
     /// Where an accepted block upload or proposal is handed to the node.
     blocks: Option<mpsc::UnboundedSender<NakamotoBlock>>,
     /// The `authorization` header `/v3/block_proposal` demands.
@@ -86,9 +91,17 @@ impl RpcState {
             chain: None,
             mempool: None,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
+            stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
             blocks: None,
             proposal_token: None,
         }
+    }
+
+    /// The `StackerDB` replicas this node serves, so the node can configure
+    /// their writers and read what a signer wrote.
+    #[must_use]
+    pub fn stackerdb(&self) -> Arc<RwLock<StackerDbStore>> {
+        self.stackerdb.clone()
     }
 
     /// Serve accounts and read-only calls from this executed Clarity state.
@@ -169,6 +182,22 @@ pub fn router(state: RpcState) -> Router {
             post(call_read_only),
         )
         .route("/v2/transactions", post(submit_transaction))
+        .route(
+            "/v2/stackerdb/{address}/{contract}",
+            get(stackerdb_metadata),
+        )
+        .route(
+            "/v2/stackerdb/{address}/{contract}/chunks",
+            post(stackerdb_chunk_upload),
+        )
+        .route(
+            "/v2/stackerdb/{address}/{contract}/{slot_id}",
+            get(stackerdb_chunk),
+        )
+        .route(
+            "/v2/stackerdb/{address}/{contract}/{slot_id}/{slot_version}",
+            get(stackerdb_chunk_at_version),
+        )
         .route("/v3/sortitions/consensus/{consensus_hash}", get(sortition))
         .route("/v3/stacker_set/{cycle}", get(stacker_set))
         .route("/v3/tenures/info", get(tenure_info))
@@ -450,6 +479,94 @@ impl ChainTip for ExecutedTip<'_> {
     }
 }
 
+async fn stackerdb_metadata(
+    State(state): State<RpcState>,
+    Path((address, contract)): Path<(String, String)>,
+) -> Result<axum::Json<Vec<SlotMetadataWire>>, RpcError> {
+    let metadata = state
+        .stackerdb
+        .read()
+        .await
+        .metadata(&format!("{address}.{contract}"))
+        .ok_or(RpcError::NotFound)?;
+    Ok(axum::Json(
+        metadata.iter().map(SlotMetadataWire::from).collect(),
+    ))
+}
+
+async fn stackerdb_chunk(
+    State(state): State<RpcState>,
+    Path((address, contract, slot_id)): Path<(String, String, u32)>,
+) -> Result<RawBlockStream, RpcError> {
+    chunk_response(&state, &format!("{address}.{contract}"), slot_id, None).await
+}
+
+async fn stackerdb_chunk_at_version(
+    State(state): State<RpcState>,
+    Path((address, contract, slot_id, slot_version)): Path<(String, String, u32, u32)>,
+) -> Result<RawBlockStream, RpcError> {
+    chunk_response(
+        &state,
+        &format!("{address}.{contract}"),
+        slot_id,
+        Some(slot_version),
+    )
+    .await
+}
+
+async fn chunk_response(
+    state: &RpcState,
+    contract_id: &str,
+    slot_id: u32,
+    slot_version: Option<u32>,
+) -> Result<RawBlockStream, RpcError> {
+    let chunk = state
+        .stackerdb
+        .read()
+        .await
+        .chunk(contract_id, slot_id, slot_version)
+        .map(<[u8]>::to_vec)
+        .ok_or(RpcError::NotFound)?;
+    Ok(RawBlockStream(chunk))
+}
+
+#[derive(Deserialize)]
+struct ChunkUploadWire {
+    slot_id: u32,
+    slot_version: u32,
+    sig: String,
+    data: String,
+}
+
+async fn stackerdb_chunk_upload(
+    State(state): State<RpcState>,
+    Path((address, contract)): Path<(String, String)>,
+    axum::Json(upload): axum::Json<ChunkUploadWire>,
+) -> Result<axum::Json<Value>, RpcError> {
+    let signature: [u8; 65] = hex::decode(upload.sig.trim_start_matches("0x"))
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| RpcError::BadRequest("invalid chunk signature".to_owned()))?;
+    let chunk = nano_stackerdb::Chunk {
+        slot_id: upload.slot_id,
+        slot_version: upload.slot_version,
+        signature: MessageSignature::from_bytes(signature),
+        data: hex::decode(upload.data.trim_start_matches("0x"))
+            .map_err(|error| RpcError::BadRequest(format!("invalid chunk data: {error}")))?,
+    };
+    let metadata = SlotMetadataWire::from(&chunk.metadata());
+    let contract_id = format!("{address}.{contract}");
+    let accepted = state.stackerdb.write().await.put(&contract_id, chunk);
+    Ok(axum::Json(match accepted {
+        Ok(()) => json!({ "accepted": true, "metadata": metadata }),
+        Err(refusal) => json!({
+            "accepted": false,
+            "reason": refusal.reason(),
+            "code": refusal.code(),
+        }),
+    }))
+}
+
 async fn upload_block(
     State(state): State<RpcState>,
     body: Bytes,
@@ -595,6 +712,25 @@ impl CallReadOnlyWire {
 }
 
 #[derive(Serialize)]
+struct SlotMetadataWire {
+    slot_id: u32,
+    slot_version: u32,
+    data_hash: String,
+    signature: String,
+}
+
+impl From<&nano_stackerdb::SlotMetadata> for SlotMetadataWire {
+    fn from(metadata: &nano_stackerdb::SlotMetadata) -> Self {
+        Self {
+            slot_id: metadata.slot_id,
+            slot_version: metadata.slot_version,
+            data_hash: metadata.data_hash.to_string(),
+            signature: hex::encode(metadata.signature.as_bytes()),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct BlockUploadWire {
     stacks_block_id: String,
     accepted: bool,
@@ -715,14 +851,18 @@ mod tests {
 
     use clarity::vm::{Value, types::PrincipalData};
     use nano_address::StacksAddress;
-    use nano_codec::{AnchorMode, Principal, Transaction, TransactionPayloadData, TransactionVersion};
+    use nano_codec::{
+        AnchorMode, Principal, Transaction, TransactionPayloadData, TransactionVersion,
+    };
     use nano_crypto::StacksPrivateKey;
     use nano_mempool::Mempool;
     use nano_primitives::Network;
     use serde_json::json;
     use tokio::sync::Mutex;
 
-    use super::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall, Router, RpcState, router};
+    use super::{
+        AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall, Router, RpcState, router,
+    };
 
     const NETWORK: Network = Network::TESTNET;
 
@@ -744,9 +884,9 @@ mod tests {
         }
 
         fn call_read_only(&mut self, call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
-            self.answer
-                .clone()
-                .ok_or_else(|| ChainAccessError::Failed(format!("no such function {}", call.function)))
+            self.answer.clone().ok_or_else(|| {
+                ChainAccessError::Failed(format!("no such function {}", call.function))
+            })
         }
     }
 
@@ -785,7 +925,10 @@ mod tests {
         serde_json::from_slice(&bytes).expect("decode body")
     }
 
-    fn chain(accounts: &[(StacksAddress, AccountEntry)], answer: Option<Value>) -> Arc<Mutex<dyn ChainAccess>> {
+    fn chain(
+        accounts: &[(StacksAddress, AccountEntry)],
+        answer: Option<Value>,
+    ) -> Arc<Mutex<dyn ChainAccess>> {
         Arc::new(Mutex::new(FixedChain {
             accounts: accounts
                 .iter()
@@ -945,6 +1088,74 @@ mod tests {
         assert_eq!(
             body_json(found).await,
             json!({ "stacker_set": { "signers": [] } })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signer_writes_a_chunk_and_reads_it_back() {
+        let writer = key(b"signer");
+        let state = RpcState::new();
+        state.stackerdb().write().await.configure(
+            "ST000000000000000000002AMW42H.signers-0-1",
+            vec![nano_primitives::hash160(
+                &writer.public_key().to_bytes_compressed(),
+            )],
+        );
+        let app = router(state);
+        let mut chunk = nano_stackerdb::Chunk::new(0, 1, b"accepted".to_vec());
+        chunk.sign(&writer).expect("sign chunk");
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "slot_id": 0,
+                            "slot_version": 1,
+                            "sig": hex::encode(chunk.signature.as_bytes()),
+                            "data": hex::encode(&chunk.data),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(body_json(accepted).await["accepted"], json!(true));
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1/0")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let data = axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .expect("read chunk");
+        assert_eq!(data.as_ref(), b"accepted");
+
+        let metadata = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let metadata = body_json(metadata).await;
+        assert_eq!(metadata[0]["slot_version"], json!(1));
+        assert_eq!(
+            metadata[0]["signature"],
+            json!(hex::encode(chunk.signature.as_bytes()))
         );
     }
 

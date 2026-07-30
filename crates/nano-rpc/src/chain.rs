@@ -103,9 +103,8 @@ impl ChainAccess for Vm {
             )
             .map_err(|error| ChainAccessError::Failed(error.to_string()))?;
         let result = match outcome {
-            ContractCallOutcome::Success(result) | ContractCallOutcome::AbortedByResponse(result) => {
-                result
-            }
+            ContractCallOutcome::Success(result)
+            | ContractCallOutcome::AbortedByResponse(result) => result,
             ContractCallOutcome::RuntimeFailure { error, .. } => {
                 return Err(ChainAccessError::Failed(error.to_string()));
             }

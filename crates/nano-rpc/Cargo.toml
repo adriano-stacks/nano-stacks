@@ -13,6 +13,7 @@ hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
+nano-crypto = { path = "../nano-crypto" }
 nano-mempool = { path = "../nano-mempool" }
 nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
@@ -26,7 +27,6 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "s
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
-nano-crypto = { path = "../nano-crypto" }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
 

@@ -114,7 +114,9 @@ pub fn new_block_payload(
         .iter()
         .zip(&applied.receipts)
         .enumerate()
-        .map(|(index, (transaction, receipt))| transaction_payload(index, &transaction.encode(), receipt))
+        .map(|(index, (transaction, receipt))| {
+            transaction_payload(index, &transaction.encode(), receipt)
+        })
         .collect();
     let (reward_set, cycle_number) = context
         .reward_set
@@ -233,7 +235,11 @@ pub fn mined_nakamoto_block_payload(
     })
 }
 
-fn transaction_payload(index: usize, raw_transaction: &[u8], receipt: &TransactionReceipt) -> Value {
+fn transaction_payload(
+    index: usize,
+    raw_transaction: &[u8],
+    receipt: &TransactionReceipt,
+) -> Value {
     let (status, vm_error) = match &receipt.status {
         TransactionStatus::Success => ("success", None),
         TransactionStatus::AbortedByResponse => ("abort_by_response", None),
