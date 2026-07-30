@@ -23,27 +23,26 @@ Replaying a capture taken from a Hacknet on the pinned revision reached
 tests failed. Six were fixed by giving them the capture's accounting — now
 `captured_chainstate` — and four causes remain:
 
-- `checkpoint_executor_executes_captured_descendants` builds a `Checkpoint`
-  with `accounting: None`, and
-  `a_chainstate_reopened_between_blocks_matches_one_that_never_closed` uses
-  `ChainState::open_from_checkpoint`, which takes no accounting at all. Both
-  then fail the moment a tenure earned before the window matures.
+- two tests built a chainstate with no accounting — **fixed**, both now take the
+  capture's
+- the capture wrote one `stacker_set` and a 340-block window spans more —
+  **fixed**, it now writes every cycle the window spans
 - `captured_bitcoin_blocks_match_the_recorded_operation_hashes` and
   `captured_sortition_snapshots_match_the_reference_bitcoin_chain` disagree with
-  the reference at the first captured burn height. A window that opens mid-chain
-  has no `PreStx` pairings from the six blocks before it, which the operation
-  hash depends on.
-- `captured_blocks_have_the_expected_signer_weight` cannot read a block whose
-  reward cycle the capture did not write a `stacker_set` for — the capture
-  records one cycle and a 340-block window spans more.
+  the reference `ops_hash` at **Bitcoin height 305**. This one is not a capture
+  gap and is not explained: the capture takes every burn block from height 0,
+  so the `PreStx` window is complete. Either nano parses an operation in that
+  block differently from stacks-core, or it orders them differently — and the
+  fixtures in the tree never exercised it. Treat it as a suspected nano defect
+  until it is understood, not as a fixture problem.
 
 ## Tasks
 
-- [ ] Give `ChainState::open_from_checkpoint` and `Checkpoint` a way to carry
-      the accounting a mid-chain window needs.
-- [ ] Capture the burn blocks before the first replayed one, so `PreStx`
-      pairing has the window it needs, or record the pairings themselves.
-- [ ] Capture a `stacker_set` for every cycle the window spans.
+- [x] Give the two paths that took no accounting the capture's.
+- [x] Capture a `stacker_set` for every cycle the window spans.
+- [ ] Find out why nano's operation hash differs from the reference at Bitcoin
+      height 305 of the new capture. This is the one that may not be the tests'
+      fault.
 - [ ] Drive the remaining tests from the manifest and provenance rather than
       from heights that happen to be true of one capture.
 

@@ -280,14 +280,7 @@ impl CaptureConfig {
             snapshots.as_bytes(),
         )?;
 
-        let cycle = self.current_reward_cycle()?;
-        let stacker_set = http_get(&format!("{}/v3/stacker_set/{cycle}", self.stacks_rpc))?;
-        write_file(
-            &staging
-                .join("stacker_set")
-                .join(format!("cycle-{cycle}.json")),
-            &stacker_set,
-        )?;
+        self.write_stacker_sets(staging, &snapshots, blocks)?;
 
         let first_bitcoin_height =
             snapshots_by_consensus_hash(&snapshots, &blocks[0].consensus_hash)
@@ -508,6 +501,40 @@ impl CaptureConfig {
     }
 
     /// The stacking calendar a replay needs to place a block in its reward cycle.
+    /// Write the reward set of every cycle the captured window spans.
+    ///
+    /// A block is verified against the reward set of its own cycle, so a window
+    /// long enough to cross a rollover needs more than the cycle it ends in.
+    fn write_stacker_sets(
+        &self,
+        staging: &Path,
+        snapshots: &str,
+        blocks: &[CapturedBlock],
+    ) -> Result<(), String> {
+        let (first_pox, prepare, reward) = self.pox_calendar()?;
+        let length = u64::from(prepare) + u64::from(reward);
+        let cycle_at = |height: u64| height.saturating_sub(first_pox) / length.max(1);
+        let first = snapshots_by_consensus_hash(snapshots, &blocks[0].consensus_hash)
+            .ok_or_else(|| "captured first block has no sortition snapshot".to_owned())?;
+        let last = blocks
+            .last()
+            .and_then(|block| snapshots_by_consensus_hash(snapshots, &block.consensus_hash))
+            .unwrap_or(first);
+        for cycle in cycle_at(first)..=cycle_at(last).max(self.current_reward_cycle()?) {
+            let Ok(stacker_set) = http_get(&format!("{}/v3/stacker_set/{cycle}", self.stacks_rpc))
+            else {
+                continue;
+            };
+            write_file(
+                &staging
+                    .join("stacker_set")
+                    .join(format!("cycle-{cycle}.json")),
+                &stacker_set,
+            )?;
+        }
+        Ok(())
+    }
+
     fn pox_calendar(&self) -> Result<(u64, u32, u32), String> {
         let response = String::from_utf8(http_get(&format!("{}/v2/pox", self.stacks_rpc))?)
             .map_err(|error| format!("PoX response was not UTF-8: {error}"))?;

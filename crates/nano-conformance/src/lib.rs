@@ -792,6 +792,13 @@ pub fn captured_network(root: &Path) -> Network {
         .map_or(Network::TESTNET, Network::from_chain_id)
 }
 
+/// The matured rewards a capture owes for tenures earned before its window.
+#[cfg(test)]
+fn captured_accounting(root: &Path) -> Option<TenureAccounting> {
+    let contents = fs::read(root.join("chainstate/checkpoint-H/native-effects.json")).ok()?;
+    TenureAccounting::from_json(&contents).ok()
+}
+
 /// Open the captured checkpoint the way replay does, accounting included.
 ///
 /// A window that opens part way through the chain owes rewards earned before
@@ -981,9 +988,9 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_chainstate, captured_signer_set, checkpoint_manifest, checkpoint_state,
-        decode_hash, scoreboard,
-        validate_fixture_tree,
+        captured_accounting, captured_chainstate, captured_signer_set, checkpoint_manifest,
+        checkpoint_state,
+        decode_hash, scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -1587,7 +1594,7 @@ mod tests {
                 path: fixture.join("chainstate/checkpoint-H/marf.sqlite"),
                 source,
                 state_root: root,
-                accounting: None,
+                accounting: captured_accounting(&fixture),
             },
             first,
             first_context,
@@ -2073,6 +2080,9 @@ mod tests {
                     root,
                 )
                 .expect("reopen chainstate");
+                if let Some(accounting) = captured_accounting(&fixture) {
+                    *chainstate.accounting_mut() = accounting;
+                }
                 let applied = apply(&mut chainstate, block, parent);
                 parent = Some(*block.block_id().as_bytes());
                 applied.execution.state_root
