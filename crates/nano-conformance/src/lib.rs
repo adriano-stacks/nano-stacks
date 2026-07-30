@@ -1758,6 +1758,98 @@ mod tests {
         }
     }
 
+    /// A reorganization takes the tenures it invalidated off the executed chain.
+    ///
+    /// The burnchain side retracts snapshots; this is the other half, which
+    /// stops nano from building on a tenure Bitcoin no longer awarded.
+    #[test]
+    fn a_reorganization_retracts_the_tenures_it_invalidated() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+
+        let mut parent = Some(source);
+        let mut blocks = Vec::new();
+        for path in captured_block_paths(&fixture).into_iter().take(8) {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .expect("decode block");
+            let view = block.header.consensus_hash.to_string();
+            chainstate
+                .append_nakamoto_block_with_bitcoin_operations(
+                    *snapshots.get(&view).expect("Bitcoin context"),
+                    bitcoin_operations.get(&view).expect("Bitcoin operations"),
+                    parent,
+                    &block,
+                )
+                .expect("execute block");
+            parent = Some(*block.block_id().as_bytes());
+            blocks.push(block);
+        }
+        let executed = chainstate.executed_blocks();
+        assert_eq!(executed.len(), blocks.len());
+
+        // Retract from the last tenure the capture starts, so the tenure's own
+        // blocks and everything after it come back.
+        let last_tenure = blocks
+            .iter()
+            .rev()
+            .find(|block| nano_chainstate::starts_new_tenure(block))
+            .expect("a captured tenure-start block");
+        let retracted_from = blocks
+            .iter()
+            .position(|block| block.header.consensus_hash == last_tenure.header.consensus_hash)
+            .expect("the tenure is in the executed chain");
+
+        let reorg = nano_sortition::SortitionReorg {
+            valid_ancestor: nano_sortition::SortitionSnapshot::genesis(
+                0,
+                nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            ),
+            retracted: vec![nano_sortition::SortitionSnapshot {
+                consensus_hash: last_tenure.header.consensus_hash,
+                ..nano_sortition::SortitionSnapshot::genesis(
+                    1,
+                    nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+                )
+            }],
+        };
+        let retraction = chainstate.retract(&reorg);
+
+        assert_eq!(
+            retraction.discarded,
+            executed[retracted_from..].to_vec(),
+            "every block of the invalidated tenure and its successors is discarded"
+        );
+        assert_eq!(
+            retraction.resume_from,
+            retracted_from
+                .checked_sub(1)
+                .map(|index| executed[index]),
+            "execution resumes from the last surviving block"
+        );
+        assert_eq!(chainstate.executed_blocks(), executed[..retracted_from]);
+
+        // A reorganization that invalidates nothing nano executed leaves the
+        // chain where it was.
+        let untouched = chainstate.retract(&nano_sortition::SortitionReorg {
+            valid_ancestor: nano_sortition::SortitionSnapshot::genesis(
+                0,
+                nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            ),
+            retracted: Vec::new(),
+        });
+        assert!(untouched.discarded.is_empty());
+        assert_eq!(untouched.resume_from, retraction.resume_from);
+    }
+
     /// Clarity reads back the header of a block nano executed.
     ///
     /// `get-stacks-block-info?` and `get-tenure-info?` are answered from nano's

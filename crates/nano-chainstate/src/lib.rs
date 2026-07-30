@@ -27,8 +27,8 @@ use nano_codec::{
 };
 use nano_crypto::{StacksPrivateKey, Vrf, VrfProof, VrfPublicKey};
 use nano_marf::{MarfValue, TriePointer};
-use nano_primitives::{Network, Sha256Sum, TrieHash, sha512_256};
-use nano_sortition::SortitionSnapshot;
+use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, sha512_256};
+use nano_sortition::{SortitionReorg, SortitionSnapshot};
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
 use serde::Deserialize;
@@ -322,6 +322,17 @@ impl TenureAccounting {
     }
 
     /// Record a tenure whose start block was executed here.
+    /// Forget every tenure from `coinbase_height` on, which a Bitcoin
+    /// reorganization takes off the canonical chain along with its sortitions.
+    pub fn retract_from(&mut self, coinbase_height: u64) {
+        self.earnings.retain(|height, _| *height < coinbase_height);
+        self.matured_effects
+            .retain(|height, _| *height < coinbase_height);
+        if self.started.is_some_and(|started| started >= coinbase_height) {
+            self.started = None;
+        }
+    }
+
     /// The rewards a tenure earned, once they have been recorded.
     #[must_use]
     pub fn earnings_at(&self, coinbase_height: u64) -> Option<&TenureEarnings> {
@@ -513,6 +524,26 @@ pub struct ChainState {
     accounting: TenureAccounting,
     /// Stacks height each tenure started at, which `get-tenure-info?` maps back.
     tenure_start_heights: BTreeMap<u32, u32>,
+    /// The blocks executed since the checkpoint, oldest first.
+    executed: Vec<ExecutedBlock>,
+}
+
+/// A block nano has executed, and the tenure it belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutedBlock {
+    block_id: [u8; 32],
+    consensus_hash: ConsensusHash,
+    tenure_height: u32,
+}
+
+/// What a Bitcoin reorganization took off nano's executed chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainRetraction {
+    /// The state to resume execution from, or the checkpoint when every
+    /// executed block was retracted.
+    pub resume_from: Option<[u8; 32]>,
+    /// The blocks that left the canonical chain, oldest first.
+    pub discarded: Vec<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -590,6 +621,7 @@ impl ChainState {
             vm: Vm::new(network)?,
             accounting: TenureAccounting::default(),
             tenure_start_heights: BTreeMap::new(),
+            executed: Vec::new(),
         })
     }
 
@@ -604,6 +636,7 @@ impl ChainState {
             vm: Vm::from_checkpoint(network, path, source, expected_root)?,
             accounting: TenureAccounting::default(),
             tenure_start_heights: BTreeMap::new(),
+            executed: Vec::new(),
         })
     }
 
@@ -1069,6 +1102,45 @@ impl ChainState {
         result
     }
 
+    /// Take back the blocks a Bitcoin reorganization removed from the chain.
+    ///
+    /// A retracted sortition takes its whole tenure with it, so every block
+    /// under an invalidated consensus hash is discarded and execution resumes
+    /// from the last block that survived. The MARF keeps the states those
+    /// blocks sealed: they are addressed by block identifier and nothing
+    /// reaches them once the chain no longer runs through them, so they cost
+    /// space rather than correctness until storage reclaims them
+    /// ([[021-hold-mainnet-scale-state-on-disk]]).
+    pub fn retract(&mut self, reorg: &SortitionReorg) -> ChainRetraction {
+        let invalidated: HashSet<_> = reorg.invalidated_consensus_hashes().into_iter().collect();
+        let Some(fork) = self
+            .executed
+            .iter()
+            .position(|block| invalidated.contains(&block.consensus_hash))
+        else {
+            return ChainRetraction {
+                resume_from: self.executed.last().map(|block| block.block_id),
+                discarded: Vec::new(),
+            };
+        };
+        let discarded: Vec<_> = self.executed.split_off(fork);
+        if let Some(first) = discarded.first() {
+            self.accounting.retract_from(u64::from(first.tenure_height));
+            self.tenure_start_heights
+                .retain(|tenure, _| *tenure < first.tenure_height);
+        }
+        ChainRetraction {
+            resume_from: self.executed.last().map(|block| block.block_id),
+            discarded: discarded.into_iter().map(|block| block.block_id).collect(),
+        }
+    }
+
+    /// The blocks executed since the checkpoint, oldest first.
+    #[must_use]
+    pub fn executed_blocks(&self) -> Vec<[u8; 32]> {
+        self.executed.iter().map(|block| block.block_id).collect()
+    }
+
     /// Record what Clarity may later read about the block just executed.
     ///
     /// Every block of a tenure reports that tenure's burn block, which is what
@@ -1085,6 +1157,11 @@ impl ChainState {
         if block_starts_new_tenure(block) {
             self.tenure_start_heights.insert(tenure_height, stacks_height);
         }
+        self.executed.push(ExecutedBlock {
+            block_id: *block.block_id().as_bytes(),
+            consensus_hash: block.header.consensus_hash,
+            tenure_height,
+        });
         let miner = self
             .accounting
             .earnings_at(u64::from(tenure_height))

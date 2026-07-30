@@ -1,13 +1,14 @@
 ---
 id: "026"
 title: "Survive a Bitcoin reorganization"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: feature
 dependencies: []
 tags: ["mainnet", "burnchain"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Survive a Bitcoin reorganization
@@ -29,7 +30,7 @@ them.
 - [x] Detect that a burn block nano processed is no longer canonical.
 - [x] Retract the sortition snapshots that descend from it and reprocess.
 - [x] Invalidate the `PreStx` pairings the retracted blocks contributed.
-- [ ] Carry the Stacks state that descended from a retracted sortition back to a
+- [x] Carry the Stacks state that descended from a retracted sortition back to a
       valid ancestor.
 - [x] Cover a reorganization in the sortition conformance tests.
 
@@ -42,6 +43,12 @@ rollback. Unwinding the Clarity state and the tenures those consensus hashes
 carried belongs to `nano-chainstate`, which owns the MARF and the executed tip:
 it has to discard every Stacks block whose consensus hash the reorganization
 invalidated and re-execute from the last block under the surviving ancestor.
+
+`ChainState::retract` now does exactly that and reports a `ChainRetraction`:
+the block to resume from, and the blocks discarded. The MARF keeps the states
+those blocks sealed — they are addressed by block identifier, so nothing
+reaches them once the chain no longer runs through them. Reclaiming that space
+belongs to [[021-hold-mainnet-scale-state-on-disk]].
 
 ## Acceptance Criteria
 
