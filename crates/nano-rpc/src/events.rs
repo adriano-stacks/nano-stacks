@@ -389,3 +389,93 @@ impl EventDispatcher {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Router,
+        extract::{Path, State},
+        routing::post,
+    };
+    use serde_json::json;
+
+    use super::{EventDispatcher, EventKind, Url, Value};
+
+    /// What an observer received, and the path each payload arrived on.
+    type Received = Arc<Mutex<Vec<(String, Value)>>>;
+
+    async fn observer() -> (Url, Received) {
+        let received: Received = Arc::default();
+        let app = Router::new()
+            .route(
+                "/{event}",
+                post(
+                    |State(received): State<Received>,
+                     Path(event): Path<String>,
+                     axum::Json(payload): axum::Json<Value>| async move {
+                        received.lock().expect("record").push((event, payload));
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observer");
+        let address = listener.local_addr().expect("observer address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (
+            Url::parse(&format!("http://{address}/")).expect("observer URL"),
+            received,
+        )
+    }
+
+    #[tokio::test]
+    async fn every_event_reaches_the_observer_on_its_own_path() {
+        let (url, received) = observer().await;
+        let dispatcher = EventDispatcher::new(vec![url]);
+
+        for kind in [
+            EventKind::NewBlock,
+            EventKind::NewBurnBlock,
+            EventKind::StackerDbChunks,
+            EventKind::ProposalResponse,
+            EventKind::MinedNakamotoBlock,
+        ] {
+            assert!(
+                dispatcher
+                    .dispatch(kind, &json!({ "kind": kind.path() }))
+                    .await
+                    .is_empty()
+            );
+        }
+
+        let received = received.lock().expect("record").clone();
+        assert_eq!(
+            received
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "new_block",
+                "new_burn_block",
+                "stackerdb_chunks",
+                "proposal_response",
+                "mined_nakamoto_block",
+            ]
+        );
+        assert_eq!(received[0].1, json!({ "kind": "new_block" }));
+    }
+
+    #[tokio::test]
+    async fn an_observer_that_never_answers_is_reported_rather_than_waited_on() {
+        let unreachable = Url::parse("http://127.0.0.1:1/").expect("URL");
+        let dispatcher = EventDispatcher::new(vec![unreachable.clone()]).with_attempts(1);
+
+        assert_eq!(
+            dispatcher.dispatch(EventKind::NewBlock, &json!({})).await,
+            vec![unreachable]
+        );
+    }
+}
