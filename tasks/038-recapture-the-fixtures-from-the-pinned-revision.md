@@ -50,6 +50,10 @@ this fixture tree is not.
       `provenance.toml` alongside the Hacknet commit.
 - [ ] Confirm `replay: state root` and `replay: receipts` stay at their full
       depth, and see where `replay: costs` lands.
+- [ ] Include the checkpoint height's own block, so the attestation test in
+      [[031-establish-a-trust-root-for-the-checkpoint]] can attest `checkpoint-H`
+      itself rather than standing in a later block. The capture starts one block
+      after the checkpoint, so that header is missing today.
 - [x] Make the capture refuse to record a node whose revision is not the pinned
       one, so this cannot recur silently.
 
