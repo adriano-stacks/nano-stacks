@@ -991,58 +991,58 @@ impl WasmGenerator {
             .map_err(|error| GeneratorError::TypeError(error.to_string()))
     }
 
-    pub fn clarity_value_size_on_stack(
+    /// Emit the size of a value already saved in `locals` into `size`.
+    ///
+    /// From epoch 3.3 costs are charged on the size of the value rather than
+    /// of its declared type (`callables.rs`, `uses_arg_size_for_cost`), and a
+    /// wrapper's declared size is its widest branch: `(optional (buff 500))`
+    /// holding two bytes declares 505 and is 7. Whatever the value carries at
+    /// runtime — a discriminant, a sequence length — is on the stack here, so
+    /// the size follows it. What cannot be told apart at runtime keeps the
+    /// declared size, which over-charges but never under.
+    fn runtime_size(
         &mut self,
         builder: &mut InstrSeqBuilder,
         ty: &TypeSignature,
+        locals: &[LocalId],
+        size: LocalId,
     ) -> Result<(), GeneratorError> {
-        let values = self.save_to_locals(builder, ty, true);
-        let size = self.borrow_local(ValType::I32);
-
         match ty {
             TypeSignature::OptionalType(inner) => {
-                let some_size = 1 + self.clarity_value_size(inner)?;
+                let inner_size = self.borrow_local(ValType::I32);
+                self.runtime_size(builder, inner, &locals[1..], *inner_size)?;
                 builder
-                    .local_get(values[0])
+                    .local_get(locals[0])
                     .if_else(
                         ValType::I32,
                         |then| {
-                            then.i32_const(some_size as i32);
+                            then.local_get(*inner_size).i32_const(1).binop(BinaryOp::I32Add);
                         },
                         |else_| {
                             else_.i32_const(2);
                         },
                     )
-                    .local_set(*size);
+                    .local_set(size);
             }
             TypeSignature::ResponseType(response) => {
-                let ok_size = 1 + self.clarity_value_size(&response.0)?;
-                let err_size = 1 + self.clarity_value_size(&response.1)?;
+                let ok_locals = clar2wasm_ty(&response.0).len();
+                let ok_size = self.borrow_local(ValType::I32);
+                let err_size = self.borrow_local(ValType::I32);
+                self.runtime_size(builder, &response.0, &locals[1..], *ok_size)?;
+                self.runtime_size(builder, &response.1, &locals[1 + ok_locals..], *err_size)?;
                 builder
-                    .local_get(values[0])
+                    .local_get(locals[0])
                     .if_else(
                         ValType::I32,
                         |then| {
-                            then.i32_const(ok_size as i32);
+                            then.local_get(*ok_size).i32_const(1).binop(BinaryOp::I32Add);
                         },
                         |else_| {
-                            else_.i32_const(err_size as i32);
+                            else_.local_get(*err_size).i32_const(1).binop(BinaryOp::I32Add);
                         },
                     )
-                    .local_set(*size);
+                    .local_set(size);
             }
-            // From epoch 3.3 the interpreter charges the size of the *value*,
-            // not of its declared type (`callables.rs`,
-            // `uses_arg_size_for_cost`). A byte sequence carries its length on
-            // the stack, so its size is known here: `4 + len` for a buffer or
-            // an ASCII string (`signatures.rs`, `inner_size`). Everything else
-            // keeps the declared size, which over-charges but never under.
-            // From epoch 3.3 the interpreter charges the size of the *value*,
-            // not of its declared type (`callables.rs`,
-            // `uses_arg_size_for_cost`). A byte sequence carries its length on
-            // the stack, so its size is known here: `4 + len` for a buffer or
-            // an ASCII string (`signatures.rs`, `inner_size`). Everything else
-            // keeps the declared size, which over-charges but never under.
             // A byte sequence is `4 + len`, and a UTF-8 string is
             // `4 + 4 * characters` over four-byte scalars, so both are four
             // more than the bytes on the stack.
@@ -1051,36 +1051,46 @@ impl WasmGenerator {
                 | SequenceSubtype::StringType(StringSubtype::ASCII(_) | StringSubtype::UTF8(_)),
             ) => {
                 builder
-                    .local_get(values[1])
+                    .local_get(locals[1])
                     .i32_const(4)
                     .binop(BinaryOp::I32Add)
-                    .local_set(*size);
+                    .local_set(size);
             }
             // A list is `entry * count + type_size`, and its stack length is
             // bytes, so the count is that over the entry's in-memory width
-            // (`words/sequences.rs`, `Len`). Everything but the count is known
-            // while compiling.
+            // (`words/sequences.rs`, `Len`).
             TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
                 let entry = self.clarity_value_size(list.get_list_item_type())?;
                 let width = get_type_size(list.get_list_item_type());
                 let declared = self.clarity_value_size(ty)?;
                 let type_size = declared.saturating_sub(entry.saturating_mul(list.get_max_len()));
                 builder
-                    .local_get(values[1])
+                    .local_get(locals[1])
                     .i32_const(width)
                     .binop(BinaryOp::I32DivU)
                     .i32_const(entry as i32)
                     .binop(BinaryOp::I32Mul)
                     .i32_const(type_size as i32)
                     .binop(BinaryOp::I32Add)
-                    .local_set(*size);
+                    .local_set(size);
             }
             _ => {
                 builder
                     .i32_const(self.clarity_value_size(ty)? as i32)
-                    .local_set(*size);
+                    .local_set(size);
             }
         }
+        Ok(())
+    }
+
+    pub fn clarity_value_size_on_stack(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let values = self.save_to_locals(builder, ty, true);
+        let size = self.borrow_local(ValType::I32);
+        self.runtime_size(builder, ty, &values, *size)?;
 
         for value in values {
             builder.local_get(value);

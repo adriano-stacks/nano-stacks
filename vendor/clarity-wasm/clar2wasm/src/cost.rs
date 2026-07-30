@@ -1968,9 +1968,58 @@ mod crosscheck {
                  (define-public (f (a (buff 64))) (ok (g a)))",
                 vec![Value::buff_from(vec![9; 3]).expect("buffer")],
             ),
+            (
+                "(define-public (f (a (list 20 uint))) (ok a))",
+                vec![
+                    Value::cons_list_unsanitized(vec![Value::UInt(1), Value::UInt(2)])
+                        .expect("list"),
+                ],
+            ),
+            (
+                "(define-public (f (a (string-utf8 40))) (ok a))",
+                vec![Value::string_utf8_from_bytes("hi".into()).expect("utf8")],
+            ),
+            (
+                "(define-public (f (a (optional (buff 500)))) (ok a))",
+                vec![Value::none()],
+            ),
+            (
+                "(define-public (f (a (optional (buff 500)))) (ok a))",
+                vec![
+                    Value::some(Value::buff_from(vec![3, 4]).expect("buffer")).expect("optional"),
+                ],
+            ),
+            (
+                "(define-public (f (a (response uint (buff 400)))) (ok a))",
+                vec![Value::okay(Value::UInt(7)).expect("response")],
+            ),
         ] {
             crosscheck_cost(snippet, "f", &arguments);
         }
+    }
+
+    /// A trait argument declares 276 and a contract principal is 148, so a
+    /// function taking one is where a declared size and a value's size differ
+    /// most. `.pox-5 stake-update` takes two.
+    #[test]
+    fn charges_a_trait_argument_for_what_it_holds() {
+        crosscheck_cost_multi_contract(
+            &[
+                ("callee", "(define-public (go) (ok u1))"),
+                (
+                    "snippet",
+                    "(define-trait go-trait ((go () (response uint uint)))) \
+                     (define-public (f (a <go-trait>)) (ok (contract-of a)))",
+                ),
+            ],
+            "f",
+            &[Value::Principal(
+                clarity::vm::types::PrincipalData::parse_qualified_contract_principal(
+                    "S1G2081040G2081040G2081040G208105NK8PE5.callee",
+                )
+                .expect("contract principal"),
+            )],
+        );
     }
 
     #[test]

@@ -83,11 +83,27 @@ is bytes over the entry's width (`words/sequences.rs`, `Len`) and a UTF-8
 string is four-byte scalars, which makes it `4 + length` like a buffer. Every
 case is crosschecked against the interpreter.
 
+Optionals and responses now do too. A wrapper's declared size is its widest
+branch — `(optional (buff 500))` holding two bytes declares 505 and is 7 — so
+the size follows the discriminant and the branch actually taken. Before this a
+single such argument was charged 2,237 runtime against the interpreter's 245.
+
 What remains, measured against a capture from the pinned revision, is runtime
 high by **843 in 231,186 — 0.36%** — at the first divergence. That transaction
-is a `.pox-5 stake-update` call, so the residual is somewhere in pox-5's own
-private functions rather than in argument handling: none of the three fixes
-above moved it.
+is a `.pox-5 stake-update` call.
+
+The residual is **not** in argument handling. Four fixes and one ruling-out
+have failed to move it:
+
+- byte sequences, lists and UTF-8 strings charged at runtime size
+- optionals and responses charged at the branch taken
+- trait arguments, which declare 276 against a principal's 148, were the best
+  remaining theory and are **correct**: a trait crosscheck passes
+
+So it is inside `stake-update`'s body — the trait dispatch to
+`signer-manager-validate-stake`, `remove-staker-from-cycles`'s loops, or
+`stx-account`. Finding it means bisecting that body the way the earlier eight
+were found; every crosscheck case here is the harness to do it with.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.
