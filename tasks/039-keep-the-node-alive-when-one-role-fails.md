@@ -1,7 +1,7 @@
 ---
 id: "039"
 title: "Keep the node alive when one role fails"
-status: pending
+status: in-progress
 priority: high
 effort: small
 type: bug
@@ -35,11 +35,11 @@ find its leader key.
 
 ## Tasks
 
-- [ ] Decide, per role, whether a failure is fatal to the node or only to that
+- [x] Decide, per role, whether a failure is fatal to the node or only to that
       role, and say why in the code.
-- [ ] Keep the process running when a non-fatal role fails, reporting the role
+- [x] Keep the process running when a non-fatal role fails, reporting the role
       and the reason.
-- [ ] Check the miner's Bitcoin identity — the leader key transaction and the
+- [x] Check the miner's Bitcoin identity — the leader key transaction and the
       wallet — at start-up, so it fails while starting rather than mid-tenure.
 - [ ] Refuse a configuration whose miner identity does not exist on the
       burnchain it names, rather than starting and dying.
@@ -49,3 +49,17 @@ find its leader key.
 - A node whose miner is misconfigured still follows and still signs.
 - The failure names the role, the reason, and what the node is still doing.
 - A miner identity that does not resolve is refused at start-up.
+
+## Outcome
+
+`Job::is_fatal` decides it: signing and following end the node, the miner and
+the RPC server do not. A node whose miner dies now says so and carries on
+signing, which is what the Hacknet stall needed.
+
+The miner's identity is resolved before it commits, and a `key_txid` the wallet
+has never seen now names the configuration key and says what to do, instead of
+surfacing a bare JSON-RPC code -5.
+
+Refusing such a configuration outright, rather than starting and reporting,
+still wants the burnchain reachable at load time — the config layer does not
+talk to Bitcoin today.

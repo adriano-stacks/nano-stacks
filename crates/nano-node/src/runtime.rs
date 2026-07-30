@@ -30,6 +30,42 @@ pub type SharedExecutor = Arc<Mutex<CheckpointExecutor<BitcoinRpcSource>>>;
 /// What a role reports when it stops, which is always the end of the node.
 pub type Role = Result<(), String>;
 
+/// A job the node runs, and what its stopping means for the rest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Job {
+    Rpc,
+    Follower,
+    Signer,
+    Miner,
+}
+
+impl Job {
+    /// Whether the node must stop when this job does.
+    ///
+    /// A network's liveness rests on its signers, and a node that has stopped
+    /// validating must not keep an operator believing it still signs. A miner
+    /// that cannot commit, or a closed RPC port, costs this node work and the
+    /// chain nothing — so they must not take the signer down with them, which
+    /// is how one stale leader-key transaction stalled a whole Hacknet.
+    const fn is_fatal(self) -> bool {
+        match self {
+            Self::Signer | Self::Follower => true,
+            Self::Rpc | Self::Miner => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Job {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Rpc => "RPC server",
+            Self::Follower => "follower",
+            Self::Signer => "signer",
+            Self::Miner => "miner",
+        })
+    }
+}
+
 /// Run a node until it is asked to stop or a role gives up.
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&config.node.working_dir)?;
@@ -77,9 +113,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             println!("serving the public RPC on {address}");
             let served = state.clone();
             roles.spawn(async move {
-                serve(listener, served)
-                    .await
-                    .map_err(|error| error.to_string())
+                (
+                    Job::Rpc,
+                    serve(listener, served)
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
             });
             Some(state)
         }
@@ -90,7 +129,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // view fresh.
     let executing_follower = config.miner.is_none();
     if let (Some(miner), Some(executor)) = (config.miner.clone(), executor.clone()) {
-        roles.spawn(miner::run(miner::Runtime {
+        let runtime = miner::Runtime {
             config: config.clone(),
             miner,
             network,
@@ -98,7 +137,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             peer: peer.clone(),
             executor,
             dispatcher,
-        }));
+        };
+        roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
     }
     if let Some(signer) = config.signer.clone() {
         let validator = signer::open(
@@ -109,39 +149,60 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             &config.chainstate_dir(SIGNER_CHAINSTATE),
         )
         .await?;
-        roles.spawn(signer::run(
-            config.clone(),
-            signer,
-            network,
-            peer.clone(),
-            validator,
-        ));
+        let (running, peer) = (config.clone(), peer.clone());
+        roles.spawn(async move {
+            (
+                Job::Signer,
+                signer::run(running, signer, network, peer, validator).await,
+            )
+        });
     }
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
     if state.is_some() || executor.is_some() {
-        roles.spawn(follow(config, peer, state, executor));
+        roles.spawn(async move { (Job::Follower, follow(config, peer, state, executor).await) });
     }
     if roles.is_empty() {
         return Err("this configuration switches on no roles".into());
     }
 
-    let outcome = tokio::select! {
-        joined = roles.join_next() => match joined {
-            Some(Ok(Err(error))) => Err(error.into()),
-            Some(Err(error)) => Err(error.into()),
-            _ => Ok(()),
-        },
-        () = terminated() => {
-            println!("stopping: every sealed block is already on disk");
-            Ok(())
-        }
-    };
+    let outcome = supervise(&mut roles).await;
     // Aborting the roles drops their chainstates, which closes the stores they
     // hold; anything they had not sealed was never a tip.
     roles.abort_all();
     outcome
+}
+
+/// Run until a job the node depends on stops, or until it is asked to.
+///
+/// A job that is not fatal is reported and left behind; the node is only done
+/// when a fatal one fails or nothing is left running.
+async fn supervise(roles: &mut JoinSet<(Job, Role)>) -> Result<(), Box<dyn Error>> {
+    loop {
+        let joined = tokio::select! {
+            joined = roles.join_next() => joined,
+            () = terminated() => {
+                println!("stopping: every sealed block is already on disk");
+                return Ok(());
+            }
+        };
+        match joined {
+            None => return Ok(()),
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok((job, Err(error)))) if job.is_fatal() => return Err(error.into()),
+            Some(Ok((job, result))) => {
+                match result {
+                    Err(error) => eprintln!("the {job} stopped: {error}"),
+                    Ok(()) => eprintln!("the {job} finished"),
+                }
+                if roles.is_empty() {
+                    return Ok(());
+                }
+                eprintln!("the node carries on without it");
+            }
+        }
+    }
 }
 
 /// Follow the peer, publishing what it validated and executing along it.
@@ -323,5 +384,20 @@ async fn terminated() {
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Job;
+
+    /// A network's liveness rests on its signers, so only the jobs that keep
+    /// the node honest about what it is doing may end it.
+    #[test]
+    fn only_signing_and_following_are_fatal() {
+        assert!(Job::Signer.is_fatal());
+        assert!(Job::Follower.is_fatal());
+        assert!(!Job::Miner.is_fatal());
+        assert!(!Job::Rpc.is_fatal());
     }
 }

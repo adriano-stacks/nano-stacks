@@ -233,7 +233,17 @@ impl State {
                     println!("waiting for Bitcoin to confirm the leader key {txid}");
                     sleep(Duration::from_secs(self.config.node.poll_interval_secs)).await;
                 }
-                Err(error) => return Err(error.into()),
+                // A transaction the wallet has never seen is a configuration
+                // naming a burnchain this node is not on — usually a key
+                // registered against a chain that has since been replaced.
+                // Say which key, so the answer is not a bare RPC code.
+                Err(error) => {
+                    return Err(format!(
+                        "miner.key_txid {txid} is not a transaction this burnchain wallet knows \
+                         ({error}); register a leader key against the chain this node follows"
+                    )
+                    .into());
+                }
             }
         }
     }
