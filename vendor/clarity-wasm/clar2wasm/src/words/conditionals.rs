@@ -955,7 +955,9 @@ impl ComplexWord for Asserts {
         let predicate_expr = args.get_expr(0)?;
         let thrown = args.get_expr(1)?;
 
-        generator.traverse_expr_as_borrowed_value(builder, predicate_expr)?;
+        // The interpreter keeps the evaluated predicate rather than reading it
+        // in place, so a bound name here does pay to be copied.
+        generator.traverse_expr(builder, predicate_expr)?;
         let predicate = generator.module.locals.add(ValType::I32);
         builder.local_set(predicate);
 

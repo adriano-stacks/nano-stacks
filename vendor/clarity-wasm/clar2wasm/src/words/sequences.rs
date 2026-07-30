@@ -48,7 +48,16 @@ impl ComplexWord for ListCons {
                 )));
             };
 
-        self.charge(generator, builder, list.len() as u32)?;
+        // The interpreter charges the sum of the elements' sizes, not how many
+        // there are (`vm/functions/sequences.rs`, `list_cons`).
+        let elem_size = elem_ty
+            .size()
+            .map_err(|error| GeneratorError::TypeError(error.to_string()))?;
+        self.charge(
+            generator,
+            builder,
+            elem_size.saturating_mul(list.len() as u32),
+        )?;
 
         // Allocate space on the data stack for the entire list
         let (offset, _size) = generator.create_call_stack_local(builder, &ty, false, true);

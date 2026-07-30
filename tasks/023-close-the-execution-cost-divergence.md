@@ -38,10 +38,12 @@ about when a block is full and when a tenure must be extended.
 - [x] Reduce the remaining divergence to the words that cause it.
 - [x] Stop charging a copy for operands the interpreter reads in place.
 - [x] Account for `fold`'s function-argument lookup.
-- [ ] Charge the per-element and per-application amounts still short: a fold
-      by one an element and 33 more over a native word, `asserts!` by 3,
-      `list` by 2, `append` by 1. Then un-ignore
-      `charges_folding_a_function_over_a_list`.
+- [x] Charge `asserts!` its predicate copy, and `list` by the size of what it
+      holds rather than how many.
+- [ ] Charge a list of a sequence type by the elements' runtime sizes, `append`
+      the one it is short, and a fold over a native word the application it
+      inlines. Then un-ignore
+      `charges_a_list_of_sequences_and_a_native_fold`.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -128,16 +130,24 @@ Where it now stands, against a capture from the pinned revision:
 |---|---|---|
 | stale fixtures | 240,515 | a factor of two out |
 | pinned fixtures, before this work | 232,029 | **843 over** |
-| after | 231,071 | **115 under** |
+| after | 231,251 | **65 over** |
 
-The sign has flipped, which is the useful part: what is left is under-charging,
-and every under-charge still known is measured and in the one `#[ignore]`d
-case — a fold by one an element and 33 more over a native word, `asserts!` by
-3, `list` by 2, `append` by 1. All of a kind: a per-element or per-application
-charge the interpreter makes and the compiler does not.
+Two more came out of the sweep after that: `asserts!` was suppressing a copy
+the interpreter does make, and `list` charged how many elements it holds rather
+than the sum of their sizes, which is what `list_cons` charges. The second one
+also closed the fold gap — a fold's under-charge was its list literal all along.
 
-Twelve charging bugs are fixed, each a passing crosscheck. The row is still not
-green and the task is not done.
+Fifteen charging bugs are fixed, each a passing crosscheck against the
+interpreter, and the copy cost turns out to be exactly `2n + 1`: a bool 3, a
+uint 33, a principal 297. That is what made each one recognisable.
+
+What is left is 65 in 231,186 — 0.028%, from 0.36% — and it is of one kind: an
+element's *declared* size where the interpreter charges what it holds. A list
+of a sequence type over-charges, `append` is short by one, and a fold over a
+native word is short by 32 an element. All three are in the one `#[ignore]`d
+case.
+
+The row is not green and the task is not done.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.

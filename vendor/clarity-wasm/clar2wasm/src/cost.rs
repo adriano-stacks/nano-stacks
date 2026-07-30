@@ -1568,9 +1568,9 @@ mod word {
         3 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("index_of_list", "(index-of (list 1 2 3) 2)", {
-        1 => CostMeter { runtime: 9000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 588,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 522,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 54000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1218,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1152,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("index_of_string_utf8", r#"(index-of u"hello" u"l")"#, {
         1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1618,9 +1618,9 @@ mod word {
         3 => CostMeter { runtime: 241,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_list", "(is-eq (list 1 2 3) (list 1 2 3))", {
-        1 => CostMeter { runtime: 14000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1484,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 723,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 104000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 2744,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1983,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_optional", "(is-eq (some u5) (some u5))", {
         1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1628,9 +1628,9 @@ mod word {
         3 => CostMeter { runtime: 633,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_tuple", "(is-eq {field1: 1, field2: (list 1 2 3)} {field1: 1, field2: (list 1 2 3)})", {
-        1 => CostMeter { runtime: 22000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 4266,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 4619,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 112000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 5526,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 5879,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_error", "(is-eq (err u5) (err u5))", {
         1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1742,9 +1742,9 @@ mod word {
         3 => CostMeter { runtime: 8365,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("append", "(append (list 1 2 3 4) 5)", {
-        1 => CostMeter { runtime: 13000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 817,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 902,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 73000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1657,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1742,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("as_max_len", "(as-max-len? 0x1234567890 u2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1767,9 +1767,9 @@ mod word {
     // `fold` resolves its function argument before the loop, as every other
     // application does; these carry that lookup.
     decl_tests!("fold", "(fold * (list 2 2 2) 1)", {
-        1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 771,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 714,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 53000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1401,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1344,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("len", "(len 0x010203)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1777,9 +1777,9 @@ mod word {
         3 => CostMeter { runtime: 445,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("list_cons", "(list 1 2 3)", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 222,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 50000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 886,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 852,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("map", "(define-private (zero-or-one (char (buff 1))) \
                           (if (is-eq char 0x00) 0x00 0x01)) \
@@ -2074,6 +2074,10 @@ mod crosscheck {
                 vec![Value::UInt(3)],
             ),
             (
+                "(define-public (f (a bool)) (begin (asserts! a (err u1)) (ok u2)))",
+                vec![Value::Bool(true)],
+            ),
+            (
                 "(define-public (f (a principal)) (ok (get unlocked (stx-account a))))",
                 vec![Value::Principal(
                     clarity::vm::types::PrincipalData::parse(
@@ -2120,29 +2124,32 @@ mod crosscheck {
         }
     }
 
-    /// `fold` resolves its function argument once before the loop, which every
-    /// other application pays for and this one did not. Two gaps remain, both
-    /// per element and both under-charges:
+    /// What still diverges, both of a kind: an element's *declared* size where
+    /// the interpreter charges what it holds.
     ///
-    /// - one unit an element folding a user-defined function over a list, and
-    ///   none at all over a buffer
-    /// - a further 32 an element when the folded function is a native word,
-    ///   which nano inlines without paying to apply
-    ///
-    /// `asserts!` is short by 3, `list` by 2 and `append` by 1, all of the same
-    /// kind: a per-application or per-element charge the interpreter makes and
-    /// the compiler does not.
+    /// - a list of a sequence type charges the element type's maximum, so a
+    ///   short buffer in a wide element over-charges
+    /// - `append` is short by one
+    /// - a fold over a *native* word is short by 32 an element, which nano
+    ///   inlines without paying to apply; over a user-defined function it is
+    ///   exact
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]
-    #[ignore = "known divergence: a fold is short per element, more so over a native word"]
-    fn charges_folding_a_function_over_a_list() {
-        for snippet in [
-            "(define-private (g (i uint) (acc uint)) (+ acc i)) \
-             (define-public (f) (ok (fold g (list u1 u2 u3 u4) u0)))",
-            "(define-public (f) (ok (fold * (list u2 u2 u2) u1)))",
+    #[ignore = "known divergence: element sizes in list construction, and a native fold"]
+    fn charges_a_list_of_sequences_and_a_native_fold() {
+        for (snippet, args) in [
+            (
+                "(define-public (f (a (buff 4))) (ok (list a 0x01)))",
+                vec![Value::buff_from(vec![1, 2]).expect("buffer")],
+            ),
+            (
+                "(define-public (f (a (list 4 uint))) (ok (append a u1)))",
+                vec![Value::cons_list_unsanitized(vec![Value::UInt(1)]).expect("list")],
+            ),
+            ("(define-public (f) (ok (fold * (list u2 u2 u2) u1)))", vec![]),
         ] {
-            crosscheck_cost(snippet, "f", &[]);
+            crosscheck_cost(snippet, "f", &args);
         }
     }
 
