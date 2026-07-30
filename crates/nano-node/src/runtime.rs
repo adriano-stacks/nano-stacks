@@ -121,12 +121,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             validator,
         ));
     }
-    roles.spawn(follow(
-        config,
-        peer,
-        state,
-        executor.filter(|_| executing_follower),
-    ));
+    let executor = executor.filter(|_| executing_follower);
+    // Following is only worth a task when someone reads what it produces: a
+    // signer-only node validates from its own store and needs no second view.
+    if state.is_some() || executor.is_some() {
+        roles.spawn(follow(config, peer, state, executor));
+    }
+    if roles.is_empty() {
+        return Err("this configuration switches on no roles".into());
+    }
 
     let outcome = tokio::select! {
         joined = roles.join_next() => match joined {

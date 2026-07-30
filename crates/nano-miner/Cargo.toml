@@ -27,10 +27,8 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 [lints]
 workspace = true
 
-[[bin]]
-name = "stacks-miner"
-path = "src/main.rs"
-
+# The Bitcoin one-shots that give a miner its identity, which a node needs done
+# before it can start: registering a leader key, and paying a commitment.
 [[bin]]
 name = "stacks-register-leader-key"
 path = "src/bin/register_leader_key.rs"
@@ -38,5 +36,3 @@ path = "src/bin/register_leader_key.rs"
 [[bin]]
 name = "stacks-commit-block"
 path = "src/bin/commit_block.rs"
-
-
