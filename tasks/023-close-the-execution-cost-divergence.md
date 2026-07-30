@@ -35,7 +35,9 @@ about when a block is full and when a tenure must be extended.
 - [x] Reduce the block-22 transaction to the smallest snippet that diverges.
 - [x] Fix the vendored compiler's charging for it and keep the case as a
       regression test.
-- [ ] Work forward through the fixtures until the cost row reaches 600/600.
+- [ ] Work forward through the fixtures until the cost row reaches full depth.
+      The fixtures now come from the pinned revision, so what remains is nano's:
+      runtime is high by 843 in 231,186 at the first divergence.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 

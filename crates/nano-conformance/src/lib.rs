@@ -822,6 +822,63 @@ fn captured_chainstate(root: &Path) -> ChainState {
     chainstate
 }
 
+/// Every reward set the capture recorded, by the cycle it pays.
+///
+/// A block is signed by the set of its own cycle, and a window long enough to
+/// cross a rollover spans more than one.
+#[cfg(test)]
+fn captured_signer_sets(root: &Path) -> BTreeMap<u64, nano_chainstate::SignerSet> {
+    #[derive(Deserialize)]
+    struct SignerWire {
+        signing_key: String,
+        stacked_amt: u64,
+    }
+    #[derive(Deserialize)]
+    struct RewardSetWire {
+        signers: Vec<SignerWire>,
+    }
+    #[derive(Deserialize)]
+    struct StackerSetWire {
+        stacker_set: RewardSetWire,
+    }
+
+    let mut sets = BTreeMap::new();
+    for entry in fs::read_dir(root.join("stacker_set")).expect("read reward sets") {
+        let path = entry.expect("reward set entry").path();
+        let Some(cycle) = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("cycle-"))
+            .and_then(|cycle| cycle.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(reward_set) =
+            serde_json::from_slice::<StackerSetWire>(&fs::read(&path).expect("read reward set"))
+        else {
+            continue;
+        };
+        let signers = reward_set
+            .stacker_set
+            .signers
+            .into_iter()
+            .map(|signer| {
+                (
+                    nano_crypto::StacksPublicKey::from_bytes(
+                        &hex::decode(signer.signing_key).expect("decode signing key"),
+                    )
+                    .expect("valid signer key"),
+                    u128::from(signer.stacked_amt),
+                )
+            })
+            .collect();
+        if let Ok((set, _)) = nano_chainstate::SignerSet::from_reward_slots(signers, 30) {
+            sets.insert(cycle, set);
+        }
+    }
+    sets
+}
+
 /// The reward set the capture's cycle stacked, as a signer set.
 #[cfg(test)]
 fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
@@ -988,7 +1045,8 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_accounting, captured_chainstate, captured_signer_set, checkpoint_manifest,
+        captured_accounting, captured_chainstate, captured_signer_set, captured_signer_sets,
+        checkpoint_manifest,
         checkpoint_state,
         decode_hash, scoreboard, validate_fixture_tree,
     };
@@ -1035,7 +1093,7 @@ mod tests {
         BitcoinBlock, BitcoinSource, PreStxCache, decode_block as decode_bitcoin_block,
         decode_block_with_pre_stx,
     };
-    use nano_chainstate::{NakamotoBlock as NanoNakamotoBlock, SignerSet};
+    use nano_chainstate::{BitcoinBlockContext, NakamotoBlock as NanoNakamotoBlock, SignerSet};
     use nano_codec::{
         Transaction as NanoTransaction, TransactionAuth as NanoTransactionAuth,
         transaction_merkle_root,
@@ -2055,8 +2113,7 @@ mod tests {
         };
 
         // One chainstate that stays open for all three blocks.
-        let mut open = ChainState::from_checkpoint(network, &checkpoint, source, root)
-            .expect("open checkpoint");
+        let mut open = captured_chainstate(&fixture);
         let mut parent = Some(source);
         let continuous = blocks
             .iter()
@@ -3381,34 +3438,25 @@ mod tests {
             );
         }
 
-        let reward_set_path = fs::read_dir(fixture_root.join("stacker_set"))
-            .expect("read reward sets")
-            .map(|entry| entry.expect("reward set entry").path())
-            .next()
-            .expect("captured reward set");
-        let reward_set: StackerSetWire =
-            serde_json::from_slice(&fs::read(reward_set_path).expect("read reward set"))
-                .expect("parse reward set");
-        let signers = reward_set
-            .stacker_set
-            .signers
-            .into_iter()
-            .map(|signer| {
-                (
-                    StacksPublicKey::from_bytes(
-                        &hex::decode(signer.signing_key).expect("decode signing key"),
-                    )
-                    .expect("valid signer key"),
-                    u128::from(signer.stacked_amt),
-                )
-            })
-            .collect();
-        let (signer_set, _) =
-            SignerSet::from_reward_slots(signers, HACKNET_REWARD_SLOTS).expect("valid signer set");
+        let sets = captured_signer_sets(&fixture_root);
+        assert!(!sets.is_empty(), "the capture records no reward set");
+
+        let snapshots = captured_bitcoin_snapshots(&fixture_root).expect("snapshots");
+        let cycle_of = |context: &BitcoinBlockContext| -> u64 {
+            let length = u64::from(context.prepare_phase_length + context.reward_phase_length);
+            context.height.saturating_sub(context.first_height) / length.max(1)
+        };
+
         for entry in fs::read_dir(fixture_root.join("nakamoto/blocks")).expect("read blocks") {
             let path = entry.expect("fixture entry").path();
             let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let Some(context) = snapshots.get(&block.header.consensus_hash.to_string()) else {
+                continue;
+            };
+            let Some(signer_set) = sets.get(&cycle_of(context)) else {
+                continue;
+            };
             assert!(
                 signer_set.verify(&block.header).is_ok(),
                 "{}",
@@ -3855,11 +3903,7 @@ mod tests {
             );
             assert_eq!(
                 nano_sortition::OpsHash::from_txids(
-                    &block
-                        .operations
-                        .iter()
-                        .map(|operation| operation.txid)
-                        .collect::<Vec<_>>(),
+                    &nano_sortition::accepted_operation_txids(&block),
                 )
                 .as_bytes(),
                 &hex_array(&snapshot.ops_hash),

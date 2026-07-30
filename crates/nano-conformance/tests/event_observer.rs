@@ -23,7 +23,13 @@ use nano_rpc::{
 use serde_json::Value;
 
 /// How deep the payload diff replays, which is the whole capture.
-const REPLAY_BLOCKS: u64 = 600;
+/// How many blocks the capture in the tree holds, read from its own manifest
+/// so a recapture with a different window needs no change here.
+fn replay_blocks(root: &std::path::Path) -> u64 {
+    nano_conformance::FixtureManifest::load(&root.join("manifest.toml"))
+        .expect("fixture manifest")
+        .replay_blocks
+}
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
@@ -219,10 +225,11 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
         parent = Some(block.header.block_hash());
     };
 
-    let depth = replay_captured_blocks(&root, REPLAY_BLOCKS, &mut { compare });
+    let blocks = replay_blocks(&root);
+    let depth = replay_captured_blocks(&root, blocks, &mut { compare });
 
     assert_eq!(
-        depth.completed, REPLAY_BLOCKS,
+        depth.completed, blocks,
         "replay stopped early: {:?}",
         depth.first_divergence
     );

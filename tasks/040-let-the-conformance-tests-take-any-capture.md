@@ -1,13 +1,14 @@
 ---
 id: "040"
 title: "Let the conformance tests take any capture"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: improvement
 dependencies: []
 tags: ["conformance", "fixtures"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Let the conformance tests take any capture
@@ -41,10 +42,8 @@ tests failed. Six were fixed by giving them the capture's accounting — now
 - [x] Capture a `stacker_set` for every cycle the window spans.
 - [x] Find out why nano's operation hash differs from the reference at Bitcoin
       height 305 of the new capture — it was nano, and it is fixed.
-- [ ] Hash accepted operations, not parsed ones, in
-      `captured_bitcoin_blocks_match_the_recorded_operation_hashes` and
-      `captured_sortition_snapshots_match_the_reference_bitcoin_chain`.
-- [ ] Drive the remaining tests from the manifest and provenance rather than
+- [x] Hash accepted operations, not parsed ones.
+- [x] Drive the remaining tests from the manifest and provenance rather than
       from heights that happen to be true of one capture.
 
 ## Acceptance Criteria

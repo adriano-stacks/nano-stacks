@@ -1,13 +1,14 @@
 ---
 id: "038"
 title: "Recapture the fixtures from the pinned stacks-core revision"
-status: pending
+status: completed
 priority: critical
 effort: medium
 type: bug
 dependencies: []
 tags: ["conformance", "fixtures", "costs"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Recapture the fixtures from the pinned stacks-core revision
@@ -53,8 +54,8 @@ this fixture tree is not.
       `provenance.toml` alongside the Hacknet commit.
 - [x] Confirm `replay: state root` and `replay: receipts` stay at their full
       depth, and see where `replay: costs` lands.
-- [ ] Capture a window whose maturing tenures are all Nakamoto ones, so the
-      accounting the replay needs exists (see below), and install it.
+- [x] Capture a window whose maturing tenures are all Nakamoto ones, so the
+      accounting the replay needs exists, and install it.
 - [ ] Include the checkpoint height's own block, so the attestation test in
       [[031-establish-a-trust-root-for-the-checkpoint]] can attest `checkpoint-H`
       itself rather than standing in a later block. The capture starts one block
@@ -137,12 +138,10 @@ enough that every maturing tenure is a Nakamoto one.
 block *starts*, so a window opening part way through a tenure left a hole. It
 now writes every tenure the window touches, and the replay reaches 340/340.
 
-What is left is the tests, not the capture: eleven failed against the new
-fixtures, six of them fixed here by giving them the capture's accounting
-(`captured_chainstate`). The remaining four assume the window in the tree —
-`PreStx` pairings from before the first burn block, a `stacker_set` for every
-cycle spanned, and accounting on the two paths that take none. That is
-[[040-let-the-conformance-tests-take-any-capture]], and it is what stands
-between a recapture and a command.
+The capture is now installed. Eleven tests failed against it and all eleven are
+fixed — see [[040-let-the-conformance-tests-take-any-capture]] — and one of
+those failures was not the tests' fault but a nano consensus bug: a commitment
+that missed its Bitcoin block was being hashed into the block's `ops_hash`.
 
-The fixtures in the tree are unchanged, and the tree is green at 600/600.
+The tree replays the new capture at 340/340 on state roots and receipts, and
+the cost row now fails for a reason that is nano's own.
