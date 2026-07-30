@@ -29,7 +29,7 @@ use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::{SortitionReorg, SortitionSnapshot};
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How a block's committed state root is established during execution.
@@ -287,7 +287,53 @@ impl TenureAccounting {
                 },
             )?;
         }
+        accounting.started = checkpoint.started;
         Ok(accounting)
+    }
+
+    /// Encode this accounting in the same JSON a checkpoint carries.
+    ///
+    /// A node writes it back out on every block so that a restart resumes owing
+    /// exactly what it owed, rather than what its checkpoint owed.
+    pub fn to_json(&self) -> Result<Vec<u8>, TenureAccountingError> {
+        let checkpoint = TenureAccountingCheckpoint {
+            matured_effects: self
+                .matured_effects
+                .iter()
+                .map(|(height, effects)| TenureAccountingCheckpointEntry {
+                    coinbase_height: *height,
+                    credits: effects
+                        .credits
+                        .iter()
+                        .map(|credit| TenureAccountingCheckpointCredit {
+                            recipient: credit.recipient.to_string(),
+                            amount: credit.amount,
+                        })
+                        .collect(),
+                    liquid_supply_increase: effects.liquid_supply_increase,
+                })
+                .collect(),
+            tenures: self
+                .earnings
+                .iter()
+                .map(|(height, earnings)| TenureAccountingCheckpointTenure {
+                    coinbase_height: *height,
+                    recipient: earnings.recipient.to_string(),
+                    coinbase: earnings.coinbase,
+                    fees: earnings.fees,
+                })
+                .collect(),
+            coinbase_schedule: self.schedule.map(|schedule| {
+                TenureAccountingCheckpointSchedule {
+                    mainnet: schedule.mainnet,
+                    first_bitcoin_height: schedule.first_bitcoin_height,
+                    initial_mining_bonus_ustx: schedule.initial_mining_bonus,
+                }
+            }),
+            started: self.started,
+        };
+        serde_json::to_vec(&checkpoint)
+            .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))
     }
 
     /// Record the effects that mature when the given coinbase height is reached.
@@ -433,7 +479,7 @@ impl std::fmt::Display for TenureAccountingError {
 
 impl std::error::Error for TenureAccountingError {}
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpoint {
     matured_effects: Vec<TenureAccountingCheckpointEntry>,
@@ -443,9 +489,13 @@ struct TenureAccountingCheckpoint {
     tenures: Vec<TenureAccountingCheckpointTenure>,
     /// Burnchain emission schedule, needed to derive later tenures' coinbases.
     coinbase_schedule: Option<TenureAccountingCheckpointSchedule>,
+    /// The tenure whose start block was executed here, which is the only one
+    /// whose fees keep accruing after a restart.
+    #[serde(default)]
+    started: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpointTenure {
     coinbase_height: u64,
@@ -454,7 +504,7 @@ struct TenureAccountingCheckpointTenure {
     fees: u128,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpointSchedule {
     mainnet: bool,
@@ -462,7 +512,7 @@ struct TenureAccountingCheckpointSchedule {
     initial_mining_bonus_ustx: u128,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpointEntry {
     coinbase_height: u64,
@@ -470,7 +520,7 @@ struct TenureAccountingCheckpointEntry {
     liquid_supply_increase: u128,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TenureAccountingCheckpointCredit {
     recipient: String,
@@ -663,6 +713,12 @@ impl ChainState {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.vm.network()
+    }
+
+    /// The deepest sealed block state, which is where a reopened node resumes.
+    #[must_use]
+    pub fn tip(&self) -> Option<[u8; 32]> {
+        self.vm.tip()
     }
 
     /// The executed state, for reads that answer the public RPC.
@@ -2552,6 +2608,52 @@ mod tests {
             42
         );
         assert!(TenureAccounting::from_json(br#"{"matured_effects": [], "extra": 1}"#).is_err());
+    }
+
+    /// A node writes its accounting back out on every block, and a restart owes
+    /// what it wrote, not what its checkpoint owed.
+    #[test]
+    fn tenure_accounting_survives_a_round_trip_through_json() {
+        let recipient =
+            PrincipalData::parse("ST000000000000000000002AMW42H").expect("boot principal");
+        let mut accounting = TenureAccounting::default();
+        accounting.record_earnings(
+            120,
+            TenureEarnings {
+                recipient: recipient.clone(),
+                coinbase: 1_000,
+                fees: 0,
+            },
+        );
+        accounting.add_fees(120, 7);
+        accounting
+            .record_matured_effects(
+                20,
+                NativeBlockEffects {
+                    credits: vec![NativeStxCredit {
+                        recipient,
+                        amount: 42,
+                    }],
+                    liquid_supply_increase: 42,
+                },
+            )
+            .expect("record matured effects");
+
+        let restored = TenureAccounting::from_json(&accounting.to_json().expect("encode accounting"))
+            .expect("decode accounting");
+        // Fees only keep accruing for the tenure whose start block was executed
+        // here, so the round trip has to carry that over as well.
+        let mut extended = restored;
+        extended.add_fees(120, 3);
+
+        assert_eq!(extended.reward_for_tenure(120), 1_010);
+        assert_eq!(
+            extended
+                .effects_for_tenure(Network::TESTNET, 20)
+                .expect("checkpointed effects")
+                .liquid_supply_increase,
+            42
+        );
     }
 
     #[test]
