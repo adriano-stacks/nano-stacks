@@ -1,13 +1,14 @@
 ---
 id: "034"
 title: "Bring dependencies up to date"
-status: in-progress
+status: completed
 priority: low
 effort: small
 type: chore
 dependencies: []
 tags: ["notes", "build"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Bring dependencies up to date
@@ -26,7 +27,7 @@ Two of them are load-bearing and deserve a decision rather than a bump:
 - [x] List which direct dependencies are behind and by how much.
 - [x] Bump the ones that are a bump.
 - [x] Decide what to do about `wasmtime` and record why.
-- [ ] Decide how the pinned stacks-core revision is chosen and moved.
+- [x] Decide how the pinned stacks-core revision is chosen and moved.
 
 ## Acceptance Criteria
 
@@ -57,7 +58,15 @@ its wasm codegen is the thing the cost work in
 underneath that would confound the one signal telling us whether costs match.
 It belongs after the cost row is green, as its own task.
 
-The pinned stacks-core revision (`efc34a07`) is still unresolved: nothing says
-how it is chosen or when it moves, and every conformance oracle compares against
-it. That needs an answer before mainnet, since the revision decides what
-"matches stacks-core" means.
+**The pinned stacks-core revision** (`efc34a07`) is what every conformance
+oracle compares against, so moving it changes what "matches stacks-core" means.
+Two rules now hold it in place rather than convention:
+
+- a fixture capture records the revision it came from in `provenance.toml`
+- `cargo xtask capture-fixtures` refuses a node that is not that revision,
+  reading the pin out of the lockfile so the check cannot drift
+
+Moving the pin is therefore a deliberate act with a visible consequence: the
+fixtures must be recaptured against the new revision, and a capture that was
+not will be refused rather than silently believed. That is what went wrong once
+already — see [[038-recapture-the-fixtures-from-the-pinned-revision]].
