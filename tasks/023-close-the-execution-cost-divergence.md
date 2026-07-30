@@ -113,12 +113,16 @@ same way the earlier eight were found.
 
 ## Hacknet
 
-Not validated on a live chain. The run that would have done it stalled before
-it started: nano's node ended on the resume path because the block its signer
-state was sealed at had been reorganized away
-([[041-walk-back-when-our-tip-left-the-chain]]), and the stock signers were
-rejecting proposals of their own accord with
-`Cannot validate block, no global signer state`.
+Not validated on a live chain. Two runs tried. The first ended on nano's side,
+which is now fixed ([[041-walk-back-when-our-tip-left-the-chain]]); on the
+second nano ran for minutes, signing for its cycle, while the network itself
+stayed frozen — stock signers looping on `Last accepted block has timed out`
+and `Cannot validate block, no global signer state`, with the tip already stuck
+before nano rejoined.
+
+That Hacknet has now deadlocked itself in three of five boots, so a live
+measurement of these cost changes needs a network that stays up, not another
+attempt.
 
 The offline evidence stands on its own — every cost change here is crosschecked
 against the interpreter, and the 340-block replay matches state roots and

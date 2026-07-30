@@ -66,3 +66,10 @@ halves of that.
 blocks past the fork point were never sealed into the resumed state's chain —
 execution simply carries on from the surviving ancestor, and the orphaned
 states stay on disk unreferenced, as they do after any reorganization.
+
+## Hacknet
+
+Confirmed on a live network. The same restart that killed the previous build —
+switching the mining role on, with the signer's sealed tip reorganized away in
+between — now walks back, takes its signing slot for the cycle, and stays up.
+The node has run for minutes where it used to exit in seconds.
