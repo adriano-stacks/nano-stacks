@@ -1,6 +1,8 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
-    fs,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -8,8 +10,9 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::{
-    MarfBlockId, MarfTrie, MarfValue, MarfVersion, TrieChild, TrieHash, TrieNode, TrieNodeId,
-    VersionedMarf, state_root,
+    ChildTarget, MarfBlockId, MarfError, MarfValue, TrieChild, TrieHash, TrieNode, TrieNodeId,
+    VersionedMarf, internal_node_hash, leaf_hash, node_id_for_children, slots, state_root,
+    storage::TrieStorage,
 };
 
 const ROOT_OFFSET: usize = 36;
@@ -17,11 +20,16 @@ const BACK_POINTER: u8 = 0x80;
 const COMPRESSED: u8 = 0x40;
 const CONTROL_BITS: u8 = BACK_POINTER | COMPRESSED | 0x20 | 0x10;
 
+/// How much of the blob file one node can occupy. A Node256 with uncompressed
+/// pointers is under 3 KiB, so nothing straddles a window of this size.
+const WINDOW: usize = 8192;
+
 /// Errors raised while importing a stacks-core MARF checkpoint.
 #[derive(Debug)]
 pub enum CheckpointError {
     Io(std::io::Error),
     Sql(rusqlite::Error),
+    Storage(MarfError),
     InvalidCheckpoint(&'static str),
     InvalidManifest(String),
     MissingBlock(MarfBlockId),
@@ -37,6 +45,7 @@ impl std::fmt::Display for CheckpointError {
         match self {
             Self::Io(error) => write!(formatter, "checkpoint I/O error: {error}"),
             Self::Sql(error) => write!(formatter, "checkpoint SQLite error: {error}"),
+            Self::Storage(error) => write!(formatter, "checkpoint storage error: {error}"),
             Self::InvalidCheckpoint(reason) => write!(formatter, "invalid checkpoint: {reason}"),
             Self::InvalidManifest(reason) => write!(formatter, "invalid PCS manifest: {reason}"),
             Self::MissingBlock(block) => write!(
@@ -61,6 +70,7 @@ impl std::error::Error for CheckpointError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sql(error) => Some(error),
+            Self::Storage(error) => Some(error),
             Self::InvalidCheckpoint(_)
             | Self::InvalidManifest(_)
             | Self::MissingBlock(_)
@@ -98,36 +108,145 @@ impl From<rusqlite::Error> for CheckpointError {
     }
 }
 
-/// Import a raw stacks-core SQLite/blob MARF checkpoint at `source`.
-///
-/// The imported state keeps its original trie graph and back-pointer block identities. The
-/// checkpoint's published root is checked before it is made available for extension.
+impl From<MarfError> for CheckpointError {
+    fn from(error: MarfError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// Import a raw stacks-core SQLite/blob MARF checkpoint at `source` into memory.
 pub fn import_checkpoint(
     sqlite_path: impl AsRef<Path>,
     source: MarfBlockId,
     expected_root: TrieHash,
 ) -> Result<VersionedMarf, CheckpointError> {
-    let sqlite_path = sqlite_path.as_ref();
-    let records = read_records(sqlite_path)?;
-    let blobs = fs::read(blob_path(sqlite_path)?)?;
-    let loader = Loader {
-        records: &records,
-        blobs: &blobs,
-    };
+    import_into(
+        TrieStorage::in_memory()?,
+        sqlite_path.as_ref(),
+        source,
+        expected_root,
+    )
+}
+
+/// Import a checkpoint into the durable MARF held at `marf_path`.
+///
+/// The trie node graph streams straight from the checkpoint's blob file into
+/// storage, so nothing larger than one node is ever resident.
+pub fn import_checkpoint_into(
+    marf_path: impl AsRef<Path>,
+    sqlite_path: impl AsRef<Path>,
+    source: MarfBlockId,
+    expected_root: TrieHash,
+) -> Result<VersionedMarf, CheckpointError> {
+    import_into(
+        TrieStorage::open(marf_path.as_ref())?,
+        sqlite_path.as_ref(),
+        source,
+        expected_root,
+    )
+}
+
+fn import_into(
+    storage: TrieStorage,
+    sqlite_path: &Path,
+    source: MarfBlockId,
+    expected_root: TrieHash,
+) -> Result<VersionedMarf, CheckpointError> {
+    let blobs = Blobs::open(&blob_path(sqlite_path)?)?;
+    let records = read_records(sqlite_path, &blobs)?;
     let source_record = records
         .get(&source)
         .ok_or(CheckpointError::MissingBlock(source))?;
-    let trie = loader.load_root(source_record)?;
-    let actual_root = source_record.root;
-    if actual_root != expected_root {
+    if source_record.root != expected_root {
         return Err(CheckpointError::RootMismatch {
             expected: expected_root,
-            actual: actual_root,
+            actual: source_record.root,
         });
     }
 
-    let ancestors = ancestor_roots(source_record.parent, &records)?;
-    let calculated_root = state_root(trie.root_hash(), &ancestors);
+    let mut chain = vec![source];
+    while let Some(parent) = records
+        .get(chain.last().expect("chain is never empty"))
+        .ok_or(CheckpointError::MissingBlock(source))?
+        .parent
+    {
+        chain.push(parent);
+    }
+    chain.reverse();
+
+    match import_chain(&storage, &records, &blobs, &chain, expected_root) {
+        Ok(()) => Ok(VersionedMarf::from_storage(storage)),
+        Err(error) => {
+            storage.forget();
+            Err(error)
+        }
+    }
+}
+
+fn import_chain(
+    storage: &TrieStorage,
+    records: &BTreeMap<MarfBlockId, Record>,
+    blobs: &Blobs,
+    chain: &[MarfBlockId],
+    expected_root: TrieHash,
+) -> Result<(), CheckpointError> {
+    let transaction = storage.transaction()?;
+    let empty_root = internal_node_hash(
+        TrieNodeId::Node256,
+        &vec![
+            crate::TriePointer {
+                id: 0,
+                character: 0,
+                referenced_block: None,
+            };
+            256
+        ],
+        &[],
+        &vec![TrieHash::EMPTY; 256],
+    )?;
+
+    let mut identifiers = BTreeMap::new();
+    let mut parent = None;
+    for (height, block) in chain.iter().enumerate() {
+        let jumps = power_of_two_ancestors(chain, height);
+        let height = u32::try_from(height)
+            .map_err(|_| CheckpointError::InvalidCheckpoint("checkpoint height overflow"))?;
+        let id = storage.reserve_block(*block, parent, height, &jumps)?;
+        let record = records
+            .get(block)
+            .ok_or(CheckpointError::MissingBlock(*block))?;
+        storage.complete_block(*block, id, record.root, empty_root, None)?;
+        identifiers.insert(record.block_id, id);
+        parent = Some(id);
+    }
+
+    let source = *chain.last().ok_or(CheckpointError::InvalidCheckpoint(
+        "checkpoint has no source block",
+    ))?;
+    let source_record = records
+        .get(&source)
+        .ok_or(CheckpointError::MissingBlock(source))?;
+    let mut importer = Importer {
+        records,
+        blocks_by_id: index_by_id(records),
+        blobs,
+        storage,
+        identifiers,
+        next: BTreeMap::new(),
+    };
+    let (index, content) = importer.import_root(source_record)?;
+
+    let ancestors = power_of_two_ancestors(chain, chain.len() - 1);
+    let ancestor_roots = ancestors
+        .iter()
+        .map(|block| {
+            records
+                .get(block)
+                .map(|record| record.root)
+                .ok_or(CheckpointError::MissingBlock(*block))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let calculated_root = state_root(content, &ancestor_roots);
     if calculated_root != expected_root {
         return Err(CheckpointError::RootMismatch {
             expected: expected_root,
@@ -135,42 +254,38 @@ pub fn import_checkpoint(
         });
     }
 
-    let mut retained = BTreeMap::new();
-    let mut current = Some(source);
-    while let Some(block) = current {
-        let record = records
-            .get(&block)
-            .ok_or(CheckpointError::MissingBlock(block))?;
-        retained.insert(block, record);
-        current = record.parent;
-    }
-
-    let mut versions = BTreeMap::new();
-    for (block, record) in retained {
-        versions.insert(
-            block,
-            MarfVersion {
-                parent: record.parent,
-                height: height(block, &records)?,
-                trie: MarfTrie::default(),
-                root: record.root,
-            },
-        );
-    }
-    let version = versions
-        .get_mut(&source)
+    let id = *importer
+        .identifiers
+        .get(&source_record.block_id)
         .ok_or(CheckpointError::MissingBlock(source))?;
-    version.trie = trie;
+    storage.complete_block(source, id, expected_root, content, Some(index))?;
+    transaction.commit()?;
+    Ok(())
+}
 
-    Ok(VersionedMarf {
-        versions,
-        active: None,
-    })
+/// The linear chain's ancestors at back-distances 1, 2, 4, … from `height`.
+fn power_of_two_ancestors(chain: &[MarfBlockId], height: usize) -> Vec<MarfBlockId> {
+    let mut ancestors = Vec::new();
+    let mut step = 0;
+    while (1_usize << step) <= height {
+        ancestors.push(chain[height - (1 << step)]);
+        step += 1;
+    }
+    ancestors
 }
 
 /// Import the Clarity MARF from a standard marf-squash PCS directory.
 pub fn import_pcs(root: impl AsRef<Path>) -> Result<VersionedMarf, CheckpointError> {
     let pcs_root = root.as_ref();
+    let (source, expected_root) = pcs_state(pcs_root)?;
+    import_checkpoint(
+        pcs_root.join("chainstate/vm/clarity/marf.sqlite"),
+        source,
+        expected_root,
+    )
+}
+
+fn pcs_state(pcs_root: &Path) -> Result<(MarfBlockId, TrieHash), CheckpointError> {
     let manifest = fs::read_to_string(pcs_root.join("PCS_manifest.toml"))?;
     let manifest: PcsManifest = toml::from_str(&manifest)
         .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
@@ -182,14 +297,10 @@ pub fn import_pcs(root: impl AsRef<Path>) -> Result<VersionedMarf, CheckpointErr
         .ok_or(CheckpointError::InvalidCheckpoint(
             "PCS manifest has no Clarity archival MARF root",
         ))?;
-    import_checkpoint(
-        pcs_root.join("chainstate/vm/clarity/marf.sqlite"),
-        source,
-        TrieHash::from_bytes(parse_hex(expected_root)?),
-    )
+    Ok((source, TrieHash::from_bytes(parse_hex(expected_root)?)))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Record {
     block_id: u32,
     parent: Option<MarfBlockId>,
@@ -197,7 +308,10 @@ struct Record {
     root: TrieHash,
 }
 
-fn read_records(path: &Path) -> Result<BTreeMap<MarfBlockId, Record>, CheckpointError> {
+fn read_records(
+    path: &Path,
+    blobs: &Blobs,
+) -> Result<BTreeMap<MarfBlockId, Record>, CheckpointError> {
     let uri = format!("file:{}?immutable=1", path.display());
     let connection = Connection::open_with_flags(
         uri,
@@ -215,7 +329,7 @@ fn read_records(path: &Path) -> Result<BTreeMap<MarfBlockId, Record>, Checkpoint
         let offset: u64 = row.get(2)?;
         raw_records.push((
             block_id,
-            parse_block(&block)?,
+            parse_hex(&block)?,
             usize::try_from(offset).map_err(|_| {
                 CheckpointError::InvalidCheckpoint("blob offset exceeds address space")
             })?,
@@ -225,11 +339,10 @@ fn read_records(path: &Path) -> Result<BTreeMap<MarfBlockId, Record>, Checkpoint
     drop(statement);
     drop(connection);
 
-    let blobs = fs::read(blob_path(path)?)?;
     let mut records = BTreeMap::new();
     for (block_id, block, offset) in raw_records {
-        let parent = block_at(&blobs, offset, 32)?;
-        let root = TrieHash::from_bytes(block_at(&blobs, offset + ROOT_OFFSET, 32)?);
+        let header = blobs.read(offset, ROOT_OFFSET + 32)?;
+        let root = TrieHash::from_bytes(fixed(&header[ROOT_OFFSET..])?);
         records.insert(
             block,
             Record {
@@ -239,26 +352,26 @@ fn read_records(path: &Path) -> Result<BTreeMap<MarfBlockId, Record>, Checkpoint
                 root,
             },
         );
-        let _ = parent;
     }
 
-    let blocks_by_id: BTreeMap<_, _> = records
-        .iter()
-        .map(|(block, record)| (record.block_id, *block))
-        .collect();
-    let known_blocks: Vec<_> = records.keys().copied().collect();
+    let blocks_by_id = index_by_id(&records);
+    let known: std::collections::BTreeSet<_> = records.keys().copied().collect();
     for record in records.values_mut() {
-        let parent = block_at(&blobs, record.offset, 32)?;
-        record.parent = known_blocks
-            .contains(&parent)
-            .then_some(parent)
-            .or_else(|| {
-                blocks_by_id
-                    .get(&record.block_id.saturating_sub(1))
-                    .copied()
-            });
+        let parent = fixed(&blobs.read(record.offset, 32)?)?;
+        record.parent = known.contains(&parent).then_some(parent).or_else(|| {
+            blocks_by_id
+                .get(&record.block_id.saturating_sub(1))
+                .copied()
+        });
     }
     Ok(records)
+}
+
+fn index_by_id(records: &BTreeMap<MarfBlockId, Record>) -> BTreeMap<u32, MarfBlockId> {
+    records
+        .iter()
+        .map(|(block, record)| (record.block_id, *block))
+        .collect()
 }
 
 fn blob_path(sqlite_path: &Path) -> Result<PathBuf, CheckpointError> {
@@ -271,51 +384,61 @@ fn blob_path(sqlite_path: &Path) -> Result<PathBuf, CheckpointError> {
     Ok(sqlite_path.with_file_name(format!("{name}.blobs")))
 }
 
-fn ancestor_roots(
-    mut block: Option<MarfBlockId>,
-    records: &BTreeMap<MarfBlockId, Record>,
-) -> Result<Vec<TrieHash>, CheckpointError> {
-    let mut roots = Vec::new();
-    while let Some(current) = block {
-        let record = records
-            .get(&current)
-            .ok_or(CheckpointError::MissingBlock(current))?;
-        roots.push(record.root);
-        block = record.parent;
-    }
-    Ok(roots)
+/// The checkpoint's blob file, read a node at a time.
+struct Blobs {
+    file: RefCell<File>,
+    length: u64,
 }
 
-fn height(
-    block: MarfBlockId,
-    records: &BTreeMap<MarfBlockId, Record>,
-) -> Result<u32, CheckpointError> {
-    let mut height = 0_u32;
-    let mut cursor = records
-        .get(&block)
-        .ok_or(CheckpointError::MissingBlock(block))?
-        .parent;
-    while let Some(parent) = cursor {
-        height = height
-            .checked_add(1)
-            .ok_or(CheckpointError::InvalidCheckpoint("height overflow"))?;
-        cursor = records
-            .get(&parent)
-            .ok_or(CheckpointError::MissingBlock(parent))?
-            .parent;
+impl Blobs {
+    fn open(path: &Path) -> Result<Self, CheckpointError> {
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        Ok(Self {
+            file: RefCell::new(file),
+            length,
+        })
     }
-    Ok(height)
+
+    fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>, CheckpointError> {
+        let end = u64::try_from(offset.saturating_add(length))
+            .map_err(|_| CheckpointError::InvalidCheckpoint("blob offset exceeds address space"))?;
+        if end > self.length {
+            return Err(CheckpointError::InvalidCheckpoint("blob is truncated"));
+        }
+        let mut bytes = vec![0; length];
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Read enough bytes from `offset` to hold any single node.
+    fn window(&self, offset: usize) -> Result<Vec<u8>, CheckpointError> {
+        let offset64 = u64::try_from(offset)
+            .map_err(|_| CheckpointError::InvalidCheckpoint("blob offset exceeds address space"))?;
+        let length = usize::try_from(self.length.saturating_sub(offset64))
+            .unwrap_or(WINDOW)
+            .min(WINDOW);
+        self.read(offset, length)
+    }
 }
 
-struct Loader<'a> {
+struct Importer<'a> {
     records: &'a BTreeMap<MarfBlockId, Record>,
-    blobs: &'a [u8],
+    blocks_by_id: BTreeMap<u32, MarfBlockId>,
+    blobs: &'a Blobs,
+    storage: &'a TrieStorage,
+    identifiers: BTreeMap<u32, u32>,
+    next: BTreeMap<u32, u32>,
 }
 
-impl Loader<'_> {
-    fn load_root(&self, record: &Record) -> Result<MarfTrie, CheckpointError> {
-        let node = self.load_node(record.block_id, ROOT_OFFSET, TrieNodeId::Node256 as u8)?;
-        let TrieNode::Internal { path, children } = node else {
+impl Importer<'_> {
+    /// Import a checkpoint's root, which always hashes as a Node256.
+    fn import_root(&mut self, record: &Record) -> Result<(u32, TrieHash), CheckpointError> {
+        let DecodedNode::Internal { path, pointers, .. } =
+            self.decode_node(record.block_id, ROOT_OFFSET, TrieNodeId::Node256 as u8)?
+        else {
             return Err(CheckpointError::InvalidCheckpoint(
                 "root is not an internal node",
             ));
@@ -325,47 +448,94 @@ impl Loader<'_> {
                 "root has a compressed path",
             ));
         }
-        Ok(MarfTrie {
-            root_children: children,
-        })
+        let (children, hashes) = self.import_children(record.block_id, &pointers)?;
+        let (slot_pointers, slot_hashes) = slots(TrieNodeId::Node256, &children, &hashes);
+        let hash = internal_node_hash(TrieNodeId::Node256, &slot_pointers, &[], &slot_hashes)?;
+        let index = self.write(record.block_id, hash, &TrieNode::Internal { path, children })?;
+        Ok((index, hash))
     }
 
-    fn load_node(
-        &self,
+    fn import_node(
+        &mut self,
         block_id: u32,
         pointer: usize,
         expected_id: u8,
-    ) -> Result<TrieNode, CheckpointError> {
+    ) -> Result<(u32, TrieHash, TrieNodeId), CheckpointError> {
         match self.decode_node(block_id, pointer, expected_id)? {
-            DecodedNode::Leaf { path, value } => Ok(TrieNode::Leaf { path, value }),
+            DecodedNode::Leaf { path, value } => {
+                let hash = leaf_hash(&path, value)?;
+                let index = self.write(block_id, hash, &TrieNode::Leaf { path, value })?;
+                Ok((index, hash, TrieNodeId::Leaf))
+            }
             DecodedNode::Internal { path, pointers, .. } => {
-                let mut children = Vec::new();
-                for pointer in pointers {
-                    if pointer.id == 0 {
-                        continue;
-                    }
-                    let target_id = if pointer.id & BACK_POINTER != 0 {
-                        pointer.back_block
-                    } else {
-                        block_id
-                    };
-                    let target_block = self.block_for_id(target_id)?;
-                    let node = self.load_node(
-                        target_id,
-                        usize::try_from(pointer.offset).map_err(|_| {
-                            CheckpointError::InvalidCheckpoint("node pointer exceeds address space")
-                        })?,
-                        pointer.id,
-                    )?;
-                    children.push(TrieChild {
-                        character: pointer.character,
-                        node: Box::new(node),
-                        referenced_block: (pointer.id & BACK_POINTER != 0).then_some(target_block),
-                    });
-                }
-                Ok(TrieNode::Internal { path, children })
+                let (children, hashes) = self.import_children(block_id, &pointers)?;
+                let id = node_id_for_children(children.len());
+                let (slot_pointers, slot_hashes) = slots(id, &children, &hashes);
+                let hash = internal_node_hash(id, &slot_pointers, &path, &slot_hashes)?;
+                let index = self.write(block_id, hash, &TrieNode::Internal { path, children })?;
+                Ok((index, hash, id))
             }
         }
+    }
+
+    fn import_children(
+        &mut self,
+        block_id: u32,
+        pointers: &[Pointer],
+    ) -> Result<(Vec<TrieChild>, Vec<TrieHash>), CheckpointError> {
+        let mut children = Vec::new();
+        let mut hashes = Vec::new();
+        for pointer in pointers {
+            if pointer.id == 0 {
+                continue;
+            }
+            let back_pointer = pointer.id & BACK_POINTER != 0;
+            let target_id = if back_pointer {
+                pointer.back_block
+            } else {
+                block_id
+            };
+            let offset = usize::try_from(pointer.offset).map_err(|_| {
+                CheckpointError::InvalidCheckpoint("node pointer exceeds address space")
+            })?;
+            let (index, hash, kind) = self.import_node(target_id, offset, pointer.id)?;
+            let referenced_block = back_pointer
+                .then(|| self.block_for_id(target_id))
+                .transpose()?;
+            hashes.push(referenced_block.map_or(hash, TrieHash::from_bytes));
+            children.push(TrieChild {
+                character: pointer.character,
+                referenced_block,
+                target: ChildTarget::Stored {
+                    block: self.identifier(target_id)?,
+                    index,
+                    kind,
+                },
+            });
+        }
+        Ok((children, hashes))
+    }
+
+    fn write(
+        &mut self,
+        block_id: u32,
+        hash: TrieHash,
+        node: &TrieNode,
+    ) -> Result<u32, CheckpointError> {
+        let block = self.identifier(block_id)?;
+        let index = self.next.entry(block).or_default();
+        let assigned = *index;
+        *index = index
+            .checked_add(1)
+            .ok_or(CheckpointError::InvalidCheckpoint("too many trie nodes"))?;
+        self.storage.insert_node(block, assigned, hash, node)?;
+        Ok(assigned)
+    }
+
+    fn identifier(&self, block_id: u32) -> Result<u32, CheckpointError> {
+        self.identifiers.get(&block_id).copied().ok_or(
+            CheckpointError::InvalidCheckpoint("node points to unknown block ID"),
+        )
     }
 
     fn decode_node(
@@ -383,13 +553,8 @@ impl Loader<'_> {
             .offset
             .checked_add(pointer)
             .ok_or(CheckpointError::InvalidCheckpoint("node offset overflow"))?;
-        let bytes = self
-            .blobs
-            .get(start..)
-            .ok_or(CheckpointError::InvalidCheckpoint(
-                "node points outside blob file",
-            ))?;
-        let mut reader = Reader::new(bytes);
+        let window = self.blobs.window(start)?;
+        let mut reader = Reader::new(&window);
         reader.take(32)?;
         let id = reader.byte()?;
         if id & !CONTROL_BITS == 6 {
@@ -402,7 +567,12 @@ impl Loader<'_> {
         }
         if id & !CONTROL_BITS == TrieNodeId::Leaf as u8 {
             let path = reader.path()?;
-            let value = MarfValue::from_bytes(reader.take(40)?.try_into().expect("fixed slice"));
+            let value = MarfValue::from_bytes(
+                reader
+                    .take(40)?
+                    .try_into()
+                    .map_err(|_| CheckpointError::InvalidCheckpoint("leaf value is truncated"))?,
+            );
             return Ok(DecodedNode::Leaf { path, value });
         }
 
@@ -468,12 +638,9 @@ impl Loader<'_> {
     }
 
     fn block_for_id(&self, id: u32) -> Result<MarfBlockId, CheckpointError> {
-        self.records
-            .iter()
-            .find_map(|(block, record)| (record.block_id == id).then_some(*block))
-            .ok_or(CheckpointError::InvalidCheckpoint(
-                "node points to unknown block ID",
-            ))
+        self.blocks_by_id.get(&id).copied().ok_or(
+            CheckpointError::InvalidCheckpoint("node points to unknown block ID"),
+        )
     }
 }
 
@@ -618,10 +785,6 @@ fn replace_pointer(
     Ok(())
 }
 
-fn parse_block(value: &str) -> Result<MarfBlockId, CheckpointError> {
-    parse_hex(value)
-}
-
 fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], CheckpointError> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     if value.len() != LENGTH * 2 {
@@ -640,15 +803,10 @@ fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], Checkpoin
     Ok(bytes)
 }
 
-fn block_at(bytes: &[u8], offset: usize, length: usize) -> Result<MarfBlockId, CheckpointError> {
-    if length != 32 {
-        return Err(CheckpointError::InvalidCheckpoint(
-            "invalid fixed block length",
-        ));
-    }
-    Ok(bytes
-        .get(offset..offset + length)
+fn fixed(bytes: &[u8]) -> Result<MarfBlockId, CheckpointError> {
+    bytes
+        .get(..32)
         .ok_or(CheckpointError::InvalidCheckpoint("blob is truncated"))?
         .try_into()
-        .expect("fixed slice"))
+        .map_err(|_| CheckpointError::InvalidCheckpoint("blob is truncated"))
 }
