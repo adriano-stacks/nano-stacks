@@ -34,22 +34,56 @@ containing characters outside ASCII into a shorter valid one and report
 success. That is a **correctness** divergence, not a cost one: a transaction
 would take a different branch on nano than on the network.
 
+## What the seed reduces to
+
+`u"\u{0}"` — a single NUL. proptest shrank it that far itself.
+
+The compiled path breaks its loop only on the high bit, so any byte under 128
+is accepted, NUL included. That is the fault.
+
+## Three rules that disagree
+
+Before changing anything, these have to be reconciled, because they do not say
+the same thing:
+
+| | admits |
+|---|---|
+| `string_ascii_from_bytes` (clarity-types) | alphanumeric, punctuation **or whitespace** — so tab, newline and `0x7e` |
+| the tests here | `(0x20u8..0x7e)` — a half-open range, so no whitespace and no `0x7e` |
+| the compiled path | anything under `0x80` |
+
+An attempt to make the compiled path follow `string_ascii_from_bytes` was
+reverted rather than kept: it moved the compiled path in the *permissive*
+direction on a reading that the second failing case contradicts. That case has
+the interpreter answering `(err u1)` for an input whose compiled conversion is
+`"\t\\"` — a tab and a backslash, which `string_ascii_from_bytes` admits. So
+either `to-ascii?` does not go through that function on this path, or the input
+carried something else the compiled path dropped.
+
+Settling which rule `to-ascii?` actually applies is the first task, and no
+change should land before it does. A wrong answer here is a consensus fault in
+the direction that accepts what the network rejects.
+
 ## Where it came from
 
 A random case, hit during a full-suite run on 2026-07-30 and persisted by
 proptest under `tests/proptest-regressions/to_ascii.txt` — which is gitignored,
-so it does not travel with the repository. It reproduces on demand once that
-file exists and disappears with it, which is worth knowing before concluding it
-is fixed.
+so it does not travel with the repository. Verified: the tests pass six of six
+with that file moved aside and fail two of six with it in place. The seed line
+is
 
-It is not caused by the charging work of the same day: it reproduces with those
-changes stashed and with `words/` checked out from before them.
+```
+cc 209793d50b98eeaad07990d183079a0d022d81c76ea3398cd494089146c5293b
+```
+
+It is not caused by the charging work of the same day: both tests fail with
+those changes stashed and with `words/` checked out from before them.
 
 ## Tasks
 
-- [ ] Reduce it to the shortest UTF-8 input that converts differently.
-- [ ] Decide which byte classes the compiled path is admitting or dropping, and
-      make it apply `string_ascii_from_bytes`' rule.
+- [x] Reduce it to the shortest UTF-8 input that converts differently — a NUL.
+- [ ] Settle which rule `to-ascii?` applies, given the three that disagree, and
+      only then change the compiled path.
 - [ ] Keep the reduced case as a unit test, so it does not depend on a
       gitignored seed file.
 - [ ] Check the neighbouring conversions — `to-utf8?`, `string-to-int?`,
