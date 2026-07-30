@@ -297,10 +297,17 @@ impl ComplexWord for Fold {
             loop_.local_get(l);
         }
 
-        if let Some(simple) = words::lookup_simple(func).or(words::lookup_variadic_simple(func)) {
-            // Call simple builtin
+        if let Some(simple) = words::lookup_simple(func) {
+            // Call simple builtin, which charges itself.
             let arg_types = &[(&elem_ty).into(), result_clar_ty.clone()];
             simple.visit(generator, &mut loop_, arg_types, &result_clar_ty)?;
+        } else if let Some(variadic) = words::lookup_variadic_simple(func) {
+            // A variadic is charged by its caller rather than by `visit`. The
+            // interpreter applies the word once an element, through
+            // `dispatch_args`, so the loop body charges it once an element.
+            let arg_types = &[(&elem_ty).into(), result_clar_ty.clone()];
+            variadic.charge(generator, &mut loop_, arg_types.len() as u32)?;
+            variadic.visit(generator, &mut loop_, arg_types, &result_clar_ty)?;
         } else {
             let preallocated = generator.borrow_local(ValType::I32);
             loop_.i32_const(accumulator_offset).local_set(*preallocated);
@@ -808,8 +815,12 @@ impl ComplexWord for Map {
             }
         }
 
-        // cost tracking: depends on the number of elements in the result
-        self.charge(generator, builder, *num_elements)?;
+        // `special_map` charges for how many arguments it was applied to, not
+        // for how long the sequences turn out to be.
+        self.charge(generator, builder, args.len() as u32)?;
+        // The name of the applied function is resolved once before the loop,
+        // as `special_fold` does; see `Fold`.
+        generator.charge_function_lookup(builder)?;
 
         // here is the map loop: we go through each corresponding element of each sequence and apply the function
         let loop_id = {
@@ -870,6 +881,9 @@ impl ComplexWord for Map {
                         "map needs at least one sequence argument".to_owned(),
                     ));
                 };
+                // Charged once an element with the whole argument count, as the
+                // standalone dispatcher charges once for the whole interleave.
+                variadic.charge(generator, &mut loop_, mapargs.len() as u32)?;
                 // if we have only one sequence, we use the function directly, otherwise we load each following arguments
                 // and interleave them with the variadic function.
                 first_element_type.load(generator, &mut loop_, **first_offset)?;

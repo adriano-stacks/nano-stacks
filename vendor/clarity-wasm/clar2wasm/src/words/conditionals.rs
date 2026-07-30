@@ -4,7 +4,7 @@ use walrus::ir::{self, Block, IfElse, Loop, UnaryOp};
 use walrus::{InstrSeqBuilder, LocalId, ValType};
 
 use super::{ComplexWord, SimpleWord, Word};
-use crate::cost::WordCharge;
+use crate::cost::{ChargeGenerator, WordCharge};
 use crate::duck_type::dt_needed_workspace;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
@@ -461,6 +461,9 @@ impl ComplexWord for Filter {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
         self.charge(generator, builder, 0)?;
+        // The name of the applied function is resolved once before the loop,
+        // as `special_fold` does; see `Fold`.
+        generator.charge_function_lookup(builder)?;
 
         let memory = generator.get_memory()?;
 

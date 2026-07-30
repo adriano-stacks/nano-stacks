@@ -1482,9 +1482,9 @@ mod word {
         3 => CostMeter { runtime: 144,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("filter", "(filter not (list true false true false))", {
-        1 => CostMeter { runtime: 12000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1426,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1211,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 13000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1442,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1227,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("if", "(if true 1 2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1767,9 +1767,9 @@ mod word {
     // `fold` resolves its function argument before the loop, as every other
     // application does; these carry that lookup.
     decl_tests!("fold", "(fold * (list 2 2 2) 1)", {
-        1 => CostMeter { runtime: 53000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1401,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1344,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 62000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1956,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1797,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("len", "(len 0x010203)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1785,8 +1785,8 @@ mod word {
                           (if (is-eq char 0x00) 0x00 0x01)) \
                         (map zero-or-one 0x000102)", {
         1 => CostMeter { runtime: 65000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 9054,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 7940,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 7860,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 6758,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("replace_at", "(replace-at? 0x00112233 u2 0x44)", {
         3 => CostMeter { runtime: 581,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -2132,25 +2132,27 @@ mod crosscheck {
         }
     }
 
-    /// A fold over a *native* word is short by **31 an element**: nano inlines
-    /// the word and charges what it does, but never pays to apply it. Over a
-    /// user-defined function a fold is exact, because applying that is a real
-    /// call nano already charges.
+    /// Applying a word to each element of a `fold`, `map` or `filter` costs
+    /// what applying it anywhere else costs.
     ///
-    /// It is not a user-function application: charging one per element costs
-    /// 57 an element and overshoots by 26.
-    ///
-    /// What the interpreter does pay is in `dispatch_args` (`vm/mod.rs`):
-    /// applying a `CallableType::NativeFunction` charges that word's own cost
-    /// function with `args.len()`. Inside a fold that happens once an element,
-    /// while nano inlines the word and charges it once for the whole loop —
-    /// which is the shape to check next.
-    ///
-    /// Ignored because it fails: it is the reproduction, not a guard.
+    /// Two charges were missing. A *variadic* word is charged by its caller
+    /// rather than by its own `visit`, and these three call `visit` directly,
+    /// so `(fold * ...)` never paid for the multiply — 31 an element. And
+    /// resolving the applied function's name, which `fold` charged and the
+    /// other two did not, is a flat 16.
     #[test]
-    #[ignore = "known divergence: a fold over a native word does not pay to apply it"]
     fn charges_a_native_fold() {
-        crosscheck_cost("(define-public (f) (ok (fold * (list u2 u2 u2) u1)))", "f", &[]);
+        for snippet in [
+            "(define-public (f) (ok (fold * (list u2 u2 u2) u1)))",
+            "(define-public (f) (ok (fold + (list u1 u1 u1) u0)))",
+            "(define-public (f) (ok (map + (list u1 u1) (list u2 u2))))",
+            "(define-public (f) (ok (map not (list true false true))))",
+            "(define-public (f) (ok (filter not (list true false true))))",
+            "(define-private (g (i uint) (a uint)) (* a i))
+             (define-public (f) (ok (fold g (list u2 u2 u2) u1)))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
     }
 
     #[test]
