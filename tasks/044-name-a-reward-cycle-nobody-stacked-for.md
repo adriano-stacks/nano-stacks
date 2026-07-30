@@ -65,6 +65,27 @@ reward cycle 23 has no signer set: nothing stacked for it
 It stays fatal, because a cycle no one signs cannot be extended into. Only the
 diagnosis changed, not the behaviour.
 
+## A second way it deadlocks
+
+Rebuilding the network from genesis to validate later work hit a different
+stall, and a harder one. The stock nodes wedge processing burn block 241,
+looping:
+
+```
+Process burn block 241 reward cycle 12 ... is_rc_start: true
+No PoX anchor block known yet for cycle 12
+ERRO Missing canonical anchor block
+```
+
+Bitcoin ran on to 253 and past; the Stacks tip never left 8. **nano was not
+running at all** — it had not been introduced yet — so this is stacks-core
+failing to bootstrap its own chain, not a participant misbehaving.
+
+Two distinct deadlocks now, then: this one at the first reward-cycle boundary
+after Nakamoto on a fresh genesis, and the stacking-horizon one above on a
+long-lived network. Between them a Hacknet run is only reliably usable for a
+window in the middle, which is worth knowing before planning to validate on it.
+
 ## Tasks
 
 - [x] Establish whether the empty set is nano's or the network's — it is the
@@ -74,6 +95,9 @@ diagnosis changed, not the behaviour.
 - [ ] Give the Hacknet harness a way to keep stacking ahead of the prepare
       phase, so a long run does not deadlock at a cycle boundary. `W13` already
       notes the stacker needed a pox-5 path; this is the rest of it.
+- [ ] Find why a fresh genesis wedges on `Missing canonical anchor block` at
+      the first cycle boundary, and whether the boot needs a longer pre-Nakamoto
+      run or a prepared snapshot.
 
 ## Acceptance Criteria
 
