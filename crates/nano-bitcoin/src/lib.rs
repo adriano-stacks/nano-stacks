@@ -40,6 +40,15 @@ impl PreStxCache {
             height.saturating_sub(*seen_height) <= PRE_STX_WINDOW_BLOCKS
         });
     }
+
+    /// Drop the pairings contributed at or above a Bitcoin height.
+    ///
+    /// A reorganized Bitcoin block takes its `PreStx` outputs with it, so the
+    /// operations they would have authenticated are no longer paired.
+    pub fn invalidate_from(&mut self, height: u64) {
+        self.senders
+            .retain(|_, (_, seen_height)| *seen_height < height);
+    }
 }
 
 /// The source boundary for Bitcoin input.
@@ -63,6 +72,14 @@ pub struct BitcoinRpcSource {
 pub enum BitcoinRpcSourceError {
     Rpc(bitcoincore_rpc::Error),
     Parse(BitcoinParseError),
+    /// Bitcoin no longer holds the block this source read at that height.
+    ///
+    /// The fork can be deeper: this is only the shallowest height known to have
+    /// changed. Callers locate the fork point against their own snapshot
+    /// history and call [`BitcoinRpcSource::invalidate_from`] with it.
+    Reorganized {
+        height: u64,
+    },
 }
 
 impl std::fmt::Display for BitcoinRpcSourceError {
@@ -70,6 +87,10 @@ impl std::fmt::Display for BitcoinRpcSourceError {
         match self {
             Self::Rpc(error) => error.fmt(formatter),
             Self::Parse(error) => error.fmt(formatter),
+            Self::Reorganized { height } => write!(
+                formatter,
+                "Bitcoin block at height {height} is no longer canonical"
+            ),
         }
     }
 }
@@ -79,6 +100,7 @@ impl std::error::Error for BitcoinRpcSourceError {
         match self {
             Self::Rpc(error) => Some(error),
             Self::Parse(error) => Some(error),
+            Self::Reorganized { .. } => None,
         }
     }
 }
@@ -119,8 +141,45 @@ impl BitcoinRpcSource {
         ))
     }
 
+    /// Forget every block read at or above a Bitcoin height.
+    ///
+    /// Called with the first height a reorganization invalidated, this leaves
+    /// the source primed with the surviving chain's `PreStx` outputs only, so
+    /// the next read walks forward from the fork point.
+    pub fn invalidate_from(&mut self, height: u64) {
+        self.pre_stx.invalidate_from(height);
+        self.last_block = self.last_block.take().filter(|block| block.height < height);
+        self.last_height = self.last_height.and_then(|last| {
+            if last < height {
+                Some(last)
+            } else {
+                height.checked_sub(1)
+            }
+        });
+    }
+
+    /// Report a reorganization rather than folding it into the next read.
+    ///
+    /// The `PreStx` window and the incremental walk are only sound over a chain
+    /// that has not moved underneath them.
+    fn check_last_read(&mut self) -> Result<(), BitcoinRpcSourceError> {
+        let Some((height, hash)) = self
+            .last_block
+            .as_ref()
+            .map(|block| (block.height, block.hash))
+        else {
+            return Ok(());
+        };
+        if self.block_hash_at(height)? == hash {
+            return Ok(());
+        }
+        self.invalidate_from(height);
+        Err(BitcoinRpcSourceError::Reorganized { height })
+    }
+
     /// Decode the protocol operations in a Bitcoin block, retaining required prior `PreStx` outputs.
     pub fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, BitcoinRpcSourceError> {
+        self.check_last_read()?;
         if let Some(block) = self
             .last_block
             .as_ref()
@@ -741,8 +800,8 @@ mod tests {
         BitcoinBlock, BitcoinOperationKind, BitcoinRpcSource, LeaderBlockCommitment,
         LeaderCommitmentTransactionError, LeaderKeyRegistration, LeaderKeyRegistrationError,
         PreStxCache, build_leader_commitment_transaction,
-        build_leader_key_registration_transaction, decode_block, parse_leader_block_commit,
-        parse_leader_key_registration, protocol_payload,
+        build_leader_key_registration_transaction, decode_block, decode_block_with_pre_stx,
+        parse_leader_block_commit, parse_leader_key_registration, protocol_payload,
     };
 
     #[test]
@@ -763,18 +822,56 @@ mod tests {
     }
 
     #[test]
-    fn rpc_source_reuses_the_current_block_without_another_request() {
+    fn rpc_source_rewinds_to_the_fork_point_of_a_reorganization() {
         let mut source =
             BitcoinRpcSource::new("http://127.0.0.1:18443", "user", "password", *b"T3")
                 .expect("create RPC source");
+        let sender =
+            nano_address::StacksAddress::new(26, nano_primitives::Hash160::from_bytes([0x24; 20]))
+                .expect("valid Stacks address");
         source.last_height = Some(123);
         source.last_block = Some(BitcoinBlock {
             height: 123,
             hash: [0x42; 32],
             operations: Vec::new(),
         });
+        source.pre_stx.senders.insert([0x01; 32], (sender, 120));
+        source.pre_stx.senders.insert([0x02; 32], (sender, 122));
 
-        assert_eq!(source.block_at(123).expect("cached block").hash, [0x42; 32]);
+        source.invalidate_from(122);
+
+        assert_eq!(source.last_height, Some(121));
+        assert!(source.last_block.is_none());
+        assert_eq!(
+            source.pre_stx.senders.keys().collect::<Vec<_>>(),
+            [&[0x01; 32]]
+        );
+    }
+
+    #[test]
+    fn prestx_pairings_of_a_reorganized_block_are_dropped() {
+        let mut cache = PreStxCache::new();
+        let pre_stx = transaction(
+            vec![TxIn::default()],
+            vec![protocol_output(b'p', &[]), p2pkh_output(0x24)],
+        );
+        let spend = TxIn {
+            previous_output: OutPoint::new(pre_stx.compute_txid(), 1),
+            ..TxIn::default()
+        };
+        decode_block_with_pre_stx(100, &block_bytes(vec![pre_stx]), *b"T3", &mut cache)
+            .expect("valid Bitcoin block");
+        cache.invalidate_from(100);
+
+        let transfer = transaction(
+            vec![spend],
+            vec![protocol_output(b'$', &[0; 16]), p2pkh_output(0x42)],
+        );
+        let block =
+            decode_block_with_pre_stx(101, &block_bytes(vec![transfer]), *b"T3", &mut cache)
+                .expect("valid Bitcoin block");
+
+        assert!(block.operations.is_empty());
     }
 
     #[test]
