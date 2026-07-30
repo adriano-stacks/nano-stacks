@@ -23,6 +23,7 @@ use nano_address::StacksAddress;
 use nano_bitcoin::BitcoinRpcSource;
 use nano_chainstate::{NakamotoBlock, SignerSetError, TenureAccounting};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
+use nano_mempool::Mempool;
 use nano_miner::{
     BitcoinTenureView, BitcoinWallet, CommitmentPlanError, ProposalCoordinator, ProposalError,
     RegisteredLeaderKey, SortitionHashPoint, TenureExtension, TenureTip,
@@ -137,6 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut committed_at = 0;
     let mut mined = Vec::new();
+    let mut mempool = Mempool::new(network);
     let mut tenure: Option<TenureState> = None;
     loop {
         if let Err(error) = executor
@@ -169,6 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 miner_hash,
                 miner_address,
                 mined: &mut mined,
+                mempool: &mut mempool,
                 tenure,
             },
         )
@@ -289,6 +292,8 @@ struct Tracked<'a> {
     miner_address: StacksAddress,
     /// Tenures already started, so a won sortition is not mined twice.
     mined: &'a mut Vec<ConsensusHash>,
+    /// The transactions this node holds for the blocks it still owes.
+    mempool: &'a mut Mempool,
     tenure: Option<TenureState>,
 }
 
@@ -309,6 +314,7 @@ async fn advance_tenure(
         miner_hash,
         miner_address,
         mined,
+        mempool,
         mut tenure,
     } = tracked;
     let Some(won) = won_tenure(node, miner_hash, mined).await? else {
@@ -316,7 +322,9 @@ async fn advance_tenure(
         // keeps confirming what the mempool holds, and says on chain when the
         // tenure outlives the budget it started with.
         if let Some(state) = tenure.as_mut()
-            && let Some(block) = continue_tenure(cli, network, node, pox, miner_key, executor, state).await?
+            && let Some(block) =
+                continue_tenure(cli, network, node, pox, miner_key, executor, mempool, state)
+                    .await?
         {
             println!(
                 "the network accepted nano's block {} at height {}",
@@ -342,7 +350,10 @@ async fn advance_tenure(
         );
         return Ok(Some(resumed));
     }
-    let block = mine(cli, network, node, pox, password, miner_key, vrf_key, executor, &won).await?;
+    let block = mine(
+        cli, network, node, pox, password, miner_key, vrf_key, executor, &won,
+    )
+    .await?;
     println!("the network accepted nano's block {}", block.block_id());
     let started = TenureState::started(&won, &block, nonce);
     executor.accept_own_block(block);
@@ -384,6 +395,7 @@ async fn resume_tenure(
 /// when the mempool is empty, and when no extension is due: a block with no
 /// transactions and no tenure change would only ask the signers to sign the
 /// state it already agreed to.
+#[allow(clippy::too_many_arguments)]
 async fn continue_tenure(
     cli: &Cli,
     network: Network,
@@ -391,6 +403,7 @@ async fn continue_tenure(
     pox: &PoxInfo,
     miner_key: &StacksPrivateKey,
     executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+    mempool: &mut Mempool,
     state: &TenureState,
 ) -> Result<Option<NakamotoBlock>, Box<dyn Error>> {
     let tenure = node.tenure_info().await?;
@@ -399,7 +412,11 @@ async fn continue_tenure(
     {
         return Ok(None);
     }
-    let (pending, _) = node.mempool_page(None).await?;
+    let now = now_unix();
+    node.fill_mempool(mempool, now).await?;
+    let accounts = node.accounts_for(mempool).await?;
+    mempool.advance(&accounts, now);
+    let pending = mempool.candidates(&accounts);
     let extend_due = !state.extended
         && state.since.elapsed() >= Duration::from_secs(cli.tenure_extend_after_secs);
     if pending.is_empty() && !extend_due {
@@ -447,9 +464,13 @@ async fn continue_tenure(
         block.transactions.len(),
         hex::encode(applied.execution.state_root.0)
     );
-    submit(cli, node, pox, miner_key, block, sortition.bitcoin_height)
-        .await
-        .map(Some)
+    let block = submit(cli, node, pox, miner_key, block, sortition.bitcoin_height).await?;
+    // A confirmed transaction leaves now rather than when the peer's account
+    // nonces catch up, so the next block does not offer it again.
+    for transaction in &block.transactions {
+        mempool.remove(transaction.txid());
+    }
+    Ok(Some(block))
 }
 
 /// The tenure this miner has won and not yet mined, if there is one.

@@ -8,6 +8,7 @@ members = [
     "crates/nano-bitcoin",
     "crates/nano-sortition",
     "crates/nano-marf",
+    "crates/nano-mempool",
     "crates/nano-vm",
     "crates/nano-chainstate",
     "crates/nano-sync",

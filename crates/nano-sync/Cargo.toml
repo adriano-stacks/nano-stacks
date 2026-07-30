@@ -10,6 +10,7 @@ nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
+nano-mempool = { path = "../nano-mempool" }
 nano-primitives = { path = "../nano-primitives" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }

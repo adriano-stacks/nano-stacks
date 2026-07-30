@@ -2573,6 +2573,7 @@ dependencies = [
  "nano-codec",
  "nano-crypto",
  "nano-marf",
+ "nano-mempool",
  "nano-node",
  "nano-primitives",
  "nano-signer",
@@ -2611,6 +2612,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-mempool"
+version = "0.1.0"
+dependencies = [
+ "nano-address",
+ "nano-codec",
+ "nano-crypto",
+ "nano-primitives",
+ "serde_json",
+]
+
+[[package]]
 name = "nano-miner"
 version = "0.1.0"
 dependencies = [
@@ -2623,6 +2635,7 @@ dependencies = [
  "nano-chainstate",
  "nano-codec",
  "nano-crypto",
+ "nano-mempool",
  "nano-node",
  "nano-primitives",
  "nano-sortition",
@@ -2727,6 +2740,7 @@ dependencies = [
  "nano-chainstate",
  "nano-codec",
  "nano-crypto",
+ "nano-mempool",
  "nano-primitives",
  "reqwest",
  "serde",

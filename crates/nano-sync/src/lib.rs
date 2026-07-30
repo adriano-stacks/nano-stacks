@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
@@ -9,6 +9,7 @@ use nano_chainstate::{
 };
 use nano_codec::Transaction;
 use nano_crypto::{CryptoError, StacksPublicKey};
+use nano_mempool::{Account, Admission, ChainTip, Mempool};
 use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId,
     StacksBlockId,
@@ -21,6 +22,19 @@ use serde_json::Value;
 pub struct SyncClient {
     client: Client,
     base_url: Url,
+}
+
+/// The accounts a peer reports, as the tip a mempool judges against.
+///
+/// A node that follows a peer has no account index of its own until it
+/// executes, so the peer's view of the tip is the one it admits against.
+#[derive(Clone, Debug, Default)]
+pub struct PeerAccounts(HashMap<StacksAddress, Account>);
+
+impl ChainTip for PeerAccounts {
+    fn account(&self, address: &StacksAddress) -> Account {
+        self.0.account(address)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +173,7 @@ pub enum SyncError {
     UnstableTip,
     Fork,
     InvalidMempool,
+    InvalidAccount,
 }
 
 impl fmt::Display for SyncError {
@@ -180,6 +195,7 @@ impl fmt::Display for SyncError {
             Self::UnstableTip => formatter.write_str("peer tip changed during tenure download"),
             Self::Fork => formatter.write_str("peer tenure does not extend the followed chain"),
             Self::InvalidMempool => formatter.write_str("mempool page is not a transaction stream"),
+            Self::InvalidAccount => formatter.write_str("account response has no readable balance"),
         }
     }
 }
@@ -202,7 +218,8 @@ impl std::error::Error for SyncError {
             | Self::BlockUploadRejected
             | Self::UnstableTip
             | Self::Fork
-            | Self::InvalidMempool => None,
+            | Self::InvalidMempool
+            | Self::InvalidAccount => None,
         }
     }
 }
@@ -286,8 +303,69 @@ impl SyncClient {
 
     /// Fetch the next nonce an account's transactions must use.
     pub async fn account_nonce(&self, address: StacksAddress) -> Result<u64, SyncError> {
+        Ok(self.account(address).await?.nonce)
+    }
+
+    /// Fetch the nonce and spendable balance a peer holds for an account.
+    pub async fn account(&self, address: StacksAddress) -> Result<Account, SyncError> {
         let response: AccountWire = self.get(&format!("v2/accounts/{address}?proof=0")).await?;
-        Ok(response.nonce)
+        let balance = u128::from_str_radix(response.balance.trim_start_matches("0x"), 16)
+            .map_err(|_| SyncError::InvalidAccount)?;
+        Ok(Account {
+            nonce: response.nonce,
+            balance: Some(balance),
+        })
+    }
+
+    /// Fetch the account state every transaction a mempool holds is judged
+    /// against.
+    pub async fn accounts_for(&self, mempool: &Mempool) -> Result<PeerAccounts, SyncError> {
+        let mut accounts = HashMap::new();
+        for address in mempool.addresses() {
+            accounts.insert(address, self.account(address).await?);
+        }
+        Ok(PeerAccounts(accounts))
+    }
+
+    /// Offer a peer's whole mempool to a local one, and report what it kept.
+    ///
+    /// A peer's mempool is a source of transactions, not the node's answer to
+    /// what it will mine: every transaction it hands over is admitted on this
+    /// node's own rules against this node's own view of the accounts.
+    pub async fn fill_mempool(&self, mempool: &mut Mempool, now: u64) -> Result<usize, SyncError> {
+        let mut pending = Vec::new();
+        let mut page = None;
+        loop {
+            let (transactions, next) = self.mempool_page(page).await?;
+            pending.extend(transactions);
+            match next {
+                Some(next) => page = Some(next),
+                None => break,
+            }
+        }
+
+        let mut accounts = HashMap::new();
+        for transaction in &pending {
+            for address in [transaction.origin_address(), transaction.sponsor_address()]
+                .into_iter()
+                .flatten()
+            {
+                if let std::collections::hash_map::Entry::Vacant(slot) = accounts.entry(address) {
+                    slot.insert(self.account(address).await?);
+                }
+            }
+        }
+        let accounts = PeerAccounts(accounts);
+        let mut admitted = 0;
+        for transaction in pending {
+            if matches!(
+                mempool.submit(transaction, &accounts, now),
+                Ok(Admission::Added | Admission::Replaced(_))
+            ) {
+                admitted += 1;
+            }
+        }
+        Ok(admitted)
     }
 
     /// Fetch the waterfall reward set active for one reward cycle.
@@ -783,6 +861,8 @@ struct BlockUploadWire {
 #[derive(Deserialize)]
 struct AccountWire {
     nonce: u64,
+    /// The balance the account can spend now, as thirty-two hexadecimal digits.
+    balance: String,
 }
 
 #[derive(Deserialize)]
