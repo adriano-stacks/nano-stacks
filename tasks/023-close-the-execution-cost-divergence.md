@@ -178,16 +178,28 @@ same way the earlier eight were found.
 
 ## Hacknet
 
-Not validated on a live chain. Two runs tried. The first ended on nano's side,
-which is now fixed ([[041-walk-back-when-our-tip-left-the-chain]]); on the
-second nano ran for minutes, signing for its cycle, while the network itself
-stayed frozen — stock signers looping on `Last accepted block has timed out`
-and `Cannot validate block, no global signer state`, with the tip already stuck
-before nano rejoined.
+**Validated.** With all seventeen charging fixes in, `harness.sh verify`
+against a fresh network:
 
-That Hacknet has now deadlocked itself in three of five boots, so a live
-measurement of these cost changes needs a network that stays up, not another
-attempt.
+```
+observed 47 canonical blocks across cycles 15..=16
+every one of the 47 blocks carries nano's signature
+nano mined 16 of the 47 canonical blocks
+29 transfer, 4 deploy, 59 call, 8 tenure change, 8 coinbase transactions,
+  each with one the network reports as success
+9 sortitions across 3 distinct miners
+reward cycle 16 pays a waterfall set in which nano holds weight 10 of 30
+```
+
+Hacknet runs three signers of equal weight against a seven-tenths threshold, so
+no block is accepted without all three: a network that keeps producing with
+nano signing and mining is proof the cost changes did not move anything the
+network disagrees with.
+
+It took four attempts. Three earlier networks deadlocked on their own stock
+signers — `Last accepted block has timed out`, `Cannot validate block, no
+global signer state` — which was confirmed as not nano's by restoring the stock
+participant and watching the tip stay frozen anyway.
 
 The offline evidence stands on its own — every cost change here is crosschecked
 against the interpreter, and the 340-block replay matches state roots and
