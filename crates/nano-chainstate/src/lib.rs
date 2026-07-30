@@ -322,6 +322,20 @@ impl TenureAccounting {
     }
 
     /// Record a tenure whose start block was executed here.
+    /// The rewards a tenure earned, once they have been recorded.
+    #[must_use]
+    pub fn earnings_at(&self, coinbase_height: u64) -> Option<&TenureEarnings> {
+        self.earnings.get(&coinbase_height)
+    }
+
+    /// The STX a tenure earned, as `get-tenure-info? block-reward` reports it.
+    #[must_use]
+    pub fn reward_for_tenure(&self, coinbase_height: u64) -> u128 {
+        self.earnings
+            .get(&coinbase_height)
+            .map_or(0, |earnings| earnings.coinbase.saturating_add(earnings.fees))
+    }
+
     pub fn record_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
         self.earnings.insert(coinbase_height, earnings);
         self.started = Some(coinbase_height);
@@ -497,6 +511,8 @@ struct BlockExecution<'a> {
 pub struct ChainState {
     vm: Vm,
     accounting: TenureAccounting,
+    /// Stacks height each tenure started at, which `get-tenure-info?` maps back.
+    tenure_start_heights: BTreeMap<u32, u32>,
 }
 
 #[derive(Debug)]
@@ -573,6 +589,7 @@ impl ChainState {
         Ok(Self {
             vm: Vm::new(network)?,
             accounting: TenureAccounting::default(),
+            tenure_start_heights: BTreeMap::new(),
         })
     }
 
@@ -586,6 +603,7 @@ impl ChainState {
         Ok(Self {
             vm: Vm::from_checkpoint(network, path, source, expected_root)?,
             accounting: TenureAccounting::default(),
+            tenure_start_heights: BTreeMap::new(),
         })
     }
 
@@ -593,6 +611,14 @@ impl ChainState {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.vm.network()
+    }
+
+    /// Evaluate a read-only Clarity program against the state just executed.
+    pub fn evaluate(&mut self, source: &str) -> Result<Option<Value>, ChainStateError> {
+        Ok(self
+            .vm
+            .execute(source, LimitedCostTracker::new_free())?
+            .value)
     }
 
     /// Read an account's spendable STX at the state this chainstate reads from.
@@ -1027,6 +1053,7 @@ impl ChainState {
                 }
                 RootPolicy::Trust => {}
             }
+            self.record_block_header(block, bitcoin_context)?;
             let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
             Ok(AppliedBlock {
                 bitcoin_height: bitcoin_context.height,
@@ -1040,6 +1067,57 @@ impl ChainState {
             drop(self.vm.abort_block());
         }
         result
+    }
+
+    /// Record what Clarity may later read about the block just executed.
+    ///
+    /// Every block of a tenure reports that tenure's burn block, which is what
+    /// `get-tenure-info?` returns and what stacks-core stores per header.
+    fn record_block_header(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), ChainStateError> {
+        let tenure_height = self.vm.tenure_height()?;
+        let stacks_height = u32::try_from(block.header.chain_length).map_err(|_| {
+            ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
+        })?;
+        if block_starts_new_tenure(block) {
+            self.tenure_start_heights.insert(tenure_height, stacks_height);
+        }
+        let miner = self
+            .accounting
+            .earnings_at(u64::from(tenure_height))
+            .and_then(|earnings| match &earnings.recipient {
+                PrincipalData::Standard(address) => Some((address.version(), address.1)),
+                PrincipalData::Contract(_) => None,
+            })
+            .unwrap_or((0, [0; 20]));
+        self.vm.record_block_header(
+            *block.block_id().as_bytes(),
+            nano_vm::BlockHeader {
+                burn_header_hash: bitcoin_context.burn_header_hash,
+                burn_block_height: u32::try_from(bitcoin_context.height).map_err(|_| {
+                    ChainStateError::InvalidTransaction("Bitcoin height overflows u32".to_owned())
+                })?,
+                burn_block_time: bitcoin_context.burn_block_time,
+                stacks_block_time: block.header.timestamp,
+                block_header_hash: *block.header.block_hash().as_bytes(),
+                consensus_hash: *block.header.consensus_hash.as_bytes(),
+                vrf_seed: bitcoin_context.vrf_seed,
+                miner_address: miner,
+                burn_spend_total: bitcoin_context.burn_spend_total,
+                burn_spend_winner: bitcoin_context.burn_spend_winner,
+                block_reward: self.accounting.reward_for_tenure(u64::from(tenure_height)),
+                tenure_height,
+                tenure_start_height: self
+                    .tenure_start_heights
+                    .get(&tenure_height)
+                    .copied()
+                    .unwrap_or(stacks_height),
+            },
+        );
+        Ok(())
     }
 
     /// Mint the SIP-031 emission a new tenure owes, to the `.sip-031` contract.

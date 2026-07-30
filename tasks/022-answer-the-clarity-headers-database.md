@@ -1,13 +1,14 @@
 ---
 id: "022"
 title: "Answer the Clarity headers database"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: feature
 dependencies: []
 tags: ["mainnet", "vm", "consensus"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Answer the Clarity headers database
@@ -27,11 +28,11 @@ and it is the piece of it that was not built.
 
 ## Tasks
 
-- [ ] Keep the header fields Clarity can read for every block nano executes.
-- [ ] Implement `HeadersDB` over that index and use it wherever `NULL_HEADER_DB`
+- [x] Keep the header fields Clarity can read for every block nano executes.
+- [x] Implement `HeadersDB` over that index and use it wherever `NULL_HEADER_DB`
       is passed today.
-- [ ] Cross-check each accessor against stacks-core on the captured chain.
-- [ ] Cover the tenure-height and stacks-height mappings, which are not header
+- [x] Cross-check each accessor against stacks-core on the captured chain.
+- [x] Cover the tenure-height and stacks-height mappings, which are not header
       fields.
 
 ## Acceptance Criteria
@@ -41,3 +42,22 @@ and it is the piece of it that was not built.
   captured block.
 - A contract calling `get-stacks-block-info?` and `get-tenure-info?` replays with
   matching receipts.
+
+## Known limits
+
+Two answers are still not what stacks-core would give, and both need work that
+is not this task's:
+
+- `block-reward` is what a tenure earned, and a tenure's reward is not known
+  until it matures a hundred tenures later. nano records what the accounting
+  holds at execution time, which is zero until then. Correcting it means
+  revising a header record once its rewards mature.
+- A block older than the checkpoint has no header record at all, so every
+  accessor answers `none` for it where a node with full history answers. This
+  is inherent to starting from a checkpoint; see
+  [[031-establish-a-trust-root-for-the-checkpoint]].
+
+`vm-epoch::epoch-version` is only ever written inside the rolled-back
+transaction the cost tracker uses, so a store nano did not import reads as
+Epoch 2.0. Production always imports a checkpoint that carries the right value,
+but a genesis `Vm` does not, and Clarity takes its pre-3.0 branches there.

@@ -134,6 +134,9 @@ impl PoxInfo {
             // Only a tenure-start block collects a coinbase, so its caller
             // fills this in from the sortitions around it.
             accumulated_coinbase: 0,
+            // The tenure's own burn block, which its caller reads from the
+            // sortition that awarded it.
+            ..BitcoinBlockContext::at_height(self.bitcoin_height)
         }
     }
 }

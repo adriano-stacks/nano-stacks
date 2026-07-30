@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_bitcoin::{BitcoinOperation, PreStxCache, decode_block_with_pre_stx};
+use nano_bitcoin::{BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block_with_pre_stx};
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
 use nano_primitives::{Network, TrieHash};
 use serde::Deserialize;
@@ -32,7 +32,9 @@ pub enum FixtureMode {
 struct CapturedBitcoinSnapshot {
     block_height: u64,
     burn_header_hash: String,
+    burn_header_timestamp: u64,
     consensus_hash: String,
+    winning_block_txid: String,
 }
 
 #[derive(Deserialize)]
@@ -778,15 +780,56 @@ fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlo
     let first_height = field("pox_first_bitcoin_height")?;
     let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
     let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
+    let operations = captured_bitcoin_operations(root)?;
     snapshots
         .into_iter()
         .map(|snapshot| {
+            // What Clarity reads back about the tenure's burn block, which the
+            // capture holds either in the snapshot or in the Bitcoin block.
+            let commits = operations.get(&snapshot.consensus_hash);
+            let winner = decode_hash(&snapshot.winning_block_txid);
+            let burn = |operation: &BitcoinOperation| -> u128 {
+                operation
+                    .outputs
+                    .iter()
+                    .map(|output| u128::from(output.amount_sats))
+                    .sum()
+            };
+            let (vrf_seed, burn_spend_winner) = commits
+                .and_then(|commits| {
+                    commits.iter().find_map(|operation| match operation.kind {
+                        BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }
+                            if Some(operation.txid) == winner =>
+                        {
+                            Some((new_seed, burn(operation)))
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or(([0; 32], 0));
+            let burn_spend_total = commits.map_or(0, |commits| {
+                commits
+                    .iter()
+                    .filter(|operation| {
+                        matches!(
+                            operation.kind,
+                            BitcoinOperationKind::LeaderBlockCommit { .. }
+                        )
+                    })
+                    .map(burn)
+                    .sum()
+            });
             Some((
-                snapshot.consensus_hash,
+                snapshot.consensus_hash.clone(),
                 BitcoinBlockContext {
                     first_height,
                     prepare_phase_length,
                     reward_phase_length,
+                    burn_header_hash: decode_hash(&snapshot.burn_header_hash)?,
+                    burn_block_time: snapshot.burn_header_timestamp,
+                    vrf_seed,
+                    burn_spend_total,
+                    burn_spend_winner,
                     ..BitcoinBlockContext::at_height(snapshot.block_height)
                 },
             ))
@@ -1715,6 +1758,97 @@ mod tests {
         }
     }
 
+    /// Clarity reads back the header of a block nano executed.
+    ///
+    /// `get-stacks-block-info?` and `get-tenure-info?` are answered from nano's
+    /// own index; before it existed every one of these returned `none`, which is
+    /// a divergence for any contract that consults chain history.
+    #[test]
+    fn clarity_reads_the_headers_of_executed_blocks() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
+            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+            source,
+            root,
+        )
+        .expect("open checkpoint");
+
+        // Execute far enough in that the block being read is an ancestor of the
+        // state the read runs against, which is what Clarity requires.
+        let mut parent = Some(source);
+        let mut executed = Vec::new();
+        for path in captured_block_paths(&fixture).into_iter().take(4) {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .expect("decode block");
+            let view = block.header.consensus_hash.to_string();
+            let context = *snapshots.get(&view).expect("Bitcoin context");
+            chainstate
+                .append_nakamoto_block_with_bitcoin_operations(
+                    context,
+                    bitcoin_operations.get(&view).expect("Bitcoin operations"),
+                    parent,
+                    &block,
+                )
+                .expect("execute block");
+            parent = Some(*block.block_id().as_bytes());
+            executed.push((block, context));
+        }
+
+        let (target, context) = &executed[1];
+        let height = target.header.chain_length;
+        let mut read = |source: &str| {
+            chainstate
+                .evaluate(source)
+                .unwrap_or_else(|error| panic!("evaluate {source}: {error}"))
+                .unwrap_or_else(|| panic!("{source} produced no value"))
+        };
+
+        assert_eq!(
+            read(&format!("(get-stacks-block-info? header-hash u{height})")),
+            Value::some(
+                Value::buff_from(target.header.block_hash().as_bytes().to_vec())
+                    .expect("32-byte buffer")
+            )
+            .expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-stacks-block-info? time u{height})")),
+            Value::some(Value::UInt(u128::from(target.header.timestamp))).expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-tenure-info? burnchain-header-hash u{height})")),
+            Value::some(
+                Value::buff_from(context.burn_header_hash.to_vec()).expect("32-byte buffer")
+            )
+            .expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-tenure-info? time u{height})")),
+            Value::some(Value::UInt(u128::from(context.burn_block_time))).expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-tenure-info? vrf-seed u{height})")),
+            Value::some(Value::buff_from(context.vrf_seed.to_vec()).expect("32-byte buffer"))
+                .expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-tenure-info? miner-spend-winner u{height})")),
+            Value::some(Value::UInt(context.burn_spend_winner)).expect("optional"),
+        );
+        assert_eq!(
+            read(&format!("(get-tenure-info? miner-spend-total u{height})")),
+            Value::some(Value::UInt(context.burn_spend_total)).expect("optional"),
+        );
+        assert_ne!(
+            context.burn_spend_winner, 0,
+            "the capture must record a real commitment for the read to mean anything"
+        );
+    }
+
     /// Every captured tenure-start block satisfies both VRF rules.
     ///
     /// The coinbase proof must come from the winning miner's registered key over
@@ -2189,7 +2323,7 @@ mod tests {
         write_file(&root.join("events/new_block/00000001.json"), "{}")?;
         write_file(&root.join("stacker_set/cycle-0.json"), "{}")?;
         let snapshot = format!(
-            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"consensus_hash\":\"0000000000000000000000000000000000000000\"}}]"
+            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"burn_header_timestamp\":0,\"consensus_hash\":\"0000000000000000000000000000000000000000\",\"winning_block_txid\":\"{bitcoin_hash}\"}}]"
         );
         write_file(&root.join("sortition/snapshots.json"), &snapshot)?;
         write_file(

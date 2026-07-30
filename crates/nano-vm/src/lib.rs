@@ -13,8 +13,8 @@ use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
 };
 use clarity::vm::database::{
-    BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, MemoryBackingStore,
-    NULL_BURN_STATE_DB, NULL_HEADER_DB,
+    BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, HeadersDB,
+    MemoryBackingStore,
 };
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
@@ -29,10 +29,11 @@ use rusqlite::{OptionalExtension, params};
 use stacks_common::types::{
     StacksEpoch, StacksEpochId,
     chainstate::{
-        BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
-        TrieHash as ReferenceTrieHash,
+        BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress,
+        StacksBlockId, TrieHash as ReferenceTrieHash, VRFSeed,
     },
 };
+use stacks_common::util::hash::Hash160;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 /// The consensus execution-cost limit for an Epoch 4 block.
@@ -96,6 +97,14 @@ pub struct BitcoinBlockContext {
     /// Coinbase a sortition at this height collects beyond its own emission,
     /// mirroring a snapshot's `accumulated_coinbase_ustx`.
     pub accumulated_coinbase: u128,
+    /// The burn block this tenure won, as Clarity reads it back.
+    pub burn_header_hash: [u8; 32],
+    pub burn_block_time: u64,
+    /// The seed the winning commitment carried.
+    pub vrf_seed: [u8; 32],
+    /// Bitcoin every miner spent on this sortition, and the winner's share.
+    pub burn_spend_total: u128,
+    pub burn_spend_winner: u128,
 }
 
 impl BitcoinBlockContext {
@@ -113,11 +122,53 @@ impl BitcoinBlockContext {
             v3_unlock_height: u32::MAX,
             pox_5_activation_height: u32::MAX,
             accumulated_coinbase: 0,
+            burn_header_hash: [0; 32],
+            burn_block_time: 0,
+            vrf_seed: [0; 32],
+            burn_spend_total: 0,
+            burn_spend_winner: 0,
         }
     }
 }
 
-/// Bitcoin state available while executing one block.
+/// What Clarity may read about a block nano has already executed.
+///
+/// These are the fields behind `get-stacks-block-info?` and `get-tenure-info?`.
+/// A follower that answers them from nowhere returns `none` where the network
+/// returns a value, so every contract that consults chain history diverges.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockHeader {
+    pub burn_header_hash: [u8; 32],
+    pub burn_block_height: u32,
+    pub burn_block_time: u64,
+    pub stacks_block_time: u64,
+    pub block_header_hash: [u8; 32],
+    pub consensus_hash: [u8; 20],
+    pub vrf_seed: [u8; 32],
+    /// The miner's address as its version byte and `Hash160`.
+    pub miner_address: (u8, [u8; 20]),
+    /// Bitcoin every miner spent on the sortition this block's tenure won.
+    pub burn_spend_total: u128,
+    /// Bitcoin the winning miner alone spent on it.
+    pub burn_spend_winner: u128,
+    /// STX the tenure earned, once its rewards matured.
+    pub block_reward: u128,
+    /// The tenure this block belongs to, counted in tenures.
+    pub tenure_height: u32,
+    /// The Stacks height that tenure's first block sits at.
+    pub tenure_start_height: u32,
+}
+
+/// Everything outside the MARF that Clarity may read.
+///
+/// The burn state and the block headers travel together because Clarity reads
+/// them through one database, and keeping them in one value spares every
+/// evaluation path a second parameter.
+pub trait ChainContext: BurnStateDB + HeadersDB {}
+
+impl<T: BurnStateDB + HeadersDB> ChainContext for T {}
+
+/// Bitcoin state and executed headers available while evaluating.
 #[derive(Debug, Default)]
 struct BitcoinContext {
     height: u32,
@@ -129,23 +180,145 @@ struct BitcoinContext {
     v2_unlock_height: u32,
     v3_unlock_height: u32,
     pox_5_activation_height: u32,
+    headers: BTreeMap<[u8; 32], BlockHeader>,
+    /// Stacks height each tenure started at, for the tenure-height mapping.
+    tenure_starts: BTreeMap<u32, u32>,
 }
 
+/// A context that knows no chain, for evaluating programs that read none.
+static NULL_CONTEXT: BitcoinContext = BitcoinContext {
+    height: 0,
+    first_height: 0,
+    prepare_phase_length: 0,
+    reward_phase_length: 0,
+    rejection_fraction: 0,
+    v1_unlock_height: 0,
+    v2_unlock_height: 0,
+    v3_unlock_height: 0,
+    pox_5_activation_height: 0,
+    headers: BTreeMap::new(),
+    tenure_starts: BTreeMap::new(),
+};
+
 impl BitcoinContext {
-    fn new(context: BitcoinBlockContext) -> Result<Self, MarfStoreError> {
-        Ok(Self {
-            height: u32::try_from(context.height)
-                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.height))?,
-            first_height: u32::try_from(context.first_height)
-                .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.first_height))?,
-            prepare_phase_length: context.prepare_phase_length,
-            reward_phase_length: context.reward_phase_length,
-            rejection_fraction: context.rejection_fraction,
-            v1_unlock_height: context.v1_unlock_height,
-            v2_unlock_height: context.v2_unlock_height,
-            v3_unlock_height: context.v3_unlock_height,
-            pox_5_activation_height: context.pox_5_activation_height,
+    /// Point the context at the block about to execute, keeping the headers of
+    /// the blocks already executed.
+    fn set_block(&mut self, context: BitcoinBlockContext) -> Result<(), MarfStoreError> {
+        self.height = u32::try_from(context.height)
+            .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.height))?;
+        self.first_height = u32::try_from(context.first_height)
+            .map_err(|_| MarfStoreError::BitcoinHeightOverflow(context.first_height))?;
+        self.prepare_phase_length = context.prepare_phase_length;
+        self.reward_phase_length = context.reward_phase_length;
+        self.rejection_fraction = context.rejection_fraction;
+        self.v1_unlock_height = context.v1_unlock_height;
+        self.v2_unlock_height = context.v2_unlock_height;
+        self.v3_unlock_height = context.v3_unlock_height;
+        self.pox_5_activation_height = context.pox_5_activation_height;
+        Ok(())
+    }
+
+    fn header(&self, id: &StacksBlockId) -> Option<&BlockHeader> {
+        self.headers.get(id.as_bytes())
+    }
+}
+
+impl HeadersDB for BitcoinContext {
+    fn get_stacks_block_header_hash_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<BlockHeaderHash> {
+        self.header(id_bhh)
+            .map(|header| BlockHeaderHash(header.block_header_hash))
+    }
+
+    fn get_burn_header_hash_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+    ) -> Option<BurnchainHeaderHash> {
+        self.header(id_bhh)
+            .map(|header| BurnchainHeaderHash(header.burn_header_hash))
+    }
+
+    fn get_consensus_hash_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<ConsensusHash> {
+        self.header(id_bhh)
+            .map(|header| ConsensusHash(header.consensus_hash))
+    }
+
+    fn get_vrf_seed_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _tip: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<VRFSeed> {
+        self.header(id_bhh).map(|header| VRFSeed(header.vrf_seed))
+    }
+
+    fn get_stacks_block_time_for_block(&self, id_bhh: &StacksBlockId) -> Option<u64> {
+        self.header(id_bhh).map(|header| header.stacks_block_time)
+    }
+
+    fn get_burn_block_time_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _epoch: Option<&StacksEpochId>,
+    ) -> Option<u64> {
+        self.header(id_bhh).map(|header| header.burn_block_time)
+    }
+
+    fn get_burn_block_height_for_block(&self, id_bhh: &StacksBlockId) -> Option<u32> {
+        self.header(id_bhh).map(|header| header.burn_block_height)
+    }
+
+    fn get_miner_address(
+        &self,
+        id_bhh: &StacksBlockId,
+        _tip: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<StacksAddress> {
+        self.header(id_bhh).and_then(|header| {
+            StacksAddress::new(header.miner_address.0, Hash160(header.miner_address.1)).ok()
         })
+    }
+
+    fn get_burnchain_tokens_spent_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _tip: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<u128> {
+        self.header(id_bhh).map(|header| header.burn_spend_total)
+    }
+
+    fn get_burnchain_tokens_spent_for_winning_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _tip: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<u128> {
+        self.header(id_bhh).map(|header| header.burn_spend_winner)
+    }
+
+    fn get_tokens_earned_for_block(
+        &self,
+        id_bhh: &StacksBlockId,
+        _tip: &StacksBlockId,
+        _epoch: &StacksEpochId,
+    ) -> Option<u128> {
+        self.header(id_bhh).map(|header| header.block_reward)
+    }
+
+    fn get_stacks_height_for_tenure_height(
+        &self,
+        _tip: &StacksBlockId,
+        tenure_height: u32,
+    ) -> Option<u32> {
+        self.tenure_starts.get(&tenure_height).copied()
     }
 }
 
@@ -312,7 +485,7 @@ impl Vm {
         block: [u8; 32],
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<(), MarfStoreError> {
-        self.context = BitcoinContext::new(bitcoin_context)?;
+        self.context.set_block(bitcoin_context)?;
         self.store.begin(parent, block)
     }
 
@@ -324,6 +497,15 @@ impl Vm {
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<(), MarfStoreError> {
         self.begin_block_with_bitcoin_context(parent, temporary_state_id, bitcoin_context)
+    }
+
+    /// Record what Clarity may later read about a block nano has executed.
+    pub fn record_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
+        self.context
+            .tenure_starts
+            .entry(header.tenure_height)
+            .or_insert(header.tenure_start_height);
+        self.context.headers.insert(block, header);
     }
 
     /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.
@@ -785,7 +967,7 @@ impl MarfStore {
 
     /// Create a Clarity database backed by this store.
     pub fn as_clarity_db(&mut self) -> ClarityDatabase<'_> {
-        ClarityDatabase::new(self, &NULL_HEADER_DB, &NULL_BURN_STATE_DB)
+        ClarityDatabase::new(self, &NULL_CONTEXT, &NULL_CONTEXT)
     }
 
     /// Begin a new state, inheriting all values from `parent` when present.
@@ -1358,12 +1540,12 @@ pub fn evaluate_with_tracker(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<Evaluation, ClarityEvalError> {
-    evaluate_with_tracker_in_context(store, &NULL_BURN_STATE_DB, source, cost_tracker)
+    evaluate_with_tracker_in_context(store, &NULL_CONTEXT, source, cost_tracker)
 }
 
 fn evaluate_with_tracker_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<Evaluation, ClarityEvalError> {
@@ -1406,7 +1588,7 @@ pub fn deploy_contract(
 ) -> Result<TransactionResult, ClarityEvalError> {
     deploy_contract_in_context(
         store,
-        &NULL_BURN_STATE_DB,
+        &NULL_CONTEXT,
         contract,
         version,
         source,
@@ -1416,7 +1598,7 @@ pub fn deploy_contract(
 
 fn deploy_contract_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     contract: QualifiedContractIdentifier,
     version: ClarityVersion,
     source: &str,
@@ -1444,7 +1626,7 @@ fn deploy_contract_in_context(
 
 fn deploy_contract_with_wasm_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     contract: QualifiedContractIdentifier,
     version: ClarityVersion,
@@ -1558,7 +1740,7 @@ pub fn execute_contract_call_outcome(
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     execute_contract_call_outcome_in_context(
         store,
-        &NULL_BURN_STATE_DB,
+        &NULL_CONTEXT,
         ContractCall {
             sender,
             sponsor,
@@ -1580,7 +1762,7 @@ struct ContractCall<'a> {
 
 fn execute_contract_call_outcome_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
@@ -1649,7 +1831,7 @@ fn execute_contract_call_outcome_in_context(
 
 fn execute_contract_call_outcome_with_wasm_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
@@ -1686,7 +1868,7 @@ fn execute_contract_call_outcome_with_wasm_in_context(
 #[allow(clippy::too_many_arguments)]
 fn call_contract_values_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     sender: PrincipalData,
     contract: &QualifiedContractIdentifier,
@@ -1769,7 +1951,7 @@ const fn contract_argument(value: &Value) -> Option<&QualifiedContractIdentifier
 
 fn ensure_wasm_module(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     contract: &QualifiedContractIdentifier,
 ) -> Result<(), VmExecutionError> {
@@ -1850,7 +2032,7 @@ pub fn transfer_stx(
 ) -> Result<TransactionResult, VmExecutionError> {
     transfer_stx_in_context(
         store,
-        &NULL_BURN_STATE_DB,
+        &NULL_CONTEXT,
         sender,
         recipient,
         amount,
@@ -1861,7 +2043,7 @@ pub fn transfer_stx(
 
 fn transfer_stx_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     sender: &PrincipalData,
     recipient: &PrincipalData,
     amount: u128,
@@ -1900,12 +2082,12 @@ pub fn debit_fee(
     payer: &PrincipalData,
     fee: u64,
 ) -> Result<(), VmExecutionError> {
-    debit_fee_in_context(store, &NULL_BURN_STATE_DB, payer, fee)
+    debit_fee_in_context(store, &NULL_CONTEXT, payer, fee)
 }
 
 fn debit_fee_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     payer: &PrincipalData,
     fee: u64,
 ) -> Result<(), VmExecutionError> {
@@ -1933,7 +2115,7 @@ fn debit_fee_in_context(
 
 fn touch_stx_balance_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     principal: &PrincipalData,
 ) -> Result<(), VmExecutionError> {
     let network = store.network();
@@ -1954,7 +2136,7 @@ fn touch_stx_balance_in_context(
 
 fn credit_stx_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     principal: &PrincipalData,
     amount: u128,
 ) -> Result<(), VmExecutionError> {
@@ -1976,7 +2158,7 @@ fn credit_stx_in_context(
 
 fn transaction_cost_tracker_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     total: ExecutionCost,
 ) -> Result<LimitedCostTracker, VmExecutionError> {
     let network = store.network();
@@ -2005,7 +2187,7 @@ fn transaction_cost_tracker_in_context(
 
 fn process_scheduled_unlocks_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
 ) -> Result<u128, VmExecutionError> {
     let network = store.network();
     let database = clarity_database(store, bitcoin_context);
@@ -2049,7 +2231,7 @@ fn process_scheduled_unlocks_in_context(
 
 fn increment_liquid_stx_supply_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     amount: u128,
 ) -> Result<(), VmExecutionError> {
     let network = store.network();
@@ -2069,13 +2251,13 @@ pub fn account_nonce(
     store: &mut MarfStore,
     principal: &PrincipalData,
 ) -> Result<u64, VmExecutionError> {
-    account_nonce_in_context(store, &NULL_BURN_STATE_DB, principal)
+    account_nonce_in_context(store, &NULL_CONTEXT, principal)
 }
 
 /// Read an account's spendable STX in an isolated database transaction.
 fn account_balance_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     principal: &PrincipalData,
 ) -> Result<u128, VmExecutionError> {
     let network = store.network();
@@ -2097,7 +2279,7 @@ fn account_balance_in_context(
 
 fn account_nonce_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     principal: &PrincipalData,
 ) -> Result<u64, VmExecutionError> {
     let network = store.network();
@@ -2118,12 +2300,12 @@ pub fn set_account_nonce(
     principal: &PrincipalData,
     nonce: u64,
 ) -> Result<(), VmExecutionError> {
-    set_account_nonce_in_context(store, &NULL_BURN_STATE_DB, principal, nonce)
+    set_account_nonce_in_context(store, &NULL_CONTEXT, principal, nonce)
 }
 
 fn set_account_nonce_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     principal: &PrincipalData,
     nonce: u64,
 ) -> Result<(), VmExecutionError> {
@@ -2141,14 +2323,14 @@ fn set_account_nonce_in_context(
 
 fn clarity_database<'a>(
     store: &'a mut MarfStore,
-    bitcoin_context: &'a dyn BurnStateDB,
+    bitcoin_context: &'a dyn ChainContext,
 ) -> ClarityDatabase<'a> {
-    ClarityDatabase::new(store, &NULL_HEADER_DB, bitcoin_context)
+    ClarityDatabase::new(store, bitcoin_context, bitcoin_context)
 }
 
 fn setup_block_metadata_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     timestamp: u64,
 ) -> Result<(), VmExecutionError> {
     let network = store.network();
@@ -2165,7 +2347,7 @@ fn setup_block_metadata_in_context(
 
 fn tenure_height_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
 ) -> Result<u32, VmExecutionError> {
     let network = store.network();
     let database = clarity_database(store, bitcoin_context);
@@ -2181,7 +2363,7 @@ fn tenure_height_in_context(
 
 fn set_tenure_height_in_context(
     store: &mut MarfStore,
-    bitcoin_context: &dyn BurnStateDB,
+    bitcoin_context: &dyn ChainContext,
     height: u32,
 ) -> Result<(), VmExecutionError> {
     let network = store.network();
@@ -2206,6 +2388,8 @@ mod tests {
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
     use clarity::vm::{ClarityVersion, Value};
     use nano_primitives::{Network, TrieHash};
+
+    use super::BlockHeader;
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -2305,9 +2489,11 @@ mod tests {
             PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid principal");
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [1; 32]).expect("begin checkpoint");
+        vm.record_block_header([1; 32], BlockHeader::default());
         vm.seal_block().expect("seal checkpoint");
         vm.begin_block(Some([1; 32]), [2; 32])
             .expect("begin successor");
+        vm.record_block_header([2; 32], BlockHeader::default());
         vm.credit_stx(&principal, 42).expect("credit STX");
 
         let value = vm
