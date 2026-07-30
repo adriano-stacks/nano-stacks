@@ -2634,6 +2634,7 @@ dependencies = [
  "nano-chainstate",
  "nano-codec",
  "nano-crypto",
+ "nano-mempool",
  "nano-node",
  "nano-primitives",
  "nano-sortition",
