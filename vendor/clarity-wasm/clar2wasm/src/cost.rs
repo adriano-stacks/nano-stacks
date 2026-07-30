@@ -2132,6 +2132,37 @@ mod crosscheck {
         }
     }
 
+    /// An expression that aborts part-way pays only for what it did.
+    ///
+    /// A word the interpreter treats as a native function is charged through
+    /// `dispatch_args`, once its arguments have been evaluated. Charging
+    /// before them costs nothing while everything succeeds — the same charges
+    /// land, in a different order — and overcharges the moment an operand
+    /// aborts, because the enclosing work is paid for and never done.
+    ///
+    /// It compounds with nesting: an abort under three enclosing operations
+    /// was charged for all three. Special forms such as `map` and `if` are
+    /// different and do charge first, which is why this is per word rather
+    /// than a rule about all of them.
+    #[test]
+    fn charges_an_aborted_expression_for_what_it_did() {
+        for snippet in [
+            "(define-public (f) (ok (- u0 u1)))",
+            "(define-public (f) (ok (+ (- u0 u1) u1)))",
+            "(define-public (f) (ok (+ (* (- u0 u1) u2) u1)))",
+            "(define-data-var a uint u0) (define-public (f) (ok (/ u1 (var-get a))))",
+            "(define-public (f) (ok (+ u340282366920938463463374607431768211455 u1)))",
+            "(define-public (f) (begin (asserts! false (err u47)) (ok true)))",
+            "(define-public (f) (ok (unwrap! (if false (some u1) none) (err u1))))",
+            "(define-public (f) (begin (- u0 u1) (ok (* u2 u3))))",
+            "(define-public (f) (begin (- u0 u1) (* u2 u3) (ok true)))",
+            "(define-public (f) (ok (some (- u0 u1))))",
+            "(define-public (f) (ok (err (- u0 u1))))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
     /// Applying a word to each element of a `fold`, `map` or `filter` costs
     /// what applying it anywhere else costs.
     ///

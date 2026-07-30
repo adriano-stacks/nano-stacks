@@ -685,26 +685,35 @@ impl WasmGenerator {
                 } else if let Some(variadic) = words::lookup_variadic_simple(function_name) {
                     let (arg_types, return_type) = get_types()?;
 
+                    // The interpreter evaluates every argument, then charges
+                    // once through `dispatch_args`, then folds them pairwise.
+                    // Charging before the arguments makes an expression that
+                    // aborts part-way pay for work it never did, which is
+                    // invisible while everything succeeds and wrong the moment
+                    // something does not.
+                    if args.is_empty() {
+                        return Err(GeneratorError::InternalError(
+                            "Variadic called without arguments".to_owned(),
+                        ));
+                    }
+                    let mut evaluated = Vec::with_capacity(args.len());
+                    for (expr, ty) in args.iter().zip(arg_types.iter()) {
+                        self.traverse_expr(builder, expr)?;
+                        evaluated.push(self.save_to_locals(builder, ty, true));
+                    }
+
                     variadic.charge(self, builder, arg_types.len() as u32)?;
 
-                    let mut args_enumerated = args.iter().enumerate();
-
-                    let first_arg = args_enumerated
-                        .next()
-                        .ok_or_else(|| {
-                            GeneratorError::InternalError(
-                                "Variadic called without arguments".to_owned(),
-                            )
-                        })?
-                        .1;
-
-                    self.traverse_expr(builder, first_arg)?;
-
+                    for local in &evaluated[0] {
+                        builder.local_get(*local);
+                    }
                     if arg_types.len() == 1 {
                         variadic.visit(self, builder, &arg_types[..1], &return_type)?;
                     } else {
-                        for (i, expr) in args_enumerated {
-                            self.traverse_expr(builder, expr)?;
+                        for (i, locals) in evaluated.iter().enumerate().skip(1) {
+                            for local in locals {
+                                builder.local_get(*local);
+                            }
                             variadic.visit(self, builder, &arg_types[i - 1..=i], &return_type)?;
                         }
                     }

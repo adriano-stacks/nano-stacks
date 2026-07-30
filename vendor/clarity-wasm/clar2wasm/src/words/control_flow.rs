@@ -34,8 +34,6 @@ impl ComplexWord for Begin {
             ArgumentCountCheck::AtLeast
         );
 
-        self.charge(generator, builder, 0)?;
-
         generator.set_expr_type(
             args.last().ok_or_else(|| {
                 GeneratorError::TypeError("begin must have at least one arg".to_string())
@@ -45,7 +43,10 @@ impl ComplexWord for Begin {
                 .ok_or_else(|| GeneratorError::TypeError("begin must be typed".to_owned()))?
                 .clone(),
         )?;
-        generator.traverse_statement_list(builder, args)
+        generator.traverse_statement_list(builder, args)?;
+        // Charged after the statements, as the interpreter does: `begin` is a
+        // native function, applied once its arguments are evaluated. See `ok`.
+        self.charge(generator, builder, 0)
     }
 }
 
