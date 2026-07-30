@@ -11,6 +11,9 @@ use nano_primitives::{
 
 const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23, 0, 0, 0];
 
+/// The Bitcoin blocks a sortition weighs mining commitments over.
+pub const MINING_COMMITMENT_WINDOW: usize = 6;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpsHash([u8; 32]);
 
@@ -395,7 +398,7 @@ impl RewardCycleSchedule {
     }
 
     fn starts_at(&self, bitcoin_height: u64) -> bool {
-        let relative_height = bitcoin_height - self.first_bitcoin_height;
+        let relative_height = bitcoin_height.saturating_sub(self.first_bitcoin_height);
         if self
             .first_waterfall_height
             .is_some_and(|height| bitcoin_height >= height)
@@ -451,6 +454,25 @@ impl PoxIdTracker {
         self.bitcoin_height = bitcoin_height;
         Ok(&self.pox_id)
     }
+
+    /// Rewind to a Bitcoin height, dropping the anchor bits the blocks above it
+    /// contributed.
+    pub fn retract_to(&mut self, bitcoin_height: u64) -> Result<&PoxId, SortitionError> {
+        if bitcoin_height > self.bitcoin_height {
+            return Err(SortitionError::UnexpectedHeight {
+                expected: self.bitcoin_height,
+                actual: bitcoin_height,
+            });
+        }
+        let retracted_starts = (bitcoin_height + 1..=self.bitcoin_height)
+            .filter(|height| self.schedule.starts_at(*height))
+            .count();
+        self.pox_id
+            .0
+            .truncate(self.pox_id.0.len().saturating_sub(retracted_starts));
+        self.bitcoin_height = bitcoin_height;
+        Ok(&self.pox_id)
+    }
 }
 
 impl fmt::Display for PoxId {
@@ -495,6 +517,69 @@ impl SortitionSnapshot {
     }
 }
 
+/// Where Bitcoin's chain and a snapshot chain part company.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fork {
+    /// Bitcoin still holds every block the chain took a snapshot of.
+    Canonical,
+    /// The snapshots above this Bitcoin height are no longer canonical.
+    Above(u64),
+    /// The reorganization reaches the chain's root, which cannot be retracted.
+    ///
+    /// The root is where the chain was started from — a checkpoint, or the
+    /// first Bitcoin block a node ever saw — so nothing local can tell what
+    /// replaces it. The node has to be restarted from a checkpoint Bitcoin
+    /// agrees with.
+    BeyondChainRoot { root_bitcoin_height: u64 },
+}
+
+/// The sortitions a Bitcoin reorganization retracted, and where to resume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortitionReorg {
+    /// The deepest snapshot Bitcoin still agrees with.
+    pub valid_ancestor: SortitionSnapshot,
+    /// The retracted snapshots, oldest first.
+    pub retracted: Vec<SortitionSnapshot>,
+}
+
+impl SortitionReorg {
+    /// The number of snapshots the reorganization retracted.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.retracted.len()
+    }
+
+    /// Whether the reorganization retracted nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.retracted.is_empty()
+    }
+
+    /// The first Bitcoin height to read again.
+    ///
+    /// This is also the height to invalidate the `PreStx` window from, with
+    /// [`nano_bitcoin::PreStxCache::invalidate_from`].
+    #[must_use]
+    pub const fn resume_bitcoin_height(&self) -> u64 {
+        self.valid_ancestor.bitcoin_height.saturating_add(1)
+    }
+
+    /// The consensus hashes whose Stacks blocks left the canonical chain.
+    ///
+    /// A retracted sortition takes its tenure with it. Unwinding the Clarity
+    /// state those tenures wrote is not this crate's to do — `nano-chainstate`
+    /// owns it — so this is the signal it acts on: discard every Stacks block
+    /// whose `consensus_hash` appears here, and re-execute from the last block
+    /// under [`Self::valid_ancestor`]'s consensus hash.
+    #[must_use]
+    pub fn invalidated_consensus_hashes(&self) -> Vec<ConsensusHash> {
+        self.retracted
+            .iter()
+            .map(|snapshot| snapshot.consensus_hash)
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotChain {
     snapshots: Vec<SortitionSnapshot>,
@@ -516,6 +601,61 @@ impl SnapshotChain {
     #[must_use]
     pub fn snapshots(&self) -> &[SortitionSnapshot] {
         &self.snapshots
+    }
+
+    /// Find the deepest snapshot Bitcoin still agrees with.
+    ///
+    /// `canonical_hash` reports the header hash Bitcoin holds at a height now;
+    /// `nano_bitcoin::BitcoinRpcSource::block_hash_at` is what a node passes.
+    /// The walk stops at the first agreement, so a chain that did not
+    /// reorganize costs one lookup.
+    pub fn find_fork<E>(
+        &self,
+        mut canonical_hash: impl FnMut(u64) -> Result<[u8; 32], E>,
+    ) -> Result<Fork, E> {
+        for snapshot in self.snapshots.iter().rev() {
+            if canonical_hash(snapshot.bitcoin_height)? == *snapshot.bitcoin_header_hash.as_bytes()
+            {
+                return Ok(if snapshot.bitcoin_height == self.tip().bitcoin_height {
+                    Fork::Canonical
+                } else {
+                    Fork::Above(snapshot.bitcoin_height)
+                });
+            }
+        }
+        Ok(Fork::BeyondChainRoot {
+            root_bitcoin_height: self.root().bitcoin_height,
+        })
+    }
+
+    /// Retract every snapshot above a Bitcoin height.
+    ///
+    /// Snapshots are contiguous in Bitcoin height, so the height alone fixes
+    /// the split. Retracting the chain's root is refused: see
+    /// [`Fork::BeyondChainRoot`].
+    pub fn retract_above(&mut self, bitcoin_height: u64) -> Result<SortitionReorg, SortitionError> {
+        let root_bitcoin_height = self.root().bitcoin_height;
+        let above_root = bitcoin_height.checked_sub(root_bitcoin_height).ok_or(
+            SortitionError::ReorgBeyondChainRoot {
+                root_bitcoin_height,
+            },
+        )?;
+        let kept = usize::try_from(above_root)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let retracted = if kept < self.snapshots.len() {
+            self.snapshots.split_off(kept)
+        } else {
+            Vec::new()
+        };
+        Ok(SortitionReorg {
+            valid_ancestor: self.tip().clone(),
+            retracted,
+        })
+    }
+
+    fn root(&self) -> &SortitionSnapshot {
+        self.snapshots.first().expect("snapshot chain has genesis")
     }
 
     pub fn append(
@@ -641,6 +781,36 @@ impl SortitionEngine {
         &self.commitment_window
     }
 
+    /// Retract every sortition above a Bitcoin height, and the commitment
+    /// window entries the retracted blocks contributed.
+    ///
+    /// The window holds one entry per snapshot appended, so a retraction drops
+    /// that many entries from its end and the entries below the fork point
+    /// survive to weigh the replacement branch. A reorganization deeper than
+    /// the window would empty it, and the blocks that would refill it are below
+    /// the fork point and never read again — the sortitions that followed could
+    /// not be recomputed, so the retraction is refused rather than performed
+    /// against a short window.
+    pub fn retract_above(&mut self, bitcoin_height: u64) -> Result<SortitionReorg, SortitionError> {
+        let depth = usize::try_from(
+            self.snapshots
+                .tip()
+                .bitcoin_height
+                .saturating_sub(bitcoin_height),
+        )
+        .unwrap_or(usize::MAX);
+        if depth > MINING_COMMITMENT_WINDOW {
+            return Err(SortitionError::ReorgTooDeep {
+                depth,
+                limit: MINING_COMMITMENT_WINDOW,
+            });
+        }
+        let reorg = self.snapshots.retract_above(bitcoin_height)?;
+        self.commitment_window
+            .truncate(self.commitment_window.len().saturating_sub(reorg.depth()));
+        Ok(reorg)
+    }
+
     pub fn append(
         &mut self,
         block: &BitcoinBlock,
@@ -650,7 +820,7 @@ impl SortitionEngine {
     ) -> Result<&SortitionSnapshot, SortitionError> {
         let mut window = self.commitment_window.clone();
         window.push(commitments);
-        if window.len() > 6 {
+        if window.len() > MINING_COMMITMENT_WINDOW {
             window.remove(0);
         }
         let statistics = commitment_burn_statistics(&window)?;
@@ -745,6 +915,8 @@ pub enum SortitionError {
     ZeroRewardCycleLength,
     HeightOverflow,
     UnexpectedHeight { expected: u64, actual: u64 },
+    ReorgBeyondChainRoot { root_bitcoin_height: u64 },
+    ReorgTooDeep { depth: usize, limit: usize },
 }
 
 impl fmt::Display for SortitionError {
@@ -767,6 +939,16 @@ impl fmt::Display for SortitionError {
                     "expected Bitcoin height {expected}, got {actual}"
                 )
             }
+            Self::ReorgBeyondChainRoot {
+                root_bitcoin_height,
+            } => write!(
+                formatter,
+                "Bitcoin reorganization reaches the chain root at height {root_bitcoin_height}"
+            ),
+            Self::ReorgTooDeep { depth, limit } => write!(
+                formatter,
+                "Bitcoin reorganization of {depth} blocks exceeds the {limit}-block commitment window"
+            ),
         }
     }
 }
@@ -929,11 +1111,159 @@ mod tests {
     }
 
     #[test]
+    fn a_reorganized_branch_is_retracted_and_replaced() {
+        let mut engine = engine_over(&[1, 2, 3, 4]);
+        let chain = engine.snapshots().clone();
+
+        let fork = chain
+            .find_fork(|height| Ok::<_, ()>(canonical_hash(height, 2)))
+            .expect("fork lookup succeeds");
+        assert_eq!(fork, super::Fork::Above(2));
+        let super::Fork::Above(fork_height) = fork else {
+            panic!("expected a fork above height 2");
+        };
+
+        let reorg = engine.retract_above(fork_height).expect("retract branch");
+        assert_eq!(reorg.depth(), 2);
+        assert_eq!(reorg.resume_bitcoin_height(), 3);
+        assert_eq!(reorg.valid_ancestor.bitcoin_height, 2);
+        assert_eq!(
+            reorg.invalidated_consensus_hashes(),
+            chain.snapshots()[3..]
+                .iter()
+                .map(|snapshot| snapshot.consensus_hash)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(engine.commitment_window().len(), 2);
+        assert_eq!(engine.snapshots().tip().bitcoin_height, 2);
+
+        // The replacement branch reproduces the snapshots of a chain that only
+        // ever saw it.
+        append(&mut engine, 3, 0x33);
+        append(&mut engine, 4, 0x44);
+        let mut replayed = engine_over(&[1, 2]);
+        append(&mut replayed, 3, 0x33);
+        append(&mut replayed, 4, 0x44);
+        assert_eq!(engine.snapshots(), replayed.snapshots());
+    }
+
+    #[test]
+    fn retracting_nothing_leaves_the_chain_alone() {
+        let mut engine = engine_over(&[1, 2]);
+        let reorg = engine.retract_above(2).expect("retract nothing");
+
+        assert!(reorg.is_empty());
+        assert_eq!(reorg.valid_ancestor.bitcoin_height, 2);
+        assert_eq!(engine.commitment_window().len(), 2);
+    }
+
+    #[test]
+    fn a_reorganization_deeper_than_the_commitment_window_is_refused() {
+        let mut engine = engine_over(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            engine.retract_above(0),
+            Err(super::SortitionError::ReorgTooDeep {
+                depth: 7,
+                limit: super::MINING_COMMITMENT_WINDOW,
+            })
+        );
+        assert_eq!(engine.snapshots().tip().bitcoin_height, 7);
+
+        let mut chain = engine_over(&[1, 2]).snapshots().clone();
+        assert_eq!(
+            chain.find_fork(|_| Ok::<_, ()>([0xff; 32])),
+            Ok(super::Fork::BeyondChainRoot {
+                root_bitcoin_height: 0
+            })
+        );
+        assert_eq!(
+            chain.retract_above(0).map(|reorg| reorg.depth()),
+            Ok(2),
+            "the root itself survives a retraction down to it"
+        );
+        assert!(matches!(
+            chain.retract_above(u64::MAX),
+            Ok(reorg) if reorg.is_empty()
+        ));
+    }
+
+    #[test]
+    fn pox_tracker_rewinds_the_anchors_of_a_retracted_branch() {
+        let schedule = RewardCycleSchedule::new(0, 20, None).expect("valid schedule");
+        let mut tracker = PoxIdTracker::new(schedule);
+        for height in 1..=25 {
+            tracker.advance(height, true).expect("contiguous height");
+        }
+        let bits = tracker.pox_id().bits().len();
+
+        tracker.retract_to(20).expect("rewind past a cycle start");
+        assert_eq!(tracker.pox_id().bits().len(), bits - 1);
+        for height in 21..=25 {
+            tracker.advance(height, true).expect("replayed height");
+        }
+        assert_eq!(tracker.pox_id().bits().len(), bits);
+    }
+
+    #[test]
     fn pox_tracker_records_an_unknown_anchor() {
         let schedule = RewardCycleSchedule::new(0, 20, None).expect("valid schedule");
         let mut tracker = PoxIdTracker::new(schedule);
         tracker.advance(1, false).expect("first cycle start");
         assert_eq!(tracker.pox_id().bits(), &[true, false]);
+    }
+
+    /// An engine over Bitcoin blocks whose header hash and commitment are named
+    /// by one byte, each commitment spending the one before it.
+    fn engine_over(hashes: &[u8]) -> SortitionEngine {
+        let mut engine = SortitionEngine::new(SortitionSnapshot::genesis(
+            0,
+            super::BitcoinHeaderHash::from_bytes([0; 32]),
+        ));
+        for (index, hash) in hashes.iter().enumerate() {
+            append(
+                &mut engine,
+                u64::try_from(index).expect("test index fits u64") + 1,
+                *hash,
+            );
+        }
+        engine
+    }
+
+    fn append(engine: &mut SortitionEngine, height: u64, hash: u8) {
+        let spent_txid = engine
+            .commitment_window()
+            .last()
+            .and_then(|block| block.commitments.first())
+            .map_or([0; 32], |commitment| commitment.txid);
+        let mining = MiningCommitment {
+            txid: [hash; 32],
+            spent_txid,
+            spent_output: 3,
+            burn_sats: 10,
+            vrf_seed: [hash; 32],
+        };
+        engine
+            .append(
+                &bitcoin_block(height, hash),
+                &[mining.txid],
+                CommitmentWindowBlock {
+                    commitments: vec![mining],
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+                super::PoxId::initial(),
+            )
+            .expect("contiguous Bitcoin block");
+    }
+
+    /// The header hash Bitcoin reports once it reorganized above `fork_height`.
+    fn canonical_hash(height: u64, fork_height: u64) -> [u8; 32] {
+        let byte = u8::try_from(height).expect("test height fits u8");
+        if height <= fork_height {
+            [byte; 32]
+        } else {
+            [byte ^ 0x80; 32]
+        }
     }
 
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
