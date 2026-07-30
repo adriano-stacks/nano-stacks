@@ -30,6 +30,10 @@ pub type SharedExecutor = Arc<Mutex<CheckpointExecutor<BitcoinRpcSource>>>;
 /// What a role reports when it stops, which is always the end of the node.
 pub type Role = Result<(), String>;
 
+/// Polls a peer is given to produce the block a resumed state is sealed at,
+/// before the state is declared to have left the chain.
+const RESUME_ATTEMPTS: u32 = 30;
+
 /// A job the node runs, and what its stopping means for the rest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Job {
@@ -288,7 +292,31 @@ pub async fn open_chainstate(
         context.height = config.checkpoint.anchor_bitcoin_height;
         return Ok((chainstate, anchor, Some(context)));
     };
-    let tip = peer.block(StacksBlockId::from_bytes(tip)).await?;
+    // A peer that does not have this block yet is usually one still catching
+    // up, not a chain that moved: it is worth waiting for. A peer that never
+    // produces it means this state descends from a block the network dropped,
+    // and no amount of waiting fixes that.
+    let sealed = StacksBlockId::from_bytes(tip);
+    let mut waited = 0;
+    let tip = loop {
+        match peer.block(sealed).await {
+            Ok(tip) => break tip,
+            Err(error) if waited < RESUME_ATTEMPTS => {
+                waited += 1;
+                println!("waiting for the peer to catch up to block {sealed} ({error})");
+                sleep(Duration::from_secs(config.node.poll_interval_secs)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the state in {} is sealed at block {sealed}, which the peer does not have \
+                     ({error}); it descends from a block the network dropped, so it needs another \
+                     peer or a fresh checkpoint",
+                    directory.display()
+                )
+                .into());
+            }
+        }
+    };
     println!(
         "resuming {} from the state on disk, sealed at block {} of height {}",
         directory.display(),

@@ -39,35 +39,35 @@ place, and shuts down cleanly on `SIGTERM`.
 - The Hacknet replacement run passes driving that binary.
 - Stopping and restarting mid-tenure resumes without re-importing.
 
-## Validation status
+## Validation
 
-The binary starts, imports its checkpoint, resumes from state on disk, takes
-its signing slot for the reward cycle, wins a sortition, assembles a block and
-publishes a proposal — all observed in a real Hacknet run.
+`hacknet/harness.sh verify`, driving `stacks-node start --config` for both
+roles:
 
-It is **not** yet validated end to end. The Hacknet it was started into had
-already wedged: all three stock containers stopped logging within seconds of
-each other about an hour before the swap, with the Stacks tip frozen while
-Bitcoin ran on. nano therefore had no counterparties to gather signatures from,
-and `advancing the tenure failed: signer weight is below approval threshold` is
-what that looks like from the inside.
+```
+observed 20 canonical blocks across cycles 15..=16
+every one of the 20 blocks carries nano's signature
+nano mined 11 of the 20 canonical blocks, at heights [342 .. 361]
+12 transfer, 4 deploy, 29 call, 5 tenure change, 5 coinbase transactions,
+  each with one the network reports as success
+5 sortitions across 2 distinct miners
+reward cycle 16 pays a waterfall set in which nano holds weight 10 of 30
+```
 
-The `verify` run that did pass — 40 canonical blocks across a cycle rollover,
-every one carrying nano's signature, three of them mined by nano — was driven
-by the separate binaries this task replaced. Re-running `verify` against a
-fresh Hacknet is what closes the acceptance criterion.
+Hacknet runs three signers of equal weight against a seven-tenths threshold, so
+no block is accepted without all three: a network that keeps producing with
+nano in place is proof its signature counted. The run also restarted the node
+to switch the mining role on, so resuming from state on disk is on that path.
 
-A second attempt on a freshly booted Hacknet did not get there either: that
-network froze its Stacks tip at height 274 while Bitcoin ran on, before nano
-was started into it. Two Hacknets wedging unprompted is an environment
-question, not a nano one, and it is not something this task can settle.
-
-What the attempts did surface, both real:
+Three earlier attempts failed for reasons worth keeping:
 
 - the export and the fixture capture published different checkpoint manifests,
   so the node could not read a Hacknet checkpoint at all — fixed
-- a stale miner identity ends the whole process, taking the signer with it —
+- a stale miner identity ended the whole process, taking the signer with it —
   [[039-keep-the-node-alive-when-one-role-fails]]
+- two Hacknets deadlocked on their own, stock signers looping on `Last accepted
+  block has timed out` with nano restored out of the network entirely. Not
+  nano's, but worth knowing this environment does it.
 
 ## What this left
 
