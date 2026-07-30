@@ -852,7 +852,7 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        checkpoint_state, scoreboard, validate_fixture_tree,
+        checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -1713,6 +1713,147 @@ mod tests {
                 clarity::boot_util::boot_code_id("pox-5", mainnet).to_string()
             );
         }
+    }
+
+    /// Every captured tenure-start block satisfies both VRF rules.
+    ///
+    /// The coinbase proof must come from the winning miner's registered key over
+    /// the tenure's sortition hash, and the seed that miner committed on Bitcoin
+    /// must be the hash of the parent tenure's proof. A follower that skips
+    /// either will build on a chain the network rejects.
+    #[test]
+    fn captured_tenures_satisfy_the_vrf_rules() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let snapshots: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(fixture.join("sortition/snapshots.json")).expect("read snapshots"),
+        )
+        .expect("decode snapshots");
+        let operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let by_height = |height: u64| -> Vec<nano_bitcoin::BitcoinOperation> {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot["block_height"].as_u64() == Some(height))
+                .and_then(|snapshot| snapshot["consensus_hash"].as_str())
+                .and_then(|consensus_hash| operations.get(consensus_hash))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let mut previous_proof: Option<[u8; 80]> = None;
+        let mut checked = 0_usize;
+        for path in captured_block_paths(&fixture) {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .expect("decode block");
+            if !nano_chainstate::starts_new_tenure(&block) {
+                continue;
+            }
+            let consensus_hash = block.header.consensus_hash.to_string();
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot["consensus_hash"].as_str() == Some(&consensus_hash))
+                .expect("captured tenure has a sortition snapshot");
+            let sortition_hash =
+                decode_hash(snapshot["sortition_hash"].as_str().expect("sortition hash"))
+                    .expect("32-byte sortition hash");
+            // Several miners can commit to the same block hash in the same
+            // Bitcoin block, so the winner is identified by its transaction, not
+            // by what it committed to.
+            let winning_txid = decode_hash(
+                snapshot["winning_block_txid"]
+                    .as_str()
+                    .expect("winning commitment txid"),
+            )
+            .expect("32-byte winning txid");
+            let height = snapshot["block_height"].as_u64().expect("burn height");
+
+            // The winning commitment names the leader key it registered under,
+            // which is what the proof has to have been produced with.
+            let (key_height, key_index, new_seed) = by_height(height)
+                .into_iter()
+                .find_map(|operation| match operation.kind {
+                    nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                        key_block_height,
+                        key_transaction_index,
+                        new_seed,
+                        ..
+                    } if operation.txid == winning_txid => {
+                        Some((key_block_height, key_transaction_index, new_seed))
+                    }
+                    _ => None,
+                })
+                .expect("the winning commitment is in the captured Bitcoin block");
+            let vrf_public_key = by_height(u64::from(key_height))
+                .into_iter()
+                .find_map(|operation| match operation.kind {
+                    nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                        vrf_public_key,
+                        ..
+                    } if operation.transaction_index == u32::from(key_index) => Some(vrf_public_key),
+                    _ => None,
+                })
+                .expect("the leader key registration is in the captured Bitcoin block");
+
+            nano_chainstate::verify_coinbase_vrf_proof(&block, &vrf_public_key, &sortition_hash)
+                .unwrap_or_else(|error| {
+                    panic!("tenure {consensus_hash} failed its coinbase proof: {error}")
+                });
+
+            // The seed is checked against the tenure before it, which the first
+            // captured tenure does not have inside the window.
+            if let Some(parent_proof) = previous_proof {
+                nano_chainstate::verify_committed_vrf_seed(&new_seed, &parent_proof)
+                    .unwrap_or_else(|error| {
+                        panic!("tenure {consensus_hash} committed a bad seed: {error}")
+                    });
+            }
+            previous_proof = nano_chainstate::coinbase_vrf_proof(&block);
+            checked += 1;
+        }
+        assert!(
+            checked > 1,
+            "the capture must hold more than one tenure to check a seed against its parent"
+        );
+    }
+
+    /// A tampered proof or seed is rejected, so the check is not vacuous.
+    #[test]
+    fn a_tampered_vrf_proof_or_seed_is_rejected() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let block = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .find(nano_chainstate::starts_new_tenure)
+            .expect("a captured tenure-start block");
+        let proof = nano_chainstate::coinbase_vrf_proof(&block).expect("coinbase proof");
+
+        // A well-formed key that did not produce the proof, and a key that is
+        // not a curve point at all, fail differently and both fail.
+        let stranger = nano_crypto::VrfPrivateKey::from_bytes([3; 32])
+            .public_key()
+            .to_bytes();
+        assert_eq!(
+            nano_chainstate::verify_coinbase_vrf_proof(&block, &stranger, &[9; 32]),
+            Err(nano_chainstate::TenureVrfError::ProofNotFromLeaderKey)
+        );
+        assert_eq!(
+            nano_chainstate::verify_coinbase_vrf_proof(&block, &[7; 32], &[9; 32]),
+            Err(nano_chainstate::TenureVrfError::MalformedProof)
+        );
+
+        assert_eq!(
+            nano_chainstate::verify_committed_vrf_seed(
+                &nano_chainstate::vrf_seed_from_proof(&proof),
+                &proof
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            nano_chainstate::verify_committed_vrf_seed(&[0; 32], &proof),
+            Err(nano_chainstate::TenureVrfError::SeedNotFromParentProof)
+        );
     }
 
     /// A tenure-start block inside the emission schedule moves real STX.

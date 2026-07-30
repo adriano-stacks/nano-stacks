@@ -25,7 +25,7 @@ use nano_codec::{
     PostConditionMode, PostConditionPrincipal, PoxCondition, Principal, TenureChangeCause,
     Transaction, TransactionPayloadData,
 };
-use nano_crypto::StacksPrivateKey;
+use nano_crypto::{StacksPrivateKey, Vrf, VrfProof, VrfPublicKey};
 use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{Network, Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
@@ -1583,6 +1583,92 @@ fn block_fees(block: &NakamotoBlock) -> u128 {
 #[must_use]
 pub fn starts_new_tenure(block: &NakamotoBlock) -> bool {
     block_starts_new_tenure(block)
+}
+
+/// The VRF proof a tenure-start block's coinbase carries.
+#[must_use]
+pub fn coinbase_vrf_proof(block: &NakamotoBlock) -> Option<[u8; 80]> {
+    block
+        .transactions
+        .iter()
+        .find_map(|transaction| match transaction.payload().data() {
+            TransactionPayloadData::NakamotoCoinbase { vrf_proof, .. } => Some(*vrf_proof),
+            _ => None,
+        })
+}
+
+/// The seed a miner must commit for the tenure that follows one whose coinbase
+/// carried this proof (`stacks-common`, `VRFSeed::from_proof`).
+#[must_use]
+pub fn vrf_seed_from_proof(proof: &[u8; 80]) -> [u8; 32] {
+    *sha512_256(proof).as_bytes()
+}
+
+/// A tenure-start block whose VRF does not hold up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TenureVrfError {
+    /// A tenure-start block reached execution without a coinbase proof.
+    MissingProof,
+    /// The proof is not 80 well-formed bytes.
+    MalformedProof,
+    /// The proof was not produced by the winning miner's registered VRF key.
+    ProofNotFromLeaderKey,
+    /// The seed committed on Bitcoin is not the hash of the parent tenure's proof.
+    SeedNotFromParentProof,
+}
+
+impl std::fmt::Display for TenureVrfError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingProof => "tenure-start block has no coinbase VRF proof",
+            Self::MalformedProof => "coinbase VRF proof is malformed",
+            Self::ProofNotFromLeaderKey => {
+                "coinbase VRF proof was not produced by the winning leader key"
+            }
+            Self::SeedNotFromParentProof => {
+                "committed seed is not the hash of the parent tenure's VRF proof"
+            }
+        })
+    }
+}
+
+impl std::error::Error for TenureVrfError {}
+
+/// Verify a tenure-start block's coinbase proof against the winning miner's key.
+///
+/// The proof is over the tenure's sortition hash, which already mixes the seed
+/// the winning commitment carried, so a miner cannot produce it for a sortition
+/// it did not win (`chainstate/nakamoto/mod.rs`, `check_normal_coinbase_tx`).
+pub fn verify_coinbase_vrf_proof(
+    block: &NakamotoBlock,
+    leader_vrf_public_key: &[u8; 32],
+    sortition_hash: &[u8; 32],
+) -> Result<(), TenureVrfError> {
+    let proof = coinbase_vrf_proof(block).ok_or(TenureVrfError::MissingProof)?;
+    let public_key =
+        VrfPublicKey::from_bytes(*leader_vrf_public_key)
+        .map_err(|_| TenureVrfError::MalformedProof)?;
+    let proof = VrfProof::from_bytes(&proof).map_err(|_| TenureVrfError::MalformedProof)?;
+    match Vrf::verify(&public_key, &proof, sortition_hash) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(TenureVrfError::ProofNotFromLeaderKey),
+    }
+}
+
+/// Verify that the seed a tenure's winning commitment carried was derived from
+/// the parent tenure's VRF proof (`chainstate/nakamoto`, `validate_vrf_seed`).
+///
+/// Without this a miner could commit any seed and steer the sortition that
+/// follows, so it is checked separately from the proof itself.
+pub fn verify_committed_vrf_seed(
+    committed_seed: &[u8; 32],
+    parent_tenure_proof: &[u8; 80],
+) -> Result<(), TenureVrfError> {
+    if vrf_seed_from_proof(parent_tenure_proof) == *committed_seed {
+        Ok(())
+    } else {
+        Err(TenureVrfError::SeedNotFromParentProof)
+    }
 }
 
 /// Whether a block begins a tenure or extends the one it belongs to, which is
