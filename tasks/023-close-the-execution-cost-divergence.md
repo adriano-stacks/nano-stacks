@@ -52,7 +52,10 @@ about when a block is full and when a tenure must be extended.
       into the harness, and found the constants.
 - [x] Seed the state a call runs against, not just the contract — a driver
       contract over two environments does it, and found another 31.
-- [ ] Bisect `.pox-5 stake` for that 31, and the 66 for `stake-update`.
+- [x] Bisect `.pox-5 stake` for that 31 — it was `try!`, and three more words
+      had the same fault.
+- [ ] Find the 66 on a *successful* `stake-update`, which none of the aborting
+      paths reach.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -255,18 +258,31 @@ and a driver into both, then call through the driver, snapshotting
 maps with `.pox-5`'s own code, which is as close to the real thing as anything
 offline gets.
 
-Doing that turns up **another 31**: `stake` returning `ERR_SIGNER_NOT_FOUND`
-costs 31 too much, while `stake-update` returning `ERR_NOT_STAKING` on the same
-state is exact.
+Doing that turned up **another 31**: `stake` returning `ERR_SIGNER_NOT_FOUND`
+cost 31 too much, while `stake-update` returning `ERR_NOT_STAKING` on the same
+state was exact.
 
-It is not the shapes already fixed. A failing `unwrap!` returning a constant is
-exact, directly and inside a `let`; so is an error propagated by `try!` out of
-another contract, with or without work after it, and so is `unwrap-err!` across
-the same boundary.
+Bisecting it — probe functions holding growing prefixes of `stake`'s body,
+appended to a local copy of the contract — put it on one statement:
 
-So it is somewhere in `stake`'s own path, and finding it means bisecting 3,851
-lines rather than guessing at shapes — the reduction the earlier ones needed,
-against a contract large enough that it wants doing carefully.
+```clarity
+(try! (verify-signer-key-grant signer
+    (unwrap! (get-signer-info signer) ERR_SIGNER_NOT_FOUND)))
+```
+
+The `unwrap!` fails, and `try!` had already been charged for work it never did.
+`try!` is a *native* function in the interpreter, so its argument is evaluated
+and then `dispatch_args` charges — the same rule the aborted-expression fix
+established, applied to a word that fix had missed.
+
+Sweeping every word that takes an operand for the same fault found three more:
+`tuple`, `default-to`, and `append` — the last charging *between* its two
+operands, so only an aborting element exposed it. Twenty wrappers around an
+aborting operand now crosscheck exactly, and **`.pox-5 stake` matches**.
+
+The lesson is that "charged before its operands" is a fault of a *word*, not of
+a shape, so the sweep has to be over words. Four rounds of it have now found
+eight.
 
 ### What the remaining 66 is not
 
