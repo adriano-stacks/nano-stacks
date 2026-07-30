@@ -3,7 +3,7 @@
 use std::{env, path::Path};
 
 use clarity::vm::{Value, types::PrincipalData};
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use nano_vm::{BitcoinBlockContext, Vm};
 
 fn main() {
@@ -26,7 +26,7 @@ fn main() {
 
     let checkpoint = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../nano-conformance/fixtures/chainstate/checkpoint-H/marf.sqlite");
-    let mut vm = Vm::from_checkpoint(checkpoint, block, TrieHash::from_bytes(root))
+    let mut vm = Vm::from_checkpoint(Network::TESTNET, checkpoint, block, TrieHash::from_bytes(root))
         .expect("open the captured state");
     vm.begin_block_execution(
         Some(block),
@@ -40,7 +40,7 @@ fn main() {
         },
     )
     .expect("begin a probe block");
-    let pox = clarity::boot_util::boot_code_id("pox-5", false);
+    let pox = clarity::boot_util::boot_code_id("pox-5", vm.network().is_mainnet());
     let sender = PrincipalData::Standard(pox.issuer.clone());
     let args = staker
         .map(|staker| {

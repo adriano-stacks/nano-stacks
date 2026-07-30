@@ -29,8 +29,8 @@ use nano_miner::{
     build_tenure_continuation_block, build_tenure_extend_block, build_tenure_start_block,
     extend_sortition_hash, plan_commitment, total_burn_after,
 };
-use nano_node::CheckpointExecutor;
-use nano_primitives::{ConsensusHash, TrieHash, hash160};
+use nano_node::{Checkpoint, CheckpointExecutor};
+use nano_primitives::{ConsensusHash, Network, TrieHash, hash160};
 use nano_stackerdb::{BlockProposal, StackerDbClient, StackerDbContract};
 use nano_sync::{PoxInfo, SortitionInfo, SyncClient};
 use reqwest::Url;
@@ -88,8 +88,9 @@ struct Cli {
     /// commitment must spend so the sortition attributes them to one miner.
     #[arg(long)]
     commitment_chain_file: PathBuf,
-    #[arg(long, default_value_t = 0x8000_0000)]
-    chain_id: u32,
+    /// Two-byte burnchain magic prefixing every Stacks `OP_RETURN`.
+    #[arg(long, default_value = "T3")]
+    bitcoin_magic: String,
     #[arg(long)]
     pox_5_activation_height: Option<u32>,
     /// Seconds to wait for the threshold signer response set.
@@ -110,6 +111,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let node = SyncClient::new(Url::parse(&cli.peer)?)?;
     let pox = node.pox_info().await?;
+    // The chain nano mines on is whichever one the peer it follows reports.
+    let network = Network::from_chain_id(node.node_info().await?.network_id);
     let password = fs::read_to_string(&cli.bitcoin_rpc_password_file)?
         .trim_end()
         .to_owned();
@@ -117,7 +120,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         StacksPrivateKey::from_bytes(read_hex_array(&cli.block_signing_private_key_file)?)?;
     let vrf_key = VrfPrivateKey::from_bytes(read_hex_array(&cli.vrf_private_key_file)?);
     let miner_hash = hash160(&miner_key.public_key().to_bytes_compressed());
-    let miner_address = StacksAddress::single_signature(miner_hash, false);
+    let miner_address = StacksAddress::single_signature(miner_hash, network.is_mainnet());
 
     let wallet = BitcoinWallet::connect(
         &format!(
@@ -129,7 +132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let leader_key = registered_key(&wallet, &cli).await?;
 
-    let mut executor = open_checkpoint(&cli, &pox, &password)?;
+    let mut executor = open_checkpoint(&cli, network, &pox, &password)?;
     println!("mining as {miner_hash} from the checkpoint");
 
     let mut committed_at = 0;
@@ -155,6 +158,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         tenure = match advance_tenure(
             &cli,
+            network,
             &node,
             &pox,
             &password,
@@ -210,6 +214,7 @@ async fn registered_key(
 /// Open the checkpoint the miner extends, with the rewards it still owes.
 fn open_checkpoint(
     cli: &Cli,
+    network: Network,
     pox: &PoxInfo,
     password: &str,
 ) -> Result<CheckpointExecutor<BitcoinRpcSource>, Box<dyn Error>> {
@@ -218,17 +223,20 @@ fn open_checkpoint(
     if let Some(height) = cli.pox_5_activation_height {
         context.pox_5_activation_height = height;
     }
-    Ok(CheckpointExecutor::from_checkpoint_with_accounting(
-        &cli.checkpoint,
-        parse_hex_array(&cli.source_state_id)?,
-        TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
+    Ok(CheckpointExecutor::from_checkpoint(
+        Checkpoint {
+            network,
+            path: &cli.checkpoint,
+            source: parse_hex_array(&cli.source_state_id)?,
+            state_root: TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
+            accounting: match &cli.tenure_accounting {
+                Some(path) => Some(TenureAccounting::from_json(&fs::read(path)?)?),
+                None => None,
+            },
+        },
         NakamotoBlock::decode(&fs::read(&cli.anchor_block)?)?,
         context,
         bitcoin_source(cli, password)?,
-        match &cli.tenure_accounting {
-            Some(path) => Some(TenureAccounting::from_json(&fs::read(path)?)?),
-            None => None,
-        },
     )?)
 }
 
@@ -288,6 +296,7 @@ struct Tracked<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn advance_tenure(
     cli: &Cli,
+    network: Network,
     node: &SyncClient,
     pox: &PoxInfo,
     password: &str,
@@ -307,7 +316,7 @@ async fn advance_tenure(
         // keeps confirming what the mempool holds, and says on chain when the
         // tenure outlives the budget it started with.
         if let Some(state) = tenure.as_mut()
-            && let Some(block) = continue_tenure(cli, node, pox, miner_key, executor, state).await?
+            && let Some(block) = continue_tenure(cli, network, node, pox, miner_key, executor, state).await?
         {
             println!(
                 "the network accepted nano's block {} at height {}",
@@ -333,7 +342,7 @@ async fn advance_tenure(
         );
         return Ok(Some(resumed));
     }
-    let block = mine(cli, node, pox, password, miner_key, vrf_key, executor, &won).await?;
+    let block = mine(cli, network, node, pox, password, miner_key, vrf_key, executor, &won).await?;
     println!("the network accepted nano's block {}", block.block_id());
     let started = TenureState::started(&won, &block, nonce);
     executor.accept_own_block(block);
@@ -377,6 +386,7 @@ async fn resume_tenure(
 /// state it already agreed to.
 async fn continue_tenure(
     cli: &Cli,
+    network: Network,
     node: &SyncClient,
     pox: &PoxInfo,
     miner_key: &StacksPrivateKey,
@@ -418,7 +428,7 @@ async fn continue_tenure(
                 nonce: state.nonce,
                 now: now_unix(),
             },
-            cli.chain_id,
+            network,
             miner_key,
             Vec::new(),
         )?
@@ -486,7 +496,7 @@ async fn commit(
         .ok()
         .and_then(|value| parse_outpoint(value.trim()));
     let submitted = wallet.submit_leader_commitment(
-        *b"T3",
+        cli.magic()?,
         plan.commitment,
         &plan.sbtc_address,
         Amount::from_sat(cli.commitment_sats),
@@ -510,6 +520,7 @@ async fn commit(
 #[allow(clippy::too_many_arguments)]
 async fn mine(
     cli: &Cli,
+    network: Network,
     node: &SyncClient,
     pox: &PoxInfo,
     password: &str,
@@ -527,7 +538,7 @@ async fn mine(
         node,
         won,
         view,
-        cli.chain_id,
+        network,
         miner_key,
         vrf_key,
         won.bitcoin_timestamp,
@@ -643,6 +654,18 @@ async fn tenure_view(
 }
 
 /// Seconds since the epoch, which a block's timestamp is measured in.
+impl Cli {
+    /// The two-byte burnchain magic this network prefixes its `OP_RETURN`s with.
+    fn magic(&self) -> Result<[u8; 2], io::Error> {
+        self.bitcoin_magic.as_bytes().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "burnchain magic must be exactly two bytes",
+            )
+        })
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -654,7 +677,7 @@ fn bitcoin_source(cli: &Cli, password: &str) -> Result<BitcoinRpcSource, Box<dyn
         &cli.bitcoin_rpc,
         cli.bitcoin_rpc_user.clone(),
         password.to_owned(),
-        *b"T3",
+        cli.magic()?,
     )?)
 }
 

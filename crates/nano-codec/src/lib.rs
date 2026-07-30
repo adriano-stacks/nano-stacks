@@ -5,7 +5,7 @@ use std::fmt;
 use nano_address::StacksAddress;
 use nano_crypto::{MessageSignature, StacksPrivateKey, StacksPublicKey, VrfProof};
 use nano_primitives::{
-    ConsensusHash, Hash160, Sha256Sum, StacksBlockId, hash160, sha256, sha512_256,
+    ConsensusHash, Hash160, Network, Sha256Sum, StacksBlockId, hash160, sha256, sha512_256,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,6 +297,16 @@ pub enum TransactionVersion {
 }
 
 impl TransactionVersion {
+    /// The version byte transactions on this network carry.
+    #[must_use]
+    pub const fn for_network(network: Network) -> Self {
+        if network.is_mainnet() {
+            Self::Mainnet
+        } else {
+            Self::Testnet
+        }
+    }
+
     const fn parse(value: u8) -> Self {
         match value {
             0x00 => Self::Mainnet,

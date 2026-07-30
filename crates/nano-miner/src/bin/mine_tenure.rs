@@ -11,8 +11,8 @@ use nano_miner::{
     BitcoinTenureView, ProposalCoordinator, ProposalError, SortitionHashPoint,
     build_tenure_start_block, extend_sortition_hash, total_burn_after,
 };
-use nano_node::CheckpointExecutor;
-use nano_primitives::{TrieHash, hash160};
+use nano_node::{Checkpoint, CheckpointExecutor};
+use nano_primitives::{Network, TrieHash, hash160};
 use nano_stackerdb::{BlockProposal, StackerDbClient, StackerDbContract};
 use nano_sync::SyncClient;
 use reqwest::Url;
@@ -68,8 +68,9 @@ struct Cli {
     #[arg(long)]
     sortition_hash_cache: PathBuf,
     /// Network chain identifier.
-    #[arg(long, default_value_t = 0x8000_0000)]
-    chain_id: u32,
+    /// Two-byte burnchain magic prefixing every Stacks `OP_RETURN`.
+    #[arg(long, default_value = "T3")]
+    bitcoin_magic: String,
     /// Bitcoin height at which PoX-5 activates.
     #[arg(long)]
     pox_5_activation_height: Option<u32>,
@@ -95,6 +96,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let node = SyncClient::new(Url::parse(&cli.peer)?)?;
     let pox = node.pox_info().await?;
+    // The chain nano mines on is whichever one the peer it follows reports.
+    let network = Network::from_chain_id(node.node_info().await?.network_id);
     let password = fs::read_to_string(&cli.bitcoin_rpc_password_file)?
         .trim_end()
         .to_owned();
@@ -109,7 +112,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bitcoin_context.pox_5_activation_height = height;
     }
 
-    let mut executor = checkpoint_executor(&cli, &password, bitcoin_context)?;
+    let mut executor = checkpoint_executor(&cli, network, &password, bitcoin_context)?;
     let executed = executor
         .follow_to_tip(&node, &pox, cli.max_sync_blocks)
         .await?;
@@ -152,7 +155,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &node,
         &won,
         view,
-        cli.chain_id,
+        network,
         &miner_key,
         &vrf_key,
         won.bitcoin_timestamp,
@@ -185,6 +188,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Open the checkpoint the miner extends, with the rewards it still owes.
 fn checkpoint_executor(
     cli: &Cli,
+    network: Network,
     password: &str,
     bitcoin_context: nano_chainstate::BitcoinBlockContext,
 ) -> Result<CheckpointExecutor<BitcoinRpcSource>, Box<dyn Error>> {
@@ -192,19 +196,22 @@ fn checkpoint_executor(
         Some(path) => Some(TenureAccounting::from_json(&fs::read(path)?)?),
         None => None,
     };
-    Ok(CheckpointExecutor::from_checkpoint_with_accounting(
-        &cli.checkpoint,
-        parse_hex_array(&cli.source_state_id)?,
-        TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
+    Ok(CheckpointExecutor::from_checkpoint(
+        Checkpoint {
+            network,
+            path: &cli.checkpoint,
+            source: parse_hex_array(&cli.source_state_id)?,
+            state_root: TrieHash::from_bytes(parse_hex_array(&cli.state_root)?),
+            accounting,
+        },
         NakamotoBlock::decode(&fs::read(&cli.anchor_block)?)?,
         bitcoin_context,
         BitcoinRpcSource::new(
             &cli.bitcoin_rpc,
             cli.bitcoin_rpc_user.clone(),
             password.to_owned(),
-            *b"T3",
+            cli.magic()?,
         )?,
-        accounting,
     )?)
 }
 
@@ -274,7 +281,7 @@ async fn bitcoin_tenure_view(
         &cli.bitcoin_rpc,
         cli.bitcoin_rpc_user.clone(),
         password.to_owned(),
-        *b"T3",
+        cli.magic()?,
     )?;
     let tenure = node.tenure_info().await?;
     let parent = node.sortition(tenure.consensus_hash).await?;
@@ -303,6 +310,18 @@ async fn bitcoin_tenure_view(
         total_burn,
         sortition_hash: point.sortition_hash,
     })
+}
+
+impl Cli {
+    /// The two-byte burnchain magic this network prefixes its `OP_RETURN`s with.
+    fn magic(&self) -> Result<[u8; 2], io::Error> {
+        self.bitcoin_magic.as_bytes().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "burnchain magic must be exactly two bytes",
+            )
+        })
+    }
 }
 
 fn read_hex_array<const N: usize>(path: &PathBuf) -> Result<[u8; N], io::Error> {

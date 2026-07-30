@@ -11,6 +11,7 @@ use clarity::vm::{
 };
 use nano_crypto::StacksPublicKey;
 use nano_primitives::hash160;
+use nano_primitives::Network;
 use nano_vm::{BitcoinBlockContext, Vm};
 
 use crate::{ChainStateError, SignerSet};
@@ -49,7 +50,8 @@ pub fn update_signer_set(
     let Some(reward_cycle) = prepare_phase_reward_cycle(context) else {
         return Ok(());
     };
-    let signers = boot_contract("signers");
+    let network = vm.network();
+    let signers = boot_contract(network, "signers");
     // A cycle is only set up once, by whichever block reaches the prepare phase first.
     let Ok(last_set_cycle) = read_u128(vm, &signers, "get-last-set-cycle", &[]) else {
         return Ok(());
@@ -80,7 +82,7 @@ pub fn update_signer_set(
         |weight| Value::UInt(u128::from(weight)),
     )?;
     vm.call_contract_values(
-        boot_sender(),
+        boot_sender(network),
         &signers,
         "stackerdb-set-signer-slots",
         &[
@@ -90,7 +92,7 @@ pub fn update_signer_set(
         ],
     )?;
     vm.call_contract_values(
-        boot_sender(),
+        boot_sender(network),
         &signers,
         "set-signers",
         &[Value::UInt(u128::from(reward_cycle)), weights],
@@ -103,7 +105,7 @@ fn stake_entries(
     vm: &mut Vm,
     reward_cycle: u64,
 ) -> Result<Vec<(StacksPublicKey, u128)>, ChainStateError> {
-    let pox = boot_contract("pox-5");
+    let pox = boot_contract(vm.network(), "pox-5");
     let cycle = Value::UInt(u128::from(reward_cycle));
     let mut current = read_optional(
         vm,
@@ -188,12 +190,12 @@ fn signing_principal(public_key: &StacksPublicKey) -> PrincipalData {
     )
 }
 
-fn boot_contract(name: &str) -> QualifiedContractIdentifier {
-    clarity::boot_util::boot_code_id(name, false)
+fn boot_contract(network: Network, name: &str) -> QualifiedContractIdentifier {
+    clarity::boot_util::boot_code_id(name, network.is_mainnet())
 }
 
-fn boot_sender() -> PrincipalData {
-    PrincipalData::Standard(boot_contract("signers").issuer)
+fn boot_sender(network: Network) -> PrincipalData {
+    PrincipalData::Standard(boot_contract(network, "signers").issuer)
 }
 
 fn read_u128(
@@ -202,7 +204,8 @@ fn read_u128(
     function: &str,
     arguments: &[Value],
 ) -> Result<u128, ChainStateError> {
-    let value = vm.call_contract_values(boot_sender(), contract, function, arguments)?;
+    let sender = boot_sender(vm.network());
+    let value = vm.call_contract_values(sender, contract, function, arguments)?;
     let value = match value {
         Value::Response(response) if response.committed => *response.data,
         other => other,
@@ -218,7 +221,8 @@ fn read_optional(
     function: &str,
     arguments: &[Value],
 ) -> Result<Option<Value>, ChainStateError> {
-    vm.call_contract_values(boot_sender(), contract, function, arguments)?
+    let sender = boot_sender(vm.network());
+    vm.call_contract_values(sender, contract, function, arguments)?
         .expect_optional()
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }

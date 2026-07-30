@@ -22,12 +22,12 @@ use std::{
 
 use clarity::vm::database::{ClarityDatabase, StoreType};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
-use nano_bitcoin::{BitcoinRpcSource, BitcoinSource};
+use nano_bitcoin::BitcoinRpcSource;
 use nano_chainstate::{ChainState, NakamotoBlock, TenureAccounting};
 use nano_codec::{Principal, TransactionPayloadData};
 use nano_marf::MarfValue;
-use nano_node::CheckpointExecutor;
-use nano_primitives::{TrieHash, sha512_256};
+use nano_node::{Checkpoint, CheckpointExecutor};
+use nano_primitives::{Network, TrieHash, sha512_256};
 use nano_sync::{PoxInfo, SyncClient};
 use reqwest::Url;
 
@@ -41,6 +41,13 @@ async fn main() {
             .expect("NANO_PEER must be a URL");
     let client = SyncClient::new(peer).expect("create the sync client");
     let pox = client.pox_info().await.expect("read the PoX calendar");
+    let network = Network::from_chain_id(
+        client
+            .node_info()
+            .await
+            .expect("read the peer's node information")
+            .network_id,
+    );
 
     let anchor_height: u64 = checkpoint_value(&checkpoint, "anchor_bitcoin_height")
         .parse()
@@ -55,19 +62,23 @@ async fn main() {
 
     let mut context = pox.bitcoin_context();
     context.height = anchor_height;
-    let mut executor = CheckpointExecutor::from_checkpoint_with_accounting(
-        checkpoint.join("marf.sqlite"),
-        source,
-        root,
+    let mut executor = CheckpointExecutor::from_checkpoint(
+        Checkpoint {
+            network,
+            path: checkpoint.join("marf.sqlite"),
+            source,
+            state_root: root,
+            accounting: Some(
+                TenureAccounting::from_json(
+                    &fs::read(checkpoint.join("native-effects.json"))
+                        .expect("read tenure accounting"),
+                )
+                .expect("decode tenure accounting"),
+            ),
+        },
         anchor.clone(),
         context,
         bitcoin(),
-        Some(
-            TenureAccounting::from_json(
-                &fs::read(checkpoint.join("native-effects.json")).expect("read tenure accounting"),
-            )
-            .expect("decode tenure accounting"),
-        ),
     )
     .expect("import the checkpoint");
 
@@ -111,7 +122,7 @@ async fn main() {
                     block.block_id(),
                     block.header.chain_length
                 );
-                report(&mut executor, &parent, &block, context, &pox);
+                report(network, &mut executor, &parent, &block, context, &pox);
                 return;
             }
         }
@@ -121,6 +132,7 @@ async fn main() {
 
 /// Compare the writes nano and the node performed for one diverging block.
 fn report(
+    network: Network,
     executor: &mut CheckpointExecutor<BitcoinRpcSource>,
     parent: &NakamotoBlock,
     block: &NakamotoBlock,
@@ -149,10 +161,10 @@ fn report(
     };
     // An import keeps the block's own trie, back pointers included, so the
     // node's writes are the difference between the two states it imports.
-    let stock_state = imported(Path::new(&path), block);
+    let stock_state = imported(network, Path::new(&path), block);
     let stock = difference(
         &leaves(&stock_state, block),
-        &leaves(&imported(Path::new(&path), parent), parent),
+        &leaves(&imported(network, Path::new(&path), parent), parent),
     )
     .into_iter()
     .collect::<BTreeMap<_, _>>();
@@ -233,8 +245,9 @@ fn descend(nano: &ChainState, stock: &ChainState, block: [u8; 32]) {
 }
 
 /// Import one block state of a node's own MARF.
-fn imported(path: &Path, block: &NakamotoBlock) -> ChainState {
+fn imported(network: Network, path: &Path, block: &NakamotoBlock) -> ChainState {
     ChainState::from_checkpoint(
+        network,
         path,
         *block.block_id().as_bytes(),
         block.header.state_index_root,
@@ -374,7 +387,11 @@ fn bitcoin() -> BitcoinRpcSource {
         &env::var("NANO_BITCOIN_RPC").unwrap_or_else(|_| "http://127.0.0.1:18443".to_owned()),
         env::var("NANO_BITCOIN_USER").unwrap_or_else(|_| "hacknet".to_owned()),
         password.trim_end(),
-        *b"T3",
+        env::var("NANO_BITCOIN_MAGIC")
+            .unwrap_or_else(|_| "T3".to_owned())
+            .as_bytes()
+            .try_into()
+            .expect("burnchain magic must be exactly two bytes"),
     )
     .expect("connect to Bitcoin Core")
 }

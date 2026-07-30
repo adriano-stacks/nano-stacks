@@ -24,9 +24,8 @@ use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
     CheckpointError, MarfError, MarfValue, StateRoot, TriePointer, VersionedMarf, import_checkpoint,
 };
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use rusqlite::{OptionalExtension, params};
-use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::{
     StacksEpoch, StacksEpochId,
     chainstate::{
@@ -254,10 +253,10 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Create an empty VM.
-    pub fn new() -> Result<Self, MarfStoreError> {
+    /// Create an empty VM for the supplied network.
+    pub fn new(network: Network) -> Result<Self, MarfStoreError> {
         Ok(Self {
-            store: MarfStore::new()?,
+            store: MarfStore::new(network)?,
             context: BitcoinContext::default(),
             modules: ModuleCache::default(),
         })
@@ -265,15 +264,22 @@ impl Vm {
 
     /// Open a VM at a checkpointed Clarity state.
     pub fn from_checkpoint(
+        network: Network,
         path: impl AsRef<Path>,
         source: [u8; 32],
         expected_root: TrieHash,
     ) -> Result<Self, MarfStoreError> {
         Ok(Self {
-            store: MarfStore::from_checkpoint(path, source, expected_root)?,
+            store: MarfStore::from_checkpoint(network, path, source, expected_root)?,
             context: BitcoinContext::default(),
             modules: ModuleCache::default(),
         })
+    }
+
+    /// The chain this VM executes against.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.store.network()
     }
 
     /// Begin execution for a block state.
@@ -638,6 +644,7 @@ pub const fn execute_stub() -> ExecutionResult {
 /// A versioned Clarity key/value store whose state roots are committed by the MARF.
 #[derive(Debug)]
 pub struct MarfStore {
+    network: Network,
     marf: VersionedMarf,
     side_store: rusqlite::Connection,
     states: BTreeMap<[u8; 32], StoreState>,
@@ -717,9 +724,10 @@ impl From<rusqlite::Error> for MarfStoreError {
 }
 
 impl MarfStore {
-    /// Create an empty versioned store.
-    pub fn new() -> Result<Self, MarfStoreError> {
+    /// Create an empty versioned store for the supplied network.
+    pub fn new(network: Network) -> Result<Self, MarfStoreError> {
         Ok(Self {
+            network,
             marf: VersionedMarf::default(),
             side_store: create_side_store()?,
             states: BTreeMap::new(),
@@ -732,7 +740,11 @@ impl MarfStore {
     }
 
     /// Load a checkpointed Clarity MARF and its corresponding `SQLite` side tables.
+    ///
+    /// A checkpoint belongs to exactly one chain, so the network it is executed
+    /// as is fixed when it is opened.
     pub fn from_checkpoint(
+        network: Network,
         path: impl AsRef<Path>,
         source: [u8; 32],
         expected_root: TrieHash,
@@ -744,6 +756,7 @@ impl MarfStore {
         states.insert(source, StoreState::default());
 
         Ok(Self {
+            network,
             marf,
             side_store,
             states,
@@ -753,6 +766,12 @@ impl MarfStore {
             active: None,
             transaction: None,
         })
+    }
+
+    /// The chain this state belongs to.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.network
     }
 
     /// Create a Clarity database backed by this store.
@@ -1288,18 +1307,15 @@ impl ClarityBackingStore for MarfStore {
     }
 }
 
-/// Evaluate a Clarity 6 program under the consensus Epoch 4.0 rules.
-///
-/// The current backing store is deliberately ephemeral while the MARF adapter is
-/// implemented. The interpreter, language version, epoch, and cost tracker are
-/// nevertheless the production consensus implementation.
-pub fn evaluate(source: &str) -> Result<Option<Value>, ClarityEvalError> {
+/// Evaluate a Clarity 6 program under the consensus Epoch 4.0 rules against an
+/// ephemeral store, for programs that read and write nothing.
+pub fn evaluate(network: Network, source: &str) -> Result<Option<Value>, ClarityEvalError> {
     let contract_id = QualifiedContractIdentifier::transient();
     let mut backing_store = MemoryBackingStore::new();
     let database = backing_store.as_clarity_db();
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -1342,11 +1358,12 @@ fn evaluate_with_tracker_in_context(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<Evaluation, ClarityEvalError> {
+    let network = store.network();
     let contract_id = QualifiedContractIdentifier::transient();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1396,10 +1413,11 @@ fn deploy_contract_in_context(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, ClarityEvalError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1424,6 +1442,7 @@ fn deploy_contract_with_wasm_in_context(
     source: &str,
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, ClarityEvalError> {
+    let network = store.network();
     let compiled = {
         let mut analysis = AnalysisDatabase::new(store);
         let compiled: CompiledContract = analysis
@@ -1453,8 +1472,8 @@ fn deploy_contract_with_wasm_in_context(
 
     let database = clarity_database(store, bitcoin_context);
     let mut global = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1556,6 +1575,7 @@ fn execute_contract_call_outcome_in_context(
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
+    let network = store.network();
     let arguments = call
         .arguments
         .iter()
@@ -1576,8 +1596,8 @@ fn execute_contract_call_outcome_in_context(
     let mut database = clarity_database(store, bitcoin_context);
     database.begin();
     let mut environment = OwnedEnvironment::new_cost_limited(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1665,6 +1685,7 @@ fn call_contract_values_in_context(
     arguments: &[Value],
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
+    let network = store.network();
     for argument in arguments.iter().filter_map(contract_argument) {
         ensure_wasm_module(store, bitcoin_context, modules, argument)?;
     }
@@ -1674,8 +1695,8 @@ fn call_contract_values_in_context(
         .ok_or_else(|| VmInternalError::Expect(format!("missing WASM module for {contract}")))?;
     let database = clarity_database(store, bitcoin_context);
     let mut global = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1838,10 +1859,11 @@ fn transfer_stx_in_context(
     memo: &[u8],
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         cost_tracker,
         StacksEpochId::Epoch40,
@@ -1878,13 +1900,14 @@ fn debit_fee_in_context(
     payer: &PrincipalData,
     fee: u64,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     if fee == 0 {
         return Ok(());
     }
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -1904,10 +1927,11 @@ fn touch_stx_balance_in_context(
     bitcoin_context: &dyn BurnStateDB,
     principal: &PrincipalData,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -1925,10 +1949,11 @@ fn credit_stx_in_context(
     principal: &PrincipalData,
     amount: u128,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -1945,12 +1970,13 @@ fn transaction_cost_tracker_in_context(
     bitcoin_context: &dyn BurnStateDB,
     total: ExecutionCost,
 ) -> Result<LimitedCostTracker, VmExecutionError> {
+    let network = store.network();
     let mut database = clarity_database(store, bitcoin_context);
     database.begin();
     database.set_clarity_epoch_version(StacksEpochId::Epoch40)?;
     let result = LimitedCostTracker::new_mid_block(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         EPOCH_4_BLOCK_LIMIT,
         &mut database,
         StacksEpochId::Epoch40,
@@ -1972,10 +1998,11 @@ fn process_scheduled_unlocks_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
 ) -> Result<u128, VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2016,10 +2043,11 @@ fn increment_liquid_stx_supply_in_context(
     bitcoin_context: &dyn BurnStateDB,
     amount: u128,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2040,10 +2068,11 @@ fn account_nonce_in_context(
     bitcoin_context: &dyn BurnStateDB,
     principal: &PrincipalData,
 ) -> Result<u64, VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2066,10 +2095,11 @@ fn set_account_nonce_in_context(
     principal: &PrincipalData,
     nonce: u64,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2089,10 +2119,11 @@ fn setup_block_metadata_in_context(
     bitcoin_context: &dyn BurnStateDB,
     timestamp: u64,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2104,10 +2135,11 @@ fn tenure_height_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn BurnStateDB,
 ) -> Result<u32, VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2120,10 +2152,11 @@ fn set_tenure_height_in_context(
     bitcoin_context: &dyn BurnStateDB,
     height: u32,
 ) -> Result<(), VmExecutionError> {
+    let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
-        false,
-        CHAIN_ID_TESTNET,
+        network.is_mainnet(),
+        network.chain_id(),
         database,
         LimitedCostTracker::new_free(),
         StacksEpochId::Epoch40,
@@ -2140,7 +2173,7 @@ mod tests {
     use clarity::vm::database::clarity_store::make_contract_hash_key;
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
     use clarity::vm::{ClarityVersion, Value};
-    use nano_primitives::TrieHash;
+    use nano_primitives::{Network, TrieHash};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -2152,7 +2185,7 @@ mod tests {
 
     #[test]
     fn evaluates_clarity_six_programs() {
-        let value = evaluate("(+ u20 u22)").expect("Clarity 6 program should evaluate");
+        let value = evaluate(Network::TESTNET, "(+ u20 u22)").expect("Clarity 6 program should evaluate");
 
         assert_eq!(value, Some(Value::UInt(42)));
     }
@@ -2160,8 +2193,8 @@ mod tests {
     #[test]
     fn supports_epoch_four_clarity_six_words() {
         let concatenated =
-            evaluate("(concat 0x01 0x02 0x03)").expect("variadic concat should evaluate");
-        let parsed_bitcoin = evaluate("(get-bitcoin-tx-output? 0x00 u0)")
+            evaluate(Network::TESTNET, "(concat 0x01 0x02 0x03)").expect("variadic concat should evaluate");
+        let parsed_bitcoin = evaluate(Network::TESTNET, "(get-bitcoin-tx-output? 0x00 u0)")
             .expect("bitcoin transaction parser should evaluate");
 
         assert_eq!(
@@ -2173,7 +2206,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_programs() {
-        assert!(evaluate("(unknown-word u1)").is_err());
+        assert!(evaluate(Network::TESTNET, "(unknown-word u1)").is_err());
     }
 
     #[test]
@@ -2181,7 +2214,7 @@ mod tests {
         let first = [1; 32];
         let second = [2; 32];
         let fork = [3; 32];
-        let mut store = MarfStore::new().expect("create MARF store");
+        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
 
         store.begin(None, first).expect("begin first state");
         store
@@ -2224,7 +2257,7 @@ mod tests {
 
     #[test]
     fn evaluates_against_an_active_marf_store() {
-        let mut store = MarfStore::new().expect("create MARF store");
+        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
         store.begin(None, [1; 32]).expect("begin state");
 
         let value =
@@ -2238,7 +2271,7 @@ mod tests {
     fn credits_liquid_stx_without_a_transaction_event() {
         let principal =
             PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid principal");
-        let mut vm = Vm::new().expect("create VM");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [1; 32]).expect("begin checkpoint");
         vm.seal_block().expect("seal checkpoint");
         vm.begin_block(Some([1; 32]), [2; 32])
@@ -2257,7 +2290,7 @@ mod tests {
 
     #[test]
     fn persists_clarity_data_variables_in_the_marf_store() {
-        let mut store = MarfStore::new().expect("create MARF store");
+        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
         let block = [1; 32];
         store.begin(None, block).expect("begin state");
 
@@ -2275,7 +2308,7 @@ mod tests {
     #[test]
     fn transaction_rollback_restores_active_state() {
         let block = [1; 32];
-        let mut store = MarfStore::new().expect("create MARF store");
+        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
         store.begin(None, block).expect("begin block");
         store
             .put("counter".to_owned(), "one".to_owned())
@@ -2294,7 +2327,7 @@ mod tests {
     #[test]
     fn vm_executes_and_seals_a_block_state() {
         let block = [9; 32];
-        let mut vm = Vm::new().expect("create VM");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, block).expect("begin block");
 
         let evaluation = vm
@@ -2319,7 +2352,7 @@ mod tests {
         Value::UInt(41)
             .consensus_serialize(&mut argument)
             .expect("serialize Clarity value");
-        let mut vm = Vm::new().expect("create VM");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, block).expect("begin block");
         vm.deploy_contract(
             contract.clone(),
@@ -2356,7 +2389,7 @@ mod tests {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.guard")
             .expect("valid contract identifier");
         let sender: PrincipalData = contract.issuer.clone().into();
-        let mut vm = Vm::new().expect("create VM");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, block).expect("begin block");
         vm.deploy_contract(
             contract.clone(),
@@ -2393,7 +2426,7 @@ mod tests {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.bitcoin")
             .expect("valid contract identifier");
         let sender = contract.issuer.clone().into();
-        let mut vm = Vm::new().expect("create VM");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, block).expect("begin block");
         vm.deploy_contract(
             contract.clone(),
@@ -2521,7 +2554,7 @@ mod tests {
         ];
         let sender: PrincipalData = contract.issuer.clone().into();
 
-        let mut wasm = Vm::new().expect("create WASM VM");
+        let mut wasm = Vm::new(Network::TESTNET).expect("create WASM VM");
         wasm.begin_block(None, [0x71; 32])
             .expect("begin WASM block");
         wasm.deploy_contract(
@@ -2531,7 +2564,7 @@ mod tests {
             LimitedCostTracker::new_free(),
         )
         .expect("deploy WASM contract");
-        let mut store = MarfStore::new().expect("create interpreter store");
+        let mut store = MarfStore::new(Network::TESTNET).expect("create interpreter store");
         store
             .begin(None, [0x72; 32])
             .expect("begin interpreter block");
@@ -2599,7 +2632,7 @@ mod tests {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
             .expect("valid boot contract identifier");
         let mut store =
-            MarfStore::from_checkpoint(checkpoint, source, root).expect("load checkpoint");
+            MarfStore::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("load checkpoint");
 
         assert_eq!(
             store.root(source).map(|root| root.0),
@@ -2639,7 +2672,7 @@ mod tests {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox-5")
             .expect("valid checkpoint contract identifier");
         let sender = contract.issuer.clone().into();
-        let mut vm = Vm::from_checkpoint(checkpoint, source, root).expect("load checkpoint");
+        let mut vm = Vm::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("load checkpoint");
         vm.begin_block(Some(source), [0x43; 32])
             .expect("extend checkpoint state");
 

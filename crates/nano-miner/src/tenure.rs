@@ -10,7 +10,9 @@ use nano_codec::{
     TransactionPayloadData, TransactionVersion, transaction_merkle_root,
 };
 use nano_crypto::{MessageSignature, StacksPrivateKey, Vrf, VrfError, VrfPrivateKey};
-use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, StacksBlockId, TrieHash, hash160};
+use nano_primitives::{
+    BitVec, BitcoinHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash, hash160,
+};
 use nano_sortition::SortitionHash;
 use nano_sync::{SortitionInfo, SyncClient, SyncError};
 use serde::{Deserialize, Serialize};
@@ -204,7 +206,7 @@ pub async fn build_tenure_start_block(
     node: &SyncClient,
     won: &SortitionInfo,
     view: BitcoinTenureView,
-    chain_id: u32,
+    network: Network,
     miner_key: &StacksPrivateKey,
     vrf_key: &VrfPrivateKey,
     timestamp: u64,
@@ -226,12 +228,12 @@ pub async fn build_tenure_start_block(
 
     let miner_hash = hash160(&miner_key.public_key().to_bytes_compressed());
     let nonce = node
-        .account_nonce(StacksAddress::single_signature(miner_hash, false))
+        .account_nonce(StacksAddress::single_signature(miner_hash, network.is_mainnet()))
         .await?;
     let transactions = vec![
         Transaction::sign_standard(
-            TransactionVersion::Testnet,
-            chain_id,
+            TransactionVersion::for_network(network),
+            network.chain_id(),
             AnchorMode::OnChainOnly,
             miner_key,
             nonce,
@@ -248,8 +250,8 @@ pub async fn build_tenure_start_block(
             }),
         )?,
         Transaction::sign_standard(
-            TransactionVersion::Testnet,
-            chain_id,
+            TransactionVersion::for_network(network),
+            network.chain_id(),
             AnchorMode::OnChainOnly,
             miner_key,
             nonce.saturating_add(1),
@@ -478,13 +480,13 @@ pub fn build_tenure_continuation_block(
 pub fn build_tenure_extend_block(
     tenure: &TenureTip,
     extension: TenureExtension,
-    chain_id: u32,
+    network: Network,
     miner_key: &StacksPrivateKey,
     transactions: Vec<Transaction>,
 ) -> Result<NakamotoBlock, TenureStartError> {
     let mut extended = vec![Transaction::sign_standard(
-        TransactionVersion::Testnet,
-        chain_id,
+        TransactionVersion::for_network(network),
+        network.chain_id(),
         AnchorMode::OnChainOnly,
         miner_key,
         extension.nonce,

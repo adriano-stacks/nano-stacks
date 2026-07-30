@@ -9,6 +9,7 @@ rust-version.workspace = true
 axum = "0.8.9"
 clap = { version = "4.6.4", features = ["derive"] }
 nano-node = { path = "../nano-node" }
+nano-primitives = { path = "../nano-primitives" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -17,7 +18,6 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "s
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
-nano-primitives = { path = "../nano-primitives" }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
 

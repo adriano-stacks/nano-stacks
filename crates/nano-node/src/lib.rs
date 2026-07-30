@@ -6,7 +6,7 @@ use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
     AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock, TenureAccounting,
 };
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use nano_sync::{
     FollowedTenure, NodeInfo, PoxInfo, SyncClient, SyncError, TenureFollower, TenureInfo,
 };
@@ -117,6 +117,21 @@ impl From<ChainStateError> for CheckpointExecutionError {
     }
 }
 
+/// A checkpointed Clarity state, and what is needed to execute from it.
+#[derive(Clone, Debug)]
+pub struct Checkpoint<P> {
+    /// The chain this state belongs to, which fixes how it is executed.
+    pub network: Network,
+    /// Path to the checkpoint's MARF.
+    pub path: P,
+    /// The MARF state the checkpoint was taken at.
+    pub source: [u8; 32],
+    /// The state root that state is published under.
+    pub state_root: TrieHash,
+    /// The matured native rewards the checkpoint still owes, if it records them.
+    pub accounting: Option<TenureAccounting>,
+}
+
 impl<S> CheckpointExecutor<S>
 where
     S: BitcoinSource,
@@ -124,35 +139,19 @@ where
 {
     /// Import a checkpoint and apply its first known descendant as the execution anchor.
     pub fn from_checkpoint(
-        path: impl AsRef<Path>,
-        source: [u8; 32],
-        state_root: TrieHash,
-        anchor: NakamotoBlock,
-        bitcoin_context: BitcoinBlockContext,
-        bitcoin: S,
-    ) -> Result<Self, CheckpointExecutionError> {
-        Self::from_checkpoint_with_accounting(
-            path,
-            source,
-            state_root,
-            anchor,
-            bitcoin_context,
-            bitcoin,
-            None,
-        )
-    }
-
-    /// Import a checkpoint together with the matured native rewards it owes.
-    pub fn from_checkpoint_with_accounting(
-        path: impl AsRef<Path>,
-        source: [u8; 32],
-        state_root: TrieHash,
+        checkpoint: Checkpoint<impl AsRef<Path>>,
         anchor: NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
         mut bitcoin: S,
-        accounting: Option<TenureAccounting>,
     ) -> Result<Self, CheckpointExecutionError> {
-        let mut chainstate = ChainState::from_checkpoint(path, source, state_root)?;
+        let Checkpoint {
+            network,
+            path,
+            source,
+            state_root,
+            accounting,
+        } = checkpoint;
+        let mut chainstate = ChainState::from_checkpoint(network, path, source, state_root)?;
         if let Some(accounting) = accounting {
             *chainstate.accounting_mut() = accounting;
         }

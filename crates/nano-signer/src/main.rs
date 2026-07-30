@@ -7,7 +7,7 @@ use nano_address::StacksAddress;
 use nano_bitcoin::BitcoinRpcSource;
 use nano_chainstate::{ChainState, NakamotoBlock, TenureAccounting};
 use nano_crypto::StacksPrivateKey;
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use nano_signer::{
     AccumulatedCoinbase, ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner,
     LiveSigner, SignerConfig, SignerService, StateAnnouncer,
@@ -72,6 +72,9 @@ enum Command {
         /// Bitcoin height at which PoX-5 activates for this network.
         #[arg(long)]
         pox_5_activation_height: Option<u32>,
+        /// Two-byte burnchain magic prefixing every Stacks `OP_RETURN`.
+        #[arg(long, default_value = "T3")]
+        bitcoin_magic: String,
         #[arg(long, default_value_t = 1)]
         poll_interval_secs: u64,
         /// Maximum canonical blocks to fetch before requiring a nearer checkpoint.
@@ -106,6 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 anchor_block,
                 anchor_bitcoin_height,
                 pox_5_activation_height,
+                bitcoin_magic,
                 poll_interval_secs,
                 max_sync_blocks,
                 conflict_timeout_secs,
@@ -114,9 +118,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } = Cli::parse();
     let client = SyncClient::new(Url::parse(&peer)?)?;
     let pox = client.pox_info().await?;
+    // The chain nano executes is whichever one the peer it follows reports.
+    let network = Network::from_chain_id(client.node_info().await?.network_id);
+    let magic: [u8; 2] = bitcoin_magic
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "burnchain magic must be exactly two bytes")?;
     let password = fs::read_to_string(bitcoin_rpc_password_file)?;
     let mut bitcoin =
-        BitcoinRpcSource::new(&bitcoin_rpc, bitcoin_rpc_user, password.trim_end(), *b"T3")?;
+        BitcoinRpcSource::new(&bitcoin_rpc, bitcoin_rpc_user, password.trim_end(), magic)?;
     let mut bitcoin_context = pox.bitcoin_context();
     bitcoin_context.height = anchor_bitcoin_height;
     if let Some(height) = pox_5_activation_height {
@@ -125,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let source = parse_array(&source_state_id)?;
     let root = TrieHash::from_bytes(parse_array(&state_root)?);
     let anchor = NakamotoBlock::decode(&fs::read(anchor_block)?)?;
-    let mut chainstate = ChainState::from_checkpoint(checkpoint, source, root)?;
+    let mut chainstate = ChainState::from_checkpoint(network, checkpoint, source, root)?;
     if let Some(path) = tenure_accounting {
         *chainstate.accounting_mut() = TenureAccounting::from_json(&fs::read(path)?)?;
     }

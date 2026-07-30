@@ -26,7 +26,7 @@ use nano_codec::{
 };
 use nano_crypto::StacksPrivateKey;
 use nano_marf::{MarfValue, TriePointer};
-use nano_primitives::{Sha256Sum, TrieHash, sha512_256};
+use nano_primitives::{Network, Sha256Sum, TrieHash, sha512_256};
 use nano_sortition::SortitionSnapshot;
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
@@ -69,9 +69,6 @@ pub struct NativeStxCredit {
 
 /// Number of sortition-created tenures before a miner reward matures.
 pub const MINER_REWARD_MATURITY: u64 = 100;
-
-/// Address that receives a matured share whose earning tenure is unknown.
-const BOOT_ADDRESS: &str = "ST000000000000000000002AMW42H";
 
 /// What a tenure earned for the recipients it pays once it matures.
 ///
@@ -307,6 +304,7 @@ impl TenureAccounting {
     /// that differs from the network's only once the block is already sealed.
     pub fn effects_for_tenure(
         &self,
+        network: Network,
         coinbase_height: u64,
     ) -> Result<NativeBlockEffects, TenureAccountingError> {
         if let Some(effects) = self.matured_effects.get(&coinbase_height) {
@@ -323,8 +321,10 @@ impl TenureAccounting {
         // The fees a tenure paid mature one tenure after its coinbase, and land
         // on the boot address when no tenure earned them.
         let previous = self.earnings.get(&matured.saturating_sub(1));
-        let boot =
-            || PrincipalData::parse(BOOT_ADDRESS).expect("the boot address is a valid principal");
+        let boot = || {
+            PrincipalData::parse(network.boot_address())
+                .expect("the boot address is a valid principal")
+        };
         Ok(NativeBlockEffects {
             credits: vec![
                 NativeStxCredit {
@@ -528,24 +528,31 @@ impl From<VmExecutionError> for ChainStateError {
 }
 
 impl ChainState {
-    /// Create an empty chainstate.
-    pub fn new() -> Result<Self, ChainStateError> {
+    /// Create an empty chainstate for the supplied network.
+    pub fn new(network: Network) -> Result<Self, ChainStateError> {
         Ok(Self {
-            vm: Vm::new()?,
+            vm: Vm::new(network)?,
             accounting: TenureAccounting::default(),
         })
     }
 
     /// Open chainstate from a checkpointed Clarity MARF.
     pub fn from_checkpoint(
+        network: Network,
         path: impl AsRef<Path>,
         source: [u8; 32],
         expected_root: TrieHash,
     ) -> Result<Self, ChainStateError> {
         Ok(Self {
-            vm: Vm::from_checkpoint(path, source, expected_root)?,
+            vm: Vm::from_checkpoint(network, path, source, expected_root)?,
             accounting: TenureAccounting::default(),
         })
+    }
+
+    /// The chain this state belongs to.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.vm.network()
     }
 
     /// Access the portable accounting ledger associated with this chainstate.
@@ -874,7 +881,7 @@ impl ChainState {
                 .record_earnings(u64::from(next_height), earnings);
         }
         self.accounting
-            .effects_for_tenure(u64::from(next_height))
+            .effects_for_tenure(self.vm.network(), u64::from(next_height))
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
     }
 
@@ -1019,7 +1026,7 @@ impl ChainState {
                 ..
             } => self.execute_native_contract_call(
                 principal_from_address(*sender)?,
-                "ST000000000000000000002AMW42H.pox-5",
+                &self.vm.network().boot_contract_id("pox-5"),
                 "stack-stx",
                 &[
                     Value::UInt(*amount),
@@ -1053,7 +1060,7 @@ impl ChainState {
                 ..
             } => self.execute_native_contract_call(
                 principal_from_address(*sender)?,
-                "ST000000000000000000002AMW42H.pox-5",
+                &self.vm.network().boot_contract_id("pox-5"),
                 "delegate-stx",
                 &[
                     Value::UInt(*amount),
@@ -1070,7 +1077,7 @@ impl ChainState {
                 reward_cycle,
             } => self.execute_native_contract_call(
                 principal_from_address(*sender)?,
-                "ST000000000000000000002AMW42H.signers-voting",
+                &self.vm.network().boot_contract_id("signers-voting"),
                 "vote-for-aggregate-public-key",
                 &[
                     Value::UInt(u128::from(*signer_index)),
@@ -1894,7 +1901,7 @@ mod tests {
 
     use nano_address::StacksAddress;
     use nano_codec::Transaction;
-    use nano_primitives::{BitcoinHeaderHash, Hash160, TrieHash};
+    use nano_primitives::{BitcoinHeaderHash, Hash160, Network, TrieHash};
     use nano_sortition::SortitionSnapshot;
 
     use super::{
@@ -1906,7 +1913,7 @@ mod tests {
     #[test]
     fn append_program_seals_the_vm_state_root() {
         let snapshot = SortitionSnapshot::genesis(42, BitcoinHeaderHash::from_bytes([0; 32]));
-        let mut chainstate = ChainState::new().expect("create chainstate");
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
 
         let applied = chainstate
             .append_program(
@@ -1923,7 +1930,7 @@ mod tests {
 
     #[test]
     fn executes_decoded_contract_deployments_and_calls() {
-        let mut chainstate = ChainState::new().expect("create chainstate");
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
         chainstate
             .vm
             .begin_block(None, [1; 32])
@@ -1999,7 +2006,7 @@ mod tests {
         let (checkpoint, source, root, _) = captured_checkpoint();
         let block = captured_first_block();
         let mut chainstate =
-            ChainState::from_checkpoint(checkpoint, source, root).expect("open checkpoint");
+            ChainState::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("open checkpoint");
         chainstate
             .vm
             .begin_block(Some(source), *block.block_id().as_bytes())
@@ -2017,7 +2024,7 @@ mod tests {
         let (checkpoint, source, root, bitcoin_height) = captured_checkpoint();
         let block = captured_first_block();
         let context = BitcoinBlockContext::at_height(bitcoin_height);
-        let baseline = ChainState::from_checkpoint(&checkpoint, source, root)
+        let baseline = ChainState::from_checkpoint(Network::TESTNET, &checkpoint, source, root)
             .expect("open checkpoint")
             .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
             .expect("execute baseline block");
@@ -2029,7 +2036,7 @@ mod tests {
             }],
             liquid_supply_increase: 1,
         };
-        let applied = ChainState::from_checkpoint(checkpoint, source, root)
+        let applied = ChainState::from_checkpoint(Network::TESTNET, checkpoint, source, root)
             .expect("open checkpoint")
             .execute_nakamoto_block_with_effects(context, Some(source), &block, effects)
             .expect("execute native effects");
@@ -2054,12 +2061,12 @@ mod tests {
             .record_matured_effects(100, effects.clone())
             .expect("record effects");
         assert_eq!(
-            accounting.effects_for_tenure(99),
+            accounting.effects_for_tenure(Network::TESTNET, 99),
             Ok(NativeBlockEffects::default())
         );
-        assert_eq!(accounting.effects_for_tenure(100), Ok(effects));
+        assert_eq!(accounting.effects_for_tenure(Network::TESTNET, 100), Ok(effects));
         assert_eq!(
-            accounting.effects_for_tenure(101),
+            accounting.effects_for_tenure(Network::TESTNET, 101),
             Err(TenureAccountingError::UnknownTenure(1)),
             "a payout with neither a checkpoint nor an executed tenure must fail loudly"
         );
@@ -2132,7 +2139,7 @@ mod tests {
         );
         assert_eq!(
             accounting
-                .effects_for_tenure(113)
+                .effects_for_tenure(Network::TESTNET, 113)
                 .expect("seeded and executed tenures")
                 .credits[1]
                 .amount,
@@ -2140,7 +2147,7 @@ mod tests {
         );
 
         let effects = accounting
-            .effects_for_tenure(111)
+            .effects_for_tenure(Network::TESTNET, 111)
             .expect("both tenures were executed");
         assert_eq!(effects.liquid_supply_increase, 9);
         assert_eq!(
@@ -2176,7 +2183,7 @@ mod tests {
 
         assert_eq!(
             accounting
-                .effects_for_tenure(100)
+                .effects_for_tenure(Network::TESTNET, 100)
                 .expect("checkpointed effects")
                 .liquid_supply_increase,
             42
@@ -2218,7 +2225,7 @@ mod tests {
 
     #[test]
     fn failed_postcondition_rolls_back_contract_writes_and_consumes_nonce() {
-        let mut chainstate = ChainState::new().expect("create chainstate");
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
         chainstate
             .vm
             .begin_block(None, [2; 32])
@@ -2265,7 +2272,7 @@ mod tests {
 
     #[test]
     fn runtime_failure_rolls_back_contract_writes_and_consumes_nonce() {
-        let mut chainstate = ChainState::new().expect("create chainstate");
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
         chainstate
             .vm
             .begin_block(None, [3; 32])

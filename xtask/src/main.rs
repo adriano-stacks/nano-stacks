@@ -10,6 +10,7 @@ use std::{
 };
 
 use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
+use nano_primitives::Network;
 use serde_json::json;
 
 fn main() -> ExitCode {
@@ -55,9 +56,6 @@ fn print_public_key(private_key: Option<&str>) -> ExitCode {
 
 /// Tenures between a reward being earned and paid, mirroring stacks-core.
 const MINER_REWARD_MATURITY: u64 = 100;
-
-/// Testnet boot address, which receives a parent share that has no tenure.
-const BOOT_ADDRESS: &str = "ST000000000000000000002AMW42H";
 
 /// The reward one tenure earned, as stacks-core scheduled it.
 struct ScheduledPayment {
@@ -112,6 +110,7 @@ struct CaptureConfig {
     first_height: u64,
     replay_blocks: u64,
     checkpoint_height: u64,
+    bitcoin_magic: String,
 }
 
 fn capture_fixtures(arguments: &[String]) -> ExitCode {
@@ -138,6 +137,7 @@ impl CaptureConfig {
         let mut first_height = None;
         let mut replay_blocks = None;
         let mut checkpoint_height = None;
+        let mut bitcoin_magic = None;
 
         while let Some(flag) = values.next() {
             let value = values
@@ -153,6 +153,7 @@ impl CaptureConfig {
                 "--first-height" => first_height = Some(parse_u64(flag, value)?),
                 "--replay-blocks" => replay_blocks = Some(parse_u64(flag, value)?),
                 "--checkpoint-height" => checkpoint_height = Some(parse_u64(flag, value)?),
+                "--bitcoin-magic" => bitcoin_magic = Some(value.to_owned()),
                 _ => return Err(format!("unknown capture-fixtures argument: {flag}")),
             }
         }
@@ -169,6 +170,7 @@ impl CaptureConfig {
             replay_blocks: replay_blocks.ok_or_else(|| "--replay-blocks is required".to_owned())?,
             checkpoint_height: checkpoint_height
                 .ok_or_else(|| "--checkpoint-height is required".to_owned())?,
+            bitcoin_magic: bitcoin_magic.unwrap_or_else(|| "T3".to_owned()),
         })
     }
 
@@ -299,6 +301,10 @@ impl CaptureConfig {
             &node_root.join("chainstate/vm/index.sqlite"),
             blocks,
             &checkpoint_dir,
+            Network::from_chain_id(u32::try_from(self.chain_id()?).map_err(|error| {
+                format!("captured node reports an out-of-range chain identifier: {error}")
+            })?)
+            .boot_address(),
         )?;
         let checkpoint_manifest = format!(
             "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = {}\n",
@@ -382,6 +388,7 @@ impl CaptureConfig {
         chainstate_db: &Path,
         blocks: &[CapturedBlock],
         checkpoint_dir: &Path,
+        boot_address: &str,
     ) -> Result<(), String> {
         let block_ids = blocks
             .iter()
@@ -421,7 +428,7 @@ impl CaptureConfig {
                 chainstate_db,
                 coinbase_height.saturating_sub(MINER_REWARD_MATURITY + 1),
             )?
-            .map_or_else(|| BOOT_ADDRESS.to_owned(), |payment| payment.recipient);
+            .map_or_else(|| boot_address.to_owned(), |payment| payment.recipient);
             effects.push(json!({
                 "coinbase_height": coinbase_height,
                 "credits": [
@@ -507,6 +514,14 @@ impl CaptureConfig {
         ))
     }
 
+    /// The chain identifier the captured node reports, which decides the network
+    /// replay must execute the capture as.
+    fn chain_id(&self) -> Result<u64, String> {
+        let response = String::from_utf8(http_get(&format!("{}/v2/info", self.stacks_rpc))?)
+            .map_err(|error| format!("node information response was not UTF-8: {error}"))?;
+        json_unsigned_field(&response, "network_id")
+    }
+
     fn write_provenance(
         &self,
         staging: &Path,
@@ -519,8 +534,10 @@ impl CaptureConfig {
             .map_err(|error| format!("system time precedes Unix epoch: {error}"))?
             .as_secs();
         let (pox_first_height, prepare_phase_length, reward_phase_length) = self.pox_calendar()?;
+        let chain_id = self.chain_id()?;
+        let magic = &self.bitcoin_magic;
         let contents = format!(
-            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}\n",
+            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}\n",
             self.hacknet_commit,
             checkpoint.height,
             checkpoint.index_block_hash,

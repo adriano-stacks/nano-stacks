@@ -14,6 +14,7 @@ use axum::{
     routing::get,
 };
 use nano_node::NodeView;
+use nano_primitives::Network;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
@@ -128,7 +129,9 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
 }
 
 async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
-    let pox = view(&state).await?.pox_info;
+    let view = view(&state).await?;
+    let network = Network::from_chain_id(view.node_info.network_id);
+    let pox = view.pox_info;
     Ok(axum::Json(PoxInfoWire {
         first_burnchain_block_height: pox.first_bitcoin_height,
         current_burnchain_block_height: pox.bitcoin_height,
@@ -141,7 +144,7 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWir
             .map(|height| {
                 vec![PoxContractVersionWire {
                     activation_burnchain_block_height: height,
-                    contract_id: "ST000000000000000000002AMW42H.pox-5".to_owned(),
+                    contract_id: network.boot_contract_id("pox-5"),
                 }]
             })
             .unwrap_or_default(),

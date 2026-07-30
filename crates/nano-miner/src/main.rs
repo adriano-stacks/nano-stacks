@@ -10,7 +10,7 @@ use nano_chainstate::{
 };
 use nano_crypto::StacksPrivateKey;
 use nano_miner::{ProposalCoordinator, ProposalError};
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use nano_stackerdb::{BlockProposal, StackerDbClient, StackerDbContract};
 use nano_sync::{PoxInfo, SyncClient};
 use reqwest::Url;
@@ -32,6 +32,9 @@ struct Cli {
     /// File containing the Bitcoin Core RPC password.
     #[arg(long)]
     bitcoin_rpc_password_file: PathBuf,
+    /// Two-byte burnchain magic prefixing every Stacks `OP_RETURN`.
+    #[arg(long, default_value = "T3")]
+    bitcoin_magic: String,
     /// Miner `StackerDB` contract as ADDRESS/name.
     #[arg(long)]
     miner_contract: String,
@@ -84,6 +87,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let client = SyncClient::new(Url::parse(&cli.peer)?)?;
     let pox = client.pox_info().await?;
+    // The chain nano executes is whichever one the peer it follows reports.
+    let network = Network::from_chain_id(client.node_info().await?.network_id);
     let mut bitcoin = bitcoin_source(&cli)?;
 
     let source = parse_array(&cli.source_state_id)?;
@@ -104,7 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let anchor_context = execution_context(&cli, &pox, cli.anchor_bitcoin_height);
     let candidate_context = execution_context(&cli, &pox, bitcoin_height);
-    let mut chainstate = ChainState::from_checkpoint(&cli.checkpoint, source, root)?;
+    let mut chainstate = ChainState::from_checkpoint(network, &cli.checkpoint, source, root)?;
     if let Some(path) = &cli.tenure_accounting {
         *chainstate.accounting_mut() = TenureAccounting::from_json(&fs::read(path)?)?;
     }
@@ -175,7 +180,10 @@ fn bitcoin_source(cli: &Cli) -> Result<BitcoinRpcSource, Box<dyn Error>> {
         &cli.bitcoin_rpc,
         &cli.bitcoin_rpc_user,
         password.trim_end(),
-        *b"T3",
+        cli.bitcoin_magic
+            .as_bytes()
+            .try_into()
+            .map_err(|_| "burnchain magic must be exactly two bytes")?,
     )?)
 }
 

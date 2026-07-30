@@ -9,7 +9,7 @@ use std::{
 
 use nano_bitcoin::{BitcoinOperation, PreStxCache, decode_block_with_pre_stx};
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
-use nano_primitives::TrieHash;
+use nano_primitives::{Network, TrieHash};
 use serde::Deserialize;
 
 /// The minimum metadata needed to make replay depth visible before fixture
@@ -548,8 +548,9 @@ fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static str
     let (source, state_root) =
         checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
     let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
-    let mut chainstate = ChainState::from_checkpoint(checkpoint, source, state_root)
-        .map_err(|_| "checkpoint cannot be opened")?;
+    let mut chainstate =
+        ChainState::from_checkpoint(captured_network(root), checkpoint, source, state_root)
+            .map_err(|_| "checkpoint cannot be opened")?;
     let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
         .ok()
         .and_then(|contents| TenureAccounting::from_json(&contents).ok())
@@ -738,19 +739,42 @@ impl std::fmt::Display for ReplayDivergence {
     }
 }
 
+/// Read a scalar field from the capture's provenance record.
+fn provenance_field(root: &Path, name: &str) -> Option<String> {
+    let provenance = fs::read_to_string(root.join("provenance.toml")).ok()?;
+    provenance
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))
+        .map(|value| value.trim().trim_matches('"').to_owned())
+}
+
+/// The chain the fixtures were captured from.
+///
+/// Replay has to execute a capture as the network that produced it: the flag
+/// and the identifier both reach the state root.
+pub fn captured_network(root: &Path) -> Network {
+    provenance_field(root, "chain_id")
+        .and_then(|value| {
+            value
+                .strip_prefix("0x")
+                .map_or_else(|| value.parse().ok(), |hex| u32::from_str_radix(hex, 16).ok())
+        })
+        .map_or(Network::TESTNET, Network::from_chain_id)
+}
+
+/// The burnchain magic the captured chain prefixes its `OP_RETURN`s with.
+fn captured_magic(root: &Path) -> [u8; 2] {
+    provenance_field(root, "bitcoin_magic")
+        .and_then(|value| value.as_bytes().try_into().ok())
+        .unwrap_or(*b"T3")
+}
+
 fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlockContext>> {
     let snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
     // A block's reward cycle position decides whether it sets up a signer set,
     // so replay needs the captured network's stacking calendar.
-    let provenance = fs::read_to_string(root.join("provenance.toml")).ok()?;
-    let field = |name: &str| -> Option<u64> {
-        provenance
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))?
-            .parse()
-            .ok()
-    };
+    let field = |name: &str| -> Option<u64> { provenance_field(root, name)?.parse().ok() };
     let first_height = field("pox_first_bitcoin_height")?;
     let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
     let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
@@ -774,6 +798,7 @@ fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<Bitco
     let mut snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
     snapshots.sort_by_key(|snapshot| snapshot.block_height);
+    let magic = captured_magic(root);
     let mut cache = PreStxCache::new();
     snapshots
         .into_iter()
@@ -785,7 +810,7 @@ fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<Bitco
             .ok()?;
             let raw = hex::decode(encoded.trim()).ok()?;
             let block =
-                decode_block_with_pre_stx(snapshot.block_height, &raw, *b"T3", &mut cache).ok()?;
+                decode_block_with_pre_stx(snapshot.block_height, &raw, magic, &mut cache).ok()?;
             Some((snapshot.consensus_hash, block.operations))
         })
         .collect()
@@ -826,8 +851,8 @@ mod tests {
 
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
-        baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, checkpoint_state,
-        scoreboard, validate_fixture_tree,
+        baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
+        checkpoint_state, scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -883,8 +908,8 @@ mod tests {
         MarfTrie, MarfValue, TrieNodeId, TriePointer, VersionedMarf, import_checkpoint, import_pcs,
         internal_node_hash, key_path, leaf_hash,
     };
-    use nano_node::CheckpointExecutor;
-    use nano_primitives::{BitVec, TrieHash, hash160, sha256, sha512, sha512_256};
+    use nano_node::{Checkpoint, CheckpointExecutor};
+    use nano_primitives::{BitVec, Network, TrieHash, hash160, sha256, sha512, sha512_256};
     use nano_signer::{ChainstateProposalValidator, ProposalValidator};
     use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, Chunk, SignerMessage};
     use proptest::prelude::*;
@@ -1100,6 +1125,7 @@ mod tests {
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
             root,
@@ -1162,6 +1188,7 @@ mod tests {
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
         let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
             root,
@@ -1215,6 +1242,7 @@ mod tests {
             .get(&second.header.consensus_hash.to_string())
             .expect("second Bitcoin context");
         let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
             root,
@@ -1310,9 +1338,13 @@ mod tests {
             .collect(),
         };
         let mut executor = CheckpointExecutor::from_checkpoint(
-            fixture.join("chainstate/checkpoint-H/marf.sqlite"),
-            source,
-            root,
+            Checkpoint {
+                network: captured_network(&fixture),
+                path: fixture.join("chainstate/checkpoint-H/marf.sqlite"),
+                source,
+                state_root: root,
+                accounting: None,
+            },
             first,
             first_context,
             bitcoin,
@@ -1332,6 +1364,7 @@ mod tests {
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut chainstate = ChainState::from_checkpoint(
+            captured_network(&fixture),
             fixture.join("chainstate/checkpoint-H/marf.sqlite"),
             source,
             root,
@@ -1652,6 +1685,50 @@ mod tests {
         assert_eq!(ours.read_length, reference.read_length);
         assert_eq!(ours.read_count, reference.read_count);
         assert_eq!(ours.runtime, reference.runtime);
+    }
+
+    /// The two consensus-visible halves of a network's identity.
+    ///
+    /// Both reach the state root: the chain identifier through every signing
+    /// preimage and `(chain-id)`, and the boot address through the principal of
+    /// every boot contract a block touches.
+    #[test]
+    fn network_identity_matches_stacks_core() {
+        for (network, mainnet) in [(Network::MAINNET, true), (Network::TESTNET, false)] {
+            assert_eq!(network.is_mainnet(), mainnet);
+            assert_eq!(
+                network.chain_id(),
+                if mainnet {
+                    stacks_common::consts::CHAIN_ID_MAINNET
+                } else {
+                    stacks_common::consts::CHAIN_ID_TESTNET
+                }
+            );
+            assert_eq!(
+                network.boot_address(),
+                clarity::boot_util::boot_code_addr(mainnet).to_string()
+            );
+            assert_eq!(
+                network.boot_contract_id("pox-5"),
+                clarity::boot_util::boot_code_id("pox-5", mainnet).to_string()
+            );
+        }
+    }
+
+    /// A peer's reported chain identifier is what decides the network, and only
+    /// the mainnet identifier means mainnet.
+    #[test]
+    fn only_the_mainnet_chain_identifier_is_mainnet() {
+        assert!(Network::from_chain_id(stacks_common::consts::CHAIN_ID_MAINNET).is_mainnet());
+        for chain_id in [
+            stacks_common::consts::CHAIN_ID_TESTNET,
+            0x8000_0005,
+            0,
+            u32::MAX,
+        ] {
+            assert!(!Network::from_chain_id(chain_id).is_mainnet());
+            assert_eq!(Network::from_chain_id(chain_id).chain_id(), chain_id);
+        }
     }
 
     /// Find keys whose hashed trie paths share a leading prefix.

@@ -109,6 +109,81 @@ pub fn hash160(data: &[u8]) -> Hash160 {
     Hash160::from(digest)
 }
 
+/// The chain a node executes against.
+///
+/// Both fields are consensus-visible: the flag picks the boot address and the
+/// version byte inside every serialized principal, and the identifier is the
+/// `chain_id` a transaction signs over and `(chain-id)` reads
+/// (`stacks-common/src/libcommon.rs`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Network {
+    mainnet: bool,
+    chain_id: u32,
+}
+
+impl Network {
+    pub const MAINNET: Self = Self {
+        mainnet: true,
+        chain_id: 0x0000_0001,
+    };
+
+    pub const TESTNET: Self = Self {
+        mainnet: false,
+        chain_id: 0x8000_0000,
+    };
+
+    /// A non-mainnet chain that is not the public testnet, such as Hacknet.
+    #[must_use]
+    pub const fn testnet_with_chain_id(chain_id: u32) -> Self {
+        Self {
+            mainnet: false,
+            chain_id,
+        }
+    }
+
+    /// Recover the network a peer reports as its `network_id`.
+    ///
+    /// Only the mainnet identifier means mainnet; every other chain is a
+    /// testnet of some description.
+    #[must_use]
+    pub const fn from_chain_id(chain_id: u32) -> Self {
+        Self {
+            mainnet: chain_id == Self::MAINNET.chain_id,
+            chain_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_mainnet(self) -> bool {
+        self.mainnet
+    }
+
+    #[must_use]
+    pub const fn chain_id(self) -> u32 {
+        self.chain_id
+    }
+
+    /// The address every boot contract is published under.
+    ///
+    /// `SP000000000000000000002Q6VF78` on mainnet and
+    /// `ST000000000000000000002AMW42H` elsewhere (`clarity/src/vm/types/mod.rs`,
+    /// `boot_util::boot_code_addr`).
+    #[must_use]
+    pub const fn boot_address(self) -> &'static str {
+        if self.mainnet {
+            "SP000000000000000000002Q6VF78"
+        } else {
+            "ST000000000000000000002AMW42H"
+        }
+    }
+
+    /// Fully qualify a boot contract for this network.
+    #[must_use]
+    pub fn boot_contract_id(self, name: &str) -> String {
+        format!("{}.{name}", self.boot_address())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BitVec<const MAX_SIZE: u16> {
     data: Vec<u8>,

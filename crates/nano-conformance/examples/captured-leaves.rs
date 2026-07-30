@@ -8,6 +8,7 @@
 use std::{collections::BTreeSet, env, fs, path::Path};
 
 use nano_chainstate::{ChainState, NakamotoBlock};
+use nano_conformance::captured_network;
 
 fn main() {
     let target: u64 = env::args()
@@ -30,7 +31,12 @@ fn main() {
         .collect::<Vec<_>>();
     let leaves = |block: &NakamotoBlock| {
         let block_id = *block.block_id().as_bytes();
-        ChainState::from_checkpoint(&checkpoint, block_id, block.header.state_index_root)
+        ChainState::from_checkpoint(
+            captured_network(&fixtures),
+            &checkpoint,
+            block_id,
+            block.header.state_index_root,
+        )
             .expect("open the captured block state")
             .state_leaves(block_id)
             .expect("captured leaves")
