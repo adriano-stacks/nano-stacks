@@ -1,7 +1,7 @@
 ---
 id: "027"
 title: "Choose a fork instead of following a peer"
-status: pending
+status: in-progress
 priority: high
 effort: large
 type: improvement
@@ -27,15 +27,30 @@ strands it.
 
 ## Tasks
 
-- [ ] Follow several peers and keep the candidate tips they report.
-- [ ] Choose between candidates on chain length and valid signature weight
+- [x] Follow several peers and keep the candidate tips they report.
+- [x] Choose between candidates on chain length and valid signature weight
       against the burn view, not on arrival.
 - [ ] Reorganize onto a heavier fork instead of failing.
-- [ ] Use `/v3/tenures/fork_info` to find where a candidate diverged.
-- [ ] Treat a peer that serves an invalid block as untrusted rather than fatal.
+- [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
+- [x] Treat a peer that serves an invalid block as untrusted rather than fatal.
 
 ## Acceptance Criteria
 
 - A peer that reorganizes does not stall nano.
 - Given two candidate forks, nano selects the one stacks-core selects.
 - No single peer can withhold the canonical tip from a node with other peers.
+
+## Remaining
+
+`PeerPool` gathers candidate tips, `weigh_tip`/`choose_canonical_tip` pick one on
+signer weight then length (ties by block identifier, so peer order never decides),
+`SyncClient::tenure_fork_info` and `fork_point` locate where two views parted, and
+`PeerPool::distrust` sets a lying peer aside instead of raising.
+
+What is not done is the loop that acts on all of it. `TenureFollower::poll` still
+follows one client and still answers `SyncError::Fork` when the peer's chain does
+not extend its history, where it should instead take the chosen tip, find the fork
+point, hand `ChainState::retract` the blocks below it, and replay forward. The
+pieces on both sides now exist — `ChainRetraction` from
+[[026-survive-a-bitcoin-reorganization]] and the choice here — so this is wiring,
+in `TenureFollower` and in `nano-node`'s `ExecutingNode`.

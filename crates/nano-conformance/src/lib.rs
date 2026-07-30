@@ -764,6 +764,50 @@ pub fn captured_network(root: &Path) -> Network {
         .map_or(Network::TESTNET, Network::from_chain_id)
 }
 
+/// The reward set the capture's cycle stacked, as a signer set.
+#[cfg(test)]
+fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
+    #[derive(Deserialize)]
+    struct SignerWire {
+        signing_key: String,
+        stacked_amt: u64,
+    }
+    #[derive(Deserialize)]
+    struct RewardSetWire {
+        signers: Vec<SignerWire>,
+    }
+    #[derive(Deserialize)]
+    struct StackerSetWire {
+        stacker_set: RewardSetWire,
+    }
+
+    let mut paths = fs::read_dir(root.join("stacker_set"))
+        .expect("read reward sets")
+        .map(|entry| entry.expect("reward set entry").path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let path = paths.first().expect("a captured reward set");
+    let reward_set: StackerSetWire =
+        serde_json::from_slice(&fs::read(path).expect("read reward set")).expect("decode reward set");
+    let signers = reward_set
+        .stacker_set
+        .signers
+        .into_iter()
+        .map(|signer| {
+            (
+                nano_crypto::StacksPublicKey::from_bytes(
+                    &hex::decode(signer.signing_key).expect("decode signing key"),
+                )
+                .expect("valid signer key"),
+                u128::from(signer.stacked_amt),
+            )
+        })
+        .collect();
+    nano_chainstate::SignerSet::from_reward_slots(signers, 30)
+        .expect("build the captured signer set")
+        .0
+}
+
 /// The burnchain magic the captured chain prefixes its `OP_RETURN`s with.
 fn captured_magic(root: &Path) -> [u8; 2] {
     provenance_field(root, "bitcoin_magic")
@@ -895,7 +939,7 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
+        captured_signer_set, checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -1756,6 +1800,105 @@ mod tests {
                 clarity::boot_util::boot_code_id("pox-5", mainnet).to_string()
             );
         }
+    }
+
+    /// Fork choice weighs signatures before it compares lengths.
+    ///
+    /// Following one peer means following whatever it says. A pool has to pick,
+    /// and a longer chain nobody signed must never win over a shorter one the
+    /// reward set put its name to.
+    #[test]
+    fn a_longer_unsigned_chain_never_wins_the_fork_choice() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signers = captured_signer_set(&fixture);
+        let blocks = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .collect::<Vec<_>>();
+
+        // A real, signed tip from the captured chain.
+        let signed = blocks
+            .iter()
+            .find(|block| nano_sync::weigh_tip(&block.header, &signers).is_ok())
+            .expect("a captured block the reward set signed");
+        // The same chain, longer, with its signatures stripped.
+        let mut forged = signed.header.clone();
+        forged.chain_length = signed.header.chain_length + 1_000;
+        forged.signer_signatures.clear();
+
+        assert_eq!(
+            nano_sync::weigh_tip(&forged, &signers),
+            Err(nano_sync::TipRejection::InsufficientWeight),
+            "an unsigned header carries no weight however long it claims to be"
+        );
+
+        let tip = |peer: usize, header: nano_chainstate::NakamotoBlockHeader| {
+            nano_sync::CandidateTip {
+                peer,
+                info: nano_sync::TenureInfo {
+                    consensus_hash: header.consensus_hash,
+                    tenure_start_block_id: header.block_id(),
+                    parent_consensus_hash: header.consensus_hash,
+                    parent_tenure_start_block_id: header.parent_block_id,
+                    tip_block_id: header.block_id(),
+                    tip_height: header.chain_length,
+                    reward_cycle: 0,
+                },
+                header,
+            }
+        };
+        let candidates = vec![tip(0, forged), tip(1, signed.header.clone())];
+
+        let chosen = nano_sync::choose_canonical_tip(&candidates, &signers)
+            .expect("a signed candidate is available");
+        assert_eq!(chosen.peer, 1, "the signed tip wins despite being shorter");
+
+        // With nothing signed, there is no canonical tip to follow at all.
+        assert!(
+            nano_sync::choose_canonical_tip(&candidates[..1], &signers).is_none(),
+            "an unsigned chain is not a chain to follow"
+        );
+    }
+
+    /// Two peers offering equally long signed tips resolve the same way
+    /// everywhere, or nodes following the same peers would split.
+    #[test]
+    fn an_exact_tie_in_fork_choice_resolves_deterministically() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signers = captured_signer_set(&fixture);
+        let signed = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .find(|block| nano_sync::weigh_tip(&block.header, &signers).is_ok())
+            .expect("a captured block the reward set signed");
+
+        let tip = |peer: usize| nano_sync::CandidateTip {
+            peer,
+            info: nano_sync::TenureInfo {
+                consensus_hash: signed.header.consensus_hash,
+                tenure_start_block_id: signed.block_id(),
+                parent_consensus_hash: signed.header.consensus_hash,
+                parent_tenure_start_block_id: signed.header.parent_block_id,
+                tip_block_id: signed.block_id(),
+                tip_height: signed.header.chain_length,
+                reward_cycle: 0,
+            },
+            header: signed.header.clone(),
+        };
+        let forwards = vec![tip(0), tip(1)];
+        let backwards = vec![tip(1), tip(0)];
+
+        assert_eq!(
+            nano_sync::choose_canonical_tip(&forwards, &signers).map(|tip| tip.header.block_id()),
+            nano_sync::choose_canonical_tip(&backwards, &signers).map(|tip| tip.header.block_id()),
+            "the order the peers answered in must not decide the tip"
+        );
     }
 
     /// A reorganization takes the tenures it invalidated off the executed chain.

@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, fmt, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    time::Duration,
+};
 
 use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
@@ -89,6 +93,96 @@ pub struct TenureFollower {
     client: SyncClient,
     latest: Option<TenureInfo>,
     history: Vec<FollowedTenure>,
+}
+
+/// One burn block on the view a peer holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkInfo {
+    pub bitcoin_height: u64,
+    pub consensus_hash: ConsensusHash,
+    pub was_sortition: bool,
+    pub first_block_mined: Option<StacksBlockId>,
+}
+
+/// The first burn block two views agree on, which is where they parted.
+///
+/// Both are ordered newest first, as the endpoint returns them.
+#[must_use]
+pub fn fork_point(ours: &[ForkInfo], theirs: &[ForkInfo]) -> Option<ConsensusHash> {
+    let theirs: BTreeSet<_> = theirs.iter().map(|entry| entry.consensus_hash).collect();
+    ours.iter()
+        .find(|entry| theirs.contains(&entry.consensus_hash))
+        .map(|entry| entry.consensus_hash)
+}
+
+/// A chain tip a peer is offering, and the header that proves it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateTip {
+    /// Which of the followed peers offered it.
+    pub peer: usize,
+    pub info: TenureInfo,
+    pub header: nano_chainstate::NakamotoBlockHeader,
+}
+
+/// Why a candidate tip is not one to follow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TipRejection {
+    /// Its signatures do not add up to the threshold the reward set requires.
+    InsufficientWeight,
+    /// It carries a signature from outside the reward set, or out of order.
+    UnknownOrUnorderedSigner,
+    /// Its signatures do not recover.
+    UnrecoverableSignature,
+}
+
+impl fmt::Display for TipRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InsufficientWeight => "tip does not carry threshold signer weight",
+            Self::UnknownOrUnorderedSigner => "tip carries a signature from outside the reward set",
+            Self::UnrecoverableSignature => "tip carries a signature that does not recover",
+        })
+    }
+}
+
+impl std::error::Error for TipRejection {}
+
+/// Whether a tip is one the network would accept, and what weight signed it.
+///
+/// Length decides nothing on its own: a peer can serve a longer chain that no
+/// signer put its name to. Weight is what makes a chain canonical, so it is
+/// checked before length is even compared.
+pub fn weigh_tip(
+    header: &nano_chainstate::NakamotoBlockHeader,
+    signers: &SignerSet,
+) -> Result<u32, TipRejection> {
+    signers.verify(header).map_err(|error| match error {
+        SignerSetError::InsufficientWeight => TipRejection::InsufficientWeight,
+        SignerSetError::Signature(_) => TipRejection::UnrecoverableSignature,
+        _ => TipRejection::UnknownOrUnorderedSigner,
+    })
+}
+
+/// Choose the tip to follow among the ones the peers are offering.
+///
+/// A candidate has to carry threshold signer weight before its length counts.
+/// Among those, the longest chain wins, and an exact tie goes to the lowest
+/// block identifier so that every node following the same peers lands on the
+/// same block rather than on whichever answered first.
+#[must_use]
+pub fn choose_canonical_tip<'a>(
+    candidates: &'a [CandidateTip],
+    signers: &SignerSet,
+) -> Option<&'a CandidateTip> {
+    candidates
+        .iter()
+        .filter(|candidate| weigh_tip(&candidate.header, signers).is_ok())
+        .max_by(|left, right| {
+            left.header
+                .chain_length
+                .cmp(&right.header.chain_length)
+                .then_with(|| right.header.block_id().cmp(&left.header.block_id()))
+        })
 }
 
 /// Bitcoin calendar and stacking parameters advertised by a node.
@@ -569,6 +663,35 @@ impl SyncClient {
         Ok(upload)
     }
 
+    /// Walk the burn view between two consensus hashes.
+    ///
+    /// This is how a node finds where a candidate chain left the one it holds:
+    /// the answer runs backwards from `start` to `stop`, one entry per burn
+    /// block, and the first entry both chains agree on is the fork point.
+    pub async fn tenure_fork_info(
+        &self,
+        start: ConsensusHash,
+        stop: ConsensusHash,
+    ) -> Result<Vec<ForkInfo>, SyncError> {
+        let wire: Vec<ForkInfoWire> = self
+            .get(&format!("v3/tenures/fork_info/{start}/{stop}"))
+            .await?;
+        wire.into_iter()
+            .map(|entry| {
+                Ok(ForkInfo {
+                    bitcoin_height: entry.burn_block_height,
+                    consensus_hash: parse_consensus_hash(&entry.consensus_hash)?,
+                    was_sortition: entry.was_sortition,
+                    first_block_mined: entry
+                        .first_block_mined
+                        .as_deref()
+                        .map(parse_block_id)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
     /// Download and validate all Nakamoto blocks in a tenure.
     pub async fn tenure(
         &self,
@@ -623,6 +746,79 @@ impl SyncClient {
             .bytes()
             .await?
             .to_vec())
+    }
+}
+
+/// Several peers, and which of them have proved unreliable.
+///
+/// A node with one peer follows whatever that peer says: the peer decides both
+/// what nano sees and what it cannot see. A pool asks all of them, so a peer
+/// that stalls, lies or withholds costs nano nothing as long as one other peer
+/// is honest.
+#[derive(Debug)]
+pub struct PeerPool {
+    peers: Vec<SyncClient>,
+    distrusted: BTreeSet<usize>,
+}
+
+impl PeerPool {
+    /// Follow the given peers, trusting all of them until one misbehaves.
+    #[must_use]
+    pub const fn new(peers: Vec<SyncClient>) -> Self {
+        Self {
+            peers,
+            distrusted: BTreeSet::new(),
+        }
+    }
+
+    /// The peers still worth asking.
+    pub fn trusted(&self) -> impl Iterator<Item = (usize, &SyncClient)> {
+        self.peers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.distrusted.contains(index))
+    }
+
+    /// Stop asking a peer that served something invalid.
+    ///
+    /// Serving a bad block is that peer's fault, not a reason to stop
+    /// following the chain, so it is set aside rather than raised.
+    pub fn distrust(&mut self, peer: usize) {
+        self.distrusted.insert(peer);
+    }
+
+    /// Whether a peer is still being asked.
+    #[must_use]
+    pub fn is_trusted(&self, peer: usize) -> bool {
+        !self.distrusted.contains(&peer) && peer < self.peers.len()
+    }
+
+    /// A peer by index, whether or not it is still trusted.
+    #[must_use]
+    pub fn peer(&self, peer: usize) -> Option<&SyncClient> {
+        self.peers.get(peer)
+    }
+
+    /// Ask every trusted peer what its tip is.
+    ///
+    /// A peer that fails to answer is skipped for this round rather than
+    /// distrusted: not answering is usually a restart, not a lie.
+    pub async fn candidate_tips(&self) -> Vec<CandidateTip> {
+        let mut candidates = Vec::new();
+        for (index, client) in self.trusted() {
+            let Ok(info) = client.tenure_info().await else {
+                continue;
+            };
+            let Ok(tip) = client.block(info.tip_block_id).await else {
+                continue;
+            };
+            candidates.push(CandidateTip {
+                peer: index,
+                info,
+                header: tip.header,
+            });
+        }
+        candidates
     }
 }
 
@@ -879,6 +1075,14 @@ struct SortitionInfoWire {
     last_sortition_ch: Option<String>,
     committed_block_hash: Option<String>,
     vrf_seed: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ForkInfoWire {
+    burn_block_height: u64,
+    consensus_hash: String,
+    was_sortition: bool,
+    first_block_mined: Option<String>,
 }
 
 /// Wire tag for a mempool query that lists the transactions already known
