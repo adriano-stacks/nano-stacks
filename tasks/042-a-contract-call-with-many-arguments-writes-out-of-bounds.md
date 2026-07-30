@@ -1,13 +1,14 @@
 ---
 id: "042"
 title: "A contract call with many arguments writes out of bounds"
-status: pending
-priority: medium
+status: completed
+priority: high
 effort: medium
 type: bug
 dependencies: []
-tags: ["vm", "clarity-wasm", "test-harness"]
+tags: ["vm", "clarity-wasm", "correctness"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # A contract call with many arguments writes out of bounds
@@ -35,49 +36,52 @@ deterministic runner, removes eight of them. **One argument fails on its own:**
 (list 30 (list 17 (string-utf8 31)))
 ```
 
-**The call itself is fine.** With the same argument and value, and without the
-test's padding, it passes. It fails only inside `as_oom_check_snippet`.
+With the *generated* value — a short list — that call passes unpadded, which
+made it look like only the harness was wrong. It is not: with a full-size value
+for the same declared type, it fails with no padding at all.
 
-## Why the harness cannot express this case
+## What it was
 
-`as_oom_check_snippet` prefixes a buffer sized to leave exactly the room the
-arguments need, so that a call writing one byte too many fails. Two things
-break for an argument this large.
+A called contract is not sized for the arguments it is given.
 
-`get_type_in_memory_size` makes that argument `8 + 30 * (8 + 17 * 132)` =
-**67,568 bytes**, more than a 64 KiB page, and the helper takes at most one
-extra page. Making it take pages until they fit does not help either, because
-the target is unreachable: measured, the most free space the module ever has is
-**64,167 bytes**, against the 69,080 the helper is trying to leave. So the
-padding lands wherever it lands — 3,544 bytes free — and the call overruns.
+The host writes them into the callee's memory before entering it, and nothing
+reserved that room. `set_memory_pages` sizes a module once, at compile time, as
+`literal_memory_end + frame_size + max_work_space`, and a function definition
+never added its parameters to `frame_size` — so the callee compiled to a single
+page with **64,060 bytes free whatever its arguments were**, and ran on
+whatever the page round-up happened to spare.
 
-`set_memory_pages` sizes memory once, at compile time, as `literal_memory_end +
-frame_size + max_work_space`. There is no runtime growth, so how much room a
-call has is fixed when it is compiled.
+A 20x17 list fits in that. A 30x17 one is 67,568 bytes and does not. That is
+the entire difference between working and writing out of bounds, and it is why
+the generated case looked like it was about having many arguments: it was about
+their total size.
 
-## The open question
+The reduction misattributed it twice before landing. It is not the harness —
+the same call fails unpadded once the value is full-size, which the first
+reduction missed because the generated value was small. And it is not
+`ContractCall`'s argument region, which is right: `write_to_memory` stores a
+sequence as its eight-byte offset and length, so eight bytes an argument is all
+that region needs. The caller was the correctly-sized module all along, at
+71,912 bytes over two pages; the callee was the broken one.
 
-The call succeeds with 64,167 bytes free and wants 67,568 by the helper's
-reckoning, so the two numbers do not mean the same thing, and which of them is
-right is what decides whether there is a defect underneath. If `max_work_space`
-genuinely covers the arguments then only the harness is wrong; if it can
-under-reserve for a nested list, then a large enough contract could overrun in
-production, where nothing would report it as clearly as this test does.
+## The fix
 
-This is **not** currently evidence of a consensus bug: a contract call with this
-argument executes correctly.
+`traverse_define_function` adds each parameter's `get_type_in_memory_size` to
+`frame_size`, for public and read-only functions — the ones a call from outside
+can enter. Private functions are unaffected: their arguments arrive on the
+wasm stack, not through memory.
+
+Two regression tests pin it, one either side of the old threshold, plus two
+that show building the same list — at the top level and in a function — was
+always fine. Only being handed one was not.
 
 ## Tasks
 
 - [x] Reduce the generated contract to the smallest call that fails.
 - [x] Establish whether the call is wrong or the harness is.
-- [ ] Decide whether `max_work_space` reserves enough for a nested list
-      argument — compare what `set_memory_pages` reserves against what the
-      argument actually writes.
-- [ ] Fix whichever is wrong, and keep the reduced single-argument case as a
-      unit test rather than a generated one.
-- [ ] If it is the harness, make it refuse a case it cannot set up instead of
-      silently leaving the wrong amount of space.
+- [x] Decide whether the module reserves enough for a nested list argument —
+      it did not, and the callee was the module at fault.
+- [x] Fix it, and keep the case as unit tests rather than a generated one.
 
 ## Acceptance Criteria
 
@@ -85,3 +89,4 @@ argument executes correctly.
 - The single-argument case is a unit test.
 - Whether the compiler reserves enough memory for a nested list argument is
   answered in the code, not left to the harness.
+- The replay still matches, so the change moves no consensus behaviour.

@@ -832,3 +832,83 @@ proptest! {
         );
     }
 }
+
+/// A called contract has to be sized for the arguments it is given.
+///
+/// The host writes them into the callee's memory before entering it, and
+/// nothing reserved that room: the callee compiled to a single page with
+/// 64,060 bytes free, whatever its arguments were. A 20x17 list fits in that
+/// and a 30x17 one does not, which was the whole difference between working
+/// and writing out of bounds.
+///
+/// Building the same list, at the top level or in a function, was always fine
+/// — only being handed one was not.
+#[cfg(test)]
+mod contract_call_argument_memory {
+    use clar2wasm::tools::{crosscheck, crosscheck_multi_contract, evaluate};
+    use clarity::vm::types::TupleData;
+    use clarity::vm::{ContractName, Value};
+
+    fn big_list(rows: usize, cols: usize) -> String {
+        let inner = format!(
+            "(list {})",
+            vec!["u\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""; cols].join(" ")
+        );
+        format!("(list {})", vec![inner.as_str(); rows].join(" "))
+    }
+
+    /// Building the list is accounted for correctly; only passing it is not.
+    #[test]
+    fn building_a_big_list_is_fine() {
+        for rows in [4usize, 10, 20, 30] {
+            let lit = big_list(rows, 17);
+            let expected = evaluate(&lit).unwrap();
+            crosscheck(
+                &format!("(define-public (f) (ok {lit})) (f)"),
+                Ok(expected.map(|v| Value::okay(v).unwrap())),
+            );
+        }
+    }
+
+    fn pass(rows: usize) {
+        let lit = big_list(rows, 17);
+        let callee = "(define-public (foo (a (list 30 (list 17 (string-utf8 31))))) (ok {a: a, }))";
+        let caller = format!("(contract-call? .callee foo {lit})");
+        let value = evaluate(&lit).unwrap().unwrap();
+        let expected = Value::okay(
+            TupleData::from_data(vec![("a".try_into().unwrap(), value)])
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+        crosscheck_multi_contract(
+            &[
+                (ContractName::from_literal("callee"), callee),
+                (ContractName::from_literal("caller"), &caller),
+            ],
+            Ok(Some(expected)),
+        );
+    }
+
+    /// The same list built at the top level rather than inside a function.
+    #[test]
+    fn building_a_big_list_at_top_level() {
+        for rows in [4usize, 10, 20, 30] {
+            let lit = big_list(rows, 17);
+            let expected = evaluate(&lit).unwrap();
+            println!("TOPLEVEL {rows}");
+            crosscheck(&lit, Ok(expected));
+            println!("TOPLEVEL {rows} OK");
+        }
+    }
+
+    #[test]
+    fn passing_a_list_that_fits_the_slack() {
+        pass(20);
+    }
+
+    #[test]
+    fn passing_a_list_the_slack_would_not_hold() {
+        pass(30);
+    }
+}

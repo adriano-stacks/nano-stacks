@@ -798,6 +798,17 @@ impl WasmGenerator {
             parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
+        // A call from outside writes this function's arguments into this
+        // module's memory before entering it. Nothing else reserves that room,
+        // so without this the call runs on whatever the page round-up spares —
+        // enough until an argument is large enough that it is not.
+        if matches!(kind, FunctionKind::Public | FunctionKind::ReadOnly) {
+            self.frame_size += parameters
+                .iter()
+                .map(|(signature, _, _)| get_type_in_memory_size(signature, true))
+                .sum::<i32>();
+        }
+
         let results_types = clar2wasm_ty(&function_type.returns);
         let mut func_builder = FunctionBuilder::new(
             &mut self.module.types,
