@@ -11,6 +11,8 @@
       devShells = forEachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
         in {
+          # The toolchain comes from the pinned nixpkgs. `rust-toolchain.toml`
+          # asks rustup for the same channel, for anyone outside this shell.
           default = pkgs.mkShell {
             packages = [
               pkgs.cargo

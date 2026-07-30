@@ -1,13 +1,14 @@
 ---
 id: "032"
 title: "Settle the toolchain version in one place"
-status: pending
+status: completed
 priority: low
 effort: small
 type: chore
 dependencies: []
 tags: ["notes", "build"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Settle the toolchain version in one place
@@ -25,13 +26,24 @@ One of these should decide, and the others should follow it or go away.
 
 ## Tasks
 
-- [ ] Decide whether `rust-version` in `Cargo.toml` is doing anything that
+- [x] Decide whether `rust-version` in `Cargo.toml` is doing anything that
       `rust-toolchain.toml` is not.
-- [ ] Make the flake supply the toolchain `rust-toolchain.toml` names, rather
+- [x] Make the flake supply the toolchain `rust-toolchain.toml` names, rather
       than a parallel one.
-- [ ] Remove whichever of the three is redundant.
+- [x] Remove whichever of the three is redundant.
 
 ## Acceptance Criteria
 
 - `rustc --version` in the nix shell is the version the repository asks for.
 - The version is stated once.
+
+## What was decided
+
+`rust-version` was the redundant one. It declares a minimum this repository
+never builds against — CI and the shell both run whatever the pinned nixpkgs
+provides — so it was an unverified claim, not a constraint. `edition = "2024"`
+already requires 1.85 and the compiler enforces that.
+
+`rust-toolchain.toml` stays: it is what rustup reads outside the nix shell, and
+it asks for the same channel the flake supplies. The flake now says so where
+someone changing it will look.
