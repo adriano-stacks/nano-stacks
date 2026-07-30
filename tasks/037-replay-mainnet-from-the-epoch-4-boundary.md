@@ -90,6 +90,27 @@ Two things were needed to use it, one of them now done:
   stream *will* be interrupted — it was, twice, with `Unexpected EOF in
   archive`. It has to land on disk first, resumably.
 
+## Where the transfer got to
+
+Running, detached and resumable, under `/home/aldur/fetch-mainnet.sh`. It had
+38 GiB of 208 GiB when this was written, and the archive host throttles: the
+first minutes ran at 21 MB/s and it settled to 6 MB/s, which puts the rest
+around seven hours. It survives interruption — `curl -C -` in a retry loop, to
+a file rather than a pipe — so it does not need watching.
+
+When it lands:
+
+```sh
+zstd -d --long=31 -c archive.tar.zst | tar -x -C /home/aldur/mainnet-chainstate \
+  --wildcards "*/chainstate/vm/*" "*/chainstate/blocks/nakamoto.sqlite" \
+               "*/chainstate/index.sqlite" "*/burnchain/sortition/*"
+cargo xtask capture-fixtures --node-root /home/aldur/mainnet-chainstate/mainnet ...
+```
+
+The capture will refuse for want of `--events-dir`, which is the next thing to
+fix and is deliberately left until the refusal is real rather than predicted —
+building for a guessed failure is how the `to-ascii?` detour started.
+
 ## What the archive still cannot give
 
 **Receipts.** `events/new_block/*.json` come from an event observer attached to
