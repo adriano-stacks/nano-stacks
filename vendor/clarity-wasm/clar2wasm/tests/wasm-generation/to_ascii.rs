@@ -79,7 +79,15 @@ mod clarity_v4 {
                     let all_ascii = bytes
                         .data
                         .iter()
-                        .all(|b| b.len() == 1 && (0x20u8..0x7e).contains(&b[0]));
+                        // `Value::string_ascii_from_bytes`' rule, which is what the
+                        // interpreter answers with: asked directly it accepts a
+                        // tab and a tilde and rejects NUL, a vertical tab and DEL.
+                        .all(|b| {
+                            b.len() == 1
+                                && (b[0].is_ascii_alphanumeric()
+                                    || b[0].is_ascii_punctuation()
+                                    || b[0].is_ascii_whitespace())
+                        });
                     if all_ascii {
                         Value::okay(
                             Value::string_ascii_from_bytes(bytes.data.iter().flatten().copied().collect())
@@ -107,7 +115,15 @@ mod clarity_v4 {
                     let all_valid_ascii = bytes
                         .data
                         .iter()
-                        .all(|b| b.len() == 1 && (0x20u8..0x7e).contains(&b[0]));
+                        // `Value::string_ascii_from_bytes`' rule, which is what the
+                        // interpreter answers with: asked directly it accepts a
+                        // tab and a tilde and rejects NUL, a vertical tab and DEL.
+                        .all(|b| {
+                            b.len() == 1
+                                && (b[0].is_ascii_alphanumeric()
+                                    || b[0].is_ascii_punctuation()
+                                    || b[0].is_ascii_whitespace())
+                        });
                     if all_valid_ascii {
                         Value::okay(
                             Value::string_ascii_from_bytes(bytes.data.iter().flatten().copied().collect())

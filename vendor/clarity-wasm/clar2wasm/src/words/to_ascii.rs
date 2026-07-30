@@ -619,6 +619,36 @@ fn to_ascii_string_utf8(
                 .binop(BinaryOp::I32And)
                 .br_if(block_id);
 
+            // Being under 128 is not enough. Clarity admits a byte that is
+            // alphanumeric, punctuation or whitespace (`string_ascii_from_bytes`),
+            // which is `0x20..=0x7e` plus tab, newline, form feed and carriage
+            // return. Asked directly, the interpreter answers `(err u1)` for
+            // NUL, for a vertical tab and for DEL, and `ok` for every other
+            // byte under 128 — breaking only on the high bit accepted all
+            // three.
+            loop_
+                .local_get(*unicode)
+                .i32_const(24)
+                .binop(BinaryOp::I32ShrU)
+                .i32_const(0x20)
+                .binop(BinaryOp::I32GeU)
+                .local_get(*unicode)
+                .i32_const(24)
+                .binop(BinaryOp::I32ShrU)
+                .i32_const(0x7e)
+                .binop(BinaryOp::I32LeU)
+                .binop(BinaryOp::I32And);
+            for whitespace in [0x09, 0x0a, 0x0c, 0x0d] {
+                loop_
+                    .local_get(*unicode)
+                    .i32_const(24)
+                    .binop(BinaryOp::I32ShrU)
+                    .i32_const(whitespace)
+                    .binop(BinaryOp::I32Eq)
+                    .binop(BinaryOp::I32Or);
+            }
+            loop_.unop(UnaryOp::I32Eqz).br_if(block_id);
+
             // otherwise we store the last byte
             // CAUTION: for now, string-utf8 are still stored in big-endian order!!!
             loop_
@@ -716,7 +746,7 @@ mod tests {
     use clarity_types::types::{BuffData, ResponseData};
     use clarity_types::Value;
 
-    use crate::tools::crosscheck;
+    use crate::tools::{crosscheck, evaluate};
 
     #[test]
     fn to_ascii_bool() {
@@ -862,5 +892,47 @@ mod tests {
 
         check("SM3X6QWWETNBZWGBK6DRGTR1KX50S74D341M9C5X7");
         check("ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE.foo")
+    }
+
+    /// Clarity admits a byte that is alphanumeric, punctuation or whitespace.
+    ///
+    /// Being under 128 is not the same rule: NUL, a vertical tab and DEL are
+    /// all under it and all rejected. Asked directly, the interpreter answers
+    /// `(err u1)` for those three and `ok` for the rest of this table.
+    #[test]
+    fn to_ascii_utf8_follows_claritys_ascii_rule() {
+        for (literal, ok) in [
+            ("\\u{0}", false),
+            ("\\u{9}", true),
+            ("\\u{a}", true),
+            ("\\u{b}", false),
+            ("\\u{c}", true),
+            ("\\u{d}", true),
+            (" ", true),
+            ("~", true),
+            ("\\u{7f}", false),
+            ("A", true),
+        ] {
+            let snippet = format!("(to-ascii? u\"{literal}\")");
+            let expected = if ok {
+                let byte = evaluate(&format!("u\"{literal}\"")).unwrap().unwrap();
+                let clarity::vm::Value::Sequence(clarity::vm::types::SequenceData::String(
+                    clarity::vm::types::CharType::UTF8(data),
+                )) = byte
+                else {
+                    unreachable!("a utf8 literal is a utf8 string")
+                };
+                clarity::vm::Value::okay(
+                    clarity::vm::Value::string_ascii_from_bytes(
+                        data.data.into_iter().flatten().collect(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            } else {
+                clarity::vm::Value::err_uint(1)
+            };
+            crosscheck(&snippet, Ok(Some(expected)));
+        }
     }
 }

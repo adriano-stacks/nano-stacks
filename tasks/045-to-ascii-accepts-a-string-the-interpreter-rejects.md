@@ -1,13 +1,14 @@
 ---
 id: "045"
 title: "to-ascii? accepts a string the interpreter rejects"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: bug
 dependencies: []
 tags: ["vm", "clarity-wasm", "correctness"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # `to-ascii?` accepts a string the interpreter rejects
@@ -41,28 +42,37 @@ would take a different branch on nano than on the network.
 The compiled path breaks its loop only on the high bit, so any byte under 128
 is accepted, NUL included. That is the fault.
 
-## Three rules that disagree
+## Which rule applies
 
-Before changing anything, these have to be reconciled, because they do not say
-the same thing:
+Asking the interpreter directly settles it. `to-ascii?` on a one-character
+string:
 
-| | admits |
+| byte | interpreter |
 |---|---|
-| `string_ascii_from_bytes` (clarity-types) | alphanumeric, punctuation **or whitespace** — so tab, newline and `0x7e` |
-| the tests here | `(0x20u8..0x7e)` — a half-open range, so no whitespace and no `0x7e` |
-| the compiled path | anything under `0x80` |
+| NUL `0x00`, vertical tab `0x0b`, DEL `0x7f` | `(err u1)` |
+| tab, newline, form feed, return, space, `~`, letters | `ok` |
 
-An attempt to make the compiled path follow `string_ascii_from_bytes` was
-reverted rather than kept: it moved the compiled path in the *permissive*
-direction on a reading that the second failing case contradicts. That case has
-the interpreter answering `(err u1)` for an input whose compiled conversion is
-`"\t\\"` — a tab and a backslash, which `string_ascii_from_bytes` admits. So
-either `to-ascii?` does not go through that function on this path, or the input
-carried something else the compiled path dropped.
+That is `string_ascii_from_bytes` exactly — alphanumeric, punctuation or
+whitespace — and it is neither of the other two candidates. The compiled path
+admitted everything under `0x80`, so it took all three rejected bytes. The
+tests here admitted `(0x20u8..0x7e)`, which is *stricter*: it rejects a tab the
+network accepts, and rejects `0x7e` as well.
 
-Settling which rule `to-ascii?` actually applies is the first task, and no
-change should land before it does. A wrong answer here is a consensus fault in
-the direction that accepts what the network rejects.
+So both were wrong, in opposite directions, and the failing case was the two of
+them disagreeing rather than either disagreeing with the network.
+
+## The fix
+
+The compiled path now breaks on a byte outside `0x20..=0x7e` unless it is a
+tab, newline, form feed or carriage return, and the two proptests assert
+`string_ascii_from_bytes`' rule rather than an approximation of it. The table
+above is a unit test, so this no longer depends on a gitignored seed.
+
+Worth recording: this fix was written, reverted, and then restored unchanged.
+The revert was the right call at the time — it was a permissive change on an
+unverified reading, and accepting what the network rejects is the worse
+direction to be wrong in. What made it safe was measuring the interpreter
+rather than reading it.
 
 ## Where it came from
 
@@ -82,9 +92,9 @@ those changes stashed and with `words/` checked out from before them.
 ## Tasks
 
 - [x] Reduce it to the shortest UTF-8 input that converts differently — a NUL.
-- [ ] Settle which rule `to-ascii?` applies, given the three that disagree, and
-      only then change the compiled path.
-- [ ] Keep the reduced case as a unit test, so it does not depend on a
+- [x] Settle which rule `to-ascii?` applies — measured, not read — and only
+      then change the compiled path.
+- [x] Keep the reduced case as a unit test, so it does not depend on a
       gitignored seed file.
 - [ ] Check the neighbouring conversions — `to-utf8?`, `string-to-int?`,
       `string-to-uint?` — for the same leniency.
