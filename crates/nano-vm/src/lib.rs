@@ -535,6 +535,12 @@ impl Vm {
         self.begin_block_with_bitcoin_context(parent, temporary_state_id, bitcoin_context)
     }
 
+    /// The state a block was built on, as the store recorded it.
+    #[must_use]
+    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
+        self.store.parent_of(block)
+    }
+
     /// Record what Clarity may later read about a block nano has executed.
     pub fn record_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
         self.context
@@ -1035,6 +1041,12 @@ impl MarfStore {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.network
+    }
+
+    /// The state a block was built on, as the store recorded it.
+    #[must_use]
+    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
+        self.marf.parent(block).flatten()
     }
 
     /// Create a Clarity database backed by this store.

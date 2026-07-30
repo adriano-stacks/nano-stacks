@@ -2209,6 +2209,62 @@ mod tests {
         );
     }
 
+    /// A state on disk names the ancestors a resume can fall back to.
+    ///
+    /// When the block a node sealed at leaves the chain, walking back needs
+    /// the parents the store recorded — without them the only answer is to
+    /// stop, which is what turned a one-block reorganization into a dead node.
+    #[test]
+    fn a_stored_state_remembers_what_it_was_built_on() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let mut chainstate = captured_chainstate(&fixture);
+
+        let mut parent = Some(source);
+        let mut executed = Vec::new();
+        for path in captured_block_paths(&fixture).into_iter().take(4) {
+            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                .expect("decode block");
+            let view = block.header.consensus_hash.to_string();
+            chainstate
+                .append_nakamoto_block_with_bitcoin_operations(
+                    *snapshots.get(&view).expect("Bitcoin context"),
+                    operations.get(&view).expect("Bitcoin operations"),
+                    parent,
+                    &block,
+                )
+                .expect("execute block");
+            parent = Some(*block.block_id().as_bytes());
+            executed.push(*block.block_id().as_bytes());
+        }
+
+        // From the tip, every ancestor back to the checkpoint, in order.
+        let mut walked = Vec::new();
+        let mut block = *executed.last().expect("executed blocks");
+        while let Some(parent) = chainstate.parent_of(block) {
+            walked.push(parent);
+            block = parent;
+        }
+
+        // The blocks just executed, newest first, then the checkpoint — and
+        // past it, the ancestors the import kept, which a resume can also fall
+        // back to.
+        let mut expected: Vec<_> = executed[..executed.len() - 1].to_vec();
+        expected.reverse();
+        expected.push(source);
+        assert_eq!(
+            walked.get(..expected.len()),
+            Some(expected.as_slice()),
+            "a resume must be able to walk back to the checkpoint one block at a time"
+        );
+        assert!(
+            walked.len() > expected.len(),
+            "the checkpoint's own ancestors are reachable too"
+        );
+    }
+
     /// Fork choice weighs signatures before it compares lengths.
     ///
     /// Following one peer means following whatever it says. A pool has to pick,

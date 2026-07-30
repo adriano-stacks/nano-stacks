@@ -296,27 +296,14 @@ pub async fn open_chainstate(
     // up, not a chain that moved: it is worth waiting for. A peer that never
     // produces it means this state descends from a block the network dropped,
     // and no amount of waiting fixes that.
-    let sealed = StacksBlockId::from_bytes(tip);
-    let mut waited = 0;
-    let tip = loop {
-        match peer.block(sealed).await {
-            Ok(tip) => break tip,
-            Err(error) if waited < RESUME_ATTEMPTS => {
-                waited += 1;
-                println!("waiting for the peer to catch up to block {sealed} ({error})");
-                sleep(Duration::from_secs(config.node.poll_interval_secs)).await;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "the state in {} is sealed at block {sealed}, which the peer does not have \
-                     ({error}); it descends from a block the network dropped, so it needs another \
-                     peer or a fresh checkpoint",
-                    directory.display()
-                )
-                .into());
-            }
-        }
-    };
+    // Collected before any request, so the store is not borrowed across one.
+    let mut ancestors = Vec::new();
+    let mut walk = tip;
+    while let Some(parent) = chainstate.parent_of(walk) {
+        ancestors.push(parent);
+        walk = parent;
+    }
+    let tip = resume_from(ancestors, peer, tip, directory).await?;
     println!(
         "resuming {} from the state on disk, sealed at block {} of height {}",
         directory.display(),
@@ -324,6 +311,55 @@ pub async fn open_chainstate(
         tip.header.chain_length
     );
     Ok((chainstate, tip, None))
+}
+
+/// Find the block a resumed state can carry on from.
+///
+/// A peer that does not have our sealed tip is usually one still catching up,
+/// so it is worth waiting for. If it never produces the block, the tip lost a
+/// fork race while this node was down — an ordinary event, one block deep —
+/// and the answer is to walk back to the nearest ancestor the peer does have
+/// rather than to refuse to start. Only a state with no ancestor on the
+/// network at all is one nothing can extend.
+async fn resume_from(
+    ancestors: Vec<[u8; 32]>,
+    peer: &SyncClient,
+    tip: [u8; 32],
+    directory: &Path,
+) -> Result<NakamotoBlock, Box<dyn Error>> {
+    let sealed = StacksBlockId::from_bytes(tip);
+    let mut waited = 0;
+    loop {
+        match peer.block(sealed).await {
+            Ok(block) => return Ok(block),
+            Err(_) if waited < RESUME_ATTEMPTS => {
+                waited += 1;
+                println!("waiting for the peer to catch up to block {sealed}");
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(_) => break,
+        }
+    }
+
+    for (walked, ancestor) in ancestors.iter().enumerate() {
+        if let Ok(block) = peer.block(StacksBlockId::from_bytes(*ancestor)).await {
+            println!(
+                "block {sealed} left the chain; carrying on from {}, {} back",
+                block.block_id(),
+                walked + 1
+            );
+            return Ok(block);
+        }
+    }
+
+    Err(format!(
+        "the state in {} is sealed at block {sealed}, and the peer has none of its {} ancestors \
+         either; nothing on the network extends it, so it needs another peer or a fresh \
+         checkpoint",
+        directory.display(),
+        ancestors.len()
+    )
+    .into())
 }
 
 /// The rewards a role still owes: what it last wrote, or what the checkpoint

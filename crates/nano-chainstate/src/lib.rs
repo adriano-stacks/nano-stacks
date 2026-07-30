@@ -721,6 +721,12 @@ impl ChainState {
         self.vm.tip()
     }
 
+    /// The state a block was built on, for walking back over a reorganization.
+    #[must_use]
+    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
+        self.vm.parent_of(block)
+    }
+
     /// The executed state, for reads that answer the public RPC.
     ///
     /// Handing out the VM is deliberate: a read-only call and an account query

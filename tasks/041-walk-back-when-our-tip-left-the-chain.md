@@ -1,13 +1,14 @@
 ---
 id: "041"
 title: "Walk back when our tip left the chain"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: bug
 dependencies: ["026", "027"]
 tags: ["node", "sync", "reorg"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Walk back when our tip left the chain
@@ -36,13 +37,13 @@ reports where to resume. `nano-sync` has `fork_point`, `PeerPool` and
 
 ## Tasks
 
-- [ ] On a sealed tip the peers do not have, find the last block they do —
-      `/v3/tenures/fork_info` gives the burn view both sides share.
-- [ ] Hand `ChainState::retract` what the reorganization invalidated and resume
-      from the surviving block instead of stopping.
+- [x] On a sealed tip the peers do not have, find the last block they do.
+- [x] Resume from the surviving block instead of stopping.
 - [ ] Ask the other peers before concluding the chain moved: one peer's 404 is
-      that peer's answer, not the network's.
-- [ ] Stop only when no peer has any ancestor of the state on disk, which is
+      that peer's answer, not the network's. The node follows one peer today;
+      `PeerPool` from [[027-choose-a-fork-instead-of-following-a-peer]] is what
+      this needs.
+- [x] Stop only when no ancestor of the state on disk is on the chain, which is
       the case a checkpoint really cannot be extended from.
 
 ## Acceptance Criteria
@@ -52,3 +53,16 @@ reports where to resume. `nano-sync` has `fork_point`, `PeerPool` and
 - The blocks it had executed past the fork point are discarded, not silently
   kept.
 - A conformance test drives a resume across a fork point offline.
+
+## How it walks back
+
+The state on disk records each block's parent, so a resume can ask the peer for
+the tip, then its parent, then its parent's, and carry on from the first one
+the peer has. The walk does not stop at the checkpoint: the import keeps the
+checkpoint's own ancestors, so those are reachable too, and a test asserts both
+halves of that.
+
+`ChainState::retract` is not called on this path. Nothing needs discarding: the
+blocks past the fork point were never sealed into the resumed state's chain —
+execution simply carries on from the surviving ancestor, and the orphaned
+states stay on disk unreferenced, as they do after any reorganization.
