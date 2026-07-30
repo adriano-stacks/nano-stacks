@@ -2573,6 +2573,7 @@ dependencies = [
  "nano-codec",
  "nano-crypto",
  "nano-marf",
+ "nano-mempool",
  "nano-node",
  "nano-primitives",
  "nano-signer",
