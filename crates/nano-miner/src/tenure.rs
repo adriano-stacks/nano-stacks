@@ -228,7 +228,10 @@ pub async fn build_tenure_start_block(
 
     let miner_hash = hash160(&miner_key.public_key().to_bytes_compressed());
     let nonce = node
-        .account_nonce(StacksAddress::single_signature(miner_hash, network.is_mainnet()))
+        .account_nonce(StacksAddress::single_signature(
+            miner_hash,
+            network.is_mainnet(),
+        ))
         .await?;
     let transactions = vec![
         Transaction::sign_standard(
