@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::diagnostic::DiagnosableError;
+use clarity::vm::functions::define::DefineFunctions;
 use clarity::vm::types::signatures::{CallableSubtype, StringUTF8Length};
 use clarity::vm::types::{
     ASCIIData, CharType, FixedFunction, FunctionType, ListTypeData, PrincipalData, SequenceData,
@@ -630,6 +631,12 @@ impl WasmGenerator {
                         .cloned();
                     Ok((arg_types?, return_type?))
                 };
+
+                // A definition is not evaluated, so only an application resolves
+                // a name to a function and pays for doing so.
+                if DefineFunctions::lookup_by_name(function_name).is_none() {
+                    self.charge_function_lookup(builder)?;
+                }
 
                 // Complex words handle their own argument traversal, and have priority
                 // since we need to have a slight overlap for the words `and` and `or`
