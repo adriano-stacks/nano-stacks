@@ -932,6 +932,7 @@ mod tests {
     };
     use blockstack_lib::core::StacksEpochId;
     use clarity::vm::ClarityVersion as ReferenceClarityVersion;
+    use clarity::vm::costs::LimitedCostTracker;
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::{
@@ -1686,6 +1687,65 @@ mod tests {
         let imported = import_pcs(&root)?;
         assert!(imported.root(source).is_some());
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_chainstate_reopened_from_disk_matches_one_that_never_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixtures).expect("checkpoint metadata");
+        let checkpoint = fixtures.join("chainstate/checkpoint-H/marf.sqlite");
+        let network = captured_network(&fixtures);
+        let temporary = temporary_fixture_root()?;
+
+        // One variable per block, so every block moves the state root.
+        let programs = [
+            "(define-data-var first uint u1)",
+            "(define-data-var second uint u2)",
+            "(define-data-var third uint u3)",
+        ];
+        let blocks = [[0xa1; 32], [0xa2; 32], [0xa3; 32]];
+
+        let mut open = nano_vm::Vm::open_from_checkpoint(
+            network,
+            temporary.join("open"),
+            &checkpoint,
+            source,
+            root,
+        )?;
+        let mut parent = source;
+        let mut expected = Vec::new();
+        for (block, program) in blocks.iter().zip(programs) {
+            open.begin_block(Some(parent), *block)?;
+            open.execute(program, LimitedCostTracker::new_free())
+                .expect("execute block");
+            expected.push(open.seal_block()?);
+            parent = *block;
+        }
+        drop(open);
+
+        let directory = temporary.join("reopened");
+        let mut parent = source;
+        let mut reopened_roots = Vec::new();
+        for (block, program) in blocks.iter().zip(programs) {
+            let mut reopened = nano_vm::Vm::open_from_checkpoint(
+                network,
+                &directory,
+                &checkpoint,
+                source,
+                root,
+            )?;
+            assert_eq!(reopened.tip(), Some(parent), "resumes from the tip on disk");
+            reopened.begin_block(Some(parent), *block)?;
+            reopened.execute(program, LimitedCostTracker::new_free())
+                .expect("execute block");
+            reopened_roots.push(reopened.seal_block()?);
+            parent = *block;
+        }
+
+        assert_eq!(reopened_roots, expected);
+        fs::remove_dir_all(temporary)?;
         Ok(())
     }
 
