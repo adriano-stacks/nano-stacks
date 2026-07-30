@@ -278,7 +278,10 @@ impl SignerConfig {
 
 impl MinerConfig {
     pub fn block_signing_private_key(&self) -> Result<StacksPrivateKey, ConfigError> {
-        private_key("miner.block_signing_private_key", &self.block_signing_private_key)
+        private_key(
+            "miner.block_signing_private_key",
+            &self.block_signing_private_key,
+        )
     }
 
     pub fn vrf_private_key(&self) -> Result<VrfPrivateKey, ConfigError> {
@@ -322,8 +325,9 @@ fn urls(field: &str, values: &[String]) -> Result<Vec<Url>, ConfigError> {
     values
         .iter()
         .map(|value| {
-            Url::parse(value)
-                .map_err(|error| ConfigError::Invalid(format!("{field}: {value} is not a URL: {error}")))
+            Url::parse(value).map_err(|error| {
+                ConfigError::Invalid(format!("{field}: {value} is not a URL: {error}"))
+            })
         })
         .collect()
 }
@@ -344,9 +348,9 @@ fn parse_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], Config
     let bytes = hex::decode(value)
         .map_err(|error| ConfigError::Invalid(format!("{field} is not hexadecimal: {error}")))?;
     let length = bytes.len();
-    bytes.try_into().map_err(|_| {
-        ConfigError::Invalid(format!("{field} must be {N} bytes, found {length}"))
-    })
+    bytes
+        .try_into()
+        .map_err(|_| ConfigError::Invalid(format!("{field} must be {N} bytes, found {length}")))
 }
 
 #[cfg(test)]
@@ -378,11 +382,17 @@ mod tests {
         let config = Config::parse(MINIMAL).expect("valid configuration");
 
         assert_eq!(config.node.network, Some(NetworkName::Testnet));
-        assert_eq!(config.network().expect("fixed network").chain_id(), 0x8000_0000);
+        assert_eq!(
+            config.network().expect("fixed network").chain_id(),
+            0x8000_0000
+        );
         assert_eq!(config.burnchain.magic().expect("magic"), *b"T3");
         assert_eq!(config.node.poll_interval_secs, 1);
         assert!(config.signer.is_none() && config.miner.is_none());
-        assert_eq!(config.chainstate_dir("chainstate"), std::path::Path::new("/tmp/nano/chainstate"));
+        assert_eq!(
+            config.chainstate_dir("chainstate"),
+            std::path::Path::new("/tmp/nano/chainstate")
+        );
     }
 
     /// A role is on because its table is there, and a key quoted the way
@@ -415,6 +425,9 @@ mod tests {
     fn a_node_without_a_peer_or_with_a_bad_key_is_refused() {
         assert!(Config::parse(&MINIMAL.replace(r#"["http://127.0.0.1:20443/"]"#, "[]")).is_err());
         assert!(Config::parse(&format!("{MINIMAL}\n[signer]\nprivate_key = \"11\"\n")).is_err());
-        assert!(Config::parse(&MINIMAL.replace(r#"rpc_user = "hacknet""#, r#"rpc_users = "x""#)).is_err());
+        assert!(
+            Config::parse(&MINIMAL.replace(r#"rpc_user = "hacknet""#, r#"rpc_users = "x""#))
+                .is_err()
+        );
     }
 }

@@ -20,10 +20,10 @@ use nano_chainstate::{NakamotoBlock, SignerSetError};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use nano_mempool::Mempool;
 use nano_miner::{
-    BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError,
-    RegisteredLeaderKey, SortitionHashPoint, TenureExtension, TenureTip,
-    build_tenure_continuation_block, build_tenure_extend_block, build_tenure_start_block,
-    extend_sortition_hash, plan_commitment, total_burn_after,
+    BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError, RegisteredLeaderKey,
+    SortitionHashPoint, TenureExtension, TenureTip, build_tenure_continuation_block,
+    build_tenure_extend_block, build_tenure_start_block, extend_sortition_hash, plan_commitment,
+    total_burn_after,
 };
 use nano_primitives::{ConsensusHash, Hash160, Network, hash160};
 use nano_rpc::{EventDispatcher, EventKind, mined_nakamoto_block_payload};

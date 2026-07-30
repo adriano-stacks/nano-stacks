@@ -15,11 +15,7 @@ use nano_rpc::{ChainAccess, EventDispatcher, RpcState, serve};
 use nano_sync::{Node, PoxInfo, SyncClient};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
-use crate::{
-    CheckpointExecutor,
-    config::Config,
-    miner, signer,
-};
+use crate::{CheckpointExecutor, config::Config, miner, signer};
 
 /// The state directory the node executes the canonical chain in.
 pub(crate) const NODE_CHAINSTATE: &str = "chainstate";
