@@ -158,8 +158,14 @@ word is short by **31 an element**, because nano inlines the word without
 paying to apply it. Over a user-defined function a fold is exact.
 
 Charging a user-function application per element was the obvious guess and it
-is wrong — that costs 57 an element and overshoots by 26. So the 31 is
-something else, and it needs identifying rather than fitting.
+is wrong — that costs 57 an element and overshoots by 26.
+
+What the interpreter actually pays is in `dispatch_args` (`vm/mod.rs`):
+applying a `CallableType::NativeFunction` charges *that word's own cost
+function* with `args.len()`, once an element. nano inlines the word and
+charges it once for the whole loop. That is the shape to check next, and it
+explains why the gap is the same 31 for `*` and for `+` — both are two-argument
+natives with the same cost shape.
 
 What accounts for the 65 itself is not yet identified. The row is not green
 and the task is not done.

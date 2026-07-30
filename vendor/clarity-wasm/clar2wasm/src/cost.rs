@@ -2138,9 +2138,13 @@ mod crosscheck {
     /// call nano already charges.
     ///
     /// It is not a user-function application: charging one per element costs
-    /// 57 an element and overshoots. Whatever the interpreter pays to apply a
-    /// native inside `special_fold` has to be identified before this can be
-    /// charged, rather than a constant fitted to the difference.
+    /// 57 an element and overshoots by 26.
+    ///
+    /// What the interpreter does pay is in `dispatch_args` (`vm/mod.rs`):
+    /// applying a `CallableType::NativeFunction` charges that word's own cost
+    /// function with `args.len()`. Inside a fold that happens once an element,
+    /// while nano inlines the word and charges it once for the whole loop —
+    /// which is the shape to check next.
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]
