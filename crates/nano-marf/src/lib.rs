@@ -3,9 +3,11 @@ use std::{fmt, path::Path, sync::Arc};
 use nano_primitives::{TrieHash, sha512_256};
 
 mod checkpoint;
+mod provenance;
 mod storage;
 
 pub use checkpoint::{CheckpointError, import_checkpoint, import_checkpoint_into, import_pcs};
+pub use provenance::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
 use storage::{BlockRecord, TrieStorage};
 
 /// The 40-byte value stored in a MARF leaf.

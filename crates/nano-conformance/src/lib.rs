@@ -931,22 +931,13 @@ fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<Bitco
         .collect()
 }
 
-fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
-    let contents = fs::read_to_string(root.join("chainstate/checkpoint-H/checkpoint.toml")).ok()?;
-    let source = checkpoint_field(&contents, "source_state_id")?;
-    let state_root = checkpoint_field(&contents, "published_state_index_root")?;
-    Some((
-        decode_hash(source)?,
-        TrieHash::from_bytes(decode_hash(state_root)?),
-    ))
+fn checkpoint_manifest(root: &Path) -> Option<nano_marf::CheckpointManifest> {
+    nano_marf::CheckpointManifest::load(root.join("chainstate/checkpoint-H")).ok()
 }
 
-fn checkpoint_field<'a>(contents: &'a str, field: &str) -> Option<&'a str> {
-    contents
-        .lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix(&format!("{field} = ")))
-        .map(|value| value.trim_matches('"'))
+fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
+    let manifest = checkpoint_manifest(root)?;
+    Some((manifest.source_state_id, manifest.state_index_root))
 }
 
 fn decode_hash(value: &str) -> Option<[u8; 32]> {
@@ -967,7 +958,8 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_signer_set, checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
+        captured_signer_set, checkpoint_manifest, checkpoint_state, decode_hash, scoreboard,
+        validate_fixture_tree,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -1024,7 +1016,9 @@ mod tests {
         MarfTrie, MarfValue, TrieNodeId, TriePointer, VersionedMarf, import_checkpoint, import_pcs,
         internal_node_hash, key_path, leaf_hash,
     };
-    use nano_node::{Checkpoint, CheckpointExecutor};
+    use nano_node::{
+        Checkpoint, CheckpointExecutor, CheckpointTrustError, adopt_checkpoint, attest_checkpoint,
+    };
     use nano_primitives::{BitVec, Network, TrieHash, hash160, sha256, sha512, sha512_256};
     use nano_signer::{ChainstateProposalValidator, ProposalValidator};
     use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, Chunk, SignerMessage};
@@ -1220,6 +1214,134 @@ mod tests {
         let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
         let imported = import_checkpoint(checkpoint, source, root).expect("imports checkpoint");
         assert_eq!(imported.root(source), Some(root));
+    }
+
+    /// A checkpoint is trusted because signers signed its root, not because it
+    /// says so.
+    ///
+    /// `signer_signature_hash` covers `state_index_root`, so a header the
+    /// reward set put threshold weight behind states what the state root at
+    /// that height was. The capture starts one block after the checkpoint, so
+    /// the attestation runs against a captured block treated as a checkpoint —
+    /// the mechanism is the same one a mainnet checkpoint goes through.
+    #[test]
+    fn a_signed_header_attests_the_checkpoint_it_sealed() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signers = captured_signer_set(&fixture);
+        let published = checkpoint_manifest(&fixture).expect("checkpoint manifest");
+        let block = NanoNakamotoBlock::decode(
+            &fs::read(captured_block_paths(&fixture).first().expect("captured block"))
+                .expect("read block"),
+        )
+        .expect("decode block");
+        let manifest = nano_marf::CheckpointManifest {
+            stacks_height: block.header.chain_length,
+            source_state_id: *block.block_id().as_bytes(),
+            state_index_root: block.header.state_index_root,
+            ..published
+        };
+
+        let directory = tempfile::tempdir().expect("state directory");
+        let attestation = adopt_checkpoint(&directory, &manifest, &block.header, &signers)
+            .expect("attested checkpoint");
+        assert!(
+            attestation.signer_weight >= attestation.approval_threshold,
+            "attestation accepted a header the reward set did not approve"
+        );
+        assert_eq!(
+            nano_marf::CheckpointProvenance::load(&directory)
+                .expect("read provenance")
+                .and_then(|provenance| provenance.attestation),
+            Some(attestation),
+            "adopting a checkpoint left no record of what attested it"
+        );
+
+        let mut tampered_root = *manifest.state_index_root.as_bytes();
+        tampered_root[0] ^= 0x01;
+        let tampered = nano_marf::CheckpointManifest {
+            state_index_root: TrieHash::from_bytes(tampered_root),
+            ..manifest.clone()
+        };
+        assert!(
+            matches!(
+                attest_checkpoint(&tampered, &block.header, &signers),
+                Err(CheckpointTrustError::StateRoot { .. })
+            ),
+            "a checkpoint root the signed header does not carry was accepted"
+        );
+
+        let mut header = block.header;
+        header.signer_signatures.clear();
+        assert!(
+            matches!(
+                attest_checkpoint(&manifest, &header, &signers),
+                Err(CheckpointTrustError::Signers(_))
+            ),
+            "an unsigned header attested a checkpoint"
+        );
+    }
+
+    /// An import is refused when the caller's root is not the published one.
+    ///
+    /// The two roots are separate claims — one from the operator's
+    /// configuration, one from the checkpoint itself — and a checkpoint being
+    /// self-consistent with a root nobody published proves nothing.
+    #[test]
+    fn a_declared_root_that_is_not_the_published_one_is_refused() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
+        let mut tampered = *root.as_bytes();
+        tampered[0] ^= 0x01;
+
+        assert!(
+            matches!(
+                import_checkpoint(&checkpoint, source, TrieHash::from_bytes(tampered)),
+                Err(nano_marf::CheckpointError::DeclaredRootMismatch { .. })
+            ),
+            "a root the checkpoint does not publish was imported"
+        );
+    }
+
+    /// A node remembers which checkpoint its state descends from.
+    ///
+    /// Without the record a restart re-reads the configuration and believes
+    /// whatever it now says, so swapping the configured checkpoint would graft
+    /// one chain's blocks onto another chain's state.
+    #[test]
+    fn checkpoint_provenance_survives_a_restart() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = checkpoint_manifest(&fixture).expect("checkpoint manifest");
+        let directory = tempfile::tempdir().expect("state directory");
+        let provenance = nano_marf::CheckpointProvenance {
+            checkpoint: manifest.clone(),
+            attestation: Some(nano_marf::CheckpointAttestation {
+                attesting_block_id: manifest.source_state_id,
+                signer_weight: 7,
+                approval_threshold: 7,
+            }),
+        };
+        provenance.record(&directory).expect("record provenance");
+
+        assert_eq!(
+            nano_marf::CheckpointProvenance::load(&directory).expect("read provenance"),
+            Some(provenance),
+            "a restart lost where the state came from"
+        );
+
+        let mut other = manifest;
+        other.stacks_height += 1;
+        assert!(
+            matches!(
+                nano_marf::CheckpointProvenance {
+                    checkpoint: other,
+                    attestation: None,
+                }
+                .record(&directory),
+                Err(nano_marf::CheckpointError::ProvenanceMismatch { .. })
+            ),
+            "state imported from one checkpoint was resumed under another"
+        );
     }
 
     #[test]

@@ -2607,6 +2607,7 @@ dependencies = [
 name = "nano-marf"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nano-primitives",
  "rusqlite",
  "serde",
@@ -2657,6 +2658,7 @@ dependencies = [
  "nano-chainstate",
  "nano-codec",
  "nano-crypto",
+ "nano-marf",
  "nano-primitives",
  "nano-sync",
  "reqwest",
