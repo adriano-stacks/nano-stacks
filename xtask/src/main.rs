@@ -173,6 +173,7 @@ impl CaptureConfig {
     }
 
     fn capture(&self, root: &Path) -> Result<(), String> {
+        self.check_node_revision()?;
         if self.replay_blocks == 0 {
             return Err("--replay-blocks must be greater than zero".to_owned());
         }
@@ -509,6 +510,47 @@ impl CaptureConfig {
             .map_err(|error| error.to_string())?,
             u32::try_from(json_unsigned_field(&response, "reward_phase_block_length")?)
                 .map_err(|error| error.to_string())?,
+        ))
+    }
+
+    /// The stacks-core revision every conformance oracle compares against.
+    ///
+    /// Read from the lockfile rather than restated here, so it cannot drift
+    /// from what the crates actually build against.
+    fn pinned_stacks_core() -> Result<String, String> {
+        let lockfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock");
+        let contents =
+            fs::read_to_string(&lockfile).map_err(io_error("read the workspace lockfile"))?;
+        contents
+            .lines()
+            .find_map(|line| {
+                line.split_once("stacks-core.git?rev=")
+                    .map(|(_, rest)| rest.split(['#', '"']).next().unwrap_or_default().to_owned())
+            })
+            .filter(|rev| !rev.is_empty())
+            .ok_or_else(|| "the lockfile pins no stacks-core revision".to_owned())
+    }
+
+    /// Refuse a capture from a node that is not the revision the oracles use.
+    ///
+    /// A capture from a different build records what *that* build decided, and
+    /// nothing says so afterwards: the fixtures then contradict every
+    /// in-process comparison, and the contradiction reads as a nano bug.
+    fn check_node_revision(&self) -> Result<(), String> {
+        let pinned = Self::pinned_stacks_core()?;
+        let response = String::from_utf8(http_get(&format!("{}/v2/info", self.stacks_rpc))?)
+            .map_err(|error| format!("node information response was not UTF-8: {error}"))?;
+        let version = response
+            .split_once("\"server_version\":\"")
+            .and_then(|(_, rest)| rest.split('"').next())
+            .ok_or_else(|| "node reports no server version".to_owned())?
+            .to_owned();
+        if version.contains(&pinned[..pinned.len().min(7)]) {
+            return Ok(());
+        }
+        Err(format!(
+            "node reports {version:?} but the oracles compare against stacks-core {pinned}; \
+             capturing from a different build produces fixtures that contradict them"
         ))
     }
 

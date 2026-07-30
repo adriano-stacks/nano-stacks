@@ -50,7 +50,7 @@ this fixture tree is not.
       `provenance.toml` alongside the Hacknet commit.
 - [ ] Confirm `replay: state root` and `replay: receipts` stay at their full
       depth, and see where `replay: costs` lands.
-- [ ] Make the capture refuse to record a node whose revision is not the pinned
+- [x] Make the capture refuse to record a node whose revision is not the pinned
       one, so this cannot recur silently.
 
 ## Acceptance Criteria
@@ -58,3 +58,15 @@ this fixture tree is not.
 - The fixtures and the pinned stacks-core agree about the cost schedule.
 - `replay: costs` either reaches full depth or fails for a reason that is nano's.
 - `provenance.toml` names the stacks-core revision the capture came from.
+
+## The guard
+
+`cargo xtask capture-fixtures` now reads the pinned revision out of the
+workspace lockfile — not a copy restated in the tool, which could drift — asks
+the node for its `server_version`, and refuses the capture unless they agree.
+Checked against the running Hacknet: lockfile `efc34a07a225…`, node
+`stacks-node 4.0.1 (efc34a0, debug build)`, accepted.
+
+The capture itself still needs a Hacknet grown past a checkpoint plus the
+replay window. The one that is up was booted from genesis today and is still
+short of it.
