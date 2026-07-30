@@ -239,25 +239,96 @@ pub trait ChargeGenerator {
         Ok(())
     }
 
-    /// Generate code that charges resolving a name to a function.
-    ///
-    /// The interpreter pays this once for every application it evaluates,
-    /// before it knows whether the name is a word or a user-defined function,
-    /// so it is charged by the caller rather than by the word.
-    fn charge_function_lookup(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
+    /// Generate code that charges one of the costs the interpreter pays around
+    /// a word rather than for it. See [`EvalCosts`].
+    #[doc(hidden)]
+    fn charge_eval(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        cost: impl Fn(&EvalCosts) -> Caf,
+        n: impl Into<Scalar>,
+    ) -> Result<()> {
         if let Some((ctx, module)) = self.cost_context() {
             ctx.emit_with_caf(
                 instrs,
                 module,
-                Caf::Constant(ctx.function_lookup_cost()),
+                cost(ctx.eval_costs()),
                 ctx.runtime,
                 ErrorMap::CostOverrunRuntime as _,
-                0u32,
+                n,
             )?;
         }
         Ok(())
     }
+
+    /// Charge resolving the head of an application to a function.
+    fn charge_function_lookup(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.function_lookup, 0_u32)
+    }
+
+    /// Charge entering a user-defined function with `arguments` parameters.
+    fn charge_user_function_application(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        arguments: u32,
+    ) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.user_function_application, arguments)
+    }
+
+    /// Charge type-checking one argument of a user-defined function.
+    fn charge_inner_type_check(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.inner_type_check, size)
+    }
+
+    /// Charge searching the binding scopes for a name.
+    fn charge_variable_lookup(&self, instrs: &mut InstrSeqBuilder, depth: u32) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.variable_depth, depth)
+    }
+
+    /// Charge copying a bound value out of its binding.
+    fn charge_variable_copy(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.variable_size, size)
+    }
 }
+
+/// The runtime the interpreter charges for evaluation itself, rather than for
+/// any one word: resolving names, entering user-defined functions, and copying
+/// bound values out of their bindings.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalCosts {
+    function_lookup: Caf,
+    variable_depth: Caf,
+    variable_size: Caf,
+    user_function_application: Caf,
+    inner_type_check: Caf,
+}
+
+/// `costs-1`.
+const EVAL_COSTS_1: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(1_000),
+    variable_depth: Caf::Linear { a: 1_000, b: 1_000 },
+    variable_size: Caf::Linear { a: 1_000, b: 0 },
+    user_function_application: Caf::Linear { a: 1_000, b: 1_000 },
+    inner_type_check: Caf::Linear { a: 1_000, b: 1_000 },
+};
+
+/// `costs-2`, on both networks.
+const EVAL_COSTS_2: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(16),
+    variable_depth: Caf::Linear { a: 2, b: 14 },
+    variable_size: Caf::Linear { a: 2, b: 1 },
+    user_function_application: Caf::Linear { a: 26, b: 140 },
+    inner_type_check: Caf::Linear { a: 2, b: 9 },
+};
+
+/// `costs-3`, which `costs-4` and `costs-5` leave alone.
+const EVAL_COSTS_3: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(16),
+    variable_depth: Caf::Linear { a: 1, b: 1 },
+    variable_size: Caf::Linear { a: 2, b: 1 },
+    user_function_application: Caf::Linear { a: 26, b: 5 },
+    inner_type_check: Caf::Linear { a: 2, b: 5 },
+};
 
 impl ChargeGenerator for WasmGenerator {
     fn cost_context(&self) -> Option<(&ChargeContext, &Module)> {
@@ -346,18 +417,18 @@ impl ChargeContext {
         }
     }
 
-    /// `lookup_function`, which every schedule after the first prices alike.
-    const fn function_lookup_cost(&self) -> u32 {
+    const fn eval_costs(&self) -> &'static EvalCosts {
         match self.epoch {
             StacksEpochId::Epoch10 => panic!("clarity did not exist in epoch 1"),
-            StacksEpochId::Epoch20 => 1_000,
-            _ => 16,
+            StacksEpochId::Epoch20 => &EVAL_COSTS_1,
+            StacksEpochId::Epoch2_05 => &EVAL_COSTS_2,
+            _ => &EVAL_COSTS_3,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WordCost {
+pub struct WordCost {
     runtime: Caf,
     read_count: Caf,
     read_length: Caf,
@@ -367,7 +438,7 @@ struct WordCost {
 
 /// Cost assessment function
 #[derive(Debug, Clone, Copy)]
-enum Caf {
+pub enum Caf {
     /// Constant cost
     Constant(u32),
     /// Linear cost, scaling with `n`
@@ -1383,9 +1454,9 @@ mod word {
         3 => CostMeter { runtime: 330,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("let", "(let ((a 42) (b 24)) a)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 428,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 22000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1219,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 463,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("at_block", "(at-block 0x0000000000000000000000000000000000000000000000000000000000000000 1)", {
         1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
@@ -1711,9 +1782,9 @@ mod word {
     decl_tests!("map", "(define-private (zero-or-one (char (buff 1))) \
                           (if (is-eq char 0x00) 0x00 0x01)) \
                         (map zero-or-one 0x000102)", {
-        1 => CostMeter { runtime: 23000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 8424,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 7766,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 65000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 9054,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 7940,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("replace_at", "(replace-at? 0x00112233 u2 0x44)", {
         3 => CostMeter { runtime: 581,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1811,9 +1882,9 @@ mod word {
         ),
         ("caller", "(contract-call? .callee foo (ok true) 2 3 4)"),
         {
-                 1 => CostMeter { runtime: 158000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 2 => CostMeter { runtime: 1457, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 3 => CostMeter { runtime: 1129, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 1 => CostMeter { runtime: 142000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 2 => CostMeter { runtime: 1274, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 3 => CostMeter { runtime: 965, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
              }
     );
 
@@ -1854,7 +1925,9 @@ mod word {
 /// the interpreter rather than a hand-written expectation.
 #[cfg(test)]
 mod crosscheck {
-    use crate::tools::crosscheck_cost;
+    use clarity::vm::Value;
+
+    use crate::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
 
     #[test]
     fn charges_every_application() {
@@ -1867,5 +1940,47 @@ mod crosscheck {
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }
+    }
+
+    #[test]
+    fn charges_entering_a_function_once() {
+        for (snippet, arguments) in [
+            ("(define-public (f (a uint)) (ok a))", vec![Value::UInt(1)]),
+            (
+                "(define-public (f (a uint) (b uint)) (ok (+ a b)))",
+                vec![Value::UInt(1), Value::UInt(2)],
+            ),
+            (
+                "(define-private (g (a uint)) a) (define-public (f) (ok (g u1)))",
+                vec![],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &arguments);
+        }
+    }
+
+    #[test]
+    fn charges_reading_a_bound_value() {
+        for snippet in [
+            "(define-public (f) (ok (let ((a { x: u1, y: u2 })) (get x a))))",
+            "(define-private (g (a { x: uint })) (get x a)) (define-public (f) (ok (g { x: u1 })))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_a_cross_contract_call_once() {
+        crosscheck_cost_multi_contract(
+            &[
+                ("callee", "(define-public (h (a uint)) (ok a))"),
+                (
+                    "caller",
+                    "(define-public (f) (contract-call? .callee h u1))",
+                ),
+            ],
+            "f",
+            &[],
+        );
     }
 }

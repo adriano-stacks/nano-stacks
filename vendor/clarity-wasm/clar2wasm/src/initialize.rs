@@ -482,20 +482,8 @@ pub fn call_function(
     };
     let expected_arguments = function.get_arg_types();
     let read_only = function.is_read_only();
-    runtime_cost(
-        ClarityCostFunction::UserFunctionApplication,
-        global_context,
-        expected_arguments.len() as u64,
-    )?;
-    if !global_context.epoch_id.uses_arg_size_for_cost() {
-        for argument_type in expected_arguments {
-            runtime_cost(
-                ClarityCostFunction::InnerTypeCheckCost,
-                global_context,
-                argument_type.size()?,
-            )?;
-        }
-    }
+    // Entering the function and type-checking its arguments is charged by the
+    // function's own prelude, which runs whoever calls it.
     if arguments.len() != expected_arguments.len() {
         return Err(
             clarity::vm::errors::RuntimeCheckErrorKind::IncorrectArgumentCount(
