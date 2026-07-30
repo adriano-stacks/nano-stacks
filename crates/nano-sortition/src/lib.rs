@@ -2,7 +2,7 @@ pub(crate) mod carryover;
 
 use std::{collections::HashMap, fmt};
 
-use nano_bitcoin::BitcoinBlock;
+use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
 use nano_primitives::{
     BitcoinHeaderHash, ConsensusHash, SortitionId, Uint256, Uint512, hash160, sha256, sha512_256,
 };
@@ -80,6 +80,46 @@ pub struct MiningCommitment {
 pub struct SortitionWinner {
     pub txid: [u8; 32],
     pub vrf_seed: [u8; 32],
+}
+
+/// Bitcoin blocks a miner may name when it says which block it built on.
+///
+/// A commitment carries the height of its parent modulo this
+/// (`burn/operations/leader_block_commit.rs`, `BURN_BLOCK_MINED_AT_MODULUS`).
+pub const BURN_BLOCK_MINED_AT_MODULUS: u64 = 5;
+
+/// Whether a commitment landed in the Bitcoin block it aimed at.
+///
+/// A miner names the block it built on by its height modulo five, so the block
+/// it means to land in is the one after that. A commitment that arrives
+/// anywhere else missed: stacks-core keeps it only so its UTXO can chain
+/// through the mining window, and it is neither a candidate for the sortition
+/// nor one of the operations the block's `ops_hash` covers
+/// (`leader_block_commit.rs`, `check`).
+#[must_use]
+pub const fn commitment_is_on_time(parent_modulus: u8, bitcoin_height: u64) -> bool {
+    let intended =
+        (parent_modulus as u64 % BURN_BLOCK_MINED_AT_MODULUS + 1) % BURN_BLOCK_MINED_AT_MODULUS;
+    bitcoin_height % BURN_BLOCK_MINED_AT_MODULUS == intended
+}
+
+/// The operations a Bitcoin block contributes to its own consensus hash.
+///
+/// Everything the block carries except the commitments that missed their
+/// target, which the network parses but does not accept.
+#[must_use]
+pub fn accepted_operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
+    block
+        .operations
+        .iter()
+        .filter(|operation| match operation.kind {
+            BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
+                commitment_is_on_time(parent_modulus, block.height)
+            }
+            _ => true,
+        })
+        .map(|operation| operation.txid)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,11 +712,7 @@ impl SnapshotChain {
         pox_id: PoxId,
         winner: Option<SortitionWinner>,
     ) -> Result<&SortitionSnapshot, SortitionError> {
-        let operation_txids = block
-            .operations
-            .iter()
-            .map(|operation| operation.txid)
-            .collect::<Vec<_>>();
+        let operation_txids = accepted_operation_txids(block);
         self.append_with_operations(block, &operation_txids, total_burn, pox_id, winner)
     }
 

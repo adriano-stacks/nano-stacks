@@ -992,6 +992,7 @@ mod tests {
         checkpoint_state,
         decode_hash, scoreboard, validate_fixture_tree,
     };
+    use nano_sortition::BURN_BLOCK_MINED_AT_MODULUS;
     use blockstack_lib::burnchains::{
         MagicBytes,
         bitcoin::{BitcoinNetworkType, BitcoinTxInput, blocks::BitcoinBlockParser},
@@ -2092,6 +2093,62 @@ mod tests {
         assert_eq!(
             reopened, continuous,
             "reopening the chainstate between blocks changed the state it produced"
+        );
+    }
+
+    /// A commitment that missed its Bitcoin block is not one of the block's
+    /// operations.
+    ///
+    /// stacks-core parses such a commitment and keeps it only so its UTXO can
+    /// chain through the mining window; it wins no sortition and it is not
+    /// covered by the block's `ops_hash`. nano hashed every commitment it could
+    /// parse, so a single late miner would have moved its consensus hash.
+    #[test]
+    fn a_missed_commitment_leaves_the_operation_hash() {
+        // The rule, against stacks-core's own arithmetic, over every modulus a
+        // commitment can carry and a run of heights.
+        for parent_modulus in 0..=u8::try_from(BURN_BLOCK_MINED_AT_MODULUS).expect("small") {
+            for height in 0..32_u64 {
+                let intended = (u64::from(parent_modulus) % BURN_BLOCK_MINED_AT_MODULUS + 1)
+                    % BURN_BLOCK_MINED_AT_MODULUS;
+                assert_eq!(
+                    nano_sortition::commitment_is_on_time(parent_modulus, height),
+                    height % BURN_BLOCK_MINED_AT_MODULUS == intended,
+                    "modulus {parent_modulus} at height {height}"
+                );
+            }
+        }
+
+        // A block holding one commitment that arrived on time and one that did
+        // not: only the first is one of the block's operations.
+        let height = 305;
+        let on_time = u8::try_from((height + BURN_BLOCK_MINED_AT_MODULUS - 1) % 5).expect("small");
+        let commit = |txid: u8, parent_modulus: u8| nano_bitcoin::BitcoinOperation {
+            txid: [txid; 32],
+            transaction_index: u32::from(txid),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            kind: nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                block_header_hash: [0; 32],
+                new_seed: [0; 32],
+                parent_block_height: 0,
+                parent_transaction_index: 0,
+                key_block_height: 0,
+                key_transaction_index: 0,
+                memo: 0,
+                parent_modulus,
+            },
+        };
+        let block = nano_bitcoin::BitcoinBlock {
+            height,
+            hash: [9; 32],
+            operations: vec![commit(1, on_time), commit(2, (on_time + 1) % 5)],
+        };
+
+        assert_eq!(
+            nano_sortition::accepted_operation_txids(&block),
+            vec![[1; 32]],
+            "the late commitment must not be one of the block's operations"
         );
     }
 

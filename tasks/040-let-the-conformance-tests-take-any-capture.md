@@ -27,22 +27,23 @@ tests failed. Six were fixed by giving them the capture's accounting — now
   capture's
 - the capture wrote one `stacker_set` and a 340-block window spans more —
   **fixed**, it now writes every cycle the window spans
-- `captured_bitcoin_blocks_match_the_recorded_operation_hashes` and
-  `captured_sortition_snapshots_match_the_reference_bitcoin_chain` disagree with
-  the reference `ops_hash` at **Bitcoin height 305**. This one is not a capture
-  gap and is not explained: the capture takes every burn block from height 0,
-  so the `PreStx` window is complete. Either nano parses an operation in that
-  block differently from stacks-core, or it orders them differently — and the
-  fixtures in the tree never exercised it. Treat it as a suspected nano defect
-  until it is understood, not as a fixture problem.
+- the `ops_hash` disagreement at **Bitcoin height 305** was a real nano
+  consensus bug, now **fixed**. The reference hash there is `e3b0c442…`, the
+  hash of nothing: stacks-core accepted no operations in that block, while
+  `missed_commits` holds exactly one commitment intended for it. A miner had
+  committed late, and nano hashed every commitment it could parse. See the
+  commit; the tests still need updating to hash accepted operations rather than
+  parsed ones.
 
 ## Tasks
 
 - [x] Give the two paths that took no accounting the capture's.
 - [x] Capture a `stacker_set` for every cycle the window spans.
-- [ ] Find out why nano's operation hash differs from the reference at Bitcoin
-      height 305 of the new capture. This is the one that may not be the tests'
-      fault.
+- [x] Find out why nano's operation hash differs from the reference at Bitcoin
+      height 305 of the new capture — it was nano, and it is fixed.
+- [ ] Hash accepted operations, not parsed ones, in
+      `captured_bitcoin_blocks_match_the_recorded_operation_hashes` and
+      `captured_sortition_snapshots_match_the_reference_bitcoin_chain`.
 - [ ] Drive the remaining tests from the manifest and provenance rather than
       from heights that happen to be true of one capture.
 
