@@ -42,10 +42,9 @@ about when a block is full and when a tenure must be extended.
       holds rather than how many.
 - [x] Charge a list of a sequence type by the elements' runtime sizes, and
       `append` by the size of an entry rather than how many there are.
-- [ ] Charge a fold over a native word the application it inlines, 31 an
-      element. It is *not* a user-function application — charging one costs 57
-      an element and overshoots — so what the interpreter pays there has to be
-      identified first. Then un-ignore `charges_a_native_fold`.
+- [x] Charge a fold over a native word the application it inlines, and the
+      function-argument lookup `map` and `filter` skip. `charges_a_native_fold`
+      is un-ignored and covers all three forms.
 - [ ] Find what remains of the 65.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
@@ -153,28 +152,50 @@ an entry rather than how many entries the result has.
 Seventeen charging bugs are fixed, each a passing crosscheck, and `.pox-5
 stake-update` sits **65 out of 231,186 — 0.028%, from 0.36%**.
 
-One known divergence is left, and it is not the 65: a fold over a *native*
-word is short by **31 an element**, because nano inlines the word without
-paying to apply it. Over a user-defined function a fold is exact.
+### Applying a word to every element — fixed
 
-Charging a user-function application per element was the obvious guess and it
-is wrong — that costs 57 an element and overshoots by 26.
+`fold`, `map` and `filter` call a word's `visit` directly, which skips the
+dispatcher, and two charges went with it.
 
-What the interpreter actually pays is in `dispatch_args` (`vm/mod.rs`):
-applying a `CallableType::NativeFunction` charges *that word's own cost
-function* with `args.len()`, once an element. nano inlines the word and
-charges it once for the whole loop. That is the shape to check next, and it
-explains why the gap is the same 31 for `*` and for `+` — both are two-argument
-natives with the same cost shape.
+A **variadic** word is charged by its *caller* rather than by its own `visit`,
+so `(fold * ...)` never paid for the multiply — 31 an element. A non-variadic
+word charges itself, so only the variadic branch was short; charging both
+double-charged `(map not ...)` by the same 31, which is how the asymmetry
+showed itself.
 
-What accounts for the 65 itself is not yet identified. The row is not green
-and the task is not done.
+Resolving the applied function's name is a flat 16 that `fold` already paid and
+`map` and `filter` did not. And `map` charged for how long its sequences turned
+out to be, where `special_map` charges for how many arguments it was applied
+to.
 
-Also still open, and in the other direction: `fold`/`map`/`filter` miss the
-function-argument lookup, 16 plus 1 per element.
+All exact now, on one to forty elements, over natives and user functions alike.
+Eight recorded word-cost snapshots moved with it and were re-recorded.
 
-Reducing `stake-update` to the snippet that over-charges is the next step, the
-same way the earlier eight were found.
+### What the 65 is not
+
+Enumerating every cost divergence across the 340 blocks gives nine, all
+runtime-only, all nano **over**, and all in one contract:
+
+| blocks | function | over by |
+|---|---|---|
+| 76, 134, 177, 237, 339 | `.pox-5 stake-update` | 65 |
+| 77, 79 | `.pox-5 stake-update` | 65 |
+| 146 | `.pox-5 stake-update` | 31 |
+| 179 | `.pox-5 stake` | 32 |
+
+That the same function is out by 65 on one path and 31 on another says it is
+charged per *something* the path varies, not once a call.
+
+`stake-update` takes two trait arguments and `stake` one, which fit 65 and 32
+well enough to be worth testing. They are not the cause: `contract-of`,
+`stx-account`, `merge` and `print` all crosscheck exactly, and so do trait,
+`uint` and `principal` arguments.
+
+A probe suggesting otherwise was wrong — it called functions with fewer
+arguments than they declare, and `cost_crosscheck`'s argument list has to match
+the signature or both engines are measured doing something other than the work.
+Worth remembering: a divergence that scales with parameter count is the shape
+that artefact produces.
 
 ## Hacknet
 
@@ -203,4 +224,7 @@ participant and watching the tip stay frozen anyway.
 
 The offline evidence stands on its own — every cost change here is crosschecked
 against the interpreter, and the 340-block replay matches state roots and
-receipts — but a live chain has not seen these changes.
+receipts.
+
+The sequence-application fixes landed after that run and have not themselves
+been on a live chain.
