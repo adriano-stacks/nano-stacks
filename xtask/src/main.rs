@@ -193,6 +193,12 @@ fn validate_fixtures() -> ExitCode {
 struct CaptureConfig {
     out_dir: Option<PathBuf>,
     state_dir: PathBuf,
+    /// The directory holding `chainstate/` and `burnchain/`.
+    ///
+    /// Hacknet nests it under a participant, a node run anywhere else does
+    /// not, so a capture from an archived mainnet chainstate names it
+    /// directly.
+    node_root: Option<PathBuf>,
     events_dir: PathBuf,
     bitcoin_rpc: String,
     stacks_rpc: String,
@@ -220,6 +226,7 @@ impl CaptureConfig {
         let mut values = arguments.iter();
         let mut out_dir = None;
         let mut state_dir = None;
+        let mut node_root = None;
         let mut events_dir = None;
         let mut bitcoin_rpc = None;
         let mut stacks_rpc = None;
@@ -236,6 +243,7 @@ impl CaptureConfig {
             match flag.as_str() {
                 "--out-dir" => out_dir = Some(PathBuf::from(value)),
                 "--state-dir" => state_dir = Some(PathBuf::from(value)),
+                "--node-root" => node_root = Some(PathBuf::from(value)),
                 "--events-dir" => events_dir = Some(PathBuf::from(value)),
                 "--bitcoin-rpc" => bitcoin_rpc = Some(value.to_owned()),
                 "--stacks-rpc" => stacks_rpc = Some(value.to_owned()),
@@ -251,6 +259,7 @@ impl CaptureConfig {
         Ok(Self {
             out_dir,
             state_dir: state_dir.ok_or_else(|| "--state-dir is required".to_owned())?,
+            node_root,
             events_dir: events_dir.ok_or_else(|| "--events-dir is required".to_owned())?,
             bitcoin_rpc: bitcoin_rpc.ok_or_else(|| "--bitcoin-rpc is required".to_owned())?,
             stacks_rpc: stacks_rpc.ok_or_else(|| "--stacks-rpc is required".to_owned())?,
@@ -272,7 +281,9 @@ impl CaptureConfig {
         if self.checkpoint_height >= self.first_height {
             return Err("--checkpoint-height must precede --first-height".to_owned());
         }
-        let node_root = self.state_dir.join("stacks-miner-1/nakamoto-neon");
+        let node_root = self.node_root.clone().unwrap_or_else(|| {
+            self.state_dir.join("stacks-miner-1/nakamoto-neon")
+        });
         let blocks_db = node_root.join("chainstate/blocks/nakamoto.sqlite");
         let sortition_db = node_root.join("burnchain/sortition/marf.sqlite");
         let blocks = self.blocks(&blocks_db)?;
