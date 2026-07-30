@@ -16,6 +16,12 @@ use serde::Deserialize;
 pub struct FixtureManifest {
     pub mode: FixtureMode,
     pub replay_blocks: u64,
+    /// Whether the capture carries the event-observer receipts.
+    ///
+    /// They come from an observer attached to a running node, so a capture
+    /// taken from an archived chainstate has none. The state root is in the
+    /// block header either way, which is why the two are checked separately.
+    pub receipts: bool,
 }
 
 /// Whether the fixture directory holds the empty baseline the scoreboard starts
@@ -89,9 +95,17 @@ impl FixtureManifest {
             "captured" => FixtureMode::Captured,
             other => return Err(ManifestError::InvalidMode(other.to_owned())),
         };
+        // Absent means present: every capture written before receipts could be
+        // left out carries them.
+        let receipts = contents
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("receipts ="))
+            .is_none_or(|value| value.trim() != "false");
         Ok(Self {
             mode,
             replay_blocks: value,
+            receipts,
         })
     }
 }
@@ -446,11 +460,32 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
         "replay: state root   fixture block headers       {}/{}          {}",
         replay.completed, replay.expected, first_failure
     );
-    let _ = writeln!(
-        output,
-        "replay: receipts     event observer receipts     {}/{}          {}",
-        replay.completed, replay.expected, first_failure
-    );
+    // A capture without receipts must not read as a passing row: the state
+    // root is checked, the receipts simply were not there to check.
+    if manifest.receipts {
+        let _ = writeln!(
+            output,
+            "replay: receipts     event observer receipts     {}/{}          {}",
+            replay.completed, replay.expected, first_failure
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "replay: receipts     event observer receipts   not captured  needs an observer"
+        );
+    }
+    if !manifest.receipts {
+        let _ = writeln!(
+            output,
+            "replay: costs        receipt cost dimensions   not captured  needs an observer"
+        );
+        let _ = writeln!(
+            output,
+            "\nREPLAY DEPTH: {} / {} ({})",
+            replay.completed, replay.expected, replay_mode
+        );
+        return output;
+    }
     let costs = replay.first_cost_divergence.as_ref().map_or_else(
         || format!("{}/{}          —", replay.completed, replay.expected),
         |(height, reason)| {
@@ -495,6 +530,7 @@ pub fn replay_captured_blocks(
         FixtureManifest {
             mode: FixtureMode::Captured,
             replay_blocks: blocks,
+            receipts: true,
         },
         visit,
     )
@@ -538,11 +574,15 @@ fn captured_replay_visiting(
             break;
         }
         let block_number = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
-        let (block, applied, cost_divergence) = match apply_captured_block(
+        let capture = ReplayInputs {
             root,
+            snapshots: &snapshots,
+            bitcoin_operations: &bitcoin_operations,
+            receipts: manifest.receipts,
+        };
+        let (block, applied, cost_divergence) = match apply_captured_block(
+            &capture,
             &mut chainstate,
-            &snapshots,
-            &bitcoin_operations,
             parent,
             &mut bitcoin_view,
             &path,
@@ -599,11 +639,17 @@ fn replay_fixture_failure(manifest: FixtureManifest, message: &str) -> ReplayDep
     }
 }
 
+/// What a replay carries from block to block, as against per block.
+struct ReplayInputs<'a> {
+    root: &'a Path,
+    snapshots: &'a BTreeMap<String, BitcoinBlockContext>,
+    bitcoin_operations: &'a BTreeMap<String, Vec<BitcoinOperation>>,
+    receipts: bool,
+}
+
 fn apply_captured_block(
-    root: &Path,
+    capture: &ReplayInputs<'_>,
     chainstate: &mut ChainState,
-    snapshots: &BTreeMap<String, BitcoinBlockContext>,
-    bitcoin_operations: &BTreeMap<String, Vec<BitcoinOperation>>,
     parent: Option<[u8; 32]>,
     bitcoin_view: &mut String,
     path: &Path,
@@ -620,26 +666,47 @@ fn apply_captured_block(
         // Replay can start mid-tenure, where the view is the tenure's own sortition.
         *bitcoin_view = block.header.consensus_hash.to_string();
     }
-    let mut bitcoin_context = *snapshots.get(bitcoin_view.as_str()).ok_or_else(|| {
+    let mut bitcoin_context = *capture.snapshots.get(bitcoin_view.as_str()).ok_or_else(|| {
         ReplayDivergence::Fixture(
             "block Bitcoin view is absent from captured Bitcoin snapshots".to_owned(),
         )
     })?;
-    let event_path = root.join("events/new_block").join(
+    let event_path = capture.root.join("events/new_block").join(
         path.file_stem()
             .map(|name| format!("{}.json", name.to_string_lossy()))
             .ok_or_else(|| ReplayDivergence::Fixture("block has no file name".to_owned()))?,
     );
-    let event: CapturedBlockEvent = serde_json::from_slice(
-        &fs::read(event_path)
-            .map_err(|_| ReplayDivergence::Fixture("block event cannot be read".to_owned()))?,
-    )
-    .map_err(|_| ReplayDivergence::Fixture("block event cannot be decoded".to_owned()))?;
-    bitcoin_context.v1_unlock_height = event.v1;
-    bitcoin_context.v2_unlock_height = event.v2;
-    bitcoin_context.v3_unlock_height = event.v3;
-    bitcoin_context.pox_5_activation_height = event.v4;
-    let operations = bitcoin_operations
+    // A capture without receipts still needs the unlock heights the events
+    // otherwise carry. They are constants of the chain rather than of a block,
+    // so the provenance record holds them.
+    let event = if capture.receipts {
+        let event: CapturedBlockEvent = serde_json::from_slice(
+            &fs::read(event_path)
+                .map_err(|_| ReplayDivergence::Fixture("block event cannot be read".to_owned()))?,
+        )
+        .map_err(|_| ReplayDivergence::Fixture("block event cannot be decoded".to_owned()))?;
+        bitcoin_context.v1_unlock_height = event.v1;
+        bitcoin_context.v2_unlock_height = event.v2;
+        bitcoin_context.v3_unlock_height = event.v3;
+        bitcoin_context.pox_5_activation_height = event.v4;
+        Some(event)
+    } else {
+        let height = |name: &str| {
+            provenance_field(capture.root, name)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    ReplayDivergence::Fixture(format!(
+                        "a capture without receipts needs {name} in its provenance"
+                    ))
+                })
+        };
+        bitcoin_context.v1_unlock_height = height("pox_v1_unlock_height")?;
+        bitcoin_context.v2_unlock_height = height("pox_v2_unlock_height")?;
+        bitcoin_context.v3_unlock_height = height("pox_v3_unlock_height")?;
+        bitcoin_context.pox_5_activation_height = height("pox_v4_unlock_height")?;
+        None
+    };
+    let operations = capture.bitcoin_operations
         .get(&block.header.consensus_hash.to_string())
         .ok_or_else(|| {
             ReplayDivergence::Fixture(
@@ -649,7 +716,10 @@ fn apply_captured_block(
     let applied = chainstate
         .execute_nakamoto_block_with_bitcoin_operations(bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
-    let cost_divergence = compare_receipts(&event, &applied.receipts)?;
+    let cost_divergence = match &event {
+        Some(event) => compare_receipts(event, &applied.receipts)?,
+        None => None,
+    };
     let actual = TrieHash::from_bytes(applied.execution.state_root.0);
     if actual != block.header.state_index_root {
         return Err(ReplayDivergence::StateRoot {
@@ -1257,6 +1327,7 @@ mod tests {
             baseline_replay(FixtureManifest {
                 mode: FixtureMode::Baseline,
                 replay_blocks: 1,
+                receipts: true,
             })
             .first_failure,
             Some(1)
@@ -1268,6 +1339,7 @@ mod tests {
         let report = scoreboard(FixtureManifest {
             mode: FixtureMode::Baseline,
             replay_blocks: 1,
+                receipts: true,
         });
         assert!(report.contains("0/1"));
         assert!(report.contains("block 1"));
@@ -1686,10 +1758,13 @@ mod tests {
             let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
                 .expect("decode block");
             apply_captured_block(
-                &fixture,
+                &super::ReplayInputs {
+                    root: &fixture,
+                    snapshots: &snapshots,
+                    bitcoin_operations: &bitcoin_operations,
+                    receipts: true,
+                },
                 &mut chainstate,
-                &snapshots,
-                &bitcoin_operations,
                 parent,
                 &mut bitcoin_view,
                 &path,

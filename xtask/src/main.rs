@@ -156,7 +156,12 @@ struct ScheduledPayment {
 }
 
 fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures")
+    // `NANO_FIXTURES` points the scoreboard at a capture outside the tree,
+    // which is how a mainnet one is read without installing it first.
+    env::var_os("NANO_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures"),
+        PathBuf::from,
+    )
 }
 
 fn print_scoreboard() -> ExitCode {
@@ -199,7 +204,11 @@ struct CaptureConfig {
     /// not, so a capture from an archived mainnet chainstate names it
     /// directly.
     node_root: Option<PathBuf>,
-    events_dir: PathBuf,
+    /// Absent when no event observer was attached, as for a capture taken
+    /// from an archived chainstate: the receipts simply are not there.
+    events_dir: Option<PathBuf>,
+    /// The unlock heights the events otherwise carry, needed only without them.
+    unlock_heights: Option<[u64; 4]>,
     bitcoin_rpc: String,
     stacks_rpc: String,
     hacknet_commit: String,
@@ -228,6 +237,7 @@ impl CaptureConfig {
         let mut state_dir = None;
         let mut node_root = None;
         let mut events_dir = None;
+        let mut unlock_heights: [Option<u64>; 4] = [None; 4];
         let mut bitcoin_rpc = None;
         let mut stacks_rpc = None;
         let mut hacknet_commit = None;
@@ -245,6 +255,10 @@ impl CaptureConfig {
                 "--state-dir" => state_dir = Some(PathBuf::from(value)),
                 "--node-root" => node_root = Some(PathBuf::from(value)),
                 "--events-dir" => events_dir = Some(PathBuf::from(value)),
+                "--pox-v1-unlock-height" => unlock_heights[0] = Some(parse_u64(flag, value)?),
+                "--pox-v2-unlock-height" => unlock_heights[1] = Some(parse_u64(flag, value)?),
+                "--pox-v3-unlock-height" => unlock_heights[2] = Some(parse_u64(flag, value)?),
+                "--pox-v4-unlock-height" => unlock_heights[3] = Some(parse_u64(flag, value)?),
                 "--bitcoin-rpc" => bitcoin_rpc = Some(value.to_owned()),
                 "--stacks-rpc" => stacks_rpc = Some(value.to_owned()),
                 "--hacknet-commit" => hacknet_commit = Some(value.to_owned()),
@@ -260,7 +274,11 @@ impl CaptureConfig {
             out_dir,
             state_dir: state_dir.ok_or_else(|| "--state-dir is required".to_owned())?,
             node_root,
-            events_dir: events_dir.ok_or_else(|| "--events-dir is required".to_owned())?,
+            events_dir,
+            unlock_heights: match unlock_heights {
+                [Some(v1), Some(v2), Some(v3), Some(v4)] => Some([v1, v2, v3, v4]),
+                _ => None,
+            },
             bitcoin_rpc: bitcoin_rpc.ok_or_else(|| "--bitcoin-rpc is required".to_owned())?,
             stacks_rpc: stacks_rpc.ok_or_else(|| "--stacks-rpc is required".to_owned())?,
             hacknet_commit: hacknet_commit
@@ -413,8 +431,9 @@ impl CaptureConfig {
         write_file(
             &staging.join("manifest.toml"),
             format!(
-                "mode = \"captured\"\nreplay_blocks = {}\n",
-                self.replay_blocks
+                "mode = \"captured\"\nreplay_blocks = {}\nreceipts = {}\n",
+                self.replay_blocks,
+                self.events_dir.is_some()
             )
             .as_bytes(),
         )?;
@@ -549,8 +568,11 @@ impl CaptureConfig {
     }
 
     fn event_for(&self, block_hash: &str) -> Result<String, String> {
+        let Some(events_dir) = self.events_dir.as_ref() else {
+            return Err("no events directory was given".to_owned());
+        };
         let needle = format!("\"block_hash\":\"0x{block_hash}\"");
-        let mut candidates = fs::read_dir(self.events_dir.join("new_block"))
+        let mut candidates = fs::read_dir(events_dir.join("new_block"))
             .map_err(io_error("read new_block events"))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -702,6 +724,16 @@ impl CaptureConfig {
         json_unsigned_field(&response, "network_id")
     }
 
+    /// The unlock heights a receipt-less capture has to record itself.
+    fn unlock_height_lines(&self) -> String {
+        self.unlock_heights.map_or_else(String::new, |heights| {
+            format!(
+                "\npox_v1_unlock_height = {}\npox_v2_unlock_height = {}\npox_v3_unlock_height = {}\npox_v4_unlock_height = {}",
+                heights[0], heights[1], heights[2], heights[3]
+            )
+        })
+    }
+
     fn write_provenance(
         &self,
         staging: &Path,
@@ -719,8 +751,9 @@ impl CaptureConfig {
         // The revision decides what "matches stacks-core" means, so a capture
         // that does not name it cannot be told apart from one that disagrees.
         let stacks_core_rev = Self::pinned_stacks_core()?;
+        let unlock_heights = self.unlock_height_lines();
         let contents = format!(
-            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}\n",
+            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}{unlock_heights}\n",
             self.hacknet_commit,
             checkpoint.height,
             checkpoint.index_block_hash,
