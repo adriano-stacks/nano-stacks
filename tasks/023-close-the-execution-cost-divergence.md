@@ -32,11 +32,11 @@ about when a block is full and when a tenure must be extended.
 
 ## Tasks
 
-- [ ] Reduce the block-22 transaction to the smallest snippet that diverges.
-- [ ] Fix the vendored compiler's charging for it and keep the case as a
+- [x] Reduce the block-22 transaction to the smallest snippet that diverges.
+- [x] Fix the vendored compiler's charging for it and keep the case as a
       regression test.
 - [ ] Work forward through the fixtures until the cost row reaches 600/600.
-- [ ] Assert per-snippet dimension equality against the interpreter, not only
+- [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
 ## Acceptance Criteria
@@ -44,3 +44,29 @@ about when a block is full and when a tenure must be extended.
 - The scoreboard's cost row matches its state-root and receipt rows.
 - All five dimensions match the interpreter on the crosscheck suite.
 - The reduced cases stay in the suite as regression coverage.
+
+## Where it got to
+
+Four of the five dimensions now match the node exactly, where three diverged
+before:
+
+```
+before  got (60, 134492 -> 134664, 481082 -> 366479, 19, 1657)
+after   got (62, 134492,            240515,          19, 1667)
+```
+
+Eight real charging bugs were behind that, the largest being that a rebase
+had silently dropped every cost patch nano had added, so epoch 4.0 was paying
+Clarity-3 prices for arithmetic, sequences, tuples, hashing and data access,
+and never paid for resolving a name to a function at all.
+
+The row still cannot reach full depth, and the reason is not nano's: the
+fixtures charge `costs-4` runtime at epoch 4.0 while the pinned stacks-core
+charges `costs-5`. That is [[038-recapture-the-fixtures-from-the-pinned-revision]].
+
+Two known under-charges remain, both measured:
+
+- runtime is 0.3% low because `InnerTypeCheckCost` and the value-copy cost are
+  charged on the declared type's maximum size rather than the value's actual
+  size, which needs sequence-length arithmetic in the compiler
+- `fold`/`map`/`filter` miss the function-argument lookup, 16 plus 1 per element
