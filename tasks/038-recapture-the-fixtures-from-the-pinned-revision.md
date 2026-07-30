@@ -47,12 +47,14 @@ this fixture tree is not.
 - [x] Record the receipts a capture reads. Hacknet gives its nodes one event
       observer, the signer, whose keys carry no `new_block`, so nothing wrote
       them — `harness.sh observe` adds a sink and restarts the miners onto it.
-- [ ] Grow a Hacknet on the pinned revision past a checkpoint plus the replay
+- [x] Grow a Hacknet on the pinned revision past a checkpoint plus the replay
       window.
-- [ ] Recapture with `cargo xtask capture-fixtures`, recording the revision in
+- [x] Recapture with `cargo xtask capture-fixtures`, recording the revision in
       `provenance.toml` alongside the Hacknet commit.
-- [ ] Confirm `replay: state root` and `replay: receipts` stay at their full
+- [x] Confirm `replay: state root` and `replay: receipts` stay at their full
       depth, and see where `replay: costs` lands.
+- [ ] Capture a window whose maturing tenures are all Nakamoto ones, so the
+      accounting the replay needs exists (see below), and install it.
 - [ ] Include the checkpoint height's own block, so the attestation test in
       [[031-establish-a-trust-root-for-the-checkpoint]] can attest `checkpoint-H`
       itself rather than standing in a later block. The capture starts one block
@@ -94,3 +96,46 @@ a restart, not a wipe, so the chain carries on. The sink writes
 It has to run inside the network: a node here cannot reach a host port through
 the bridge gateway, and an observer it cannot reach it retries forever, which
 is its own way of stalling a run.
+
+## The measurement
+
+A capture was taken from a Hacknet built at the pinned revision — 340 blocks
+from Stacks height 461, checkpoint at 460, receipts recorded by the sink above.
+Replayed:
+
+```
+replay: state root   340/340
+replay: receipts     340/340
+replay: costs         75/340   block 76: expected (54, 139581, 231186, 17, 1391)
+                                              got (54, 139581, 232029, 17, 1391)
+```
+
+Against the stale fixtures the same row reads `expected … 481082 … got 240515`
+— a factor of two. Against a node built at the revision the oracles compare
+with, four dimensions match exactly and runtime differs by **843 in 231,186,
+which is 0.36%**.
+
+That is the residual [[023-close-the-execution-cost-divergence]] already
+identified and measured: `InnerTypeCheckCost` and the value-copy cost are
+charged on the declared type's maximum size rather than the value's actual
+size. The costs-4/costs-5 question is settled — the schedule is right, the
+fixtures were old.
+
+## Why the capture is not installed
+
+The capture replays only 75 blocks before failing on
+`tenure 21 matured without accounting: its rewards are neither checkpointed nor
+executed`.
+
+Rewards mature a hundred tenures later, so a window starting at tenure T needs
+priced tenures back to T-100. This window reaches tenure 21, which predates
+Nakamoto and has no row in `nakamoto_tenure_events`, so `write_native_effects`
+skips it and the replay finds a hole. The old fixtures happen to start late
+enough that every maturing tenure is a Nakamoto one.
+
+The next capture needs `--first-height` chosen so that the earliest maturing
+tenure is at or after the first Nakamoto tenure — or `write_native_effects`
+taught to price a pre-Nakamoto tenure rather than skip it. The Hacknet that
+produced this one stalled at Stacks 809 before a later window was available.
+
+The fixtures in the tree are unchanged, and the tree is green at 600/600.

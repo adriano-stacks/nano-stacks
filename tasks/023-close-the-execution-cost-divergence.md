@@ -60,9 +60,15 @@ had silently dropped every cost patch nano had added, so epoch 4.0 was paying
 Clarity-3 prices for arithmetic, sequences, tuples, hashing and data access,
 and never paid for resolving a name to a function at all.
 
-The row still cannot reach full depth, and the reason is not nano's: the
-fixtures charge `costs-4` runtime at epoch 4.0 while the pinned stacks-core
-charges `costs-5`. That is [[038-recapture-the-fixtures-from-the-pinned-revision]].
+The row still cannot reach full depth against the fixtures in the tree, and the
+reason is not nano's: they charge `costs-4` runtime at epoch 4.0 while the
+pinned stacks-core charges `costs-5`.
+
+That is now measured rather than argued. A capture taken from a Hacknet built
+at the pinned revision replays with four dimensions matching exactly and
+runtime differing by 843 in 231,186 — **0.36%**, the residual named below —
+where the stale fixtures differ by a factor of two. See
+[[038-recapture-the-fixtures-from-the-pinned-revision]].
 
 Two known under-charges remain, both measured:
 
