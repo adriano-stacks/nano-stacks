@@ -38,10 +38,10 @@ about when a block is full and when a tenure must be extended.
 - [x] Reduce the remaining divergence to the words that cause it.
 - [x] Stop charging a copy for operands the interpreter reads in place.
 - [x] Account for `fold`'s function-argument lookup.
-- [ ] Charge a fold per element — one for a user-defined function, 33 for a
-      native word — and un-ignore `charges_folding_a_function_over_a_list`.
-- [ ] Charge `asserts!` the 3 it is short.
-- [ ] Find what remains of the 545 after those.
+- [ ] Charge the per-element and per-application amounts still short: a fold
+      by one an element and 33 more over a native word, `asserts!` by 3,
+      `list` by 2, `append` by 1. Then un-ignore
+      `charges_folding_a_function_over_a_list`.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -118,16 +118,26 @@ the fold lookup put it back to **545**, because that charge was genuinely
 missing and nano over-charges elsewhere. Both are right and the net number is
 not the measure of either.
 
-What is still known and unfixed:
+Sweeping again found the largest one of all: **`map-get?` charged its key as a
+copy**, 33 a lookup, and pox-5 reads maps constantly. Fixing it moved the
+transaction by 660.
 
-- a fold under-charges **one an element** over a user-defined function, and a
-  further **32 an element** over a native word, which nano inlines without
-  paying to apply. Buffers are exact.
-- `asserts!` under-charges by **3**.
+Where it now stands, against a capture from the pinned revision:
 
-Everything fixed is a passing crosscheck; everything known and unfixed is in
-the one `#[ignore]`d case. What accounts for the rest of the 545 is not yet
-identified, and the sweep that found these is the way to find it.
+| | runtime | against 231,186 |
+|---|---|---|
+| stale fixtures | 240,515 | a factor of two out |
+| pinned fixtures, before this work | 232,029 | **843 over** |
+| after | 231,071 | **115 under** |
+
+The sign has flipped, which is the useful part: what is left is under-charging,
+and every under-charge still known is measured and in the one `#[ignore]`d
+case — a fold by one an element and 33 more over a native word, `asserts!` by
+3, `list` by 2, `append` by 1. All of a kind: a per-element or per-application
+charge the interpreter makes and the compiler does not.
+
+Twelve charging bugs are fixed, each a passing crosscheck. The row is still not
+green and the task is not done.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.

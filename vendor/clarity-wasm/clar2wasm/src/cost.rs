@@ -2069,6 +2069,11 @@ mod crosscheck {
                 vec![Value::Bool(true)],
             ),
             (
+                "(define-map m uint uint) \
+                 (define-public (f (a uint)) (ok (map-get? m a)))",
+                vec![Value::UInt(3)],
+            ),
+            (
                 "(define-public (f (a principal)) (ok (get unlocked (stx-account a))))",
                 vec![Value::Principal(
                     clarity::vm::types::PrincipalData::parse(
@@ -2123,6 +2128,10 @@ mod crosscheck {
     ///   none at all over a buffer
     /// - a further 32 an element when the folded function is a native word,
     ///   which nano inlines without paying to apply
+    ///
+    /// `asserts!` is short by 3, `list` by 2 and `append` by 1, all of the same
+    /// kind: a per-application or per-element charge the interpreter makes and
+    /// the compiler does not.
     ///
     /// Ignored because it fails: it is the reproduction, not a guard.
     #[test]

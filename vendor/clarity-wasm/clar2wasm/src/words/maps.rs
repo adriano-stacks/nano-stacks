@@ -133,7 +133,9 @@ impl ComplexWord for MapGet {
 
         // Push the key to the data stack
         generator.set_expr_type(key, key_ty.clone())?;
-        generator.traverse_expr(builder, key)?;
+        // The key is read where it is and serialised, not copied out of
+        // its binding, so a bound name here does not pay to be copied.
+        generator.traverse_expr_as_borrowed_value(builder, key)?;
         // for epoch >= 2.05, we compute the serialization size of the key.
         if let Some(cost_local) = &post205_cost_local {
             generator.serialization_size(builder, &key_ty)?;
