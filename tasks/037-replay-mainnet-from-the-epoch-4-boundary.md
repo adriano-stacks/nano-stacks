@@ -35,6 +35,8 @@ depends on are done.
 - [ ] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
+- [x] Check what mainnet *can* serve without a chainstate — the block envelope
+      against the published reward set — and keep that in CI meanwhile.
 
 ## Acceptance Criteria
 
@@ -78,3 +80,25 @@ Blocks are the one part `/v3/blocks/:id` can serve. So this needs either a
 synced mainnet stacks-core node or a checkpoint published by someone who has
 one, which is the same dependency [[031-establish-a-trust-root-for-the-checkpoint]]
 has to answer anyway.
+
+## What mainnet already proves
+
+Execution needs a chainstate. **The envelope does not** — the reward set is
+published at `/v3/stacker_set/:cycle` and the envelope is self-contained — so
+that half is now checked against the chain that matters rather than against
+Hacknet.
+
+`cargo xtask verify-block <block.bin> <stacker_set.json>` checks a block
+against the set published for its cycle. Twenty consecutive blocks from the
+mainnet tip were **accepted, none rejected**, carrying between fourteen and
+nineteen signatures of twenty-five signers and between seven and eight tenths
+of the weight. nano derives the same signer signature hash mainnet signed,
+recovers the same keys from it, orders them the same way, and counts the same
+weight against the same threshold.
+
+Five of them and the reward set are kept under `fixtures/mainnet/`, so it runs
+offline in CI as a gate, and `verify-block` takes any block a node will serve
+for a wider check.
+
+This is M9 against mainnet. It says nothing about execution, which is the half
+this task is really about and which still waits on a chainstate.
