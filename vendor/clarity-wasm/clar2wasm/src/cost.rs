@@ -2206,6 +2206,32 @@ mod crosscheck {
             "(define-public (f) (begin (- u0 u1) (* u2 u3) (ok true)))",
             "(define-public (f) (ok (some (- u0 u1))))",
             "(define-public (f) (ok (err (- u0 u1))))",
+            // Every word that takes an operand has to survive that operand
+            // aborting, so the sweep is wide rather than pointed: `try!`,
+            // `tuple`, `default-to` and `append` were each charging first, and
+            // `try!` is the one `.pox-5 stake` runs into.
+            "(define-public (f) (ok (not (is-eq (- u0 u1) u0))))",
+            "(define-public (f) (ok (is-eq (- u0 u1) u0)))",
+            "(define-public (f) (ok (< (- u0 u1) u0)))",
+            "(define-public (f) (ok (and true (is-eq (- u0 u1) u0))))",
+            "(define-public (f) (ok (or false (is-eq (- u0 u1) u0))))",
+            "(define-public (f) (ok (to-int (- u0 u1))))",
+            "(define-public (f) (ok (list u1 (- u0 u1))))",
+            "(define-public (f) (ok {a: (- u0 u1)}))",
+            "(define-public (f) (ok (default-to u0 (some (- u0 u1)))))",
+            "(define-public (f) (ok (append (list u1) (- u0 u1))))",
+            "(define-public (f) (ok (concat (list u1) (list (- u0 u1)))))",
+            "(define-map m uint uint) (define-public (f) (ok (map-set m u1 (- u0 u1))))",
+            "(define-data-var v uint u0) (define-public (f) (ok (var-set v (- u0 u1))))",
+            "(define-public (f) (ok (if true (- u0 u1) u0)))",
+            "(define-public (f) (let ((a (- u0 u1))) (ok a)))",
+            "(define-public (f) (ok (print (- u0 u1))))",
+            "(define-public (f) (ok (sha256 (- u0 u1))))",
+            "(define-public (f) (stx-transfer? (- u0 u1) tx-sender tx-sender))",
+            "(define-map m principal {x: uint, y: uint})
+             (define-private (g (p principal) (a {x: uint, y: uint})) (if true (ok true) (err u1)))
+             (define-public (f)
+               (begin (try! (g tx-sender (unwrap! (map-get? m tx-sender) (err u1)))) (ok true)))",
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }

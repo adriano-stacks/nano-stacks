@@ -29,8 +29,6 @@ impl ComplexWord for DefaultTo {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         // There are a `default` value and an `optional` arguments.
         // (default-to 767 (some 1))
         // i64              i64               i32        i64           i64
@@ -52,6 +50,8 @@ impl ComplexWord for DefaultTo {
         generator.set_expr_type(optional, TypeSignature::OptionalType(Box::new(expr_type)))?;
 
         generator.traverse_args(builder, args)?;
+        // Charged after the operands, as `dispatch_args` does; see `ok`.
+        self.charge(generator, builder, 0)?;
 
         // Default value type
         let default_ty = generator

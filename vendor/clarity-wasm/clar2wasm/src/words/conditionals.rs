@@ -1016,14 +1016,16 @@ impl ComplexWord for Try {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         let input = args.get_expr(0)?;
         let input_ty = generator.get_expr_type(input).cloned().ok_or_else(|| {
             GeneratorError::TypeError("The argument in try! should be typed".to_owned())
         })?;
 
         generator.traverse_expr(builder, input)?;
+        // `try!` is a native function: the interpreter evaluates its argument,
+        // then charges through `dispatch_args`. Charging first makes an
+        // argument that aborts pay for a `try!` that never ran. See `ok`.
+        self.charge(generator, builder, 0)?;
 
         // we save the input as a short-returnable and handle the short-return
         let (short_returnable_value, variant) =

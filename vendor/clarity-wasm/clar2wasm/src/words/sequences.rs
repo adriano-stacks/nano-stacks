@@ -466,6 +466,12 @@ impl ComplexWord for Append {
             .i32_const(elem_size)
             .binop(BinaryOp::I32DivU)
             .local_set(number_of_elements);
+        // We use the values on the stack to copy the list to its destination
+        builder.memory_copy(memory, memory);
+
+        // Traverse the element that we're appending to the list.
+        generator.traverse_expr(builder, elem)?;
+        // Charged after both operands, as `dispatch_args` does; see `ok`.
         // The interpreter charges the size of an entry, not how many entries
         // the result has (`vm/functions/sequences.rs`, `special_append`).
         self.charge(
@@ -476,11 +482,6 @@ impl ComplexWord for Append {
                 .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
         )?;
 
-        // We use the values on the stack to copy the list to its destination
-        builder.memory_copy(memory, memory);
-
-        // Traverse the element that we're appending to the list.
-        generator.traverse_expr(builder, elem)?;
 
         // Store the element at the write pointer.
         generator.write_to_memory(builder, write_ptr, 0, &elem_ty)?;

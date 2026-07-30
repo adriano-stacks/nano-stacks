@@ -33,8 +33,6 @@ impl ComplexWord for TupleCons {
 
         check_argument_count(generator, builder, 1, args_len, ArgumentCountCheck::AtLeast)?;
 
-        self.charge(generator, builder, args_len as u32)?;
-
         let ty = generator
             .get_expr_type(expr)
             .ok_or_else(|| GeneratorError::TypeError("tuple expression must be typed".to_string()))?
@@ -84,6 +82,9 @@ impl ComplexWord for TupleCons {
             generator.traverse_expr(builder, value)?;
             locals_map.insert(key, generator.save_to_locals(builder, &value_ty, true));
         }
+
+        // Charged after the operands, as `dispatch_args` does; see `ok`.
+        self.charge(generator, builder, args_len as u32)?;
 
         // Make sure that all the tuples keys were defined
         if !tuple_ty.is_empty() {
