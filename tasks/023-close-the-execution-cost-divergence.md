@@ -1,13 +1,14 @@
 ---
 id: "023"
 title: "Close the execution cost divergence"
-status: pending
+status: completed
 priority: critical
 effort: large
 type: bug
 dependencies: []
 tags: ["mainnet", "vm", "costs"]
 created_at: 2026-07-30
+completed_at: 2026-07-30
 ---
 
 # Close the execution cost divergence
@@ -56,8 +57,8 @@ about when a block is full and when a tenure must be extended.
       had the same fault.
 - [x] Reach `stake-update` on seeded state and narrow the residual to one of
       its callees.
-- [ ] Seed enough of pox-5 for `remove-staker-from-cycles` to succeed, and find
-      the 33 there — then check whether it is also the capture's 66.
+- [x] Seed enough of pox-5 to run the real `stake-update`, and find what
+      remained — `slice?`, charging a copy for a position it reads in place.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -286,61 +287,38 @@ The lesson is that "charged before its operands" is a fault of a *word*, not of
 a shape, so the sweep has to be over words. Four rounds of it have now found
 eight.
 
-### Where `stake-update` stands
+### It was `slice?` — closed
 
-The same seeding technique reaches `stake-update` too, by appending a `seed!`
-helper to a local copy that fills `signer-key-grants`, `signers`, `staker-info`
-and `staker-signer-cycle-memberships` — leaving `stake-update` itself verbatim,
-so what is measured is the real function.
+`stake-update` calls `remove-staker-from-cycles`, which slices a ninety-six
+element list by a **bound** count and folds over the result. `slice?` charged a
+copy of that count out of its binding — 33 for a uint — where the interpreter
+reads it in place.
 
-Prefix probes over its body put the residual on **`remove-staker-from-cycles`**:
-every prefix up to and including the balance assertion matches exactly, and the
-step that adds that call is over by 33.
+That is the same fault as the comparisons, `if`'s condition, `and`, `or`,
+`stx-account` and `map-get?` earlier in this task: nine words now, found the
+same way each time.
 
-It is not the obvious shape. A `fold` whose body traps crosschecks exactly —
-over a uint accumulator, a response accumulator and a tuple accumulator — as do
-a trapping `map` and `filter`. So it is something that function does beyond
-folding, and reaching it cleanly needs more of pox-5's state than is seeded so
-far: the call currently aborts inside it on an arithmetic underflow, which real
-state would not do.
+Two things made it findable. Seeding pox-5's own maps through a helper appended
+to a local copy, so the real `stake-update` ran against real state. And
+noticing that `element-at?` beside it was already exact, which said the charge
+belonged to `slice?` rather than to the fold it feeds — the fold had been the
+obvious suspect and was innocent.
 
-Two caveats worth keeping. That 33 is on an *aborting* path, where the
-capture's 66 is on a successful one, so they may not be the same fault. And 33
-is exactly the copy cost of a uint (`2n + 1`), which is the signature the
-earlier copy bugs had.
+Reducing it took three wrong attributions: the fold's body, then its setup,
+then its result crossing a function boundary. What settled it was varying the
+accumulator type and finding the 33 constant — a copy of the accumulator would
+have scaled with it, so it had to be the uint the count is.
 
-### What the remaining 66 is not
+### The row is green
 
-The eight that remain are all **successful** transactions: seven `.pox-5
-stake-update` and one `.pox-5 stake`.
+```
+replay: state root   fixture block headers       340/340
+replay: receipts     event observer receipts     340/340
+replay: costs        receipt cost dimensions     340/340
+```
 
-Trait arguments fitted those numbers and are not the cause. A probe saying
-otherwise had called the functions with fewer arguments than they declare; with
-the signature matched, traits, `uint` and `principal` arguments all crosscheck
-exactly, as do `contract-of`, `stx-account`, `merge` and `print`.
-
-Nor is it dispatch: a `contract-call?` through a trait crosschecks exactly, at
-one trait argument and at two, as does a static one. Nor read-only calls,
-nested or otherwise, nor the block-height keywords.
-
-Nor is it any single word `stake-update` uses: `map-set` over a scalar and a
-tuple, `map-insert`, `map-delete`, `var-set`, `var-get`, `get`, nested `get`,
-`default-to`, tuple construction, `let`, `begin`, `match`, `is-some`,
-`to-uint`, `unwrap!` — every one exact.
-
-Nor the pox-5 iteration shape: a `fold` over `(unwrap-panic (slice? (list u0 …
-u95) u0 n))` with a response-tuple accumulator — what `remove-staker-from-cycles`
-and `add-staker-to-signer-cycles` do — is exact, as are map reads and writes
-whose declared types are far larger than what they hold.
-
-Nano adds nothing outside the VM either: the transaction's cost tracker starts
-at zero, so what remains is inside the compiler.
-
-What is left is the state the call runs against. The contract is no longer the
-unknown — it crosschecks exactly on a fresh store — so what differs must be the
-maps `stake-update` reads and writes on a chain that has been running, and the
-sizes of what they hold. Seeding that state, rather than the contract, is the
-next step.
+Every transaction in the capture, all five dimensions, against a node built at
+the pinned revision.
 
 ## Hacknet
 
