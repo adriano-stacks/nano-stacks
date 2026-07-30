@@ -341,7 +341,8 @@ impl Mempool {
         for prior in &replaced {
             self.remove(*prior);
         }
-        self.origins.insert((entry.origin, entry.origin_nonce), txid);
+        self.origins
+            .insert((entry.origin, entry.origin_nonce), txid);
         if let Some(sponsor) = entry.sponsor {
             self.sponsors.insert(sponsor, txid);
         }
@@ -537,7 +538,11 @@ impl Mempool {
             .origins
             .get(&(entry.origin, entry.origin_nonce))
             .into_iter()
-            .chain(entry.sponsor.and_then(|sponsor| self.sponsors.get(&sponsor)))
+            .chain(
+                entry
+                    .sponsor
+                    .and_then(|sponsor| self.sponsors.get(&sponsor)),
+            )
             .copied()
             .collect();
         replaced.sort_unstable();
