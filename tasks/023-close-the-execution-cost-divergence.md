@@ -322,32 +322,28 @@ the pinned revision.
 
 ## Hacknet
 
-**Validated.** With all seventeen charging fixes in, `harness.sh verify`
-against a fresh network:
+**Validated.** A fresh network, nano replacing a stock participant, with every
+charging fix of the day in — the sequence-application charges, the
+aborted-expression ordering, `try!`/`tuple`/`default-to`/`append`, the contract
+constants, `print`, and `slice?`:
 
 ```
-observed 47 canonical blocks across cycles 15..=16
-every one of the 47 blocks carries nano's signature
-nano mined 16 of the 47 canonical blocks
-29 transfer, 4 deploy, 59 call, 8 tenure change, 8 coinbase transactions,
+observed 20 canonical blocks across cycles 15..=16
+every one of the 20 blocks carries nano's signature
+nano mined 5 of the 20 canonical blocks, at heights [344 … 348]
+13 transfer, 3 deploy, 63 call, 4 tenure change, 4 coinbase transactions,
   each with one the network reports as success
-9 sortitions across 3 distinct miners
+5 sortitions across 2 distinct miners
 reward cycle 16 pays a waterfall set in which nano holds weight 10 of 30
 ```
 
-Hacknet runs three signers of equal weight against a seven-tenths threshold, so
-no block is accepted without all three: a network that keeps producing with
-nano signing and mining is proof the cost changes did not move anything the
-network disagrees with.
+Three signers of equal weight against a seven-tenths threshold means no block
+is accepted without all three, so a chain that keeps producing with nano
+signing every block — and mining a quarter of them — is the evidence that these
+changes moved nothing the network disagrees with. The deploy transactions
+matter here in particular: a contract nano executes the deployment of is
+exactly what the constants fix changed.
 
-It took four attempts. Three earlier networks deadlocked on their own stock
-signers — `Last accepted block has timed out`, `Cannot validate block, no
-global signer state` — which was confirmed as not nano's by restoring the stock
-participant and watching the tip stay frozen anyway.
-
-The offline evidence stands on its own — every cost change here is crosschecked
-against the interpreter, and the 340-block replay matches state roots and
-receipts.
-
-The sequence-application fixes landed after that run and have not themselves
-been on a live chain.
+It took two boots. The first wedged the stock nodes on `Missing canonical
+anchor block` at the first reward-cycle boundary, with nano not yet introduced
+— see [[044-name-a-reward-cycle-nobody-stacked-for]].
