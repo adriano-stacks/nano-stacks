@@ -404,6 +404,56 @@ mine() {
 }
 
 # Put the stock participant back and stop nano.
+# Record the receipts a capture needs, which Hacknet otherwise never writes.
+#
+# The node's only observer is its signer, and those keys carry no `new_block`,
+# so a `cargo xtask capture-fixtures` run has no receipts to read. Adding an
+# observer means re-rendering the node's config, which is a container restart —
+# the chainstate survives it, the chain does not restart.
+observe() {
+    need_source
+    local sink=$RUN/events port=${NANO_EVENT_PORT:-3800} name=nano-event-sink network
+    network=$( (docker network inspect "$PROJECT"_default stacks --format \
+        '{{.Name}}' 2>/dev/null || true) | head -1)
+    [ -n "$network" ] || die "the Hacknet network is not up"
+
+    # The sink runs on the Hacknet network rather than on the host: a node
+    # cannot reach a host port through the bridge gateway here, and an
+    # observer it cannot reach it retries forever.
+    mkdir -p "$sink"
+    if [ -n "$(docker ps -q --filter "name=^${name}$")" ]; then
+        log "the event sink is already recording into $sink"
+    else
+        log "recording new_block events into $sink"
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        docker run -d --name "$name" --network "$network" \
+            -v "$ROOT/hacknet/event-sink.py:/sink.py:ro" -v "$sink:/events" \
+            "${NANO_SINK_IMAGE:-python:3-slim}" python3 /sink.py /events "$port" >/dev/null
+        sleep 2
+    fi
+
+    local template=$SRC/docker/stacks/stacks-miner_signer.toml
+    if grep -q "nano event sink" "$template"; then
+        log "the node template already posts to the sink"
+    else
+        log "adding the sink to the node template and restarting the miners"
+        cat >> "$template" <<EOF
+
+# nano event sink: the receipts a fixture capture reads.
+[[events_observer]]
+endpoint = "$name:$port"
+events_keys = ["*"]
+timeout_ms = 10_000
+EOF
+        compose restart stacks-miner-1 stacks-miner-2
+    fi
+    printf 'events land in %s\n' "$sink" >&2
+}
+
+stop_observing() {
+    docker rm -f nano-event-sink >/dev/null 2>&1 || true
+}
+
 restore() {
     need_source
     local index
@@ -451,6 +501,8 @@ config) shift && nano_config "${1:-$(cat "$RUN/replaced-participant" 2>/dev/null
 replace) shift && replace "$@" ;;
 verify) verify ;;
 restore) restore ;;
+observe) observe ;;
+stop-observing) stop_observing ;;
 traffic) shift && traffic "$@" ;;
 *)
     cat >&2 <<'USAGE'
@@ -468,6 +520,7 @@ usage: harness.sh <command>
   traffic [seconds]  deploy a contract and call it for a while
   verify             assert the network keeps working with nano in place
   status             heights, reward cycle, and nano state
+  observe            record new_block receipts a fixture capture needs
   restore            put the stock participant back
   down               stop the network
   wipe               delete the chainstate

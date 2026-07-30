@@ -44,6 +44,9 @@ this fixture tree is not.
 
 ## Tasks
 
+- [x] Record the receipts a capture reads. Hacknet gives its nodes one event
+      observer, the signer, whose keys carry no `new_block`, so nothing wrote
+      them — `harness.sh observe` adds a sink and restarts the miners onto it.
 - [ ] Grow a Hacknet on the pinned revision past a checkpoint plus the replay
       window.
 - [ ] Recapture with `cargo xtask capture-fixtures`, recording the revision in
@@ -74,3 +77,20 @@ Checked against the running Hacknet: lockfile `efc34a07a225…`, node
 The capture itself still needs a Hacknet grown past a checkpoint plus the
 replay window. The one that is up was booted from genesis today and is still
 short of it.
+
+## The missing observer
+
+The reason a recapture was not simply a command: Hacknet configures exactly one
+event observer per node, the signer, with
+`events_keys = ["stackerdb", "block_proposal", "burn_blocks"]`. `new_block` is
+not among them, so the per-transaction receipts the capture reads were never
+written by anything.
+
+`harness.sh observe` adds a second observer with `events_keys = ["*"]`, pointed
+at a sink container on the Hacknet network, and restarts the miners onto it —
+a restart, not a wipe, so the chain carries on. The sink writes
+`new_block/<height>-<hash>.json`, the name the capture looks for.
+
+It has to run inside the network: a node here cannot reach a host port through
+the bridge gateway, and an observer it cannot reach it retries forever, which
+is its own way of stalling a run.
