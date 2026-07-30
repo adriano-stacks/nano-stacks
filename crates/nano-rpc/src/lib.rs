@@ -27,7 +27,7 @@ use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
-use nano_node::NodeView;
+use nano_sync::NodeView;
 use nano_primitives::Network;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -837,7 +837,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use nano_node::{Node, NodeView};
+    use nano_sync::{Node, NodeView};
     use nano_primitives::{
         BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
     };

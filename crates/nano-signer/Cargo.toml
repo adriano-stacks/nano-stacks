@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 atomicwrites = "0.4.4"
-clap = { version = "4.6.4", features = ["derive"] }
 fs2 = "0.4.3"
 hex = "0.4.3"
 nano-address = { path = "../nano-address" }
@@ -26,7 +25,3 @@ tempfile = "3.27.0"
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "stacks-signer"
-path = "src/main.rs"

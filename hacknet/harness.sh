@@ -171,12 +171,15 @@ PY
 }
 
 nano_state() {
-    local pid_file=$RUN/nano-signer.pid
-    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-        echo "signer for participant $(cat "$RUN/replaced-participant") running as pid $(cat "$pid_file")"
-    else
-        echo "not running"
-    fi
+    nano_running || { echo "not running"; return 0; }
+    local roles="signing"
+    grep -q '^\[miner\]' "$RUN/nano.toml" && roles="signing and mining"
+    printf 'node %s for participant %s as pid %s\n' \
+        "$roles" "$(cat "$RUN/replaced-participant")" "$(cat "$RUN/nano.pid")"
+}
+
+nano_running() {
+    [ -f "$RUN/nano.pid" ] && kill -0 "$(cat "$RUN/nano.pid")" 2>/dev/null
 }
 
 # Wait for the Bitcoin chain to reach a height while Stacks keeps advancing.
@@ -216,6 +219,85 @@ checkpoint() {
     compose_value BITCOIN_RPC_PASS > "$RUN/bitcoin-rpc.pass"
 }
 
+# Write the one configuration file the nano node starts from.
+#
+# Every value it needs is already known here — the chain the peers report, the
+# state the checkpoint exported, the keys the run generated — so the node takes
+# a file rather than a command line, and a restart takes the same file.
+nano_config() {
+    local index=${1:?participant index} peer chain_id key
+    peer=$(peer_url "$(stock_index "$index")")
+    chain_id=$(curl -sf "$peer/v2/info" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["network_id"])')
+    key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    {
+        cat <<EOF
+[node]
+working_dir = "$RUN/nano"
+network = "testnet"
+chain_id = $chain_id
+peers = ["$peer/"]
+${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
+event_observers = [${NANO_EVENT_OBSERVERS:+\"${NANO_EVENT_OBSERVERS//,/\", \"}\"}]
+
+[burnchain]
+rpc_url = "$BITCOIN_RPC"
+rpc_user = "$(compose_value BITCOIN_RPC_USER)"
+rpc_password = "$(compose_value BITCOIN_RPC_PASS)"
+magic = "${NANO_BITCOIN_MAGIC:-T3}"
+
+[checkpoint]
+marf = "$RUN/checkpoint/marf.sqlite"
+source_state_id = "$(checkpoint_value source_state_id)"
+state_root = "$(checkpoint_value state_index_root)"
+anchor_block = "$RUN/checkpoint/anchor-block.bin"
+anchor_bitcoin_height = $(checkpoint_value anchor_bitcoin_height)
+tenure_accounting = "$RUN/checkpoint/native-effects.json"
+
+[signer]
+private_key = "$key"
+EOF
+        # The miner half only exists once its Bitcoin identity does.
+        if [ -s "$RUN/leader-key.txt" ]; then
+            cat <<EOF
+
+[miner]
+bitcoin_wallet = "${NANO_BITCOIN_WALLET:-nano-miner}"
+key_txid = "$(grep -oE '[0-9a-f]{64}' "$RUN/leader-key.txt" | head -1)"
+block_signing_private_key = "$(cat "$RUN/miner-signing.key")"
+vrf_private_key = "$(cat "$RUN/miner-vrf.key")"
+commitment_sats = ${NANO_COMMITMENT_SATS:-20000}
+EOF
+        fi
+    } > "$RUN/nano.toml"
+}
+
+# Start the node from the configuration, replacing whatever is running.
+nano_start() {
+    local index=${1:?participant index}
+    nano_stop
+    nano_config "$index"
+    "$ROOT/target/debug/stacks-node" start --config "$RUN/nano.toml" \
+        >> "$RUN/nano.log" 2>&1 &
+    echo $! > "$RUN/nano.pid"
+    printf 'nano runs as pid %s, logging to %s\n' "$(cat "$RUN/nano.pid")" "$RUN/nano.log" >&2
+}
+
+# Stop the node the way an operator would, and wait for it to go.
+nano_stop() {
+    nano_running || return 0
+    local pid
+    pid=$(cat "$RUN/nano.pid")
+    log "stopping the nano node (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 30); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$RUN/nano.pid"
+}
+
 # Replace one stock participant: stop its node and its signer, then sign with
 # the key that participant staked.
 replace() {
@@ -224,35 +306,14 @@ replace() {
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
     [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
 
-    local key
-    key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
     log "stopping stock participant $index: stacks-miner-$index and stacks-signer-$index"
     compose stop "stacks-miner-$index" "stacks-signer-$index"
 
     # nano reads the chain from a participant it did not replace: the one it
     # took over no longer serves anything.
-    local follow
-    follow=$(peer_url "$(stock_index "$index")")
-    log "starting the nano signer for participant $index against $follow"
+    log "starting the nano node for participant $index against $(peer_url "$(stock_index "$index")")"
     echo "$index" > "$RUN/replaced-participant"
-    "$ROOT/target/debug/stacks-signer" run \
-        --peer "$follow/" \
-        --bitcoin-rpc "$BITCOIN_RPC" \
-        --bitcoin-rpc-user "$(compose_value BITCOIN_RPC_USER)" \
-        --bitcoin-rpc-password-file "$RUN/bitcoin-rpc.pass" \
-        --miner-contract "ST000000000000000000002AMW42H/miners" \
-        --private-key "${key%01}" \
-        --state-file "$RUN/signer.json" \
-        --checkpoint "$RUN/checkpoint/marf.sqlite" \
-        --tenure-accounting "$RUN/checkpoint/native-effects.json" \
-        --source-state-id "$(checkpoint_value source_state_id)" \
-        --state-root "$(checkpoint_value state_index_root)" \
-        --anchor-block "$RUN/checkpoint/anchor-block.bin" \
-        --anchor-bitcoin-height "$(checkpoint_value anchor_bitcoin_height)" \
-        >> "$RUN/nano-signer.log" 2>&1 &
-    echo $! > "$RUN/nano-signer.pid"
-    printf 'nano signs for participant %s as pid %s, logging to %s\n' \
-        "$index" "$(cat "$RUN/nano-signer.pid")" "$RUN/nano-signer.log" >&2
+    nano_start "$index"
 }
 
 # Assert the network keeps doing every kind of work while nano signs for it.
@@ -326,36 +387,20 @@ register() {
         tee "$RUN/leader-key.txt"
 }
 
-# Commit on every Bitcoin block and mine every tenure nano wins.
+# Turn the mining role on, which is a restart with a larger configuration.
+#
+# The restart is the point as much as the mining is: the node comes back to the
+# state it left on disk instead of importing the checkpoint again.
 mine() {
     need_source
+    local index
+    index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
+    [ -n "$index" ] || die "run 'harness.sh replace' first"
     [ -s "$RUN/leader-key.txt" ] || die "run 'harness.sh register' first"
-    local key_txid
-    key_txid=$(grep -oE '[0-9a-f]{64}' "$RUN/leader-key.txt" | head -1)
-    [ -n "$key_txid" ] || die "could not read the leader-key transaction from $RUN/leader-key.txt"
-    log "committing and mining as nano, logging to $RUN/nano-miner.log"
-    "$ROOT/target/debug/stacks-miner-run" \
-        --peer "$(peer_url 1)/" \
-        --bitcoin-rpc "$BITCOIN_RPC" \
-        --bitcoin-rpc-user "$(compose_value BITCOIN_RPC_USER)" \
-        --bitcoin-rpc-password-file "$RUN/bitcoin-rpc.pass" \
-        --bitcoin-wallet "${NANO_BITCOIN_WALLET:-nano-miner}" \
-        --key-txid "$key_txid" \
-        --commitment-sats "${NANO_COMMITMENT_SATS:-20000}" \
-        --commitment-chain-file "$RUN/commit-chain.txt" \
-        --miner-contract "ST000000000000000000002AMW42H/miners" \
-        --block-signing-private-key-file "$RUN/miner-signing.key" \
-        --vrf-private-key-file "$RUN/miner-vrf.key" \
-        --checkpoint "$RUN/checkpoint/marf.sqlite" \
-        --tenure-accounting "$RUN/checkpoint/native-effects.json" \
-        --source-state-id "$(checkpoint_value source_state_id)" \
-        --state-root "$(checkpoint_value state_index_root)" \
-        --anchor-block "$RUN/checkpoint/anchor-block.bin" \
-        --anchor-bitcoin-height "$(checkpoint_value anchor_bitcoin_height)" \
-        --sortition-hash-cache "$RUN/sortition-hash.json" \
-        >> "$RUN/nano-miner.log" 2>&1 &
-    echo $! > "$RUN/nano-miner.pid"
-    printf 'nano mines as pid %s\n' "$(cat "$RUN/nano-miner.pid")" >&2
+    grep -qE '[0-9a-f]{64}' "$RUN/leader-key.txt" ||
+        die "could not read the leader-key transaction from $RUN/leader-key.txt"
+    log "restarting nano with the mining role on"
+    nano_start "$index"
 }
 
 # Put the stock participant back and stop nano.
@@ -364,13 +409,7 @@ restore() {
     local index
     index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
     [ -n "$index" ] || die "no participant is replaced"
-    for role in signer miner; do
-        if [ -f "$RUN/nano-$role.pid" ]; then
-            pkill -P "$(cat "$RUN/nano-$role.pid")" 2>/dev/null || true
-            kill "$(cat "$RUN/nano-$role.pid")" 2>/dev/null || true
-            rm -f "$RUN/nano-$role.pid"
-        fi
-    done
+    nano_stop
     log "restoring stock participant $index"
     compose start "stacks-miner-$index" "stacks-signer-$index"
     rm -f "$RUN/replaced-participant"
@@ -407,6 +446,8 @@ checkpoint) checkpoint ;;
 fund) shift && fund "$@" ;;
 register) register ;;
 mine) mine ;;
+config) shift && nano_config "${1:-$(cat "$RUN/replaced-participant" 2>/dev/null)}" &&
+    cat "$RUN/nano.toml" ;;
 replace) shift && replace "$@" ;;
 verify) verify ;;
 restore) restore ;;
@@ -422,7 +463,8 @@ usage: harness.sh <command>
   replace <1|2|3>    stop one stock participant and run nano in its place
   fund [btc]         give nano a funded Bitcoin wallet and miner keys
   register           register nano's leader key on Bitcoin
-  mine               commit on every Bitcoin block and mine every tenure won
+  mine               restart nano with the mining role on
+  config             print the configuration nano would start from
   traffic [seconds]  deploy a contract and call it for a while
   verify             assert the network keeps working with nano in place
   status             heights, reward cycle, and nano state

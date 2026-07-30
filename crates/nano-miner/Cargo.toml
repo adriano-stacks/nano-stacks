@@ -15,7 +15,6 @@ nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-mempool = { path = "../nano-mempool" }
-nano-node = { path = "../nano-node" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
@@ -28,10 +27,8 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 [lints]
 workspace = true
 
-[[bin]]
-name = "stacks-miner"
-path = "src/main.rs"
-
+# The Bitcoin one-shots that give a miner its identity, which a node needs done
+# before it can start: registering a leader key, and paying a commitment.
 [[bin]]
 name = "stacks-register-leader-key"
 path = "src/bin/register_leader_key.rs"
@@ -39,11 +36,3 @@ path = "src/bin/register_leader_key.rs"
 [[bin]]
 name = "stacks-commit-block"
 path = "src/bin/commit_block.rs"
-
-[[bin]]
-name = "stacks-miner-run"
-path = "src/bin/run_miner.rs"
-
-[[bin]]
-name = "stacks-mine-tenure"
-path = "src/bin/mine_tenure.rs"

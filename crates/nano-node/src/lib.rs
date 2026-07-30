@@ -1,3 +1,8 @@
+pub mod config;
+pub mod miner;
+pub mod runtime;
+pub mod signer;
+
 use std::{fmt, path::Path};
 
 use nano_bitcoin::BitcoinSource;
@@ -7,26 +12,7 @@ use nano_chainstate::{
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
 use nano_primitives::{Network, TrieHash};
-use nano_sync::{
-    FollowedTenure, NodeInfo, PoxInfo, SyncClient, SyncError, TenureFollower, TenureInfo,
-};
-
-/// A node's validated view of a remote Nakamoto tenure stream.
-#[derive(Clone, Debug)]
-pub struct Node {
-    client: SyncClient,
-    follower: TenureFollower,
-    peer_info: Option<NodeInfo>,
-    pox_info: Option<PoxInfo>,
-}
-
-/// A consistent read-only snapshot that can be served by the public RPC.
-#[derive(Clone, Debug)]
-pub struct NodeView {
-    pub node_info: NodeInfo,
-    pub pox_info: PoxInfo,
-    pub tenures: Vec<FollowedTenure>,
-}
+use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError};
 
 /// Executes a validated tenure stream from an imported checkpoint state.
 #[derive(Debug)]
@@ -276,7 +262,7 @@ where
         checkpoint: Checkpoint<impl AsRef<Path>>,
         anchor: NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
-        mut bitcoin: S,
+        bitcoin: S,
     ) -> Result<Self, CheckpointExecutionError> {
         let Checkpoint {
             network,
@@ -289,13 +275,24 @@ where
         if let Some(accounting) = accounting {
             *chainstate.accounting_mut() = accounting;
         }
+        Self::from_chainstate(chainstate, anchor, bitcoin_context, bitcoin)
+    }
+
+    /// Apply the checkpoint's first known descendant to an already-open state.
+    pub fn from_chainstate(
+        mut chainstate: ChainState,
+        anchor: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        mut bitcoin: S,
+    ) -> Result<Self, CheckpointExecutionError> {
         let operations = bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        let parent = chainstate.tip();
         chainstate.append_nakamoto_block_with_bitcoin_operations(
             bitcoin_context,
             &operations.operations,
-            Some(source),
+            parent,
             &anchor,
         )?;
         Ok(Self {
@@ -303,6 +300,18 @@ where
             tip: anchor,
             bitcoin,
         })
+    }
+
+    /// Continue from a chainstate that already holds the blocks up to `tip`.
+    ///
+    /// A durable chainstate outlives the process, so a restart adopts the block
+    /// its state was sealed at instead of importing a checkpoint again.
+    pub const fn resume(chainstate: ChainState, tip: NakamotoBlock, bitcoin: S) -> Self {
+        Self {
+            chainstate,
+            tip,
+            bitcoin,
+        }
     }
 
     /// Apply the blocks in a followed tenure that extend the current execution tip.
@@ -476,40 +485,21 @@ where
     }
 }
 
-impl Node {
-    /// Construct a node that follows the supplied HTTP peer.
-    #[must_use]
-    pub fn new(client: SyncClient) -> Self {
-        Self {
-            follower: TenureFollower::new(client.clone()),
-            client,
-            peer_info: None,
-            pox_info: None,
-        }
+/// The public RPC answers from the state this node executed, and from nothing
+/// else: an account or a read-only call is read at the tip it sealed.
+impl<S: Send> nano_rpc::ChainAccess for CheckpointExecutor<S> {
+    fn account(
+        &mut self,
+        principal: &clarity::vm::types::PrincipalData,
+    ) -> Result<nano_rpc::AccountEntry, nano_rpc::ChainAccessError> {
+        nano_rpc::ChainAccess::account(&mut self.chainstate, principal)
     }
 
-    /// Return the latest validated peer tenure.
-    #[must_use]
-    pub const fn latest_tenure(&self) -> Option<&TenureInfo> {
-        self.follower.latest()
-    }
-
-    /// Fetch and validate the peer's next tenure update.
-    pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
-        let followed = self.follower.poll().await?;
-        self.peer_info = Some(self.client.node_info().await?);
-        self.pox_info = Some(self.client.pox_info().await?);
-        Ok(followed)
-    }
-
-    /// Return the latest complete local view after at least one successful poll.
-    #[must_use]
-    pub fn view(&self) -> Option<NodeView> {
-        Some(NodeView {
-            node_info: self.peer_info.clone()?,
-            pox_info: self.pox_info.clone()?,
-            tenures: self.follower.history().to_vec(),
-        })
+    fn call_read_only(
+        &mut self,
+        call: &nano_rpc::ReadOnlyCall,
+    ) -> Result<clarity::vm::Value, nano_rpc::ChainAccessError> {
+        nano_rpc::ChainAccess::call_read_only(&mut self.chainstate, call)
     }
 }
 
@@ -561,22 +551,5 @@ where
     #[must_use]
     pub fn view(&self) -> Option<NodeView> {
         self.executed_view.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use nano_sync::SyncClient;
-    use reqwest::Url;
-
-    use super::Node;
-
-    #[test]
-    fn node_starts_without_a_followed_tenure() {
-        let client = SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
-            .expect("create sync client");
-        let node = Node::new(client);
-
-        assert!(node.latest_tenure().is_none());
     }
 }
