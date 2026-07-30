@@ -2132,6 +2132,32 @@ mod crosscheck {
         }
     }
 
+    /// A constant counts towards the contract's size, which is what a
+    /// `contract-call?` pays `LoadContract` for.
+    ///
+    /// `save_constant` inserted the value and left `data_size` alone, so every
+    /// constant a contract defines was free to load — `.pox-5` defines around
+    /// sixty and was under-charged by 1,032 on every call into it. The deficit
+    /// is exactly the value's size: a bool 1, a uint 16, a response 17.
+    #[test]
+    fn charges_a_contract_for_the_constants_it_holds() {
+        let kinds: [fn(usize) -> String; 6] = [
+            |k| format!("(define-constant C{k} (err u{k}))\n"),
+            |k| format!("(define-constant C{k} (ok u{k}))\n"),
+            |k| format!("(define-constant C{k} u{k})\n"),
+            |k| format!("(define-constant C{k} true)\n"),
+            |k| format!("(define-constant C{k} (some u{k}))\n"),
+            |k| format!("(define-constant C{k} {{a: u{k}}})\n"),
+        ];
+        for make in kinds {
+            let body: String = (0..40).map(make).collect();
+            let callee = format!("{body}(define-read-only (h) u1)");
+            let caller = "(define-public (f) (ok (contract-call? \
+                'S1G2081040G2081040G2081040G208105NK8PE5.callee h)))";
+            crosscheck_cost_multi_contract(&[("callee", &callee), ("caller", caller)], "f", &[]);
+        }
+    }
+
     /// `print` costs what the value costs, not what its type is to write down.
     ///
     /// `special_print` charges for `input.size()`. nano charged for the length

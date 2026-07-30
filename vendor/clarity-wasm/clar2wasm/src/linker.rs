@@ -6813,11 +6813,12 @@ fn link_save_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     read_from_wasm_indirect(memory, &mut caller, value_ty, value_offset, epoch)?;
 
                 // Insert constant name and expression value into a persistent data structure.
-                caller
-                    .data_mut()
-                    .contract_context_mut()?
-                    .variables
-                    .insert(cname, value);
+                // The value counts towards the contract's data size, which is
+                // what a later `contract-call?` pays `LoadContract` for.
+                let value_size = value.size()?;
+                let context = caller.data_mut().contract_context_mut()?;
+                context.variables.insert(cname, value);
+                context.data_size = context.data_size.saturating_add(u64::from(value_size));
 
                 Ok(())
             },
