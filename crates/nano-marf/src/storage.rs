@@ -42,7 +42,7 @@ const BACK_POINTER: u8 = 0x80;
 
 /// One sealed MARF state, without the nodes it owns.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockRecord {
+pub struct BlockRecord {
     pub id: u32,
     pub hash: MarfBlockId,
     pub parent: Option<u32>,
@@ -96,7 +96,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
 
 /// The trie's backing database.
 #[derive(Debug)]
-pub(crate) struct TrieStorage {
+pub struct TrieStorage {
     connection: Connection,
     nodes: RefCell<Cache<(u32, u32), Arc<TrieNode>>>,
     blocks: RefCell<Cache<MarfBlockId, BlockRecord>>,

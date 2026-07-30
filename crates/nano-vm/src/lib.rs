@@ -22,7 +22,8 @@ use clarity::vm::representations::SymbolicExpression;
 use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value, eval_all};
 use nano_marf::{
-    CheckpointError, MarfError, MarfValue, StateRoot, TriePointer, VersionedMarf, import_checkpoint,
+    CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, VersionedMarf,
+    import_checkpoint, import_checkpoint_into,
 };
 use nano_primitives::{Network, TrieHash};
 use rusqlite::{OptionalExtension, params};
@@ -442,11 +443,48 @@ impl Vm {
         source: [u8; 32],
         expected_root: TrieHash,
     ) -> Result<Self, MarfStoreError> {
-        Ok(Self {
-            store: MarfStore::from_checkpoint(network, path, source, expected_root)?,
+        Ok(Self::over(MarfStore::from_checkpoint(
+            network,
+            path,
+            source,
+            expected_root,
+        )?))
+    }
+
+    /// Open, creating if absent, the durable chainstate held in `directory`.
+    pub fn open(network: Network, directory: impl AsRef<Path>) -> Result<Self, MarfStoreError> {
+        Ok(Self::over(MarfStore::open(network, directory)?))
+    }
+
+    /// Open a durable chainstate, importing `checkpoint` the first time only.
+    pub fn open_from_checkpoint(
+        network: Network,
+        directory: impl AsRef<Path>,
+        checkpoint: impl AsRef<Path>,
+        source: [u8; 32],
+        expected_root: TrieHash,
+    ) -> Result<Self, MarfStoreError> {
+        Ok(Self::over(MarfStore::open_from_checkpoint(
+            network,
+            directory,
+            checkpoint,
+            source,
+            expected_root,
+        )?))
+    }
+
+    fn over(store: MarfStore) -> Self {
+        Self {
+            store,
             context: BitcoinContext::default(),
             modules: ModuleCache::default(),
-        })
+        }
+    }
+
+    /// The deepest state on disk, which is where a restart resumes.
+    #[must_use]
+    pub fn tip(&self) -> Option<[u8; 32]> {
+        self.store.tip()
     }
 
     /// The chain this VM executes against.
@@ -820,7 +858,7 @@ impl Vm {
 
     /// Access a stored Clarity database value for a sealed block.
     #[must_use]
-    pub fn get(&self, block: [u8; 32], key: &str) -> Option<&str> {
+    pub fn get(&self, block: [u8; 32], key: &str) -> Option<String> {
         self.store.get(block, key)
     }
 }
@@ -833,38 +871,36 @@ pub const fn execute_stub() -> ExecutionResult {
 }
 
 /// A versioned Clarity key/value store whose state roots are committed by the MARF.
+///
+/// Values live in the MARF and its side store, so nothing a sealed block wrote
+/// is held in memory: a read resolves the key through the trie and then the
+/// value by its hash. Only the block being executed keeps writes in memory, and
+/// only its metadata, which the MARF does not commit.
 #[derive(Debug)]
 pub struct MarfStore {
     network: Network,
     marf: VersionedMarf,
     side_store: rusqlite::Connection,
-    states: BTreeMap<[u8; 32], StoreState>,
-    parents: BTreeMap<[u8; 32], Option<[u8; 32]>>,
-    heights: BTreeMap<[u8; 32], u32>,
+    metadata: BTreeMap<(String, String), String>,
+    checkpoint_heights: BTreeMap<[u8; 32], u32>,
     read_block: Option<[u8; 32]>,
     active: Option<ActiveStore>,
     transaction: Option<StoreTransaction>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ActiveStore {
     block: [u8; 32],
     parent: Option<[u8; 32]>,
     height: u32,
-    state: StoreState,
 }
 
 #[derive(Clone, Debug)]
 struct StoreTransaction {
-    marf: VersionedMarf,
+    marf: MarfSnapshot,
+    metadata: BTreeMap<(String, String), String>,
     read_block: Option<[u8; 32]>,
     active: Option<ActiveStore>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct StoreState {
-    values: BTreeMap<String, String>,
-    metadata: BTreeMap<(String, String), String>,
 }
 
 #[derive(Debug)]
@@ -872,6 +908,7 @@ pub enum MarfStoreError {
     Marf(MarfError),
     Checkpoint(CheckpointError),
     Sql(rusqlite::Error),
+    Io(std::io::Error),
     NoActiveState,
     TransactionInProgress,
     NoTransaction,
@@ -884,6 +921,7 @@ impl std::fmt::Display for MarfStoreError {
             Self::Marf(error) => write!(formatter, "MARF error: {error}"),
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
+            Self::Io(error) => write!(formatter, "chainstate I/O error: {error}"),
             Self::NoActiveState => formatter.write_str("no active VM state"),
             Self::TransactionInProgress => formatter.write_str("VM transaction is already active"),
             Self::NoTransaction => formatter.write_str("no active VM transaction"),
@@ -917,17 +955,24 @@ impl From<rusqlite::Error> for MarfStoreError {
 impl MarfStore {
     /// Create an empty versioned store for the supplied network.
     pub fn new(network: Network) -> Result<Self, MarfStoreError> {
-        Ok(Self {
+        Ok(Self::assemble(
             network,
-            marf: VersionedMarf::default(),
-            side_store: create_side_store()?,
-            states: BTreeMap::new(),
-            parents: BTreeMap::new(),
-            heights: BTreeMap::new(),
-            read_block: None,
-            active: None,
-            transaction: None,
-        })
+            VersionedMarf::default(),
+            create_side_store()?,
+            None,
+        ))
+    }
+
+    /// Open, creating if absent, the durable store held in `directory`.
+    ///
+    /// A store that already holds state resumes from the tip it left there.
+    pub fn open(network: Network, directory: impl AsRef<Path>) -> Result<Self, MarfStoreError> {
+        let directory = directory.as_ref();
+        std::fs::create_dir_all(directory).map_err(MarfStoreError::Io)?;
+        let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
+        let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
+        let tip = marf.tip();
+        Ok(Self::assemble(network, marf, side_store, tip))
     }
 
     /// Load a checkpointed Clarity MARF and its corresponding `SQLite` side tables.
@@ -942,21 +987,57 @@ impl MarfStore {
     ) -> Result<Self, MarfStoreError> {
         let path = path.as_ref();
         let marf = import_checkpoint(path, source, expected_root)?;
-        let side_store = copy_side_store(path)?;
-        let mut states = BTreeMap::new();
-        states.insert(source, StoreState::default());
+        let side_store = create_side_store()?;
+        import_side_store(&side_store, path)?;
+        Ok(Self::assemble(network, marf, side_store, Some(source)))
+    }
 
-        Ok(Self {
+    /// Open a durable store in `directory`, importing `checkpoint` the first time.
+    ///
+    /// A directory that already holds state is resumed from its tip, so a
+    /// restart replays only the blocks that came after it.
+    pub fn open_from_checkpoint(
+        network: Network,
+        directory: impl AsRef<Path>,
+        checkpoint: impl AsRef<Path>,
+        source: [u8; 32],
+        expected_root: TrieHash,
+    ) -> Result<Self, MarfStoreError> {
+        let directory = directory.as_ref();
+        std::fs::create_dir_all(directory).map_err(MarfStoreError::Io)?;
+        let marf_path = directory.join(MARF_FILE);
+        let clarity_path = directory.join(CLARITY_FILE);
+        if VersionedMarf::open(&marf_path)?.tip().is_some() {
+            return Self::open(network, directory);
+        }
+        let marf = import_checkpoint_into(&marf_path, checkpoint.as_ref(), source, expected_root)?;
+        let side_store = open_side_store(&clarity_path)?;
+        import_side_store(&side_store, checkpoint.as_ref())?;
+        Ok(Self::assemble(network, marf, side_store, Some(source)))
+    }
+
+    const fn assemble(
+        network: Network,
+        marf: VersionedMarf,
+        side_store: rusqlite::Connection,
+        read_block: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
             network,
             marf,
             side_store,
-            states,
-            parents: BTreeMap::new(),
-            heights: BTreeMap::new(),
-            read_block: Some(source),
+            metadata: BTreeMap::new(),
+            checkpoint_heights: BTreeMap::new(),
+            read_block,
             active: None,
             transaction: None,
-        })
+        }
+    }
+
+    /// The deepest sealed state, which is where a reopened store resumes.
+    #[must_use]
+    pub fn tip(&self) -> Option<[u8; 32]> {
+        self.marf.tip()
     }
 
     /// The chain this state belongs to.
@@ -977,25 +1058,23 @@ impl MarfStore {
         block: [u8; 32],
     ) -> Result<(), MarfStoreError> {
         self.marf.begin(parent, block)?;
-        let state = parent
-            .and_then(|parent| self.states.get(&parent).cloned())
-            .unwrap_or_default();
         let height = parent
-            .and_then(|parent| {
-                self.heights
-                    .get(&parent)
-                    .copied()
-                    .or_else(|| self.marf.height(parent))
-            })
+            .and_then(|parent| self.height_of(parent))
             .map_or(0, |height| height + 1);
+        self.metadata.clear();
         self.active = Some(ActiveStore {
             block,
             parent,
             height,
-            state,
         });
         self.read_block = Some(block);
         Ok(())
+    }
+
+    fn height_of(&self, block: [u8; 32]) -> Option<u32> {
+        self.marf
+            .height(block)
+            .or_else(|| self.checkpoint_heights.get(&block).copied())
     }
 
     /// Start an atomic transaction within the active block state.
@@ -1004,9 +1083,10 @@ impl MarfStore {
             return Err(MarfStoreError::TransactionInProgress);
         }
         self.transaction = Some(StoreTransaction {
-            marf: self.marf.clone(),
+            marf: self.marf.snapshot(),
+            metadata: self.metadata.clone(),
             read_block: self.read_block,
-            active: self.active.clone(),
+            active: self.active,
         });
         Ok(())
     }
@@ -1025,29 +1105,33 @@ impl MarfStore {
             .transaction
             .take()
             .ok_or(MarfStoreError::NoTransaction)?;
-        self.marf = transaction.marf;
+        self.marf.restore(transaction.marf);
+        self.metadata = transaction.metadata;
         self.read_block = transaction.read_block;
         self.active = transaction.active;
         Ok(())
     }
 
     /// Persist a Clarity database key and commit its value hash into the active MARF.
-    pub fn put(&mut self, key: String, value: String) -> Result<(), MarfStoreError> {
+    pub fn put(&mut self, key: &str, value: &str) -> Result<(), MarfStoreError> {
         let value_hash = MarfValue::from_value(value.as_bytes());
         self.marf.insert(key.as_bytes(), value_hash)?;
-        self.side_store.execute(
-            "INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)",
-            params![marf_value_key(value_hash), &value],
-        )?;
-        let active = self.active.as_mut().ok_or(MarfStoreError::NoActiveState)?;
-        active.state.values.insert(key, value);
+        self.write_value(value_hash, value)
+    }
+
+    fn write_value(&self, value_hash: MarfValue, value: &str) -> Result<(), MarfStoreError> {
+        self.side_store
+            .prepare_cached("INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)")?
+            .execute(params![marf_value_key(value_hash), value])?;
         Ok(())
     }
 
     /// Read a value from a sealed state.
     #[must_use]
-    pub fn get(&self, block: [u8; 32], key: &str) -> Option<&str> {
-        self.states.get(&block)?.values.get(key).map(String::as_str)
+    pub fn get(&self, block: [u8; 32], key: &str) -> Option<String> {
+        self.marf
+            .get(block, key.as_bytes())
+            .and_then(|value| self.data_from_side_store(value).ok().flatten())
     }
 
     /// Seal the active state and return its MARF root.
@@ -1076,18 +1160,39 @@ impl MarfStore {
         // Seal the MARF first: a failure here must leave the active state intact
         // so the caller can still abort it.
         let root = self.marf.seal_to(block)?;
-        let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
-        self.parents.insert(block, active.parent);
-        self.heights.insert(block, active.height);
-        self.states.insert(block, active.state);
+        self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.flush_metadata(block)?;
         self.read_block = Some(block);
         Ok(StateRoot(*root.as_bytes()))
+    }
+
+    /// Move the block's Clarity metadata into the side store, keyed by the
+    /// block that defined it, which is how a later block finds it again.
+    fn flush_metadata(&mut self, block: [u8; 32]) -> Result<(), MarfStoreError> {
+        let blockhash = block_hex(block);
+        let transaction = self.side_store.unchecked_transaction()?;
+        for ((contract, key), value) in &self.metadata {
+            self.side_store
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO metadata_table (key, blockhash, value) \
+                     VALUES (?1, ?2, ?3)",
+                )?
+                .execute(params![
+                    format!("clr-meta::{contract}::{key}"),
+                    &blockhash,
+                    value
+                ])?;
+        }
+        transaction.commit()?;
+        self.metadata.clear();
+        Ok(())
     }
 
     /// Discard the active state without registering a new MARF version.
     pub fn abort(&mut self) -> Result<(), MarfStoreError> {
         let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
         self.marf.abort()?;
+        self.metadata.clear();
         self.read_block = active.parent;
         Ok(())
     }
@@ -1103,7 +1208,7 @@ impl MarfStore {
     /// Record an imported checkpoint's Stacks height for Clarity balance history lookups.
     pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
         if self.marf.height(block).is_none() {
-            self.heights.entry(block).or_insert(height);
+            self.checkpoint_heights.entry(block).or_insert(height);
         }
     }
 
@@ -1135,94 +1240,47 @@ impl MarfStore {
         self.marf.pointers_at(block, prefix)
     }
 
-    fn read_state(&self) -> Option<&StoreState> {
-        if let Some(block) = self.read_block {
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|active| active.block == block)
-            {
-                return self.active.as_ref().map(|active| &active.state);
-            }
-            return self.states.get(&block);
-        }
-        self.active.as_ref().map(|active| &active.state)
-    }
-
-    fn block_at_height(&self, mut block: [u8; 32], height: u32) -> Option<[u8; 32]> {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.block == block && active.height == height)
-        {
-            return Some(block);
-        }
-        loop {
-            if self.heights.get(&block).copied() == Some(height) {
-                return Some(block);
-            }
-            block = self.parents.get(&block).copied().flatten()?;
-        }
-    }
-
-    fn checkpoint_block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
-        self.marf.block_at_height(block, height).or_else(|| {
-            self.active
-                .as_ref()
-                .filter(|active| active.block == block)
-                .and_then(|active| active.parent)
-                .and_then(|parent| self.marf.block_at_height(parent, height))
+    /// Whether reads currently see the state being written.
+    fn reads_active_state(&self) -> bool {
+        self.active.is_some_and(|active| {
+            self.read_block
+                .is_none_or(|block| block == active.block)
         })
     }
 
-    fn current_block(&self) -> Option<[u8; 32]> {
-        self.active
-            .as_ref()
-            .map(|active| active.block)
-            .or(self.read_block)
-    }
-
-    fn selected_state(&self) -> Option<(&StoreState, Option<[u8; 32]>)> {
-        if let Some(block) = self.read_block {
-            if let Some(active) = self.active.as_ref().filter(|active| active.block == block) {
-                return Some((&active.state, active.parent));
+    fn block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
+        if let Some(active) = self.active.filter(|active| active.block == block) {
+            if active.height == height {
+                return Some(block);
             }
-            return self.states.get(&block).map(|state| (state, Some(block)));
+            return active
+                .parent
+                .and_then(|parent| self.marf.block_at_height(parent, height));
         }
-        self.active
-            .as_ref()
-            .map(|active| (&active.state, active.parent))
+        self.marf.block_at_height(block, height)
     }
 
-    fn data_from_marf(
-        &self,
-        block: Option<[u8; 32]>,
-        key: &str,
-    ) -> Result<Option<String>, VmExecutionError> {
-        block
-            .and_then(|block| self.marf.get(block, key.as_bytes()))
-            .map_or(Ok(None), |value| self.data_from_side_store(value))
+    fn current_block(&self) -> Option<[u8; 32]> {
+        self.active.map(|active| active.block).or(self.read_block)
     }
 
-    fn data_from_path(
-        &self,
-        block: Option<[u8; 32]>,
-        path: [u8; 32],
-    ) -> Result<Option<String>, VmExecutionError> {
-        block
-            .and_then(|block| self.marf.get_path(block, path))
-            .map_or(Ok(None), |value| self.data_from_side_store(value))
+    /// Resolve a key against whichever state reads are pointed at.
+    fn value_of(&self, path: [u8; 32]) -> Option<MarfValue> {
+        if self.reads_active_state() {
+            return self.marf.get_active_path(path);
+        }
+        self.marf.get_path(self.read_block?, path)
     }
 
     fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {
         Ok(self
             .side_store
-            .query_row(
-                "SELECT value FROM data_table WHERE key = ?1",
-                params![marf_value_key(value)],
-                |row| row.get(0),
-            )
-            .optional()
+            .prepare_cached("SELECT value FROM data_table WHERE key = ?1")
+            .and_then(|mut statement| {
+                statement
+                    .query_row(params![marf_value_key(value)], |row| row.get(0))
+                    .optional()
+            })
             .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?)
     }
 
@@ -1234,67 +1292,66 @@ impl MarfStore {
     ) -> Result<Option<String>, VmExecutionError> {
         Ok(self
             .side_store
-            .query_row(
-                "SELECT value FROM metadata_table WHERE blockhash = ?1 AND key = ?2",
-                params![block_hex(block), format!("clr-meta::{contract}::{key}"),],
-                |row| row.get(0),
-            )
-            .optional()
+            .prepare_cached("SELECT value FROM metadata_table WHERE blockhash = ?1 AND key = ?2")
+            .and_then(|mut statement| {
+                statement
+                    .query_row(
+                        params![block_hex(block), format!("clr-meta::{contract}::{key}")],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
             .map_err(|error| VmInternalError::Expect(format!("metadata read failed: {error}")))?)
     }
 }
 
+/// The files a durable store keeps in its directory.
+const MARF_FILE: &str = "marf.sqlite";
+const CLARITY_FILE: &str = "clarity.sqlite";
+
+const SIDE_STORE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS data_table (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata_table (
+    key TEXT NOT NULL,
+    blockhash TEXT,
+    value TEXT NOT NULL,
+    UNIQUE (key, blockhash)
+);
+CREATE INDEX IF NOT EXISTS md_blockhashes ON metadata_table(blockhash);
+";
+
 fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open_in_memory()?;
-    connection.execute_batch(
-        "CREATE TABLE data_table (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE metadata_table (
-             key TEXT NOT NULL,
-             blockhash TEXT,
-             value TEXT NOT NULL,
-             UNIQUE (key, blockhash)
-         );
-         CREATE INDEX md_blockhashes ON metadata_table(blockhash);",
-    )?;
+    connection.execute_batch(SIDE_STORE_SCHEMA)?;
     Ok(connection)
 }
 
-fn copy_side_store(path: &Path) -> Result<rusqlite::Connection, MarfStoreError> {
-    let source_uri = format!("file:{}?immutable=1", path.display());
-    let source = rusqlite::Connection::open_with_flags(
-        source_uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    let connection = rusqlite::Connection::open(path)?;
+    connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+    connection.execute_batch("PRAGMA synchronous = NORMAL")?;
+    connection.execute_batch(SIDE_STORE_SCHEMA)?;
+    Ok(connection)
+}
+
+/// Copy a checkpoint's Clarity side tables in `SQLite`, so no row crosses into
+/// this process on the way.
+fn import_side_store(
+    destination: &rusqlite::Connection,
+    checkpoint: &Path,
+) -> Result<(), MarfStoreError> {
+    destination.execute(
+        "ATTACH DATABASE ?1 AS checkpoint",
+        params![format!("file:{}?immutable=1", checkpoint.display())],
     )?;
-    let destination = create_side_store()?;
-
-    let mut data = source.prepare("SELECT key, value FROM data_table")?;
-    let data_rows = data.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in data_rows {
-        let (key, value) = row?;
-        destination.execute(
-            "INSERT INTO data_table (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
-    }
-
-    let mut metadata = source.prepare("SELECT key, blockhash, value FROM metadata_table")?;
-    let metadata_rows = metadata.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in metadata_rows {
-        let (key, blockhash, value) = row?;
-        destination.execute(
-            "INSERT INTO metadata_table (key, blockhash, value) VALUES (?1, ?2, ?3)",
-            params![key, blockhash, value],
-        )?;
-    }
-    Ok(destination)
+    let copied = destination.execute_batch(
+        "INSERT OR REPLACE INTO data_table (key, value) \
+             SELECT key, value FROM checkpoint.data_table;
+         INSERT OR REPLACE INTO metadata_table (key, blockhash, value) \
+             SELECT key, blockhash, value FROM checkpoint.metadata_table;",
+    );
+    destination.execute_batch("DETACH DATABASE checkpoint")?;
+    Ok(copied?)
 }
 
 fn marf_value_key(value: MarfValue) -> String {
@@ -1326,40 +1383,22 @@ impl ClarityBackingStore for MarfStore {
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
         for (key, value) in items {
-            self.put(key, value)
+            self.put(&key, &value)
                 .map_err(|error| VmInternalError::Expect(error.to_string()))?;
         }
         Ok(())
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
-        let Some((state, fallback_block)) = self.selected_state() else {
-            return Ok(None);
-        };
-        state.values.get(key).cloned().map_or_else(
-            || self.data_from_marf(fallback_block, key),
-            |value| Ok(Some(value)),
-        )
+        self.get_data_from_path(&ReferenceTrieHash(*nano_marf::key_path(key.as_bytes()).as_bytes()))
     }
 
     fn get_data_from_path(
         &mut self,
         path: &ReferenceTrieHash,
     ) -> Result<Option<String>, VmExecutionError> {
-        let Some((state, fallback_block)) = self.selected_state() else {
-            return Ok(None);
-        };
-        state
-            .values
-            .iter()
-            .find_map(|(key, value)| {
-                (nano_marf::key_path(key.as_bytes()).as_bytes() == path.as_bytes())
-                    .then(|| value.clone())
-            })
-            .map_or_else(
-                || self.data_from_path(fallback_block, *path.as_bytes()),
-                |value| Ok(Some(value)),
-            )
+        self.value_of(*path.as_bytes())
+            .map_or(Ok(None), |value| self.data_from_side_store(value))
     }
 
     fn get_data_with_proof(
@@ -1379,11 +1418,8 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn set_block_hash(&mut self, block: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
-        if !self.states.contains_key(&block.0)
-            && self
-                .active
-                .as_ref()
-                .is_none_or(|active| active.block != block.0)
+        if !self.marf.contains(block.0)
+            && self.active.is_none_or(|active| active.block != block.0)
         {
             return Err(RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(block.0)).into());
         }
@@ -1394,35 +1430,27 @@ impl ClarityBackingStore for MarfStore {
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
         self.current_block()
-            .and_then(|block| {
-                self.block_at_height(block, height)
-                    .or_else(|| self.checkpoint_block_at_height(block, height))
-            })
+            .and_then(|block| self.block_at_height(block, height))
             .map(StacksBlockId)
     }
 
     fn get_current_block_height(&mut self) -> u32 {
         self.active
-            .as_ref()
             .map(|active| active.height + 1)
             .or_else(|| {
                 self.current_block()
-                    .and_then(|block| {
-                        self.marf
-                            .height(block)
-                            .or_else(|| self.heights.get(&block).copied())
-                    })
+                    .and_then(|block| self.height_of(block))
                     .map(|height| height + 1)
             })
             .unwrap_or(0)
     }
 
     fn get_open_chain_tip_height(&mut self) -> u32 {
-        self.active.as_ref().map_or(0, |active| active.height)
+        self.active.map_or(0, |active| active.height)
     }
 
     fn get_open_chain_tip(&mut self) -> StacksBlockId {
-        StacksBlockId(self.active.as_ref().map_or([0; 32], |active| active.block))
+        StacksBlockId(self.active.map_or([0; 32], |active| active.block))
     }
 
     fn get_contract_hash(
@@ -1446,12 +1474,12 @@ impl ClarityBackingStore for MarfStore {
         key: &str,
         value: &str,
     ) -> Result<(), VmExecutionError> {
-        let active = self.active.as_mut().ok_or_else(|| {
-            VmInternalError::Expect("metadata write without an active state".to_owned())
-        })?;
-        active
-            .state
-            .metadata
+        if self.active.is_none() {
+            return Err(
+                VmInternalError::Expect("metadata write without an active state".to_owned()).into(),
+            );
+        }
+        self.metadata
             .insert((contract.to_string(), key.to_owned()), value.to_owned());
         Ok(())
     }
@@ -1461,12 +1489,7 @@ impl ClarityBackingStore for MarfStore {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        if let Some(value) = self.read_state().and_then(|state| {
-            state
-                .metadata
-                .get(&(contract.to_string(), key.to_owned()))
-                .cloned()
-        }) {
+        if let Some(value) = self.pending_metadata(contract, key) {
             return Ok(Some(value));
         }
         let (block, _) = self.get_contract_hash(contract)?;
@@ -1481,20 +1504,30 @@ impl ClarityBackingStore for MarfStore {
     ) -> Result<Option<String>, VmExecutionError> {
         let block = self
             .current_block()
-            .and_then(|block| {
-                self.block_at_height(block, height)
-                    .or_else(|| self.checkpoint_block_at_height(block, height))
-            })
+            .and_then(|block| self.block_at_height(block, height))
             .ok_or_else(|| RuntimeError::BadBlockHeight(height.to_string()))?;
-        if let Some(value) = self.states.get(&block).and_then(|state| {
-            state
-                .metadata
-                .get(&(contract.to_string(), key.to_owned()))
-                .cloned()
-        }) {
-            return Ok(Some(value));
+        if self.active.is_some_and(|active| active.block == block) {
+            if let Some(value) = self.pending_metadata(contract, key) {
+                return Ok(Some(value));
+            }
         }
         self.metadata_from_side_store(block, contract, key)
+    }
+}
+
+impl MarfStore {
+    /// Metadata the block being executed has written but not yet sealed.
+    fn pending_metadata(
+        &self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+    ) -> Option<String> {
+        if !self.reads_active_state() {
+            return None;
+        }
+        self.metadata
+            .get(&(contract.to_string(), key.to_owned()))
+            .cloned()
     }
 }
 
@@ -2434,7 +2467,7 @@ mod tests {
 
         store.begin(None, first).expect("begin first state");
         store
-            .put("counter".to_owned(), "one".to_owned())
+            .put("counter", "one")
             .expect("write first state");
         let pending_first_root = store.pending_root().expect("derive first state root");
         let first_root = store.seal().expect("seal first state");
@@ -2444,19 +2477,19 @@ mod tests {
             .begin(Some(first), second)
             .expect("begin second state");
         store
-            .put("counter".to_owned(), "two".to_owned())
+            .put("counter", "two")
             .expect("write second state");
         let second_root = store.seal().expect("seal second state");
 
         store.begin(Some(first), fork).expect("begin fork state");
         store
-            .put("counter".to_owned(), "fork".to_owned())
+            .put("counter", "fork")
             .expect("write fork state");
         let fork_root = store.seal().expect("seal fork state");
 
-        assert_eq!(store.get(first, "counter"), Some("one"));
-        assert_eq!(store.get(second, "counter"), Some("two"));
-        assert_eq!(store.get(fork, "counter"), Some("fork"));
+        assert_eq!(store.get(first, "counter").as_deref(), Some("one"));
+        assert_eq!(store.get(second, "counter").as_deref(), Some("two"));
+        assert_eq!(store.get(fork, "counter").as_deref(), Some("fork"));
         assert_eq!(store.root(first), Some(first_root));
         assert_eq!(store.root(second), Some(second_root));
         assert_eq!(store.root(fork), Some(fork_root));
@@ -2529,17 +2562,17 @@ mod tests {
         let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
         store.begin(None, block).expect("begin block");
         store
-            .put("counter".to_owned(), "one".to_owned())
+            .put("counter", "one")
             .expect("write baseline value");
 
         store.begin_transaction().expect("begin transaction");
         store
-            .put("counter".to_owned(), "two".to_owned())
+            .put("counter", "two")
             .expect("write transactional value");
         store.rollback_transaction().expect("roll back transaction");
         store.seal().expect("seal block");
 
-        assert_eq!(store.get(block, "counter"), Some("one"));
+        assert_eq!(store.get(block, "counter").as_deref(), Some("one"));
     }
 
     #[test]
@@ -2879,7 +2912,7 @@ mod tests {
                 .is_some()
         );
         store
-            .put("nano-checkpoint-extension".to_owned(), "value".to_owned())
+            .put("nano-checkpoint-extension", "value")
             .expect("write extension");
         store.seal().expect("seal checkpoint extension");
     }

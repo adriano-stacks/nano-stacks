@@ -240,17 +240,18 @@ pub fn state_root(content: TrieHash, ancestor_roots: &[TrieHash]) -> TrieHash {
 /// Nothing inherited is copied: an unchanged child stays a reference into the
 /// block that owns it, exactly as the MARF's copy-on-write back-pointers
 /// express it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MarfTrie {
-    storage: Arc<TrieStorage>,
+    storage: TrieStorage,
     root_children: Vec<TrieChild>,
 }
 
 impl Default for MarfTrie {
     fn default() -> Self {
-        Self::new(Arc::new(
-            TrieStorage::in_memory().expect("opens in-memory trie storage"),
-        ))
+        Self {
+            storage: TrieStorage::in_memory().expect("opens in-memory trie storage"),
+            root_children: Vec::new(),
+        }
     }
 }
 
@@ -353,59 +354,13 @@ impl TrieChild {
 }
 
 impl MarfTrie {
-    fn new(storage: Arc<TrieStorage>) -> Self {
-        Self {
-            storage,
-            root_children: Vec::new(),
-        }
-    }
-
-    /// Layer a new state over the sealed state `parent`.
-    fn extending(storage: Arc<TrieStorage>, parent: &BlockRecord) -> Result<Self, MarfError> {
-        let root_children = match parent.node {
-            Some(index) => match &*storage.node(parent.id, index)? {
-                TrieNode::Internal { children, .. } => children.clone(),
-                TrieNode::Leaf { .. } => {
-                    return Err(MarfError::Storage("root state is a leaf".to_owned()));
-                }
-            },
-            None => Vec::new(),
-        };
-        let mut trie = Self {
-            storage,
-            root_children,
-        };
-        trie.prepare_root_for_copy(parent.hash);
-        Ok(trie)
-    }
-
     pub fn insert(&mut self, key: &[u8], value: MarfValue) {
         self.insert_path(*key_path(key).as_bytes(), value);
     }
 
     pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) {
-        self.try_insert_path(path, value).expect("trie storage");
-    }
-
-    fn try_insert_path(&mut self, path: [u8; 32], value: MarfValue) -> Result<(), MarfError> {
-        let root_character = path[0];
-        let suffix = &path[1..];
-        if let Some(child) = self
-            .root_children
-            .iter_mut()
-            .find(|child| child.character == root_character)
-        {
-            child.insert(&self.storage, suffix, value)
-        } else {
-            self.root_children.push(TrieChild::local(
-                root_character,
-                TrieNode::Leaf {
-                    path: suffix.to_vec(),
-                    value,
-                },
-            ));
-            Ok(())
-        }
+        insert_under_root(&self.storage, &mut self.root_children, path, value)
+            .expect("trie storage");
     }
 
     #[must_use]
@@ -420,11 +375,8 @@ impl MarfTrie {
 
     #[must_use]
     pub fn root_hash(&self) -> TrieHash {
-        self.content_hash().expect("trie storage")
-    }
-
-    fn content_hash(&self) -> Result<TrieHash, MarfError> {
         hash_children(&self.storage, TrieNodeId::Node256, &[], &self.root_children)
+            .expect("trie storage")
     }
 
     /// Return every stored path and value in deterministic path order.
@@ -452,30 +404,78 @@ impl MarfTrie {
     pub fn pointers_at(&self, prefix: &[u8]) -> Option<Vec<(TriePointer, TrieHash)>> {
         pointers_under_root(&self.storage, &self.root_children, prefix).expect("trie storage")
     }
+}
 
-    fn prepare_root_for_copy(&mut self, block: MarfBlockId) {
-        for child in &mut self.root_children {
-            if child.referenced_block.is_none() {
-                child.referenced_block = Some(block);
+/// Take over the sealed state `parent`, turning every child it owns into a
+/// back-pointer to it.
+fn extend_root(
+    storage: &TrieStorage,
+    parent: &BlockRecord,
+) -> Result<Vec<TrieChild>, MarfError> {
+    let mut children = match parent.node {
+        Some(index) => match &*storage.node(parent.id, index)? {
+            TrieNode::Internal { children, .. } => children.clone(),
+            TrieNode::Leaf { .. } => {
+                return Err(MarfError::Storage("root state is a leaf".to_owned()));
             }
+        },
+        None => Vec::new(),
+    };
+    prepare_root_for_copy(&mut children, parent.hash);
+    Ok(children)
+}
+
+fn prepare_root_for_copy(children: &mut [TrieChild], block: MarfBlockId) {
+    for child in children {
+        if child.referenced_block.is_none() {
+            child.referenced_block = Some(block);
         }
     }
+}
 
-    /// Write every node this state owns, returning its root node and hash.
-    fn persist(&self, block: u32, next: &mut u32) -> Result<(u32, TrieHash), MarfError> {
-        let (children, hashes) = persist_children(&self.storage, block, &self.root_children, next)?;
-        let (pointers, child_hashes) = slots(TrieNodeId::Node256, &children, &hashes);
-        let hash = internal_node_hash(TrieNodeId::Node256, &pointers, &[], &child_hashes)?;
-        let index = *next;
-        *next = next.checked_add(1).ok_or(MarfError::HeightOverflow)?;
-        let node = Arc::new(TrieNode::Internal {
-            path: Vec::new(),
-            children,
-        });
-        self.storage.insert_node(block, index, hash, &node)?;
-        self.storage.remember(block, index, node);
-        Ok((index, hash))
-    }
+fn insert_under_root(
+    storage: &TrieStorage,
+    root_children: &mut Vec<TrieChild>,
+    path: [u8; 32],
+    value: MarfValue,
+) -> Result<(), MarfError> {
+    let root_character = path[0];
+    let suffix = &path[1..];
+    let Some(child) = root_children
+        .iter_mut()
+        .find(|child| child.character == root_character)
+    else {
+        root_children.push(TrieChild::local(
+            root_character,
+            TrieNode::Leaf {
+                path: suffix.to_vec(),
+                value,
+            },
+        ));
+        return Ok(());
+    };
+    child.insert(storage, suffix, value)
+}
+
+/// Write every node a state owns, returning its root node and content hash.
+fn persist_root(
+    storage: &TrieStorage,
+    block: u32,
+    root_children: &[TrieChild],
+    next: &mut u32,
+) -> Result<(u32, TrieHash), MarfError> {
+    let (children, hashes) = persist_children(storage, block, root_children, next)?;
+    let (pointers, child_hashes) = slots(TrieNodeId::Node256, &children, &hashes);
+    let hash = internal_node_hash(TrieNodeId::Node256, &pointers, &[], &child_hashes)?;
+    let index = *next;
+    *next = next.checked_add(1).ok_or(MarfError::HeightOverflow)?;
+    let node = Arc::new(TrieNode::Internal {
+        path: Vec::new(),
+        children,
+    });
+    storage.insert_node(block, index, hash, &node)?;
+    storage.remember(block, index, node);
+    Ok((index, hash))
 }
 
 impl TrieNode {
@@ -604,12 +604,10 @@ impl TrieNode {
 
                 let child_character = path[node_path.len()];
                 let suffix = &path[node_path.len() + 1..];
-                if let Some(child) = children
+                let Some(child) = children
                     .iter_mut()
                     .find(|child| child.character == child_character)
-                {
-                    child.insert(storage, suffix, value)
-                } else {
+                else {
                     children.push(TrieChild::local(
                         child_character,
                         Self::Leaf {
@@ -617,8 +615,9 @@ impl TrieNode {
                             value,
                         },
                     ));
-                    Ok(())
-                }
+                    return Ok(());
+                };
+                child.insert(storage, suffix, value)
             }
         }
     }
@@ -632,7 +631,7 @@ impl TrieNode {
         }
     }
 
-    const fn node_id(&self) -> TrieNodeId {
+    fn node_id(&self) -> TrieNodeId {
         match self {
             Self::Leaf { .. } => TrieNodeId::Leaf,
             Self::Internal { children, .. } => node_id_for_children(children.len()),
@@ -868,17 +867,15 @@ fn shared_prefix(left: &[u8], right: &[u8]) -> usize {
 pub type MarfBlockId = [u8; 32];
 
 /// A copy-on-write MARF keyed by block identifier, held on disk.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct VersionedMarf {
-    storage: Arc<TrieStorage>,
+    storage: TrieStorage,
     active: Option<ActiveVersion>,
 }
 
 impl Default for VersionedMarf {
     fn default() -> Self {
-        Self::from_storage(Arc::new(
-            TrieStorage::in_memory().expect("opens in-memory trie storage"),
-        ))
+        Self::from_storage(TrieStorage::in_memory().expect("opens in-memory trie storage"))
     }
 }
 
@@ -887,22 +884,38 @@ struct ActiveVersion {
     block: MarfBlockId,
     parent: Option<MarfBlockId>,
     height: u32,
-    trie: MarfTrie,
+    root_children: Vec<TrieChild>,
 }
+
+/// The unsealed state, kept so a failed Clarity transaction can put it back.
+///
+/// Copying it shares every node it did not itself write, so a snapshot costs
+/// the block's root pointers and nothing more.
+#[derive(Clone, Debug)]
+pub struct MarfSnapshot(Option<ActiveVersion>);
 
 impl VersionedMarf {
     /// Open, creating if absent, the MARF held in `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MarfError> {
-        Ok(Self::from_storage(Arc::new(TrieStorage::open(
-            path.as_ref(),
-        )?)))
+        Ok(Self::from_storage(TrieStorage::open(path.as_ref())?))
     }
 
-    pub(crate) fn from_storage(storage: Arc<TrieStorage>) -> Self {
+    pub(crate) const fn from_storage(storage: TrieStorage) -> Self {
         Self {
             storage,
             active: None,
         }
+    }
+
+    /// Copy the unsealed state so it can be restored after a rollback.
+    #[must_use]
+    pub fn snapshot(&self) -> MarfSnapshot {
+        MarfSnapshot(self.active.clone())
+    }
+
+    /// Put back the unsealed state a snapshot captured.
+    pub fn restore(&mut self, snapshot: MarfSnapshot) {
+        self.active = snapshot.0;
     }
 
     /// The deepest sealed state, which is where a reopened MARF resumes.
@@ -939,36 +952,33 @@ impl VersionedMarf {
             return Err(MarfError::VersionAlreadyExists);
         }
 
-        let (mut trie, height) = match parent {
+        let (mut root_children, height) = match parent {
             Some(parent) => {
                 let record = self
                     .storage
                     .block(parent)?
                     .ok_or(MarfError::UnknownVersion)?;
                 (
-                    MarfTrie::extending(Arc::clone(&self.storage), &record)?,
+                    extend_root(&self.storage, &record)?,
                     record.height.checked_add(1).ok_or(MarfError::HeightOverflow)?,
                 )
             }
-            None => (MarfTrie::new(Arc::clone(&self.storage)), 0),
+            None => (Vec::new(), 0),
         };
-        insert_metadata(&mut trie, parent, block, height)?;
+        insert_metadata(&self.storage, &mut root_children, parent, block, height)?;
         self.active = Some(ActiveVersion {
             block,
             parent,
             height,
-            trie,
+            root_children,
         });
         Ok(())
     }
 
     /// Write a raw path into the active state.
     pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) -> Result<(), MarfError> {
-        self.active
-            .as_mut()
-            .ok_or(MarfError::WriteNotBegun)?
-            .trie
-            .try_insert_path(path, value)
+        let active = self.active.as_mut().ok_or(MarfError::WriteNotBegun)?;
+        insert_under_root(&self.storage, &mut active.root_children, path, value)
     }
 
     /// Write a logical key into the active state.
@@ -986,7 +996,7 @@ impl VersionedMarf {
     pub fn pending_root(&self) -> Result<TrieHash, MarfError> {
         let active = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?;
         Ok(state_root(
-            active.trie.content_hash()?,
+            hash_children(&self.storage, TrieNodeId::Node256, &[], &active.root_children)?,
             &self.ancestor_roots(active.parent, active.height)?,
         ))
     }
@@ -1030,7 +1040,7 @@ impl VersionedMarf {
             .storage
             .reserve_block(block, parent, active.height, &jumps)?;
         let mut next = 0;
-        let (node, content) = active.trie.persist(id, &mut next)?;
+        let (node, content) = persist_root(&self.storage, id, &active.root_children, &mut next)?;
         let root = state_root(content, &ancestor_roots);
         self.storage
             .complete_block(block, id, root, content, Some(node))?;
@@ -1067,9 +1077,8 @@ impl VersionedMarf {
     /// Read a raw path from the state being written.
     #[must_use]
     pub fn get_active_path(&self, path: [u8; 32]) -> Option<MarfValue> {
-        self.active
-            .as_ref()
-            .and_then(|active| active.trie.get_path(path))
+        let active = self.active.as_ref()?;
+        find_path(&self.storage, &active.root_children, path).expect("trie storage")
     }
 
     /// Return a sealed state root.
@@ -1217,7 +1226,8 @@ const BLOCK_HEIGHT_TO_HASH_KEY: &str = "__MARF_BLOCK_HEIGHT_TO_HASH";
 const OWN_BLOCK_HEIGHT_KEY: &str = "__MARF_BLOCK_HEIGHT_SELF";
 
 fn insert_metadata(
-    trie: &mut MarfTrie,
+    storage: &TrieStorage,
+    root_children: &mut Vec<TrieChild>,
     parent: Option<MarfBlockId>,
     block: MarfBlockId,
     height: u32,
@@ -1250,7 +1260,12 @@ fn insert_metadata(
         ));
     }
     for (key, value) in entries {
-        trie.try_insert_path(*key_path(key.as_bytes()).as_bytes(), value)?;
+        insert_under_root(
+            storage,
+            root_children,
+            *key_path(key.as_bytes()).as_bytes(),
+            value,
+        )?;
     }
     Ok(())
 }
@@ -1369,7 +1384,7 @@ mod tests {
         let first_value = MarfValue::from_u32(1);
         let mut trie = MarfTrie::default();
         trie.insert_path(path, first_value);
-        trie.prepare_root_for_copy(first);
+        super::prepare_root_for_copy(&mut trie.root_children, first);
         let mut pointers = vec![
             TriePointer {
                 id: 0,

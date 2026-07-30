@@ -4,7 +4,6 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use rusqlite::Connection;
@@ -122,7 +121,7 @@ pub fn import_checkpoint(
     expected_root: TrieHash,
 ) -> Result<VersionedMarf, CheckpointError> {
     import_into(
-        Arc::new(TrieStorage::in_memory()?),
+        TrieStorage::in_memory()?,
         sqlite_path.as_ref(),
         source,
         expected_root,
@@ -140,7 +139,7 @@ pub fn import_checkpoint_into(
     expected_root: TrieHash,
 ) -> Result<VersionedMarf, CheckpointError> {
     import_into(
-        Arc::new(TrieStorage::open(marf_path.as_ref())?),
+        TrieStorage::open(marf_path.as_ref())?,
         sqlite_path.as_ref(),
         source,
         expected_root,
@@ -148,7 +147,7 @@ pub fn import_checkpoint_into(
 }
 
 fn import_into(
-    storage: Arc<TrieStorage>,
+    storage: TrieStorage,
     sqlite_path: &Path,
     source: MarfBlockId,
     expected_root: TrieHash,
@@ -452,7 +451,7 @@ impl Importer<'_> {
         let (children, hashes) = self.import_children(record.block_id, &pointers)?;
         let (slot_pointers, slot_hashes) = slots(TrieNodeId::Node256, &children, &hashes);
         let hash = internal_node_hash(TrieNodeId::Node256, &slot_pointers, &[], &slot_hashes)?;
-        let index = self.write(record.block_id, hash, TrieNode::Internal { path, children })?;
+        let index = self.write(record.block_id, hash, &TrieNode::Internal { path, children })?;
         Ok((index, hash))
     }
 
@@ -465,7 +464,7 @@ impl Importer<'_> {
         match self.decode_node(block_id, pointer, expected_id)? {
             DecodedNode::Leaf { path, value } => {
                 let hash = leaf_hash(&path, value)?;
-                let index = self.write(block_id, hash, TrieNode::Leaf { path, value })?;
+                let index = self.write(block_id, hash, &TrieNode::Leaf { path, value })?;
                 Ok((index, hash, TrieNodeId::Leaf))
             }
             DecodedNode::Internal { path, pointers, .. } => {
@@ -473,7 +472,7 @@ impl Importer<'_> {
                 let id = node_id_for_children(children.len());
                 let (slot_pointers, slot_hashes) = slots(id, &children, &hashes);
                 let hash = internal_node_hash(id, &slot_pointers, &path, &slot_hashes)?;
-                let index = self.write(block_id, hash, TrieNode::Internal { path, children })?;
+                let index = self.write(block_id, hash, &TrieNode::Internal { path, children })?;
                 Ok((index, hash, id))
             }
         }
@@ -521,7 +520,7 @@ impl Importer<'_> {
         &mut self,
         block_id: u32,
         hash: TrieHash,
-        node: TrieNode,
+        node: &TrieNode,
     ) -> Result<u32, CheckpointError> {
         let block = self.identifier(block_id)?;
         let index = self.next.entry(block).or_default();
@@ -529,7 +528,7 @@ impl Importer<'_> {
         *index = index
             .checked_add(1)
             .ok_or(CheckpointError::InvalidCheckpoint("too many trie nodes"))?;
-        self.storage.insert_node(block, assigned, hash, &node)?;
+        self.storage.insert_node(block, assigned, hash, node)?;
         Ok(assigned)
     }
 
