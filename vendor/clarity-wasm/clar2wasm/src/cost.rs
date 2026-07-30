@@ -2022,6 +2022,79 @@ mod crosscheck {
         );
     }
 
+    /// Constructs `.pox-5 stake-update` is built from, one at a time.
+    ///
+    /// Its cost still diverges by a fraction of a percent and the divergence
+    /// is not in how its arguments are handled, so this walks its body.
+    #[test]
+    fn charges_what_stake_update_is_made_of() {
+        for snippet in [
+            // `let` over reads of a map entry, which is most of its prelude.
+            "(define-map m principal { a: uint, b: uint }) \
+             (define-public (f) (let ((e (unwrap! (map-get? m tx-sender) (err u1))) \
+                                      (x (+ (get a e) (get b e)))) (ok x)))",
+            // The unlocked-balance check.
+            "(define-public (f) (ok (get unlocked (stx-account tx-sender))))",
+            // `try!` through a private function returning a response. The
+            // condition is a literal, because a computed one has its own open
+            // divergence above.
+            "(define-private (g (a uint)) (if true (ok a) (err u1))) \
+             (define-public (f) (begin (try! (g u1)) (ok u2)))",
+            // `asserts!` on an equality, which it does throughout.
+            "(define-public (f) (begin (asserts! (is-eq u1 u1) (err u1)) (ok u2)))",
+            // A tuple written back into a map.
+            "(define-map m principal { a: uint, b: uint }) \
+             (define-public (f) (begin (map-set m tx-sender { a: u1, b: u2 }) (ok true)))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    /// What `.pox-5 stake-update` still diverges by, reduced to two shapes.
+    ///
+    /// Both cost more than the interpreter charges, by a constant that does
+    /// not vary with the operand types:
+    ///
+    /// - an ordered comparison (`<`, `<=`, `>`, `>=`) against a bound name,
+    ///   by 33. Two literals are exact, and so are `is-eq` and `+` over the
+    ///   same binding, so it is these words reading a bound value. They go
+    ///   through `special_geq_v2`, which charges
+    ///   `min(a.size(), b.size())` over the *evaluated* operands
+    ///   (`vm/functions/arithmetic.rs`).
+    /// - an `if` whose condition is computed rather than literal, by 31.
+    ///
+    /// pox-5 asserts and branches with these throughout, which is how 843 in
+    /// 231,186 accumulates over one `stake-update`.
+    ///
+    /// Ignored because it fails: it is the reproduction, not a regression
+    /// guard, and belongs un-ignored the moment the charge is fixed.
+    #[test]
+    #[ignore = "known divergence: comparisons and branches over bound names cost too much"]
+    fn charges_a_comparison_or_branch_over_a_bound_name() {
+        for (snippet, args) in [
+            ("(define-public (f (a uint)) (ok (> a u0)))", vec![Value::UInt(3)]),
+            (
+                "(define-private (g (a uint)) (> a u0)) (define-public (f) (ok (g u1)))",
+                vec![],
+            ),
+            ("(define-public (f) (let ((a u1)) (ok (> a u0))))", vec![]),
+            (
+                "(define-private (g (a uint)) (if (is-eq a u0) u1 u2)) \
+                 (define-public (f) (ok (g u1)))",
+                vec![],
+            ),
+            // And the fold under-charge, in the other direction: the
+            // function-argument lookup `special_fold` performs.
+            (
+                "(define-private (g (i uint) (acc uint)) (+ acc i)) \
+                 (define-public (f) (ok (fold g (list u1 u2 u3 u4) u0)))",
+                vec![],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &args);
+        }
+    }
+
     #[test]
     fn charges_entering_a_function_once() {
         for (snippet, arguments) in [

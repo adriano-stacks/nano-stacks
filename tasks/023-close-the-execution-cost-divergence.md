@@ -35,9 +35,10 @@ about when a block is full and when a tenure must be extended.
 - [x] Reduce the block-22 transaction to the smallest snippet that diverges.
 - [x] Fix the vendored compiler's charging for it and keep the case as a
       regression test.
-- [ ] Work forward through the fixtures until the cost row reaches full depth.
-      The fixtures now come from the pinned revision, so what remains is nano's:
-      runtime is high by 843 in 231,186 at the first divergence.
+- [x] Reduce the remaining divergence to the words that cause it.
+- [ ] Fix the charge for an ordered comparison and a computed branch condition
+      over a bound name, and un-ignore
+      `charges_a_comparison_or_branch_over_a_bound_name`.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -92,18 +93,28 @@ What remains, measured against a capture from the pinned revision, is runtime
 high by **843 in 231,186 — 0.36%** — at the first divergence. That transaction
 is a `.pox-5 stake-update` call.
 
-The residual is **not** in argument handling. Four fixes and one ruling-out
-have failed to move it:
+The residual is **not** in argument handling — four fixes and one ruling-out
+failed to move it — and it is no longer a mystery. Bisecting `stake-update`'s
+body reduced it to two shapes, both constant and neither varying with the
+operand types:
 
-- byte sequences, lists and UTF-8 strings charged at runtime size
-- optionals and responses charged at the branch taken
-- trait arguments, which declare 276 against a principal's 148, were the best
-  remaining theory and are **correct**: a trait crosscheck passes
+- an **ordered comparison against a bound name** costs **33** too much.
+  `(> u1 u2)` on two literals is exact, and so are `is-eq` and `+` over the
+  same binding, so it is `<`, `<=`, `>`, `>=` reading a bound value. They go
+  through `special_geq_v2`, which charges `min(a.size(), b.size())` over the
+  *evaluated* operands (`vm/functions/arithmetic.rs`), where nano takes the
+  minimum of the declared types.
+- an **`if` whose condition is computed** rather than literal costs **31** too
+  much.
 
-So it is inside `stake-update`'s body — the trait dispatch to
-`signer-manager-validate-stake`, `remove-staker-from-cycles`'s loops, or
-`stx-account`. Finding it means bisecting that body the way the earlier eight
-were found; every crosscheck case here is the harness to do it with.
+pox-5 asserts and branches with these throughout, which is how 843 in 231,186
+accumulates across one `stake-update`.
+
+`cost::crosscheck::charges_a_comparison_or_branch_over_a_bound_name` is the
+reproduction, three lines a case. It is `#[ignore]`d because it fails: it is
+the reproduction, not a regression guard, and belongs un-ignored the moment
+the charge is fixed. `charges_what_stake_update_is_made_of` covers what the
+same function does that is already exact.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.
