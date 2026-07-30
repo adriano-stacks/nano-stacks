@@ -1046,26 +1046,30 @@ mod word {
 
         let runtime = |word: &dyn Word| clar5::WORD_COSTS.get(&word.name()).unwrap().runtime;
 
-        assert!(matches!(runtime(&Secp256r1Verify), Caf::Constant(51_750)));
+        assert!(matches!(runtime(&Secp256r1Verify), Caf::Constant(38)));
         assert!(matches!(
             runtime(&Ed25519Verify),
             Caf::LinearShift {
-                a: 125,
-                b: 7_880,
-                shift: 10
+                a: 1,
+                b: 39,
+                shift: 9
             }
         ));
-        assert!(matches!(runtime(&Decompress), Caf::Constant(1_035)));
+        assert!(matches!(runtime(&Decompress), Caf::Constant(39)));
         assert!(matches!(
             runtime(&VerifyMerkleProof),
-            Caf::Linear { a: 125, b: 502 }
+            Caf::LinearShift {
+                a: 1,
+                b: 38,
+                shift: 2
+            }
         ));
         assert!(matches!(
             runtime(&GetBitcoinTxOutput),
             Caf::LinearShift {
-                a: 125,
-                b: 291,
-                shift: 10
+                a: 1,
+                b: 38,
+                shift: 9
             }
         ));
     }
