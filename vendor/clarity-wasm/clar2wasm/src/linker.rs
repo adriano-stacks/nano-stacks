@@ -4,8 +4,7 @@ use std::sync::Mutex;
 
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
-use clarity::vm::costs::cost_functions::ClarityCostFunction;
-use clarity::vm::costs::{constants as cost_constants, runtime_cost, CostTracker};
+use clarity::vm::costs::{constants as cost_constants, CostTracker};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{
     RuntimeCheckErrorKind, RuntimeError, StaticCheckErrorKind, VmExecutionError, VmInternalError,
@@ -5691,11 +5690,6 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         .contract_identifier
                         .clone()
                         .into();
-                    runtime_cost(
-                        ClarityCostFunction::ContractCall,
-                        caller.data_mut().global_context,
-                        0,
-                    )?;
                     let sender = caller.data().sender.clone();
                     let sponsor = caller.data().sponsor.clone();
                     let module_cache = caller.data().module_cache;

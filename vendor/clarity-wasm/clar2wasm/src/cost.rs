@@ -68,6 +68,18 @@ impl CostMeter {
         write_length: 0,
     };
 
+    /// The cost between two meter readings, clamped at zero per dimension.
+    #[must_use]
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            runtime: self.runtime.saturating_sub(earlier.runtime),
+            read_count: self.read_count.saturating_sub(earlier.read_count),
+            read_length: self.read_length.saturating_sub(earlier.read_length),
+            write_count: self.write_count.saturating_sub(earlier.write_count),
+            write_length: self.write_length.saturating_sub(earlier.write_length),
+        }
+    }
+
     pub fn used_from_remaining(remaining: Self) -> Self {
         Self {
             runtime: Self::INIT.runtime - remaining.runtime,
@@ -226,7 +238,97 @@ pub trait ChargeGenerator {
 
         Ok(())
     }
+
+    /// Generate code that charges one of the costs the interpreter pays around
+    /// a word rather than for it. See [`EvalCosts`].
+    #[doc(hidden)]
+    fn charge_eval(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        cost: impl Fn(&EvalCosts) -> Caf,
+        n: impl Into<Scalar>,
+    ) -> Result<()> {
+        if let Some((ctx, module)) = self.cost_context() {
+            ctx.emit_with_caf(
+                instrs,
+                module,
+                cost(ctx.eval_costs()),
+                ctx.runtime,
+                ErrorMap::CostOverrunRuntime as _,
+                n,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Charge resolving the head of an application to a function.
+    fn charge_function_lookup(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.function_lookup, 0_u32)
+    }
+
+    /// Charge entering a user-defined function with `arguments` parameters.
+    fn charge_user_function_application(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        arguments: u32,
+    ) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.user_function_application, arguments)
+    }
+
+    /// Charge type-checking one argument of a user-defined function.
+    fn charge_inner_type_check(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.inner_type_check, size)
+    }
+
+    /// Charge searching the binding scopes for a name.
+    fn charge_variable_lookup(&self, instrs: &mut InstrSeqBuilder, depth: u32) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.variable_depth, depth)
+    }
+
+    /// Charge copying a bound value out of its binding.
+    fn charge_variable_copy(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
+        self.charge_eval(instrs, |costs| costs.variable_size, size)
+    }
 }
+
+/// The runtime the interpreter charges for evaluation itself, rather than for
+/// any one word: resolving names, entering user-defined functions, and copying
+/// bound values out of their bindings.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalCosts {
+    function_lookup: Caf,
+    variable_depth: Caf,
+    variable_size: Caf,
+    user_function_application: Caf,
+    inner_type_check: Caf,
+}
+
+/// `costs-1`.
+const EVAL_COSTS_1: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(1_000),
+    variable_depth: Caf::Linear { a: 1_000, b: 1_000 },
+    variable_size: Caf::Linear { a: 1_000, b: 0 },
+    user_function_application: Caf::Linear { a: 1_000, b: 1_000 },
+    inner_type_check: Caf::Linear { a: 1_000, b: 1_000 },
+};
+
+/// `costs-2`, on both networks.
+const EVAL_COSTS_2: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(16),
+    variable_depth: Caf::Linear { a: 2, b: 14 },
+    variable_size: Caf::Linear { a: 2, b: 1 },
+    user_function_application: Caf::Linear { a: 26, b: 140 },
+    inner_type_check: Caf::Linear { a: 2, b: 9 },
+};
+
+/// `costs-3`, which `costs-4` and `costs-5` leave alone.
+const EVAL_COSTS_3: EvalCosts = EvalCosts {
+    function_lookup: Caf::Constant(16),
+    variable_depth: Caf::Linear { a: 1, b: 1 },
+    variable_size: Caf::Linear { a: 2, b: 1 },
+    user_function_application: Caf::Linear { a: 26, b: 5 },
+    inner_type_check: Caf::Linear { a: 2, b: 5 },
+};
 
 impl ChargeGenerator for WasmGenerator {
     fn cost_context(&self) -> Option<(&ChargeContext, &Module)> {
@@ -314,10 +416,19 @@ impl ChargeContext {
             StacksEpochId::Epoch40 => clar5::WORD_COSTS.get(name),
         }
     }
+
+    const fn eval_costs(&self) -> &'static EvalCosts {
+        match self.epoch {
+            StacksEpochId::Epoch10 => panic!("clarity did not exist in epoch 1"),
+            StacksEpochId::Epoch20 => &EVAL_COSTS_1,
+            StacksEpochId::Epoch2_05 => &EVAL_COSTS_2,
+            _ => &EVAL_COSTS_3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WordCost {
+pub struct WordCost {
     runtime: Caf,
     read_count: Caf,
     read_length: Caf,
@@ -327,7 +438,7 @@ struct WordCost {
 
 /// Cost assessment function
 #[derive(Debug, Clone, Copy)]
-enum Caf {
+pub enum Caf {
     /// Constant cost
     Constant(u32),
     /// Linear cost, scaling with `n`
@@ -1034,26 +1145,30 @@ mod word {
 
         let runtime = |word: &dyn Word| clar5::WORD_COSTS.get(&word.name()).unwrap().runtime;
 
-        assert!(matches!(runtime(&Secp256r1Verify), Caf::Constant(51_750)));
+        assert!(matches!(runtime(&Secp256r1Verify), Caf::Constant(38)));
         assert!(matches!(
             runtime(&Ed25519Verify),
             Caf::LinearShift {
-                a: 125,
-                b: 7_880,
-                shift: 10
+                a: 1,
+                b: 39,
+                shift: 9
             }
         ));
-        assert!(matches!(runtime(&Decompress), Caf::Constant(1_035)));
+        assert!(matches!(runtime(&Decompress), Caf::Constant(39)));
         assert!(matches!(
             runtime(&VerifyMerkleProof),
-            Caf::Linear { a: 125, b: 502 }
+            Caf::LinearShift {
+                a: 1,
+                b: 38,
+                shift: 2
+            }
         ));
         assert!(matches!(
             runtime(&GetBitcoinTxOutput),
             Caf::LinearShift {
-                a: 125,
-                b: 291,
-                shift: 10
+                a: 1,
+                b: 38,
+                shift: 9
             }
         ));
     }
@@ -1131,396 +1246,396 @@ mod word {
     // TODO: test `contract-call` and `contract-of`
 
     decl_tests!("add", "(+ 1 2 3)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 158,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 174,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("sub", "(- 10 9 1)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 158,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 174,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("mul", "(* 2 5 10)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 164,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 180,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("div", "(/ 10 5 2)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 164,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 180,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("log2", "(log2 1000)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 133,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 149,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("mod", "(mod 2 3)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 141,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 157,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("pow", "(pow 2 3)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 143,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 159,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("sqrti", "(sqrti 11)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 142,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 158,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("bitwise_and", "(bit-and 24 16)", {
-        3 => CostMeter { runtime: 159,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 175,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("bitwise_or", "(bit-or 24 16)", {
-        3 => CostMeter { runtime: 159,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 175,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("bitwise_xor", "(bit-xor 1 2)", {
-        3 => CostMeter { runtime: 159,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 175,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("bitwise_not", "(bit-not 3)", {
-        3 => CostMeter { runtime: 147,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 163,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("bitwise_lshift", "(bit-shift-left 2 u1)", {
-        3 => CostMeter { runtime: 167,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("bitwise_rshift", "(bit-shift-right 2 u1)", {
-        3 => CostMeter { runtime: 167,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("buf_to_int_be", "(buff-to-int-be 0x01)", {
-        3 => CostMeter { runtime: 141,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("buf_to_int_le", "(buff-to-int-le 0x01)", {
-        3 => CostMeter { runtime: 141,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("buf_to_uint_be", "(buff-to-uint-be 0x01)", {
-        3 => CostMeter { runtime: 141,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("buf_to_uint_le", "(buff-to-uint-le 0x01)", {
-        3 => CostMeter { runtime: 141,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("gt_int", "(> 1 2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("gte_int", "(>= 1 2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("lt_int", "(< 1 2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("lte_int", "(<= 1 2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("gt_buf", "(> 0xffff 0x4242)", {
-        3 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("gte_buf", "(>= 0xffff 0x4242)", {
-        3 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("lt_buf", "(< 0xffff 0x4242)", {
-        3 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("lte_buf", "(<= 0xffff 0x4242)", {
-        3 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("or", "(or true false)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 155,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 126,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("and", "(and true false)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 155,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 126,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("not", "(not true)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 138,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("to_int", "(to-int u238)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 135,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("to_uint", "(to-uint 238)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 135,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("int_to_ascii", "(int-to-ascii 1)", {
-        3 => CostMeter { runtime: 147,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("int_to_utf8", "(int-to-utf8 1)", {
-        3 => CostMeter { runtime: 181,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("string_to_int", "(string-to-int? \"1\")", {
-        3 => CostMeter { runtime: 168,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("string_to_uint", "(string-to-uint? \"1\")", {
-        3 => CostMeter { runtime: 168,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("hash160_int", "(hash160 0)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 218,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 205,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("keccak256_int", "(keccak256 0)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 238,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 144,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("sha256_int", "(sha256 0)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 117,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 117,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("sha512_int", "(sha512 0)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 193,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 193,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("sha512_256_int", "(sha512/256 0)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 205,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 73,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("hash160_buf", "(hash160 0xffff)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 208,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 195,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("keccak256_buf", "(keccak256 0xffff)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 228,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 134,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("sha256_buf", "(sha256 0xffff)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 107,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 107,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("sha512_buf", "(sha512 0xffff)", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 183,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         3 => CostMeter { runtime: 183,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("sha512_256_buf", "(sha512/256 0xffff)", {
+    decl_tests!("bitwise_rshift", "(bit-shift-right 2 u1)", {
+        3 => CostMeter { runtime: 183,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("buf_to_int_be", "(buff-to-int-be 0x01)", {
+        3 => CostMeter { runtime: 157,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("buf_to_int_le", "(buff-to-int-le 0x01)", {
+        3 => CostMeter { runtime: 157,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("buf_to_uint_be", "(buff-to-uint-be 0x01)", {
+        3 => CostMeter { runtime: 157,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("buf_to_uint_le", "(buff-to-uint-le 0x01)", {
+        3 => CostMeter { runtime: 157,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("gt_int", "(> 1 2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 195,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 63,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("stx_burn", "(stx-burn? u100 'S1G2081040G2081040G2081040G208105NK8PE5)", {
-        1 => CostMeter { runtime: 1000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        2 => CostMeter { runtime: 612,  read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        3 => CostMeter { runtime: 549,  read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-    });
-    decl_tests!("stx_get_balance", "(stx-get-balance 'S1G2081040G2081040G2081040G208105NK8PE5)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1385,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 4294,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("stx_get_account", "(stx-account 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR)", {
-        3 => CostMeter { runtime: 4654,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("principal_construct", "(principal-construct? 0x1a 0xfa6bf38ed557fe417333710d6033e9419391a320)", {
-        3 => CostMeter { runtime: 398,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("principal_destruct", "(principal-destruct? 'STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6)", {
-        3 => CostMeter { runtime: 314,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("let", "(let ((a 42) (b 24)) a)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1154,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 412,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("at_block", "(at-block 0x0000000000000000000000000000000000000000000000000000000000000000 1)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 210,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1327,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("get_block_info", "(get-block-info? time u0)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 6321,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("get_burn_block_info", "(get-burn-block-info? header-hash u677050)", {
-        3 => CostMeter { runtime: 96479,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("get_stacks_block_info", "(get-stacks-block-info? time u0)", {
-        3 => CostMeter { runtime: 6321,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("get_tenure_info", "(get-tenure-info? time u0)", {
-        3 => CostMeter { runtime: 0,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("asserts", "(asserts! true 1)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 170,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 128,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("filter", "(filter not (list true false true false))", {
-        1 => CostMeter { runtime: 10000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1394,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1179,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("if", "(if true 1 2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 200,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 168,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("match", "(match (some 1) value 1 2)", {
+    decl_tests!("gte_int", "(>= 1 2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 463,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("try", "(try! (some 1))", {
+    decl_tests!("lt_int", "(< 1 2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 439,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("unwrap", "(unwrap! (ok 1) 1)", {
+    decl_tests!("lte_int", "(<= 1 2)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 451,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("unwrap_err", "(unwrap-err! (err 1) false)", {
+    decl_tests!("gt_buf", "(> 0xffff 0x4242)", {
+        3 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("gte_buf", "(>= 0xffff 0x4242)", {
+        3 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("lt_buf", "(< 0xffff 0x4242)", {
+        3 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("lte_buf", "(<= 0xffff 0x4242)", {
+        3 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("or", "(or true false)", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 171,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 142,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("and", "(and true false)", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 171,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 142,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("not", "(not true)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 447,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 154,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("from_consensus_buff", "(from-consensus-buff? int 0x0000000000000000000000000000000001)", {
-        3 => CostMeter { runtime: 389,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("to_consensus_buff", "(to-consensus-buff? 1)", {
-        3 => CostMeter { runtime: 250,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("as_contract", "(as-contract 1)", {
-        3 => CostMeter { runtime: 138,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-    });
-    decl_tests!("begin", "(begin 1)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 202,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    decl_tests!("to_int", "(to-int u238)", {
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         3 => CostMeter { runtime: 151,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
-    decl_tests!("unwrap_err_panic", "(unwrap-err-panic (err 1))", {
+    decl_tests!("to_uint", "(to-uint 238)", {
         1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 569,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 501,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 151,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("int_to_ascii", "(int-to-ascii 1)", {
+        3 => CostMeter { runtime: 163,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("int_to_utf8", "(int-to-utf8 1)", {
+        3 => CostMeter { runtime: 197,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("string_to_int", "(string-to-int? \"1\")", {
+        3 => CostMeter { runtime: 184,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("string_to_uint", "(string-to-uint? \"1\")", {
+        3 => CostMeter { runtime: 184,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("hash160_int", "(hash160 0)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 234,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 221,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("keccak256_int", "(keccak256 0)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 254,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 160,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha256_int", "(sha256 0)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 133,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 133,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha512_int", "(sha512 0)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 209,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 209,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha512_256_int", "(sha512/256 0)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 221,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 89,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("hash160_buf", "(hash160 0xffff)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 224,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 211,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("keccak256_buf", "(keccak256 0xffff)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 244,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 150,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha256_buf", "(sha256 0xffff)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 123,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 123,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha512_buf", "(sha512 0xffff)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("sha512_256_buf", "(sha512/256 0xffff)", {
+        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 211,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 79,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("stx_burn", "(stx-burn? u100 'S1G2081040G2081040G2081040G208105NK8PE5)", {
+        1 => CostMeter { runtime: 2000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        2 => CostMeter { runtime: 628,  read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        3 => CostMeter { runtime: 565,  read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+    });
+    decl_tests!("stx_get_balance", "(stx-get-balance 'S1G2081040G2081040G2081040G208105NK8PE5)", {
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1401,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 4310,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("stx_get_account", "(stx-account 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR)", {
+        3 => CostMeter { runtime: 4670,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("principal_construct", "(principal-construct? 0x1a 0xfa6bf38ed557fe417333710d6033e9419391a320)", {
+        3 => CostMeter { runtime: 414,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("principal_destruct", "(principal-destruct? 'STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6)", {
+        3 => CostMeter { runtime: 330,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("let", "(let ((a 42) (b 24)) a)", {
+        1 => CostMeter { runtime: 22000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1219,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 463,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("at_block", "(at-block 0x0000000000000000000000000000000000000000000000000000000000000000 1)", {
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 226,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1343,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("get_block_info", "(get-block-info? time u0)", {
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 6337,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("get_burn_block_info", "(get-burn-block-info? header-hash u677050)", {
+        3 => CostMeter { runtime: 96495,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("get_stacks_block_info", "(get-stacks-block-info? time u0)", {
+        3 => CostMeter { runtime: 6337,  read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("get_tenure_info", "(get-tenure-info? time u0)", {
+        3 => CostMeter { runtime: 16,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("asserts", "(asserts! true 1)", {
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 144,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("filter", "(filter not (list true false true false))", {
+        1 => CostMeter { runtime: 12000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1426,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1211,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("if", "(if true 1 2)", {
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 216,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 184,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("match", "(match (some 1) value 1 2)", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 495,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("try", "(try! (some 1))", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 471,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("unwrap", "(unwrap! (ok 1) 1)", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 483,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("unwrap_err", "(unwrap-err! (err 1) false)", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 479,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("from_consensus_buff", "(from-consensus-buff? int 0x0000000000000000000000000000000001)", {
+        3 => CostMeter { runtime: 405,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("to_consensus_buff", "(to-consensus-buff? 1)", {
+        3 => CostMeter { runtime: 266,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("as_contract", "(as-contract 1)", {
+        3 => CostMeter { runtime: 154,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("begin", "(begin 1)", {
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 218,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 167,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+    });
+    decl_tests!("unwrap_err_panic", "(unwrap-err-panic (err 1))", {
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 601,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 533,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("unwrap_panic", "(unwrap-panic (some 1))", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 569,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 473,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 601,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 505,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("get_data_var", "(define-data-var i int 0) \
                                  (var-get i)", {
-        1 => CostMeter { runtime: 33000, read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 575,  read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 183,  read_count: 1, read_length: 33, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 18000, read_count: 1, read_length: 17, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 576,  read_count: 1, read_length: 18, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 184,  read_count: 1, read_length: 18, write_count: 0, write_length: 0 },
     });
     decl_tests!("set_data_var", "(define-data-var i int 0) \
                                  (var-set i 1)", {
-        1 => CostMeter { runtime: 17000, read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
-        2 => CostMeter { runtime: 771,  read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
-        3 => CostMeter { runtime: 735,  read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
+        1 => CostMeter { runtime: 18000, read_count: 0, read_length: 0, write_count: 1, write_length: 17 },
+        2 => CostMeter { runtime: 792,  read_count: 0, read_length: 0, write_count: 1, write_length: 18 },
+        3 => CostMeter { runtime: 756,  read_count: 0, read_length: 0, write_count: 1, write_length: 18 },
     });
     decl_tests!("default_to", "(default-to 0 none)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 287,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 268,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 303,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 284,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("err", "(err true)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 230,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 246,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("ok", "(ok true)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 230,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 246,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("some", "(some true)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 230,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 246,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 215,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("index_of_list", "(index-of (list 1 2 3) 2)", {
-        1 => CostMeter { runtime: 7000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 556,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 490,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 9000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 588,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 522,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("index_of_string_utf8", r#"(index-of u"hello" u"l")"#, {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 259,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 227,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 275,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 243,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("index_of_buff", r#"(index-of 0x1234567890 0x34)"#, {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 259,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 227,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 275,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 243,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_signed_int", "(is-eq 1 1)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 410,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 185,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 426,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 201,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_unsigned_int", "(is-eq u1 u1)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 410,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 185,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 426,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 201,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_bool", "(is-eq true true)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 153,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 202,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 169,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_principal", "(is-eq 'ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE 'ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 480,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 195,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 496,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 211,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_buffer", "(is-eq 0x68656c6c6f21 0x68656c6c6f21)", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 326,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 173,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 342,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 189,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_ascii_string", "(is-eq \"This is an ASCII string\" \"This is an ASCII string\")", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 564,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 207,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 580,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 223,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_utf8_string", "(is-eq u\"And this is an UTF-8 string \\u{1f601}\" u\"And this is an UTF-8 string \\u{1f601}\")", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 690,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 225,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 706,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 241,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_list", "(is-eq (list 1 2 3) (list 1 2 3))", {
-        1 => CostMeter { runtime: 11000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1436,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 675,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 14000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1484,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 723,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_optional", "(is-eq (some u5) (some u5))", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 884,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 585,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 932,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 633,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_tuple", "(is-eq {field1: 1, field2: (list 1 2 3)} {field1: 1, field2: (list 1 2 3)})", {
-        1 => CostMeter { runtime: 17000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 4186,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 4539,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 22000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 4266,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 4619,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_eq_error", "(is-eq (err u5) (err u5))", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 884,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 585,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 932,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 633,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("map_definition", "(define-map squares { x: int } { y: int })", {
         1 => CostMeter { runtime: 0, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1530,233 +1645,233 @@ mod word {
     decl_tests!("map_delete_existing", "(define-map squares { x: int } { y: int }) \
                                         (map-set squares {x: 1} {y : 0})
                                         (map-delete squares { x: 1 })", {
-        1 => CostMeter { runtime: 74000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
-        2 => CostMeter { runtime: 8003,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
-        3 => CostMeter { runtime: 9718,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        1 => CostMeter { runtime: 79000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
+        2 => CostMeter { runtime: 8087,  read_count: 2, read_length: 0, write_count: 2, write_length: 76 },
+        3 => CostMeter { runtime: 9802,  read_count: 2, read_length: 0, write_count: 2, write_length: 76 },
     });
     decl_tests!("map_delete_non_existing", "(define-map squares { x: int } { y: int }) \
                                             (map-set squares {x: 1} {y : 0})
                                             (map-delete squares { x: 0 })", {
-        1 => CostMeter { runtime: 74000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
-        2 => CostMeter { runtime: 7999,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
-        3 => CostMeter { runtime: 9714,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
+        1 => CostMeter { runtime: 79000, read_count: 2, read_length: 0, write_count: 2, write_length: 71 },
+        2 => CostMeter { runtime: 8083,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        3 => CostMeter { runtime: 9798,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
     });
     decl_tests!("map_get_non_existing", "(define-map squares { x: int } { y: int }) \
                                          (map-set squares {x: 1} {y : 0})
                                          (map-get? squares { x: 0 })", {
-        1 => CostMeter { runtime: 97000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
-        2 => CostMeter { runtime: 7262,  read_count: 2, read_length: 25, write_count: 1, write_length: 49 },
-        3 => CostMeter { runtime: 8768,  read_count: 2, read_length: 25, write_count: 1, write_length: 49 },
+        1 => CostMeter { runtime: 102000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
+        2 => CostMeter { runtime: 7346,  read_count: 2, read_length: 25, write_count: 1, write_length: 50 },
+        3 => CostMeter { runtime: 8852,  read_count: 2, read_length: 25, write_count: 1, write_length: 50 },
     });
     decl_tests!("map_get_existing", "(define-map squares { x: int } { y: int }) \
                                      (map-set squares {x: 1} {y : 0})
                                      (map-get? squares { x : 1 } )", {
-        1 => CostMeter { runtime: 97000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
-        2 => CostMeter { runtime: 7287,  read_count: 2, read_length: 50, write_count: 1, write_length: 49 },
-        3 => CostMeter { runtime: 8793,  read_count: 2, read_length: 50, write_count: 1, write_length: 49 },
+        1 => CostMeter { runtime: 102000, read_count: 2, read_length: 47, write_count: 1, write_length: 47},
+        2 => CostMeter { runtime: 7371,  read_count: 2, read_length: 50, write_count: 1, write_length: 50 },
+        3 => CostMeter { runtime: 8877,  read_count: 2, read_length: 50, write_count: 1, write_length: 50 },
     });
     decl_tests!("map_insert_existing", "(define-map squares { x: int } { y: int }) \
                                         (map-set squares {x: 1} {y : 0})
                                         (map-insert squares { x: 1 } { y: 1 })", {
-        1 => CostMeter { runtime: 98000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9100,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
-        3 => CostMeter { runtime: 11590,  read_count: 2, read_length: 0, write_count: 2, write_length: 74 },
+        1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
+        2 => CostMeter { runtime: 9200,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
+        3 => CostMeter { runtime: 11690,  read_count: 2, read_length: 0, write_count: 2, write_length: 75 },
     });
     decl_tests!("map_insert_non_existing", "(define-map squares { x: int } { y: int }) \
                                             (map-set squares {x: 1} {y : 0})
                                             (map-insert squares { x: 0 } { y: 1 })", {
-        1 => CostMeter { runtime: 98000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9196,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11686,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
+        2 => CostMeter { runtime: 9296,  read_count: 2, read_length: 0, write_count: 2, write_length: 99 },
+        3 => CostMeter { runtime: 11786,  read_count: 2, read_length: 0, write_count: 2, write_length: 99 },
     });
     decl_tests!("map_set_existing", "(define-map squares { x: int } { y: int }) \
                                      (map-set squares {x: 1} {y : 0})
                                      (map-set squares { x: 1 } { y: 1 })", {
-        1 => CostMeter { runtime: 98000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9196,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11686,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
+        2 => CostMeter { runtime: 9300,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
+        3 => CostMeter { runtime: 11790,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
     });
     decl_tests!("map_set_non_existing", "(define-map squares { x: int } { y: int }) \
                                          (map-set squares {x: 1} {y : 0})
                                          (map-set squares { x: 0 } { y: 1 })", {
-        1 => CostMeter { runtime: 98000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
-        2 => CostMeter { runtime: 9196,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
-        3 => CostMeter { runtime: 11686,  read_count: 2, read_length: 0, write_count: 2, write_length: 98 },
+        1 => CostMeter { runtime: 104000, read_count: 2, read_length: 0, write_count: 2, write_length: 94 },
+        2 => CostMeter { runtime: 9300,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
+        3 => CostMeter { runtime: 11790,  read_count: 2, read_length: 0, write_count: 2, write_length: 100 },
     });
     decl_tests!("is_none", "(is-none none)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 287,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 214,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 303,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 230,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_some", "(is-some (some 1))", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 394,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 426,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_standard", "(is-standard 'STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6)", {
-        3 => CostMeter { runtime: 127,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 143,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("principal_of", "(principal-of? 0x03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 999,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 984,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1015,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1000,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("print", "(print 0x1234567890)", {
-        1 => CostMeter { runtime: 9000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1437,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1578,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 10000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1453,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1594,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_err", "(is-err (err 1))", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 444,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 476,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("is_ok", "(is-ok (ok 1))", {
-        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 517,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 457,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 489,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("recover", "(secp256k1-recover? 0xde5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04 0x8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b873554428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 14344,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 8655,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 14360,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 8671,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("verify", "(secp256k1-verify 0xde5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04 0x8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b873554428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301 0x03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 13540,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 8349,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 13556,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 8365,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("append", "(append (list 1 2 3 4) 5)", {
-        1 => CostMeter { runtime: 11000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 785,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 870,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 13000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 817,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 902,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("as_max_len", "(as-max-len? 0x1234567890 u2)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 475,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 475,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 491,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 491,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("concat", "(concat 0x0102 0x0304)", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 544,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 368,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 6000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 560,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 384,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("element_at", "(element-at 0x1234567890 u2)", {
-        1 => CostMeter { runtime: 1000,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 619,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 498,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 635,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 514,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("element_at_alias", "(element-at? 0x1234567890 u2)", {
-        3 => CostMeter { runtime: 498,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 514,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("fold", "(fold * (list 2 2 2) 1)", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 723,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 666,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 7000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 755,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 698,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("len", "(len 0x010203)", {
-        1 => CostMeter { runtime: 1000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 486,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 429,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 502,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 445,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("list_cons", "(list 1 2 3)", {
-        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 240,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 206,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 256,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 222,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("map", "(define-private (zero-or-one (char (buff 1))) \
                           (if (is-eq char 0x00) 0x00 0x01)) \
                         (map zero-or-one 0x000102)", {
-        1 => CostMeter { runtime: 16000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 8312,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 7654,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 65000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 9054,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 7940,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("replace_at", "(replace-at? 0x00112233 u2 0x44)", {
-        3 => CostMeter { runtime: 565,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 581,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("slice", "(slice? 0x1234567890 u1 u3)", {
-        3 => CostMeter { runtime: 498,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 514,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("stx_transfer", "(stx-transfer? u100 'S1G2081040G2081040G2081040G208105NK8PE5 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 1430,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 4640,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 1446,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 4656,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("stx_transfer_memo", "(stx-transfer-memo? u100 'S1G2081040G2081040G2081040G208105NK8PE5 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM 0x12345678)", {
-        3 => CostMeter { runtime: 4709,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 4725,  read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_burn", "(define-fungible-token st) \
                             (ft-mint? st u100 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 1000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        2 => CostMeter { runtime: 1645, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        3 => CostMeter { runtime: 1479, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        1 => CostMeter { runtime: 2000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        2 => CostMeter { runtime: 1661, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        3 => CostMeter { runtime: 1495, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
     });
     decl_tests!("nft_burn", "(define-non-fungible-token st int) \
                              (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 3000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 813, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 593, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 4000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 829, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 609, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_get_balance", "(define-fungible-token st) \
                                    (ft-get-balance st 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 547, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 479, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 563, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 495, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
     });
     decl_tests!("nft_get_owner", "(define-non-fungible-token st int) \
                                   (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF) \
                                   (nft-get-owner? st 1)", {
-        1 => CostMeter { runtime: 6000, read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 1626,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 1406,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 8000, read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 1658,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 1438,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_get_supply", "(define-fungible-token st) \
                                   (ft-get-supply st)", {
-        1 => CostMeter { runtime: 1000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 483, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 420, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 2000, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 499, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 436, read_count: 1, read_length: 1, write_count: 0, write_length: 0 },
     });
     decl_tests!("ft_mint", "(define-fungible-token st) \
                             (ft-mint? st u100 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 1000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        2 => CostMeter { runtime: 1645, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
-        3 => CostMeter { runtime: 1479, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        1 => CostMeter { runtime: 2000, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        2 => CostMeter { runtime: 1661, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
+        3 => CostMeter { runtime: 1495, read_count: 2, read_length: 1, write_count: 2, write_length: 1 },
     });
     decl_tests!("nft_mint", "(define-non-fungible-token st int) \
                              (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 3000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 813, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 593, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 4000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 829, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 609, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_transfer", "(define-fungible-token st) \
                                 (ft-mint? st u100 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR) \
                                 (ft-transfer? st u50 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF) \
                                 (ft-transfer? st u60 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 3000, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
-        2 => CostMeter { runtime: 2869, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
-        3 => CostMeter { runtime: 2577, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
+        1 => CostMeter { runtime: 6000, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
+        2 => CostMeter { runtime: 2917, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
+        3 => CostMeter { runtime: 2625, read_count: 6, read_length: 3, write_count: 6, write_length: 3 },
     });
     decl_tests!("nft_transfer", "(define-non-fungible-token st int) \
                                  (nft-mint? st 1 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR) \
                                  (nft-transfer? st 1 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 6000, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
-        2 => CostMeter { runtime: 1626, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
-        3 => CostMeter { runtime: 1183, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        1 => CostMeter { runtime: 8000, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        2 => CostMeter { runtime: 1658, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        3 => CostMeter { runtime: 1215, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
     });
     decl_tests!("tuple_cons", "(tuple (b 0x0102) (id 1337))", {
-        1 => CostMeter { runtime: 3000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 1123,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 1896,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 1139,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 1912,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("tuple_get", "(get id (tuple (b 0x0102) (id 1337)))", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 2911,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 3640,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 7000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 2943,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 3672,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("tuple_merge", "(merge {a: 1} {b: 2})", {
-        1 => CostMeter { runtime: 5000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        2 => CostMeter { runtime: 3040,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
-        3 => CostMeter { runtime: 4352,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        1 => CostMeter { runtime: 8000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        2 => CostMeter { runtime: 3088,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 4400,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
 
     decl_tests_with_contract_call!(
@@ -1767,9 +1882,9 @@ mod word {
         ),
         ("caller", "(contract-call? .callee foo (ok true) 2 3 4)"),
         {
-                 1 => CostMeter { runtime: 155000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 2 => CostMeter { runtime: 1409, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
-                 3 => CostMeter { runtime: 1081, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 1 => CostMeter { runtime: 142000, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 2 => CostMeter { runtime: 1274, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
+                 3 => CostMeter { runtime: 965, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
              }
     );
 
@@ -1804,4 +1919,80 @@ mod word {
     //     2 => CostMeter { runtime: 199,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     //     3 => CostMeter { runtime: 164,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     // });
+}
+
+/// Charging regressions reduced from the captured chain, each asserted against
+/// the interpreter rather than a hand-written expectation.
+#[cfg(test)]
+mod crosscheck {
+    use clarity::vm::Value;
+
+    use crate::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
+
+    #[test]
+    fn charges_every_application() {
+        for snippet in [
+            "(define-public (f) (ok u1))",
+            "(define-public (f) (begin (ok u1)))",
+            "(define-public (f) (ok (+ u1 u2 u3)))",
+            "(define-public (f) (ok tx-sender))",
+            "(define-public (f) (ok (if true u1 u2)))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_entering_a_function_once() {
+        for (snippet, arguments) in [
+            ("(define-public (f (a uint)) (ok a))", vec![Value::UInt(1)]),
+            (
+                "(define-public (f (a uint) (b uint)) (ok (+ a b)))",
+                vec![Value::UInt(1), Value::UInt(2)],
+            ),
+            (
+                "(define-private (g (a uint)) a) (define-public (f) (ok (g u1)))",
+                vec![],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &arguments);
+        }
+    }
+
+    #[test]
+    fn charges_reading_a_bound_value() {
+        for snippet in [
+            "(define-public (f) (ok (let ((a { x: u1, y: u2 })) (get x a))))",
+            "(define-private (g (a { x: uint })) (get x a)) (define-public (f) (ok (g { x: u1 })))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_what_a_data_word_serializes_to() {
+        for snippet in [
+            "(define-data-var v uint u0) (define-public (f) (ok (var-get v)))",
+            "(define-data-var v uint u0) (define-public (f) (ok (var-set v u7)))",
+            "(define-data-var v (buff 100) 0x00) (define-public (f) (begin (var-set v 0x0102030405) (ok (var-get v))))",
+            "(define-map m uint { a: uint, b: principal }) (define-public (f) (begin (map-set m u1 { a: u2, b: tx-sender }) (ok (map-get? m u1))))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_a_cross_contract_call_once() {
+        crosscheck_cost_multi_contract(
+            &[
+                ("callee", "(define-public (h (a uint)) (ok a))"),
+                (
+                    "caller",
+                    "(define-public (f) (contract-call? .callee h u1))",
+                ),
+            ],
+            "f",
+            &[],
+        );
+    }
 }

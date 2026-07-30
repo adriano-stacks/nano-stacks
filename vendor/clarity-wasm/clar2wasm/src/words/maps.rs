@@ -316,6 +316,10 @@ impl ComplexWord for MapSet {
             builder
                 .local_get(**cost_local)
                 .binop(BinaryOp::I32Add)
+                // A map stores its value wrapped in an optional, so what lands
+                // in the store is one `some` tag longer than the value itself.
+                .i32_const(1)
+                .binop(BinaryOp::I32Add)
                 .local_set(**cost_local);
         }
 

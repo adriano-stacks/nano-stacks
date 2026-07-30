@@ -11,14 +11,16 @@ use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use clarity::types::StacksEpochId;
 use clarity::vm::analysis::run_analysis;
 use clarity::vm::ast::build_ast;
-use clarity::vm::contexts::{EventBatch, GlobalContext};
+use clarity::vm::contexts::{EventBatch, GlobalContext, OwnedEnvironment};
 use clarity::vm::costs::{CostTracker, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::ClarityDatabase;
 use clarity::vm::errors::{StaticCheckErrorKind, VmExecutionError, VmInternalError};
 use clarity::vm::events::{SmartContractEventData, StacksTransactionEvent};
 use clarity::vm::resource_limiter::ResourceLimiter;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData};
-use clarity::vm::{eval_all, ClarityVersion, ContractContext, ContractName, Value};
+use clarity::vm::{
+    eval_all, ClarityVersion, ContractContext, ContractName, SymbolicExpression, Value,
+};
 use clarity_types::types::TypeSignature;
 use regex::Regex;
 
@@ -405,6 +407,54 @@ impl TestEnvironment {
         }
         self.cost_tracker = global_context.cost_track;
         result
+    }
+
+    /// The interpreter's counterpart to [`Self::call_contract`], so a public
+    /// function can be charged through both runtimes from the same state.
+    pub fn interpret_call_contract(
+        &mut self,
+        contract_name: &str,
+        function_name: &str,
+        arguments: &[Value],
+    ) -> Result<Value, VmExecutionError> {
+        let contract_id = QualifiedContractIdentifier::new(
+            StandardPrincipalData::transient(),
+            ContractName::try_from(contract_name)?,
+        );
+        let connection = ClarityDatabase::new(
+            &mut self.datastore,
+            &self.burn_datastore,
+            &self.burn_datastore,
+        );
+        let mut tracker = LimitedCostTracker::new_free();
+        std::mem::swap(&mut self.cost_tracker, &mut tracker);
+        let mut environment = OwnedEnvironment::new_cost_limited(
+            self.is_mainnet,
+            self.chain_id,
+            connection,
+            tracker,
+            self.epoch,
+        );
+        let arguments = arguments
+            .iter()
+            .cloned()
+            .map(SymbolicExpression::atom_value)
+            .collect::<Vec<_>>();
+        let result = environment.execute_transaction(
+            PrincipalData::Standard(StandardPrincipalData::transient()),
+            None,
+            contract_id,
+            function_name,
+            &arguments,
+        );
+        let (_, tracker) = environment
+            .destruct()
+            .expect("interpreted call should leave the database usable");
+        self.cost_tracker = tracker;
+        result.map(|(value, _, events)| {
+            self.events.push(EventBatch { events });
+            value
+        })
     }
 
     pub fn get_events(&self) -> &Vec<EventBatch> {
@@ -1030,6 +1080,68 @@ pub fn crosscheck_with_network(
         "value is not the expected {:?}",
         eval.compiled
     );
+}
+
+/// Assert that the compiler and the interpreter charge the same five cost
+/// dimensions for calling `function` on a contract built from `snippet`.
+///
+/// Only the call is charged: the deployment runs on both sides first and its
+/// cost is excluded, which is the shape a transaction against an already
+/// published contract has.
+pub fn crosscheck_cost(snippet: &str, function: &str, arguments: &[Value]) {
+    crosscheck_cost_multi_contract(&[("snippet", snippet)], function, arguments);
+}
+
+/// [`crosscheck_cost`] over a sequence of contracts, calling into the last.
+pub fn crosscheck_cost_multi_contract(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Value],
+) {
+    let (compiled, interpreted) = cost_crosscheck(contracts, function, arguments);
+    assert_eq!(
+        compiled, interpreted,
+        "compiled and interpreted costs diverge calling {function} on {contracts:?}"
+    );
+}
+
+/// Charge one contract call through the compiler and through the interpreter,
+/// and report what each one charged.
+///
+/// Only the call is charged: the deployments run on both sides first and their
+/// cost is excluded, which is the shape a transaction against an already
+/// published contract has.
+pub fn cost_crosscheck(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Value],
+) -> (CostMeter, CostMeter) {
+    let env =
+        TestEnvironment::new_with_cost(TestConfig::latest_epoch(), TestConfig::clarity_version());
+    let mut interpreted_env = env.clone();
+    let mut compiled_env = env;
+    for (name, snippet) in contracts {
+        assert_eq!(
+            compiled_env.init_contract_with_snippet(name, snippet),
+            interpreted_env.interpret_contract_with_snippet(name, snippet),
+            "compiled and interpreted deployments diverge for {snippet}"
+        );
+    }
+    let called = contracts
+        .last()
+        .expect("a call needs a contract to call into")
+        .0;
+    let compiled_before = CostMeter::from(compiled_env.cost_tracker.get_total());
+    let interpreted_before = CostMeter::from(interpreted_env.cost_tracker.get_total());
+    assert_eq!(
+        compiled_env.call_contract(called, function, arguments),
+        interpreted_env.interpret_call_contract(called, function, arguments),
+        "compiled and interpreted results diverge calling {function} on {called}"
+    );
+    (
+        CostMeter::from(compiled_env.cost_tracker.get_total()).saturating_sub(compiled_before),
+        CostMeter::from(interpreted_env.cost_tracker.get_total()).saturating_sub(interpreted_before),
+    )
 }
 
 // Represents a boot contract on disk

@@ -34,6 +34,10 @@ impl ComplexWord for Let {
         // Save the current named locals
         let saved_locals = generator.bindings.clone();
 
+        // The bindings and the body are both read from a nested scope, which
+        // costs more to search than the one the `let` itself sits in.
+        generator.bindings.enter_scope()?;
+
         // Traverse the bindings
         for i in 0..bindings.len() {
             let pair = bindings.get_list(i)?;
