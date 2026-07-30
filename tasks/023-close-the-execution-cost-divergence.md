@@ -54,8 +54,10 @@ about when a block is full and when a tenure must be extended.
       contract over two environments does it, and found another 31.
 - [x] Bisect `.pox-5 stake` for that 31 — it was `try!`, and three more words
       had the same fault.
-- [ ] Find the 66 on a *successful* `stake-update`, which none of the aborting
-      paths reach.
+- [x] Reach `stake-update` on seeded state and narrow the residual to one of
+      its callees.
+- [ ] Seed enough of pox-5 for `remove-staker-from-cycles` to succeed, and find
+      the 33 there — then check whether it is also the capture's 66.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -283,6 +285,29 @@ aborting operand now crosscheck exactly, and **`.pox-5 stake` matches**.
 The lesson is that "charged before its operands" is a fault of a *word*, not of
 a shape, so the sweep has to be over words. Four rounds of it have now found
 eight.
+
+### Where `stake-update` stands
+
+The same seeding technique reaches `stake-update` too, by appending a `seed!`
+helper to a local copy that fills `signer-key-grants`, `signers`, `staker-info`
+and `staker-signer-cycle-memberships` — leaving `stake-update` itself verbatim,
+so what is measured is the real function.
+
+Prefix probes over its body put the residual on **`remove-staker-from-cycles`**:
+every prefix up to and including the balance assertion matches exactly, and the
+step that adds that call is over by 33.
+
+It is not the obvious shape. A `fold` whose body traps crosschecks exactly —
+over a uint accumulator, a response accumulator and a tuple accumulator — as do
+a trapping `map` and `filter`. So it is something that function does beyond
+folding, and reaching it cleanly needs more of pox-5's state than is seeded so
+far: the call currently aborts inside it on an arithmetic underflow, which real
+state would not do.
+
+Two caveats worth keeping. That 33 is on an *aborting* path, where the
+capture's 66 is on a successful one, so they may not be the same fault. And 33
+is exactly the copy cost of a uint (`2n + 1`), which is the signature the
+earlier copy bugs had.
 
 ### What the remaining 66 is not
 
