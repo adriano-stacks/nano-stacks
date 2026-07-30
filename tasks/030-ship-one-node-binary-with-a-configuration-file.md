@@ -57,6 +57,18 @@ every one carrying nano's signature, three of them mined by nano — was driven
 by the separate binaries this task replaced. Re-running `verify` against a
 fresh Hacknet is what closes the acceptance criterion.
 
+A second attempt on a freshly booted Hacknet did not get there either: that
+network froze its Stacks tip at height 274 while Bitcoin ran on, before nano
+was started into it. Two Hacknets wedging unprompted is an environment
+question, not a nano one, and it is not something this task can settle.
+
+What the attempts did surface, both real:
+
+- the export and the fixture capture published different checkpoint manifests,
+  so the node could not read a Hacknet checkpoint at all — fixed
+- a stale miner identity ends the whole process, taking the signer with it —
+  [[039-keep-the-node-alive-when-one-role-fails]]
+
 ## What this left
 
 - The signer keeps a chainstate of its own, under the same working directory,
