@@ -1,8 +1,10 @@
 # Replacing a Hacknet participant with nano-stacks
 
 A Hacknet participant is a `stacks-node` and the `stacks-signer` it feeds. nano
-replaces one of them: it holds the Stacks key that participant staked, executes
-every block from its own checkpoint, and answers the miner over `StackerDB`.
+replaces both halves with one binary: it holds the Stacks key that participant
+staked, executes every block from its own checkpoint, and answers the miner over
+`StackerDB`. Following, signing and mining are roles a single `stacks-node
+start --config` process switches on from its configuration file.
 
 Hacknet stacks three signers of equal weight against a threshold of seven tenths,
 so **no block is accepted without all three**. A network that keeps producing
@@ -16,10 +18,10 @@ hacknet/harness.sh setup            # clone Hacknet at the pinned commit and pat
 hacknet/harness.sh up               # build and boot from genesis
 hacknet/harness.sh wait 285         # epoch 4.0 starts at 262, PoX-5 cycle 14 at 280
 hacknet/harness.sh checkpoint       # export the state nano validates from
-hacknet/harness.sh replace 3        # stop participant 3 and sign in its place
+hacknet/harness.sh replace 3        # stop participant 3 and run nano in its place
 hacknet/harness.sh fund             # give nano a funded Bitcoin wallet and miner keys
 hacknet/harness.sh register         # register nano's leader key on Bitcoin
-hacknet/harness.sh mine             # commit every Bitcoin block, mine every tenure won
+hacknet/harness.sh mine             # restart nano with the mining role on
 hacknet/harness.sh verify           # assert the network keeps doing every kind of work
 hacknet/harness.sh restore          # put the stock participant back
 hacknet/harness.sh down
@@ -30,13 +32,21 @@ stops competing for tenures and the other two miners carry the chain. `fund`,
 `register` and `mine` add the other half, so nano commits on Bitcoin and mines
 the tenures it wins.
 
+`replace` writes `run/nano.toml` and starts the node from it; `mine` rewrites
+that file with a `[miner]` table and restarts the same process, which comes back
+to the state it left on disk rather than importing the checkpoint again. `config`
+prints what would be written without starting anything, and `restore` stops the
+node with `SIGTERM`. Set `NANO_RPC_BIND` to serve the public RPC as well, and
+`NANO_EVENT_OBSERVERS` to a comma-separated list to post events.
+
 `status` prints the heights of all three participants, the reward cycle, and
 whether nano is running. `wait` fails as soon as Bitcoin advances with a frozen
 Stacks tip, which is what a broken replacement looks like.
 
 Each command is independent, so a run can be inspected or interrupted at any
-stage. The clone, the checkpoint, the signer log and the state file live under
-`~/.cache/nano-stacks/hacknet` (`NANO_HACKNET_HOME`).
+stage. The clone, the checkpoint, the configuration, the log and every byte of
+nano's own state live under `~/.cache/nano-stacks/hacknet` (`NANO_HACKNET_HOME`),
+with the node's state in `run/nano`.
 
 Compose is driven directly rather than through Hacknet's Makefile, whose Linux
 path assumes rootful Docker: it removes chainstate with `sudo` and extracts
