@@ -249,9 +249,9 @@ magic = "${NANO_BITCOIN_MAGIC:-T3}"
 [checkpoint]
 marf = "$RUN/checkpoint/marf.sqlite"
 source_state_id = "$(checkpoint_value source_state_id)"
-state_root = "$(checkpoint_value state_index_root)"
+state_root = "$(checkpoint_value published_state_index_root)"
 anchor_block = "$RUN/checkpoint/anchor-block.bin"
-anchor_bitcoin_height = $(checkpoint_value anchor_bitcoin_height)
+anchor_bitcoin_height = $(checkpoint_value first_bitcoin_height)
 tenure_accounting = "$RUN/checkpoint/native-effects.json"
 
 [signer]

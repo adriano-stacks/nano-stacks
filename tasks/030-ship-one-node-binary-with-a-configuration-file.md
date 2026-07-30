@@ -39,6 +39,24 @@ place, and shuts down cleanly on `SIGTERM`.
 - The Hacknet replacement run passes driving that binary.
 - Stopping and restarting mid-tenure resumes without re-importing.
 
+## Validation status
+
+The binary starts, imports its checkpoint, resumes from state on disk, takes
+its signing slot for the reward cycle, wins a sortition, assembles a block and
+publishes a proposal — all observed in a real Hacknet run.
+
+It is **not** yet validated end to end. The Hacknet it was started into had
+already wedged: all three stock containers stopped logging within seconds of
+each other about an hour before the swap, with the Stacks tip frozen while
+Bitcoin ran on. nano therefore had no counterparties to gather signatures from,
+and `advancing the tenure failed: signer weight is below approval threshold` is
+what that looks like from the inside.
+
+The `verify` run that did pass — 40 canonical blocks across a cycle rollover,
+every one carrying nano's signature, three of them mined by nano — was driven
+by the separate binaries this task replaced. Re-running `verify` against a
+fresh Hacknet is what closes the acceptance criterion.
+
 ## What this left
 
 - The signer keeps a chainstate of its own, under the same working directory,

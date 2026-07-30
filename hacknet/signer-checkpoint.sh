@@ -175,10 +175,13 @@ json.dump(
 )
 PY
 
+# The same manifest a captured fixture publishes, so a checkpoint reads the
+# same whether it came from here or from `cargo xtask capture-fixtures`.
 cat > "$OUT/checkpoint.toml" <<EOF
+format = "stacks-core-marf-sqlite-v2"
 checkpoint_stacks_height = $checkpoint_height
 source_state_id = "$checkpoint_id"
-state_index_root = "$state_root"
-anchor_bitcoin_height = $anchor_bitcoin_height
+published_state_index_root = "$state_root"
+first_bitcoin_height = $anchor_bitcoin_height
 EOF
 cat "$OUT/checkpoint.toml"
