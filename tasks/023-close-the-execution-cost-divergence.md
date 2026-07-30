@@ -47,8 +47,9 @@ about when a block is full and when a tenure must be extended.
       is un-ignored and covers all three forms.
 - [x] Charge an aborted expression for what it did, not for the enclosing work
       it never reached. One of the nine divergences was this.
-- [ ] Find what remains of the 65, which needs a crosscheck against real
-      `.pox-5` state rather than a snippet.
+- [x] Charge `print` for the value rather than for its type's name.
+- [ ] Find what remains, which needs a crosscheck against real `.pox-5` state
+      rather than a snippet.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -205,10 +206,25 @@ real but it was the *abort* it caused, not the arithmetic. Two of the three
 false leads this task has produced were snippets that measured the engines
 doing something other than the work.
 
-### What the remaining 65 is not
+### `print` charged for the type's name — fixed
+
+`special_print` charges for `input.size()`. nano charged for the length of the
+type's *textual form*: a different quantity that sits close for simple values
+and drifts as soon as a tuple carries long field names — which is the shape
+every `.pox-5` event print has, and `stake-update` prints a merged eleven-field
+tuple.
+
+Eleven shapes crosscheck exactly now, where a tuple with long names was short
+by one and a forty-field one by two.
+
+It moves the first divergence from 65 to **66**, because nano was under here
+and is over elsewhere. Both are right and the net is not the measure of either
+— the same thing happened when the fold lookup went in.
+
+### What the remaining 66 is not
 
 The eight that remain are all **successful** transactions: seven `.pox-5
-stake-update` over by 65 and one `.pox-5 stake` over by 32.
+stake-update` and one `.pox-5 stake`.
 
 Trait arguments fitted those numbers and are not the cause. A probe saying
 otherwise had called the functions with fewer arguments than they declare; with
@@ -224,8 +240,13 @@ tuple, `map-insert`, `map-delete`, `var-set`, `var-get`, `get`, nested `get`,
 `default-to`, tuple construction, `let`, `begin`, `match`, `is-some`,
 `to-uint`, `unwrap!` — every one exact.
 
+Nor the pox-5 iteration shape: a `fold` over `(unwrap-panic (slice? (list u0 …
+u95) u0 n))` with a response-tuple accumulator — what `remove-staker-from-cycles`
+and `add-staker-to-signer-cycles` do — is exact, as are map reads and writes
+whose declared types are far larger than what they hold.
+
 Nano adds nothing outside the VM either: the transaction's cost tracker starts
-at zero, so the 65 is inside the compiler.
+at zero, so what remains is inside the compiler.
 
 What is left is the shape of the whole call: state a fresh environment does not
 have, or values the size the real maps hold. Reducing against a real `.pox-5`
