@@ -157,6 +157,17 @@ pub(crate) static COMPLEX_WORDS: &[&'static dyn ComplexWord] = &[
 ];
 
 pub trait SimpleWord: Word {
+    /// Whether the interpreter reads this word's operands where they are
+    /// rather than copying them out of their bindings.
+    ///
+    /// A word that reads in place does not pay to copy, so charging its
+    /// operands as copies costs more than the interpreter charges — and does
+    /// so once per bound name, which compounds through a contract that
+    /// compares as often as pox-5 does.
+    fn reads_operands_in_place(&self) -> bool {
+        false
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,

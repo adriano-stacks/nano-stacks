@@ -75,6 +75,10 @@ impl Word for CmpLess {
 }
 
 impl SimpleWord for CmpLess {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,
@@ -102,6 +106,10 @@ impl Word for CmpLeq {
 }
 
 impl SimpleWord for CmpLeq {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,
@@ -129,6 +137,10 @@ impl Word for CmpGreater {
 }
 
 impl SimpleWord for CmpGreater {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,
@@ -156,6 +168,10 @@ impl Word for CmpGeq {
 }
 
 impl SimpleWord for CmpGeq {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,

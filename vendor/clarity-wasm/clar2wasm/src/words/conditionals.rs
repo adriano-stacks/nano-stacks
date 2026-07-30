@@ -302,7 +302,10 @@ impl ComplexWord for If {
         let id_true = generator.block_from_expr(builder, true_branch)?;
         let id_false = generator.block_from_expr(builder, false_branch)?;
 
-        generator.traverse_expr(builder, conditional)?;
+        // The interpreter reads the condition where it is rather than
+        // copying it out of its binding, so a bound name here does not pay
+        // to be copied.
+        generator.traverse_expr_as_borrowed_value(builder, conditional)?;
 
         builder.instr(ir::IfElse {
             consequent: id_true,

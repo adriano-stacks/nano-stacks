@@ -672,8 +672,13 @@ impl WasmGenerator {
                     let (arg_types, return_type) = get_types()?;
 
                     // traverse arguments
+                    let borrowed = simpleword.reads_operands_in_place();
                     for arg in args {
-                        self.traverse_expr(builder, arg)?;
+                        if borrowed {
+                            self.traverse_expr_as_borrowed_value(builder, arg)?;
+                        } else {
+                            self.traverse_expr(builder, arg)?;
+                        }
                     }
 
                     simpleword.visit(self, builder, &arg_types, &return_type)?;

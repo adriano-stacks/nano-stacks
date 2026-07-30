@@ -36,9 +36,10 @@ about when a block is full and when a tenure must be extended.
 - [x] Fix the vendored compiler's charging for it and keep the case as a
       regression test.
 - [x] Reduce the remaining divergence to the words that cause it.
-- [ ] Fix the charge for an ordered comparison and a computed branch condition
-      over a bound name, and un-ignore
-      `charges_a_comparison_or_branch_over_a_bound_name`.
+- [x] Stop charging a copy for operands the interpreter reads in place.
+- [ ] Account for `fold`'s function-argument lookup, and un-ignore
+      `charges_folding_a_function_over_a_list`.
+- [ ] Find what remains of the 513 after that.
 - [x] Assert per-snippet dimension equality against the interpreter, not only
       block-level acceptance.
 
@@ -93,28 +94,22 @@ What remains, measured against a capture from the pinned revision, is runtime
 high by **843 in 231,186 — 0.36%** — at the first divergence. That transaction
 is a `.pox-5 stake-update` call.
 
-The residual is **not** in argument handling — four fixes and one ruling-out
-failed to move it — and it is no longer a mystery. Bisecting `stake-update`'s
-body reduced it to two shapes, both constant and neither varying with the
-operand types:
+Bisecting `stake-update`'s body found it, and it was not argument handling at
+all. An **ordered comparison against a bound name** cost 33 too much and an
+**`if` with a computed condition** cost 31 — both constant, both once per bound
+name, neither varying with the operand types. Two literals compared exactly,
+and so did `is-eq` and `+` over the same binding.
 
-- an **ordered comparison against a bound name** costs **33** too much.
-  `(> u1 u2)` on two literals is exact, and so are `is-eq` and `+` over the
-  same binding, so it is `<`, `<=`, `>`, `>=` reading a bound value. They go
-  through `special_geq_v2`, which charges `min(a.size(), b.size())` over the
-  *evaluated* operands (`vm/functions/arithmetic.rs`), where nano takes the
-  minimum of the declared types.
-- an **`if` whose condition is computed** rather than literal costs **31** too
-  much.
+The cause: the interpreter reads those operands where they are, while nano
+charged them as copies out of their bindings. `traverse_expr_without_value_copy_charge`
+already existed for exactly this and the comparisons did not use it. `<`, `<=`,
+`>`, `>=` and `if`'s condition now do, and every case is a passing crosscheck
+rather than a reproduction.
 
-pox-5 asserts and branches with these throughout, which is how 843 in 231,186
-accumulates across one `stake-update`.
-
-`cost::crosscheck::charges_a_comparison_or_branch_over_a_bound_name` is the
-reproduction, three lines a case. It is `#[ignore]`d because it fails: it is
-the reproduction, not a regression guard, and belongs un-ignored the moment
-the charge is fixed. `charges_what_stake_update_is_made_of` covers what the
-same function does that is already exact.
+That took the divergence from **843 to 513** in 231,186 — 0.36% to 0.22%. What
+is left is at least `fold`'s missing function-argument lookup, which
+under-charges in the other direction and is the one case still
+`#[ignore]`d.
 
 Also still open, and in the other direction: `fold`/`map`/`filter` miss the
 function-argument lookup, 16 plus 1 per element.
