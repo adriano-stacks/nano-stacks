@@ -90,26 +90,31 @@ Two things were needed to use it, one of them now done:
   stream *will* be interrupted — it was, twice, with `Unexpected EOF in
   archive`. It has to land on disk first, resumably.
 
-## Where the transfer got to
+## The transfer works; the chainstate does not fit
 
-Running, detached and resumable, under `/home/aldur/fetch-mainnet.sh`. It had
-38 GiB of 208 GiB when this was written, and the archive host throttles: the
-first minutes ran at 21 MB/s and it settled to 6 MB/s, which puts the rest
-around seven hours. It survives interruption — `curl -C -` in a retry loop, to
-a file rather than a pipe — so it does not need watching.
+The archive downloads fine. The host throttles **per connection** — one stream
+settles to 6 MB/s while a second fresh one gets 42 — so twelve parallel ranges
+pull it at about 110 MB/s, and all 223,511,739,939 bytes arrived and joined to
+exactly that size.
 
-When it lands:
+Two things went wrong on the way, both worth keeping:
 
-```sh
-zstd -d --long=31 -c archive.tar.zst | tar -x -C /home/aldur/mainnet-chainstate \
-  --wildcards "*/chainstate/vm/*" "*/chainstate/blocks/nakamoto.sqlite" \
-               "*/chainstate/index.sqlite" "*/burnchain/sortition/*"
-cargo xtask capture-fixtures --node-root /home/aldur/mainnet-chainstate/mainnet ...
-```
+- `curl -C -` and `-r` are incompatible, and retrying a *range* while appending
+  with `>>` duplicates it: curl's own `--retry` re-requests the whole range.
+  That produced an archive 7.4 GB too long. Each part must be written with
+  `-o`, so a retry overwrites.
+- **It does not fit.** `chainstate/vm/clarity/marf.sqlite.blobs` alone is
+  228 GB and `marf.sqlite` more than 146 GB, and extraction needs the 208 GiB
+  archive present throughout. Peak demand is over 600 GB against the 612 GB
+  free here, and the extraction filled the disk to 100% before being stopped.
 
-The capture will refuse for want of `--events-dir`, which is the next thing to
-fix and is deliberately left until the refusal is real rather than predicted —
-building for a guessed failure is how the `to-ascii?` detour started.
+That was foreseeable from the archive's own contents and should have been
+computed before spending the bandwidth. Everything downloaded has been removed
+and the disk restored.
+
+So the blocker is no longer the data — it is **room for it**. What this needs
+is a machine with roughly a terabyte free, or better, running the capture where
+a synced node already lives, which avoids the archive entirely.
 
 ## The unlock heights the capture needs
 
