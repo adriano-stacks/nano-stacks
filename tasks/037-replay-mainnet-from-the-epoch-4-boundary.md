@@ -27,9 +27,11 @@ depends on are done.
 
 ## Tasks
 
-- [ ] Capture a mainnet checkpoint at or after the 4.0 boundary, with the blocks,
-      the burn blocks and the receipts that follow it.
-- [ ] Teach the fixture tooling and the scoreboard about a mainnet capture.
+- [x] Capture a mainnet checkpoint at or after the 4.0 boundary, with the
+      blocks and the burn blocks that follow it. Receipts need an observer.
+- [x] Teach the fixture tooling and the scoreboard about a mainnet capture.
+- [ ] Make `import_checkpoint` work in bounded memory, so a mainnet-sized MARF
+      can be imported at all.
 - [ ] Replay forward and report the first divergence with the field that
       diverged.
 - [ ] Work the divergence point forward until it stops moving for a real reason
@@ -90,31 +92,53 @@ Two things were needed to use it, one of them now done:
   stream *will* be interrupted — it was, twice, with `Unexpected EOF in
   archive`. It has to land on disk first, resumably.
 
-## The transfer works; the chainstate does not fit
+## The capture works
 
-The archive downloads fine. The host throttles **per connection** — one stream
-settles to 6 MB/s while a second fresh one gets 42 — so twelve parallel ranges
-pull it at about 110 MB/s, and all 223,511,739,939 bytes arrived and joined to
-exactly that size.
+The archive downloads and extracts, and **a mainnet capture succeeds**:
 
-Two things went wrong on the way, both worth keeping:
+```
+captured 100 real Nakamoto blocks with a portable MARF checkpoint
+chain_id = 1
+checkpoint_stacks_height = 8665600
+checkpoint_state_index_root = "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec"
+first_stacks_height = 8665601
+stacks_core_rev = "62e03cc"
+```
 
-- `curl -C -` and `-r` are incompatible, and retrying a *range* while appending
-  with `>>` duplicates it: curl's own `--retry` re-requests the whole range.
-  That produced an archive 7.4 GB too long. Each part must be written with
-  `-o`, so a retry overwrites.
-- **It does not fit.** `chainstate/vm/clarity/marf.sqlite.blobs` alone is
-  228 GB and `marf.sqlite` more than 146 GB, and extraction needs the 208 GiB
-  archive present throughout. Peak demand is over 600 GB against the 612 GB
-  free here, and the extraction filled the disk to 100% before being stopped.
+Getting there needed care in five places, each found by running the command
+rather than predicting it — see the commit. Two are worth repeating here:
+mainnet has a million burn blocks and more than one snapshot per height, so the
+capture takes the canonical one across the window; and mainnet runs `62e03cc`
+where the in-process oracles pin `efc34a0`, so `--accept-node-revision` takes
+the build by name and records it, rather than waving the guard through.
 
-That was foreseeable from the archive's own contents and should have been
-computed before spending the bandwidth. Everything downloaded has been removed
-and the disk restored.
+Also learned about the archive itself:
 
-So the blocker is no longer the data — it is **room for it**. What this needs
-is a machine with roughly a terabyte free, or better, running the capture where
-a synced node already lives, which avoids the archive entirely.
+- The host throttles **per connection** — one stream settles to 6 MB/s while a
+  second fresh one gets 42 — so twelve parallel ranges pull it at ~110 MB/s.
+- `curl -C -` and `-r` are incompatible, and retrying a range while appending
+  duplicates it, because curl re-requests the whole range. Parts must be
+  written with `-o`.
+- The archive dated the day mainnet crossed the boundary stops **27 burn blocks
+  short of it**. The next day's reaches burn 960,341.
+
+## What stops the replay: memory
+
+Replaying that capture **runs out of memory**. The import was at 15 GB resident
+and still climbing when the kernel killed it:
+
+```
+tmux-spawn-…scope: The kernel OOM killer killed some processes in this unit
+```
+
+This machine has 31 GB. A mainnet Clarity MARF is 142 GB of `marf.sqlite` and
+229 GB of blobs, and the checkpoint import holds too much of it at once —
+against Hacknet's, which is small enough that nothing showed.
+
+That is a real limit in nano, not in the environment: **`import_checkpoint` has
+to work in bounded memory**, streaming the trie graph rather than accumulating
+it. Until it does, the size of chain nano can start from is capped by the size
+of a machine.
 
 ## The unlock heights the capture needs
 
