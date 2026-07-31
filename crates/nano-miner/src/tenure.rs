@@ -3,7 +3,7 @@
 use std::fmt;
 
 use nano_address::StacksAddress;
-use nano_bitcoin::{BitcoinOperationKind, BitcoinRpcSource, BitcoinRpcSourceError, BitcoinSource};
+use nano_bitcoin::{BitcoinOperationKind, BitcoinRpcSourceError, BitcoinSource};
 use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
 use nano_codec::{
     AnchorMode, CodecError, TenureChangeCause, TenureChangePayload, Transaction,
@@ -133,7 +133,7 @@ impl SortitionHashPoint {
 /// which blocks produced a sortition.
 pub async fn extend_sortition_hash(
     node: &SyncClient,
-    bitcoin: &BitcoinRpcSource,
+    bitcoin: &(impl BitcoinSource<Error = BitcoinRpcSourceError> + Sync),
     from: SortitionHashPoint,
     to_bitcoin_height: u64,
 ) -> Result<SortitionHashPoint, TenureStartError> {

@@ -6,7 +6,7 @@
 
 use std::{error::Error, fs, path::Path, sync::Arc, time::Duration};
 
-use nano_bitcoin::{BitcoinRpcSource, BitcoinSource};
+use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource};
 use nano_chainstate::{
     BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting, TenureAccountingError,
 };
@@ -25,7 +25,7 @@ const SIGNER_CHAINSTATE: &str = "signer-chainstate";
 const ACCOUNTING_FILE: &str = "accounting.json";
 
 /// The shared executed chain the node follows along and answers reads from.
-pub type SharedExecutor = Arc<Mutex<CheckpointExecutor<BitcoinRpcSource>>>;
+pub type SharedExecutor = Arc<Mutex<CheckpointExecutor<BurnchainSource>>>;
 
 /// What a role reports when it stops, which is always the end of the node.
 pub type Role = Result<(), String>;
@@ -253,7 +253,7 @@ pub async fn open_executor(
     pox: &PoxInfo,
     peer: &SyncClient,
     directory: &Path,
-) -> Result<CheckpointExecutor<BitcoinRpcSource>, Box<dyn Error>> {
+) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
     let (chainstate, anchor, context) =
         open_chainstate(config, network, pox, peer, directory).await?;
     let bitcoin = bitcoin_source(config)?;
@@ -403,13 +403,48 @@ pub fn bitcoin_context(config: &Config, pox: &PoxInfo) -> BitcoinBlockContext {
 }
 
 /// Connect to the burnchain the configuration names.
-pub fn bitcoin_source(config: &Config) -> Result<BitcoinRpcSource, Box<dyn Error>> {
-    Ok(BitcoinRpcSource::new(
+///
+/// Either kind of source answers the one question a follower asks — the block
+/// at a height — so which one is configured decides nothing but where the
+/// bytes come from.
+pub fn bitcoin_source(config: &Config) -> Result<BurnchainSource, Box<dyn Error>> {
+    if let Some(rest) = config.burnchain.rest_url.as_ref() {
+        return Ok(BurnchainSource::Rest(Box::new(BitcoinRestSource::new(
+            rest,
+            config.burnchain.magic()?,
+        )?)));
+    }
+    Ok(BurnchainSource::Rpc(Box::new(BitcoinRpcSource::new(
         &config.burnchain.rpc_url,
         config.burnchain.rpc_user.clone(),
         config.burnchain.rpc_password.clone(),
         config.burnchain.magic()?,
-    )?)
+    )?)))
+}
+
+/// The burnchain this node reads, however it reaches it.
+#[derive(Debug)]
+pub enum BurnchainSource {
+    Rpc(Box<BitcoinRpcSource>),
+    Rest(Box<BitcoinRestSource>),
+}
+
+impl nano_bitcoin::BitcoinSource for BurnchainSource {
+    type Error = nano_bitcoin::BitcoinRpcSourceError;
+
+    fn block_at(&mut self, height: u64) -> Result<nano_bitcoin::BitcoinBlock, Self::Error> {
+        match self {
+            Self::Rpc(source) => source.block_at(height),
+            Self::Rest(source) => source.block_at(height),
+        }
+    }
+
+    fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+        match self {
+            Self::Rpc(source) => source.block_hash_at(height),
+            Self::Rest(source) => source.block_hash_at(height),
+        }
+    }
 }
 
 /// The first configured peer that answers, so one dead peer is not a dead node.

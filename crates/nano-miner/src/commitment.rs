@@ -265,7 +265,11 @@ mod tests {
                 .cloned()
                 .ok_or(CommitmentPlanError::ParentCommitmentNotFound)
         }
-    }
+    
+        fn block_hash_at(&self, _height: u64) -> Result<[u8; 32], Self::Error> {
+            unimplemented!("this source is only asked for blocks")
+        }
+}
 
     fn commitment(transaction_index: u32, key_transaction_index: u16) -> BitcoinOperation {
         BitcoinOperation {

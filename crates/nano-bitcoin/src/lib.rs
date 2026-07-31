@@ -56,6 +56,9 @@ pub trait BitcoinSource {
     type Error;
 
     fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error>;
+
+    /// One block's header hash, without decoding its transactions.
+    fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error>;
 }
 
 /// Bitcoin Core RPC-backed protocol-operation source.
@@ -71,6 +74,8 @@ pub struct BitcoinRpcSource {
 #[derive(Debug)]
 pub enum BitcoinRpcSourceError {
     Rpc(bitcoincore_rpc::Error),
+    /// A REST source could not be read.
+    Rest(String),
     Parse(BitcoinParseError),
     /// Bitcoin no longer holds the block this source read at that height.
     ///
@@ -86,6 +91,7 @@ impl std::fmt::Display for BitcoinRpcSourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rpc(error) => error.fmt(formatter),
+            Self::Rest(error) => write!(formatter, "burnchain REST source: {error}"),
             Self::Parse(error) => error.fmt(formatter),
             Self::Reorganized { height } => write!(
                 formatter,
@@ -100,7 +106,7 @@ impl std::error::Error for BitcoinRpcSourceError {
         match self {
             Self::Rpc(error) => Some(error),
             Self::Parse(error) => Some(error),
-            Self::Reorganized { .. } => None,
+            Self::Rest(_) | Self::Reorganized { .. } => None,
         }
     }
 }
@@ -209,11 +215,149 @@ impl BitcoinRpcSource {
     }
 }
 
+/// An Esplora-backed source, for a node with no Bitcoin RPC of its own.
+///
+/// Esplora serves `/block/<hash>/raw`, which is the same bytes `getblock
+/// <hash> 0` returns, and `/block-height/<n>`, which is `getblockhash`. Those
+/// two are all a follower reads the burnchain for, so a node can follow a
+/// public chain without carrying several hundred gigabytes of it.
+#[derive(Debug)]
+pub struct BitcoinRestSource {
+    base: String,
+    client: reqwest::blocking::Client,
+    magic: [u8; 2],
+    pre_stx: PreStxCache,
+    last_height: Option<u64>,
+    last_block: Option<BitcoinBlock>,
+}
+
+impl BitcoinRestSource {
+    pub fn new(base: &str, magic: [u8; 2]) -> Result<Self, BitcoinRpcSourceError> {
+        Ok(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?,
+            magic,
+            pre_stx: PreStxCache::new(),
+            last_height: None,
+            last_block: None,
+        })
+    }
+
+    fn get(&self, path: &str) -> Result<Vec<u8>, BitcoinRpcSourceError> {
+        let response = self
+            .client
+            .get(format!("{}/{path}", self.base))
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+        response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))
+    }
+
+    /// The hash Esplora reports at a height, in the byte order nano uses.
+    pub fn block_hash_at(&self, height: u64) -> Result<[u8; 32], BitcoinRpcSourceError> {
+        let text = String::from_utf8(self.get(&format!("block-height/{height}"))?)
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+        let hash = decode_block_hash(text.trim())
+            .ok_or_else(|| BitcoinRpcSourceError::Rest(format!("unreadable block hash {text:?}")))?;
+        Ok(bitcoin_hash_bytes(hash))
+    }
+
+    pub fn invalidate_from(&mut self, height: u64) {
+        self.pre_stx.invalidate_from(height);
+        self.last_block = self.last_block.take().filter(|block| block.height < height);
+        self.last_height = self.last_height.and_then(|last| {
+            (last < height).then_some(last)
+        });
+    }
+
+    fn check_last_read(&mut self) -> Result<(), BitcoinRpcSourceError> {
+        let Some((height, hash)) = self
+            .last_block
+            .as_ref()
+            .map(|block| (block.height, block.hash))
+        else {
+            return Ok(());
+        };
+        if self.block_hash_at(height)? == hash {
+            return Ok(());
+        }
+        self.invalidate_from(height);
+        Err(BitcoinRpcSourceError::Reorganized { height })
+    }
+
+    pub fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, BitcoinRpcSourceError> {
+        self.check_last_read()?;
+        if let Some(block) = self
+            .last_block
+            .as_ref()
+            .filter(|block| block.height == height)
+        {
+            return Ok(block.clone());
+        }
+        if self.last_height.is_some_and(|last| height < last) {
+            self.pre_stx = PreStxCache::new();
+        }
+        // A `PreStx` output authorises an operation up to six blocks later, so
+        // a source that starts mid-chain reads that window first.
+        let first_height = self.last_height.filter(|last| *last < height).map_or_else(
+            || height.saturating_sub(PRE_STX_WINDOW_BLOCKS),
+            |last| last + 1,
+        );
+        let mut current = None;
+        for current_height in first_height..=height {
+            let hash = String::from_utf8(self.get(&format!("block-height/{current_height}"))?)
+                .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+            let raw = self.get(&format!("block/{}/raw", hash.trim()))?;
+            let block =
+                decode_block_with_pre_stx(current_height, &raw, self.magic, &mut self.pre_stx)?;
+            current = Some(block);
+        }
+        self.last_height = Some(height);
+        let block = current.ok_or(BitcoinParseError::InvalidBlock)?;
+        self.last_block = Some(block.clone());
+        Ok(block)
+    }
+}
+
+impl BitcoinSource for BitcoinRestSource {
+    type Error = BitcoinRpcSourceError;
+
+    fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error> {
+        Self::block_at(self, height)
+    }
+
+    fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+        Self::block_hash_at(self, height)
+    }
+}
+
+/// Decode a big-endian block hash as Esplora prints it.
+fn decode_block_hash(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
 impl BitcoinSource for BitcoinRpcSource {
     type Error = BitcoinRpcSourceError;
 
     fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error> {
         Self::block_at(self, height)
+    }
+
+    fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+        Self::block_hash_at(self, height)
     }
 }
 
@@ -1165,5 +1309,28 @@ mod tests {
             },
             txdata: transactions,
         })
+    }
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::BitcoinRestSource;
+
+    /// Reads a real mainnet burn block over Esplora.
+    ///
+    /// Ignored by default: it needs the network. It is the check that a node
+    /// with no Bitcoin of its own can still see the burnchain.
+    #[test]
+    #[ignore = "reads mempool.space"]
+    fn reads_a_mainnet_burn_block() {
+        let mut source = BitcoinRestSource::new("https://mempool.space/api", *b"X2")
+            .expect("build the source");
+        // A burn block just past the epoch 4.0 boundary.
+        let block = source.block_at(960_240).expect("read the block");
+        assert_eq!(block.height, 960_240);
+        assert!(
+            !block.hash.iter().all(|byte| *byte == 0),
+            "the block carries its hash"
+        );
     }
 }

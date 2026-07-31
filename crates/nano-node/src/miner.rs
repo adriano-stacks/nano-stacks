@@ -15,7 +15,7 @@ use std::{
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoincore_rpc::Auth;
 use nano_address::StacksAddress;
-use nano_bitcoin::BitcoinRpcSource;
+use crate::runtime::BurnchainSource;
 use nano_chainstate::{NakamotoBlock, SignerSetError};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use nano_mempool::Mempool;
@@ -286,7 +286,7 @@ impl State {
     /// Start the tenure nano has won, carry on the one it owns, or do neither.
     async fn advance_tenure(
         &mut self,
-        executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+        executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<(), Box<dyn Error>> {
         let Some(won) = self.won_tenure().await? else {
             // A tenure is not one block: while nano still owns the current one,
@@ -388,7 +388,7 @@ impl State {
     /// sign the state they already agreed to.
     async fn continue_tenure(
         &mut self,
-        executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+        executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<Option<NakamotoBlock>, Box<dyn Error>> {
         let state = self.tenure.as_ref().expect("a tenure to continue");
         let tenure = self.peer.tenure_info().await?;
@@ -465,7 +465,7 @@ impl State {
     /// Assemble the tenure's first block, gather threshold signatures, submit it.
     async fn mine(
         &self,
-        executor: &mut CheckpointExecutor<BitcoinRpcSource>,
+        executor: &mut CheckpointExecutor<BurnchainSource>,
         won: &SortitionInfo,
     ) -> Result<NakamotoBlock, Box<dyn Error>> {
         println!(

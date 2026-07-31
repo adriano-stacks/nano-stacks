@@ -62,9 +62,20 @@ pub enum NetworkName {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BurnchainConfig {
+    /// A Bitcoin Core JSON-RPC endpoint, when this node has one.
+    #[serde(default)]
     pub rpc_url: String,
+    #[serde(default)]
     pub rpc_user: String,
+    #[serde(default)]
     pub rpc_password: String,
+    /// An Esplora base URL to read burn blocks from instead.
+    ///
+    /// A follower reads the burnchain only for its blocks, and Esplora serves
+    /// the same bytes `getblock` does, so a node can follow a public chain
+    /// without carrying several hundred gigabytes of it. Mining still wants
+    /// the RPC: it has to send transactions.
+    pub rest_url: Option<String>,
     /// Two-byte magic prefixing every Stacks `OP_RETURN` on this burnchain.
     #[serde(default = "hacknet_magic")]
     pub magic: String,

@@ -6,7 +6,8 @@
 
 use std::{error::Error, path::Path, time::Duration};
 
-use nano_bitcoin::BitcoinRpcSource;
+use crate::runtime::BurnchainSource;
+use nano_bitcoin::BitcoinSource as _;
 use nano_chainstate::SignerSet;
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::Network;
@@ -31,7 +32,7 @@ const STATE_MESSAGE_ID: u32 = 2;
 const PRE_COMMIT_MESSAGE_ID: u32 = 3;
 
 /// The state a signer validates proposals against.
-pub type Validator = ActiveSortitionValidator<ChainstateProposalValidator<BitcoinRpcSource>>;
+pub type Validator = ActiveSortitionValidator<ChainstateProposalValidator<BurnchainSource>>;
 
 /// Where the signer records what it has already signed.
 const STATE_FILE: &str = "signer.json";
@@ -196,7 +197,7 @@ async fn binding(
 /// verify its state root, so this runs before every round of signing.
 async fn catch_up(
     peer: &SyncClient,
-    signer: &mut LiveSigner<ChainstateProposalValidator<BitcoinRpcSource>>,
+    signer: &mut LiveSigner<ChainstateProposalValidator<BurnchainSource>>,
     max_blocks: usize,
 ) -> Result<(), String> {
     let tip = peer

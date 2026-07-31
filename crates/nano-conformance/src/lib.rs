@@ -1223,7 +1223,11 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| format!("missing captured Bitcoin block at height {height}"))
         }
-    }
+    
+        fn block_hash_at(&self, _height: u64) -> Result<[u8; 32], Self::Error> {
+            unimplemented!("this source is only asked for blocks")
+        }
+}
     use stacks_common::{
         deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize,
         types::chainstate::{

@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::Deserialize;
 
 use crate::{
@@ -186,9 +186,9 @@ fn import_into(
         manifest.check_declared_root(source, expected_root)?;
     }
     let blobs = Blobs::open(&blob_path(sqlite_path)?)?;
-    let records = read_records(sqlite_path, &blobs)?;
+    let records = Records::open(sqlite_path, &blobs)?;
     let source_record = records
-        .get(&source)
+        .by_hash(source)?
         .ok_or(CheckpointError::MissingBlock(source))?;
     if source_record.root != expected_root {
         return Err(CheckpointError::RootMismatch {
@@ -198,12 +198,12 @@ fn import_into(
     }
 
     let mut chain = vec![source];
-    while let Some(parent) = records
-        .get(chain.last().expect("chain is never empty"))
-        .ok_or(CheckpointError::MissingBlock(source))?
-        .parent
-    {
+    let mut current = source_record;
+    while let Some(parent) = records.parent_of(&current)? {
         chain.push(parent);
+        current = records
+            .by_hash(parent)?
+            .ok_or(CheckpointError::MissingBlock(parent))?;
     }
     chain.reverse();
 
@@ -218,7 +218,7 @@ fn import_into(
 
 fn import_chain(
     storage: &TrieStorage,
-    records: &BTreeMap<MarfBlockId, Record>,
+    records: &Records<'_>,
     blobs: &Blobs,
     chain: &[MarfBlockId],
     expected_root: TrieHash,
@@ -246,7 +246,7 @@ fn import_chain(
             .map_err(|_| CheckpointError::InvalidCheckpoint("checkpoint height overflow"))?;
         let id = storage.reserve_block(*block, parent, height, &jumps)?;
         let record = records
-            .get(block)
+            .by_hash(*block)?
             .ok_or(CheckpointError::MissingBlock(*block))?;
         storage.complete_block(*block, id, record.root, empty_root, None)?;
         identifiers.insert(record.block_id, id);
@@ -257,24 +257,23 @@ fn import_chain(
         "checkpoint has no source block",
     ))?;
     let source_record = records
-        .get(&source)
+        .by_hash(source)?
         .ok_or(CheckpointError::MissingBlock(source))?;
     let mut importer = Importer {
         records,
-        blocks_by_id: index_by_id(records),
         blobs,
         storage,
         identifiers,
         next: BTreeMap::new(),
     };
-    let (index, content) = importer.import_root(source_record)?;
+    let (index, content) = importer.import_root(&source_record)?;
 
     let ancestors = power_of_two_ancestors(chain, chain.len() - 1);
     let ancestor_roots = ancestors
         .iter()
         .map(|block| {
             records
-                .get(block)
+                .by_hash(*block)?
                 .map(|record| record.root)
                 .ok_or(CheckpointError::MissingBlock(*block))
         })
@@ -336,75 +335,94 @@ fn pcs_state(pcs_root: &Path) -> Result<(MarfBlockId, TrieHash), CheckpointError
 #[derive(Clone, Copy)]
 struct Record {
     block_id: u32,
-    parent: Option<MarfBlockId>,
     offset: usize,
     root: TrieHash,
 }
 
-fn read_records(
-    path: &Path,
-    blobs: &Blobs,
-) -> Result<BTreeMap<MarfBlockId, Record>, CheckpointError> {
-    let uri = format!("file:{}?immutable=1", path.display());
-    let connection = Connection::open_with_flags(
-        uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )?;
-    let mut statement = connection.prepare(
-        "SELECT block_id, block_hash, external_offset FROM marf_data \
-         WHERE unconfirmed = 0 AND external_length > 0",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut raw_records = Vec::new();
-    while let Some(row) = rows.next()? {
-        let block_id: u32 = row.get(0)?;
-        let block: String = row.get(1)?;
-        let offset: u64 = row.get(2)?;
-        raw_records.push((
-            block_id,
-            parse_hex(&block)?,
-            usize::try_from(offset).map_err(|_| {
-                CheckpointError::InvalidCheckpoint("blob offset exceeds address space")
-            })?,
-        ));
-    }
-    drop(rows);
-    drop(statement);
-    drop(connection);
-
-    let mut records = BTreeMap::new();
-    for (block_id, block, offset) in raw_records {
-        let header = blobs.read(offset, ROOT_OFFSET + 32)?;
-        let root = TrieHash::from_bytes(fixed(&header[ROOT_OFFSET..])?);
-        records.insert(
-            block,
-            Record {
-                block_id,
-                parent: None,
-                offset,
-                root,
-            },
-        );
-    }
-
-    let blocks_by_id = index_by_id(&records);
-    let known: std::collections::BTreeSet<_> = records.keys().copied().collect();
-    for record in records.values_mut() {
-        let parent = fixed(&blobs.read(record.offset, 32)?)?;
-        record.parent = known.contains(&parent).then_some(parent).or_else(|| {
-            blocks_by_id
-                .get(&record.block_id.saturating_sub(1))
-                .copied()
-        });
-    }
-    Ok(records)
+/// The checkpoint's `marf_data` rows, read on demand.
+///
+/// A mainnet chainstate holds nearly nine million of them. Loading every
+/// record — and the two indexes the walk needs beside it — cost more memory
+/// than the machine had, and the import was killed part-way. `block_id` is the
+/// table's primary key and `block_hash` is unique and indexed, so each lookup
+/// is a log-time query rather than a map that has to be built first.
+struct Records<'a> {
+    connection: Connection,
+    blobs: &'a Blobs,
 }
 
-fn index_by_id(records: &BTreeMap<MarfBlockId, Record>) -> BTreeMap<u32, MarfBlockId> {
-    records
-        .iter()
-        .map(|(block, record)| (record.block_id, *block))
-        .collect()
+impl<'a> Records<'a> {
+    fn open(path: &Path, blobs: &'a Blobs) -> Result<Self, CheckpointError> {
+        let uri = format!("file:{}?immutable=1", path.display());
+        let connection = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        Ok(Self { connection, blobs })
+    }
+
+    /// The record a block hash names, if the checkpoint holds its trie.
+    fn by_hash(&self, block: MarfBlockId) -> Result<Option<Record>, CheckpointError> {
+        let hash = hex_of(&block);
+        let row = self
+            .connection
+            .query_row(
+                "SELECT block_id, external_offset FROM marf_data \
+                 WHERE block_hash = ?1 AND unconfirmed = 0 AND external_length > 0",
+                [&hash],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()?;
+        let Some((block_id, offset)) = row else {
+            return Ok(None);
+        };
+        self.record(block_id, offset).map(Some)
+    }
+
+    /// The block a `block_id` names, which is how a back-pointer refers to one.
+    fn hash_for_id(&self, block_id: u32) -> Result<Option<MarfBlockId>, CheckpointError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT block_hash FROM marf_data \
+                 WHERE block_id = ?1 AND unconfirmed = 0 AND external_length > 0",
+                [block_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        row.map(|hash| parse_hex(&hash)).transpose()
+    }
+
+    fn record(&self, block_id: u32, offset: u64) -> Result<Record, CheckpointError> {
+        let offset = usize::try_from(offset).map_err(|_| {
+            CheckpointError::InvalidCheckpoint("blob offset exceeds address space")
+        })?;
+        let header = self.blobs.read(offset, ROOT_OFFSET + 32)?;
+        let root = TrieHash::from_bytes(fixed(&header[ROOT_OFFSET..])?);
+        Ok(Record {
+            block_id,
+            offset,
+            root,
+        })
+    }
+
+    /// A block's parent: the one its blob names, or the one before it by id
+    /// when that name is not a block this checkpoint carries.
+    fn parent_of(&self, record: &Record) -> Result<Option<MarfBlockId>, CheckpointError> {
+        let named: MarfBlockId = fixed(&self.blobs.read(record.offset, 32)?)?;
+        if self.by_hash(named)?.is_some() {
+            return Ok(Some(named));
+        }
+        self.hash_for_id(record.block_id.saturating_sub(1))
+    }
+}
+
+fn hex_of(block: &MarfBlockId) -> String {
+    use std::fmt::Write as _;
+    block.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 fn blob_path(sqlite_path: &Path) -> Result<PathBuf, CheckpointError> {
@@ -458,8 +476,7 @@ impl Blobs {
 }
 
 struct Importer<'a> {
-    records: &'a BTreeMap<MarfBlockId, Record>,
-    blocks_by_id: BTreeMap<u32, MarfBlockId>,
+    records: &'a Records<'a>,
     blobs: &'a Blobs,
     storage: &'a TrieStorage,
     identifiers: BTreeMap<u32, u32>,
@@ -580,7 +597,7 @@ impl Importer<'_> {
         let block = self.block_for_id(block_id)?;
         let record = self
             .records
-            .get(&block)
+            .by_hash(block)?
             .ok_or(CheckpointError::MissingBlock(block))?;
         let start = record
             .offset
@@ -671,7 +688,7 @@ impl Importer<'_> {
     }
 
     fn block_for_id(&self, id: u32) -> Result<MarfBlockId, CheckpointError> {
-        self.blocks_by_id.get(&id).copied().ok_or(
+        self.records.hash_for_id(id)?.ok_or(
             CheckpointError::InvalidCheckpoint("node points to unknown block ID"),
         )
     }
