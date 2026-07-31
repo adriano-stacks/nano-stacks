@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -265,6 +265,7 @@ fn import_chain(
         storage,
         identifiers,
         next: BTreeMap::new(),
+        imported: HashMap::new(),
     };
     let (index, content) = importer.import_root(&source_record)?;
 
@@ -349,6 +350,14 @@ struct Record {
 struct Records<'a> {
     connection: Connection,
     blobs: &'a Blobs,
+    /// Records already read, because the import asks for the same ones
+    /// constantly: every node it decodes belongs to a block, and the blocks a
+    /// trie reaches through back-pointers repeat. Reading them lazily is what
+    /// keeps the walk small; reading them lazily *and* repeatedly is what made
+    /// it slow, at a hundred thousand reads a second to write sixteen
+    /// megabytes.
+    by_hash: RefCell<HashMap<MarfBlockId, Option<Record>>>,
+    by_id: RefCell<HashMap<u32, Option<MarfBlockId>>>,
 }
 
 impl<'a> Records<'a> {
@@ -358,11 +367,25 @@ impl<'a> Records<'a> {
             uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        Ok(Self { connection, blobs })
+        Ok(Self {
+            connection,
+            blobs,
+            by_hash: RefCell::new(HashMap::new()),
+            by_id: RefCell::new(HashMap::new()),
+        })
     }
 
     /// The record a block hash names, if the checkpoint holds its trie.
     fn by_hash(&self, block: MarfBlockId) -> Result<Option<Record>, CheckpointError> {
+        if let Some(known) = self.by_hash.borrow().get(&block) {
+            return Ok(*known);
+        }
+        let found = self.read_by_hash(block)?;
+        self.by_hash.borrow_mut().insert(block, found);
+        Ok(found)
+    }
+
+    fn read_by_hash(&self, block: MarfBlockId) -> Result<Option<Record>, CheckpointError> {
         let hash = hex_of(&block);
         let row = self
             .connection
@@ -381,6 +404,15 @@ impl<'a> Records<'a> {
 
     /// The block a `block_id` names, which is how a back-pointer refers to one.
     fn hash_for_id(&self, block_id: u32) -> Result<Option<MarfBlockId>, CheckpointError> {
+        if let Some(known) = self.by_id.borrow().get(&block_id) {
+            return Ok(*known);
+        }
+        let found = self.read_hash_for_id(block_id)?;
+        self.by_id.borrow_mut().insert(block_id, found);
+        Ok(found)
+    }
+
+    fn read_hash_for_id(&self, block_id: u32) -> Result<Option<MarfBlockId>, CheckpointError> {
         let row = self
             .connection
             .query_row(
@@ -481,6 +513,15 @@ struct Importer<'a> {
     storage: &'a TrieStorage,
     identifiers: BTreeMap<u32, u32>,
     next: BTreeMap<u32, u32>,
+    /// Nodes already imported, by where they live in the checkpoint.
+    ///
+    /// A back-pointer names a node in an ancestor block, and on a chain with
+    /// millions of blocks of copy-on-write the same ancestor node is reached
+    /// again and again. Importing it once per path is most of the work: a
+    /// mainnet import wrote for hours without finishing. Re-importing is only
+    /// wasteful rather than wrong — both copies hash the same — so a miss here
+    /// costs time, not correctness.
+    imported: HashMap<(u32, u32), (u32, TrieHash, TrieNodeId)>,
 }
 
 impl Importer<'_> {
@@ -506,6 +547,21 @@ impl Importer<'_> {
     }
 
     fn import_node(
+        &mut self,
+        block_id: u32,
+        pointer: usize,
+        expected_id: u8,
+    ) -> Result<(u32, TrieHash, TrieNodeId), CheckpointError> {
+        let key = (block_id, u32::try_from(pointer).unwrap_or(u32::MAX));
+        if let Some(already) = self.imported.get(&key) {
+            return Ok(*already);
+        }
+        let imported = self.import_fresh(block_id, pointer, expected_id)?;
+        self.imported.insert(key, imported);
+        Ok(imported)
+    }
+
+    fn import_fresh(
         &mut self,
         block_id: u32,
         pointer: usize,
