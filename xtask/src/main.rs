@@ -209,7 +209,20 @@ struct CaptureConfig {
     events_dir: Option<PathBuf>,
     /// The unlock heights the events otherwise carry, needed only without them.
     unlock_heights: Option<[u64; 4]>,
-    bitcoin_rpc: String,
+    bitcoin_rpc: Option<String>,
+    /// A build to capture from other than the pinned one, named explicitly.
+    ///
+    /// The guard exists so a Hacknet capture cannot silently disagree with the
+    /// in-process oracles. Mainnet is a different case: the chain is the
+    /// oracle, and it runs whatever it runs. Naming the build rather than
+    /// waving the check through keeps it in the provenance, so a divergence
+    /// can be read against the right source.
+    accept_node_revision: Option<String>,
+    /// An Esplora base URL, for a capture with no Bitcoin node to ask.
+    ///
+    /// `<base>/block/<hash>/raw` serves the same bytes `getblock <hash> 0`
+    /// returns, which is all the capture wants them for.
+    bitcoin_rest: Option<String>,
     stacks_rpc: String,
     hacknet_commit: String,
     first_height: u64,
@@ -239,6 +252,8 @@ impl CaptureConfig {
         let mut events_dir = None;
         let mut unlock_heights: [Option<u64>; 4] = [None; 4];
         let mut bitcoin_rpc = None;
+        let mut bitcoin_rest = None;
+        let mut accept_node_revision = None;
         let mut stacks_rpc = None;
         let mut hacknet_commit = None;
         let mut first_height = None;
@@ -260,6 +275,8 @@ impl CaptureConfig {
                 "--pox-v3-unlock-height" => unlock_heights[2] = Some(parse_u64(flag, value)?),
                 "--pox-v4-unlock-height" => unlock_heights[3] = Some(parse_u64(flag, value)?),
                 "--bitcoin-rpc" => bitcoin_rpc = Some(value.to_owned()),
+                "--bitcoin-rest" => bitcoin_rest = Some(value.to_owned()),
+                "--accept-node-revision" => accept_node_revision = Some(value.to_owned()),
                 "--stacks-rpc" => stacks_rpc = Some(value.to_owned()),
                 "--hacknet-commit" => hacknet_commit = Some(value.to_owned()),
                 "--first-height" => first_height = Some(parse_u64(flag, value)?),
@@ -279,7 +296,9 @@ impl CaptureConfig {
                 [Some(v1), Some(v2), Some(v3), Some(v4)] => Some([v1, v2, v3, v4]),
                 _ => None,
             },
-            bitcoin_rpc: bitcoin_rpc.ok_or_else(|| "--bitcoin-rpc is required".to_owned())?,
+            bitcoin_rpc,
+            bitcoin_rest,
+            accept_node_revision,
             stacks_rpc: stacks_rpc.ok_or_else(|| "--stacks-rpc is required".to_owned())?,
             hacknet_commit: hacknet_commit
                 .ok_or_else(|| "--hacknet-commit is required".to_owned())?,
@@ -352,6 +371,76 @@ impl CaptureConfig {
             .collect()
     }
 
+    /// The burn heights the captured blocks span, widened by the window a
+    /// commitment can reach back over.
+    fn burn_span(sortition_db: &Path, blocks: &[CapturedBlock]) -> Result<(u64, u64), String> {
+        let hashes = blocks
+            .iter()
+            .map(|block| format!("'{}'", block.consensus_hash))
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = sqlite(
+            sortition_db,
+            &format!(
+                "select min(block_height), max(block_height) from snapshots where pox_valid = 1 and consensus_hash in ({hashes})"
+            ),
+        )?;
+        let (first, last) = output
+            .trim()
+            .split_once('|')
+            .ok_or_else(|| "the captured blocks belong to no burn block".to_owned())?;
+        let first: u64 = first
+            .trim()
+            .parse()
+            .map_err(|error| format!("unreadable first burn height: {error}"))?;
+        let last: u64 = last
+            .trim()
+            .parse()
+            .map_err(|error| format!("unreadable last burn height: {error}"))?;
+        // A block commitment may reach back over the mining window, and the
+        // replay reads the burn blocks either side of its own span.
+        Ok((first.saturating_sub(12), last.saturating_add(1)))
+    }
+
+    /// Write each captured block, and its receipts when there are any.
+    fn write_blocks(
+        &self,
+        staging: &Path,
+        blocks: &[CapturedBlock],
+        blocks_db: &Path,
+    ) -> Result<(), String> {
+        for block in blocks {
+            let name = format!("{:08}-{}.bin", block.height, block.block_hash);
+            let destination = staging.join("nakamoto/blocks").join(name);
+            // The blocks are in the node's own database, so a capture reads
+            // them there rather than asking the network for what it already
+            // has — which also keeps a hundred-block window from being rate
+            // limited by a public API.
+            let encoded = sqlite(
+                blocks_db,
+                &format!(
+                    "select lower(hex(data)) from nakamoto_staging_blocks where index_block_hash = '{}' and processed = 1 and orphaned = 0",
+                    block.index_block_hash
+                ),
+            )?;
+            let raw_block = decode_hex(encoded.trim())
+                .ok_or_else(|| format!("block {} is not stored as bytes", block.block_hash))?;
+            write_file(&destination, &raw_block)?;
+
+            // Without an observer there are no receipts to carry; the manifest
+            // records that, and the replay checks state roots only.
+            if self.events_dir.is_some() {
+                let event = self.event_for(&block.block_hash)?;
+                let event_name = format!("{:08}-{}.json", block.height, block.block_hash);
+                write_file(
+                    &staging.join("events/new_block").join(event_name),
+                    event.as_bytes(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn write_capture(
         &self,
         staging: &Path,
@@ -360,34 +449,35 @@ impl CaptureConfig {
         sortition_db: &Path,
         node_root: &Path,
     ) -> Result<(), String> {
-        let snapshot_query = "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots order by block_height";
+        // Only the burn window the captured blocks sit in, and only the
+        // canonical snapshot at each height. A chain with forks has more than
+        // one row per height, and a chain with a million burn blocks does not
+        // want all of them in a fixture.
+        let (first_burn, last_burn) = Self::burn_span(sortition_db, blocks)?;
+        let snapshot_query = format!(
+            "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
+        );
+        let snapshot_query = snapshot_query.as_str();
         let snapshots = sqlite_json(sortition_db, snapshot_query)?;
         let bitcoin_blocks = Self::bitcoin_blocks(&snapshots)?;
 
-        for block in blocks {
-            let name = format!("{:08}-{}.bin", block.height, block.block_hash);
-            let destination = staging.join("nakamoto/blocks").join(name);
-            let raw_block = http_get(&format!(
-                "{}/v3/blocks/{}",
-                self.stacks_rpc, block.index_block_hash
-            ))?;
-            write_file(&destination, &raw_block)?;
-
-            let event = self.event_for(&block.block_hash)?;
-            let event_name = format!("{:08}-{}.json", block.height, block.block_hash);
-            write_file(
-                &staging.join("events/new_block").join(event_name),
-                event.as_bytes(),
-            )?;
-        }
+        self.write_blocks(staging, blocks, blocks_db)?;
 
         for bitcoin_block in bitcoin_blocks {
             let burn_hash = bitcoin_block.hash;
-            let payload = format!(
-                "{{\"jsonrpc\":\"1.0\",\"id\":\"nano-stacks\",\"method\":\"getblock\",\"params\":[\"{burn_hash}\",0]}}"
-            );
-            let response = http_post(&self.bitcoin_rpc, &payload)?;
-            let encoded = json_result_string(&response)?;
+            let encoded = if let Some(rest) = self.bitcoin_rest.as_ref() {
+                let raw = http_get(&format!("{}/block/{burn_hash}/raw", rest.trim_end_matches('/')))?;
+                encode_hex(&raw)
+            } else {
+                let rpc = self
+                    .bitcoin_rpc
+                    .as_ref()
+                    .ok_or_else(|| "--bitcoin-rpc or --bitcoin-rest is required".to_owned())?;
+                let payload = format!(
+                    "{{\"jsonrpc\":\"1.0\",\"id\":\"nano-stacks\",\"method\":\"getblock\",\"params\":[\"{burn_hash}\",0]}}"
+                );
+                json_result_string(&http_post(rpc, &payload)?)?
+            };
             write_file(
                 &staging
                     .join("bitcoin/blocks")
@@ -710,6 +800,14 @@ impl CaptureConfig {
         if version.contains(&pinned[..pinned.len().min(7)]) {
             return Ok(());
         }
+        if let Some(accepted) = self.accept_node_revision.as_ref() {
+            if version.contains(accepted.as_str()) {
+                return Ok(());
+            }
+            return Err(format!(
+                "node reports {version:?}, which does not carry the accepted revision {accepted}"
+            ));
+        }
         Err(format!(
             "node reports {version:?} but the oracles compare against stacks-core {pinned}; \
              capturing from a different build produces fixtures that contradict them"
@@ -750,7 +848,10 @@ impl CaptureConfig {
         let magic = &self.bitcoin_magic;
         // The revision decides what "matches stacks-core" means, so a capture
         // that does not name it cannot be told apart from one that disagrees.
-        let stacks_core_rev = Self::pinned_stacks_core()?;
+        let stacks_core_rev = self
+            .accept_node_revision
+            .clone()
+            .map_or_else(Self::pinned_stacks_core, Ok)?;
         let unlock_heights = self.unlock_height_lines();
         let contents = format!(
             "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}{unlock_heights}\n",
@@ -760,7 +861,7 @@ impl CaptureConfig {
             checkpoint_root,
             self.first_height,
             self.replay_blocks,
-            self.bitcoin_rpc,
+            self.bitcoin_rpc.as_deref().unwrap_or_default(),
             self.stacks_rpc,
             blocks[0].block_hash,
             blocks[0].consensus_hash,
@@ -777,12 +878,17 @@ impl CaptureConfig {
             "stacker_set",
             "chainstate",
         ] {
+            let source = staging.join(relative);
+            // A capture without an observer writes no events at all, so the
+            // directory is simply absent rather than empty.
+            if !source.exists() {
+                continue;
+            }
             let target = root.join(relative);
             if target.exists() {
                 fs::remove_dir_all(&target).map_err(io_error("replace captured fixture data"))?;
             }
-            fs::rename(staging.join(relative), target)
-                .map_err(io_error("install captured fixture data"))?;
+            fs::rename(source, target).map_err(io_error("install captured fixture data"))?;
         }
         let provenance = root.join("provenance.toml");
         if provenance.exists() {
@@ -888,6 +994,26 @@ fn sqlite_json(database: &Path, query: &str) -> Result<String, String> {
             .arg(database)
             .arg(query),
     )
+}
+
+/// Encode bytes as lowercase hexadecimal, as `getblock <hash> 0` returns them.
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// Decode a lowercase hexadecimal string, as `SQLite`'s `hex()` produces.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(text.get(index..index + 2)?, 16).ok())
+        .collect()
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
