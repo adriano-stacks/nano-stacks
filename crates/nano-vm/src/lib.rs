@@ -985,7 +985,7 @@ impl MarfStore {
         let path = path.as_ref();
         let marf = import_checkpoint(path, source, expected_root)?;
         let side_store = create_side_store()?;
-        import_side_store(&side_store, path)?;
+        import_side_store(&side_store, path, None)?;
         Ok(Self::assemble(network, marf, side_store, Some(source)))
     }
 
@@ -1009,7 +1009,7 @@ impl MarfStore {
         }
         let marf = import_checkpoint_into(&marf_path, checkpoint.as_ref(), source, expected_root)?;
         let side_store = open_side_store(&clarity_path)?;
-        import_side_store(&side_store, checkpoint.as_ref())?;
+        import_side_store(&side_store, checkpoint.as_ref(), Some(&marf_path))?;
         Ok(Self::assemble(network, marf, side_store, Some(source)))
     }
 
@@ -1332,28 +1332,70 @@ fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open(path)?;
     connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
-    connection.execute_batch("PRAGMA synchronous = NORMAL")?;
+    // Importing a mainnet checkpoint copies 369,694,685 values keyed by a hex
+    // string, in the source's row order rather than key order, so every insert
+    // lands somewhere else in the destination's B-tree. The same two megabytes
+    // of default page cache that slowed the MARF slows this more.
+    connection.execute_batch(
+        "PRAGMA synchronous = NORMAL;
+         PRAGMA cache_size = -1000000;
+         PRAGMA temp_store = MEMORY;",
+    )?;
     connection.execute_batch(SIDE_STORE_SCHEMA)?;
     Ok(connection)
 }
 
-/// Copy a checkpoint's Clarity side tables in `SQLite`, so no row crosses into
-/// this process on the way.
+/// Copy the Clarity values a checkpoint's trie refers to, in `SQLite`, so no
+/// row crosses into this process on the way.
+///
+/// A mainnet checkpoint carries 369,694,685 values, nearly all of them
+/// history: a node starting at one height needs only what the trie at that
+/// height refers to. A leaf record ends with its forty-byte `MarfValue`, and
+/// the side store is keyed by that value's hex, so the set can be taken
+/// straight out of the imported nodes without decoding one.
+///
+/// `metadata_table` is copied whole. It holds contract analyses rather than
+/// per-key state, so it is small beside the values and its keys cannot be read
+/// off the trie the same way.
 fn import_side_store(
     destination: &rusqlite::Connection,
     checkpoint: &Path,
+    marf: Option<&Path>,
 ) -> Result<(), MarfStoreError> {
     destination.execute(
         "ATTACH DATABASE ?1 AS checkpoint",
         params![format!("file:{}?immutable=1", checkpoint.display())],
     )?;
+    // Without a MARF on disk to read the leaves from — an in-memory import,
+    // which is only ever given a small checkpoint — take the values whole.
+    let Some(marf) = marf else {
+        let copied = destination.execute_batch(
+            "INSERT OR REPLACE INTO data_table (key, value) \
+                 SELECT key, value FROM checkpoint.data_table;
+             INSERT OR REPLACE INTO metadata_table (key, blockhash, value) \
+                 SELECT key, blockhash, value FROM checkpoint.metadata_table;",
+        );
+        destination.execute_batch("DETACH DATABASE checkpoint")?;
+        return Ok(copied?);
+    };
+    destination.execute(
+        "ATTACH DATABASE ?1 AS imported",
+        params![format!("file:{}?mode=ro", marf.display())],
+    )?;
     let copied = destination.execute_batch(
-        "INSERT OR REPLACE INTO data_table (key, value) \
-             SELECT key, value FROM checkpoint.data_table;
-         INSERT OR REPLACE INTO metadata_table (key, blockhash, value) \
-             SELECT key, blockhash, value FROM checkpoint.metadata_table;",
+        "CREATE TEMP TABLE needed_value (key TEXT PRIMARY KEY) WITHOUT ROWID;
+         INSERT OR IGNORE INTO needed_value (key)
+             SELECT lower(hex(substr(data, -40))) FROM imported.marf_node
+             WHERE substr(data, 1, 1) = x'00';
+         INSERT OR REPLACE INTO data_table (key, value)
+             SELECT key, value FROM checkpoint.data_table
+             WHERE key IN (SELECT key FROM needed_value);
+         INSERT OR REPLACE INTO metadata_table (key, blockhash, value)
+             SELECT key, blockhash, value FROM checkpoint.metadata_table;
+         DROP TABLE needed_value;",
     );
     destination.execute_batch("DETACH DATABASE checkpoint")?;
+    destination.execute_batch("DETACH DATABASE imported")?;
     Ok(copied?)
 }
 
