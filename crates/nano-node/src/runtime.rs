@@ -4,7 +4,7 @@
 //! and mining are three tasks over one configuration rather than three
 //! programs over three command lines.
 
-use std::{error::Error, fs, path::Path, sync::Arc, time::Duration};
+use std::{error::Error, fs, future::Future, path::Path, sync::Arc, time::Duration};
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource};
 use nano_chainstate::{
@@ -12,10 +12,13 @@ use nano_chainstate::{
 };
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, serve};
-use nano_sync::{Node, PoxInfo, SyncClient};
+use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
 use crate::{CheckpointExecutor, config::Config, miner, signer};
+
+/// How long a startup step waits out a rate-limited peer before giving up.
+const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
 
 /// The state directory the node executes the canonical chain in.
 pub(crate) const NODE_CHAINSTATE: &str = "chainstate";
@@ -78,9 +81,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         Some(network) => network,
         // A private network's chain identifier is only knowable from the chain,
         // so a configuration that does not fix it takes what the peer reports.
-        None => Network::from_chain_id(peer.node_info().await?.network_id),
+        None => Network::from_chain_id(patiently(|| peer.node_info()).await?.network_id),
     };
-    let pox = peer.pox_info().await?;
+    let pox = patiently(|| peer.pox_info()).await?;
     println!(
         "nano-stacks starting on chain {:#010x}, state under {}",
         network.chain_id(),
@@ -330,7 +333,7 @@ async fn resume_from(
     let sealed = StacksBlockId::from_bytes(tip);
     let mut waited = 0;
     loop {
-        match peer.block(sealed).await {
+        match patiently(|| peer.block(sealed)).await {
             Ok(block) => return Ok(block),
             Err(_) if waited < RESUME_ATTEMPTS => {
                 waited += 1;
@@ -342,7 +345,7 @@ async fn resume_from(
     }
 
     for (walked, ancestor) in ancestors.iter().enumerate() {
-        if let Ok(block) = peer.block(StacksBlockId::from_bytes(*ancestor)).await {
+        if let Ok(block) = patiently(|| peer.block(StacksBlockId::from_bytes(*ancestor))).await {
             println!(
                 "block {sealed} left the chain; carrying on from {}, {} back",
                 block.block_id(),
@@ -448,11 +451,34 @@ impl nano_bitcoin::BitcoinSource for BurnchainSource {
 }
 
 /// The first configured peer that answers, so one dead peer is not a dead node.
+/// Run a startup step, waiting out a peer that is rate limiting this node.
+///
+/// A round of following can give up on a 429 and ask again next poll. Startup
+/// has no next poll: giving up there ends the process, so a node that a public
+/// endpoint merely asked to slow down never comes up at all.
+async fn patiently<T, F, S>(mut step: F) -> Result<T, SyncError>
+where
+    F: FnMut() -> S,
+    S: Future<Output = Result<T, SyncError>>,
+{
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match step().await {
+            Err(error) if error.is_rate_limited() && wait < STARTUP_PATIENCE => {
+                eprintln!("the peer is rate limiting this node, waiting {wait:?}");
+                sleep(wait).await;
+                wait = wait.saturating_mul(2);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 async fn reachable_peer(config: &Config) -> Result<SyncClient, Box<dyn Error>> {
     let mut last = None;
     for url in config.node.peers()? {
         let client = SyncClient::new(url.clone())?;
-        match client.node_info().await {
+        match patiently(|| client.node_info()).await {
             Ok(_) => return Ok(client),
             Err(error) => {
                 eprintln!("peer {url} is not answering: {error}");

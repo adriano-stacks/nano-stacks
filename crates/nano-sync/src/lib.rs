@@ -312,6 +312,16 @@ pub enum SyncError {
     InvalidAccount,
 }
 
+impl SyncError {
+    /// Whether the peer answered 429, which is a reason to wait rather than to
+    /// treat the peer as broken.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::Http(error)
+            if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS))
+    }
+}
+
 impl fmt::Display for SyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1477,7 +1487,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        BlockUploadWire, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError,
+        RATE_LIMIT_RETRIES, BlockUploadWire, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError,
         parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
         parse_stacker_set, validate_tenure, validate_tenure_transition,
     };
@@ -1572,6 +1582,39 @@ mod tests {
                 .as_bytes(),
             &[0; 32]
         );
+    }
+
+    /// A rate limit is a reason to wait, not a reason for a node to give up
+    /// starting — so it has to be told apart from every other HTTP failure.
+    #[tokio::test]
+    async fn a_rate_limit_is_distinguishable_from_a_failure() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            // The client retries a 429 before it gives up, so the peer has to
+            // keep saying it; the last answer is what the caller then sees.
+            for answered in 0.. {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                let status = if answered <= RATE_LIMIT_RETRIES {
+                    "429 Too Many Requests"
+                } else {
+                    "404 Not Found"
+                };
+                let response = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        let client = SyncClient::new(
+            Url::parse(&format!("http://{address}/")).expect("a base url"),
+        )
+        .expect("a client");
+
+        let limited = client.node_info().await.expect_err("the peer said 429");
+        assert!(limited.is_rate_limited(), "{limited}");
+        let missing = client.node_info().await.expect_err("the peer said 404");
+        assert!(!missing.is_rate_limited(), "{missing}");
     }
 
     /// A cached block is served without a request, which is what makes a round
