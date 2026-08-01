@@ -24,8 +24,11 @@ use serde_json::Value;
 const TENURE_PAGES: usize = 512;
 
 /// How long to wait out a peer's first rate limit, and how often to try again.
-const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
-const RATE_LIMIT_RETRIES: usize = 6;
+const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const RATE_LIMIT_RETRIES: usize = 12;
+/// The longest a single wait grows to, so a limited peer is waited out rather
+/// than given up on.
+const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct SyncClient {
@@ -256,6 +259,15 @@ impl PoxInfo {
 
 #[derive(Debug)]
 pub enum SyncError {
+    /// A tenure's blocks stopped short of the tip the peer reports.
+    ///
+    /// One response carries a bounded number of blocks; this says how many
+    /// short it came, which is what tells a bounded page from a real fork.
+    TenureGap {
+        tenure: StacksBlockId,
+        have: u64,
+        want: u64,
+    },
     InvalidBaseUrl,
     Http(reqwest::Error),
     Block(NakamotoCodecError),
@@ -284,6 +296,14 @@ impl fmt::Display for SyncError {
             Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
             Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
             Self::TenureLink(error) => write!(formatter, "invalid tenure link: {error}"),
+            Self::TenureGap {
+                tenure,
+                have,
+                want,
+            } => write!(
+                formatter,
+                "tenure {tenure} answered up to height {have} but its tip is {want}"
+            ),
             Self::InvalidHash => formatter.write_str("sync response contains an invalid hash"),
             Self::EmptySortition => formatter.write_str("sortition response contains no entries"),
             Self::InvalidSortition => formatter.write_str("sortition response is inconsistent"),
@@ -307,7 +327,8 @@ impl std::error::Error for SyncError {
             Self::TenureLink(error) => Some(error),
             Self::Crypto(error) => Some(error),
             Self::SignerSet(error) => Some(error),
-            Self::InvalidBaseUrl
+            Self::TenureGap { .. }
+            | Self::InvalidBaseUrl
             | Self::EmptyTenure
             | Self::TenureStart
             | Self::InvalidHash
@@ -730,33 +751,39 @@ impl SyncClient {
 
     /// Ask for more of a tenure until its tip arrives.
     ///
-    /// One response carries a bounded number of blocks and a mainnet tenure
-    /// can hold more, so a follower that assumes one response is the whole
-    /// tenure decides the next block does not follow the last.
+    /// A tenure response may carry only the block it was asked for — a public
+    /// endpoint answers `/v3/tenures/:id` with one block — so the rest is
+    /// reached by walking back from the tip through `parent_block_id`, which
+    /// needs nothing but `/v3/blocks/:id`.
     async fn extend_to_tenure_tip(
         &self,
         blocks: &mut Vec<NakamotoBlock>,
         tip: StacksBlockId,
     ) -> Result<(), SyncError> {
-        for _ in 0..TENURE_PAGES {
-            if blocks.last().map(NakamotoBlock::block_id) == Some(tip) {
-                return Ok(());
-            }
-            let from = blocks.last().ok_or(SyncError::EmptyTenure)?.block_id();
-            // Which blocks a page repeats is the endpoint's business, so take
-            // whatever is new rather than assuming where it starts.
-            let seen: std::collections::HashSet<_> =
-                blocks.iter().map(NakamotoBlock::block_id).collect();
-            let page: Vec<_> = self.tenure(from, None)
-                .await?
-                .into_iter()
-                .filter(|block| !seen.contains(&block.block_id()))
-                .collect();
-            if page.is_empty() {
-                return Ok(());
-            }
-            blocks.extend(page);
+        let Some(known) = blocks.last().map(NakamotoBlock::block_id) else {
+            return Err(SyncError::EmptyTenure);
+        };
+        if known == tip {
+            return Ok(());
         }
+        let mut walked = Vec::new();
+        let mut cursor = tip;
+        while cursor != known {
+            if walked.len() >= TENURE_PAGES {
+                return Err(SyncError::TenureGap {
+                    tenure: known,
+                    have: blocks.last().map_or(0, |block| block.header.chain_length),
+                    want: walked.last().map_or(0, |block: &NakamotoBlock| {
+                        block.header.chain_length
+                    }),
+                });
+            }
+            let block = self.block(cursor).await?;
+            cursor = StacksBlockId::from_bytes(*block.header.parent_block_id.as_bytes());
+            walked.push(block);
+        }
+        walked.reverse();
+        blocks.extend(walked);
         Ok(())
     }
 
@@ -795,8 +822,15 @@ impl SyncClient {
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Ok(response.error_for_status()?);
             }
-            tokio::time::sleep(wait).await;
-            wait = wait.saturating_mul(2);
+            // Honour the peer's own answer when it gives one.
+            let told = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
+            tokio::time::sleep(told.unwrap_or(wait).min(RATE_LIMIT_CEILING)).await;
+            wait = wait.saturating_mul(2).min(RATE_LIMIT_CEILING);
         }
         Ok(self
             .client
@@ -1009,8 +1043,13 @@ impl TenureFollower {
             if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
                 let tip = self.client.block(info.tip_block_id).await?;
                 let parent = blocks.last().ok_or(SyncError::EmptyTenure)?;
-                tip.validate_successor(&parent.header)
-                    .map_err(SyncError::TenureLink)?;
+                if tip.validate_successor(&parent.header).is_err() {
+                    return Err(SyncError::TenureGap {
+                        tenure: requested_info.tenure_start_block_id,
+                        have: parent.header.chain_length,
+                        want: tip.header.chain_length,
+                    });
+                }
                 blocks.push(tip);
             }
             if let Some(latest) = &self.latest {
