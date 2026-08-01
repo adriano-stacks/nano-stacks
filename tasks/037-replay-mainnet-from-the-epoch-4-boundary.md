@@ -145,7 +145,8 @@ That is what M10 asks for, against the chain that matters: the MARF, the Clarity
 VM, the native accounting, PoX locking, SIP-031 and the unlock schedule all
 agree with stacks-core, block for block, on real traffic.
 
-Three faults had to be fixed to get there, each only visible at mainnet scale:
+Five faults had to be fixed to get there, each only visible at mainnet scale
+against a public API that rate limits:
 
 - the checkpoint import held the whole record table in memory (below)
 - the side store copied every historical value — 140 GB — where only the ones
@@ -154,6 +155,20 @@ Three faults had to be fixed to get there, each only visible at mainnet scale:
   ever asks for the peer's latest tenure, whose first block descends from one it
   never fetched, so every round ended in a fork error. Parent links cross tenure
   boundaries like any other, so the walk that reaches a tip also closes the gap.
+- a tenure already in hand was carried forward only when the peer was exactly
+  one block ahead, and otherwise refetched whole. At a five second poll the peer
+  rarely is, and a mainnet tenure runs to hundreds of blocks, so nearly every
+  round asked for all of them again. A round that then failed threw away what it
+  had fetched, and the next asked again — the failure being a rate limit, which
+  the refetch made worse. Both are gone: the walk is incremental, and blocks are
+  cached under their identifiers, which is sound because they are immutable.
+- a 429 on `/v2/pox` **killed the node on the way up**. A round can give up on a
+  rate limit and ask again next poll; startup has no next poll, so a node the
+  endpoint merely asked to slow down never came up.
+
+Together those took the follower from oscillating between tip and twenty blocks
+behind, with eleven fork errors per twenty minutes, to a steady lag of one to
+five blocks and none.
 
 What remains is the receipt half, which needs an oracle an archive cannot give.
 
