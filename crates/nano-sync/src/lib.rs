@@ -20,15 +20,19 @@ use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// How many times a tenure is asked for more blocks before giving up.
-const TENURE_PAGES: usize = 512;
+/// How many blocks one round will walk back from a tenure's tip.
+const TENURE_WALK: usize = 32;
 
 /// How long to wait out a peer's first rate limit, and how often to try again.
-const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-const RATE_LIMIT_RETRIES: usize = 12;
-/// The longest a single wait grows to, so a limited peer is waited out rather
-/// than given up on.
-const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+/// How a rate-limited peer is waited out.
+///
+/// Short and few on purpose: a round that gives up early still applies the
+/// blocks it fetched and asks again next poll, so patience here buys nothing
+/// and costs the round. Waiting minutes per block is how a follower stalls
+/// with no error to show for it.
+const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+const RATE_LIMIT_RETRIES: usize = 3;
+const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct SyncClient {
@@ -769,7 +773,9 @@ impl SyncClient {
         let mut walked = Vec::new();
         let mut cursor = tip;
         while cursor != known {
-            if walked.len() >= TENURE_PAGES {
+            // A bounded walk per round, so one poll cannot spend itself on a
+            // gap that keeps growing.
+            if walked.len() >= TENURE_WALK {
                 return Err(SyncError::TenureGap {
                     tenure: known,
                     have: blocks.last().map_or(0, |block| block.header.chain_length),
