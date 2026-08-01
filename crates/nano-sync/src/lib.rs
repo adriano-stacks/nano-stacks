@@ -1059,13 +1059,28 @@ impl TenureFollower {
                 validate_tenure_transition(latest, &info)?;
                 if latest.tenure_start_block_id == info.tenure_start_block_id {
                     let previous = self.history.last().ok_or(SyncError::Fork)?;
-                    if !blocks.starts_with(&previous.blocks) {
+                    // A round may answer with fewer blocks of the same tenure
+                    // than the one before it did — a peer that rate limits cuts
+                    // the walk short — and that is the same chain, not a fork.
+                    if !blocks.starts_with(&previous.blocks)
+                        && !previous.blocks.starts_with(&blocks)
+                    {
                         return Err(SyncError::Fork);
                     }
-                } else if blocks
-                    .first()
-                    .is_none_or(|block| block.header.parent_block_id != latest.tip_block_id)
-                {
+                    if blocks.len() < previous.blocks.len() {
+                        blocks.clone_from(&previous.blocks);
+                    }
+                } else if blocks.first().is_none_or(|block| {
+                    // The tenure a follower actually holds is what the next one
+                    // has to extend. Comparing against the tip the peer reported
+                    // calls a tenure this node only partly fetched a fork.
+                    let held = self
+                        .history
+                        .last()
+                        .and_then(|previous| previous.blocks.last())
+                        .map_or(latest.tip_block_id, NakamotoBlock::block_id);
+                    block.header.parent_block_id != held
+                }) {
                     return Err(SyncError::Fork);
                 }
             }
