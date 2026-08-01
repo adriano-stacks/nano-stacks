@@ -129,11 +129,15 @@ network's tip**. From the checkpoint at Stacks height 8,665,600 it executed
 every block forward to the tip and now tracks it one or two blocks behind:
 
 ```
-19:09:09 nano 8683835 mainnet 8683835 lag 0
-19:12:09 nano 8683851 mainnet 8683851 lag 0
-19:16:23 nano 8683871 mainnet 8683872 lag 1
-19:19:23 nano 8683886 mainnet 8683887 lag 1
+20:49:21 nano 8684267 mainnet 8684267 lag 0
+20:55:21 nano 8684289 mainnet 8684290 lag 1
+21:03:22 nano 8684319 mainnet 8684319 lag 0
+21:07:22 nano 8684323 mainnet 8684325 lag 2
+21:13:22 nano 8684345 mainnet 8684345 lag 0
 ```
+
+Half an hour at a lag of nought to two blocks, which is the poll interval and
+the round trip rather than any backlog.
 
 **Roughly 18,290 real mainnet blocks, and every `state_index_root` matched.**
 The follower runs `RootPolicy::Verify`, so a wrong root is a hard error, and the
