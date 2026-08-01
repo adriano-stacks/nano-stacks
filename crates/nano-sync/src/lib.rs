@@ -792,14 +792,7 @@ impl SyncClient {
             .base_url
             .join(path)
             .map_err(|_| SyncError::InvalidBaseUrl)?;
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        Ok(self.send(url).await?.json().await?)
     }
 
     async fn bytes(&self, path: &str) -> Result<Vec<u8>, SyncError> {
@@ -1037,20 +1030,24 @@ impl TenureFollower {
             if info.tenure_start_block_id != requested_info.tenure_start_block_id {
                 continue;
             }
-            self.client
+            // Reaching the tip is worth trying and not worth failing over: the
+            // blocks already in hand extend this node's chain, and a round
+            // that throws them away because the last few could not be fetched
+            // makes no progress at all — which is how a rate-limited follower
+            // stops moving while reporting nothing wrong.
+            if let Err(error) = self
+                .client
                 .extend_to_tenure_tip(&mut blocks, info.tip_block_id)
-                .await?;
+                .await
+            {
+                eprintln!("reaching the tenure's tip failed, applying what it answered: {error}");
+            }
             if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
                 let tip = self.client.block(info.tip_block_id).await?;
                 let parent = blocks.last().ok_or(SyncError::EmptyTenure)?;
-                if tip.validate_successor(&parent.header).is_err() {
-                    return Err(SyncError::TenureGap {
-                        tenure: requested_info.tenure_start_block_id,
-                        have: parent.header.chain_length,
-                        want: tip.header.chain_length,
-                    });
+                if tip.validate_successor(&parent.header).is_ok() {
+                    blocks.push(tip);
                 }
-                blocks.push(tip);
             }
             if let Some(latest) = &self.latest {
                 validate_tenure_transition(latest, &info)?;
