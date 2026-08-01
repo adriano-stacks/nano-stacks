@@ -113,7 +113,17 @@ impl TrieStorage {
     pub(crate) fn open(path: &Path) -> Result<Self, MarfError> {
         let connection = Connection::open(path)?;
         connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
-        connection.execute_batch("PRAGMA synchronous = NORMAL")?;
+        // `marf_node` is a B-tree keyed by (block, idx), and a checkpoint
+        // import writes it in trie order rather than key order: it hops
+        // between blocks as it follows back-pointers, so every insert lands
+        // somewhere else in the tree. Against SQLite's default two megabytes
+        // of page cache that is one random read per node, which is where a
+        // mainnet import spent its time — 159 MB/s of reads to write 29.
+        connection.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -2000000;
+             PRAGMA temp_store = MEMORY;",
+        )?;
         Self::from_connection(connection)
     }
 
