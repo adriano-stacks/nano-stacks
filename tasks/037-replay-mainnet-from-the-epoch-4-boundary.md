@@ -136,8 +136,18 @@ every block forward to the tip and now tracks it one or two blocks behind:
 21:13:22 nano 8684345 mainnet 8684345 lag 0
 ```
 
-Half an hour at a lag of nought to two blocks, which is the poll interval and
-the round trip rather than any backlog.
+Sampled every two minutes for eighty minutes, thirty-one times against the
+network's own tip:
+
+| lag | samples |
+|---|---|
+| 0 | 5 |
+| 1 | 11 |
+| 2 | 14 |
+| 3 | 1 |
+
+Never further behind than three blocks, which is the poll interval and the round
+trip rather than any backlog, and never down.
 
 **Roughly 18,290 real mainnet blocks, and every `state_index_root` matched.**
 The follower runs `RootPolicy::Verify`, so a wrong root is a hard error, and the
