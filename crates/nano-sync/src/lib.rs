@@ -1,8 +1,12 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+use lru::LruCache;
 
 use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
@@ -46,7 +50,16 @@ const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(2
 pub struct SyncClient {
     client: Client,
     base_url: Url,
+    /// Blocks already fetched from this peer.
+    ///
+    /// A block is immutable under its identifier, so this is always sound, and
+    /// it is what makes a retried round cheap: a peer that rate limits one
+    /// request would otherwise have every block of that round asked for again.
+    blocks: Arc<Mutex<LruCache<StacksBlockId, NakamotoBlock>>>,
 }
+
+/// How many fetched blocks one peer's client keeps.
+const BLOCK_CACHE: usize = 4096;
 
 /// The accounts a peer reports, as the tip a mempool judges against.
 ///
@@ -382,6 +395,9 @@ impl SyncClient {
             Ok(Self {
                 client: Client::builder().timeout(Duration::from_secs(30)).build()?,
                 base_url,
+                blocks: Arc::new(Mutex::new(LruCache::new(
+                    NonZeroUsize::new(BLOCK_CACHE).expect("the cache holds blocks"),
+                ))),
             })
         }
     }
@@ -675,8 +691,19 @@ impl SyncClient {
 
     /// Download and validate one Nakamoto block by its block ID.
     pub async fn block(&self, block_id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
+        if let Some(block) = self.cached(block_id) {
+            return Ok(block);
+        }
         let bytes = self.bytes(&format!("v3/blocks/{block_id}")).await?;
-        NakamotoBlock::decode(&bytes).map_err(SyncError::Block)
+        let block = NakamotoBlock::decode(&bytes).map_err(SyncError::Block)?;
+        if let Ok(mut blocks) = self.blocks.lock() {
+            blocks.put(block_id, block.clone());
+        }
+        Ok(block)
+    }
+
+    fn cached(&self, block_id: StacksBlockId) -> Option<NakamotoBlock> {
+        self.blocks.lock().ok()?.get(&block_id).cloned()
     }
 
     /// Upload a finalized block to a stock node and require its exact acknowledgement.
@@ -1046,6 +1073,49 @@ impl TenureFollower {
         *blocks = bridge;
     }
 
+    /// Carry the tenure this node already holds forward to the peer's tip.
+    ///
+    /// A tenure in hand only needs the blocks added since, and asking for it
+    /// whole is what rate limits a follower out of tip: a mainnet tenure runs
+    /// to hundreds of blocks. `None` means the incremental walk did not reach
+    /// the tip, and the caller falls back to fetching the tenure.
+    async fn extend_held_tenure(
+        &mut self,
+        info: &TenureInfo,
+    ) -> Result<Option<FollowedTenure>, SyncError> {
+        let previous = self.history.last().ok_or(SyncError::Fork)?;
+        let held = previous.blocks.len();
+        let mut blocks = previous.blocks.clone();
+        if self
+            .client
+            .extend_to_tenure_tip(&mut blocks, info.tip_block_id)
+            .await
+            .is_err()
+            || !blocks
+                .windows(2)
+                .skip(held.saturating_sub(1))
+                .all(|pair| pair[1].validate_successor(&pair[0].header).is_ok())
+        {
+            return Ok(None);
+        }
+        let block_consensus_hash = blocks
+            .last()
+            .ok_or(SyncError::EmptyTenure)?
+            .header
+            .consensus_hash;
+        let sortition = self.client.sortition(block_consensus_hash).await?;
+        if !sortition.was_sortition {
+            return Err(SyncError::InvalidSortition);
+        }
+        let followed = FollowedTenure {
+            info: info.clone(),
+            sortition,
+            blocks,
+        };
+        self.record(followed.clone());
+        Ok(Some(followed))
+    }
+
     pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
         for _ in 0..3 {
             let requested_info = self.client.tenure_info().await?;
@@ -1058,30 +1128,9 @@ impl TenureFollower {
             }
             if self.latest.as_ref().is_some_and(|latest| {
                 latest.tenure_start_block_id == requested_info.tenure_start_block_id
-            }) {
-                let tip = self.client.block(requested_info.tip_block_id).await?;
-                let previous = self.history.last().ok_or(SyncError::Fork)?;
-                let parent = previous.blocks.last().ok_or(SyncError::EmptyTenure)?;
-                if tip.validate_successor(&parent.header).is_ok() {
-                    let mut blocks = previous.blocks.clone();
-                    blocks.push(tip);
-                    let block_consensus_hash = blocks
-                        .last()
-                        .expect("the appended tip is present")
-                        .header
-                        .consensus_hash;
-                    let sortition = self.client.sortition(block_consensus_hash).await?;
-                    if !sortition.was_sortition {
-                        return Err(SyncError::InvalidSortition);
-                    }
-                    let followed = FollowedTenure {
-                        info: requested_info,
-                        sortition,
-                        blocks,
-                    };
-                    self.record(followed.clone());
-                    return Ok(Some(followed));
-                }
+            }) && let Some(followed) = self.extend_held_tenure(&requested_info).await?
+            {
+                return Ok(Some(followed));
             }
             let mut blocks = self
                 .client
@@ -1522,6 +1571,35 @@ mod tests {
                 .expect("valid block ID")
                 .as_bytes(),
             &[0; 32]
+        );
+    }
+
+    /// A cached block is served without a request, which is what makes a round
+    /// that a peer rate limited cheap to retry.
+    #[tokio::test]
+    async fn a_fetched_block_is_not_asked_for_twice() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/nakamoto/blocks");
+        let path = fs::read_dir(directory)
+            .expect("read fixture blocks")
+            .map(|entry| entry.expect("fixture block").path())
+            .min()
+            .expect("a fixture block");
+        let block = NakamotoBlock::decode(&fs::read(path).expect("read fixture block"))
+            .expect("decode fixture block");
+
+        // Nothing listens here, so a request would fail rather than answer.
+        let client = SyncClient::new(Url::parse("http://127.0.0.1:1/").expect("a base url"))
+            .expect("a client");
+        assert!(client.block(block.block_id()).await.is_err());
+        client
+            .blocks
+            .lock()
+            .expect("the cache is not poisoned")
+            .put(block.block_id(), block.clone());
+        assert_eq!(
+            client.block(block.block_id()).await.expect("cached").block_id(),
+            block.block_id()
         );
     }
 
