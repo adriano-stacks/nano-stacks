@@ -23,6 +23,14 @@ use serde_json::Value;
 /// How many blocks one round will walk back from a tenure's tip.
 const TENURE_WALK: usize = 32;
 
+/// How far a round will walk to close a gap of whole tenures.
+///
+/// A partial walk toward the tip still leaves usable blocks behind; a partial
+/// bridge leaves none, because it is walked from the far end and stops before
+/// reaching anything this node holds. So it is allowed to be long, and a gap
+/// beyond it means this node fell too far behind to follow.
+const BRIDGE_WALK: usize = 1024;
+
 /// How long to wait out a peer's first rate limit, and how often to try again.
 /// How a rate-limited peer is waited out.
 ///
@@ -770,12 +778,23 @@ impl SyncClient {
         if known == tip {
             return Ok(());
         }
+        self.walk_back(blocks, tip, known, TENURE_WALK).await
+    }
+
+    /// Collect the blocks between `known` and `tip`, walking back by parent.
+    async fn walk_back(
+        &self,
+        blocks: &mut Vec<NakamotoBlock>,
+        tip: StacksBlockId,
+        known: StacksBlockId,
+        limit: usize,
+    ) -> Result<(), SyncError> {
         let mut walked = Vec::new();
         let mut cursor = tip;
         while cursor != known {
             // A bounded walk per round, so one poll cannot spend itself on a
             // gap that keeps growing.
-            if walked.len() >= TENURE_WALK {
+            if walked.len() >= limit {
                 return Err(SyncError::TenureGap {
                     tenure: known,
                     have: blocks.last().map_or(0, |block| block.header.chain_length),
@@ -991,6 +1010,42 @@ impl TenureFollower {
     }
 
     /// Download the current tenure when the peer's tip has advanced.
+    /// The last block this node actually holds, which is what the tenure it
+    /// fetches next has to extend. Comparing against the tip the peer reported
+    /// would call a tenure this node only partly fetched a fork.
+    fn held_tip(&self, latest: &TenureInfo) -> StacksBlockId {
+        self.history
+            .last()
+            .and_then(|previous| previous.blocks.last())
+            .map_or(latest.tip_block_id, NakamotoBlock::block_id)
+    }
+
+    /// Prepend whatever lies between `held` and the blocks in hand.
+    ///
+    /// Falling behind by more than one tenure was otherwise unrecoverable: the
+    /// follower only ever asks for the peer's latest tenure, whose first block
+    /// descends from one it never fetched. Parent links cross tenure
+    /// boundaries like any other, so the gap closes the same way the tip is
+    /// reached — and failing to close it leaves the round to the fork check.
+    async fn bridge_gap(&self, blocks: &mut Vec<NakamotoBlock>, held: StacksBlockId) {
+        let Some(first) = blocks.first() else { return };
+        if first.header.parent_block_id == held {
+            return;
+        }
+        let first = first.block_id();
+        let mut bridge = Vec::new();
+        if let Err(error) = self
+            .client
+            .walk_back(&mut bridge, first, held, BRIDGE_WALK)
+            .await
+        {
+            eprintln!("bridging to the peer's tenure failed: {error}");
+            return;
+        }
+        bridge.append(blocks);
+        *blocks = bridge;
+    }
+
     pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, SyncError> {
         for _ in 0..3 {
             let requested_info = self.client.tenure_info().await?;
@@ -1070,18 +1125,15 @@ impl TenureFollower {
                     if blocks.len() < previous.blocks.len() {
                         blocks.clone_from(&previous.blocks);
                     }
-                } else if blocks.first().is_none_or(|block| {
-                    // The tenure a follower actually holds is what the next one
-                    // has to extend. Comparing against the tip the peer reported
-                    // calls a tenure this node only partly fetched a fork.
-                    let held = self
-                        .history
-                        .last()
-                        .and_then(|previous| previous.blocks.last())
-                        .map_or(latest.tip_block_id, NakamotoBlock::block_id);
-                    block.header.parent_block_id != held
-                }) {
-                    return Err(SyncError::Fork);
+                } else {
+                    let held = self.held_tip(latest);
+                    self.bridge_gap(&mut blocks, held).await;
+                    if blocks
+                        .first()
+                        .is_none_or(|block| block.header.parent_block_id != held)
+                    {
+                        return Err(SyncError::Fork);
+                    }
                 }
             }
             let block_consensus_hash = blocks
