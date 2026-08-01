@@ -30,11 +30,11 @@ depends on are done.
 - [x] Capture a mainnet checkpoint at or after the 4.0 boundary, with the
       blocks and the burn blocks that follow it. Receipts need an observer.
 - [x] Teach the fixture tooling and the scoreboard about a mainnet capture.
-- [ ] Make `import_checkpoint` work in bounded memory, so a mainnet-sized MARF
+- [x] Make `import_checkpoint` work in bounded memory, so a mainnet-sized MARF
       can be imported at all.
-- [ ] Replay forward and report the first divergence with the field that
+- [x] Replay forward and report the first divergence with the field that
       diverged.
-- [ ] Work the divergence point forward until it stops moving for a real reason
+- [x] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
 - [x] Check what mainnet *can* serve without a chainstate — the block envelope
@@ -121,6 +121,41 @@ Also learned about the archive itself:
   written with `-o`.
 - The archive dated the day mainnet crossed the boundary stops **27 burn blocks
   short of it**. The next day's reaches burn 960,341.
+
+## The state-root half is done: nano follows mainnet
+
+The replay is not a harness run — it is a **live node on mainnet, at the
+network's tip**. From the checkpoint at Stacks height 8,665,600 it executed
+every block forward to the tip and now tracks it one or two blocks behind:
+
+```
+19:09:09 nano 8683835 mainnet 8683835 lag 0
+19:12:09 nano 8683851 mainnet 8683851 lag 0
+19:16:23 nano 8683871 mainnet 8683872 lag 1
+19:19:23 nano 8683886 mainnet 8683887 lag 1
+```
+
+**Roughly 18,290 real mainnet blocks, and every `state_index_root` matched.**
+The follower runs `RootPolicy::Verify`, so a wrong root is a hard error, and the
+log carries none. Every execution failure it did record was a `429` from the
+peer while fetching a block — a fetch that got rate limited, never a block that
+disagreed.
+
+That is what M10 asks for, against the chain that matters: the MARF, the Clarity
+VM, the native accounting, PoX locking, SIP-031 and the unlock schedule all
+agree with stacks-core, block for block, on real traffic.
+
+Three faults had to be fixed to get there, each only visible at mainnet scale:
+
+- the checkpoint import held the whole record table in memory (below)
+- the side store copied every historical value — 140 GB — where only the ones
+  reachable from trie leaves are needed, which is 10.5 GB
+- a follower that fell more than one tenure behind could never catch up: it only
+  ever asks for the peer's latest tenure, whose first block descends from one it
+  never fetched, so every round ended in a fork error. Parent links cross tenure
+  boundaries like any other, so the walk that reaches a tip also closes the gap.
+
+What remains is the receipt half, which needs an oracle an archive cannot give.
 
 ## What stops the replay: memory
 
