@@ -496,6 +496,39 @@ impl Blobs {
         Ok(bytes)
     }
 
+    /// Read enough bytes from `offset` to hold a node of that kind.
+    ///
+    /// A pointer says what it points at, so the read can be the size that kind
+    /// needs rather than the size the largest kind needs. Most nodes are
+    /// leaves or small branches of a hundred-odd bytes, and reading eight
+    /// kilobytes for each of them is where a mainnet import spent its time:
+    /// 159 MB/s of reads to write 29.
+    fn window_for(&self, offset: usize, id: u8) -> Result<Vec<u8>, CheckpointError> {
+        let length = match id & !CONTROL_BITS {
+            // Leaf, Node4: a path of at most 32 and either a 40-byte value or
+            // four ten-byte pointers.
+            1 | 2 => 256,
+            // Node16.
+            3 => 512,
+            // Node48 carries a 256-byte index beside its pointers.
+            4 => 1024,
+            // Node256.
+            5 => 4096,
+            // A patch names a base node and its differences, and how many
+            // there are is not known until it is read.
+            _ => WINDOW,
+        };
+        self.read_upto(offset, length)
+    }
+
+    /// Read up to `length` bytes, stopping at the end of the file.
+    fn read_upto(&self, offset: usize, length: usize) -> Result<Vec<u8>, CheckpointError> {
+        let offset64 = u64::try_from(offset)
+            .map_err(|_| CheckpointError::InvalidCheckpoint("blob offset exceeds address space"))?;
+        let available = usize::try_from(self.length.saturating_sub(offset64)).unwrap_or(length);
+        self.read(offset, length.min(available))
+    }
+
     /// Read enough bytes from `offset` to hold any single node.
     fn window(&self, offset: usize) -> Result<Vec<u8>, CheckpointError> {
         let offset64 = u64::try_from(offset)
@@ -659,11 +692,17 @@ impl Importer<'_> {
             .offset
             .checked_add(pointer)
             .ok_or(CheckpointError::InvalidCheckpoint("node offset overflow"))?;
-        let window = self.blobs.window(start)?;
+        let window = self.blobs.window_for(start, expected_id)?;
         let mut reader = Reader::new(&window);
         reader.take(32)?;
         let id = reader.byte()?;
         if id & !CONTROL_BITS == 6 {
+            // A patch is not the kind the pointer promised, so it needs the
+            // read the pointer did not size for.
+            let window = self.blobs.window(start)?;
+            let mut reader = Reader::new(&window);
+            reader.take(32)?;
+            reader.byte()?;
             return self.decode_patch(block_id, &mut reader);
         }
         if id & !CONTROL_BITS != expected_id & !CONTROL_BITS {
