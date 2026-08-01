@@ -1464,7 +1464,7 @@ impl ChainState {
                 .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?,
             function,
             &arguments,
-            LimitedCostTracker::new_free(),
+            &LimitedCostTracker::new_free(),
         );
         finalize_native_contract_call(&mut self.vm, &result)
     }
@@ -1683,7 +1683,7 @@ impl ChainState {
                     .iter()
                     .map(|argument| argument.as_bytes().to_vec())
                     .collect::<Vec<_>>(),
-                cost_tracker,
+                &cost_tracker,
             )? {
                 ContractCallOutcome::Success(result) => *result,
                 ContractCallOutcome::AbortedByResponse(result) => {

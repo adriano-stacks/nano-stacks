@@ -51,6 +51,6 @@ fn main() {
         .unwrap_or_default();
     println!(
         "{function} = {:?}",
-        vm.call_contract_values(sender, &pox, &function, &args)
+        vm.call_contract_values(&sender, &pox, &function, &args)
     );
 }

@@ -20,6 +20,13 @@ use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// How many times a tenure is asked for more blocks before giving up.
+const TENURE_PAGES: usize = 512;
+
+/// How long to wait out a peer's first rate limit, and how often to try again.
+const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+const RATE_LIMIT_RETRIES: usize = 6;
+
 #[derive(Clone, Debug)]
 pub struct SyncClient {
     client: Client,
@@ -721,6 +728,38 @@ impl SyncClient {
         Ok(blocks)
     }
 
+    /// Ask for more of a tenure until its tip arrives.
+    ///
+    /// One response carries a bounded number of blocks and a mainnet tenure
+    /// can hold more, so a follower that assumes one response is the whole
+    /// tenure decides the next block does not follow the last.
+    async fn extend_to_tenure_tip(
+        &self,
+        blocks: &mut Vec<NakamotoBlock>,
+        tip: StacksBlockId,
+    ) -> Result<(), SyncError> {
+        for _ in 0..TENURE_PAGES {
+            if blocks.last().map(NakamotoBlock::block_id) == Some(tip) {
+                return Ok(());
+            }
+            let from = blocks.last().ok_or(SyncError::EmptyTenure)?.block_id();
+            // Which blocks a page repeats is the endpoint's business, so take
+            // whatever is new rather than assuming where it starts.
+            let seen: std::collections::HashSet<_> =
+                blocks.iter().map(NakamotoBlock::block_id).collect();
+            let page: Vec<_> = self.tenure(from, None)
+                .await?
+                .into_iter()
+                .filter(|block| !seen.contains(&block.block_id()))
+                .collect();
+            if page.is_empty() {
+                return Ok(());
+            }
+            blocks.extend(page);
+        }
+        Ok(())
+    }
+
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, SyncError> {
         let url = self
             .base_url
@@ -741,15 +780,30 @@ impl SyncClient {
             .base_url
             .join(path)
             .map_err(|_| SyncError::InvalidBaseUrl)?;
+        Ok(self.send(url).await?.bytes().await?.to_vec())
+    }
+
+    /// Send a request, waiting out a peer that is rate limiting this node.
+    ///
+    /// A public endpoint answers 429 when asked too often, and a follower
+    /// catching up asks constantly. Treating that as a failure drops the whole
+    /// round and starts it again, which asks even more.
+    async fn send(&self, url: reqwest::Url) -> Result<reqwest::Response, SyncError> {
+        let mut wait = RATE_LIMIT_WAIT;
+        for _ in 0..RATE_LIMIT_RETRIES {
+            let response = self.client.get(url.clone()).send().await?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response.error_for_status()?);
+            }
+            tokio::time::sleep(wait).await;
+            wait = wait.saturating_mul(2);
+        }
         Ok(self
             .client
             .get(url)
             .send()
             .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec())
+            .error_for_status()?)
     }
 }
 
@@ -949,6 +1003,9 @@ impl TenureFollower {
             if info.tenure_start_block_id != requested_info.tenure_start_block_id {
                 continue;
             }
+            self.client
+                .extend_to_tenure_tip(&mut blocks, info.tip_block_id)
+                .await?;
             if blocks.last().map(NakamotoBlock::block_id) != Some(info.tip_block_id) {
                 let tip = self.client.block(info.tip_block_id).await?;
                 let parent = blocks.last().ok_or(SyncError::EmptyTenure)?;

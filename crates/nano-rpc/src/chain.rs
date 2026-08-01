@@ -99,7 +99,7 @@ impl ChainAccess for Vm {
                 call.contract.clone(),
                 &call.function,
                 &call.arguments,
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .map_err(|error| ChainAccessError::Failed(error.to_string()))?;
         let result = match outcome {

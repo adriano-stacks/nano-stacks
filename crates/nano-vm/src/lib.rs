@@ -627,7 +627,7 @@ impl Vm {
         contract: QualifiedContractIdentifier,
         function: &str,
         arguments: &[Vec<u8>],
-        cost_tracker: LimitedCostTracker,
+        cost_tracker: &LimitedCostTracker,
     ) -> Result<TransactionResult, VmExecutionError> {
         match self.execute_contract_call_outcome(
             sender,
@@ -649,7 +649,7 @@ impl Vm {
     /// consensus state that no transaction owns.
     pub fn call_contract_values(
         &mut self,
-        sender: PrincipalData,
+        sender: &PrincipalData,
         contract: &QualifiedContractIdentifier,
         function: &str,
         arguments: &[Value],
@@ -667,7 +667,7 @@ impl Vm {
             contract,
             function,
             arguments,
-            LimitedCostTracker::new_free(),
+            &LimitedCostTracker::new_free(),
         )? {
             ContractCallOutcome::Success(result)
             | ContractCallOutcome::AbortedByResponse(result) => result.value.ok_or_else(|| {
@@ -685,7 +685,7 @@ impl Vm {
         contract: QualifiedContractIdentifier,
         function: &str,
         arguments: &[Vec<u8>],
-        cost_tracker: LimitedCostTracker,
+        cost_tracker: &LimitedCostTracker,
     ) -> Result<ContractCallOutcome, VmExecutionError> {
         let Self {
             store,
@@ -696,7 +696,7 @@ impl Vm {
             store,
             context,
             modules,
-            ContractCall {
+            &ContractCall {
                 sender,
                 sponsor,
                 contract,
@@ -1506,7 +1506,7 @@ impl ClarityBackingStore for MarfStore {
             .get_data(&make_contract_hash_key(contract))?
             .map(|value| ContractCommitment::deserialize(&value))
             .transpose()?
-            .ok_or_else(|| VmInternalError::Expect("unknown contract".to_owned()))?;
+            .ok_or_else(|| VmInternalError::Expect(format!("unknown contract {contract}")))?;
         let block = self
             .get_block_at_height(commitment.block_height)
             .ok_or_else(|| VmInternalError::Expect("unknown contract block height".to_owned()))?;
@@ -1911,8 +1911,8 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
-    call: ContractCall<'_>,
-    cost_tracker: LimitedCostTracker,
+    call: &ContractCall<'_>,
+    cost_tracker: &LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     let arguments = call
         .arguments
@@ -1935,7 +1935,7 @@ fn execute_contract_call_outcome_with_wasm_in_context(
         store,
         bitcoin_context,
         modules,
-        call.sender,
+        &call.sender,
         &call.contract,
         call.function,
         &arguments,
@@ -1948,6 +1948,69 @@ fn call_contract_values_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
+    sender: &PrincipalData,
+    contract: &QualifiedContractIdentifier,
+    function: &str,
+    arguments: &[Value],
+    cost_tracker: &LimitedCostTracker,
+) -> Result<ContractCallOutcome, VmExecutionError> {
+    for argument in arguments.iter().filter_map(contract_argument) {
+        ensure_wasm_module(store, bitcoin_context, modules, argument)?;
+    }
+    ensure_wasm_module(store, bitcoin_context, modules, contract)?;
+    // A `contract-call?` reaches a contract this node never compiled — the
+    // checkpoint carried its source and its state, not a module, and which
+    // contracts a call reaches is not knowable in advance when a trait
+    // decides it. So compile what the run turns out to want and run it
+    // again: the failed attempt rolled its database back, so the retry
+    // starts where the first one did.
+    let mut attempts = 0;
+    loop {
+        match call_compiled_contract(
+            store,
+            bitcoin_context,
+            modules,
+            sender.clone(),
+            contract,
+            function,
+            arguments,
+            cost_tracker.clone(),
+        ) {
+            Err(error) => {
+                let Some(missing) = missing_compiled_contract(&error)
+                    .filter(|_| attempts < MISSING_MODULE_ATTEMPTS)
+                else {
+                    return Err(error);
+                };
+                attempts += 1;
+                // A contract that cannot be compiled is not the reason the
+                // run stopped — report what stopped it, not what the repair
+                // ran into.
+                if ensure_wasm_module(store, bitcoin_context, modules, &missing).is_err() {
+                    return Err(error);
+                }
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// How many contracts one call may turn out to need compiling.
+const MISSING_MODULE_ATTEMPTS: usize = 64;
+
+/// The contract a run stopped for want of, if that is why it stopped.
+fn missing_compiled_contract(error: &VmExecutionError) -> Option<QualifiedContractIdentifier> {
+    let text = error.to_string();
+    let (_, rest) = text.split_once("compiled contract ")?;
+    let name = rest.split(['"', ')', '\\']).next()?.trim();
+    QualifiedContractIdentifier::parse(name).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_compiled_contract(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    modules: &ModuleCache,
     sender: PrincipalData,
     contract: &QualifiedContractIdentifier,
     function: &str,
@@ -1955,10 +2018,6 @@ fn call_contract_values_in_context(
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     let network = store.network();
-    for argument in arguments.iter().filter_map(contract_argument) {
-        ensure_wasm_module(store, bitcoin_context, modules, argument)?;
-    }
-    ensure_wasm_module(store, bitcoin_context, modules, contract)?;
     let module = modules
         .get(contract)
         .ok_or_else(|| VmInternalError::Expect(format!("missing WASM module for {contract}")))?;
@@ -1973,6 +2032,10 @@ fn call_contract_values_in_context(
     global.begin();
     let contract_context = global.database.get_contract(contract)?;
     let mut call_stack = CallStack::new();
+    // A call from outside a contract is its own caller: `contract-caller`
+    // reads as the sender until a `contract-call?` moves it. Leaving it unset
+    // made every boot function that reads it fail with `NoCallerInContext`,
+    // which is what a mainnet node hit applying its first block.
     let result = clar2wasm::initialize::call_function(
         function,
         arguments,
@@ -1980,8 +2043,8 @@ fn call_contract_values_in_context(
         &mut global,
         &contract_context,
         &mut call_stack,
+        Some(sender.clone()),
         Some(sender),
-        None,
         None,
         modules,
     );
@@ -2278,7 +2341,10 @@ fn process_scheduled_unlocks_in_context(
     );
     context.execute(|global| {
         let block_height = Value::UInt(u128::from(global.database.get_current_block_height()));
-        let lockup_contract = clarity::boot_util::boot_code_id("lockup", false);
+        // `.lockup` lives at the boot address of the chain being executed:
+        // hardcoding the testnet one made a mainnet node look for a contract
+        // that is not there.
+        let lockup_contract = clarity::boot_util::boot_code_id("lockup", network.is_mainnet());
         let entries = match global.database.fetch_entry_unknown_descriptor(
             &lockup_contract,
             "lockups",
@@ -2666,7 +2732,7 @@ mod tests {
                 contract,
                 "increment",
                 &[argument],
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .expect("call contract");
 
@@ -2705,7 +2771,7 @@ mod tests {
                 contract,
                 "guarded",
                 &[],
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .expect("call contract");
 
@@ -2739,7 +2805,7 @@ mod tests {
                 contract,
                 "output",
                 &[],
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .expect("call contract");
 
@@ -2761,7 +2827,7 @@ mod tests {
                 contract.clone(),
                 function,
                 arguments,
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .expect("call WASM contract");
         let interpreter_result = execute_contract_call(
@@ -2796,7 +2862,7 @@ mod tests {
                 contract.clone(),
                 function,
                 arguments,
-                LimitedCostTracker::new_free(),
+                &LimitedCostTracker::new_free(),
             )
             .expect("execute WASM failure");
         let interpreter_failure = execute_contract_call_outcome(
@@ -2978,7 +3044,7 @@ mod tests {
             contract,
             "get-last-reward-compute-height",
             &[],
-            LimitedCostTracker::new_free(),
+            &LimitedCostTracker::new_free(),
         );
 
         assert!(

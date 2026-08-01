@@ -86,7 +86,7 @@ pub fn update_signer_set(
         |weight| Value::UInt(u128::from(weight)),
     )?;
     vm.call_contract_values(
-        boot_sender(network),
+        &boot_sender(network),
         &signers,
         "stackerdb-set-signer-slots",
         &[
@@ -96,7 +96,7 @@ pub fn update_signer_set(
         ],
     )?;
     vm.call_contract_values(
-        boot_sender(network),
+        &boot_sender(network),
         &signers,
         "set-signers",
         &[Value::UInt(u128::from(reward_cycle)), weights],
@@ -209,7 +209,7 @@ fn read_u128(
     arguments: &[Value],
 ) -> Result<u128, ChainStateError> {
     let sender = boot_sender(vm.network());
-    let value = vm.call_contract_values(sender, contract, function, arguments)?;
+    let value = vm.call_contract_values(&sender, contract, function, arguments)?;
     let value = match value {
         Value::Response(response) if response.committed => *response.data,
         other => other,
@@ -226,7 +226,7 @@ fn read_optional(
     arguments: &[Value],
 ) -> Result<Option<Value>, ChainStateError> {
     let sender = boot_sender(vm.network());
-    vm.call_contract_values(sender, contract, function, arguments)?
+    vm.call_contract_values(&sender, contract, function, arguments)?
         .expect_optional()
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }

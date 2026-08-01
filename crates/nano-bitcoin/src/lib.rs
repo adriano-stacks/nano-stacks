@@ -224,7 +224,6 @@ impl BitcoinRpcSource {
 #[derive(Debug)]
 pub struct BitcoinRestSource {
     base: String,
-    client: reqwest::blocking::Client,
     magic: [u8; 2],
     pre_stx: PreStxCache,
     last_height: Option<u64>,
@@ -235,10 +234,6 @@ impl BitcoinRestSource {
     pub fn new(base: &str, magic: [u8; 2]) -> Result<Self, BitcoinRpcSourceError> {
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?,
             magic,
             pre_stx: PreStxCache::new(),
             last_height: None,
@@ -246,17 +241,23 @@ impl BitcoinRestSource {
         })
     }
 
+    /// A plain synchronous GET.
+    ///
+    /// Deliberately not `reqwest::blocking`, which carries its own runtime:
+    /// building one inside the node's async context and dropping it there
+    /// panics tokio, which is how the first live node died.
     fn get(&self, path: &str) -> Result<Vec<u8>, BitcoinRpcSourceError> {
-        let response = self
-            .client
-            .get(format!("{}/{path}", self.base))
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
+        use std::io::Read as _;
+        let mut body = Vec::new();
+        let mut reader = ureq::get(&format!("{}/{path}", self.base))
+            .call()
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?
+            .into_body()
+            .into_reader();
+        reader
+            .read_to_end(&mut body)
             .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
-        response
-            .bytes()
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))
+        Ok(body)
     }
 
     /// The hash Esplora reports at a height, in the byte order nano uses.

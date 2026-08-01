@@ -366,9 +366,16 @@ where
         bitcoin_context: BitcoinBlockContext,
         operations: &[nano_bitcoin::BitcoinOperation],
     ) -> Result<AppliedBlock, CheckpointExecutionError> {
-        block
-            .validate_successor(&self.tip.header)
-            .map_err(|error| CheckpointExecutionError::Link(error.to_string()))?;
+        block.validate_successor(&self.tip.header).map_err(|error| {
+            CheckpointExecutionError::Link(format!(
+                "{error}: block {} at height {} names parent {}, but this node is at {} of height {}",
+                block.block_id(),
+                block.header.chain_length,
+                block.header.parent_block_id,
+                self.tip.block_id(),
+                self.tip.header.chain_length,
+            ))
+        })?;
         let applied = self
             .chainstate
             .append_nakamoto_block_with_bitcoin_operations(
