@@ -382,6 +382,7 @@ where
     ) -> Result<Vec<AppliedBlock>, CheckpointExecutionError> {
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.height = tenure.sortition.bitcoin_height;
+        bitcoin_context.burn_header_hash = *tenure.sortition.bitcoin_block_hash.as_bytes();
         let current_tip = self.tip.block_id();
         let blocks = tenure
             .blocks
@@ -591,11 +592,13 @@ where
             let Some(block) = staging.child_of(self.tip.block_id())? else {
                 break;
             };
+            let sortition = node.sortition(block.header.consensus_hash).await?;
             let mut bitcoin_context = pox.bitcoin_context();
-            bitcoin_context.height = node
-                .sortition(block.header.consensus_hash)
-                .await?
-                .bitcoin_height;
+            bitcoin_context.height = sortition.bitcoin_height;
+            // Clarity reads this back through `get-burn-block-info?`, and sBTC
+            // compares it against the hash a withdrawal was signed for. A
+            // context that leaves it zero makes every such call fail.
+            bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
             let bitcoin_context = node
                 .tenure_coinbase_context(
                     &block,
