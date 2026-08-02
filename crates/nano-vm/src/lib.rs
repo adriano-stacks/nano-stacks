@@ -1731,6 +1731,22 @@ fn evaluate_with_tracker_in_context(
 }
 
 /// Publish a versioned Clarity contract in an active MARF-backed state.
+/// Marks a compile failure as the contract's fault rather than the node's.
+///
+/// stacks-core turns a static check that is not `rejectable_in_epoch` into a
+/// transaction receipt and carries on; only `Unreachable` and a few others stop
+/// the block. `clar2wasm` reports every failure as one diagnostic-carrying
+/// variant, so without a mark of our own the two are indistinguishable and a
+/// contract naming one that does not exist yet — an ordinary failed deployment
+/// on mainnet — stops a node dead.
+const ANALYSIS_FAILED: &str = "contract analysis failed";
+
+/// Whether a failed deployment is the contract's fault rather than the node's.
+#[must_use]
+pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
+    error.to_string().contains(ANALYSIS_FAILED)
+}
+
 pub fn deploy_contract(
     store: &mut MarfStore,
     contract: QualifiedContractIdentifier,
@@ -2238,11 +2254,14 @@ fn ensure_wasm_module(
 
 fn wasm_compile_error(error: clar2wasm::CompileError) -> String {
     match error {
-        clar2wasm::CompileError::Generic { diagnostics, .. } => diagnostics
-            .into_iter()
-            .map(|diagnostic| diagnostic.message)
-            .collect::<Vec<_>>()
-            .join("; "),
+        clar2wasm::CompileError::Generic { diagnostics, .. } => {
+            let joined = diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("{ANALYSIS_FAILED}: {joined}")
+        }
     }
 }
 
@@ -2784,6 +2803,36 @@ mod tests {
     /// to check Bitcoin has not forked. A node that answers `none` rejects a
     /// withdrawal mainnet accepted, and diverges on the block carrying it —
     /// which is exactly what happened at height 8,665,615.
+    /// A contract naming one that does not exist is the contract's fault.
+    ///
+    /// mainnet recorded exactly this at height 8,665,623 as an ordinary failed
+    /// deployment — `abort_by_response`, `(err none)` — because the contract it
+    /// referenced was not deployed until 8,665,687. Treating it as a node
+    /// failure stops the chain on a transaction the network simply charged a
+    /// fee for.
+    #[test]
+    fn a_contract_naming_an_undeployed_one_fails_the_transaction_not_the_node() {
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.dependent")
+                .expect("valid contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+
+        let error = vm
+            .deploy_contract(
+                contract,
+                ClarityVersion::Clarity3,
+                "(define-public (go) (contract-call? 'ST000000000000000000002AMW42H.absent run))",
+                LimitedCostTracker::new_free(),
+            )
+            .expect_err("a contract that names an undeployed one does not compile");
+
+        assert!(
+            super::is_contract_analysis_failure(&error),
+            "the deployment failed on the contract, not the node: {error}"
+        );
+    }
+
     /// Both ways the VM reports a contract whose module is not loaded.
     ///
     /// The store says it has no compiled contract; the linker says the contract

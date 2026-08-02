@@ -1683,22 +1683,28 @@ impl ChainState {
             TransactionPayloadData::SmartContract {
                 contract_name,
                 source,
-            } => self.vm.deploy_contract(
+            } => match self.vm.deploy_contract(
                 contract_identifier(origin, contract_name)?,
                 VmClarityVersion::Clarity6,
                 source,
                 cost_tracker,
-            )?,
+            ) {
+                Ok(result) => result,
+                Err(error) => failed_deployment(error, &mut runtime_error)?,
+            },
             TransactionPayloadData::VersionedSmartContract {
                 clarity_version,
                 contract_name,
                 source,
-            } => self.vm.deploy_contract(
+            } => match self.vm.deploy_contract(
                 contract_identifier(origin, contract_name)?,
                 clarity_version_to_vm(*clarity_version),
                 source,
                 cost_tracker,
-            )?,
+            ) {
+                Ok(result) => result,
+                Err(error) => failed_deployment(error, &mut runtime_error)?,
+            },
             TransactionPayloadData::ContractCall {
                 address,
                 contract_name,
@@ -2085,6 +2091,28 @@ fn describe_mismatch(
             receipt.result.cost
         );
     }
+}
+
+/// A deployment the contract's own analysis refused, as a receipt.
+///
+/// stacks-core records this and carries on — the fee is charged and the nonce
+/// bumped, and nothing is stored. Treating it as a node failure stops the chain
+/// on an ordinary bad contract, which is what a mainnet replay did on a
+/// deployment naming a contract that had not been deployed yet.
+fn failed_deployment(
+    error: ClarityEvalError,
+    runtime_error: &mut Option<String>,
+) -> Result<TransactionResult, ChainStateError> {
+    if !nano_vm::is_contract_analysis_failure(&error) {
+        return Err(ChainStateError::from(error));
+    }
+    *runtime_error = Some(error.to_string());
+    Ok(TransactionResult {
+        value: Some(Value::err_none()),
+        cost: ExecutionCost::ZERO,
+        assets: AssetMap::new(),
+        events: Vec::new(),
+    })
 }
 
 fn check_postconditions(

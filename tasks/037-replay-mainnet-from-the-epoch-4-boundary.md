@@ -267,30 +267,28 @@ the block its metadata was written under.
 Inserting the analysis on demand would paper over it and is not obviously
 consensus-safe — metadata writes are state — so the lookup is the thing to fix.
 
-### It is the trie, not the side store
+### It was neither: the contract did not exist yet
 
-Followed down with two diagnostics that separate the faults that look alike:
+The diagnostics above narrowed it to "the key is not reachable in the imported
+trie", and that reading was wrong — the trie is right and so is the lookup.
+`native-pool-v1` was **deployed at height 8,665,687**, eighty-five blocks after
+the checkpoint and sixty-four after the deployment that names it. It is absent
+because it is genuinely absent.
 
-```
-no contract commitment for SP4SZE…native-pool-v1
-    at key clarity-contract::SP4SZE…native-pool-v1
-```
+Mainnet recorded that deployment as an ordinary **failed transaction**:
+`abort_by_response`, `(err none)`, fee charged and nonce bumped. nano stopped
+the chain on it.
 
-and no `the trie names value … but the side store has no such row` beside it.
-So the side store holds every value the trie names — the reachable-value
-scoping that cut it from 140 GB to 10.5 GB did not drop this — and the key is
-simply **not reachable in the imported trie at the tip**.
+The fault is nano's error classification. stacks-core turns a static check that
+is not `rejectable_in_epoch` into a receipt and carries on — `NoSuchContract` is
+one of those — and only `Unreachable` and a few others stop a block. nano
+wrapped *every* `clar2wasm` compile failure as `Unreachable`, which is the
+rejectable kind, so a bad contract and a broken VM were indistinguishable.
 
-Clarity's analysis loader swallows this with `.ok()` and reports the contract as
-unresolved, which is why it looked like a missing module for so long. The chain
-is: `load_contract` → `get_metadata` → `get_contract_hash` →
-`get_data(clarity-contract::…)` → nothing.
+Compile failures now carry a mark of their own, and a deployment that fails
+analysis becomes the same receipt mainnet wrote.
 
-That points at [[019-import-a-portable-checkpoint]] rather than at the VM: a key
-written long before the checkpoint has to resolve through back-pointers into
-imported history, and contracts deployed nearer the checkpoint resolve fine.
-State roots matching for twenty-two blocks is not evidence against it — a root
-is over the trie's shape, and this is a traversal that stops early.
-
-The next step is a `nano-marf` test that imports a checkpoint and reads a key
-written deep in its history, which needs no mainnet and no node.
+Two things are worth keeping from the wrong turn: the reachability check over an
+imported checkpoint is a real gate and stays in the tree, and the diagnostics
+that separate "the trie has no such key" from "the side store has no such value"
+are what made the wrong answer cheap to disprove.

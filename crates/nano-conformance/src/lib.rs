@@ -1373,6 +1373,73 @@ mod tests {
         paths
     }
 
+    /// Every contract a checkpoint carries has to be findable in the trie it
+    /// imported, by the key Clarity looks it up with.
+    ///
+    /// A matching root proves the trie has the right shape, not that every key
+    /// written before the checkpoint can still be walked to. Those are
+    /// different claims, and the second is the one execution depends on:
+    /// Clarity reads a contract through `clarity-contract::<id>`, its analysis
+    /// loader swallows a failed read with `.ok()`, and the caller is told the
+    /// contract is unresolved. Against mainnet that stopped execution at a
+    /// deployment referencing a contract from long before the checkpoint.
+    #[test]
+    fn every_checkpointed_contract_is_reachable_in_the_imported_trie() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
+        let contracts = checkpointed_contracts(&checkpoint);
+        assert!(
+            !contracts.is_empty(),
+            "the checkpoint carries contracts to look for"
+        );
+
+        let imported =
+            import_checkpoint(&checkpoint, source, root).expect("imports checkpoint");
+        let missing: Vec<&String> = contracts
+            .iter()
+            .filter(|contract| {
+                imported
+                    .get(source, format!("clarity-contract::{contract}").as_bytes())
+                    .is_none()
+            })
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{} of {} checkpointed contracts cannot be reached: {:?}",
+            missing.len(),
+            contracts.len(),
+            missing.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+
+    /// The contracts a checkpoint's side store says it holds an analysis for.
+    fn checkpointed_contracts(checkpoint: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open_with_flags(
+            checkpoint,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the checkpoint");
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT key FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis'",
+            )
+            .expect("query the checkpoint");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("read the checkpoint");
+        rows.filter_map(|key| {
+            let key = key.ok()?;
+            Some(
+                key.strip_prefix("clr-meta::")?
+                    .strip_suffix("::analysis")?
+                    .to_owned(),
+            )
+        })
+        .collect()
+    }
+
     #[test]
     fn checkpoint_graph_import_matches_the_published_root() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
