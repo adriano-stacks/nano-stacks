@@ -2069,9 +2069,20 @@ fn describe_mismatch(
         executed.liquid_supply_increase,
     );
     for receipt in receipts {
+        // The response value is the whole diagnosis for an aborted call: it
+        // names the check inside the contract that refused, where the cost only
+        // says how far it got.
         eprintln!(
-            "  receipt {} {:?} committed {} cost {:?}",
-            receipt.txid, receipt.status, receipt.committed, receipt.result.cost
+            "  receipt {} {:?} committed {} returned {} cost {:?}",
+            receipt.txid,
+            receipt.status,
+            receipt.committed,
+            receipt
+                .result
+                .value
+                .as_ref()
+                .map_or_else(|| "nothing".to_owned(), ToString::to_string),
+            receipt.result.cost
         );
     }
 }

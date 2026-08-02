@@ -182,6 +182,14 @@ struct BitcoinContext {
     headers: BTreeMap<[u8; 32], BlockHeader>,
     /// Stacks height each tenure started at, for the tenure-height mapping.
     tenure_starts: BTreeMap<u32, u32>,
+    /// The Bitcoin block at each burn height, as `get-burn-block-info?` reads
+    /// it back.
+    ///
+    /// Answering `none` here is not a harmless gap: sBTC's withdrawal path
+    /// compares the hash it was given against this to check Bitcoin has not
+    /// forked, so a node with no answer rejects a withdrawal the network
+    /// accepted and diverges on the block that carries it.
+    burn_headers: BTreeMap<u32, [u8; 32]>,
 }
 
 /// A context that knows no chain, for evaluating programs that read none.
@@ -197,6 +205,7 @@ static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     pox_5_activation_height: 0,
     headers: BTreeMap::new(),
     tenure_starts: BTreeMap::new(),
+    burn_headers: BTreeMap::new(),
 };
 
 impl BitcoinContext {
@@ -214,6 +223,11 @@ impl BitcoinContext {
         self.v2_unlock_height = context.v2_unlock_height;
         self.v3_unlock_height = context.v3_unlock_height;
         self.pox_5_activation_height = context.pox_5_activation_height;
+        // The block about to execute can be asked about its own burn block,
+        // which no header records until it has been executed.
+        if context.burn_header_hash != [0; 32] {
+            self.burn_headers.insert(self.height, context.burn_header_hash);
+        }
         Ok(())
     }
 
@@ -377,17 +391,27 @@ impl BurnStateDB for BitcoinContext {
 
     fn get_burn_header_hash(
         &self,
-        _height: u32,
+        height: u32,
         _sortition_id: &SortitionId,
     ) -> Option<BurnchainHeaderHash> {
-        None
+        self.burn_headers.get(&height).copied().map(BurnchainHeaderHash)
     }
 
+    /// Name a sortition for a consensus hash, so that a burn header can be
+    /// looked up at all.
+    ///
+    /// Clarity reaches a burn header through this, and answering `none` stops
+    /// `get-burn-block-info?` before it starts. A sortition identifier appears
+    /// in no consensus preimage, and a follower holds exactly one fork's
+    /// headers, so the consensus hash naming its own sortition is enough: the
+    /// height alone identifies the burn block on the chain this node executed.
     fn get_sortition_id_from_consensus_hash(
         &self,
-        _consensus_hash: &ConsensusHash,
+        consensus_hash: &ConsensusHash,
     ) -> Option<SortitionId> {
-        None
+        let mut bytes = [0u8; 32];
+        bytes[..20].copy_from_slice(&consensus_hash.0);
+        Some(SortitionId(bytes))
     }
 
     fn get_stacks_epoch(&self, _height: u32) -> Option<StacksEpoch<ExecutionCost>> {
@@ -547,6 +571,9 @@ impl Vm {
             .tenure_starts
             .entry(header.tenure_height)
             .or_insert(header.tenure_start_height);
+        self.context
+            .burn_headers
+            .insert(header.burn_block_height, header.burn_header_hash);
         self.context.headers.insert(block, header);
     }
 
@@ -2684,6 +2711,48 @@ mod tests {
         store.seal().expect("seal block");
 
         assert_eq!(store.get(block, "counter").as_deref(), Some("one"));
+    }
+
+    /// `get-burn-block-info? header-hash` has to answer for the block being
+    /// executed, not `none`.
+    ///
+    /// sBTC's withdrawal path compares the hash it is handed against this one
+    /// to check Bitcoin has not forked. A node that answers `none` rejects a
+    /// withdrawal mainnet accepted, and diverges on the block carrying it —
+    /// which is exactly what happened at height 8,665,615.
+    #[test]
+    fn a_block_can_read_its_own_burn_header() {
+        let hash = [0x5b; 32];
+        let mut context = super::BitcoinBlockContext::at_height(960_232);
+        context.burn_header_hash = hash;
+
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.record_block_header(
+            [9; 32],
+            BlockHeader {
+                burn_header_hash: hash,
+                burn_block_height: 960_232,
+                ..BlockHeader::default()
+            },
+        );
+        vm.begin_block_with_bitcoin_context(None, [9; 32], context)
+            .expect("begin block");
+
+        let value = vm
+            .execute(
+                "(get-burn-block-info? header-hash u960232)",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("execute")
+            .value;
+
+        assert_eq!(
+            value,
+            Some(
+                Value::some(Value::buff_from(hash.to_vec()).expect("a buffer"))
+                    .expect("an optional")
+            )
+        );
     }
 
     #[test]
