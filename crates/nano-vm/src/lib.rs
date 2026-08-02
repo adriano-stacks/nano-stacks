@@ -2338,6 +2338,49 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     call: &ContractCall<'_>,
     cost_tracker: &LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
+    let outcome = wasm_outcome(store, bitcoin_context, modules, call, cost_tracker)?;
+    // The interpreter is in the tree and is the oracle clarity-wasm is checked
+    // against, so a call the compiler refuses can be asked of it directly. A
+    // disagreement names a compiler bug; agreement says the state or the
+    // arguments are what differ.
+    if std::env::var_os("NANO_CROSSCHECK").is_some()
+        && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
+    {
+        let interpreted = execute_contract_call_outcome_in_context(
+            store,
+            bitcoin_context,
+            ContractCall {
+                sender: call.sender.clone(),
+                sponsor: call.sponsor.clone(),
+                contract: call.contract.clone(),
+                function: call.function,
+                arguments: call.arguments,
+            },
+            cost_tracker.clone(),
+        );
+        println!(
+            "crosscheck {}::{}: wasm failed with {error:?}, interpreter answered {}",
+            call.contract,
+            call.function,
+            match &interpreted {
+                Ok(ContractCallOutcome::Success(result)) => format!("success {:?}", result.value),
+                Ok(ContractCallOutcome::AbortedByResponse(result)) =>
+                    format!("aborted {:?}", result.value),
+                Ok(ContractCallOutcome::RuntimeFailure { error, .. }) => format!("{error:?}"),
+                Err(error) => format!("error {error:?}"),
+            }
+        );
+    }
+    Ok(outcome)
+}
+
+fn wasm_outcome(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    modules: &mut ModuleCache,
+    call: &ContractCall<'_>,
+    cost_tracker: &LimitedCostTracker,
+) -> Result<ContractCallOutcome, VmExecutionError> {
     let arguments = call
         .arguments
         .iter()

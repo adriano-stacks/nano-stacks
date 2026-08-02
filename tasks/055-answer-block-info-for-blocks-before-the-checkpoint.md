@@ -39,6 +39,8 @@ executed, is never written down, and a restart loses it.
 - [x] Persist executed block headers rather than holding them in memory.
 - [ ] Export the header fields Clarity can read for the checkpoint's ancestry,
       and import them alongside the trie.
+- [ ] Backfill the blocks this node executed before it began writing headers
+      down, which it can refetch from a peer.
 - [x] Serve `HeadersDB` from the persisted store, so a restart answers what the
       run before it answered.
 - [ ] Distinguish a header that is genuinely absent from one this node never
@@ -54,61 +56,33 @@ executed, is never written down, and a restart loses it.
 - Memory does not grow with distance from the checkpoint.
 - Mainnet replay passes 8,665,719.
 
-## Header coverage was not what stopped 8,665,719
+## It was header coverage after all, and the interpreter proved it
 
-Persisting the headers was right on its own terms — the map grew with the chain
-and a restart lost it — but tracing every `get_block_at_height` and header read
-during the failing block showed **no miss at all**, and no contract failing to
-compile either. So the `UnwrapFailure` is a Clarity-level unwrap of an `err` the
-contract itself produced, and the read behind it is one nano answers with the
-wrong *value* rather than with nothing.
+The read trace said no header lookup missed, and that reading was wrong. Asking
+the **interpreter** the same call settled it in one run:
 
-Narrowing that needs tracing at the granularity of a single Clarity read: which
-key, in which contract, returning what. The next step is that trace, not more
-guessing at which surface is missing.
+```
+crosscheck v0-4-market::borrow: wasm failed with Runtime(UnwrapFailure, Some([])),
+  interpreter answered Internal(Expect("FATAL: no burnchain block height found
+  for Stacks block 76ff2ef7…"))
+```
 
-## What the read trace ruled out, and what it found
+That block is **8,665,718 — the node's own sealed tip**, not something from
+before the checkpoint. Two things had hidden it. The header map is only
+populated by executing a block, so a process that resumes from disk has none for
+any block, including the one it is standing on; and the trace only reported a
+lookup that reached the store and found nothing, where this one never reached it
+because the map answered first in the run that wrote it.
 
-Tracing every Clarity read through the failing block ruled out the obvious
-suspects one at a time. No `get_block_at_height` missed, no header missed, no
-contract failed to compile, and the words a VAA verification stands on —
-`keccak256`, `sha256`, a `secp256k1` recovery, `slice?` across its bounds, and
-`map` across two lists — all agree with stacks-core. Those are pinned as tests.
+The `block_header` table is empty for exactly that reason: the blocks nano has
+executed were executed before it existed. So the remaining work is both halves —
+export the checkpoint's ancestry, and backfill the blocks this node executed
+before it began writing headers down.
 
-Two things the trace did find:
-
-- **Compiling on demand re-executes the whole call.** The transaction reaches 23
-  contracts and read their commitments 1,596 times, because each missing module
-  is discovered by failing, compiling one, and running again from the start.
-  That is quadratic, and it is bounded by `MISSING_MODULE_ATTEMPTS = 64`, so a
-  call reaching more contracts than that fails for want of attempts rather than
-  for any reason of its own. Compiling the transitive closure up front would do
-  it once.
-- **The cost is seven and a half times mainnet's**: 92,687,934 runtime against
-  12,352,456, at 28 reads against 300. Each retry starts from a fresh clone of
-  the cost tracker, so that is one attempt's real work, not accumulated waste —
-  which means nano is genuinely doing much more of it on this path.
-
-Every word that path stands on has now been pinned against stacks-core and
-agrees: `keccak256`, `sha256`, a `secp256k1` recovery, `slice?` over both a list
-and a buffer including its bounds, `buff-to-uint-be` at an offset, and `map`
-across two lists. Block, header and module lookups all answer. So the divergence
-is not a missing surface and not one of the primitives.
-
-The failing expression is inside wormhole's guardian-set verification, after the
-set is read and before anything is written. `unwrap-panic` there has no
-fallback, and clar2wasm leaves the Clarity stack trace empty, so the message
-says only that something could not be unwrapped.
-
-The runtime cost is the sharpest remaining clue: **92,687,934 against mainnet's
-12,352,456**, and that is one attempt's real work rather than accumulated
-retries. nano is doing seven and a half times the work on a path that then
-fails, which is what a loop running too many times looks like.
-
-Two ways forward, in order of cost: populate clar2wasm's stack trace so the
-error names its own expression, or lift the VAA bytes out of the transaction and
-run the verification against the interpreter in isolation, where the crosscheck
-harness can bisect it.
+The crosscheck that found it is worth keeping. clarity-wasm is checked against
+the interpreter by design, and the interpreter is in the tree, so a call the
+compiler refuses can simply be asked of it: a disagreement names a compiler bug,
+and agreement — as here — says the state is what differs.
 
 ## What the archive already holds
 
