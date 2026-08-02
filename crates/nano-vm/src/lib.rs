@@ -192,6 +192,22 @@ struct BitcoinContext {
     burn_headers: BTreeMap<u32, [u8; 32]>,
 }
 
+/// A sortition identifier naming the burn height it belongs to.
+///
+/// Sortition identifiers appear in no consensus preimage, and a follower holds
+/// one fork's burn view, so the height is the whole of what one has to carry:
+/// Clarity only ever uses one to ask what happened at a burn height.
+fn sortition_of_burn_height(height: u32) -> SortitionId {
+    let mut bytes = [0u8; 32];
+    bytes[..4].copy_from_slice(&height.to_be_bytes());
+    SortitionId(bytes)
+}
+
+/// The burn height a sortition identifier names.
+fn burn_height_of(sortition: &SortitionId) -> u32 {
+    u32::from_be_bytes(sortition.0[..4].try_into().unwrap_or([0; 4]))
+}
+
 /// A context that knows no chain, for evaluating programs that read none.
 static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     height: 0,
@@ -353,9 +369,7 @@ impl BurnStateDB for BitcoinContext {
     /// holds one fork's burn headers, so the burn height it is standing on
     /// names its own sortition.
     fn get_tip_sortition_id(&self) -> Option<SortitionId> {
-        let mut bytes = [0u8; 32];
-        bytes[..4].copy_from_slice(&self.height.to_be_bytes());
-        Some(SortitionId(bytes))
+        Some(sortition_of_burn_height(self.height))
     }
 
     fn get_v1_unlock_height(&self) -> u32 {
@@ -382,8 +396,8 @@ impl BurnStateDB for BitcoinContext {
         self.pox_5_activation_height
     }
 
-    fn get_burn_block_height(&self, _sortition_id: &SortitionId) -> Option<u32> {
-        None
+    fn get_burn_block_height(&self, sortition_id: &SortitionId) -> Option<u32> {
+        Some(burn_height_of(sortition_id))
     }
 
     fn get_burn_start_height(&self) -> u32 {
@@ -423,9 +437,11 @@ impl BurnStateDB for BitcoinContext {
         &self,
         consensus_hash: &ConsensusHash,
     ) -> Option<SortitionId> {
-        let mut bytes = [0u8; 32];
-        bytes[..20].copy_from_slice(&consensus_hash.0);
-        Some(SortitionId(bytes))
+        self.headers
+            .values()
+            .find(|header| header.consensus_hash == consensus_hash.0)
+            .map(|header| sortition_of_burn_height(header.burn_block_height))
+            .or_else(|| Some(sortition_of_burn_height(self.height)))
     }
 
     fn get_stacks_epoch(&self, _height: u32) -> Option<StacksEpoch<ExecutionCost>> {
@@ -2908,6 +2924,22 @@ mod tests {
 
         // Genesis is 0, its child 1, this one 2.
         assert_eq!(height, Some(Value::UInt(2)));
+    }
+
+    /// A sortition identifier round-trips the burn height it names.
+    ///
+    /// Clarity only ever uses one to ask what happened at a burn height, so
+    /// that is the whole of what one has to carry — and a node that hands one
+    /// out but cannot read it back answers `none` to `get-burn-block-info?`
+    /// again by another route.
+    #[test]
+    fn a_sortition_identifier_names_its_burn_height() {
+        for height in [0, 1, 960_232, u32::MAX] {
+            assert_eq!(
+                super::burn_height_of(&super::sortition_of_burn_height(height)),
+                height
+            );
+        }
     }
 
     /// `get-burn-block-info? header-hash` has to answer for the block being
