@@ -122,6 +122,46 @@ Also learned about the archive itself:
 - The archive dated the day mainnet crossed the boundary stops **27 burn blocks
   short of it**. The next day's reaches burn 960,341.
 
+## Replay depth on mainnet: 98 blocks
+
+The durable executed tip moved from the checkpoint at 8,665,600 to **8,665,698**
+— ninety-eight real mainnet blocks whose `state_index_root` matched the header,
+read from the store rather than inferred, and reported through
+`/nano/sync_status` as the executed height.
+
+Each divergence was a real bug, found against the network and fixed with a test:
+
+| height | what diverged |
+|---|---|
+| 8,688,027 | the SIP-040 `MaybeSent` post-condition would not decode |
+| — | Bitcoin hashes read in opposite byte orders from RPC and Esplora |
+| 8,665,615 | `get-burn-block-info?` answered `none`: no burn header, no tip sortition |
+| 8,665,623 | a deployment naming a contract deployed 64 blocks later was fatal, not failed |
+| 8,665,685 | a trait nested in a list of tuples was not recovered from its declared type |
+| 8,665,694 | `with-all-assets-unsafe` charged a cost with no entry in the 4.0 table |
+| 8,665,695 | a call into a contract using `at-block` was fatal, not failed |
+
+### Where it stops, and what that means
+
+At **8,665,699**, on a `zest-earn-adapter.set-apy` call where nano and mainnet
+agree on everything the receipt can express:
+
+```
+result   (ok u2)   ==   (ok u2)
+runtime  18222     ==   18222
+read_count 20, read_length 10152, write_count 2, write_length 72   all equal
+```
+
+and the state roots still differ. That is the signature this plan names: a
+mismatched root with matching receipts is **MARF or write ordering**, not the VM
+and not the cost tables. It is the first divergence of that kind, and the first
+the receipt oracle cannot narrow further.
+
+Also carried forward from the wrong turn before it: a reachability check over an
+imported checkpoint, which asserts every contract the side store names can still
+be walked to in the trie, and diagnostics that separate "the trie has no such
+key" from "the side store has no such value".
+
 ## The near-tip claim was the followed view, not execution
 
 On 2026-08-01 the node's `/v2/info` stayed within zero to three blocks of the

@@ -2605,6 +2605,7 @@ dependencies = [
  "nano-vm",
  "proptest",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "stacks-common",
