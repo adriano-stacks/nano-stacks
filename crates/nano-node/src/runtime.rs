@@ -330,19 +330,19 @@ async fn follow(
                 let mut executor = executor.lock().await;
                 let from = executor.tip().header.chain_length;
                 match executor.catch_up(&peer, &pox, &staging, budget).await {
-                    Ok(round) => {
-                        report_round(from, round, executor.tip());
-                        persist_accounting(&directory, &mut executor)?;
-                        executed_height = executor.tip().header.chain_length;
-                        Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
-                    }
-                    Err(error) => {
-                        eprintln!("executing the peer's chain failed: {error}");
-                        None
-                    }
+                    Ok(round) => report_round(from, round, executor.tip()),
+                    // A round that stops partway has still sealed everything up
+                    // to where it stopped, and that is what has to be recorded:
+                    // reporting only successful rounds left a node that had
+                    // executed eighty-three blocks claiming twenty-two, and
+                    // left its accounting behind its own chain.
+                    Err(error) => eprintln!("executing the peer's chain failed: {error}"),
                 }
+                persist_accounting(&directory, &mut executor)?;
+                executed_height = executor.tip().header.chain_length;
+                sealed_tip(executor.tip(), executor.bitcoin_height())
             };
-            if let (Some(state), Some(sealed)) = (state.as_ref(), sealed) {
+            if let Some(state) = state.as_ref() {
                 state.publish_executed(sealed).await;
             }
         }
