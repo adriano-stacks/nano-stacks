@@ -1286,6 +1286,26 @@ impl ChainState {
         Ok(())
     }
 
+    /// Whether this node has written down any block header at all.
+    #[must_use]
+    pub fn has_recorded_headers(&self) -> bool {
+        self.vm.has_recorded_headers()
+    }
+
+    /// Record what Clarity may read about a block without executing it.
+    ///
+    /// A node only writes a header down as it seals a block, so one whose state
+    /// was built before it began doing that has none — including for the block
+    /// it is standing on, which the next block's transactions may well read.
+    /// Refetching those blocks is cheaper than executing them again.
+    pub fn backfill_block_header(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), ChainStateError> {
+        self.record_block_header(block, bitcoin_context)
+    }
+
     fn record_block_header(
         &mut self,
         block: &NakamotoBlock,

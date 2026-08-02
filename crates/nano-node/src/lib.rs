@@ -456,6 +456,41 @@ where
         self.bitcoin_height
     }
 
+    /// Write down the headers of blocks this node executed before it kept any.
+    ///
+    /// A contract reading the block it is standing on gets `none` otherwise,
+    /// and the transaction carrying it fails against a network that answered.
+    /// Refetching the blocks is far cheaper than executing them again.
+    pub async fn backfill_headers(
+        &mut self,
+        node: &SyncClient,
+        pox: &PoxInfo,
+        from: [u8; 32],
+    ) -> Result<usize, NodeExecutionError> {
+        if self.chainstate.has_recorded_headers() {
+            return Ok(0);
+        }
+        let mut walk = Vec::new();
+        let mut cursor = self.tip.block_id();
+        while *cursor.as_bytes() != from {
+            let block = node.block(cursor).await?;
+            cursor = block.header.parent_block_id;
+            walk.push(block);
+        }
+        let recorded = walk.len();
+        for block in walk.iter().rev() {
+            let sortition = node.sortition(block.header.consensus_hash).await?;
+            let mut bitcoin_context = pox.bitcoin_context();
+            bitcoin_context.height = sortition.bitcoin_height;
+            bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
+            bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
+            self.chainstate
+                .backfill_block_header(block, bitcoin_context)
+                .map_err(CheckpointExecutionError::from)?;
+        }
+        Ok(recorded)
+    }
+
     /// Extend the staged descent toward this node's tip, then execute what it
     /// can, committing as it goes.
     ///

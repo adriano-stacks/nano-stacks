@@ -96,6 +96,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         None => Network::from_chain_id(patiently(|| peer.node_info()).await?.network_id),
     };
     let pox = patiently(|| peer.pox_info()).await?;
+    let source = config.checkpoint.source_state_id()?;
     println!(
         "nano-stacks starting on chain {:#010x}, state under {}",
         network.chain_id(),
@@ -143,16 +144,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
-    // Publish what this node is sealed at before it follows anything, so a node
-    // that never manages to execute reports the height it is really on rather
-    // than nothing at all.
-    if let (Some(state), Some(executor)) = (state.as_ref(), executor.as_ref()) {
-        let sealed = {
-            let executor = executor.lock().await;
-            sealed_tip(executor.tip(), executor.bitcoin_height())
-        };
-        state.publish_executed(sealed).await;
-    }
+    publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
     // view fresh.
@@ -191,7 +183,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // signer-only node validates from its own store and needs no second view.
     if state.is_some() || executor.is_some() {
         roles.spawn(
-            async move { (Job::Follower, follow(config, peer, pox, state, executor).await) },
+            async move {
+                (
+                    Job::Follower,
+                    follow(config, peer, pox, source, state, executor).await,
+                )
+            },
         );
     }
     if roles.is_empty() {
@@ -236,6 +233,19 @@ async fn supervise(roles: &mut JoinSet<(Job, Role)>) -> Result<(), Box<dyn Error
     }
 }
 
+/// Publish what this node is sealed at before it follows anything, so a node
+/// that never manages to execute reports the height it is really on rather than
+/// nothing at all.
+async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedExecutor>) {
+    if let (Some(state), Some(executor)) = (state, executor) {
+        let sealed = {
+            let executor = executor.lock().await;
+            sealed_tip(executor.tip(), executor.bitcoin_height())
+        };
+        state.publish_executed(sealed).await;
+    }
+}
+
 /// What this node has sealed, for the RPC to answer from.
 fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     SealedTip {
@@ -276,6 +286,7 @@ async fn follow(
     config: Config,
     peer: SyncClient,
     pox: PoxInfo,
+    source: [u8; 32],
     state: Option<RpcState>,
     executor: Option<SharedExecutor>,
 ) -> Role {
@@ -294,6 +305,16 @@ async fn follow(
     };
     let mut node = Node::new(peer.clone());
     let mut pox = pox;
+    // A state built before headers were kept has none, so the first block it
+    // executes cannot read the one it stands on. Written down once, at startup.
+    if let Some(executor) = executor.as_ref() {
+        let mut executor = executor.lock().await;
+        match executor.backfill_headers(&peer, &pox, source).await {
+            Ok(0) => {}
+            Ok(recorded) => println!("wrote down {recorded} headers this state was missing"),
+            Err(error) => eprintln!("writing down the missing headers failed: {error}"),
+        }
+    }
     let mut peer_height = u64::MAX;
     let mut executed_height = 0;
     loop {

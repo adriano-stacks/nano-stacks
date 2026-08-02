@@ -609,6 +609,23 @@ impl Vm {
         }
     }
 
+    /// Whether this node has written down any header at all.
+    ///
+    /// A state built before headers were kept has none, and cannot answer what
+    /// a contract asks about the block it is standing on.
+    #[must_use]
+    pub fn has_recorded_headers(&self) -> bool {
+        self.context.headers_db.as_ref().is_some_and(|db| {
+            db.lock().is_ok_and(|guard| {
+                guard
+                    .query_row("SELECT 1 FROM block_header LIMIT 1", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok()
+            })
+        })
+    }
+
     /// What this node knows about a block, for tests and diagnostics.
     #[must_use]
     pub fn recorded_header(&self, block: [u8; 32]) -> Option<BlockHeader> {
