@@ -103,6 +103,47 @@ fn every_checkpointed_contract_is_reachable_in_the_imported_trie() {
     assert!(missing.is_empty(), "every checkpointed contract is reachable");
 }
 
+/// What nano holds for a key at a block, which is how a root that differs while
+/// every receipt matches gets narrowed to the write that caused it.
+#[test]
+fn nano_reports_a_key_at_a_block() {
+    let (Ok(marf), Ok(clarity), Ok(block), Ok(key)) = (
+        env::var("NANO_NODE_MARF"),
+        env::var("NANO_NODE_CLARITY"),
+        env::var("NANO_MAINNET_BLOCK"),
+        env::var("NANO_MAINNET_KEY"),
+    ) else {
+        eprintln!("set NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY");
+        return;
+    };
+    let block: nano_marf::MarfBlockId =
+        <[u8; 32]>::try_from(hex::decode(&block).expect("hexadecimal").as_slice())
+            .expect("32 bytes");
+
+    let trie = nano_marf::VersionedMarf::open(&marf).expect("open the trie");
+    let Some(value) = trie.get(block, key.as_bytes()) else {
+        println!("nano has no {key} at that block");
+        return;
+    };
+    let hex = hex::encode(value.as_bytes());
+    let connection = rusqlite::Connection::open_with_flags(
+        &clarity,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the side store");
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM data_table WHERE key = ?1",
+            [&hex],
+            |row| row.get(0),
+        )
+        .ok();
+    println!(
+        "nano has {key} = {hex} -> {}",
+        stored.unwrap_or_else(|| "<no side-store row>".to_owned())
+    );
+}
+
 #[test]
 fn stacks_core_finds_the_contract_nano_cannot() {
     let (Ok(path), Ok(block)) = (env::var("NANO_MAINNET_MARF"), env::var("NANO_MAINNET_BLOCK"))

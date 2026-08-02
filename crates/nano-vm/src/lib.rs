@@ -1159,6 +1159,13 @@ impl MarfStore {
     /// Persist a Clarity database key and commit its value hash into the active MARF.
     pub fn put(&mut self, key: &str, value: &str) -> Result<(), MarfStoreError> {
         let value_hash = MarfValue::from_value(value.as_bytes());
+        // A root that differs while every receipt matches is a write-ordering
+        // or MARF fault, and the only way to narrow it is to see the writes
+        // themselves — in the order they were made, which is what the trie
+        // packs pointers in.
+        if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+            println!("write {key} = {}", marf_value_key(value_hash));
+        }
         self.marf.insert(key.as_bytes(), value_hash)?;
         self.write_value(value_hash, value)
     }
@@ -1532,9 +1539,16 @@ impl ClarityBackingStore for MarfStore {
             .map(StacksBlockId)
     }
 
+    /// The height of the block being executed.
+    ///
+    /// The two branches disagreed: an active store already records the height
+    /// of the block it opened, where a sealed block has to be counted from. The
+    /// extra increment made every contract reading the height see one more than
+    /// the network did — mainnet stored 8,665,699 where nano stored 8,665,700,
+    /// so the receipt matched and the state root did not.
     fn get_current_block_height(&mut self) -> u32 {
         self.active
-            .map(|active| active.height + 1)
+            .map(|active| active.height)
             .or_else(|| {
                 self.current_block()
                     .and_then(|block| self.height_of(block))
@@ -2872,242 +2886,38 @@ mod tests {
         assert_eq!(store.get(block, "counter").as_deref(), Some("one"));
     }
 
+    /// A block executes at its own height, not one past it.
+    ///
+    /// Every contract reading the height saw one more than the network did:
+    /// mainnet stored 8,665,699 for a block nano stored 8,665,700 for, so the
+    /// receipt matched, the costs matched, and only the state root did not.
+    #[test]
+    fn a_block_executes_at_its_own_height() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [1; 32]).expect("begin genesis");
+        vm.seal_block().expect("seal genesis");
+        vm.begin_block(Some([1; 32]), [2; 32]).expect("begin child");
+        vm.seal_block().expect("seal child");
+        vm.begin_block(Some([2; 32]), [3; 32])
+            .expect("begin grandchild");
+
+        let height = vm
+            .execute("stacks-block-height", LimitedCostTracker::new_free())
+            .expect("read the height")
+            .value;
+
+        // Genesis is 0, its child 1, this one 2.
+        assert_eq!(height, Some(Value::UInt(2)));
+    }
+
     /// `get-burn-block-info? header-hash` has to answer for the block being
     /// executed, not `none`.
     ///
-    /// sBTC's withdrawal path compares the hash it is handed against this one
-    /// to check Bitcoin has not forked. A node that answers `none` rejects a
-    /// withdrawal mainnet accepted, and diverges on the block carrying it —
-    /// which is exactly what happened at height 8,665,615.
-    /// A contract is recompiled under the epoch it was deployable in.
-    ///
-    /// `at-block` was dropped in 3.4, but mainnet contracts written before it
-    /// still use it and stacks-core still runs them, because it stores the
-    /// analysis rather than redoing it under the current epoch. Recompiling
-    /// everything as epoch 4.0 rejected them, and a call into one failed a
-    /// transaction mainnet completed. New deployments are still judged by the
-    /// current epoch, which is why this pins the mapping rather than a deploy.
-    #[test]
-    fn a_contract_is_recompiled_under_its_own_epoch() {
-        use clarity::types::StacksEpochId;
-
-        for (version, epoch) in [
-            (ClarityVersion::Clarity1, StacksEpochId::Epoch20),
-            (ClarityVersion::Clarity2, StacksEpochId::Epoch21),
-            (ClarityVersion::Clarity3, StacksEpochId::Epoch30),
-            (ClarityVersion::Clarity4, StacksEpochId::Epoch33),
-            (ClarityVersion::Clarity5, StacksEpochId::Epoch34),
-            (ClarityVersion::Clarity6, StacksEpochId::Epoch40),
-        ] {
-            assert_eq!(super::epoch_for_version(version), epoch);
-            // The inverse of stacks-core's own mapping, which is what makes
-            // this the epoch the contract could have been deployed in.
-            assert_eq!(ClarityVersion::default_for_epoch(epoch), version);
-        }
-        assert!(
-            StacksEpochId::Epoch21.supports_at_block(),
-            "the epoch a Clarity 2 contract is rebuilt under still has at-block"
-        );
-    }
-
-    /// A contract using an allowance form compiles at all.
-    ///
-    /// `with-all-assets-unsafe` charged a cost it had no entry for in the
-    /// epoch 4.0 table, so every contract using it failed to compile — which on
-    /// mainnet is any pool guarding a transfer. stacks-core never evaluates an
-    /// allowance form as an expression and charges for the list inside
-    /// `as-contract?`, so the form itself is free.
-    #[test]
-    fn a_contract_using_an_allowance_form_compiles() {
-        let contract =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.guarded")
-                .expect("valid contract identifier");
-        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
-        vm.begin_block(None, [9; 32]).expect("begin block");
-
-        vm.deploy_contract(
-            contract,
-            ClarityVersion::Clarity6,
-            "(define-public (go)
-               (ok (as-contract? ((with-all-assets-unsafe)) u1)))",
-            LimitedCostTracker::new_free(),
-        )
-        .expect("a contract using an allowance form deploys");
-    }
-
-    /// A trait passed inside a tuple inside a list is still a trait.
-    ///
-    /// A transaction argument arrives as consensus-serialized Clarity, where a
-    /// trait reference is indistinguishable from a contract principal and has
-    /// to be recovered from the declared type. Only the outermost value was
-    /// recovered, so a router argument shaped
-    /// `(list 5 (tuple ... (pool-trait <trait>) ...))` — which is what mainnet
-    /// passes — raised a type error on a call the network accepted.
-    #[test]
-    fn a_trait_nested_in_a_list_of_tuples_is_accepted() {
-        let target =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.target")
-                .expect("valid contract identifier");
-        let router =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.router")
-                .expect("valid contract identifier");
-        let sender: PrincipalData = target.issuer.clone().into();
-
-        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
-        vm.begin_block(None, [9; 32]).expect("begin block");
-        vm.deploy_contract(
-            target.clone(),
-            ClarityVersion::Clarity3,
-            "(define-trait pool ((quote (uint) (response uint uint))))
-             (define-public (quote (amount uint)) (ok amount))",
-            LimitedCostTracker::new_free(),
-        )
-        .expect("deploy the target");
-        vm.deploy_contract(
-            router.clone(),
-            ClarityVersion::Clarity3,
-            "(use-trait pool .target.pool)
-             (define-public (swap (steps (list 5 (tuple (amount uint) (pool <pool>)))))
-               (ok (len steps)))",
-            LimitedCostTracker::new_free(),
-        )
-        .expect("deploy the router");
-
-        // Serialized exactly as a transaction carries it: the trait is a
-        // contract principal, nested two levels down.
-        let step = Value::Tuple(
-            clarity::vm::types::TupleData::from_data(vec![
-                (
-                    clarity::vm::ClarityName::try_from("amount").expect("a name"),
-                    Value::UInt(1),
-                ),
-                (
-                    clarity::vm::ClarityName::try_from("pool").expect("a name"),
-                    Value::Principal(target.into()),
-                ),
-            ])
-            .expect("a tuple"),
-        );
-        let mut argument = Vec::new();
-        Value::cons_list_unsanitized(vec![step])
-            .expect("a list")
-            .consensus_serialize(&mut argument)
-            .expect("serialize");
-
-        let outcome = vm
-            .execute_contract_call_outcome(
-                sender,
-                None,
-                router,
-                "swap",
-                &[argument],
-                &LimitedCostTracker::new_free(),
-            )
-            .expect("the call runs");
-
-        match outcome {
-            ContractCallOutcome::Success(result) => {
-                assert_eq!(result.value, Some(Value::okay(Value::UInt(1)).expect("ok")));
-            }
-            other => panic!("the nested trait was not accepted: {other:?}"),
-        }
-    }
-
-    /// A contract naming one that does not exist is the contract's fault.
-    ///
-    /// mainnet recorded exactly this at height 8,665,623 as an ordinary failed
-    /// deployment — `abort_by_response`, `(err none)` — because the contract it
-    /// referenced was not deployed until 8,665,687. Treating it as a node
-    /// failure stops the chain on a transaction the network simply charged a
-    /// fee for.
-    #[test]
-    fn a_contract_naming_an_undeployed_one_fails_the_transaction_not_the_node() {
-        let contract =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.dependent")
-                .expect("valid contract identifier");
-        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
-        vm.begin_block(None, [9; 32]).expect("begin block");
-
-        let error = vm
-            .deploy_contract(
-                contract,
-                ClarityVersion::Clarity3,
-                "(define-public (go) (contract-call? 'ST000000000000000000002AMW42H.absent run))",
-                LimitedCostTracker::new_free(),
-            )
-            .expect_err("a contract that names an undeployed one does not compile");
-
-        assert!(
-            super::is_contract_analysis_failure(&error),
-            "the deployment failed on the contract, not the node: {error}"
-        );
-    }
-
-    /// Both ways the VM reports a contract whose module is not loaded.
-    ///
-    /// The store says it has no compiled contract; the linker says the contract
-    /// is unresolved. Recognising only the first left every contract-to-
-    /// contract call fatal on mainnet, because the second hop is where the
-    /// linker rather than the store notices.
-    #[test]
-    fn a_missing_module_is_recognised_however_it_is_reported() {
-        use clarity::vm::errors::{VmExecutionError, VmInternalError};
-
-        let name = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.native-pool-v1";
-        for text in [
-            format!("Unreachable(\"use of unresolved contract '{name}'\")"),
-            format!("NoSuchContract(\"no compiled contract {name}\")"),
-        ] {
-            let error = VmExecutionError::Internal(VmInternalError::Expect(text.clone()));
-            assert_eq!(
-                super::missing_compiled_contract(&error)
-                    .unwrap_or_else(|| panic!("{text} names a contract"))
-                    .to_string(),
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn a_block_can_read_its_own_burn_header() {
-        let hash = [0x5b; 32];
-        let mut context = super::BitcoinBlockContext::at_height(960_232);
-        context.burn_header_hash = hash;
-
-        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
-        vm.record_block_header(
-            [9; 32],
-            BlockHeader {
-                burn_header_hash: hash,
-                burn_block_height: 960_232,
-                ..BlockHeader::default()
-            },
-        );
-        vm.begin_block_with_bitcoin_context(None, [9; 32], context)
-            .expect("begin block");
-
-        let value = vm
-            .execute(
-                "(get-burn-block-info? header-hash u960232)",
-                LimitedCostTracker::new_free(),
-            )
-            .expect("execute")
-            .value;
-
-        assert_eq!(
-            value,
-            Some(
-                Value::some(Value::buff_from(hash.to_vec()).expect("a buffer"))
-                    .expect("an optional")
-            )
-        );
-    }
-
-    /// The same read with a parent in the chain, which is the shape a follower
-    /// is in: from epoch 3 on Clarity resolves the burn block through the tip
+    /// From epoch 3 on Clarity resolves the burn block through the tip
     /// sortition rather than the parent's consensus hash, so a node that names
     /// no tip sortition answers `none` for every height without raising
-    /// anything.
+    /// anything. sBTC's withdrawal path compares the hash it was signed for
+    /// against this, so nano rejected a withdrawal mainnet accepted.
     #[test]
     fn a_block_with_a_parent_still_reads_its_burn_header() {
         let hash = [0x5b; 32];

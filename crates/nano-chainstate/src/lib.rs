@@ -1175,11 +1175,19 @@ impl ChainState {
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             self.accounting.add_fees(coinbase_height, block_fees(block));
             let credited = effects.credits.len();
-            for credit in effects.credits {
-                self.vm.credit_stx(&credit.recipient, credit.amount)?;
+            // Only a block that actually matures miner rewards touches the
+            // liquid supply for them — stacks-core guards this on having
+            // payouts at all. Incrementing by zero still writes the key, and a
+            // write the network did not make is a leaf in the trie it does not
+            // have, so the state root differs while every receipt matches.
+            if credited > 0 {
+                for credit in effects.credits {
+                    self.vm.credit_stx(&credit.recipient, credit.amount)?;
+                }
+                self.vm
+                    .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
             }
-            self.vm
-                .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
+            // Unlocks are unconditional, as they are there.
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
             if block_starts_new_tenure(block) {
