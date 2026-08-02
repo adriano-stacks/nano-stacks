@@ -1889,6 +1889,46 @@ fn evaluate_with_tracker_in_context(
 }
 
 /// Publish a versioned Clarity contract in an active MARF-backed state.
+/// Every contract a contract's source names, so their modules can be built
+/// before the call that needs them rather than by failing it.
+fn referenced_contracts(
+    contract: &QualifiedContractIdentifier,
+    source: &str,
+    version: ClarityVersion,
+) -> Vec<QualifiedContractIdentifier> {
+    let Ok(expressions) = clarity::vm::ast::parse(
+        contract,
+        source,
+        version,
+        epoch_for_version(version),
+    ) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_contracts(&expressions, contract, &mut found);
+    found
+}
+
+fn collect_contracts(
+    expressions: &[SymbolicExpression],
+    within: &QualifiedContractIdentifier,
+    found: &mut Vec<QualifiedContractIdentifier>,
+) {
+    for expression in expressions {
+        match &expression.expr {
+            clarity::vm::representations::SymbolicExpressionType::List(list) => {
+                collect_contracts(list, within, found);
+            }
+            clarity::vm::representations::SymbolicExpressionType::LiteralValue(
+                Value::Principal(PrincipalData::Contract(identifier)),
+            ) if identifier != within && !found.contains(identifier) => {
+                found.push(identifier.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Compile a stored contract's source under one epoch.
 fn compile_under(
     store: &mut MarfStore,
@@ -2475,6 +2515,19 @@ fn ensure_wasm_module(
             }
         }
     };
+    // Everything this contract calls, before it is compiled: a module that
+    // turns out to be missing is only discovered by running the whole call and
+    // failing, so finding them one at a time makes a call over twenty-three
+    // contracts run twenty-three times, and one over more than
+    // `MISSING_MODULE_ATTEMPTS` fail for want of attempts rather than for any
+    // reason of its own.
+    for referenced in referenced_contracts(contract, &source, version) {
+        if modules.get(&referenced).is_none() {
+            // A contract that will not compile is the caller's problem to
+            // report, not a reason to give up before running anything.
+            let _ = ensure_wasm_module(store, bitcoin_context, modules, &referenced);
+        }
+    }
     // The current epoch first, so the costs baked in are the ones the chain
     // charges now. Only a contract it rejects — one using a word a later epoch
     // removed — is rebuilt under the epoch it was deployable in.
