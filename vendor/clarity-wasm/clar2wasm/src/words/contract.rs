@@ -459,8 +459,12 @@ impl ComplexWord for WithAllAssetsUnsafe {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 0, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
+        // An allowance form costs nothing of its own: stacks-core never
+        // evaluates one as an expression — `special_allowance` is unreachable
+        // there — and charges for the whole list inside `restrict-assets?` and
+        // `as-contract?`, scaled by its length. Its siblings here already do
+        // not charge; this one did, and had no entry in the epoch 4.0 table to
+        // charge from, so any contract using it failed to compile at all.
         with_allowance_context(|allowance_context| {
             builder.local_get(allowance_context);
             builder.call(generator.func_by_name("stdlib.with_all_assets_unsafe"));

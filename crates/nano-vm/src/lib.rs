@@ -2803,6 +2803,31 @@ mod tests {
     /// to check Bitcoin has not forked. A node that answers `none` rejects a
     /// withdrawal mainnet accepted, and diverges on the block carrying it —
     /// which is exactly what happened at height 8,665,615.
+    /// A contract using an allowance form compiles at all.
+    ///
+    /// `with-all-assets-unsafe` charged a cost it had no entry for in the
+    /// epoch 4.0 table, so every contract using it failed to compile — which on
+    /// mainnet is any pool guarding a transfer. stacks-core never evaluates an
+    /// allowance form as an expression and charges for the list inside
+    /// `as-contract?`, so the form itself is free.
+    #[test]
+    fn a_contract_using_an_allowance_form_compiles() {
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.guarded")
+                .expect("valid contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+
+        vm.deploy_contract(
+            contract,
+            ClarityVersion::Clarity6,
+            "(define-public (go)
+               (ok (as-contract? ((with-all-assets-unsafe)) u1)))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("a contract using an allowance form deploys");
+    }
+
     /// A trait passed inside a tuple inside a list is still a trait.
     ///
     /// A transaction argument arrives as consensus-serialized Clarity, where a
