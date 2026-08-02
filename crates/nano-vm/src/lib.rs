@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
@@ -179,7 +179,11 @@ struct BitcoinContext {
     v2_unlock_height: u32,
     v3_unlock_height: u32,
     pox_5_activation_height: u32,
+    /// Headers this node has executed, which a query consults before the
+    /// store — a block being executed is asked about before it is written.
     headers: BTreeMap<[u8; 32], BlockHeader>,
+    /// Every block this node knows about, including the checkpoint's ancestry.
+    headers_db: Option<Mutex<rusqlite::Connection>>,
     /// Stacks height each tenure started at, for the tenure-height mapping.
     tenure_starts: BTreeMap<u32, u32>,
     /// The Bitcoin block at each burn height, as `get-burn-block-info?` reads
@@ -190,6 +194,51 @@ struct BitcoinContext {
     /// forked, so a node with no answer rejects a withdrawal the network
     /// accepted and diverges on the block that carries it.
     burn_headers: BTreeMap<u32, [u8; 32]>,
+}
+
+/// A header's fixed byte layout, so a store can hold one without serde.
+fn encode_block_header(header: &BlockHeader) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(180);
+    bytes.extend_from_slice(&header.burn_header_hash);
+    bytes.extend_from_slice(&header.burn_block_height.to_be_bytes());
+    bytes.extend_from_slice(&header.burn_block_time.to_be_bytes());
+    bytes.extend_from_slice(&header.stacks_block_time.to_be_bytes());
+    bytes.extend_from_slice(&header.block_header_hash);
+    bytes.extend_from_slice(&header.consensus_hash);
+    bytes.extend_from_slice(&header.vrf_seed);
+    bytes.push(header.miner_address.0);
+    bytes.extend_from_slice(&header.miner_address.1);
+    bytes.extend_from_slice(&header.burn_spend_total.to_be_bytes());
+    bytes.extend_from_slice(&header.burn_spend_winner.to_be_bytes());
+    bytes.extend_from_slice(&header.block_reward.to_be_bytes());
+    bytes.extend_from_slice(&header.tenure_height.to_be_bytes());
+    bytes.extend_from_slice(&header.tenure_start_height.to_be_bytes());
+    bytes
+}
+
+fn decode_block_header(bytes: &[u8]) -> Option<BlockHeader> {
+    let mut reader = bytes;
+    let mut take = |count: usize| -> Option<&[u8]> {
+        let (head, rest) = reader.split_at_checked(count)?;
+        reader = rest;
+        Some(head)
+    };
+    let header = BlockHeader {
+        burn_header_hash: take(32)?.try_into().ok()?,
+        burn_block_height: u32::from_be_bytes(take(4)?.try_into().ok()?),
+        burn_block_time: u64::from_be_bytes(take(8)?.try_into().ok()?),
+        stacks_block_time: u64::from_be_bytes(take(8)?.try_into().ok()?),
+        block_header_hash: take(32)?.try_into().ok()?,
+        consensus_hash: take(20)?.try_into().ok()?,
+        vrf_seed: take(32)?.try_into().ok()?,
+        miner_address: (take(1)?[0], take(20)?.try_into().ok()?),
+        burn_spend_total: u128::from_be_bytes(take(16)?.try_into().ok()?),
+        burn_spend_winner: u128::from_be_bytes(take(16)?.try_into().ok()?),
+        block_reward: u128::from_be_bytes(take(16)?.try_into().ok()?),
+        tenure_height: u32::from_be_bytes(take(4)?.try_into().ok()?),
+        tenure_start_height: u32::from_be_bytes(take(4)?.try_into().ok()?),
+    };
+    Some(header)
 }
 
 /// A sortition identifier naming the burn height it belongs to.
@@ -220,6 +269,7 @@ static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     v3_unlock_height: 0,
     pox_5_activation_height: 0,
     headers: BTreeMap::new(),
+    headers_db: None,
     tenure_starts: BTreeMap::new(),
     burn_headers: BTreeMap::new(),
 };
@@ -247,8 +297,21 @@ impl BitcoinContext {
         Ok(())
     }
 
-    fn header(&self, id: &StacksBlockId) -> Option<&BlockHeader> {
-        self.headers.get(id.as_bytes())
+    fn header(&self, id: &StacksBlockId) -> Option<BlockHeader> {
+        if let Some(header) = self.headers.get(id.as_bytes()) {
+            return Some(*header);
+        }
+        let bytes: Vec<u8> = {
+            let guard = self.headers_db.as_ref()?.lock().ok()?;
+            guard
+                .query_row(
+                    "SELECT data FROM block_header WHERE block_id = ?1",
+                    params![id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .ok()?
+        };
+        decode_block_header(&bytes)
     }
 }
 
@@ -526,11 +589,27 @@ impl Vm {
     }
 
     fn over(store: MarfStore) -> Self {
+        // The context answers header reads from the same file the store writes
+        // them to, through a connection of its own because the two are
+        // borrowed at once while Clarity runs.
+        let headers_db = store
+            .side_store_path()
+            .and_then(|path| rusqlite::Connection::open(path).ok())
+            .map(Mutex::new);
         Self {
             store,
-            context: BitcoinContext::default(),
+            context: BitcoinContext {
+                headers_db,
+                ..BitcoinContext::default()
+            },
             modules: ModuleCache::default(),
         }
+    }
+
+    /// What this node knows about a block, for tests and diagnostics.
+    #[must_use]
+    pub fn recorded_header(&self, block: [u8; 32]) -> Option<BlockHeader> {
+        self.context.header(&StacksBlockId(block))
     }
 
     /// The deepest state on disk, which is where a restart resumes.
@@ -604,6 +683,11 @@ impl Vm {
         self.context
             .burn_headers
             .insert(header.burn_block_height, header.burn_header_hash);
+        // Written down as well as remembered: a contract may ask about any
+        // ancestor, and a restart has to answer what the run before it did.
+        if let Err(error) = self.store.write_block_header(block, &header) {
+            eprintln!("recording the header of {} failed: {error}", hex::encode(block));
+        }
         self.context.headers.insert(block, header);
     }
 
@@ -1186,6 +1270,23 @@ impl MarfStore {
         self.write_value(value_hash, value)
     }
 
+    /// Keep what Clarity may read about a block.
+    fn write_block_header(
+        &self,
+        block: [u8; 32],
+        header: &BlockHeader,
+    ) -> Result<(), MarfStoreError> {
+        self.side_store
+            .prepare_cached("INSERT OR REPLACE INTO block_header (block_id, data) VALUES (?1, ?2)")?
+            .execute(params![block.as_slice(), encode_block_header(header)])?;
+        Ok(())
+    }
+
+    /// Where this store keeps what is not in the trie, when it is on disk.
+    fn side_store_path(&self) -> Option<std::path::PathBuf> {
+        self.side_store.path().map(std::path::PathBuf::from)
+    }
+
     fn write_value(&self, value_hash: MarfValue, value: &str) -> Result<(), MarfStoreError> {
         self.side_store
             .prepare_cached("INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)")?
@@ -1385,6 +1486,14 @@ CREATE TABLE IF NOT EXISTS metadata_table (
     UNIQUE (key, blockhash)
 );
 CREATE INDEX IF NOT EXISTS md_blockhashes ON metadata_table(blockhash);
+-- What Clarity may read about a block, for every block this node knows about.
+-- Held here rather than in memory because a contract may ask about any
+-- ancestor, including ones from before the checkpoint that this node never
+-- executed, and because a map that grows with the chain is not a map.
+CREATE TABLE IF NOT EXISTS block_header (
+    block_id BLOB PRIMARY KEY,
+    data BLOB NOT NULL
+) WITHOUT ROWID;
 ";
 
 fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
@@ -2924,6 +3033,40 @@ mod tests {
 
         // Genesis is 0, its child 1, this one 2.
         assert_eq!(height, Some(Value::UInt(2)));
+    }
+
+    /// A header a node recorded is still there after it restarts.
+    ///
+    /// They lived in a map that only held blocks this process had executed, so
+    /// every block before the checkpoint — and every block before the last
+    /// restart — read back as `none`, and a contract consulting chain history
+    /// got an answer the network never gave.
+    #[test]
+    fn a_recorded_header_survives_a_restart() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let header = BlockHeader {
+            burn_header_hash: [0x5b; 32],
+            burn_block_height: 960_232,
+            burn_block_time: 1_785_400_701,
+            stacks_block_time: 1_785_402_038,
+            block_header_hash: [0x2c; 32],
+            consensus_hash: [0x1d; 20],
+            vrf_seed: [0x3e; 32],
+            miner_address: (22, [0x4f; 20]),
+            burn_spend_total: 1_234_567,
+            burn_spend_winner: 89_012,
+            block_reward: 1_000_000_000,
+            tenure_height: 251_321,
+            tenure_start_height: 8_665_600,
+        };
+
+        {
+            let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("open");
+            vm.record_block_header([7; 32], header);
+        }
+
+        let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(vm.recorded_header([7; 32]), Some(header));
     }
 
     /// A sortition identifier round-trips the burn height it names.

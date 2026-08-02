@@ -16,3 +16,6 @@ stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
