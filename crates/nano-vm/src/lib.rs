@@ -1731,6 +1731,26 @@ fn evaluate_with_tracker_in_context(
 }
 
 /// Publish a versioned Clarity contract in an active MARF-backed state.
+/// Compile a contract a call needs, reporting a bad contract as a failed call.
+fn needed_module(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    modules: &mut ModuleCache,
+    contract: &QualifiedContractIdentifier,
+    cost_tracker: &LimitedCostTracker,
+) -> Result<Option<ContractCallOutcome>, VmExecutionError> {
+    match ensure_wasm_module(store, bitcoin_context, modules, contract) {
+        Ok(()) => Ok(None),
+        Err(error) if reports_analysis_failure(&error) => {
+            Ok(Some(ContractCallOutcome::RuntimeFailure {
+                cost: cost_tracker.get_total(),
+                error,
+            }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Marks a compile failure as the contract's fault rather than the node's.
 ///
 /// stacks-core turns a static check that is not `rejectable_in_epoch` into a
@@ -1741,9 +1761,14 @@ fn evaluate_with_tracker_in_context(
 /// on mainnet — stops a node dead.
 const ANALYSIS_FAILED: &str = "contract analysis failed";
 
-/// Whether a failed deployment is the contract's fault rather than the node's.
+/// Whether a failure is the contract's fault rather than the node's.
 #[must_use]
 pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
+    reports_analysis_failure(error)
+}
+
+/// The same question of anything that can say what went wrong.
+fn reports_analysis_failure(error: &impl std::fmt::Display) -> bool {
     error.to_string().contains(ANALYSIS_FAILED)
 }
 
@@ -2045,9 +2070,11 @@ fn call_contract_values_in_context(
     cost_tracker: &LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     for argument in arguments.iter().filter_map(contract_argument) {
-        ensure_wasm_module(store, bitcoin_context, modules, argument)?;
+        needed_module(store, bitcoin_context, modules, argument, cost_tracker)?;
     }
-    ensure_wasm_module(store, bitcoin_context, modules, contract)?;
+    if let Some(failed) = needed_module(store, bitcoin_context, modules, contract, cost_tracker)? {
+        return Ok(failed);
+    }
     // A `contract-call?` reaches a contract this node never compiled — the
     // checkpoint carried its source and its state, not a module, and which
     // contracts a call reaches is not knowable in advance when a trait
@@ -2078,9 +2105,21 @@ fn call_contract_values_in_context(
                 // ran into. Say what the repair ran into all the same, because
                 // otherwise the run just keeps failing for its original reason
                 // and never says why the repair could not help.
-                if let Err(repair) = ensure_wasm_module(store, bitcoin_context, modules, &missing) {
-                    eprintln!("compiling {missing} on demand failed: {repair}");
-                    return Err(error);
+                match ensure_wasm_module(store, bitcoin_context, modules, &missing) {
+                    Ok(()) => {}
+                    // A contract that will not compile is the contract's fault,
+                    // and a call into one fails like any other failing call.
+                    // Only a node fault stops the node.
+                    Err(repair) if reports_analysis_failure(&repair) => {
+                        return Ok(ContractCallOutcome::RuntimeFailure {
+                            cost: cost_tracker.get_total(),
+                            error: repair,
+                        });
+                    }
+                    Err(repair) => {
+                        eprintln!("compiling {missing} on demand failed: {repair}");
+                        return Err(error);
+                    }
                 }
             }
             outcome => return outcome,
