@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "051", "052"]
+dependencies: ["027", "037", "051", "052", "054"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -45,4 +45,3 @@ and steady state, with evidence tied to the durable executed chain.
 - Peer failure, peer equivocation and ordinary reorganization do not stall or
   fork the node.
 - RPC responses and events describe the same durable executed state.
-

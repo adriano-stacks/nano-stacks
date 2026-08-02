@@ -22,9 +22,10 @@ fn main() -> ExitCode {
         Some("verify-block") => {
             verify_block(&env::args().skip(2).collect::<Vec<_>>())
         }
+        Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks>"
             );
             ExitCode::from(2)
         }
@@ -162,6 +163,49 @@ fn fixture_root() -> PathBuf {
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/nano-conformance/fixtures"),
         PathBuf::from,
     )
+}
+
+/// Decode a concatenated stream of consensus-serialized Nakamoto blocks.
+///
+/// A block nano cannot decode stops a mainnet descent dead, and finding out
+/// which byte by restarting a node against a live peer costs minutes a time.
+/// This reads the bytes off disk and says exactly which block and which
+/// transaction failed, in the time a build takes.
+fn decode_blocks(path: Option<&str>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("usage: cargo xtask decode-blocks <blocks.bin>");
+        return ExitCode::from(2);
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("cannot read {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut offset = 0;
+    let mut decoded = 0;
+    while offset < bytes.len() {
+        match NakamotoBlock::decode_prefix(&bytes[offset..]) {
+            Ok((block, consumed)) => {
+                decoded += 1;
+                offset += consumed;
+                println!(
+                    "block {} height {} with {} transactions",
+                    block.block_id(),
+                    block.header.chain_length,
+                    block.transactions.len()
+                );
+            }
+            Err(error) => {
+                eprintln!("block {decoded} at byte {offset} does not decode: {error}");
+                eprintln!("next 64 bytes: {}", hex::encode(&bytes[offset..(offset + 64).min(bytes.len())]));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("{decoded} blocks decoded");
+    ExitCode::SUCCESS
 }
 
 fn print_scoreboard() -> ExitCode {

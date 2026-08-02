@@ -443,6 +443,8 @@ pub enum FungibleCondition {
 pub enum NonFungibleCondition {
     DoesNotSend,
     DoesSend,
+    /// SIP-040's `MaybeSent`, which asserts nothing about the asset.
+    MaySend,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1061,6 +1063,7 @@ fn read_post_condition(reader: &mut Reader<'_>) -> Result<PostConditionData, Cod
             condition: match reader.byte()? {
                 0x10 => NonFungibleCondition::DoesSend,
                 0x11 => NonFungibleCondition::DoesNotSend,
+                0x12 => NonFungibleCondition::MaySend,
                 _ => return Err(CodecError::InvalidPostCondition),
             },
         }),
@@ -1258,6 +1261,7 @@ fn encode_post_condition(writer: &mut Writer, post_condition: &PostConditionData
             writer.byte(match condition {
                 NonFungibleCondition::DoesSend => 0x10,
                 NonFungibleCondition::DoesNotSend => 0x11,
+                NonFungibleCondition::MaySend => 0x12,
             });
         }
         PostConditionData::Staking {
@@ -2067,6 +2071,11 @@ mod tests {
             (1, 0x10, NonFungibleCondition::DoesSend),
             (2, 0x11, NonFungibleCondition::DoesNotSend),
             (3, 0x10, NonFungibleCondition::DoesSend),
+            // Real mainnet traffic carries `MaybeSent`, and a codec that
+            // rejects it cannot decode the block it is in — which stops a sync
+            // at that height and nowhere else.
+            (1, 0x12, NonFungibleCondition::MaySend),
+            (2, 0x12, NonFungibleCondition::MaySend),
         ] {
             let bytes = encoded_post_condition_transaction(mode, tag);
             let (transaction, consumed) = Transaction::decode(&bytes).expect("decode transaction");

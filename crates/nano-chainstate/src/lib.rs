@@ -1995,6 +1995,18 @@ fn system_receipt(transaction: &Transaction) -> Option<TransactionReceipt> {
     })
 }
 
+/// Whether a non-fungible post-condition holds, given whether the asset moved.
+///
+/// SIP-040's `MaybeSent` asserts nothing: it names an asset so the transaction
+/// is allowed to move it under `Deny`, and is satisfied either way.
+const fn matches_nonfungible_condition(condition: NonFungibleCondition, moved: bool) -> bool {
+    match condition {
+        NonFungibleCondition::DoesSend => moved,
+        NonFungibleCondition::DoesNotSend => !moved,
+        NonFungibleCondition::MaySend => true,
+    }
+}
+
 fn check_postconditions(
     transaction: &Transaction,
     origin: &PrincipalData,
@@ -2062,12 +2074,7 @@ fn check_postconditions(
                 let sent = assets
                     .get_nonfungible_tokens(&principal, &asset)
                     .map_or(&[][..], Vec::as_slice);
-                let moved = sent.contains(&value);
-                let passes = match condition {
-                    NonFungibleCondition::DoesSend => moved,
-                    NonFungibleCondition::DoesNotSend => !moved,
-                };
-                if !passes {
+                if !matches_nonfungible_condition(*condition, sent.contains(&value)) {
                     return Ok(Some(format!(
                         "non-fungible post-condition failed for {asset} owned by {principal}"
                     )));
