@@ -32,9 +32,10 @@ use nano_sync::{PoxInfo, SortitionInfo, SyncClient};
 use tokio::time::sleep;
 
 use crate::{
-    CheckpointExecutor,
+    CatchUpBudget, CheckpointExecutor,
     config::{Config, MinerConfig, cycle_contract, miner_contract},
-    runtime::{self, SharedExecutor},
+    runtime::{self, NODE_CHAINSTATE, SharedExecutor},
+    staging::Staging,
 };
 
 /// The previous commitment's change output, which the next commitment must
@@ -112,10 +113,21 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     println!("mining as {miner_hash} from the state on disk");
 
     let interval = Duration::from_secs(state.config.node.poll_interval_secs);
+    let staging = Staging::open(
+        &state
+            .config
+            .chainstate_dir(NODE_CHAINSTATE)
+            .join("staging.sqlite"),
+    )
+    .map_err(|error| format!("cannot open the staging store: {error}"))?;
+    let budget = CatchUpBudget {
+        fetch: state.config.node.max_sync_blocks,
+        execute: state.config.node.max_sync_blocks,
+    };
     loop {
         let mut executor = executor.lock().await;
         if let Err(error) = executor
-            .follow_to_tip(&state.peer, &state.pox, state.config.node.max_sync_blocks)
+            .catch_up(&state.peer, &state.pox, &staging, budget)
             .await
         {
             eprintln!("following the peer failed: {error}");

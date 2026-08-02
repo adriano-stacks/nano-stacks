@@ -15,7 +15,10 @@ use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
-use crate::{CheckpointExecutor, config::Config, miner, signer};
+use crate::{
+    CatchUpBudget, CatchUpRound, CheckpointExecutor, config::Config, miner, signer,
+    staging::Staging,
+};
 
 /// How long a startup step waits out a rate-limited peer before giving up.
 const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
@@ -233,18 +236,26 @@ fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     }
 }
 
-/// Say what a round of execution actually did.
+/// Say what a round of catching up actually did.
 ///
-/// A batch that executed nothing reads exactly like one that executed a
+/// A round that executed nothing reads exactly like one that executed a
 /// thousand blocks unless it says so, which is how a node that had never
 /// executed a single block past its checkpoint looked healthy for hours.
-fn report_batch(from: u64, executed: usize, tip: &NakamotoBlock) {
-    if executed == 0 {
-        println!("executed nothing: still sealed at {from}");
+fn report_round(from: u64, round: CatchUpRound, tip: &NakamotoBlock) {
+    let limited = if round.rate_limited {
+        ", peer rate limiting"
+    } else {
+        ""
+    };
+    if round.executed == 0 {
+        println!(
+            "executed nothing: sealed at {from}, {} staged, {} fetched{limited}",
+            round.staged, round.fetched
+        );
     } else {
         println!(
-            "executed {executed} blocks, {from} to {}, state root {}",
-            tip.header.chain_length, tip.header.state_index_root
+            "executed {} blocks, {from} to {}, {} staged, state root {}{limited}",
+            round.executed, tip.header.chain_length, round.staged, tip.header.state_index_root
         );
     }
 }
@@ -258,6 +269,14 @@ async fn follow(
 ) -> Role {
     let directory = config.chainstate_dir(NODE_CHAINSTATE);
     let interval = Duration::from_secs(config.node.poll_interval_secs);
+    let staging = match Staging::open(&directory.join("staging.sqlite")) {
+        Ok(staging) => staging,
+        Err(error) => return Err(format!("cannot open the staging store: {error}")),
+    };
+    let budget = CatchUpBudget {
+        fetch: config.node.max_sync_blocks,
+        execute: config.node.max_sync_blocks,
+    };
     let mut node = Node::new(peer.clone());
     loop {
         if let Err(error) = node.poll().await {
@@ -271,12 +290,9 @@ async fn follow(
                 let sealed = {
                     let mut executor = executor.lock().await;
                     let from = executor.tip().header.chain_length;
-                    match executor
-                        .follow_to_tip(&peer, &pox, config.node.max_sync_blocks)
-                        .await
-                    {
-                        Ok(executed) => {
-                            report_batch(from, executed, executor.tip());
+                    match executor.catch_up(&peer, &pox, &staging, budget).await {
+                        Ok(round) => {
+                            report_round(from, round, executor.tip());
                             persist_accounting(&directory, &mut executor)?;
                             Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
                         }

@@ -2,6 +2,7 @@ pub mod config;
 pub mod miner;
 pub mod runtime;
 pub mod signer;
+pub mod staging;
 
 use std::{fmt, path::Path};
 
@@ -11,8 +12,10 @@ use nano_chainstate::{
     NakamotoBlockHeader, SignerSet, SignerSetError, TenureAccounting,
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
-use nano_primitives::{Network, TrieHash};
+use nano_primitives::{Network, StacksBlockId, TrieHash};
 use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError};
+
+use crate::staging::{Staging, StagingError};
 
 /// Executes a validated tenure stream from an imported checkpoint state.
 #[derive(Debug)]
@@ -28,6 +31,27 @@ pub struct CheckpointExecutor<S> {
     bitcoin: S,
 }
 
+/// How much one round of catching up is allowed to do.
+#[derive(Clone, Copy, Debug)]
+pub struct CatchUpBudget {
+    /// Blocks this round will fetch from the peer.
+    pub fetch: usize,
+    /// Blocks this round will execute and seal.
+    pub execute: usize,
+}
+
+/// What one round of catching up actually did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatchUpRound {
+    pub fetched: usize,
+    pub executed: usize,
+    /// Blocks fetched but not yet executed.
+    pub staged: u64,
+    /// Whether the peer asked this node to slow down, which ends a round
+    /// successfully rather than discarding it.
+    pub rate_limited: bool,
+}
+
 /// A follower that executes each accepted tenure update from a checkpointed state.
 #[derive(Debug)]
 pub struct ExecutingNode<S> {
@@ -40,7 +64,14 @@ pub struct ExecutingNode<S> {
 pub enum NodeExecutionError {
     Sync(SyncError),
     Execution(CheckpointExecutionError),
+    Staging(StagingError),
     MissingView,
+}
+
+impl From<StagingError> for NodeExecutionError {
+    fn from(error: StagingError) -> Self {
+        Self::Staging(error)
+    }
 }
 
 impl fmt::Display for NodeExecutionError {
@@ -48,6 +79,7 @@ impl fmt::Display for NodeExecutionError {
         match self {
             Self::Sync(error) => write!(formatter, "node synchronization failed: {error}"),
             Self::Execution(error) => write!(formatter, "node execution failed: {error}"),
+            Self::Staging(error) => write!(formatter, "node staging failed: {error}"),
             Self::MissingView => formatter.write_str("node has no complete validated view"),
         }
     }
@@ -58,6 +90,7 @@ impl std::error::Error for NodeExecutionError {
         match self {
             Self::Sync(error) => Some(error),
             Self::Execution(error) => Some(error),
+            Self::Staging(error) => Some(error),
             Self::MissingView => None,
         }
     }
@@ -406,31 +439,96 @@ where
         self.bitcoin_height
     }
 
-    /// Execute every canonical block between this tip and the peer's, oldest first.
+    /// Extend the staged descent toward this node's tip, then execute what it
+    /// can, committing as it goes.
     ///
-    /// Walking the peer's ancestry backwards from its tip keeps the executed
-    /// chain on the canonical fork even when the peer reorganized.
-    pub async fn follow_to_tip(
+    /// Replaces a walk that buffered the whole gap in memory and executed only
+    /// once it reached this node's tip. Against mainnet that gap was twenty
+    /// thousand blocks and the walk never once completed: a single rate limit
+    /// anywhere in it discarded every block fetched, and the next round began
+    /// again from a tip that had since moved. Here the descent is on disk, so a
+    /// round that ends early is progress kept, and execution runs in bounded
+    /// chunks from whatever staging already holds.
+    pub async fn catch_up(
         &mut self,
         node: &SyncClient,
         pox: &PoxInfo,
-        max_blocks: usize,
-    ) -> Result<usize, NodeExecutionError> {
-        let mut pending = Vec::new();
-        let mut block_id = node.tenure_info().await?.tip_block_id;
-        while block_id != self.tip.block_id() {
-            if pending.len() == max_blocks {
-                return Err(CheckpointExecutionError::Link(
-                    "checkpoint is farther from the peer tip than the block limit".to_owned(),
-                )
-                .into());
-            }
-            let block = node.block(block_id).await?;
-            block_id = block.header.parent_block_id;
-            pending.push(block);
+        staging: &Staging,
+        budget: CatchUpBudget,
+    ) -> Result<CatchUpRound, NodeExecutionError> {
+        let mut round = CatchUpRound::default();
+        let peer_tip = node.tenure_info().await?.tip_block_id;
+
+        // What the peer added since the last round sits above everything
+        // staged, so this stops as soon as it meets a block already held.
+        let executed_tip = self.tip.block_id();
+        let mut fetched =
+            Self::descend(node, staging, peer_tip, executed_tip, budget.fetch, &mut round).await?;
+        // The descent itself continues from the furthest it has reached, which
+        // is what makes a rate-limited round cost nothing but time.
+        if let Some(resume) = staging.descent_resumes_at()? {
+            fetched += Self::descend(
+                node,
+                staging,
+                resume,
+                executed_tip,
+                budget.fetch.saturating_sub(fetched),
+                &mut round,
+            )
+            .await?;
         }
-        let executed = pending.len();
-        for block in pending.iter().rev() {
+        round.fetched = fetched;
+        round.executed = self.execute_staged(node, pox, staging, budget.execute).await?;
+        round.staged = staging.len()?;
+        Ok(round)
+    }
+
+    /// Walk back from `from`, staging each block, until this node's tip or a
+    /// block already staged is reached, or the budget runs out.
+    async fn descend(
+        node: &SyncClient,
+        staging: &Staging,
+        from: StacksBlockId,
+        until: StacksBlockId,
+        budget: usize,
+        round: &mut CatchUpRound,
+    ) -> Result<usize, NodeExecutionError> {
+        let mut cursor = from;
+        let mut fetched = 0;
+        while cursor != until && fetched < budget {
+            if staging.holds(cursor)? {
+                break;
+            }
+            let block = match node.block(cursor).await {
+                Ok(block) => block,
+                // A peer that is rate limiting has not failed, and neither has
+                // the round: everything staged so far still stands.
+                Err(error) if error.is_rate_limited() => {
+                    round.rate_limited = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            staging.put(&block)?;
+            cursor = block.header.parent_block_id;
+            fetched += 1;
+        }
+        Ok(fetched)
+    }
+
+    /// Execute staged blocks forward from this node's tip, up to `budget`.
+    async fn execute_staged(
+        &mut self,
+        node: &SyncClient,
+        pox: &PoxInfo,
+        staging: &Staging,
+        budget: usize,
+    ) -> Result<usize, NodeExecutionError> {
+        let mut executed = 0;
+        while executed < budget {
+            let Some(block) = staging.child_of(self.tip.block_id())? else {
+                break;
+            };
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = node
                 .sortition(block.header.consensus_hash)
@@ -438,12 +536,14 @@ where
                 .bitcoin_height;
             let bitcoin_context = node
                 .tenure_coinbase_context(
-                    block,
+                    &block,
                     self.chainstate.accounting_mut().schedule(),
                     bitcoin_context,
                 )
                 .await?;
-            self.apply(block, bitcoin_context)?;
+            self.apply(&block, bitcoin_context)?;
+            staging.remove(block.block_id())?;
+            executed += 1;
         }
         Ok(executed)
     }

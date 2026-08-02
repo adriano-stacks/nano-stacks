@@ -56,6 +56,12 @@ pub struct SyncClient {
     /// it is what makes a retried round cheap: a peer that rate limits one
     /// request would otherwise have every block of that round asked for again.
     blocks: Arc<Mutex<LruCache<StacksBlockId, NakamotoBlock>>>,
+    /// Sortitions already fetched from this peer.
+    ///
+    /// A sortition is fixed once its consensus hash is, and every block of a
+    /// tenure carries the same one, so this turns a request per executed block
+    /// into a request per tenure.
+    sortitions: Arc<Mutex<LruCache<ConsensusHash, SortitionInfo>>>,
 }
 
 /// How many fetched blocks one peer's client keeps.
@@ -408,6 +414,9 @@ impl SyncClient {
                 blocks: Arc::new(Mutex::new(LruCache::new(
                     NonZeroUsize::new(BLOCK_CACHE).expect("the cache holds blocks"),
                 ))),
+                sortitions: Arc::new(Mutex::new(LruCache::new(
+                    NonZeroUsize::new(BLOCK_CACHE).expect("the cache holds sortitions"),
+                ))),
             })
         }
     }
@@ -544,11 +553,22 @@ impl SyncClient {
         &self,
         consensus_hash: ConsensusHash,
     ) -> Result<SortitionInfo, SyncError> {
+        if let Some(sortition) = self
+            .sortitions
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&consensus_hash).cloned())
+        {
+            return Ok(sortition);
+        }
         let sortition = self
             .single_sortition(&format!("v3/sortitions/consensus/{consensus_hash}"))
             .await?;
         if sortition.consensus_hash != consensus_hash {
             return Err(SyncError::InvalidSortition);
+        }
+        if let Ok(mut cache) = self.sortitions.lock() {
+            cache.put(consensus_hash, sortition.clone());
         }
         Ok(sortition)
     }
