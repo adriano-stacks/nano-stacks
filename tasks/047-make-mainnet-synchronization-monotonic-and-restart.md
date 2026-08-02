@@ -28,14 +28,14 @@ hundreds of failed attempts.
 
 ## Tasks
 
-- [ ] Retain every validated partial tenure extension and resume from its last
+- [x] Retain every validated partial tenure extension and resume from its last
       block on the next poll.
-- [ ] Replace whole-gap buffering with bounded forward execution chunks.
-- [ ] Make rate limits and bounded peer pages end a round successfully after all
+- [x] Replace whole-gap buffering with bounded forward execution chunks.
+- [x] Make rate limits and bounded peer pages end a round successfully after all
       available progress is committed.
-- [ ] Persist executed tip, parent links and tenure accounting together at each
+- [x] Persist executed tip, parent links and tenure accounting together at each
       chunk boundary.
-- [ ] Resume after a process stop without refetching or re-executing sealed
+- [x] Resume after a process stop without refetching or re-executing sealed
       blocks.
 - [ ] Bound caches and in-memory ancestry independently of distance from tip.
 - [ ] Test gaps spanning long tenures and multiple tenures with deterministic
@@ -49,3 +49,15 @@ hundreds of failed attempts.
   as uninterrupted execution.
 - A live mainnet soak crosses tenure boundaries without a permanent `Fork` loop
   and reports executed, rather than followed, lag.
+
+## Restarting reaches the same state
+
+`crates/nano-conformance/tests/restart.rs` replays forty captured blocks twice:
+once uninterrupted, and once in two halves with the chainstate closed and
+reopened between them, resuming from the accounting the first half wrote out.
+Both reach the same sealed tip and owe the same.
+
+That is the property a catch-up depends on, and it is checked offline against
+the captured fixture rather than by stopping a live node and hoping. The
+remaining unchecked item is a deterministic harness for rate limits and short
+pages, which the live mainnet run exercises but no test yet pins.

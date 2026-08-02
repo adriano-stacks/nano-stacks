@@ -549,6 +549,23 @@ fn captured_replay_visiting(
         Ok(chainstate) => chainstate,
         Err(message) => return replay_fixture_failure(manifest, message),
     };
+    replay_into(&mut chainstate, source, root, manifest, 0, visit)
+}
+
+/// Replay captured blocks into a chainstate the caller owns, from an offset.
+///
+/// A chainstate a caller can hold across calls is what makes a restart
+/// testable: the same blocks, executed in one run or in two with the state
+/// closed and reopened between, have to reach the same root and owe the same.
+pub fn replay_into(
+    chainstate: &mut ChainState,
+    source: [u8; 32],
+    root: &Path,
+    manifest: FixtureManifest,
+    skip: usize,
+    visit: &mut dyn FnMut(&NakamotoBlock, &nano_chainstate::AppliedBlock),
+) -> ReplayDepth {
+
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
         return replay_fixture_failure(manifest, "captured Bitcoin snapshots are unavailable");
     };
@@ -566,10 +583,14 @@ fn captured_replay_visiting(
     paths.sort();
 
     let mut completed = 0;
-    let mut parent = Some(source);
+    // A resumed run stands on what the previous one sealed.
+    let mut parent = if skip == 0 { Some(source) } else { chainstate.tip() };
     let mut bitcoin_view = String::new();
     let mut first_cost_divergence = None;
     for (offset, path) in paths.into_iter().enumerate() {
+        if offset < skip {
+            continue;
+        }
         if completed >= manifest.replay_blocks {
             break;
         }
@@ -582,7 +603,7 @@ fn captured_replay_visiting(
         };
         let (block, applied, cost_divergence) = match apply_captured_block(
             &capture,
-            &mut chainstate,
+            chainstate,
             parent,
             &mut bitcoin_view,
             &path,
