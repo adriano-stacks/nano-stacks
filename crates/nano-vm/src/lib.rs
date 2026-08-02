@@ -301,7 +301,7 @@ impl BitcoinContext {
         if let Some(header) = self.headers.get(id.as_bytes()) {
             return Some(*header);
         }
-        let bytes: Vec<u8> = {
+        let bytes: Option<Vec<u8>> = {
             let guard = self.headers_db.as_ref()?.lock().ok()?;
             guard
                 .query_row(
@@ -309,9 +309,12 @@ impl BitcoinContext {
                     params![id.as_bytes().as_slice()],
                     |row| row.get(0),
                 )
-                .ok()?
+                .ok()
         };
-        decode_block_header(&bytes)
+        if bytes.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
+            println!("no header for block {id}");
+        }
+        decode_block_header(&bytes?)
     }
 }
 
@@ -1659,9 +1662,14 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
-        self.current_block()
+        let found = self
+            .current_block()
             .and_then(|block| self.block_at_height(block, height))
-            .map(StacksBlockId)
+            .map(StacksBlockId);
+        if found.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
+            println!("no block at height {height}");
+        }
+        found
     }
 
     /// The height of the block being executed.

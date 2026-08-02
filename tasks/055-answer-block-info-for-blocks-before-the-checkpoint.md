@@ -1,7 +1,7 @@
 ---
 id: "055"
 title: "Answer block info for blocks before the checkpoint"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 type: bug
@@ -36,10 +36,10 @@ executed, is never written down, and a restart loses it.
 
 ## Tasks
 
-- [ ] Persist executed block headers rather than holding them in memory.
+- [x] Persist executed block headers rather than holding them in memory.
 - [ ] Export the header fields Clarity can read for the checkpoint's ancestry,
       and import them alongside the trie.
-- [ ] Serve `HeadersDB` from the persisted store, so a restart answers what the
+- [x] Serve `HeadersDB` from the persisted store, so a restart answers what the
       run before it answered.
 - [ ] Distinguish a header that is genuinely absent from one this node never
       carried, rather than answering `none` as though the block never existed.
@@ -53,6 +53,19 @@ executed, is never written down, and a restart loses it.
 - The answer survives a restart.
 - Memory does not grow with distance from the checkpoint.
 - Mainnet replay passes 8,665,719.
+
+## Header coverage was not what stopped 8,665,719
+
+Persisting the headers was right on its own terms — the map grew with the chain
+and a restart lost it — but tracing every `get_block_at_height` and header read
+during the failing block showed **no miss at all**, and no contract failing to
+compile either. So the `UnwrapFailure` is a Clarity-level unwrap of an `err` the
+contract itself produced, and the read behind it is one nano answers with the
+wrong *value* rather than with nothing.
+
+Narrowing that needs tracing at the granularity of a single Clarity read: which
+key, in which contract, returning what. The next step is that trace, not more
+guessing at which surface is missing.
 
 ## What the archive already holds
 
