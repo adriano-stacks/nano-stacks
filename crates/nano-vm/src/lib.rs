@@ -609,21 +609,13 @@ impl Vm {
         }
     }
 
-    /// Whether this node has written down any header at all.
+    /// Whether this node has written down what Clarity may read about a block.
     ///
-    /// A state built before headers were kept has none, and cannot answer what
-    /// a contract asks about the block it is standing on.
+    /// Asked of the sealed tip rather than of the store as a whole, so a
+    /// backfill that a peer cut short resumes rather than counting itself done.
     #[must_use]
-    pub fn has_recorded_headers(&self) -> bool {
-        self.context.headers_db.as_ref().is_some_and(|db| {
-            db.lock().is_ok_and(|guard| {
-                guard
-                    .query_row("SELECT 1 FROM block_header LIMIT 1", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .is_ok()
-            })
-        })
+    pub fn has_recorded_header(&self, block: [u8; 32]) -> bool {
+        self.recorded_header(block).is_some()
     }
 
     /// What this node knows about a block, for tests and diagnostics.

@@ -467,13 +467,31 @@ where
         pox: &PoxInfo,
         from: [u8; 32],
     ) -> Result<usize, NodeExecutionError> {
-        if self.chainstate.has_recorded_headers() {
+        if self
+            .chainstate
+            .has_recorded_header(*self.tip.block_id().as_bytes())
+        {
             return Ok(0);
         }
         let mut walk = Vec::new();
         let mut cursor = self.tip.block_id();
         while *cursor.as_bytes() != from {
-            let block = node.block(cursor).await?;
+            let block = match node.block(cursor).await {
+                Ok(block) => block,
+                // A peer that is rate limiting has not refused: what was walked
+                // stands, and the next start carries on from the tip again.
+                Err(error) if error.is_rate_limited() => {
+                    // Says so rather than passing silently: the walk stops at
+                    // the tip's own header being present, so a run cut short
+                    // here leaves the deeper ones for the checkpoint export.
+                    eprintln!(
+                        "the peer cut the header backfill short at {cursor}, \
+                         leaving the blocks below it unrecorded"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
             cursor = block.header.parent_block_id;
             walk.push(block);
         }

@@ -1286,10 +1286,10 @@ impl ChainState {
         Ok(())
     }
 
-    /// Whether this node has written down any block header at all.
+    /// Whether this node has written down what Clarity may read about a block.
     #[must_use]
-    pub fn has_recorded_headers(&self) -> bool {
-        self.vm.has_recorded_headers()
+    pub fn has_recorded_header(&self, block: [u8; 32]) -> bool {
+        self.vm.has_recorded_header(block)
     }
 
     /// Record what Clarity may read about a block without executing it.
