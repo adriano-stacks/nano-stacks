@@ -1611,7 +1611,18 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
-        self.get_data_from_path(&ReferenceTrieHash(*nano_marf::key_path(key.as_bytes()).as_bytes()))
+        let found = self
+            .get_data_from_path(&ReferenceTrieHash(*nano_marf::key_path(key.as_bytes()).as_bytes()));
+        // A value that is wrong rather than missing is only visible by reading
+        // it, so this says what every read answered.
+        if std::env::var_os("NANO_TRACE_READS").is_some() {
+            match &found {
+                Ok(Some(value)) => println!("read {key} = {value}"),
+                Ok(None) => println!("read {key} = <none>"),
+                Err(error) => println!("read {key} failed: {error}"),
+            }
+        }
+        found
     }
 
     fn get_data_from_path(
@@ -3041,6 +3052,103 @@ mod tests {
 
         // Genesis is 0, its child 1, this one 2.
         assert_eq!(height, Some(Value::UInt(2)));
+    }
+
+    /// `slice?` over a list, which a VAA check unwraps without a fallback.
+    ///
+    /// Wormhole's core contract slices a nineteen-element list down to the
+    /// number of signatures it has and `unwrap-panic`s the result, so a `slice?`
+    /// answering `none` fails the whole verification and reads as an unwrap of
+    /// an error far from the word that was wrong. The bounds are the subtle
+    /// part, and they are stacks-core's rather than the obvious ones.
+    #[test]
+    fn slice_over_a_list_answers_for_every_range() {
+        for (range, expected) in [
+            ("u0 u2", Some("(u1 u2)")),
+            ("u0 u3", Some("(u1 u2 u3)")),
+            ("u1 u3", Some("(u2 u3)")),
+            ("u0 u0", Some("()")),
+            // `left >= len` is out of bounds even when the range is empty,
+            // which is stacks-core's check and not an obvious one.
+            ("u3 u3", None),
+            ("u2 u1", None),
+            ("u0 u4", None),
+        ] {
+            let value = evaluate(
+                Network::TESTNET,
+                &format!("(slice? (list u1 u2 u3) {range})"),
+            )
+            .expect("slice? evaluates")
+            .expect("slice? returns a value");
+            let shown = format!("{value}");
+            match expected {
+                Some(items) => assert_eq!(shown, format!("(some {items})"), "slice? {range}"),
+                None => assert_eq!(shown, "none", "slice? {range}"),
+            }
+        }
+    }
+
+    /// The crypto words a signature-verifying contract stands on.
+    ///
+    /// A mainnet market reaches a wormhole guardian-set check on its way
+    /// through `borrow`, and a recovery or a hash that differs makes the whole
+    /// verification fail — which reads as an unwrap of an error, nowhere near
+    /// the word that was wrong.
+    #[test]
+    fn the_signature_words_agree_with_their_known_vectors() {
+        // keccak256 of the empty buffer, the canonical vector.
+        assert_eq!(
+            evaluate(Network::TESTNET, "(keccak256 0x)").expect("keccak256 evaluates"),
+            Some(
+                Value::buff_from(
+                    hex::decode(
+                        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+                    )
+                    .expect("a hash")
+                )
+                .expect("a buffer")
+            )
+        );
+
+        // A recovery, which is what a guardian check actually does.
+        let recovered = evaluate(
+            Network::TESTNET,
+            "(secp256k1-recover? \
+             0xde5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04 \
+             0x8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b873\
+             554428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301)",
+        )
+        .expect("secp256k1-recover? evaluates");
+        assert_eq!(
+            recovered,
+            Some(
+                Value::okay(
+                    Value::buff_from(
+                        hex::decode(
+                            "03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110"
+                        )
+                        .expect("a key")
+                    )
+                    .expect("a buffer")
+                )
+                .expect("ok")
+            )
+        );
+
+        // sha256 of the empty buffer, for contrast: a contract hashing a
+        // message the wrong way recovers the wrong key from a good signature.
+        assert_eq!(
+            evaluate(Network::TESTNET, "(sha256 0x)").expect("sha256 evaluates"),
+            Some(
+                Value::buff_from(
+                    hex::decode(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    )
+                    .expect("a hash")
+                )
+                .expect("a buffer")
+            )
+        );
     }
 
     /// A header a node recorded is still there after it restarts.

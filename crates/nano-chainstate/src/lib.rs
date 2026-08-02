@@ -1735,7 +1735,11 @@ impl ChainState {
                     *result
                 }
                 ContractCallOutcome::RuntimeFailure { cost, error } => {
-                    runtime_error = Some(error.to_string());
+                    // The debug form carries the Clarity stack trace, which is
+                    // the only thing that says which contract and which
+                    // expression refused — the message alone says only that
+                    // something was unwrapped that could not be.
+                    runtime_error = Some(format!("{error:?}"));
                     TransactionResult {
                         value: Some(Value::err_none()),
                         cost,
