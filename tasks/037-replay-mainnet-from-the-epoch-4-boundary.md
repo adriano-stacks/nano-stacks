@@ -122,10 +122,10 @@ Also learned about the archive itself:
 - The archive dated the day mainnet crossed the boundary stops **27 burn blocks
   short of it**. The next day's reaches burn 960,341.
 
-## Replay depth on mainnet: 98 blocks
+## Replay depth on mainnet: 118 blocks
 
-The durable executed tip moved from the checkpoint at 8,665,600 to **8,665,698**
-— ninety-eight real mainnet blocks whose `state_index_root` matched the header,
+The durable executed tip moved from the checkpoint at 8,665,600 to **8,665,718**
+— a hundred and eighteen real mainnet blocks whose `state_index_root` matched,
 read from the store rather than inferred, and reported through
 `/nano/sync_status` as the executed height.
 
@@ -140,22 +140,31 @@ Each divergence was a real bug, found against the network and fixed with a test:
 | 8,665,685 | a trait nested in a list of tuples was not recovered from its declared type |
 | 8,665,694 | `with-all-assets-unsafe` charged a cost with no entry in the 4.0 table |
 | 8,665,695 | a call into a contract using `at-block` was fatal, not failed |
+| 8,665,699 | every contract read the block height as one more than the network did |
 
-### Where it stops, and what that means
+### The first divergence the receipts could not narrow
 
-At **8,665,699**, on a `zest-earn-adapter.set-apy` call where nano and mainnet
-agree on everything the receipt can express:
+At 8,665,699 nano and mainnet agreed on everything a receipt can express — the
+result `(ok u2)`, all five cost dimensions, and every key written — and the
+roots still differed. That is the signature this plan names: a mismatched root
+with matching receipts is **MARF or write ordering**.
 
-```
-result   (ok u2)   ==   (ok u2)
-runtime  18222     ==   18222
-read_count 20, read_length 10152, write_count 2, write_length 72   all equal
-```
+Tracing the writes settled it in one run. Six keys, in the order stacks-core
+writes them, with the same values — except one, and it was a *value*, not an
+ordering: `oracle-report-block` held `u8665700` where mainnet held `u8665699`.
+Two branches of the current-block height disagreed, and every contract reading
+it saw one past the block it was in. A second, smaller write was there too:
+incrementing the liquid supply by zero for matured rewards that did not exist,
+which stacks-core guards on having payouts at all — and a write the network did
+not make is a leaf in the trie it does not have.
 
-and the state roots still differ. That is the signature this plan names: a
-mismatched root with matching receipts is **MARF or write ordering**, not the VM
-and not the cost tables. It is the first divergence of that kind, and the first
-the receipt oracle cannot narrow further.
+### Where it stops now
+
+At **8,665,719**, and it is structural rather than arithmetic:
+[[055-answer-block-info-for-blocks-before-the-checkpoint]]. `HeadersDB` answers
+only for blocks nano executed itself, so everything before the checkpoint is
+`none`, and a contract reaching `get-stacks-block-info?` for older history gets
+an answer the network never gave.
 
 Also carried forward from the wrong turn before it: a reachability check over an
 imported checkpoint, which asserts every contract the side store names can still
