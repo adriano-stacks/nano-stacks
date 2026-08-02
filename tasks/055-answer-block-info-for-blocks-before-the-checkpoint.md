@@ -89,10 +89,26 @@ Two things the trace did find:
   the cost tracker, so that is one attempt's real work, not accumulated waste —
   which means nano is genuinely doing much more of it on this path.
 
+Every word that path stands on has now been pinned against stacks-core and
+agrees: `keccak256`, `sha256`, a `secp256k1` recovery, `slice?` over both a list
+and a buffer including its bounds, `buff-to-uint-be` at an offset, and `map`
+across two lists. Block, header and module lookups all answer. So the divergence
+is not a missing surface and not one of the primitives.
+
 The failing expression is inside wormhole's guardian-set verification, after the
-set is read and before anything else is written. `unwrap-panic` there has no
-fallback, and clar2wasm leaves the Clarity stack trace empty, so the next step
-is either populating that trace or bisecting the VAA path directly.
+set is read and before anything is written. `unwrap-panic` there has no
+fallback, and clar2wasm leaves the Clarity stack trace empty, so the message
+says only that something could not be unwrapped.
+
+The runtime cost is the sharpest remaining clue: **92,687,934 against mainnet's
+12,352,456**, and that is one attempt's real work rather than accumulated
+retries. nano is doing seven and a half times the work on a path that then
+fails, which is what a loop running too many times looks like.
+
+Two ways forward, in order of cost: populate clar2wasm's stack trace so the
+error names its own expression, or lift the VAA bytes out of the transaction and
+run the verification against the interpreter in isolation, where the crosscheck
+harness can bisect it.
 
 ## What the archive already holds
 

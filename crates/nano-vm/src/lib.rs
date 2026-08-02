@@ -3132,6 +3132,32 @@ mod tests {
         assert_eq!(height, Some(Value::UInt(2)));
     }
 
+    /// Reading a length out of a buffer, which decides how much work follows.
+    ///
+    /// Wormhole reads its signature count from one byte of the VAA and slices a
+    /// nineteen-element list down to it. A count that comes out too large makes
+    /// that slice answer `none`, `unwrap-panic` fail, and the recovery loop run
+    /// longer on the way — which is the shape of the divergence at 8,665,719.
+    #[test]
+    fn a_length_read_from_a_buffer_is_what_the_bytes_say() {
+        for (program, expected) in [
+            // One byte at an offset, as `read-uint-8` does it.
+            ("(buff-to-uint-be (unwrap-panic (slice? 0x00000000000d u5 u6)))", "u13"),
+            ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000000ff u5 u6)))", "u255"),
+            // Four bytes, as `read-uint-32` does it.
+            ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000007ff u1 u5)))", "u7"),
+            // A buffer slice at its exact end is still in range.
+            ("(unwrap-panic (slice? 0x0102 u0 u2))", "0x0102"),
+            // And one starting at the end is not, the same as for a list.
+            ("(slice? 0x0102 u2 u2)", "none"),
+        ] {
+            let value = evaluate(Network::TESTNET, program)
+                .expect("the program evaluates")
+                .expect("the program returns a value");
+            assert_eq!(format!("{value}"), expected, "{program}");
+        }
+    }
+
     /// `map` across two lists, which is how signatures meet their hashes.
     ///
     /// Wormhole recovers a key per signature with
