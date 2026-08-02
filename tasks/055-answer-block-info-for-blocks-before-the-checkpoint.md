@@ -67,6 +67,33 @@ Narrowing that needs tracing at the granularity of a single Clarity read: which
 key, in which contract, returning what. The next step is that trace, not more
 guessing at which surface is missing.
 
+## What the read trace ruled out, and what it found
+
+Tracing every Clarity read through the failing block ruled out the obvious
+suspects one at a time. No `get_block_at_height` missed, no header missed, no
+contract failed to compile, and the words a VAA verification stands on —
+`keccak256`, `sha256`, a `secp256k1` recovery, `slice?` across its bounds, and
+`map` across two lists — all agree with stacks-core. Those are pinned as tests.
+
+Two things the trace did find:
+
+- **Compiling on demand re-executes the whole call.** The transaction reaches 23
+  contracts and read their commitments 1,596 times, because each missing module
+  is discovered by failing, compiling one, and running again from the start.
+  That is quadratic, and it is bounded by `MISSING_MODULE_ATTEMPTS = 64`, so a
+  call reaching more contracts than that fails for want of attempts rather than
+  for any reason of its own. Compiling the transitive closure up front would do
+  it once.
+- **The cost is seven and a half times mainnet's**: 92,687,934 runtime against
+  12,352,456, at 28 reads against 300. Each retry starts from a fresh clone of
+  the cost tracker, so that is one attempt's real work, not accumulated waste —
+  which means nano is genuinely doing much more of it on this path.
+
+The failing expression is inside wormhole's guardian-set verification, after the
+set is read and before anything else is written. `unwrap-panic` there has no
+fallback, and clar2wasm leaves the Clarity stack trace empty, so the next step
+is either populating that trace or bisecting the VAA path directly.
+
 ## What the archive already holds
 
 `chainstate/vm/index.sqlite` carries `block_headers` for all 8.6 million blocks,

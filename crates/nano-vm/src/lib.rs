@@ -3054,6 +3054,27 @@ mod tests {
         assert_eq!(height, Some(Value::UInt(2)));
     }
 
+    /// `map` across two lists, which is how signatures meet their hashes.
+    ///
+    /// Wormhole recovers a key per signature with
+    /// `(map recover-public-key signatures vaa-body-hash-list)`, so a two-list
+    /// map that pairs wrongly or stops at the wrong length recovers the wrong
+    /// keys from good signatures.
+    #[test]
+    fn map_across_two_lists_pairs_them_in_order() {
+        for (program, expected) in [
+            ("(map + (list u1 u2 u3) (list u10 u20 u30))", "(u11 u22 u33)"),
+            // The shorter list decides how far it goes.
+            ("(map + (list u1 u2 u3) (list u10 u20))", "(u11 u22)"),
+            ("(map + (list u1) (list u10 u20 u30))", "(u11)"),
+        ] {
+            let value = evaluate(Network::TESTNET, program)
+                .expect("map evaluates")
+                .expect("map returns a value");
+            assert_eq!(format!("{value}"), expected, "{program}");
+        }
+    }
+
     /// `slice?` over a list, which a VAA check unwraps without a fallback.
     ///
     /// Wormhole's core contract slices a nineteen-element list down to the
