@@ -223,3 +223,46 @@ check. The repository has no root CI workflow invoking that gate yet.
 This is M9 against mainnet. It says nothing about execution, which is the half
 this task is really about and which remains open until the captured chainstate
 replays with an explicit depth and first-divergence result.
+
+## Mainnet execution has started, and what it found
+
+The executed tip is durable and moving: **8,665,601 → 8,665,622**, twenty-two
+real mainnet blocks whose `state_index_root` matched the header. Reported from
+`/nano/sync_status` as the executed height, which is the only number this task
+will accept as evidence.
+
+Getting the first block to execute at all took four fixes, each a real
+divergence rather than an infrastructure problem:
+
+- **`MaybeSent`** — nano's codec rejected the SIP-040 non-fungible condition
+  code, so the block carrying it would not decode and the descent stopped at
+  8,688,027 by any route.
+- **Bitcoin hash byte order** — a `BitcoinBlock` records the displayed order,
+  Bitcoin Core's RPC returns the internal order and is reversed to match, and
+  Esplora returns the displayed order and was reversed as well. Every read
+  looked like a reorganization.
+- **The burn header a block lands on** — the production node never set it, and
+  Clarity resolves `get-burn-block-info?` through the *tip sortition* from
+  epoch 3 on, which nano answered `none` to. sBTC's withdrawal path compares
+  the hash it was signed for against that, so nano returned
+  `ERR_INVALID_BURN_HASH` where mainnet returned `(ok true)` and diverged at
+  **8,665,615**.
+- **Compile on demand** — a contract whose module is not loaded is reported two
+  ways, and only one was recognised.
+
+## Where it stops now
+
+A deployment references `SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.native-pool-v1`
+and its analysis cannot be loaded, so `clar2wasm::compile` fails with
+`NoSuchContract`. The retry cannot help: `ensure_wasm_module` caches the
+*module* but never registers the *analysis*, where the deploy path does both.
+
+The analysis is present in the imported side store under
+`clr-meta::…native-pool-v1::analysis`, so this is a lookup that misses, not
+state that is absent. `get_metadata` reaches it through
+`get_contract_hash` → `get_block_at_height(commitment.block_height)`, so the
+next thing to check is whether a pre-checkpoint deploy height still resolves to
+the block its metadata was written under.
+
+Inserting the analysis on demand would paper over it and is not obviously
+consensus-safe — metadata writes are state — so the lookup is the thing to fix.

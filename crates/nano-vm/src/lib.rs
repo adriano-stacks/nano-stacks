@@ -2026,8 +2026,11 @@ fn call_contract_values_in_context(
                 attempts += 1;
                 // A contract that cannot be compiled is not the reason the
                 // run stopped — report what stopped it, not what the repair
-                // ran into.
-                if ensure_wasm_module(store, bitcoin_context, modules, &missing).is_err() {
+                // ran into. Say what the repair ran into all the same, because
+                // otherwise the run just keeps failing for its original reason
+                // and never says why the repair could not help.
+                if let Err(repair) = ensure_wasm_module(store, bitcoin_context, modules, &missing) {
+                    eprintln!("compiling {missing} on demand failed: {repair}");
                     return Err(error);
                 }
             }
