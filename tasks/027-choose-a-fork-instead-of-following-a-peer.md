@@ -5,7 +5,7 @@ status: in-progress
 priority: high
 effort: large
 type: improvement
-dependencies: ["026"]
+dependencies: ["026", "049", "050"]
 tags: ["mainnet", "sync"]
 created_at: 2026-07-30
 ---

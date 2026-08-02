@@ -5,7 +5,7 @@ status: pending
 priority: critical
 effort: large
 type: feature
-dependencies: ["020", "021", "022", "023", "024", "025"]
+dependencies: ["020", "021", "022", "023", "024", "025", "048"]
 tags: ["mainnet", "replay", "conformance"]
 created_at: 2026-07-30
 ---
@@ -15,7 +15,7 @@ created_at: 2026-07-30
 ## Objective
 
 The milestone that decides whether any of the rest of it worked. M10 proved nano
-computes the same chain state as stacks-core for 600 Hacknet blocks from a
+computes the same chain state as stacks-core for 340 Hacknet blocks from a
 regtest checkpoint. This is the same claim against the chain that matters.
 
 Everything before it is a component check. The oracle is the same as M10's —
@@ -32,9 +32,9 @@ depends on are done.
 - [x] Teach the fixture tooling and the scoreboard about a mainnet capture.
 - [x] Make `import_checkpoint` work in bounded memory, so a mainnet-sized MARF
       can be imported at all.
-- [x] Replay forward and report the first divergence with the field that
+- [ ] Replay forward and report the first divergence with the field that
       diverged.
-- [x] Work the divergence point forward until it stops moving for a real reason
+- [ ] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
 - [x] Check what mainnet *can* serve without a chainstate — the block envelope
@@ -122,87 +122,42 @@ Also learned about the archive itself:
 - The archive dated the day mainnet crossed the boundary stops **27 burn blocks
   short of it**. The next day's reaches burn 960,341.
 
-## The state-root half is done: nano follows mainnet
+## The near-tip claim was the followed view, not execution
 
-The replay is not a harness run — it is a **live node on mainnet, at the
-network's tip**. From the checkpoint at Stacks height 8,665,600 it executed
-every block forward to the tip and now tracks it one or two blocks behind:
-
-```
-20:49:21 nano 8684267 mainnet 8684267 lag 0
-20:55:21 nano 8684289 mainnet 8684290 lag 1
-21:03:22 nano 8684319 mainnet 8684319 lag 0
-21:07:22 nano 8684323 mainnet 8684325 lag 2
-21:13:22 nano 8684345 mainnet 8684345 lag 0
-```
-
-Sampled every two minutes for eighty minutes, thirty-one times against the
-network's own tip:
-
-| lag | samples |
-|---|---|
-| 0 | 5 |
-| 1 | 11 |
-| 2 | 14 |
-| 3 | 1 |
-
-Never further behind than three blocks, which is the poll interval and the round
-trip rather than any backlog, and never down.
-
-**Roughly 18,290 real mainnet blocks, and every `state_index_root` matched.**
-The follower runs `RootPolicy::Verify`, so a wrong root is a hard error, and the
-log carries none. Every execution failure it did record was a `429` from the
-peer while fetching a block — a fetch that got rate limited, never a block that
-disagreed.
-
-That is what M10 asks for, against the chain that matters: the MARF, the Clarity
-VM, the native accounting, PoX locking, SIP-031 and the unlock schedule all
-agree with stacks-core, block for block, on real traffic.
-
-Five faults had to be fixed to get there, each only visible at mainnet scale
-against a public API that rate limits:
-
-- the checkpoint import held the whole record table in memory (below)
-- the side store copied every historical value — 140 GB — where only the ones
-  reachable from trie leaves are needed, which is 10.5 GB
-- a follower that fell more than one tenure behind could never catch up: it only
-  ever asks for the peer's latest tenure, whose first block descends from one it
-  never fetched, so every round ended in a fork error. Parent links cross tenure
-  boundaries like any other, so the walk that reaches a tip also closes the gap.
-- a tenure already in hand was carried forward only when the peer was exactly
-  one block ahead, and otherwise refetched whole. At a five second poll the peer
-  rarely is, and a mainnet tenure runs to hundreds of blocks, so nearly every
-  round asked for all of them again. A round that then failed threw away what it
-  had fetched, and the next asked again — the failure being a rate limit, which
-  the refetch made worse. Both are gone: the walk is incremental, and blocks are
-  cached under their identifiers, which is sound because they are immutable.
-- a 429 on `/v2/pox` **killed the node on the way up**. A round can give up on a
-  rate limit and ask again next poll; startup has no next poll, so a node the
-  endpoint merely asked to slow down never came up.
-
-Together those took the follower from oscillating between tip and twenty blocks
-behind, with eleven fork errors per twenty minutes, to a steady lag of one to
-five blocks and none.
-
-What remains is the receipt half, which needs an oracle an archive cannot give.
-
-## What stops the replay: memory
-
-Replaying that capture **runs out of memory**. The import was at 15 GB resident
-and still climbing when the kernel killed it:
+On 2026-08-01 the node's `/v2/info` stayed within zero to three blocks of the
+peer for eighty minutes. That was recorded here as roughly 18,290 mainnet state
+roots matching. A read of the durable store on 2026-08-02 disproved it:
 
 ```
-tmux-spawn-…scope: The kernel OOM killer killed some processes in this unit
+select count(*), max(height) from marf_block;
+8665602|8665601
 ```
 
-This machine has 31 GB. A mainnet Clarity MARF is 142 GB of `marf.sqlite` and
-229 GB of blobs, and the checkpoint import holds too much of it at once —
-against Hacknet's, which is small enough that nothing showed.
+The store still ends at the single anchor applied after the checkpoint. Startup
+said the same thing — `sealed at ... height 8665601` — and no `accounting.json`
+exists, which means `CheckpointExecutor::follow_to_tip` has never returned one
+successful batch. The near-tip heights came from `NodeView.node_info`, copied
+from the peer and published before execution. Absence of `StateRootMismatch` in
+the log therefore proved that no mismatching block was executed, not that every
+peer block was executed successfully.
 
-That is a real limit in nano, not in the environment: **`import_checkpoint` has
-to work in bounded memory**, streaming the trie graph rather than accumulating
-it. Until it does, the size of chain nano can start from is capped by the size
-of a machine.
+The live process later fell more than a thousand blocks behind and entered a
+stable loop of `peer tenure does not extend the followed chain`, so the follower
+improvements are useful but not yet a durable mainnet sync result either. See
+[[046-distinguish-followed-and-executed-chain-tips]] and
+[[047-make-mainnet-synchronization-monotonic-and-restart]].
+
+The state-root half of this task remains open. Evidence must come from the
+offline scoreboard or from the durable executed tip and an explicit count of
+roots verified, never from the peer-facing RPC height or from absence of an
+execution error.
+
+## Historical blocker: checkpoint import memory
+
+The first import was killed after exceeding 15 GB resident against a 142 GB MARF
+and 229 GB blob store. The lazy, reachable-record import work fixed that blocker:
+the mainnet checkpoint now imports into the 31 GB machine and the node resumes
+from it. This establishes bounded-enough bootstrap behavior, not forward replay.
 
 ## The unlock heights the capture needs
 
@@ -236,18 +191,15 @@ covers costs rather than events.
 
 ## What still blocks it
 
-The fixtures this task replays cannot be taken from a public API:
+The archive supplied the MARF and sortition snapshots, and the public API
+supplied the blocks. The remaining fixture problems are now concrete:
 
-- the MARF checkpoint needs a stacks-core node's `chainstate/vm/clarity`
-  directory, or a published PCS export — `cargo xtask capture-fixtures` takes a
-  `--state-dir`, not a URL
-- `sortition/snapshots.json` is a dump of a node's `burnchain/sortition/marf.sqlite`
-- `events/new_block/*.json` come from an event observer attached to a node
-
-Blocks are the one part `/v3/blocks/:id` can serve. So this needs either a
-synced mainnet stacks-core node or a checkpoint published by someone who has
-one, which is the same dependency [[031-establish-a-trust-root-for-the-checkpoint]]
-has to answer anyway.
+- `native-effects.json` predates the complete maturity-window export and cannot
+  carry execution across the next tenure; see
+  [[048-carry-complete-mainnet-tenure-accounting]]
+- receipts and events still require an observer attached to stacks-core
+- the 100-block capture has not produced an offline scoreboard result
+- no bounded mainnet slice runs in the repository's CI
 
 ## What mainnet already proves
 
@@ -264,9 +216,10 @@ of the weight. nano derives the same signer signature hash mainnet signed,
 recovers the same keys from it, orders them the same way, and counts the same
 weight against the same threshold.
 
-Five of them and the reward set are kept under `fixtures/mainnet/`, so it runs
-offline in CI as a gate, and `verify-block` takes any block a node will serve
-for a wider check.
+Five of them and the reward set are kept under `fixtures/mainnet/`, so the test
+runs offline, and `verify-block` takes any block a node will serve for a wider
+check. The repository has no root CI workflow invoking that gate yet.
 
 This is M9 against mainnet. It says nothing about execution, which is the half
-this task is really about and which still waits on a chainstate.
+this task is really about and which remains open until the captured chainstate
+replays with an explicit depth and first-divergence result.
