@@ -1979,6 +1979,64 @@ const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
     }
 }
 
+/// The source a deployed contract was published with, and its Clarity version.
+fn contract_source(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    contract: &QualifiedContractIdentifier,
+) -> Result<(String, ClarityVersion), VmExecutionError> {
+    let mut database = clarity_database(store, bitcoin_context);
+    database.begin();
+    let result = (|| {
+        let contract_context = database.get_contract(contract)?;
+        let source = database
+            .get_contract_src(contract)
+            .ok_or_else(|| VmInternalError::Expect(format!("missing source for {contract}")))?;
+        Ok((source, *contract_context.get_clarity_version()))
+    })();
+    match result {
+        Ok(value) => {
+            database.commit()?;
+            Ok(value)
+        }
+        Err(error) => {
+            database.roll_back()?;
+            Err(error)
+        }
+    }
+}
+
+/// Compile a contract and everything its source names, before the call runs.
+///
+/// A module that turns out to be missing is otherwise only discovered by
+/// running the whole call and failing, so a transaction reaching twenty-three
+/// contracts ran twenty-three times — and one reaching more than
+/// `MISSING_MODULE_ATTEMPTS` failed for want of attempts rather than for any
+/// reason of its own.
+///
+/// One level, and iterative: contracts reference each other in cycles, and a
+/// contract is not in the cache until it has finished compiling, so following
+/// references as they are found recurses until the stack is gone.
+fn ensure_wasm_module_and_references(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    modules: &mut ModuleCache,
+    contract: &QualifiedContractIdentifier,
+) -> Result<(), VmExecutionError> {
+    let referenced = contract_source(store, bitcoin_context, contract)
+        .map(|(source, version)| referenced_contracts(contract, &source, version))
+        .unwrap_or_default();
+
+    for referenced in referenced {
+        if modules.get(&referenced).is_none() {
+            // A contract that will not compile is the caller's problem to
+            // report, not a reason to give up before running anything.
+            let _ = ensure_wasm_module(store, bitcoin_context, modules, &referenced);
+        }
+    }
+    ensure_wasm_module(store, bitcoin_context, modules, contract)
+}
+
 /// Compile a contract a call needs, reporting a bad contract as a failed call.
 fn needed_module(
     store: &mut MarfStore,
@@ -1987,7 +2045,7 @@ fn needed_module(
     contract: &QualifiedContractIdentifier,
     cost_tracker: &LimitedCostTracker,
 ) -> Result<Option<ContractCallOutcome>, VmExecutionError> {
-    match ensure_wasm_module(store, bitcoin_context, modules, contract) {
+    match ensure_wasm_module_and_references(store, bitcoin_context, modules, contract) {
         Ok(()) => Ok(None),
         Err(error) if reports_analysis_failure(&error) => {
             Ok(Some(ContractCallOutcome::RuntimeFailure {
@@ -2494,40 +2552,7 @@ fn ensure_wasm_module(
         return Ok(());
     }
 
-    let (source, version) = {
-        let mut database = clarity_database(store, bitcoin_context);
-        database.begin();
-        let result = (|| {
-            let contract_context = database.get_contract(contract)?;
-            let source = database
-                .get_contract_src(contract)
-                .ok_or_else(|| VmInternalError::Expect(format!("missing source for {contract}")))?;
-            Ok((source, *contract_context.get_clarity_version()))
-        })();
-        match result {
-            Ok(value) => {
-                database.commit()?;
-                value
-            }
-            Err(error) => {
-                database.roll_back()?;
-                return Err(error);
-            }
-        }
-    };
-    // Everything this contract calls, before it is compiled: a module that
-    // turns out to be missing is only discovered by running the whole call and
-    // failing, so finding them one at a time makes a call over twenty-three
-    // contracts run twenty-three times, and one over more than
-    // `MISSING_MODULE_ATTEMPTS` fail for want of attempts rather than for any
-    // reason of its own.
-    for referenced in referenced_contracts(contract, &source, version) {
-        if modules.get(&referenced).is_none() {
-            // A contract that will not compile is the caller's problem to
-            // report, not a reason to give up before running anything.
-            let _ = ensure_wasm_module(store, bitcoin_context, modules, &referenced);
-        }
-    }
+    let (source, version) = contract_source(store, bitcoin_context, contract)?;
     // The current epoch first, so the costs baked in are the ones the chain
     // charges now. Only a contract it rejects — one using a word a later epoch
     // removed — is rebuilt under the epoch it was deployable in.
