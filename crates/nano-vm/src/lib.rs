@@ -1731,6 +1731,28 @@ fn evaluate_with_tracker_in_context(
 }
 
 /// Publish a versioned Clarity contract in an active MARF-backed state.
+/// The epoch a contract of this Clarity version was first deployable in.
+///
+/// Recompiling on demand has to reconstruct what the network already accepted,
+/// not re-judge it. Compiling everything as epoch 4.0 rejects any contract
+/// using a word later epochs removed — `at-block`, which 3.4 dropped and which
+/// mainnet contracts written before it still use and still run, because
+/// stacks-core stores the analysis rather than redoing it.
+///
+/// The cost table this bakes in is the deploy epoch's rather than the current
+/// one's. Costs are not in a block's state root, so a replay still matches;
+/// receipts for such contracts may not.
+const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
+    match version {
+        ClarityVersion::Clarity1 => StacksEpochId::Epoch20,
+        ClarityVersion::Clarity2 => StacksEpochId::Epoch21,
+        ClarityVersion::Clarity3 => StacksEpochId::Epoch30,
+        ClarityVersion::Clarity4 => StacksEpochId::Epoch33,
+        ClarityVersion::Clarity5 => StacksEpochId::Epoch34,
+        ClarityVersion::Clarity6 => StacksEpochId::Epoch40,
+    }
+}
+
 /// Compile a contract a call needs, reporting a bad contract as a failed call.
 fn needed_module(
     store: &mut MarfStore,
@@ -2276,7 +2298,7 @@ fn ensure_wasm_module(
                     contract,
                     LimitedCostTracker::new_free(),
                     version,
-                    StacksEpochId::Epoch40,
+                    epoch_for_version(version),
                     analysis_db,
                     true,
                 )
@@ -2842,6 +2864,37 @@ mod tests {
     /// to check Bitcoin has not forked. A node that answers `none` rejects a
     /// withdrawal mainnet accepted, and diverges on the block carrying it —
     /// which is exactly what happened at height 8,665,615.
+    /// A contract is recompiled under the epoch it was deployable in.
+    ///
+    /// `at-block` was dropped in 3.4, but mainnet contracts written before it
+    /// still use it and stacks-core still runs them, because it stores the
+    /// analysis rather than redoing it under the current epoch. Recompiling
+    /// everything as epoch 4.0 rejected them, and a call into one failed a
+    /// transaction mainnet completed. New deployments are still judged by the
+    /// current epoch, which is why this pins the mapping rather than a deploy.
+    #[test]
+    fn a_contract_is_recompiled_under_its_own_epoch() {
+        use clarity::types::StacksEpochId;
+
+        for (version, epoch) in [
+            (ClarityVersion::Clarity1, StacksEpochId::Epoch20),
+            (ClarityVersion::Clarity2, StacksEpochId::Epoch21),
+            (ClarityVersion::Clarity3, StacksEpochId::Epoch30),
+            (ClarityVersion::Clarity4, StacksEpochId::Epoch33),
+            (ClarityVersion::Clarity5, StacksEpochId::Epoch34),
+            (ClarityVersion::Clarity6, StacksEpochId::Epoch40),
+        ] {
+            assert_eq!(super::epoch_for_version(version), epoch);
+            // The inverse of stacks-core's own mapping, which is what makes
+            // this the epoch the contract could have been deployed in.
+            assert_eq!(ClarityVersion::default_for_epoch(epoch), version);
+        }
+        assert!(
+            StacksEpochId::Epoch21.supports_at_block(),
+            "the epoch a Clarity 2 contract is rebuilt under still has at-block"
+        );
+    }
+
     /// A contract using an allowance form compiles at all.
     ///
     /// `with-all-assets-unsafe` charged a cost it had no entry for in the
