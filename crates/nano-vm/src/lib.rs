@@ -1731,6 +1731,34 @@ fn evaluate_with_tracker_in_context(
 }
 
 /// Publish a versioned Clarity contract in an active MARF-backed state.
+/// Compile a stored contract's source under one epoch.
+fn compile_under(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+    source: &str,
+    version: ClarityVersion,
+    epoch: StacksEpochId,
+) -> Result<clar2wasm::CompiledContract, VmExecutionError> {
+    let mut analysis = AnalysisDatabase::new(store);
+    analysis
+        .execute::<_, _, StaticCheckError>(|analysis_db| {
+            Ok(clar2wasm::compile(
+                source,
+                contract,
+                LimitedCostTracker::new_free(),
+                version,
+                epoch,
+                analysis_db,
+                true,
+            )
+            .map(clar2wasm::CompileResult::into_compiled_contract)
+            .map_err(|error: clar2wasm::CompileError| {
+                StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
+            })?)
+        })
+        .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()).into())
+}
+
 /// The epoch a contract of this Clarity version was first deployable in.
 ///
 /// Recompiling on demand has to reconstruct what the network already accepted,
@@ -2289,26 +2317,13 @@ fn ensure_wasm_module(
             }
         }
     };
-    let compiled = {
-        let mut analysis = AnalysisDatabase::new(store);
-        analysis
-            .execute::<_, _, StaticCheckError>(|analysis_db| {
-                Ok(clar2wasm::compile(
-                    &source,
-                    contract,
-                    LimitedCostTracker::new_free(),
-                    version,
-                    epoch_for_version(version),
-                    analysis_db,
-                    true,
-                )
-                .map(clar2wasm::CompileResult::into_compiled_contract)
-                .map_err(|error: clar2wasm::CompileError| {
-                    StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
-                })?)
-            })
-            .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()))?
-    };
+    // The current epoch first, so the costs baked in are the ones the chain
+    // charges now. Only a contract it rejects — one using a word a later epoch
+    // removed — is rebuilt under the epoch it was deployable in.
+    let compiled = compile_under(store, contract, &source, version, StacksEpochId::Epoch40)
+        .or_else(|_| {
+            compile_under(store, contract, &source, version, epoch_for_version(version))
+        })?;
     modules.insert(contract.clone(), compiled);
     Ok(())
 }
