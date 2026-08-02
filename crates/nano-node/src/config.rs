@@ -98,6 +98,14 @@ pub struct CheckpointConfig {
     pub anchor_bitcoin_height: u64,
     /// The rewards the checkpoint still owes, which nano cannot derive.
     pub tenure_accounting: Option<PathBuf>,
+    /// The consensus-encoded block that sealed the checkpoint's state.
+    ///
+    /// Its `state_index_root` is what a reward set signed, so it is what makes
+    /// the checkpoint trustworthy — the checkpoint saying its own root is not
+    /// evidence of anything.
+    pub attesting_block: Option<PathBuf>,
+    /// The reward set that signed that block, obtained without the checkpoint.
+    pub attesting_reward_set: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

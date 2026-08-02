@@ -7,8 +7,9 @@
 use std::{error::Error, fs, future::Future, path::Path, sync::Arc, time::Duration};
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource};
+use nano_crypto::StacksPublicKey;
 use nano_chainstate::{
-    MINER_REWARD_MATURITY,
+    MINER_REWARD_MATURITY, Signer, SignerSet,
     BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting, TenureAccountingError,
 };
 use nano_primitives::{Network, StacksBlockId};
@@ -17,8 +18,8 @@ use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
 use crate::{
-    CatchUpBudget, CatchUpRound, CheckpointExecutor, config::Config, miner, signer,
-    staging::Staging,
+    CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
+    config::Config, miner, signer, staging::Staging,
 };
 
 /// How many blocks one round of catching up will fetch before executing.
@@ -385,6 +386,7 @@ pub async fn open_chainstate(
     directory: &Path,
 ) -> Result<(ChainState, NakamotoBlock, Option<BitcoinBlockContext>), Box<dyn Error>> {
     let source = config.checkpoint.source_state_id()?;
+    adopt(config, directory, source)?;
     let mut chainstate = ChainState::open_from_checkpoint(
         network,
         directory,
@@ -468,6 +470,99 @@ async fn resume_from(
         ancestors.len()
     )
     .into())
+}
+
+/// Check the checkpoint against a signed header before any of it is opened.
+///
+/// A checkpoint stating its own root is not evidence of anything. A Nakamoto
+/// header at that height carries the same root and a reward set put threshold
+/// weight behind it, so that is what makes one trustworthy — and the reward set
+/// has to come from somewhere other than the checkpoint.
+///
+/// A state directory that already carries provenance was adopted once and is
+/// not re-adopted; it is checked to be the same checkpoint, so a directory
+/// cannot quietly become descended from a different one.
+fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<dyn Error>> {
+    let manifest = CheckpointManifest::load(
+        config
+            .checkpoint
+            .marf
+            .parent()
+            .ok_or("the checkpoint has no directory")?,
+    )?;
+    if manifest.source_state_id != source {
+        return Err(format!(
+            "the checkpoint names state {} where this node is configured for {}",
+            hex::encode(manifest.source_state_id),
+            hex::encode(source)
+        )
+        .into());
+    }
+    if let Some(recorded) = CheckpointProvenance::load(directory)? {
+        already_adopted(recorded.checkpoint.source_state_id, manifest.source_state_id)?;
+        return Ok(());
+    }
+
+    let (Some(block), Some(reward_set)) = (
+        config.checkpoint.attesting_block.as_ref(),
+        config.checkpoint.attesting_reward_set.as_ref(),
+    ) else {
+        return Err("a checkpoint needs an attesting block and the reward set that \
+                    signed it before it can be imported"
+            .into());
+    };
+    let block = NakamotoBlock::decode(&fs::read(block)?)?;
+    let signers = attesting_reward_set(&fs::read(reward_set)?)?;
+    let attestation = crate::adopt_checkpoint(directory, &manifest, &block.header, &signers)?;
+    println!(
+        "checkpoint {} attested by {} of {} signer weight",
+        hex::encode(manifest.source_state_id),
+        attestation.signer_weight,
+        attestation.approval_threshold
+    );
+    Ok(())
+}
+
+/// Whether a state directory may carry on under this checkpoint.
+///
+/// A directory descended from one checkpoint cannot be reused for another: its
+/// trie stands on the first one's state, and nothing later would notice.
+fn already_adopted(recorded: [u8; 32], configured: [u8; 32]) -> Result<(), String> {
+    if recorded == configured {
+        Ok(())
+    } else {
+        Err(format!(
+            "this state descends from checkpoint {} and cannot be reused for {}",
+            hex::encode(recorded),
+            hex::encode(configured)
+        ))
+    }
+}
+
+/// The reward set a `/v3/stacker_set/:cycle` document names.
+fn attesting_reward_set(bytes: &[u8]) -> Result<SignerSet, Box<dyn Error>> {
+    let document: serde_json::Value = serde_json::from_slice(bytes)?;
+    let entries = document["stacker_set"]["signers"]
+        .as_array()
+        .ok_or("the reward set names no signers")?;
+    let signers = entries
+        .iter()
+        .map(|entry| {
+            let key = entry["signing_key"]
+                .as_str()
+                .ok_or("a signer has no signing key")?;
+            Ok(Signer {
+                public_key: StacksPublicKey::from_bytes(&hex::decode(
+                    key.trim_start_matches("0x"),
+                )?)
+                .map_err(|error| format!("a signing key is not a public key: {error:?}"))?,
+                weight: u32::try_from(
+                    entry["weight"].as_u64().ok_or("a signer has no weight")?,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(SignerSet::new(signers)?)
 }
 
 /// The rewards a role still owes: what it last wrote, or what the checkpoint
@@ -648,6 +743,40 @@ async fn terminated() {
 
 #[cfg(test)]
 mod tests {
+    /// A state directory belongs to the checkpoint it was built from.
+    ///
+    /// Its trie stands on that checkpoint's state, so pointing it at another
+    /// would leave a node executing on a chain it never imported, and nothing
+    /// later would notice.
+    #[test]
+    fn a_state_directory_is_not_reused_for_another_checkpoint() {
+        super::already_adopted([1; 32], [1; 32]).expect("the same checkpoint carries on");
+        let refused = super::already_adopted([1; 32], [2; 32])
+            .expect_err("a different checkpoint is refused");
+        assert!(refused.contains("descends from checkpoint"), "{refused}");
+    }
+
+    /// The reward set that attests a checkpoint is read from what a node serves.
+    #[test]
+    fn an_attesting_reward_set_is_read_from_a_stacker_set_document() {
+        let document = br#"{"stacker_set":{"signers":[
+            {"signing_key":"0x03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110",
+             "weight":3},
+            {"signing_key":"02adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110",
+             "weight":1}]}}"#;
+        let signers = super::attesting_reward_set(document).expect("the reward set reads");
+        assert_eq!(signers.signers().len(), 2);
+        assert_eq!(
+            signers.signers().iter().map(|signer| signer.weight).sum::<u32>(),
+            4
+        );
+
+        // A document naming no signers is not a reward set, and a checkpoint
+        // attested by nobody is not attested.
+        assert!(super::attesting_reward_set(br#"{"stacker_set":{"signers":[]}}"#).is_err());
+        assert!(super::attesting_reward_set(b"{}").is_err());
+    }
+
     use super::Job;
 
     /// A network's liveness rests on its signers, so only the jobs that keep
