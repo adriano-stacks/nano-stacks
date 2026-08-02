@@ -121,7 +121,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     )
     .map_err(|error| format!("cannot open the staging store: {error}"))?;
     let budget = CatchUpBudget {
-        fetch: state.config.node.max_sync_blocks,
+        fetch: runtime::ROUND_FETCH,
         execute: state.config.node.max_sync_blocks,
     };
     loop {

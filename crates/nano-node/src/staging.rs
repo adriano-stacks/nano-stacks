@@ -152,6 +152,14 @@ impl Staging {
         Ok(())
     }
 
+    /// Forget everything at or below a height, which sealing past it makes
+    /// dead weight — and which a descent that overshot leaves behind.
+    pub fn remove_to(&self, height: u64) -> Result<usize, StagingError> {
+        Ok(self
+            .connection()?
+            .execute("DELETE FROM staged WHERE height <= ?1", params![height])?)
+    }
+
     /// Drop everything, which a fork or a corrupt descent calls for.
     pub fn clear(&self) -> Result<(), StagingError> {
         self.connection()?.execute("DELETE FROM staged", [])?;

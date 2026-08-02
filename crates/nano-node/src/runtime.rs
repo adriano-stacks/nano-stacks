@@ -21,6 +21,9 @@ use crate::{
     staging::Staging,
 };
 
+/// How many blocks one round of catching up will fetch before executing.
+pub(crate) const ROUND_FETCH: usize = 4_000;
+
 /// How close a node has to be before it is worth following the peer's tenure
 /// rather than spending every request catching up.
 const FOLLOW_WHEN_WITHIN: u64 = 1_000;
@@ -282,7 +285,10 @@ async fn follow(
         Err(error) => return Err(format!("cannot open the staging store: {error}")),
     };
     let budget = CatchUpBudget {
-        fetch: config.node.max_sync_blocks,
+        // Bounded so that a round ends and execution gets its turn: an
+        // unbounded descent over a gap of tens of thousands of blocks spends
+        // every round fetching and never executes what it already holds.
+        fetch: ROUND_FETCH,
         execute: config.node.max_sync_blocks,
     };
     let mut node = Node::new(peer.clone());

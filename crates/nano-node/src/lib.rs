@@ -31,6 +31,14 @@ pub struct CheckpointExecutor<S> {
     bitcoin: S,
 }
 
+/// Where a descent stops: the block this node has executed, by identity and by
+/// height, because a batch can step over the one without reaching the other.
+#[derive(Clone, Copy, Debug)]
+struct Stop {
+    block_id: StacksBlockId,
+    height: u64,
+}
+
 /// How much one round of catching up is allowed to do.
 #[derive(Clone, Copy, Debug)]
 pub struct CatchUpBudget {
@@ -470,8 +478,23 @@ where
         // What the peer added since the last round sits above everything
         // staged, so this stops as soon as it meets a block already held.
         let executed_tip = self.tip.block_id();
-        let mut fetched =
-            Self::descend(node, staging, peer_tip, executed_tip, budget.fetch, &mut round).await?;
+        let executed_height = self.tip.header.chain_length;
+        // A descent that overshot leaves blocks below the executed tip, which
+        // no round will ever execute and every round would otherwise resume
+        // from.
+        staging.remove_to(executed_height)?;
+        let mut fetched = Self::descend(
+            node,
+            staging,
+            peer_tip,
+            Stop {
+                block_id: executed_tip,
+                height: executed_height,
+            },
+            budget.fetch,
+            &mut round,
+        )
+        .await?;
         // The descent itself continues from the furthest it has reached, which
         // is what makes a rate-limited round cost nothing but time.
         if let Some(resume) = staging.descent_resumes_at()? {
@@ -479,7 +502,10 @@ where
                 node,
                 staging,
                 resume,
-                executed_tip,
+                Stop {
+                    block_id: executed_tip,
+                    height: executed_height,
+                },
                 budget.fetch.saturating_sub(fetched),
                 &mut round,
             )
@@ -497,13 +523,13 @@ where
         node: &SyncClient,
         staging: &Staging,
         from: StacksBlockId,
-        until: StacksBlockId,
+        until: Stop,
         budget: usize,
         round: &mut CatchUpRound,
     ) -> Result<usize, NodeExecutionError> {
         let mut cursor = from;
         let mut fetched = 0;
-        while cursor != until && fetched < budget {
+        while cursor != until.block_id && fetched < budget {
             if staging.holds(cursor)? {
                 break;
             }
@@ -536,6 +562,12 @@ where
                 staging.put(block)?;
             }
             fetched += blocks.len();
+            // A tenure arrives whole, so a batch straddling the executed tip
+            // never lands on it exactly — the cursor would step over it and
+            // descend forever into history this node already has.
+            if lowest.header.chain_length <= until.height {
+                break;
+            }
             // A peer that answers with only the block asked for still moves the
             // descent along, because that block's parent is the next cursor.
             if next == cursor {
