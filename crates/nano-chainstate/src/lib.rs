@@ -1174,6 +1174,7 @@ impl ChainState {
             self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             self.accounting.add_fees(coinbase_height, block_fees(block));
+            let credited = effects.credits.len();
             for credit in effects.credits {
                 self.vm.credit_stx(&credit.recipient, credit.amount)?;
             }
@@ -1184,24 +1185,13 @@ impl ChainState {
             if block_starts_new_tenure(block) {
                 self.mint_sip_031(bitcoin_context.height, block, &mut receipts)?;
             }
-            match root {
-                RootPolicy::Mine(miner_key) => {
-                    block.header.state_index_root =
-                        TrieHash::from_bytes(self.vm.pending_state_root()?.0);
-                    block.header.miner_signature =
-                        miner_key.sign(block.header.miner_signature_hash().as_bytes());
-                }
-                RootPolicy::Verify => {
-                    let actual = TrieHash::from_bytes(self.vm.pending_state_root()?.0);
-                    if actual != block.header.state_index_root {
-                        return Err(ChainStateError::StateRootMismatch {
-                            expected: block.header.state_index_root,
-                            actual,
-                        });
-                    }
-                }
-                RootPolicy::Trust => {}
-            }
+            let executed = ExecutedSummary {
+                bitcoin_height: bitcoin_context.height,
+                tenure_height: self.vm.tenure_height().unwrap_or(0),
+                credited,
+                liquid_supply_increase: effects.liquid_supply_increase,
+            };
+            self.settle_state_root(block, root, &receipts, executed)?;
             self.record_block_header(block, bitcoin_context)?;
             let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
             Ok(AppliedBlock {
@@ -1261,6 +1251,33 @@ impl ChainState {
     ///
     /// Every block of a tenure reports that tenure's burn block, which is what
     /// `get-tenure-info?` returns and what stacks-core stores per header.
+    /// Commit the state root a block claims, or refuse it, or write it.
+    fn settle_state_root(
+        &self,
+        block: &mut NakamotoBlock,
+        root: RootPolicy<'_>,
+        receipts: &[TransactionReceipt],
+        executed: ExecutedSummary,
+    ) -> Result<(), ChainStateError> {
+        let sealed = TrieHash::from_bytes(self.vm.pending_state_root()?.0);
+        match root {
+            RootPolicy::Mine(miner_key) => {
+                block.header.state_index_root = sealed;
+                block.header.miner_signature =
+                    miner_key.sign(block.header.miner_signature_hash().as_bytes());
+            }
+            RootPolicy::Verify if sealed != block.header.state_index_root => {
+                describe_mismatch(block, receipts, executed);
+                return Err(ChainStateError::StateRootMismatch {
+                    expected: block.header.state_index_root,
+                    actual: sealed,
+                });
+            }
+            RootPolicy::Verify | RootPolicy::Trust => {}
+        }
+        Ok(())
+    }
+
     fn record_block_header(
         &mut self,
         block: &NakamotoBlock,
@@ -2017,6 +2034,45 @@ const fn matches_nonfungible_condition(condition: NonFungibleCondition, moved: b
         NonFungibleCondition::DoesSend => moved,
         NonFungibleCondition::DoesNotSend => !moved,
         NonFungibleCondition::MaySend => true,
+    }
+}
+
+/// What a block's execution did, for describing a root that does not match.
+#[derive(Clone, Copy, Debug)]
+struct ExecutedSummary {
+    bitcoin_height: u64,
+    tenure_height: u32,
+    credited: usize,
+    liquid_supply_increase: u128,
+}
+
+/// Say what was executed when a root does not match.
+///
+/// A mismatch says only that something differed. It is the same block every
+/// round, so describing what went into it here is the difference between one
+/// restart and a day of them.
+fn describe_mismatch(
+    block: &NakamotoBlock,
+    receipts: &[TransactionReceipt],
+    executed: ExecutedSummary,
+) {
+    eprintln!(
+        "state root mismatch at height {}: tenure start {}, {} transactions, {} receipts, \
+         Bitcoin height {}, tenure height {}, {} credits, liquid supply +{}",
+        block.header.chain_length,
+        block_starts_new_tenure(block),
+        block.transactions.len(),
+        receipts.len(),
+        executed.bitcoin_height,
+        executed.tenure_height,
+        executed.credited,
+        executed.liquid_supply_increase,
+    );
+    for receipt in receipts {
+        eprintln!(
+            "  receipt {} {:?} committed {} cost {:?}",
+            receipt.txid, receipt.status, receipt.committed, receipt.result.cost
+        );
     }
 }
 
