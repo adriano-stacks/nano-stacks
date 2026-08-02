@@ -63,6 +63,11 @@ pub struct ExecutingNode<S> {
 #[derive(Debug)]
 pub enum NodeExecutionError {
     Sync(SyncError),
+    /// A tenure the descent asked for could not be used, and which one.
+    Descent {
+        tenure: StacksBlockId,
+        error: SyncError,
+    },
     Execution(CheckpointExecutionError),
     Staging(StagingError),
     MissingView,
@@ -78,6 +83,9 @@ impl fmt::Display for NodeExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sync(error) => write!(formatter, "node synchronization failed: {error}"),
+            Self::Descent { tenure, error } => {
+                write!(formatter, "descending through tenure {tenure} failed: {error}")
+            }
             Self::Execution(error) => write!(formatter, "node execution failed: {error}"),
             Self::Staging(error) => write!(formatter, "node staging failed: {error}"),
             Self::MissingView => formatter.write_str("node has no complete validated view"),
@@ -88,7 +96,7 @@ impl fmt::Display for NodeExecutionError {
 impl std::error::Error for NodeExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sync(error) => Some(error),
+            Self::Sync(error) | Self::Descent { error, .. } => Some(error),
             Self::Execution(error) => Some(error),
             Self::Staging(error) => Some(error),
             Self::MissingView => None,
@@ -510,7 +518,14 @@ where
                     round.rate_limited = true;
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                // Naming the tenure makes the next undecodable block one curl
+                // and one offline decode away, instead of a node restart.
+                Err(error) => {
+                    return Err(NodeExecutionError::Descent {
+                        tenure: cursor,
+                        error,
+                    });
+                }
             };
             let lowest = blocks
                 .iter()
