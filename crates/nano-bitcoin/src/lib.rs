@@ -261,12 +261,16 @@ impl BitcoinRestSource {
     }
 
     /// The hash Esplora reports at a height, in the byte order nano uses.
+    ///
+    /// Esplora answers with the hash as it is displayed, which is already the
+    /// order a `BitcoinBlock` records — reversing it again would compare a
+    /// block against its own mirror image and call every height a
+    /// reorganization.
     pub fn block_hash_at(&self, height: u64) -> Result<[u8; 32], BitcoinRpcSourceError> {
         let text = String::from_utf8(self.get(&format!("block-height/{height}"))?)
             .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
-        let hash = decode_block_hash(text.trim())
-            .ok_or_else(|| BitcoinRpcSourceError::Rest(format!("unreadable block hash {text:?}")))?;
-        Ok(bitcoin_hash_bytes(hash))
+        decode_block_hash(text.trim())
+            .ok_or_else(|| BitcoinRpcSourceError::Rest(format!("unreadable block hash {text:?}")))
     }
 
     pub fn invalidate_from(&mut self, height: u64) {
@@ -929,6 +933,32 @@ fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
+    /// A block's recorded hash and the hash a source reports for its height
+    /// have to be the same bytes, or every read looks like a reorganization.
+    ///
+    /// They came from opposite ends: a `BitcoinBlock` stores the displayed
+    /// order, Bitcoin Core's RPC hands back the internal order and is reversed,
+    /// and Esplora hands back the displayed order and was reversed too. Against
+    /// mainnet that made every block "no longer canonical" and stopped
+    /// execution at the first one.
+    #[test]
+    fn a_block_hash_reads_the_same_from_either_source() {
+        use bitcoin::hashes::Hash;
+
+        // Mainnet block 960,231, as both sources present it.
+        let displayed = "00000000000000000000e5a2b2a4dfa4d4f70e4e1e46e0e33f3e0c6a6f6a2e59";
+        let hash = bitcoin::BlockHash::from_byte_array(super::bitcoin_hash_bytes(
+            super::decode_block_hash(displayed).expect("the display hash decodes"),
+        ));
+
+        // What the RPC source does with what Bitcoin Core returns.
+        let from_rpc = super::bitcoin_hash_bytes(hash.to_byte_array());
+        // What the REST source does with what Esplora returns.
+        let from_rest = super::decode_block_hash(displayed).expect("the display hash decodes");
+
+        assert_eq!(from_rpc, from_rest, "the two sources agree on one block");
+    }
+
     use std::{fs, path::Path};
 
     use bitcoin::{
