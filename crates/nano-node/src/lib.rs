@@ -19,6 +19,12 @@ use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError};
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
     tip: NakamotoBlock,
+    /// The Bitcoin height the sealed tip was executed under.
+    ///
+    /// A block header carries the burn it spent, not the height it landed at,
+    /// and nothing else records it per block — so the executor keeps it, since
+    /// it is what a caller asking how far this node has come actually means.
+    bitcoin_height: u64,
     bitcoin: S,
 }
 
@@ -298,6 +304,7 @@ where
         Ok(Self {
             chainstate,
             tip: anchor,
+            bitcoin_height: bitcoin_context.height,
             bitcoin,
         })
     }
@@ -306,10 +313,14 @@ where
     ///
     /// A durable chainstate outlives the process, so a restart adopts the block
     /// its state was sealed at instead of importing a checkpoint again.
+    /// The Bitcoin height is not on disk, so a resumed executor reports zero
+    /// until it applies a block of its own — an honest unknown rather than a
+    /// height it made up.
     pub const fn resume(chainstate: ChainState, tip: NakamotoBlock, bitcoin: S) -> Self {
         Self {
             chainstate,
             tip,
+            bitcoin_height: 0,
             bitcoin,
         }
     }
@@ -385,7 +396,14 @@ where
                 block,
             )?;
         self.tip = block.clone();
+        self.bitcoin_height = bitcoin_context.height;
         Ok(applied)
+    }
+
+    /// The Bitcoin height the sealed tip was executed under.
+    #[must_use]
+    pub const fn bitcoin_height(&self) -> u64 {
+        self.bitcoin_height
     }
 
     /// Execute every canonical block between this tip and the peer's, oldest first.

@@ -11,7 +11,7 @@ use nano_chainstate::{
     BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting, TenureAccountingError,
 };
 use nano_primitives::{Network, StacksBlockId};
-use nano_rpc::{ChainAccess, EventDispatcher, RpcState, serve};
+use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
@@ -131,6 +131,16 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    // Publish what this node is sealed at before it follows anything, so a node
+    // that never manages to execute reports the height it is really on rather
+    // than nothing at all.
+    if let (Some(state), Some(executor)) = (state.as_ref(), executor.as_ref()) {
+        let sealed = {
+            let executor = executor.lock().await;
+            sealed_tip(executor.tip(), executor.bitcoin_height())
+        };
+        state.publish_executed(sealed).await;
+    }
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
     // view fresh.
@@ -212,6 +222,33 @@ async fn supervise(roles: &mut JoinSet<(Job, Role)>) -> Result<(), Box<dyn Error
     }
 }
 
+/// What this node has sealed, for the RPC to answer from.
+fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
+    SealedTip {
+        stacks_height: tip.header.chain_length,
+        stacks_tip: tip.block_id(),
+        consensus_hash: tip.header.consensus_hash,
+        bitcoin_height,
+        state_index_root: tip.header.state_index_root,
+    }
+}
+
+/// Say what a round of execution actually did.
+///
+/// A batch that executed nothing reads exactly like one that executed a
+/// thousand blocks unless it says so, which is how a node that had never
+/// executed a single block past its checkpoint looked healthy for hours.
+fn report_batch(from: u64, executed: usize, tip: &NakamotoBlock) {
+    if executed == 0 {
+        println!("executed nothing: still sealed at {from}");
+    } else {
+        println!(
+            "executed {executed} blocks, {from} to {}, state root {}",
+            tip.header.chain_length, tip.header.state_index_root
+        );
+    }
+}
+
 /// Follow the peer, publishing what it validated and executing along it.
 async fn follow(
     config: Config,
@@ -231,13 +268,26 @@ async fn follow(
                 state.publish(view).await;
             }
             if let Some(executor) = executor.as_ref() {
-                let mut executor = executor.lock().await;
-                match executor
-                    .follow_to_tip(&peer, &pox, config.node.max_sync_blocks)
-                    .await
-                {
-                    Ok(_) => persist_accounting(&directory, &mut executor)?,
-                    Err(error) => eprintln!("executing the peer's chain failed: {error}"),
+                let sealed = {
+                    let mut executor = executor.lock().await;
+                    let from = executor.tip().header.chain_length;
+                    match executor
+                        .follow_to_tip(&peer, &pox, config.node.max_sync_blocks)
+                        .await
+                    {
+                        Ok(executed) => {
+                            report_batch(from, executed, executor.tip());
+                            persist_accounting(&directory, &mut executor)?;
+                            Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
+                        }
+                        Err(error) => {
+                            eprintln!("executing the peer's chain failed: {error}");
+                            None
+                        }
+                    }
+                };
+                if let (Some(state), Some(sealed)) = (state.as_ref(), sealed) {
+                    state.publish_executed(sealed).await;
                 }
             }
         }

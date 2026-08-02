@@ -28,7 +28,7 @@ use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
 use nano_sync::NodeView;
-use nano_primitives::Network;
+use nano_primitives::{ConsensusHash, Network, StacksBlockId, TrieHash};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -46,6 +46,12 @@ pub use stackerdb::{ChunkRefusal, StackerDbStore};
 #[derive(Clone)]
 pub struct RpcState {
     view: Arc<RwLock<Option<NodeView>>>,
+    /// The tip this node has actually executed and sealed.
+    ///
+    /// Separate from `view`, which is what the peer said. Serving the peer's
+    /// height as this node's own is how a node that had executed nothing at all
+    /// reported itself within three blocks of mainnet for eighty minutes.
+    executed: Arc<RwLock<Option<SealedTip>>>,
     events: broadcast::Sender<NodeEvent>,
     /// The executed Clarity state, when the node runs one.
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
@@ -85,6 +91,7 @@ impl RpcState {
         let (events, _) = broadcast::channel(256);
         Self {
             view: Arc::new(RwLock::new(None)),
+            executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
             mempool: None,
@@ -135,6 +142,11 @@ impl RpcState {
         self.stacker_sets.write().await.insert(cycle, stacker_set);
     }
 
+    /// Publish the tip this node has executed and sealed.
+    pub async fn publish_executed(&self, tip: SealedTip) {
+        *self.executed.write().await = Some(tip);
+    }
+
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
     pub async fn publish(&self, view: NodeView) {
         let event = NodeEvent::from_view(&view);
@@ -173,6 +185,7 @@ impl NodeEvent {
 pub fn router(state: RpcState) -> Router {
     Router::new()
         .route("/v2/info", get(node_info))
+        .route("/nano/sync_status", get(sync_status))
         .route("/v2/pox", get(pox_info))
         .route("/v2/accounts/{principal}", get(account))
         .route(
@@ -273,14 +286,42 @@ async fn view(state: &RpcState) -> Result<NodeView, RpcError> {
     state.view.read().await.clone().ok_or(RpcError::Unavailable)
 }
 
+/// The Stacks-compatible fields describe the chain this node executed, never
+/// the chain its peer advertised: a caller reading an account and a caller
+/// reading the tip have to be told about the same state.
 async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
-    let info = view(&state).await?.node_info;
+    let network_id = view(&state).await?.node_info.network_id;
+    let executed = state
+        .executed
+        .read()
+        .await
+        .clone()
+        .ok_or(RpcError::Unavailable)?;
     Ok(axum::Json(NodeInfoWire {
-        burn_block_height: info.bitcoin_height,
-        stacks_tip_height: info.stacks_height,
-        stacks_tip: info.stacks_tip.to_string(),
-        stacks_tip_consensus_hash: info.consensus_hash.to_string(),
-        network_id: info.network_id,
+        burn_block_height: executed.bitcoin_height,
+        stacks_tip_height: executed.stacks_height,
+        stacks_tip: executed.stacks_tip.to_string(),
+        stacks_tip_consensus_hash: executed.consensus_hash.to_string(),
+        network_id,
+    }))
+}
+
+/// What this node has followed and what it has executed, as two separate facts.
+///
+/// Nothing in the Stacks API says how far behind its own peer a node is, so a
+/// node that cannot execute looks identical to one at tip. This route is
+/// nano's own, and exists so that catching up is measurable.
+async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncStatusWire>, RpcError> {
+    let followed = view(&state).await.ok().map(|view| view.node_info.stacks_height);
+    let executed = state.executed.read().await.clone();
+    Ok(axum::Json(SyncStatusWire {
+        followed_stacks_height: followed,
+        executed_stacks_height: executed.as_ref().map(|tip| tip.stacks_height),
+        executed_stacks_tip: executed.as_ref().map(|tip| tip.stacks_tip.to_string()),
+        executed_state_index_root: executed.as_ref().map(|tip| tip.state_index_root.to_string()),
+        blocks_behind: followed
+            .zip(executed.as_ref().map(|tip| tip.stacks_height))
+            .map(|(followed, executed)| followed.saturating_sub(executed)),
     }))
 }
 
@@ -739,6 +780,25 @@ struct BlockProposalWire {
     block: String,
 }
 
+/// The tip a node has executed and sealed, as opposed to the one it has seen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedTip {
+    pub stacks_height: u64,
+    pub stacks_tip: StacksBlockId,
+    pub consensus_hash: ConsensusHash,
+    pub bitcoin_height: u64,
+    pub state_index_root: TrieHash,
+}
+
+#[derive(Serialize)]
+struct SyncStatusWire {
+    followed_stacks_height: Option<u64>,
+    executed_stacks_height: Option<u64>,
+    executed_stacks_tip: Option<String>,
+    executed_state_index_root: Option<String>,
+    blocks_behind: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct NodeInfoWire {
     burn_block_height: u64,
@@ -839,7 +899,7 @@ mod tests {
     };
     use nano_sync::{Node, NodeView};
     use nano_primitives::{
-        BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
+        BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash,
     };
     use nano_sync::{FollowedTenure, NodeInfo, PoxInfo, SortitionInfo, SyncClient, TenureInfo};
     use reqwest::Url;
@@ -859,7 +919,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall, Router, RpcState, router,
+        AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall, Router, RpcState, SealedTip,
+        router,
     };
 
     const NETWORK: Network = Network::TESTNET;
@@ -1212,6 +1273,80 @@ mod tests {
         let app = router(RpcState::new());
 
         let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/info")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A peer at one height and an executor at another are two facts, and the
+    /// Stacks-compatible route has to answer with the second.
+    ///
+    /// This is the regression for a node that followed mainnet to within three
+    /// blocks of the tip for eighty minutes while having executed nothing at
+    /// all: it published the peer's height as its own, and the difference was
+    /// invisible from every endpoint it served.
+    #[tokio::test]
+    async fn the_served_tip_is_the_executed_one_not_the_followed_one() {
+        let state = RpcState::new();
+        // The peer is at 12; this node has executed nothing beyond 4.
+        state.publish(captured_view()).await;
+        let sealed = SealedTip {
+            stacks_height: 4,
+            stacks_tip: StacksBlockId::from_bytes([7; 32]),
+            consensus_hash: ConsensusHash::from_bytes([8; 20]),
+            bitcoin_height: 3,
+            state_index_root: TrieHash::from_bytes([9; 32]),
+        };
+        state.publish_executed(sealed.clone()).await;
+
+        let info = body_json(
+            router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/info")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(info["stacks_tip_height"], json!(4));
+        assert_eq!(info["stacks_tip"], json!(sealed.stacks_tip.to_string()));
+        assert_eq!(info["burn_block_height"], json!(3));
+
+        let status = body_json(
+            router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/nano/sync_status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(status["followed_stacks_height"], json!(12));
+        assert_eq!(status["executed_stacks_height"], json!(4));
+        assert_eq!(status["blocks_behind"], json!(8));
+    }
+
+    /// A node that has followed a peer but executed nothing must not answer the
+    /// Stacks tip at all, rather than answering with the peer's.
+    #[tokio::test]
+    async fn a_node_that_executed_nothing_serves_no_tip() {
+        let state = RpcState::new();
+        state.publish(captured_view()).await;
+
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .uri("/v2/info")
