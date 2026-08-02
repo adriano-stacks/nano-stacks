@@ -2040,10 +2040,24 @@ fn call_contract_values_in_context(
 const MISSING_MODULE_ATTEMPTS: usize = 64;
 
 /// The contract a run stopped for want of, if that is why it stopped.
+/// The contract a run stopped for want of, whichever way the VM said so.
+///
+/// A call into a contract whose module is not loaded is reported two ways: the
+/// store says it has no compiled contract, and the linker says the contract is
+/// unresolved. Recognising only the first leaves the second fatal, and against
+/// mainnet that is any contract called by a contract — the second hop is where
+/// the linker, not the store, notices.
 fn missing_compiled_contract(error: &VmExecutionError) -> Option<QualifiedContractIdentifier> {
     let text = error.to_string();
-    let (_, rest) = text.split_once("compiled contract ")?;
-    let name = rest.split(['"', ')', '\\']).next()?.trim();
+    let rest = text
+        .split_once("compiled contract ")
+        .or_else(|| text.split_once("unresolved contract "))?
+        .1;
+    let name = rest
+        .trim_start_matches(['\'', '"'])
+        .split(['\'', '"', ')', '\\'])
+        .next()?
+        .trim();
     QualifiedContractIdentifier::parse(name).ok()
 }
 
@@ -2734,6 +2748,31 @@ mod tests {
     /// to check Bitcoin has not forked. A node that answers `none` rejects a
     /// withdrawal mainnet accepted, and diverges on the block carrying it —
     /// which is exactly what happened at height 8,665,615.
+    /// Both ways the VM reports a contract whose module is not loaded.
+    ///
+    /// The store says it has no compiled contract; the linker says the contract
+    /// is unresolved. Recognising only the first left every contract-to-
+    /// contract call fatal on mainnet, because the second hop is where the
+    /// linker rather than the store notices.
+    #[test]
+    fn a_missing_module_is_recognised_however_it_is_reported() {
+        use clarity::vm::errors::{VmExecutionError, VmInternalError};
+
+        let name = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.native-pool-v1";
+        for text in [
+            format!("Unreachable(\"use of unresolved contract '{name}'\")"),
+            format!("NoSuchContract(\"no compiled contract {name}\")"),
+        ] {
+            let error = VmExecutionError::Internal(VmInternalError::Expect(text.clone()));
+            assert_eq!(
+                super::missing_compiled_contract(&error)
+                    .unwrap_or_else(|| panic!("{text} names a contract"))
+                    .to_string(),
+                name
+            );
+        }
+    }
+
     #[test]
     fn a_block_can_read_its_own_burn_header() {
         let hash = [0x5b; 32];
