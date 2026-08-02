@@ -181,7 +181,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
     if state.is_some() || executor.is_some() {
-        roles.spawn(async move { (Job::Follower, follow(config, peer, state, executor).await) });
+        roles.spawn(
+            async move { (Job::Follower, follow(config, peer, pox, state, executor).await) },
+        );
     }
     if roles.is_empty() {
         return Err("this configuration switches on no roles".into());
@@ -264,6 +266,7 @@ fn report_round(from: u64, round: CatchUpRound, tip: &NakamotoBlock) {
 async fn follow(
     config: Config,
     peer: SyncClient,
+    pox: PoxInfo,
     state: Option<RpcState>,
     executor: Option<SharedExecutor>,
 ) -> Role {
@@ -278,33 +281,42 @@ async fn follow(
         execute: config.node.max_sync_blocks,
     };
     let mut node = Node::new(peer.clone());
+    let mut pox = pox;
     loop {
-        if let Err(error) = node.poll().await {
-            eprintln!("following the peer failed: {error}");
-        } else if let Some(view) = node.view() {
-            let pox = view.pox_info.clone();
-            if let Some(state) = state.as_ref() {
-                state.publish(view).await;
-            }
-            if let Some(executor) = executor.as_ref() {
-                let sealed = {
-                    let mut executor = executor.lock().await;
-                    let from = executor.tip().header.chain_length;
-                    match executor.catch_up(&peer, &pox, &staging, budget).await {
-                        Ok(round) => {
-                            report_round(from, round, executor.tip());
-                            persist_accounting(&directory, &mut executor)?;
-                            Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
-                        }
-                        Err(error) => {
-                            eprintln!("executing the peer's chain failed: {error}");
-                            None
-                        }
+        // The served view and the executed chain are independent jobs on one
+        // peer. Gating execution on a successful poll is how a node twenty
+        // thousand blocks behind executed nothing at all: that far back the
+        // follower's own tenure walk fails every round, and it took the
+        // executor down with it.
+        match node.poll().await {
+            Ok(_) => {
+                if let Some(view) = node.view() {
+                    pox = view.pox_info.clone();
+                    if let Some(state) = state.as_ref() {
+                        state.publish(view).await;
                     }
-                };
-                if let (Some(state), Some(sealed)) = (state.as_ref(), sealed) {
-                    state.publish_executed(sealed).await;
                 }
+            }
+            Err(error) => eprintln!("following the peer failed: {error}"),
+        }
+        if let Some(executor) = executor.as_ref() {
+            let sealed = {
+                let mut executor = executor.lock().await;
+                let from = executor.tip().header.chain_length;
+                match executor.catch_up(&peer, &pox, &staging, budget).await {
+                    Ok(round) => {
+                        report_round(from, round, executor.tip());
+                        persist_accounting(&directory, &mut executor)?;
+                        Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
+                    }
+                    Err(error) => {
+                        eprintln!("executing the peer's chain failed: {error}");
+                        None
+                    }
+                }
+            };
+            if let (Some(state), Some(sealed)) = (state.as_ref(), sealed) {
+                state.publish_executed(sealed).await;
             }
         }
         sleep(interval).await;
