@@ -2803,6 +2803,84 @@ mod tests {
     /// to check Bitcoin has not forked. A node that answers `none` rejects a
     /// withdrawal mainnet accepted, and diverges on the block carrying it —
     /// which is exactly what happened at height 8,665,615.
+    /// A trait passed inside a tuple inside a list is still a trait.
+    ///
+    /// A transaction argument arrives as consensus-serialized Clarity, where a
+    /// trait reference is indistinguishable from a contract principal and has
+    /// to be recovered from the declared type. Only the outermost value was
+    /// recovered, so a router argument shaped
+    /// `(list 5 (tuple ... (pool-trait <trait>) ...))` — which is what mainnet
+    /// passes — raised a type error on a call the network accepted.
+    #[test]
+    fn a_trait_nested_in_a_list_of_tuples_is_accepted() {
+        let target =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.target")
+                .expect("valid contract identifier");
+        let router =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.router")
+                .expect("valid contract identifier");
+        let sender: PrincipalData = target.issuer.clone().into();
+
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+        vm.deploy_contract(
+            target.clone(),
+            ClarityVersion::Clarity3,
+            "(define-trait pool ((quote (uint) (response uint uint))))
+             (define-public (quote (amount uint)) (ok amount))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the target");
+        vm.deploy_contract(
+            router.clone(),
+            ClarityVersion::Clarity3,
+            "(use-trait pool .target.pool)
+             (define-public (swap (steps (list 5 (tuple (amount uint) (pool <pool>)))))
+               (ok (len steps)))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the router");
+
+        // Serialized exactly as a transaction carries it: the trait is a
+        // contract principal, nested two levels down.
+        let step = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (
+                    clarity::vm::ClarityName::try_from("amount").expect("a name"),
+                    Value::UInt(1),
+                ),
+                (
+                    clarity::vm::ClarityName::try_from("pool").expect("a name"),
+                    Value::Principal(target.into()),
+                ),
+            ])
+            .expect("a tuple"),
+        );
+        let mut argument = Vec::new();
+        Value::cons_list_unsanitized(vec![step])
+            .expect("a list")
+            .consensus_serialize(&mut argument)
+            .expect("serialize");
+
+        let outcome = vm
+            .execute_contract_call_outcome(
+                sender,
+                None,
+                router,
+                "swap",
+                &[argument],
+                &LimitedCostTracker::new_free(),
+            )
+            .expect("the call runs");
+
+        match outcome {
+            ContractCallOutcome::Success(result) => {
+                assert_eq!(result.value, Some(Value::okay(Value::UInt(1)).expect("ok")));
+            }
+            other => panic!("the nested trait was not accepted: {other:?}"),
+        }
+    }
+
     /// A contract naming one that does not exist is the contract's fault.
     ///
     /// mainnet recorded exactly this at height 8,665,623 as an ordinary failed

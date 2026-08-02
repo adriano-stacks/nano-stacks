@@ -1019,13 +1019,21 @@ pub fn write_to_wasm(
         | TypeSignature::CallableType(_)
         | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
-            let principal = value_as_principal(value)?;
-            let (standard, contract_name) = match principal {
-                PrincipalData::Standard(s) => (s, ""),
-                PrincipalData::Contract(contract_identifier) => (
-                    &contract_identifier.issuer,
-                    contract_identifier.name.as_str(),
+            // A trait argument arrives as a callable once the caller has
+            // recovered it from the declared type, and nested values reach here
+            // rather than the top-level path that already knew about them.
+            let (standard, contract_name) = match value {
+                Value::CallableContract(callable) => (
+                    &callable.contract_identifier.issuer,
+                    callable.contract_identifier.name.as_str(),
                 ),
+                _ => match value_as_principal(value)? {
+                    PrincipalData::Standard(s) => (s, ""),
+                    PrincipalData::Contract(contract_identifier) => (
+                        &contract_identifier.issuer,
+                        contract_identifier.name.as_str(),
+                    ),
+                },
             };
             let mut written = 0;
             let mut in_mem_written = 0;

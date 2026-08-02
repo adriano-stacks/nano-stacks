@@ -7,7 +7,7 @@ use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{
     AssetIdentifier, BuffData, CallableData, FunctionType, PrincipalData,
-    QualifiedContractIdentifier, TypeSignature,
+    QualifiedContractIdentifier, SequenceData, SequenceSubtype, TupleData, TypeSignature,
 };
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
@@ -611,6 +611,14 @@ pub fn call_function(
     Ok(value)
 }
 
+/// Re-tag contract principals as callables wherever a trait is expected.
+///
+/// A transaction argument arrives as consensus-serialized Clarity, where a
+/// trait reference is indistinguishable from a contract principal, so it has to
+/// be recovered from the type the function declares. Casting only the outermost
+/// value left every nested one — a trait inside a tuple inside a list, which is
+/// what a router's `(list 5 (tuple ... (pool-trait <trait>) ...))` argument is —
+/// failing `admits` and raising a type error on a call the network accepted.
 fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Value {
     match (expected_type, argument) {
         (
@@ -620,6 +628,51 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
             contract_identifier: contract_identifier.clone(),
             trait_identifier: Some(Box::new(trait_identifier.clone())),
         }),
+        (
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
+            Value::Sequence(SequenceData::List(list)),
+        ) => {
+            let entry_type = list_type.get_list_item_type();
+            let cast = list
+                .data
+                .iter()
+                .map(|item| implicit_contract_cast(entry_type, item))
+                .collect();
+            // Rebuilt rather than re-tagged: a value carries its own type
+            // signature, and one that still says `principal` where the cast put
+            // a callable is what `admits` rejects.
+            Value::cons_list_unsanitized(cast).unwrap_or_else(|_| argument.clone())
+        }
+        (TypeSignature::TupleType(tuple_type), Value::Tuple(tuple)) => {
+            let cast = tuple
+                .data_map
+                .iter()
+                .map(|(name, value)| {
+                    let expected = tuple_type
+                        .field_type(name)
+                        .map_or_else(|| value.clone(), |field| implicit_contract_cast(field, value));
+                    (name.clone(), expected)
+                })
+                .collect();
+            TupleData::from_data(cast).map_or_else(|_| argument.clone(), Value::Tuple)
+        }
+        (TypeSignature::OptionalType(inner), Value::Optional(optional)) => optional
+            .data
+            .as_ref()
+            .map_or_else(
+                || Ok(argument.clone()),
+                |value| Value::some(implicit_contract_cast(inner, value)),
+            )
+            .unwrap_or_else(|_| argument.clone()),
+        (TypeSignature::ResponseType(inner), Value::Response(response)) => {
+            let (expected, wrap): (_, fn(Value) -> _) = if response.committed {
+                (&inner.0, Value::okay)
+            } else {
+                (&inner.1, Value::error)
+            };
+            wrap(implicit_contract_cast(expected, &response.data))
+                .unwrap_or_else(|_| argument.clone())
+        }
         _ => argument.clone(),
     }
 }
