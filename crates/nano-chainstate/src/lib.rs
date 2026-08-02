@@ -378,6 +378,19 @@ impl TenureAccounting {
         }
     }
 
+    /// The lowest and highest coinbase heights whose earnings are known.
+    ///
+    /// A checkpoint has to carry a full maturity window of these, because every
+    /// tenure a node executes before its own mature pays out one from inside
+    /// it. A short window executes perfectly until the first payout it cannot
+    /// derive, which is why startup checks the span rather than waiting.
+    #[must_use]
+    pub fn known_earnings_span(&self) -> Option<(u64, u64)> {
+        let first = *self.earnings.keys().next()?;
+        let last = *self.earnings.keys().next_back()?;
+        Some((first, last))
+    }
+
     /// The rewards a tenure earned, once they have been recorded.
     #[must_use]
     pub fn earnings_at(&self, coinbase_height: u64) -> Option<&TenureEarnings> {

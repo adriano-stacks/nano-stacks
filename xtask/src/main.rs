@@ -240,6 +240,8 @@ fn validate_fixtures() -> ExitCode {
 }
 
 struct CaptureConfig {
+    /// Rewrite only `native-effects.json`, into this existing checkpoint.
+    accounting_only: Option<PathBuf>,
     out_dir: Option<PathBuf>,
     state_dir: PathBuf,
     /// The directory holding `chainstate/` and `burnchain/`.
@@ -290,6 +292,7 @@ fn capture_fixtures(arguments: &[String]) -> ExitCode {
 impl CaptureConfig {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let mut values = arguments.iter();
+        let mut accounting_only = None;
         let mut out_dir = None;
         let mut state_dir = None;
         let mut node_root = None;
@@ -313,6 +316,7 @@ impl CaptureConfig {
                 "--out-dir" => out_dir = Some(PathBuf::from(value)),
                 "--state-dir" => state_dir = Some(PathBuf::from(value)),
                 "--node-root" => node_root = Some(PathBuf::from(value)),
+                "--accounting-only" => accounting_only = Some(PathBuf::from(value)),
                 "--events-dir" => events_dir = Some(PathBuf::from(value)),
                 "--pox-v1-unlock-height" => unlock_heights[0] = Some(parse_u64(flag, value)?),
                 "--pox-v2-unlock-height" => unlock_heights[1] = Some(parse_u64(flag, value)?),
@@ -332,6 +336,7 @@ impl CaptureConfig {
         }
 
         Ok(Self {
+            accounting_only,
             out_dir,
             state_dir: state_dir.ok_or_else(|| "--state-dir is required".to_owned())?,
             node_root,
@@ -368,6 +373,19 @@ impl CaptureConfig {
         let blocks_db = node_root.join("chainstate/blocks/nakamoto.sqlite");
         let sortition_db = node_root.join("burnchain/sortition/marf.sqlite");
         let blocks = self.blocks(&blocks_db)?;
+        // Rewriting the accounting alone is worth a mode of its own: it is a
+        // couple of hundred queries against the archive where a full capture is
+        // hours and hundreds of gigabytes. It returns before anything else is
+        // read, written or cleared — a capture empties the fixture tree it
+        // writes to, and re-exporting one file must never do that.
+        if let Some(into) = &self.accounting_only {
+            return Self::write_native_effects(
+                &node_root.join("chainstate/vm/index.sqlite"),
+                &blocks,
+                into,
+                self.accounting_network().boot_address(),
+            );
+        }
         if blocks.len() != usize::try_from(self.replay_blocks).map_err(|error| error.to_string())? {
             return Err(format!(
                 "requested {} blocks from height {}, but only {} canonical blocks are available",
@@ -632,6 +650,20 @@ impl CaptureConfig {
         }))
     }
 
+    /// The network a re-export names, without asking a peer.
+    ///
+    /// A capture reads the chain identifier from the node it captures, but a
+    /// re-export runs against an archive with no node behind it, and a rate
+    /// limited peer is no reason to fail. The magic bytes already say which
+    /// chain this is.
+    fn accounting_network(&self) -> Network {
+        if self.bitcoin_magic == "X2" {
+            Network::MAINNET
+        } else {
+            Network::TESTNET
+        }
+    }
+
     fn write_native_effects(
         chainstate_db: &Path,
         blocks: &[CapturedBlock],
@@ -659,10 +691,10 @@ impl CaptureConfig {
             .next()
             .and_then(|line| line.split_once('|'))
             .ok_or_else(|| "the captured blocks belong to no tenure".to_owned())?;
+        let first = parse_u64("first coinbase height", first)?;
+        let last = parse_u64("last coinbase height", last)?;
         let mut effects = Vec::new();
-        for coinbase_height in parse_u64("first coinbase height", first)?
-            ..=parse_u64("last coinbase height", last)?
-        {
+        for coinbase_height in first..=last {
             let Some(earned) = Self::scheduled_payment(
                 chainstate_db,
                 coinbase_height.saturating_sub(MINER_REWARD_MATURITY),
@@ -696,7 +728,34 @@ impl CaptureConfig {
                 "liquid_supply_increase": earned.coinbase,
             }));
         }
-        let contents = serde_json::to_vec_pretty(&json!({ "matured_effects": effects }))
+        // The payouts above cover only the tenures the captured window happens
+        // to touch. A node carries on past that window, and every tenure it
+        // executes for the next hundred pays out one earned before the
+        // checkpoint — which it cannot derive and the archive still holds. So
+        // the earnings of that whole window travel with the checkpoint, and
+        // `effects_for_tenure` derives the payouts from them.
+        let mut tenures = Vec::new();
+        let earliest = last.saturating_sub(MINER_REWARD_MATURITY + 1);
+        for coinbase_height in earliest..=last {
+            let Some(earned) = Self::scheduled_payment(chainstate_db, coinbase_height)? else {
+                continue;
+            };
+            tenures.push(json!({
+                "coinbase_height": coinbase_height,
+                "recipient": earned.recipient,
+                "coinbase": earned.coinbase,
+                "fees": earned.anchored,
+            }));
+        }
+        let covered = u64::try_from(tenures.len()).unwrap_or(0);
+        if covered <= MINER_REWARD_MATURITY {
+            return Err(format!(
+                "the archive holds {covered} of the {} tenures a checkpoint at coinbase height                  {last} needs: every tenure executed before nano's own mature pays out one of                  them, so a short window fails at the first payout it cannot derive",
+                MINER_REWARD_MATURITY + 1
+            ));
+        }
+        let contents =
+            serde_json::to_vec_pretty(&json!({ "matured_effects": effects, "tenures": tenures }))
             .map_err(|error| format!("serialize native accounting: {error}"))?;
         write_file(&checkpoint_dir.join("native-effects.json"), &contents)
     }

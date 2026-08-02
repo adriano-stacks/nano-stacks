@@ -8,6 +8,7 @@ use std::{error::Error, fs, future::Future, path::Path, sync::Arc, time::Duratio
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource};
 use nano_chainstate::{
+    MINER_REWARD_MATURITY,
     BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting, TenureAccountingError,
 };
 use nano_primitives::{Network, StacksBlockId};
@@ -471,9 +472,38 @@ fn accounting(config: &Config, directory: &Path) -> Result<TenureAccounting, Box
         return Ok(TenureAccounting::from_json(&fs::read(persisted)?)?);
     }
     match &config.checkpoint.tenure_accounting {
-        Some(path) => Ok(TenureAccounting::from_json(&fs::read(path)?)?),
+        Some(path) => {
+            let accounting = TenureAccounting::from_json(&fs::read(path)?)?;
+            check_maturity_window(&accounting)?;
+            Ok(accounting)
+        }
         None => Ok(TenureAccounting::default()),
     }
+}
+
+/// Refuse a checkpoint that does not owe what the chain owes.
+///
+/// Every tenure a node executes before its own mature pays out one from the
+/// hundred before the checkpoint, which it can only read and never derive. A
+/// checkpoint short of them runs perfectly until the first payout it cannot
+/// make and then stops with `UnknownTenure` — hours in, having written state
+/// that has to be thrown away. Saying so at startup costs one comparison.
+fn check_maturity_window(accounting: &TenureAccounting) -> Result<(), Box<dyn Error>> {
+    let Some((first, last)) = accounting.known_earnings_span() else {
+        // Nothing seeded at all is a genesis start, which owes nothing yet.
+        return Ok(());
+    };
+    if last - first < MINER_REWARD_MATURITY {
+        return Err(format!(
+            "the checkpoint carries earnings for tenures {first} to {last}, which is {} of the \
+             {} a node needs: every tenure it executes before its own mature pays out one of \
+             them",
+            last - first + 1,
+            MINER_REWARD_MATURITY + 1
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Write out what the chain owes, so that a restart owes the same.

@@ -1,7 +1,7 @@
 ---
 id: "048"
 title: "Carry complete mainnet tenure accounting"
-status: pending
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["043"]
 tags: ["mainnet", "checkpoint", "chainstate"]
 created_at: 2026-08-02
+completed_at: 2026-08-02
 ---
 
 # Carry complete mainnet tenure accounting
