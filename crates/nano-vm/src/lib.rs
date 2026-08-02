@@ -1940,12 +1940,15 @@ fn compile_under(
     let mut analysis = AnalysisDatabase::new(store);
     analysis
         .execute::<_, _, StaticCheckError>(|analysis_db| {
-            Ok(clar2wasm::compile(
+            Ok(clar2wasm::compile_for_cost_epoch(
                 source,
                 contract,
                 LimitedCostTracker::new_free(),
                 version,
                 epoch,
+                // Whatever epoch accepts the contract, the chain charges it at
+                // the rate it is running at.
+                StacksEpochId::Epoch40,
                 analysis_db,
                 true,
             )
@@ -2556,10 +2559,18 @@ fn ensure_wasm_module(
     // The current epoch first, so the costs baked in are the ones the chain
     // charges now. Only a contract it rejects — one using a word a later epoch
     // removed — is rebuilt under the epoch it was deployable in.
-    let compiled = compile_under(store, contract, &source, version, StacksEpochId::Epoch40)
-        .or_else(|_| {
-            compile_under(store, contract, &source, version, epoch_for_version(version))
-        })?;
+    let compiled = match compile_under(store, contract, &source, version, StacksEpochId::Epoch40) {
+        Ok(compiled) => compiled,
+        Err(rejected) => {
+            // Worth saying: a contract built under an older epoch is charged
+            // that epoch's costs, and its receipts will not match the network's.
+            eprintln!(
+                "{contract} does not compile under epoch 4.0, rebuilding as {:?}: {rejected}",
+                epoch_for_version(version)
+            );
+            compile_under(store, contract, &source, version, epoch_for_version(version))?
+        }
+    };
     modules.insert(contract.clone(), compiled);
     Ok(())
 }

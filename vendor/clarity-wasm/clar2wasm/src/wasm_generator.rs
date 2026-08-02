@@ -446,6 +446,20 @@ impl WasmGenerator {
     }
 
     pub fn with_cost_code(contract_analysis: ContractAnalysis) -> Result<Self, GeneratorError> {
+        let epoch: clarity::types::StacksEpochId = contract_analysis.epoch;
+        Self::with_cost_code_for_epoch(contract_analysis, epoch)
+    }
+
+    /// Generate cost code from a table that is not the contract's own epoch.
+    ///
+    /// A contract keeps the semantics of the epoch it was written for — that is
+    /// what its stored analysis means — but the chain charges it at the rate of
+    /// the epoch it is running in. Recompiling a contract an older epoch
+    /// accepted would otherwise price every call into it wrongly.
+    pub fn with_cost_code_for_epoch(
+        contract_analysis: ContractAnalysis,
+        cost_epoch: clarity::types::StacksEpochId,
+    ) -> Result<Self, GeneratorError> {
         let mut generator = Self::new(contract_analysis)?;
 
         let module = &mut generator.module;
@@ -461,7 +475,7 @@ impl WasmGenerator {
         let (wl, _) = module.add_import_global("clarity", "cost-write-length", ValType::I64, true);
 
         generator.cost_context = Some(ChargeContext {
-            epoch: generator.contract_analysis.epoch,
+            epoch: cost_epoch,
             runtime: r,
             read_count: rc,
             read_length: rl,

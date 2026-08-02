@@ -94,9 +94,39 @@ pub enum CompileError {
 pub fn compile(
     source: &str,
     contract_id: &QualifiedContractIdentifier,
+    cost_tracker: LimitedCostTracker,
+    clarity_version: ClarityVersion,
+    epoch: StacksEpochId,
+    analysis_db: &mut AnalysisDatabase,
+    emit_cost_code: bool,
+) -> Result<CompileResult, CompileError> {
+    compile_for_cost_epoch(
+        source,
+        contract_id,
+        cost_tracker,
+        clarity_version,
+        epoch,
+        epoch,
+        analysis_db,
+        emit_cost_code,
+    )
+}
+
+/// Compile with the semantics of one epoch and the cost table of another.
+///
+/// A contract keeps the semantics of the epoch it was written for — that is
+/// what its stored analysis means, and it is why a contract using a word a
+/// later epoch removed still runs. But the chain charges it at the rate of the
+/// epoch it is running in, so recompiling under the older epoch alone prices
+/// every call into it wrongly.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_for_cost_epoch(
+    source: &str,
+    contract_id: &QualifiedContractIdentifier,
     mut cost_tracker: LimitedCostTracker,
     clarity_version: ClarityVersion,
     epoch: StacksEpochId,
+    cost_epoch: StacksEpochId,
     analysis_db: &mut AnalysisDatabase,
     emit_cost_code: bool,
 ) -> Result<CompileResult, CompileError> {
@@ -144,7 +174,7 @@ pub fn compile(
     #[allow(clippy::expect_used)]
     let generator = match emit_cost_code {
         false => WasmGenerator::new(contract_analysis.clone()),
-        true => WasmGenerator::with_cost_code(contract_analysis.clone()),
+        true => WasmGenerator::with_cost_code_for_epoch(contract_analysis.clone(), cost_epoch),
     };
 
     match generator.and_then(WasmGenerator::generate) {
