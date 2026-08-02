@@ -1483,8 +1483,20 @@ impl ClarityBackingStore for MarfStore {
         &mut self,
         path: &ReferenceTrieHash,
     ) -> Result<Option<String>, VmExecutionError> {
-        self.value_of(*path.as_bytes())
-            .map_or(Ok(None), |value| self.data_from_side_store(value))
+        let Some(value) = self.value_of(*path.as_bytes()) else {
+            return Ok(None);
+        };
+        let found = self.data_from_side_store(value)?;
+        if found.is_none() {
+            // The trie names a value the side store does not hold, which is a
+            // different fault from a key the trie never had — and only this
+            // one means the import dropped something it needed.
+            eprintln!(
+                "the trie names value {} but the side store has no such row",
+                hex::encode(value.as_bytes())
+            );
+        }
+        Ok(found)
     }
 
     fn get_data_with_proof(
@@ -1547,7 +1559,17 @@ impl ClarityBackingStore for MarfStore {
             .get_data(&make_contract_hash_key(contract))?
             .map(|value| ContractCommitment::deserialize(&value))
             .transpose()?
-            .ok_or_else(|| VmInternalError::Expect(format!("unknown contract {contract}")))?;
+            .ok_or_else(|| {
+                // Clarity's analysis loader swallows this with `.ok()` and
+                // reports the contract as unresolved, so without saying it here
+                // a missing commitment is indistinguishable from a contract
+                // that was never deployed.
+                eprintln!(
+                    "no contract commitment for {contract} at key {}",
+                    make_contract_hash_key(contract)
+                );
+                VmInternalError::Expect(format!("unknown contract {contract}"))
+            })?;
         let block = self
             .get_block_at_height(commitment.block_height)
             .ok_or_else(|| VmInternalError::Expect("unknown contract block height".to_owned()))?;
@@ -1579,7 +1601,18 @@ impl ClarityBackingStore for MarfStore {
             return Ok(Some(value));
         }
         let (block, _) = self.get_contract_hash(contract)?;
-        self.metadata_from_side_store(block.0, contract, key)
+        let found = self.metadata_from_side_store(block.0, contract, key)?;
+        if found.is_none() {
+            // A miss here is indistinguishable from a contract that never
+            // wrote the key, and the two need different fixes: say which block
+            // was consulted so an imported checkpoint can be checked against
+            // the block its metadata actually landed under.
+            eprintln!(
+                "no {key} for {contract} under block {}",
+                hex::encode(block.0)
+            );
+        }
+        Ok(found)
     }
 
     fn get_metadata_manual(

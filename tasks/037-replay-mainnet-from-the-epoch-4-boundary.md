@@ -266,3 +266,31 @@ the block its metadata was written under.
 
 Inserting the analysis on demand would paper over it and is not obviously
 consensus-safe — metadata writes are state — so the lookup is the thing to fix.
+
+### It is the trie, not the side store
+
+Followed down with two diagnostics that separate the faults that look alike:
+
+```
+no contract commitment for SP4SZE…native-pool-v1
+    at key clarity-contract::SP4SZE…native-pool-v1
+```
+
+and no `the trie names value … but the side store has no such row` beside it.
+So the side store holds every value the trie names — the reachable-value
+scoping that cut it from 140 GB to 10.5 GB did not drop this — and the key is
+simply **not reachable in the imported trie at the tip**.
+
+Clarity's analysis loader swallows this with `.ok()` and reports the contract as
+unresolved, which is why it looked like a missing module for so long. The chain
+is: `load_contract` → `get_metadata` → `get_contract_hash` →
+`get_data(clarity-contract::…)` → nothing.
+
+That points at [[019-import-a-portable-checkpoint]] rather than at the VM: a key
+written long before the checkpoint has to resolve through back-pointers into
+imported history, and contracts deployed nearer the checkpoint resolve fine.
+State roots matching for twenty-two blocks is not evidence against it — a root
+is over the trie's shape, and this is a traversal that stops early.
+
+The next step is a `nano-marf` test that imports a checkpoint and reads a key
+written deep in its history, which needs no mainnet and no node.
