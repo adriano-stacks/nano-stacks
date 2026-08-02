@@ -818,6 +818,33 @@ impl SyncClient {
         Ok(blocks)
     }
 
+    /// Every block of a tenure that this peer will answer for `block_id`.
+    ///
+    /// `/v3/tenures/:id` returns the tenure containing that block, which is one
+    /// request where walking parent links is one per block. Asked from high in
+    /// a tenure it answers with most of it; asked from a tenure's first block
+    /// it answers with just that block. No order is assumed — the caller keys
+    /// what it gets by height — so this only checks that the block asked for is
+    /// among the answers.
+    pub async fn blocks_of_tenure(
+        &self,
+        block_id: StacksBlockId,
+    ) -> Result<Vec<NakamotoBlock>, SyncError> {
+        let bytes = self.bytes(&format!("v3/tenures/{block_id}")).await?;
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (block, consumed) =
+                NakamotoBlock::decode_prefix(&bytes[offset..]).map_err(SyncError::Block)?;
+            offset = offset.checked_add(consumed).ok_or(SyncError::InvalidHash)?;
+            blocks.push(block);
+        }
+        if !blocks.iter().any(|block| block.block_id() == block_id) {
+            return Err(SyncError::TenureStart);
+        }
+        Ok(blocks)
+    }
+
     /// Ask for more of a tenure until its tip arrives.
     ///
     /// A tenure response may carry only the block it was asked for — a public

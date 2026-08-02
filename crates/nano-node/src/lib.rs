@@ -499,8 +499,11 @@ where
             if staging.holds(cursor)? {
                 break;
             }
-            let block = match node.block(cursor).await {
-                Ok(block) => block,
+            // A whole tenure per request rather than a block per request: over
+            // a gap of tens of thousands of blocks that is the difference
+            // between catching up and being rate limited forever.
+            let blocks = match node.blocks_of_tenure(cursor).await {
+                Ok(blocks) => blocks,
                 // A peer that is rate limiting has not failed, and neither has
                 // the round: everything staged so far still stands.
                 Err(error) if error.is_rate_limited() => {
@@ -509,9 +512,21 @@ where
                 }
                 Err(error) => return Err(error.into()),
             };
-            staging.put(&block)?;
-            cursor = block.header.parent_block_id;
-            fetched += 1;
+            let lowest = blocks
+                .iter()
+                .min_by_key(|block| block.header.chain_length)
+                .ok_or(NodeExecutionError::Sync(SyncError::EmptyTenure))?;
+            let next = lowest.header.parent_block_id;
+            for block in &blocks {
+                staging.put(block)?;
+            }
+            fetched += blocks.len();
+            // A peer that answers with only the block asked for still moves the
+            // descent along, because that block's parent is the next cursor.
+            if next == cursor {
+                break;
+            }
+            cursor = next;
         }
         Ok(fetched)
     }

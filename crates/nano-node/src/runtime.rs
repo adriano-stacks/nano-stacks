@@ -20,6 +20,10 @@ use crate::{
     staging::Staging,
 };
 
+/// How close a node has to be before it is worth following the peer's tenure
+/// rather than spending every request catching up.
+const FOLLOW_WHEN_WITHIN: u64 = 1_000;
+
 /// How long a startup step waits out a rate-limited peer before giving up.
 const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
 
@@ -282,22 +286,37 @@ async fn follow(
     };
     let mut node = Node::new(peer.clone());
     let mut pox = pox;
+    let mut peer_height = u64::MAX;
+    let mut executed_height = 0;
     loop {
+        // Following the peer's current tenure is pointless while this node is
+        // far from it — the tenure descends from blocks it has not executed, so
+        // the walk fails every round — and the requests it spends are the ones
+        // catching up needs. A node this far back has nothing to serve anyway.
+        let catching_up = peer_height.saturating_sub(executed_height) > FOLLOW_WHEN_WITHIN;
         // The served view and the executed chain are independent jobs on one
         // peer. Gating execution on a successful poll is how a node twenty
         // thousand blocks behind executed nothing at all: that far back the
         // follower's own tenure walk fails every round, and it took the
         // executor down with it.
-        match node.poll().await {
-            Ok(_) => {
-                if let Some(view) = node.view() {
-                    pox = view.pox_info.clone();
-                    if let Some(state) = state.as_ref() {
-                        state.publish(view).await;
+        if catching_up {
+            match peer.node_info().await {
+                Ok(info) => peer_height = info.stacks_height,
+                Err(error) => eprintln!("asking the peer how far ahead it is failed: {error}"),
+            }
+        } else {
+            match node.poll().await {
+                Ok(_) => {
+                    if let Some(view) = node.view() {
+                        peer_height = view.node_info.stacks_height;
+                        pox = view.pox_info.clone();
+                        if let Some(state) = state.as_ref() {
+                            state.publish(view).await;
+                        }
                     }
                 }
+                Err(error) => eprintln!("following the peer failed: {error}"),
             }
-            Err(error) => eprintln!("following the peer failed: {error}"),
         }
         if let Some(executor) = executor.as_ref() {
             let sealed = {
@@ -307,6 +326,7 @@ async fn follow(
                     Ok(round) => {
                         report_round(from, round, executor.tip());
                         persist_accounting(&directory, &mut executor)?;
+                        executed_height = executor.tip().header.chain_length;
                         Some(sealed_tip(executor.tip(), executor.bitcoin_height()))
                     }
                     Err(error) => {
