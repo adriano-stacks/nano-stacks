@@ -340,8 +340,22 @@ impl BurnStateDB for BitcoinContext {
         Some(self.height)
     }
 
+    /// Name the sortition of the block being executed.
+    ///
+    /// From epoch 3 on, `clarity_uses_tip_burn_block()` sends every burn-block
+    /// read through this rather than through the parent's consensus hash, so
+    /// answering `none` makes `get-burn-block-info?` answer `none` for every
+    /// height without raising anything. sBTC's withdrawal path reads it to
+    /// check Bitcoin has not forked, so nano rejected a withdrawal mainnet
+    /// accepted and diverged on the block that carried it.
+    ///
+    /// A sortition identifier appears in no consensus preimage, and a follower
+    /// holds one fork's burn headers, so the burn height it is standing on
+    /// names its own sortition.
     fn get_tip_sortition_id(&self) -> Option<SortitionId> {
-        None
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&self.height.to_be_bytes());
+        Some(SortitionId(bytes))
     }
 
     fn get_v1_unlock_height(&self) -> u32 {
@@ -2736,6 +2750,57 @@ mod tests {
             },
         );
         vm.begin_block_with_bitcoin_context(None, [9; 32], context)
+            .expect("begin block");
+
+        let value = vm
+            .execute(
+                "(get-burn-block-info? header-hash u960232)",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("execute")
+            .value;
+
+        assert_eq!(
+            value,
+            Some(
+                Value::some(Value::buff_from(hash.to_vec()).expect("a buffer"))
+                    .expect("an optional")
+            )
+        );
+    }
+
+    /// The same read with a parent in the chain, which is the shape a follower
+    /// is in: from epoch 3 on Clarity resolves the burn block through the tip
+    /// sortition rather than the parent's consensus hash, so a node that names
+    /// no tip sortition answers `none` for every height without raising
+    /// anything.
+    #[test]
+    fn a_block_with_a_parent_still_reads_its_burn_header() {
+        let hash = [0x5b; 32];
+        let parent = [8; 32];
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.record_block_header(
+            parent,
+            BlockHeader {
+                burn_header_hash: [0x4a; 32],
+                burn_block_height: 960_231,
+                ..BlockHeader::default()
+            },
+        );
+        vm.begin_block(None, parent).expect("begin parent");
+        vm.seal_block().expect("seal parent");
+
+        vm.record_block_header(
+            [9; 32],
+            BlockHeader {
+                burn_header_hash: hash,
+                burn_block_height: 960_232,
+                ..BlockHeader::default()
+            },
+        );
+        let mut context = super::BitcoinBlockContext::at_height(960_232);
+        context.burn_header_hash = hash;
+        vm.begin_block_with_bitcoin_context(Some(parent), [9; 32], context)
             .expect("begin block");
 
         let value = vm
