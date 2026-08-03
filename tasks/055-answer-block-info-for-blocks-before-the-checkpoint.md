@@ -921,3 +921,30 @@ remembering how far the wrong frame carried: the pox-5 source, its analysis, the
 `.dao` call before it and the special-case handler were each investigated and
 each was fine.
 
+## The interpreter path is ahead, and has one recurring fault
+
+With deploys routed through it, the interpreter reaches **8,666,676** where the
+compiler stops at 8,666,674 on `rewards-stx-v1` — a module it compiles and
+wasmtime refuses. Zero state-root mismatches on the way, and every root is still
+checked against the header, so the path cannot diverge quietly: a wrong root
+stops the node exactly as it does under the compiler.
+
+Its own fault is one error, seen three times now on different contracts:
+
+```
+<contract>::<public function>: RuntimeCheck(Unreachable("Public function must return response: int"))
+```
+
+most recently `signer-payout-v1::initialize`. Ruled out for that one:
+
+- its stored analysis is right — `initialize` is `ResponseType([Bool, Uint])`;
+- the first thing it calls, `.dao check-is-protocol`, answers `(ok true)`
+  identically in both engines against real state;
+- the contract's metadata is present and the same shape as contracts the
+  compiler deployed.
+
+So a public function whose declared return is a response is *evaluating* to an
+int under the interpreter. That is the one thing between this path and a replay
+with no codegen failures in it, and it is worth more than any individual
+clarity-wasm bug because it recurs where those do not.
+
