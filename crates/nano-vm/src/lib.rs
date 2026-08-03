@@ -2079,7 +2079,11 @@ fn needed_module(
 /// on mainnet — stops a node dead.
 const ANALYSIS_FAILED: &str = "contract analysis failed";
 
-/// Whether a failure is the contract's fault rather than the node's.
+/// Whether a failure means the compiler cannot run this contract.
+///
+/// Either it refused the source, or it produced a module that will not load.
+/// Both are the compiler's business rather than the node's, and both leave the
+/// interpreter — which needs no module — able to answer.
 #[must_use]
 pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
     reports_analysis_failure(error)
@@ -2087,7 +2091,8 @@ pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
 
 /// The same question of anything that can say what went wrong.
 fn reports_analysis_failure(error: &impl std::fmt::Display) -> bool {
-    error.to_string().contains(ANALYSIS_FAILED)
+    let text = error.to_string();
+    text.contains(ANALYSIS_FAILED) || text.contains("UnableToLoadModule")
 }
 
 pub fn deploy_contract(
