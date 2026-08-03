@@ -2050,9 +2050,20 @@ fn interpretable_contract(
     contract: &QualifiedContractIdentifier,
     version: ClarityVersion,
     source: &str,
+    dependencies: Vec<(QualifiedContractIdentifier, clarity::vm::contracts::Contract)>,
 ) -> Result<clarity::vm::contracts::Contract, ClarityEvalError> {
     let mut backing_store = MemoryBackingStore::new();
-    let database = backing_store.as_clarity_db();
+    let mut database = backing_store.as_clarity_db();
+    // A contract that names another cannot be deployed beside nothing, and the
+    // throwaway store starts empty. Its dependencies are put in first, taken
+    // from the state this node already holds.
+    if !dependencies.is_empty() {
+        database.begin();
+        for (identifier, definition) in dependencies {
+            database.insert_contract(&identifier, definition)?;
+        }
+        database.commit()?;
+    }
     let mut environment = OwnedEnvironment::new_free(
         network.is_mainnet(),
         network.chain_id(),
@@ -2584,7 +2595,20 @@ fn heal_contract_for_interpreter(
 ) -> Result<(), VmExecutionError> {
     let network = store.network();
     let (source, version) = contract_source(store, bitcoin_context, contract)?;
-    let rebuilt = interpretable_contract(network, contract, version, &source)
+    // Everything the source names, as this node already holds it.
+    let referenced = referenced_contracts(contract, &source, version);
+    let mut dependencies = Vec::new();
+    {
+        let mut database = clarity_database(store, bitcoin_context);
+        database.begin();
+        for identifier in referenced {
+            if let Ok(definition) = database.get_contract(&identifier) {
+                dependencies.push((identifier, definition));
+            }
+        }
+        database.roll_back()?;
+    }
+    let rebuilt = interpretable_contract(network, contract, version, &source, dependencies)
         .map_err(|error| VmInternalError::Expect(error.to_string()))?;
     store
         .replace_contract_definition(contract, &rebuilt.serialize())

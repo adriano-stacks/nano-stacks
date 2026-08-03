@@ -1065,3 +1065,23 @@ With the pass run, the node executed to 8,666,680 with no execution error of any
 kind — only the peer's rate limiting, which is the one thing left in the way of
 measuring how far this path actually goes.
 
+### The last four, and where they actually stick
+
+The throwaway store is now seeded with the definitions a contract names, taken
+from this node's own state. That did **not** heal the remaining four, and the
+reason is worth writing down rather than guessing at again:
+`constants-v1` and `constants-v2` *are* in the state — their
+`vm-metadata::9::contract` rows are there — but `get_contract` does not find them
+from the block the repair pass begins. `contract_source`, which reads the same
+contracts' sources happily, goes by another path. So this is a lookup-scope
+question, not missing data.
+
+Which points back at the rebuild that avoids the problem entirely: parse the
+source and construct each `DefinedFunction` directly, touching no other contract
+and needing no store to deploy into. `DefinedFunction::new` and
+`ContractContext::functions` are both public. The deploy-into-memory route was
+the first one to reach because it reuses machinery that already worked; its
+limit is now a fact rather than a guess.
+
+23 of 27 healed either way, and the four are one deployer's family.
+
