@@ -591,11 +591,23 @@ fn attesting_reward_set(bytes: &[u8]) -> Result<SignerSet, Box<dyn Error>> {
 fn accounting(config: &Config, directory: &Path) -> Result<TenureAccounting, Box<dyn Error>> {
     let persisted = directory.join(ACCOUNTING_FILE);
     if persisted.exists() {
-        let accounting = TenureAccounting::from_json(&fs::read(persisted)?)?;
+        let accounting = TenureAccounting::from_json(&fs::read(&persisted)?)?;
         // The same check the checkpoint gets: a state whose accounting was
         // written before the checkpoint carried a full window owes less than
         // the chain does, and only finds out at the first payout it cannot
         // derive.
+        // No exemption here: a state that has executed anything and owes
+        // nothing is not a genesis start, it is accounting written before the
+        // checkpoint carried a window.
+        if accounting.known_earnings_span().is_none() {
+            return Err(format!(
+                "the accounting at {} carries no tenure earnings, so it was written before \
+                 the checkpoint carried a maturity window; remove it to re-seed from the \
+                 checkpoint",
+                persisted.display()
+            )
+            .into());
+        }
         check_maturity_window(&accounting)?;
         return Ok(accounting);
     }
