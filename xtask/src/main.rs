@@ -384,6 +384,7 @@ impl CaptureConfig {
                 &blocks,
                 into,
                 self.accounting_network().boot_address(),
+                self.pox_calendar()?.0,
             );
         }
         if blocks.len() != usize::try_from(self.replay_blocks).map_err(|error| error.to_string())? {
@@ -570,6 +571,7 @@ impl CaptureConfig {
                 format!("captured node reports an out-of-range chain identifier: {error}")
             })?)
             .boot_address(),
+            self.pox_calendar()?.0,
         )?;
         let checkpoint_manifest = format!(
             "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = {}\n",
@@ -669,6 +671,7 @@ impl CaptureConfig {
         blocks: &[CapturedBlock],
         checkpoint_dir: &Path,
         boot_address: &str,
+        first_bitcoin_height: u64,
     ) -> Result<(), String> {
         let block_ids = blocks
             .iter()
@@ -754,8 +757,19 @@ impl CaptureConfig {
                 MINER_REWARD_MATURITY + 1
             ));
         }
-        let contents =
-            serde_json::to_vec_pretty(&json!({ "matured_effects": effects, "tenures": tenures }))
+        // Without the schedule a node cannot price the coinbase of a tenure it
+        // executes itself, so the first tenure start past the checkpoint pays
+        // nothing and its state root diverges.
+        let schedule = json!({
+            "mainnet": boot_address == Network::MAINNET.boot_address(),
+            "first_bitcoin_height": first_bitcoin_height,
+            "initial_mining_bonus_ustx": 0,
+        });
+        let contents = serde_json::to_vec_pretty(&json!({
+            "matured_effects": effects,
+            "tenures": tenures,
+            "coinbase_schedule": schedule,
+        }))
             .map_err(|error| format!("serialize native accounting: {error}"))?;
         write_file(&checkpoint_dir.join("native-effects.json"), &contents)
     }
