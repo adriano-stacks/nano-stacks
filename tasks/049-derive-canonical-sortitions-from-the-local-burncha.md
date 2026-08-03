@@ -71,11 +71,20 @@ so that rule starts at 962,150, well past this block.
 
 What is left is the validation nano does not do: **a commitment is only an
 operation if it names a leader key that was registered and not already spent.**
-nano accepts every commit it decodes. Keeping a registry of leader keys across
-the snapshot chain, and dropping commits that do not resolve against it, is the
-next task here — and it is the same registry the VRF check in
-[[024-verify-the-vrf-seed-a-block-commits-to]] needs to find a tenure's public
-key.
+nano accepts every commitment it decodes.
+
+`nano_sortition::LeaderKeys` now keeps that registry — a key is usable once, and
+only after it is registered — with its own test. Applying it needs history the
+window does not have, which the window itself proves: **zero leader keys are
+registered inside it**, so every commitment in those fifteen blocks names one
+from before, and filtering against what the window holds drops all five rather
+than the one the network drops.
+
+So this is the same limit as the consensus hash, and the same answer: the rule
+needs a chain replayed from its own genesis rather than a slice of one. Building
+that chain in the node is the rest of this task, and the registry it needs is
+the one the VRF check in [[024-verify-the-vrf-seed-a-block-commits-to]] needs to
+find a tenure's public key.
 
 The consensus hash is not checked by this test and cannot be: it mixes prior
 consensus hashes at power-of-two offsets reaching back thousands of blocks, so

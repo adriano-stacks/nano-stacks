@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, env, fs, path::PathBuf};
 use nano_bitcoin::{BitcoinBlock, decode_block};
 use nano_primitives::{BitcoinHeaderHash, ConsensusHash, SortitionId};
 use nano_sortition::{
-    OpsHash, PoxId, SnapshotChain, SortitionHash, SortitionSnapshot, SortitionWinner,
+    LeaderKeys, OpsHash, PoxId, SnapshotChain, SortitionHash, SortitionSnapshot, SortitionWinner,
 };
 
 /// What a captured snapshot says, in the fields nano derives.
@@ -42,6 +42,27 @@ fn capture() -> Option<PathBuf> {
 
 fn decode(value: &str) -> Vec<u8> {
     hex::decode(value).expect("a captured field is hexadecimal")
+}
+
+/// The leader keys a set of burn blocks registers.
+///
+/// Collected because naming a registered, unspent key is what makes a
+/// commitment an operation — and reported because a window cannot apply that
+/// rule: the keys its commitments name were registered long before it.
+fn keys_registered_in(blocks: &BTreeMap<u64, BitcoinBlock>) -> LeaderKeys {
+    let mut keys = LeaderKeys::new();
+    for block in blocks.values() {
+        for operation in &block.operations {
+            if let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                vrf_public_key,
+                ..
+            } = &operation.kind
+            {
+                keys.register(block.height, operation.transaction_index, *vrf_public_key);
+            }
+        }
+    }
+    keys
 }
 
 /// What nano found in a block it disagrees about, so the next look starts from
@@ -133,12 +154,21 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
     let mut chain = SnapshotChain::new(seed_from(&captured[0]));
 
 
+    println!(
+        "{} leader keys registered inside the window",
+        keys_registered_in(&blocks).available()
+    );
     let mut checked = 0;
     let mut first_divergence = None;
     for snapshot in captured.iter().skip(1) {
         let block = blocks
             .get(&snapshot.block_height)
             .expect("every captured snapshot has its Bitcoin block");
+        // Not filtered by leader key here, though that is the rule: the keys
+        // these commitments name were registered long before a fifteen-block
+        // window, so applying it against what the window holds drops every
+        // commitment rather than the one the network drops. It is the same
+        // limit as the consensus hash — the rule needs a chain, not a slice.
         let txids: Vec<[u8; 32]> = block
             .operations
             .iter()

@@ -1,5 +1,6 @@
 pub(crate) mod carryover;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::{collections::HashMap, fmt};
 
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
@@ -1316,5 +1317,82 @@ mod tests {
             hash: [hash; 32],
             operations: Vec::new(),
         }
+    }
+}
+
+/// The leader keys a burnchain has registered, and which have been spent.
+///
+/// A commitment is only an operation if it names a key that was registered and
+/// has not been used before: stacks-core resolves `(key_block_height,
+/// key_transaction_index)` against its burn database and drops a commitment
+/// that does not. A node that keeps every commitment it can decode hashes a
+/// different operation set and derives a different consensus hash — which is
+/// how nano and mainnet parted at burn 960,230, on one commitment out of five.
+#[derive(Clone, Debug, Default)]
+pub struct LeaderKeys {
+    registered: BTreeMap<(u64, u32), [u8; 32]>,
+    spent: BTreeSet<(u64, u32)>,
+}
+
+impl LeaderKeys {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a key a burn block registered.
+    pub fn register(&mut self, block_height: u64, transaction_index: u32, vrf_public_key: [u8; 32]) {
+        self.registered
+            .insert((block_height, transaction_index), vrf_public_key);
+    }
+
+    /// The VRF public key a commitment names, if it may still be used.
+    #[must_use]
+    pub fn usable(&self, block_height: u64, transaction_index: u32) -> Option<[u8; 32]> {
+        let at = (block_height, transaction_index);
+        if self.spent.contains(&at) {
+            return None;
+        }
+        self.registered.get(&at).copied()
+    }
+
+    /// Consume a key, so a later commitment naming it is not an operation.
+    pub fn spend(&mut self, block_height: u64, transaction_index: u32) {
+        self.spent.insert((block_height, transaction_index));
+    }
+
+    /// How many keys are registered and unspent.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.registered
+            .keys()
+            .filter(|at| !self.spent.contains(at))
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod leader_key_tests {
+    use super::LeaderKeys;
+
+    /// A commitment may only name a key that was registered and not yet spent.
+    ///
+    /// mainnet drops one commitment of five at burn 960,230 for want of this,
+    /// and a node that keeps it hashes a different operation set and derives a
+    /// different consensus hash from there on.
+    #[test]
+    fn a_key_is_usable_once_and_only_after_it_is_registered() {
+        let mut keys = LeaderKeys::new();
+        assert_eq!(keys.usable(100, 7), None, "an unregistered key is unusable");
+
+        keys.register(100, 7, [0xab; 32]);
+        assert_eq!(keys.usable(100, 7), Some([0xab; 32]));
+        assert_eq!(keys.available(), 1);
+        // A different position is a different key, not the same one.
+        assert_eq!(keys.usable(100, 8), None);
+
+        keys.spend(100, 7);
+        assert_eq!(keys.usable(100, 7), None, "a spent key is not usable again");
+        assert_eq!(keys.available(), 0);
     }
 }
