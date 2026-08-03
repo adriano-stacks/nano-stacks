@@ -89,8 +89,20 @@ admits into the same pool meanwhile.
 transaction") rather than reporting itself unavailable, which is the route being
 live.
 
-Noticed while checking: `/v2/info` answers `503` even with an executed tip
-present, which `/nano/sync_status` reports happily. Whatever else it wants is not
-the tip, and that belongs to the "serve every route from the executed snapshot"
-item rather than this one.
+## `/v2/info` answered `503` with a perfectly good tip
 
+It asked a *peer view* for one field — the chain identifier — and refused the
+whole request when no peer had been heard from, even with an executed tip sitting
+right there, which `/nano/sync_status` reported happily.
+
+The chain a node is on is its own configuration; no peer needs to be asked. With
+it taken from there, `/v2/info` answers from the executed tip alone:
+
+```json
+{"burn_block_height":960248,"stacks_tip_height":8666422,
+ "stacks_tip":"3b0e826e…","stacks_tip_consensus_hash":"61f3f614…"}
+```
+
+That is also the acceptance criterion about no route advertising state newer than
+the executed tip: this one now cannot, because the tip is the only thing it
+reads.

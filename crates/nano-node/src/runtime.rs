@@ -130,7 +130,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mempool = Arc::new(Mutex::new(nano_mempool::Mempool::new(network)));
 
     let mut roles = JoinSet::new();
-    let state = start_rpc(&config, executor.clone(), mempool.clone(), &mut roles).await?;
+    let state = start_rpc(
+        &config,
+        network,
+        executor.clone(),
+        mempool.clone(),
+        &mut roles,
+    )
+    .await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
@@ -492,6 +499,7 @@ async fn resume_from(
 /// Serve the public RPC, if this node is configured to.
 async fn start_rpc(
     config: &Config,
+    network: Network,
     executor: Option<SharedExecutor>,
     mempool: Arc<Mutex<nano_mempool::Mempool>>,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
@@ -499,7 +507,7 @@ async fn start_rpc(
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
-    let mut state = RpcState::new().with_mempool(mempool);
+    let mut state = RpcState::new().on(network).with_mempool(mempool);
     if let Some(executor) = executor {
         state = state.with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
     }

@@ -56,6 +56,8 @@ pub struct RpcState {
     /// The executed Clarity state, when the node runs one.
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
     mempool: Option<Arc<Mutex<Mempool>>>,
+    /// The chain this node is on, which no peer needs to be asked about.
+    network: Network,
     /// The reward sets this node derived, keyed by cycle.
     stacker_sets: Arc<RwLock<BTreeMap<u64, Value>>>,
     /// The `StackerDB` contracts this node replicates.
@@ -95,6 +97,7 @@ impl RpcState {
             events,
             chain: None,
             mempool: None,
+            network: Network::MAINNET,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
             stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
             blocks: None,
@@ -107,6 +110,13 @@ impl RpcState {
     #[must_use]
     pub fn stackerdb(&self) -> Arc<RwLock<StackerDbStore>> {
         self.stackerdb.clone()
+    }
+
+    /// Say which chain this node is on.
+    #[must_use]
+    pub const fn on(mut self, network: Network) -> Self {
+        self.network = network;
+        self
     }
 
     /// Serve accounts and read-only calls from this executed Clarity state.
@@ -290,7 +300,11 @@ async fn view(state: &RpcState) -> Result<NodeView, RpcError> {
 /// the chain its peer advertised: a caller reading an account and a caller
 /// reading the tip have to be told about the same state.
 async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
-    let network_id = view(&state).await?.node_info.network_id;
+    // The chain identifier is this node's own, not something a peer tells it.
+    // Reading it from a peer view made `/v2/info` unavailable whenever no peer
+    // had been heard from, even with a perfectly good executed tip to report —
+    // which is the opposite of what this route is for.
+    let network_id = state.network.chain_id();
     let executed = state
         .executed
         .read()
