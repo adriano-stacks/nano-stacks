@@ -687,33 +687,24 @@ where
     /// trusted would be worse off than one that says so and carries on. Once
     /// it agrees over a long enough run, execution takes the local answer and
     /// the peer stops being asked.
-    fn check_local_sortition(&mut self, peer: &nano_sync::SortitionInfo) {
-        const CATCH_UP_PER_ROUND: usize = 16;
-
+    /// Compare a peer's sortition against one this node derives itself.
+    ///
+    /// The chain can only be advanced from where its consensus-hash history
+    /// ends, and the running burn total is not derivable yet — it is the burn
+    /// distribution's total, not the sum of what a block's commitments spent —
+    /// so it is taken from the header, whose `bitcoin_spent` is that number
+    /// under threshold signer weight.
+    fn check_local_sortition(&mut self, peer: &nano_sync::SortitionInfo, burn_spent: u64) {
         let Some(tracker) = self.sortition.as_mut() else {
             return;
         };
-        // A chain seeded from a capture starts behind this node; it walks the
-        // gap a few blocks at a time rather than stalling the follow loop.
-        if tracker.tip().bitcoin_height < peer.bitcoin_height.saturating_sub(1) {
-            match tracker.catch_up_to(
-                &mut self.bitcoin,
-                peer.bitcoin_height.saturating_sub(1),
-                CATCH_UP_PER_ROUND,
-            ) {
-                Ok(reached) => eprintln!("locally derived sortitions reach burn {reached}"),
-                Err(error) => eprintln!("catching the sortition chain up failed: {error}"),
-            }
-        }
         if peer.bitcoin_height != tracker.tip().bitcoin_height.saturating_add(1) {
             return;
         }
         let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
             return;
         };
-        // The running burn total is the peer's for now, being the one field a
-        // block does not carry.
-        match tracker.advance(&block, 0) {
+        match tracker.advance(&block, burn_spent) {
             Ok(derived) if derived.consensus_hash != peer.consensus_hash => eprintln!(
                 "locally derived consensus hash at burn {} is {} where the peer says {}",
                 peer.bitcoin_height, derived.consensus_hash, peer.consensus_hash
@@ -737,7 +728,7 @@ where
                 break;
             };
             let sortition = node.sortition(block.header.consensus_hash).await?;
-            self.check_local_sortition(&sortition);
+            self.check_local_sortition(&sortition, block.header.bitcoin_spent);
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             // Clarity reads this back through `get-burn-block-info?`, and sBTC

@@ -96,32 +96,12 @@ impl SortitionTracker {
         self.chain.tip()
     }
 
-    /// Walk the chain forward to `height`, reading blocks as it goes.
-    ///
-    /// A chain seeded from a window starts behind the node that owns it, so it
-    /// has ground to make up before its answers can be compared with anything.
-    pub fn catch_up_to<S: nano_bitcoin::BitcoinSource>(
-        &mut self,
-        source: &mut S,
-        height: u64,
-        limit: usize,
-    ) -> Result<u64, TrackerError> {
-        let mut walked = 0;
-        while self.chain.tip().bitcoin_height < height && walked < limit {
-            let next = self.chain.tip().bitcoin_height.saturating_add(1);
-            let block = source
-                .block_at(next)
-                .map_err(|_| TrackerError::Seed(format!("no Bitcoin block at {next}")))?;
-            self.advance(&block, 0)?;
-            walked += 1;
-        }
-        Ok(self.chain.tip().bitcoin_height)
-    }
-
     /// Extend the chain with one Bitcoin block.
     ///
-    /// `total_burn` is the running total the network keeps, which a node
-    /// accumulates from the burn each block's operations spent.
+    /// `total_burn` is the running total the network keeps. A node cannot yet
+    /// derive it — it is the burn *distribution*'s total, not the sum of what a
+    /// block's commitments spent — so it comes from the Nakamoto header, whose
+    /// `burn_spent` is that number and carries threshold signer weight.
     pub fn advance(
         &mut self,
         block: &BitcoinBlock,
@@ -139,6 +119,8 @@ impl SortitionTracker {
     }
 }
 
+/// What the eligible commitments of a burn block spent, in satoshis.
+///
 /// The transactions of a burn block that are operations for its sortition.
 ///
 /// A commitment that arrived after the block it was aiming at is a *missed*

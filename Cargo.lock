@@ -2691,6 +2691,7 @@ dependencies = [
  "nano-primitives",
  "nano-rpc",
  "nano-signer",
+ "nano-sortition",
  "nano-stackerdb",
  "nano-sync",
  "reqwest",
@@ -2761,6 +2762,7 @@ dependencies = [
 name = "nano-sortition"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nano-bitcoin",
  "nano-primitives",
 ]

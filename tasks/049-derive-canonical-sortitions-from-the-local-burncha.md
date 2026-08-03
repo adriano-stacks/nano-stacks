@@ -142,3 +142,39 @@ choosing between several eligible commitments — the burn distribution's
 business; the tracker answers only where a block leaves no choice. Choosing between several eligible commitments is the
 burn distribution's business and still to come; the tracker currently answers
 only where a block leaves no choice to make.
+
+## The running burn total is not the sum of what a block spent
+
+Feeding the tracker a burn total it accumulated itself was the obvious next
+step, and it is wrong. Summing the paid outputs of a block's eligible
+commitments matches the capture at burn 960,220 and 960,221 — and then adds
+100,000 at 960,222, where the network added nothing and recorded no sortition.
+
+The three commitments there are *not* missed: stacks-core's rule is
+
+```rust
+let intended_modulus = (self.burn_block_mined_at() + 1) % BURN_BLOCK_MINED_AT_MODULUS;
+let actual_modulus = self.block_height % BURN_BLOCK_MINED_AT_MODULUS;
+```
+
+which is exactly what `commit_lands_in_block` already implements, and all three
+satisfy it. What the snapshot actually accumulates is
+
+```rust
+let block_burn_total = state_transition.total_burns();   // over the burn *distribution*
+let next_burn_total = last_burn_total.checked_add(block_burn_total);
+```
+
+so the number comes from the burn distribution over the six-block mining
+commitment window, not from the block in front of it — and an empty distribution
+is what makes a block have no sortition at all. Deriving it therefore waits on
+the distribution work already listed above; there is no shortcut.
+
+Meanwhile the tracker takes the total from the Nakamoto header's
+`bitcoin_spent`, which *is* that number and carries threshold signer weight. The
+capture's window is the offline oracle for everything else, and it stays green.
+
+A tracker also cannot be seeded anywhere except where its consensus-hash history
+ends — every hash after that has to be derived rather than quoted, which is the
+whole point — so a live node needs a capture reaching its own tip.
+
