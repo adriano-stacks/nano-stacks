@@ -47,16 +47,18 @@ fn decode(value: &str) -> Vec<u8> {
 /// What nano found in a block it disagrees about, so the next look starts from
 /// evidence rather than a guess.
 fn report_operations(height: u64, block: &BitcoinBlock) {
-    println!(
-        "  burn {height} yielded {} operations: {}",
-        block.operations.len(),
-        block
-            .operations
-            .iter()
-            .map(|operation| hex::encode(operation.txid))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    for operation in &block.operations {
+        println!(
+            "  burn {height} op {} index {} outputs {:?}",
+            hex::encode(operation.txid),
+            operation.transaction_index,
+            operation
+                .outputs
+                .iter()
+                .map(|output| output.amount_sats)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// The snapshot a replay starts from, taken from the capture as given.

@@ -56,14 +56,26 @@ next — none of it asked of a peer.
 It diverges at burn **960,230**, on the operations hash, where nano finds five
 operations and all of them are leader block commits.
 
-960,230 is the epoch 4.0 boundary, but the obvious suspect is **not** the cause:
-`parse_pox_waterfall_commits` — which rejects a commit whose output 0 is
-unrecognised or pays nothing — only applies from `first_pox_waterfall_block`,
-and that is the first block of the cycle *after* the one holding pox-5's
-activation. Cycle 140 runs 960,050 to 962,149, so the waterfall rule starts at
-962,150, well past this block. Whatever differs at 960,230 is something else the
-epoch changes, and the test now prints the operations it found so the next look
-starts from evidence rather than a guess.
+**The network rejects exactly one of them.** Hashing subsets and orderings of
+the five against the captured `ops_hash` finds it in one pass: mainnet's hash is
+over the **first four, in nano's own order**. So the ordering is right, the
+decoding is right, and the fifth commit — `308dab22…`, at transaction index 573
+— is one nano accepts and the network does not.
+
+It is not malformed. All five carry the same shape, two `PoX` outputs and
+change: `[20000, 20000, 1406698]` against `[15000, 15000, …]` and
+`[21250, 21250, …]`. And it is not the waterfall rule, which rejects a commit
+paying nothing but only applies from `first_pox_waterfall_block` — the first
+block of the cycle *after* pox-5 activates. Cycle 140 runs 960,050 to 962,149,
+so that rule starts at 962,150, well past this block.
+
+What is left is the validation nano does not do: **a commitment is only an
+operation if it names a leader key that was registered and not already spent.**
+nano accepts every commit it decodes. Keeping a registry of leader keys across
+the snapshot chain, and dropping commits that do not resolve against it, is the
+next task here — and it is the same registry the VRF check in
+[[024-verify-the-vrf-seed-a-block-commits-to]] needs to find a tenure's public
+key.
 
 The consensus hash is not checked by this test and cannot be: it mixes prior
 consensus hashes at power-of-two offsets reaching back thousands of blocks, so
