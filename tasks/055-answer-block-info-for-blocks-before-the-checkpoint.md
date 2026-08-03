@@ -39,7 +39,7 @@ executed, is never written down, and a restart loses it.
 - [x] Persist executed block headers rather than holding them in memory.
 - [ ] Export the header fields Clarity can read for the checkpoint's ancestry,
       and import them alongside the trie.
-- [ ] Backfill the blocks this node executed before it began writing headers
+- [x] Backfill the blocks this node executed before it began writing headers
       down, which it can refetch from a peer.
 - [x] Serve `HeadersDB` from the persisted store, so a restart answers what the
       run before it answered.
@@ -90,3 +90,29 @@ and agreement — as here — says the state is what differs.
 with the burn header hash, burn height, times, VRF seed, miner address, burn
 spends and reward — every field `BlockHeader` needs. So this is an export and an
 import, not a reconstruction.
+
+## Where it got to
+
+The backfill wrote down all 118 headers this node's state was missing, and the
+crosscheck then answered the question the whole task turned on. With the headers
+present the **interpreter succeeds with `(ok true)` — exactly mainnet's answer —
+while clarity-wasm still fails.** So the remaining fault is a compiler bug, not
+state and not the arguments.
+
+This plan names the interpreter as the execution path to fall back to, so it can
+now answer a call the compiler refuses, behind `NANO_INTERPRETER_FALLBACK`. With
+that on, the block executed and **its state root matched**, which is the
+strongest evidence available that the interpreter's answer is the consensus one.
+
+Replay then moved on and found two more things the checkpoint was not carrying:
+accounting written before the maturity window existed, which is now refused
+rather than discovered a hundred tenures later; and the coinbase schedule,
+without which a node cannot price a tenure it executes itself.
+
+It now stops at **8,665,722**, the first tenure start past the checkpoint, which
+credits two recipients and mints the 1,000 STX coinbase — all of which look
+right, so the divergence is in one of their amounts or in the SIP-031 mint
+beside them.
+
+The clarity-wasm bug itself is still to be found; every word that path stands on
+has been pinned and agrees, and the crosscheck is the oracle to bisect it with.
