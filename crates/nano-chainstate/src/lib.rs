@@ -1388,6 +1388,46 @@ impl ChainState {
         }
     }
 
+    /// Give up every block executed after `block_id` and stand on it again.
+    ///
+    /// A Stacks fork is not a Bitcoin reorganization: the sortitions still
+    /// stand, and what changes is which chain of blocks is heaviest. So the
+    /// ancestor to resume from is named directly rather than derived from
+    /// invalidated consensus hashes.
+    ///
+    /// Nothing is deleted. The MARF addresses a state by the block that sealed
+    /// it, so the abandoned branch simply stops being reachable — and if the
+    /// fork changes its mind, those states are still there to stand on. What
+    /// has to be rewound is everything kept beside the MARF: the executed
+    /// chain, the tenure start heights and the accounting, none of which is
+    /// addressed by block and all of which would otherwise describe a chain
+    /// this node is no longer on.
+    ///
+    /// Retracting to a block this node never executed does nothing: a node
+    /// cannot stand on a state it did not compute.
+    pub fn retract_to(&mut self, block_id: [u8; 32]) -> ChainRetraction {
+        let Some(position) = self
+            .executed
+            .iter()
+            .position(|block| block.block_id == block_id)
+        else {
+            return ChainRetraction {
+                resume_from: self.executed.last().map(|block| block.block_id),
+                discarded: Vec::new(),
+            };
+        };
+        let discarded: Vec<_> = self.executed.split_off(position + 1);
+        if let Some(first) = discarded.first() {
+            self.accounting.retract_from(u64::from(first.tenure_height));
+            self.tenure_start_heights
+                .retain(|tenure, _| *tenure < first.tenure_height);
+        }
+        ChainRetraction {
+            resume_from: Some(block_id),
+            discarded: discarded.into_iter().map(|block| block.block_id).collect(),
+        }
+    }
+
     /// The blocks executed since the checkpoint, oldest first.
     #[must_use]
     pub fn executed_blocks(&self) -> Vec<[u8; 32]> {

@@ -30,7 +30,10 @@ strands it.
 - [x] Follow several peers and keep the candidate tips they report.
 - [x] Choose between candidates on chain length and valid signature weight
       against the burn view, not on arrival.
-- [ ] Reorganize onto a heavier fork instead of failing.
+- [x] Give back the blocks after a named ancestor, so a heavier fork can be
+      taken instead of refused.
+- [ ] Detect the heavier fork on the follow path and drive the retraction from
+      it.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
 - [x] Treat a peer that serves an invalid block as untrusted rather than fatal.
 
@@ -54,3 +57,27 @@ point, hand `ChainState::retract` the blocks below it, and replay forward. The
 pieces on both sides now exist — `ChainRetraction` from
 [[026-survive-a-bitcoin-reorganization]] and the choice here — so this is wiring,
 in `TenureFollower` and in `nano-node`'s `ExecutingNode`.
+
+## Standing on an ancestor again
+
+`ChainState::retract_to` is the half a fork switch needs from the chainstate.
+`retract` already existed for *Bitcoin* reorganizations, which invalidate
+consensus hashes; a Stacks fork invalidates none — the sortitions still stand and
+what changes is which chain of blocks is heaviest — so the ancestor is named
+directly instead of derived.
+
+Retracting is cheap because nothing is deleted. The MARF addresses a state by the
+block that sealed it, so an abandoned branch merely stops being reachable, and if
+the fork changes its mind those states are still there to stand on. What has to
+be rewound is everything kept *beside* the MARF — the executed chain, the tenure
+start heights, the accounting — none of it addressed by block, all of it
+otherwise describing a chain this node is no longer on. That is the same class of
+bug as [[056-make-rejected-block-execution-leave-no-state]].
+
+Retracting to a block this node never executed does nothing, which is not a
+detail: the ancestor in a real switch is named by a *peer*, and a node must not
+be talked into emptying its own chain by being told about someone else's.
+
+Both are pinned in `tests/fork_retraction.rs`. What remains is the follow path
+noticing the heavier fork and calling this, rather than raising `SyncError::Fork`.
+
