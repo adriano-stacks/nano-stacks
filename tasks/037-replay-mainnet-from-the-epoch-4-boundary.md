@@ -190,6 +190,15 @@ raises no event. `vm-metadata::` is the shape that fits — a contract's data si
 changes without an event — and this plan lists those among the Clarity key
 strings the MARF holds, where nano keeps them in the side store.
 
+**And the fallback itself is the likely answer.** Block 8,665,780 runs through
+the interpreter, because a contract in it compiles to wasm that will not load.
+A MARF packs a node's pointers in the order its keys were first written, so two
+runs reaching the same values by writing them in a different order seal
+different roots — which is exactly the shape here: every value equal, every
+event equal, the root different. The interpreter is a way to carry a replay
+forward and find the next divergence; it is not a way to follow a chain, and
+the real fix is the clarity-wasm codegen bug behind it.
+
 Enumerating mainnet's own writes would settle it, and both routes are closed for
 now: there is no event observer on a mainnet node, and stacks-core will not open
 the archive's MARF to read it. That is not truncation — the blob file is exactly

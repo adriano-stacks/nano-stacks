@@ -2358,11 +2358,13 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     // A disagreement names a compiler bug; agreement says the state or the
     // arguments are what differ.
     //
-    // Answering from it is a deliberate fallback rather than a default: this
-    // plan names the interpreter as the execution path to fall back to, and a
-    // node that would otherwise stop on a block the network accepted is better
-    // off carrying on and saying so. It is off unless asked for, because the
-    // costs the two charge are not guaranteed to agree.
+    // Answering from it is a deliberate fallback rather than a default, and it
+    // is **not consensus-safe**: a MARF packs a node's pointers in the order
+    // its keys were first written, so two runs that reach the same values by
+    // writing them in a different order seal different roots. The interpreter
+    // and the compiler are not guaranteed to write in the same order, so this
+    // is for carrying a replay forward and finding the next divergence — not
+    // for following a chain. The costs the two charge may differ as well.
     let fall_back = std::env::var_os("NANO_INTERPRETER_FALLBACK").is_some();
     if (fall_back || std::env::var_os("NANO_CROSSCHECK").is_some())
         && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
