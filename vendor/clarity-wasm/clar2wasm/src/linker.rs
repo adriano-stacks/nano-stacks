@@ -1234,11 +1234,23 @@ fn link_block_height_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
             "clarity",
             "block_height",
             |mut caller: Caller<'_, ClarityWasmContext>| {
-                let height = caller
-                    .data_mut()
-                    .global_context
-                    .database
-                    .get_current_block_height();
+                // From epoch 3.0, `block-height` is the *tenure* height, not the
+                // Stacks block height: the interpreter switched (see
+                // `vm::variables`, `NativeVariables::BlockHeight`) so that the
+                // value keeps incrementing at roughly its old pace, and a
+                // contract that stores it stores a consensus-visible number.
+                let epoch = caller.data_mut().global_context.epoch_id;
+                let height = if epoch < StacksEpochId::Epoch30 {
+                    u128::from(
+                        caller
+                            .data_mut()
+                            .global_context
+                            .database
+                            .get_current_block_height(),
+                    )
+                } else {
+                    u128::from(caller.data_mut().global_context.database.get_tenure_height()?)
+                };
                 Ok((height as i64, 0i64))
             },
         )

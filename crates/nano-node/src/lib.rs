@@ -19,6 +19,10 @@ use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError};
 use crate::staging::{Staging, StagingError};
 
 /// Executes a validated tenure stream from an imported checkpoint state.
+/// How far back a burn-view walk goes before giving up: a tenure is bounded by
+/// the Bitcoin block that ends it, so this only has to outlast one.
+const TENURE_WALK_LIMIT: usize = 512;
+
 #[derive(Debug)]
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
@@ -31,6 +35,9 @@ pub struct CheckpointExecutor<S> {
     /// and nothing else records it per block — so the executor keeps it, since
     /// it is what a caller asking how far this node has come actually means.
     bitcoin_height: u64,
+    /// The burn view the current tenure is standing on, which a tenure change
+    /// states and the blocks after it inherit.
+    bitcoin_view: Option<nano_primitives::ConsensusHash>,
     bitcoin: S,
 }
 
@@ -358,6 +365,7 @@ where
             sortition: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
+            bitcoin_view: None,
             bitcoin,
         })
     }
@@ -375,6 +383,7 @@ where
             sortition: None,
             tip,
             bitcoin_height: 0,
+            bitcoin_view: None,
             bitcoin,
         }
     }
@@ -714,6 +723,29 @@ where
         }
     }
 
+    /// Find the burn view a block inherits, by walking back through its tenure.
+    ///
+    /// Only a tenure change states one, so a block that carries none stands on
+    /// the view of the last block before it that did. The walk stops when the
+    /// tenure does, since a block cannot inherit a view across tenures.
+    async fn bitcoin_view_of(
+        node: &SyncClient,
+        block: &NakamotoBlock,
+    ) -> Result<Option<nano_primitives::ConsensusHash>, NodeExecutionError> {
+        let mut parent = block.header.parent_block_id;
+        for _ in 0..TENURE_WALK_LIMIT {
+            let ancestor = node.block(parent).await?;
+            if ancestor.header.consensus_hash != block.header.consensus_hash {
+                return Ok(None);
+            }
+            if let Some(view) = ancestor.bitcoin_view_consensus_hash() {
+                return Ok(Some(view));
+            }
+            parent = ancestor.header.parent_block_id;
+        }
+        Ok(None)
+    }
+
     /// Execute staged blocks forward from this node's tip, up to `budget`.
     async fn execute_staged(
         &mut self,
@@ -727,7 +759,21 @@ where
             let Some(block) = staging.child_of(self.tip.block_id())? else {
                 break;
             };
-            let sortition = node.sortition(block.header.consensus_hash).await?;
+            // The burn view, not the tenure. A tenure that outlives the burn
+            // block that elected it is extended, and the extension moves the
+            // view forward — so a block mid-tenure sees a later burn height
+            // than its own sortition, and `burn-block-height` is what a
+            // contract stores. Only a tenure change states the view, so it
+            // carries forward to the blocks that follow.
+            if let Some(view) = block.bitcoin_view_consensus_hash() {
+                self.bitcoin_view = Some(view);
+            } else if self.bitcoin_view.is_none() {
+                // A resumed node did not execute the tenure change that stated
+                // the view, so it walks back to it.
+                self.bitcoin_view = Self::bitcoin_view_of(node, &block).await?;
+            }
+            let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
+            let sortition = node.sortition(view).await?;
             self.check_local_sortition(&sortition, block.header.bitcoin_spent);
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;

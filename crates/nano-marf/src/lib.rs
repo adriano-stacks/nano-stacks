@@ -993,6 +993,21 @@ impl VersionedMarf {
     }
 
     /// Return the root that would be produced by sealing the active state.
+    /// The character and hash of every child of the root being written.
+    ///
+    /// A state root that differs while every value agrees means the root node's
+    /// children differ, and which one is a fact to be read rather than guessed:
+    /// the network's own merkle proofs carry the same hashes, so comparing them
+    /// names the first byte of the path that is wrong.
+    pub fn pending_root_children(&self) -> Result<Vec<(u8, TrieHash)>, MarfError> {
+        let active = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?;
+        active
+            .root_children
+            .iter()
+            .map(|child| Ok((child.character, child.hash(&self.storage)?)))
+            .collect()
+    }
+
     pub fn pending_root(&self) -> Result<TrieHash, MarfError> {
         let active = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?;
         Ok(state_root(

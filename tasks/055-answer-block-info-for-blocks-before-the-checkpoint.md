@@ -314,3 +314,37 @@ That needs `TrieMerkleProof` deserialization, which `nano-conformance` already
 has through `stackslib`, and a way to read the children of nano's *pending* root.
 It is the next thing to build; nothing cheaper will name the key.
 
+## Found: two consensus values a contract stores
+
+The trie diff worked. One merkle proof against block 8,665,780 gave 255 of the
+network's root children; comparing them with nano's left exactly one child that
+disagreed for a reason other than being the proof's own path — `0xdc` — and this
+block writes exactly one key under it:
+`SP1Y5YSTAHZ88XYK1VPDH24GY0HPX5J4JECTMY4A1.univ2-core::0::pools::u6`.
+
+That map entry records a pool's reserves *alongside two chain values*, and both
+were wrong:
+
+- **`block-height`** — the network wrote 251,323, nano wrote 8,665,780. From
+  epoch 3.0 the interpreter answers `block-height` with the **tenure** height
+  (`vm::variables`, `NativeVariables::BlockHeight`); clarity-wasm's host function
+  returned `get_current_block_height()` whatever the epoch. Fixed in the vendored
+  compiler and pinned by `tests/block_height_keyword.rs`; clar2wasm's own 1,375
+  tests stay green.
+- **`burn-block-height`** — the network wrote 960,235, nano wrote 960,234. A
+  tenure that outlives the burn block electing it is *extended*, and the
+  extension moves the burn view forward, so a block mid-tenure sees a later burn
+  height than its own sortition. The node asked its peer for the sortition of the
+  block's tenure; it now asks for the sortition of the **burn view**, and a
+  resumed node — which never executed the tenure change that stated the view —
+  walks back through the tenure to find it.
+
+With both fixed the node executes 8,665,780 and 8,665,781 and stops at
+**8,665,782**, which is the first movement in this replay since the checkpoint's
+own tail.
+
+This is worth generalising: a contract that stores a chain value makes that value
+consensus, and it stays invisible until one does. Both bugs had been executing
+wrongly for every block before this one and cost nothing until a contract wrote
+one down.
+
