@@ -2,6 +2,7 @@ pub mod config;
 pub mod miner;
 pub mod runtime;
 pub mod signer;
+pub mod sortition;
 pub mod staging;
 
 use std::{fmt, path::Path};

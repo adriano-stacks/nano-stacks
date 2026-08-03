@@ -21,6 +21,7 @@ nano-miner = { path = "../nano-miner" }
 nano-primitives = { path = "../nano-primitives" }
 nano-rpc = { path = "../nano-rpc" }
 nano-signer = { path = "../nano-signer" }
+nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }

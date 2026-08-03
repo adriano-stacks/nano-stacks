@@ -26,7 +26,8 @@ never validation inputs.
 
 ## Tasks
 
-- [ ] Feed locally decoded Bitcoin operations into a persistent `SnapshotChain`.
+- [~] Feed locally decoded Bitcoin operations into a `SnapshotChain` the node
+      owns — done, though not yet persistent nor driving execution.
 - [x] Derive consensus hash, sortition hash, winning commit transaction and
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
@@ -113,3 +114,21 @@ That is necessary and not yet sufficient: seeded with it, the consensus hash
 still does not derive, because it also mixes the `PoxId` — one bit per reward
 cycle — and the replay passes `PoxId::initial()`. Deriving that bit vector is
 the next input, and it is a smaller thing than replaying a chain.
+
+## The chain is in the node
+
+`nano_node::sortition::SortitionTracker` owns a `SnapshotChain`, starts from a
+seed and the consensus hashes behind it, and advances a block at a time from
+whatever burnchain the node is configured with. It applies the missed-commit
+rule, so its operation set is the network's.
+
+`tests/mainnet_sortition.rs` drives it over the captured window and it derives
+the same consensus hash the network did at every block — the same claim the
+direct `SnapshotChain` test makes, through the code path a node actually runs.
+
+What is left here is the wiring rather than the arithmetic: persist the chain
+beside the other state, advance it from the follower's burnchain reads rather
+than a test's, and then hand its snapshot to execution in place of the peer's
+`/v3/sortitions` answer. Choosing between several eligible commitments is the
+burn distribution's business and still to come; the tracker currently answers
+only where a block leaves no choice to make.

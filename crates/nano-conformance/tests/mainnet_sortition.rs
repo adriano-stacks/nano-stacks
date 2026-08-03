@@ -325,3 +325,54 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
         "derived {checked} sortitions, below the {DERIVED_FLOOR} already reached: {first_divergence:?}"
     );
 }
+
+/// The node's own tracker derives what the network derived.
+///
+/// The window test above drives `SnapshotChain` directly, which proves the
+/// arithmetic. This drives `nano_node::sortition::SortitionTracker`, which is
+/// what a node actually runs — the same blocks through the code path that will
+/// replace asking a peer.
+#[test]
+fn the_node_tracker_derives_the_same_window() {
+    let Some(root) = capture() else {
+        eprintln!("set NANO_MAINNET_CAPTURE to a capture directory to run this");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
+        .expect("the capture carries the consensus hashes");
+
+    let mut tracker =
+        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
+            .expect("the tracker starts");
+
+    let mut checked = 0;
+    for snapshot in captured.iter().skip(1) {
+        let raw = fs::read_to_string(
+            root.join("bitcoin/blocks")
+                .join(format!("{}.hex", snapshot.burn_header_hash)),
+        )
+        .expect("read the captured Bitcoin block");
+        let block = decode_block(
+            snapshot.block_height,
+            &hex::decode(raw.trim()).expect("the block is hexadecimal"),
+            MAINNET_MAGIC,
+        )
+        .expect("decode the captured Bitcoin block");
+
+        let derived = tracker
+            .advance(&block, snapshot.total_burn.parse().expect("a burn total"))
+            .expect("the tracker advances");
+        assert_eq!(
+            hex::encode(derived.consensus_hash.as_bytes()),
+            snapshot.consensus_hash,
+            "the node derives the consensus hash at burn {}",
+            snapshot.block_height
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, DERIVED_FLOOR, "the node derived the whole window");
+}
