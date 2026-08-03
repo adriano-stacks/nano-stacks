@@ -32,8 +32,9 @@ strands it.
       against the burn view, not on arrival.
 - [x] Give back the blocks after a named ancestor, so a heavier fork can be
       taken instead of refused.
-- [ ] Detect the heavier fork on the follow path and drive the retraction from
-      it.
+- [x] Give the executor a fork switch that finds where the chains parted and
+      stands there.
+- [ ] Call it from the follow path instead of raising `SyncError::Fork`.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
 - [x] Treat a peer that serves an invalid block as untrusted rather than fatal.
 
@@ -97,4 +98,21 @@ With those two the chainstate side is complete: given a fork point from
 `/v3/tenures/fork_info`, a node can name where to stand and give back the rest.
 What is left is the follow path calling them instead of raising
 `SyncError::Fork`.
+
+### The switch itself
+
+`CheckpointExecutor::switch_to_fork` takes the tenure a peer is on, asks it for
+`/v3/tenures/fork_info` back to the oldest tenure this node executed, compares
+that against `executed_tenures`, and stands on the last block of the tenure they
+agree about.
+
+Both sides are checked and neither is taken on trust. A fork point neither side
+reaches, or one naming a tenure this node never executed, changes nothing — a
+peer must not be able to talk a node off its own chain, which is the failure mode
+that makes "fork choice" worth having over "follow whoever is configured".
+
+`fork_point_of` was added alongside because a node comparing its own chain has
+consensus hashes and nothing else: it did not learn its chain from a `fork_info`
+answer, and making it fabricate burn heights to throw them away would be
+inventing evidence.
 

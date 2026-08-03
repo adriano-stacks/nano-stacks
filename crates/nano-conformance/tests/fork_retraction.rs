@@ -187,3 +187,36 @@ fn a_tenure_this_node_never_executed_names_nothing() {
     );
 }
 
+#[test]
+fn a_forks_own_view_is_the_tenures_it_executed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (mut chainstate, source) = open(directory.path());
+    let mut seen = Vec::new();
+    replay_into(
+        &mut chainstate,
+        source,
+        &fixtures(),
+        FixtureManifest {
+            mode: FixtureMode::Captured,
+            replay_blocks: BLOCKS,
+            receipts: true,
+        },
+        0,
+        &mut |block, _| seen.push(block.header.consensus_hash),
+    );
+
+    // Newest first, each tenure once: this is nano's side of a fork comparison,
+    // and it comes from what was executed rather than from any peer's answer.
+    let mut expected: Vec<_> = Vec::new();
+    for hash in seen.iter().rev() {
+        if expected.last() != Some(hash) {
+            expected.push(*hash);
+        }
+    }
+    assert_eq!(
+        chainstate.executed_tenures(),
+        expected,
+        "the fork view is the executed tenures, newest first, without repeats"
+    );
+}
+

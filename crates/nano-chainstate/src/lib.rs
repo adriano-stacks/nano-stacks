@@ -1388,6 +1388,22 @@ impl ChainState {
         }
     }
 
+    /// The tenures this node has executed, newest first.
+    ///
+    /// This is nano's own side of a fork comparison. A peer's view comes from
+    /// `/v3/tenures/fork_info`; this one comes from what was executed, so the
+    /// two can be compared without either being taken on trust.
+    #[must_use]
+    pub fn executed_tenures(&self) -> Vec<ConsensusHash> {
+        let mut tenures: Vec<ConsensusHash> = Vec::new();
+        for block in self.executed.iter().rev() {
+            if tenures.last() != Some(&block.consensus_hash) {
+                tenures.push(block.consensus_hash);
+            }
+        }
+        tenures
+    }
+
     /// The last block this node executed under `consensus_hash`.
     ///
     /// A fork point is agreed in terms of *burn* blocks — `fork_point` compares

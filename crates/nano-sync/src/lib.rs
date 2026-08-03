@@ -148,10 +148,20 @@ pub struct ForkInfo {
 /// Both are ordered newest first, as the endpoint returns them.
 #[must_use]
 pub fn fork_point(ours: &[ForkInfo], theirs: &[ForkInfo]) -> Option<ConsensusHash> {
+    let ours: Vec<_> = ours.iter().map(|entry| entry.consensus_hash).collect();
+    fork_point_of(&ours, theirs)
+}
+
+/// The same, for a side that holds only the tenures it executed.
+///
+/// A node comparing a peer's view against its own has consensus hashes and
+/// nothing else — it did not learn its chain from a `fork_info` answer — and
+/// making it fabricate the rest of a `ForkInfo` to ask the question would be
+/// inventing burn heights to throw them away.
+#[must_use]
+pub fn fork_point_of(ours: &[ConsensusHash], theirs: &[ForkInfo]) -> Option<ConsensusHash> {
     let theirs: BTreeSet<_> = theirs.iter().map(|entry| entry.consensus_hash).collect();
-    ours.iter()
-        .find(|entry| theirs.contains(&entry.consensus_hash))
-        .map(|entry| entry.consensus_hash)
+    ours.iter().find(|hash| theirs.contains(hash)).copied()
 }
 
 /// A chain tip a peer is offering, and the header that proves it.

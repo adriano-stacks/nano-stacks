@@ -780,6 +780,48 @@ where
         }
     }
 
+    /// Stand on the last block a peer's chain and this one agree about.
+    ///
+    /// A peer that reorganises past this node used to strand it: the follower
+    /// refuses anything that does not extend the history it holds, which is
+    /// obedience to one peer rather than fork choice. Given the tenure a peer is
+    /// on, this finds where the two chains parted and gives back everything
+    /// after it, so the heavier branch can be executed instead of refused.
+    ///
+    /// Both sides of the comparison are checked: the peer's view of its own
+    /// chain, and this node's view of what it *executed*. A fork point neither
+    /// side reaches, or one naming a tenure this node never executed, changes
+    /// nothing — a peer must not be able to talk a node off its own chain.
+    ///
+    /// Returns the block to resume from when a switch happened.
+    pub async fn switch_to_fork(
+        &mut self,
+        node: &SyncClient,
+        theirs: nano_primitives::ConsensusHash,
+    ) -> Result<Option<[u8; 32]>, NodeExecutionError> {
+        let ours = self.chainstate.executed_tenures();
+        let Some(oldest) = ours.last().copied() else {
+            return Ok(None);
+        };
+        let theirs = node.tenure_fork_info(theirs, oldest).await?;
+        let Some(point) = nano_sync::fork_point_of(&ours, &theirs) else {
+            return Ok(None);
+        };
+        let Some(block) = self.chainstate.last_block_of_tenure(point) else {
+            return Ok(None);
+        };
+        let retraction = self.chainstate.retract_to(block);
+        if retraction.discarded.is_empty() {
+            return Ok(None);
+        }
+        println!(
+            "a heavier fork parted at {point}: giving back {} blocks and standing on {}",
+            retraction.discarded.len(),
+            hex::encode(block)
+        );
+        Ok(retraction.resume_from)
+    }
+
     /// Find the burn view a block inherits, by walking back through its tenure.
     ///
     /// Only a tenure change states one, so a block that carries none stands on
