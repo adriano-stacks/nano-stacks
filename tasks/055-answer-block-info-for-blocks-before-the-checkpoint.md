@@ -948,3 +948,23 @@ int under the interpreter. That is the one thing between this path and a replay
 with no codegen failures in it, and it is worth more than any individual
 clarity-wasm bug because it recurs where those do not.
 
+### The interpreter entry was bracketing the call twice
+
+`execute_transaction` brackets a call itself. nano wrapped it in another
+`begin`/`commit` on the way in, which left the environment one level deep when it
+came to unwind — and `destruct` refuses that, taking the call's own answer with
+it. stacks-core's own callers do not do this.
+
+With the extra level gone, the same call reports what it actually hit:
+
+```
+signer-payout-v1::initialize: RuntimeCheck(Unreachable("Public function must return response: int"))
+```
+
+and it now reproduces outside the node, in one `call-both`, where the compiler
+answers `(ok true)`. That is the whole of the remaining difference between the
+two engines, and it is now a two-second question instead of a node restart.
+
+The captured replay still passes under `NANO_INTERPRETER_ONLY` with matching
+roots, so removing the bracket did not loosen the path it guards.
+

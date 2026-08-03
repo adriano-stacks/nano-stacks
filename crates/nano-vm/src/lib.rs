@@ -2460,8 +2460,10 @@ fn execute_contract_call_outcome_in_context(
             Ok(SymbolicExpression::atom_value(value))
         })
         .collect::<Result<Vec<_>, VmExecutionError>>()?;
-    let mut database = clarity_database(store, bitcoin_context);
-    database.begin();
+    // No `begin` here: `execute_transaction` brackets the call itself, and an
+    // extra level leaves the environment nested when it tries to unwind — which
+    // `destruct` refuses, losing the call's own answer with it.
+    let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         network.is_mainnet(),
         network.chain_id(),
@@ -2477,7 +2479,7 @@ fn execute_contract_call_outcome_in_context(
         call.function,
         &arguments,
     );
-    let Some((mut database, cost_tracker)) = environment.destruct() else {
+    let Some((_database, cost_tracker)) = environment.destruct() else {
         // A context outlived the call that opened it. Whatever the call was
         // actually complaining about is the useful half, and reporting only
         // that the unwind failed throws it away — which is how this looked
@@ -2492,7 +2494,6 @@ fn execute_contract_call_outcome_in_context(
     };
     match result {
         Ok((value, assets, events)) => {
-            database.commit()?;
             Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
                 value: Some(value),
                 cost: cost_tracker.get_total(),
@@ -2501,7 +2502,6 @@ fn execute_contract_call_outcome_in_context(
             })))
         }
         Err(error) => {
-            database.roll_back()?;
             if is_acceptable_runtime_failure(&error) {
                 Ok(ContractCallOutcome::RuntimeFailure {
                     cost: cost_tracker.get_total(),
