@@ -261,3 +261,22 @@ It did leave something behind at first — thirty-two blocks sealed at height
 the node refuse to execute that block at all. They were removed and the probe
 no longer commits anything.
 
+## Every value nano writes is the network's; one it does not write is missing
+
+Checked against mainnet at block 8,665,780's own tip, key by key:
+
+- **twelve STX balances** — every one equal, to the microSTX;
+- **four nonces** — each exactly the transaction's nonce plus one, and the block
+  is decoded from nano's own staging store to confirm it;
+- **four pool reserves** (`xyk-pool-stx-aeusdc` v-1-1 and v-1-2, `x-balance` and
+  `y-balance`) — byte-identical serialized Clarity values.
+
+Together with receipts that already matched — status, result, and all four
+non-runtime cost dimensions — this says nano computes the right answer for
+everything it touches. The block diverges on something it does not touch.
+
+So the search is now for a **missing write**: a key the network wrote in this
+block and nano did not. It is not one of nano's writes being wrong, not an extra
+one, and not the order. `cargo xtask decode-blocks` now prints each
+transaction's origin, nonce and fee, which is what settled the nonces.
+

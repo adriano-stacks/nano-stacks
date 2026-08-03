@@ -201,6 +201,17 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
                     block.header.chain_length,
                     block.transactions.len()
                 );
+                for transaction in &block.transactions {
+                    let payer = transaction.auth().payer();
+                    println!(
+                        "  tx {} origin {} nonce {} fee {} payload {}",
+                        transaction.txid(),
+                        transaction.auth().origin().account_address(true),
+                        payer.nonce(),
+                        payer.fee(),
+                        transaction.payload_type() as u8
+                    );
+                }
             }
             Err(error) => {
                 eprintln!("block {decoded} at byte {offset} does not decode: {error}");
