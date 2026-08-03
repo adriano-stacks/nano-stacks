@@ -136,3 +136,30 @@ functions.
 So the trigger is the linking context: the node compiles it beside the contracts
 it calls, and one of those modules is what is refused. That is where the next
 look goes, and the guard is in the tree so a fix has something to satisfy.
+
+## The refused module is not flea's
+
+Deploying flea, closing the state and reopening it — the path a resumed node
+takes, which rebuilds a module from stored source rather than using the one
+built at deploy time — still loads and runs it. The call gets as far as the
+trait dispatch, so the module is fine.
+
+The transaction that fails passes `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.hilt`
+as that trait: 30 KB importing six traits of its own, which fits the
+74,624-byte offset in the error far better than flea's own module does. It
+needs its trait-defining contracts deployed alongside it to reproduce, which is
+the next step.
+
+## The receipts are right; the state root is not
+
+Mainnet block 8,665,780 executes five transactions and nano now produces **five
+receipts identical to mainnet's** — same status, same returned value, same
+`write_length`, `write_count`, `read_length` and `read_count` — including the
+flea call the interpreter answered (653/30/455,375/236 on both sides). Only one
+unrelated transaction's `runtime` differs, 247,635 against 222,230, and costs
+are not in a state root.
+
+By the plan's own rule that leaves write ordering or a native effect, not the
+VM's answers. It is the sharpest divergence signal the project has had: the
+execution is right and something around it is not.
+

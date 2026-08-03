@@ -7,13 +7,20 @@
 //! i32", which is a response's payload width against its indicator's.
 //!
 //! Neither shape reproduces it alone, and neither does forty of either grown
-//! synthetically. Nor does the contract itself, under any Clarity version —
-//! which this checks, and which narrows the trigger to the linking context: the
-//! node compiles it beside the contracts it calls, and one of those modules is
-//! what wasmtime refuses.
+//! synthetically. Deploying and calling it in one session does not either — the
+//! module built at deploy time is the one that runs, and it is fine.
 //!
-//! So this is a guard rather than the reproduction: it pins that the contract
-//! is fine on its own, so the next look goes to what it is linked with.
+//! What the node does instead is *rebuild* it: a process that resumes has no
+//! module for a contract deployed before it started, so it recompiles from the
+//! stored source under the epoch the chain is running at. This deploys, closes
+//! the state and reopens it to take that path — and flea's own module still
+//! loads and runs, reaching the trait dispatch before it stops.
+//!
+//! So the module wasmtime refuses is not flea's. The transaction that fails
+//! passes `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.hilt` as the trait — 30 KB
+//! importing six traits of its own, which fits the 74,624-byte offset in the
+//! error far better than this contract does. That is where the next look goes,
+//! and it needs the trait-defining contracts deployed alongside it.
 
 use nano_primitives::Network;
 use nano_vm::Vm;
@@ -40,11 +47,12 @@ fn a_mainnet_contract_compiles_to_a_module_that_loads() {
     }
 }
 
-/// Deploy and call it under one Clarity version.
+/// Deploy it under one Clarity version, then call it from a cold process.
 fn check_loads(version: ClarityVersion) {
     let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.flea")
         .expect("valid contract identifier");
-    let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+    let directory = tempfile::tempdir().expect("a directory");
+    let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("open VM");
     vm.begin_block(None, [9; 32]).expect("begin block");
 
     vm.deploy_contract(
@@ -54,9 +62,14 @@ fn check_loads(version: ClarityVersion) {
         LimitedCostTracker::new_free(),
     )
     .unwrap_or_else(|error| panic!("the contract deploys as {version}: {error}"));
+    vm.seal_block().expect("seal the deploy");
+    drop(vm);
 
-    // Deploying compiles it; calling it is what loads the module, which is
-    // where wasmtime refuses.
+    // A resumed process holds no module for it and has to rebuild one from the
+    // source on disk, which is the compilation that goes wrong.
+    let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen VM");
+    vm.begin_block(Some([9; 32]), [10; 32]).expect("begin block");
+
     let mut buffer = Vec::new();
     Value::buff_from(vec![0])
         .expect("a buffer")
@@ -75,8 +88,8 @@ fn check_loads(version: ClarityVersion) {
         &[buffer, target],
         &LimitedCostTracker::new_free(),
     );
-    // The call itself may fail for want of a real trait implementation; what
-    // must not happen is the module failing to load.
+    // The call fails for want of a real implementation of the trait — which it
+    // can only reach by loading and running flea's module, which is the point.
     if let Err(error) = &outcome {
         assert!(
             !format!("{error:?}").contains("UnableToLoadModule"),
