@@ -170,6 +170,8 @@ impl<T: BurnStateDB + HeadersDB> ChainContext for T {}
 /// Bitcoin state and executed headers available while evaluating.
 #[derive(Debug, Default)]
 struct BitcoinContext {
+    /// Which chain this is, because only mainnet's epoch boundaries are known.
+    mainnet: bool,
     height: u32,
     first_height: u32,
     prepare_phase_length: u32,
@@ -241,6 +243,58 @@ fn decode_block_header(bytes: &[u8]) -> Option<BlockHeader> {
     Some(header)
 }
 
+/// The epochs a stored contract may be rebuilt under, oldest first.
+const ACCEPTING_EPOCHS: [StacksEpochId; 6] = [
+    StacksEpochId::Epoch20,
+    StacksEpochId::Epoch21,
+    StacksEpochId::Epoch25,
+    StacksEpochId::Epoch30,
+    StacksEpochId::Epoch33,
+    StacksEpochId::Epoch34,
+];
+
+/// Where mainnet's epochs begin, by Bitcoin height.
+///
+/// Transcribed from `stackslib::core`, and pinned against it by a test rather
+/// than trusted: a boundary that is wrong recompiles a contract under rules it
+/// was never written for.
+const MAINNET_EPOCHS: [(u64, StacksEpochId); 12] = [
+    (0, StacksEpochId::Epoch20),
+    (713_000, StacksEpochId::Epoch2_05),
+    (781_551, StacksEpochId::Epoch21),
+    (787_651, StacksEpochId::Epoch22),
+    (788_240, StacksEpochId::Epoch23),
+    (791_551, StacksEpochId::Epoch24),
+    (840_360, StacksEpochId::Epoch25),
+    (867_867, StacksEpochId::Epoch30),
+    (875_000, StacksEpochId::Epoch31),
+    (907_740, StacksEpochId::Epoch32),
+    (923_222, StacksEpochId::Epoch33),
+    (943_333, StacksEpochId::Epoch34),
+];
+
+/// The epoch a Bitcoin height falls in, on the network it belongs to.
+///
+/// Only mainnet's boundaries are known here. Another network's are a matter of
+/// its own configuration, so it is treated as being at the epoch this node
+/// runs — which is what a fresh chain is.
+fn epoch_at_burn_height(mainnet: bool, height: u64) -> StacksEpochId {
+    if !mainnet {
+        return StacksEpochId::Epoch40;
+    }
+    if height >= MAINNET_EPOCH_40_HEIGHT {
+        return StacksEpochId::Epoch40;
+    }
+    MAINNET_EPOCHS
+        .iter()
+        .rev()
+        .find(|(start, _)| height >= *start)
+        .map_or(StacksEpochId::Epoch20, |(_, epoch)| *epoch)
+}
+
+/// Where epoch 4.0 begins on mainnet, which is where pox-5 activates.
+const MAINNET_EPOCH_40_HEIGHT: u64 = 960_230;
+
 /// A sortition identifier naming the burn height it belongs to.
 ///
 /// Sortition identifiers appear in no consensus preimage, and a follower holds
@@ -259,6 +313,7 @@ fn burn_height_of(sortition: &SortitionId) -> u32 {
 
 /// A context that knows no chain, for evaluating programs that read none.
 static NULL_CONTEXT: BitcoinContext = BitcoinContext {
+    mainnet: false,
     height: 0,
     first_height: 0,
     prepare_phase_length: 0,
@@ -510,9 +565,16 @@ impl BurnStateDB for BitcoinContext {
             .or_else(|| Some(sortition_of_burn_height(self.height)))
     }
 
-    fn get_stacks_epoch(&self, _height: u32) -> Option<StacksEpoch<ExecutionCost>> {
+    /// The epoch a Bitcoin height falls in.
+    ///
+    /// Answering "epoch 4.0" for every height is only right at the tip. A
+    /// contract deployed years ago was analysed under the epoch of its own
+    /// time, and recompiling it needs to know which — otherwise every contract
+    /// written against an older Clarity has to be discovered by failing.
+    fn get_stacks_epoch(&self, height: u32) -> Option<StacksEpoch<ExecutionCost>> {
+        let epoch_id = epoch_at_burn_height(self.mainnet, u64::from(height));
         Some(StacksEpoch {
-            epoch_id: StacksEpochId::Epoch40,
+            epoch_id,
             start_height: 0,
             end_height: u64::MAX,
             block_limit: EPOCH_4_BLOCK_LIMIT,
@@ -595,6 +657,7 @@ impl Vm {
         // The context answers header reads from the same file the store writes
         // them to, through a connection of its own because the two are
         // borrowed at once while Clarity runs.
+        let mainnet = store.network().is_mainnet();
         let headers_db = store
             .side_store_path()
             .and_then(|path| rusqlite::Connection::open(path).ok())
@@ -602,6 +665,7 @@ impl Vm {
         Self {
             store,
             context: BitcoinContext {
+                mainnet,
                 headers_db,
                 ..BitcoinContext::default()
             },
@@ -2643,11 +2707,23 @@ fn ensure_wasm_module(
         Err(rejected) => {
             // Worth saying: a contract built under an older epoch is charged
             // that epoch's costs, and its receipts will not match the network's.
-            eprintln!(
-                "{contract} does not compile under epoch 4.0, rebuilding as {:?}: {rejected}",
-                epoch_for_version(version)
-            );
-            compile_under(store, contract, &source, version, epoch_for_version(version))?
+            // Newest first: a contract keeps the semantics of the epoch it was
+            // written for, and the newest epoch that still accepts it is the
+            // closest guess at that — where the oldest its version allows sends
+            // a Clarity 1 contract back to epoch 2.0, whose code paths are the
+            // least exercised in the compiler.
+            let (epoch, compiled) = ACCEPTING_EPOCHS
+                .iter()
+                .rev()
+                .filter(|epoch| **epoch >= epoch_for_version(version))
+                .find_map(|epoch| {
+                    compile_under(store, contract, &source, version, *epoch)
+                        .ok()
+                        .map(|compiled| (*epoch, compiled))
+                })
+                .ok_or(rejected)?;
+            eprintln!("{contract} does not compile under epoch 4.0, rebuilt as {epoch:?}");
+            compiled
         }
     };
     modules.insert(contract.clone(), compiled);
@@ -3430,6 +3506,41 @@ mod tests {
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
         assert_eq!(vm.recorded_header([7; 32]), Some(header));
+    }
+
+    /// A height falls in the epoch mainnet was in at the time.
+    ///
+    /// Answering "epoch 4.0" everywhere is only right at the tip, and a
+    /// contract deployed years ago was analysed under the rules of its own.
+    #[test]
+    fn a_burn_height_names_the_epoch_mainnet_was_in() {
+        use clarity::types::StacksEpochId;
+
+        for (height, expected) in [
+            (666_050, StacksEpochId::Epoch20),
+            (712_999, StacksEpochId::Epoch20),
+            (713_000, StacksEpochId::Epoch2_05),
+            (781_551, StacksEpochId::Epoch21),
+            (840_360, StacksEpochId::Epoch25),
+            (867_867, StacksEpochId::Epoch30),
+            (943_333, StacksEpochId::Epoch34),
+            (960_229, StacksEpochId::Epoch34),
+            (960_230, StacksEpochId::Epoch40),
+            (u64::MAX, StacksEpochId::Epoch40),
+        ] {
+            assert_eq!(
+                super::epoch_at_burn_height(true, height),
+                expected,
+                "mainnet burn height {height}"
+            );
+        }
+
+        // Another network's boundaries are its own configuration, so it is
+        // treated as being at the epoch this node runs.
+        assert_eq!(
+            super::epoch_at_burn_height(false, 1),
+            StacksEpochId::Epoch40
+        );
     }
 
     /// A sortition identifier round-trips the burn height it names.

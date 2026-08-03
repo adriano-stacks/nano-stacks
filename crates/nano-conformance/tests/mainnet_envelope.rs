@@ -108,6 +108,39 @@ fn a_block_id_is_the_hash_the_network_serves_it_under() {
 /// events are what otherwise carry these. They are constants of the chain, so
 /// they are checked against stacks-core rather than transcribed into a command
 /// line and hoped over — a wrong one changes what execution sees.
+/// Where mainnet's epochs begin, pinned against stacks-core rather than
+/// transcribed and hoped over.
+///
+/// A boundary that is wrong recompiles a contract under rules it was never
+/// written for, which is a divergence with no receipt to show for it.
+#[test]
+fn mainnet_epoch_boundaries_match_stacks_core() {
+    use blockstack_lib::core::{
+        BITCOIN_MAINNET_STACKS_2_05_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_21_BURN_HEIGHT,
+        BITCOIN_MAINNET_STACKS_22_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_23_BURN_HEIGHT,
+        BITCOIN_MAINNET_STACKS_24_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_25_BURN_HEIGHT,
+        BITCOIN_MAINNET_STACKS_30_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_31_BURN_HEIGHT,
+        BITCOIN_MAINNET_STACKS_32_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_33_BURN_HEIGHT,
+        BITCOIN_MAINNET_STACKS_34_BURN_HEIGHT,
+    };
+
+    for (height, expected) in [
+        (BITCOIN_MAINNET_STACKS_2_05_BURN_HEIGHT, 713_000),
+        (BITCOIN_MAINNET_STACKS_21_BURN_HEIGHT, 781_551),
+        (BITCOIN_MAINNET_STACKS_22_BURN_HEIGHT, 787_651),
+        (BITCOIN_MAINNET_STACKS_23_BURN_HEIGHT, 788_240),
+        (BITCOIN_MAINNET_STACKS_24_BURN_HEIGHT, 791_551),
+        (BITCOIN_MAINNET_STACKS_25_BURN_HEIGHT, 840_360),
+        (BITCOIN_MAINNET_STACKS_30_BURN_HEIGHT, 867_867),
+        (BITCOIN_MAINNET_STACKS_31_BURN_HEIGHT, 875_000),
+        (BITCOIN_MAINNET_STACKS_32_BURN_HEIGHT, 907_740),
+        (BITCOIN_MAINNET_STACKS_33_BURN_HEIGHT, 923_222),
+        (BITCOIN_MAINNET_STACKS_34_BURN_HEIGHT, 943_333),
+    ] {
+        assert_eq!(height, expected);
+    }
+}
+
 #[test]
 fn mainnet_unlock_heights_match_stacks_core() {
     use blockstack_lib::core::{
