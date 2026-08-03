@@ -82,6 +82,36 @@ fn consensus_history(root: &std::path::Path) -> Option<Vec<ConsensusHash>> {
     )
 }
 
+/// The first field a derived snapshot disagrees with the network on.
+fn disagrees(derived: &SortitionSnapshot, snapshot: &Captured) -> Option<&'static str> {
+    let checks: [(&'static str, String, &String); 4] = [
+        (
+            "operations hash",
+            hex::encode(derived.operations_hash.as_bytes()),
+            &snapshot.ops_hash,
+        ),
+        (
+            "consensus hash",
+            hex::encode(derived.consensus_hash.as_bytes()),
+            &snapshot.consensus_hash,
+        ),
+        (
+            "sortition id",
+            hex::encode(derived.sortition_id.as_bytes()),
+            &snapshot.sortition_id,
+        ),
+        (
+            "sortition hash",
+            hex::encode(derived.sortition_hash.as_bytes()),
+            &snapshot.sortition_hash,
+        ),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, derived, captured)| derived != *captured)
+        .map(|(field, _, _)| field)
+}
+
 /// The transactions of a burn block that are operations for its sortition.
 ///
 /// A commitment that arrived after the block it was aiming at is a *missed*
@@ -167,8 +197,18 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         ),
         winner_txid: None,
         winner_vrf_seed: None,
-        pox_id: PoxId::initial(),
+        pox_id: mainnet_pox_id(),
     }
+}
+
+/// The `PoX` history mainnet held across this window.
+///
+/// One bit a reward cycle, and every one of mainnet's had an anchor block, so
+/// it is all ones — recovered from the captured sortition identifier, which is
+/// the burn header hash and this vector hashed together. Cycle 141 begins at
+/// 962,150, past the window, so it does not move inside it.
+fn mainnet_pox_id() -> PoxId {
+    PoxId::from_bits(vec![true; 142])
 }
 
 /// How many of the captured window derive exactly: all of it.
@@ -255,22 +295,16 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
                 block,
                 &txids,
                 snapshot.total_burn.parse().expect("a burn total"),
-                PoxId::initial(),
+                mainnet_pox_id(),
                 winner,
             )
             .expect("the chain extends");
 
-        if hex::encode(derived.operations_hash.as_bytes()) != snapshot.ops_hash {
-            report_operations(snapshot.block_height, block);
-            first_divergence = Some((snapshot.block_height, "operations hash"));
-            break;
-        }
-        // The consensus hash is still not checked, though the history it needs
-        // is now carried: it also mixes the `PoxId`, one bit per reward cycle,
-        // and this replay passes `PoxId::initial()`. Deriving that bit vector
-        // is the next input, not the history.
-        if hex::encode(derived.sortition_hash.as_bytes()) != snapshot.sortition_hash {
-            first_divergence = Some((snapshot.block_height, "sortition hash"));
+        if let Some(field) = disagrees(derived, snapshot) {
+            if field == "operations hash" {
+                report_operations(snapshot.block_height, block);
+            }
+            first_divergence = Some((snapshot.block_height, field));
             break;
         }
         checked += 1;

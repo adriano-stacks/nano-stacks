@@ -1446,6 +1446,44 @@ pub const fn commit_lands_in_block(burn_parent_modulus: u8, block_height: u64) -
 }
 
 #[cfg(test)]
+mod pox_id_tests {
+    use super::{PoxId, sortition_id};
+    use nano_primitives::BitcoinHeaderHash;
+
+    /// The `PoX` history mainnet held at the epoch 4.0 boundary.
+    ///
+    /// A sortition identifier is the burn header hash and the `PoxId` hashed
+    /// together, so the identifier a capture carries says which bit vector
+    /// produced it — and mainnet's, at burn 960,219, is a hundred and
+    /// forty-two bits, every one set. Every reward cycle mainnet has had chose
+    /// an anchor block.
+    ///
+    /// Pinned because the consensus hash mixes it: without it every other
+    /// field of a snapshot derives and this one does not.
+    #[test]
+    fn mainnet_pox_history_is_unbroken_at_the_epoch_four_boundary() {
+        let header = BitcoinHeaderHash::from_bytes(
+            <[u8; 32]>::try_from(
+                hex::decode("00000000000000000000fbd11b102b2b1b9c85645d5b0dd8812d618e7a6ffd81")
+                    .expect("hexadecimal")
+                    .as_slice(),
+            )
+            .expect("32 bytes"),
+        );
+
+        assert_eq!(
+            hex::encode(sortition_id(header, &PoxId::from_bits(vec![true; 142])).as_bytes()),
+            "f49a1a55f7fa56cb1f5a27992ec2fec6545e94e1f37d82a3eb5485c3ec0c2f0c"
+        );
+        // One bit fewer or one unset is a different chain.
+        assert_ne!(
+            hex::encode(sortition_id(header, &PoxId::from_bits(vec![true; 141])).as_bytes()),
+            "f49a1a55f7fa56cb1f5a27992ec2fec6545e94e1f37d82a3eb5485c3ec0c2f0c"
+        );
+    }
+}
+
+#[cfg(test)]
 mod missed_commit_tests {
     use super::{BURN_BLOCK_MINED_AT_MODULUS, commit_lands_in_block};
 

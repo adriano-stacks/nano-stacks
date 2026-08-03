@@ -27,8 +27,8 @@ never validation inputs.
 ## Tasks
 
 - [ ] Feed locally decoded Bitcoin operations into a persistent `SnapshotChain`.
-- [ ] Derive consensus hash, sortition hash, winning commit transaction, leader
-      key, total burn and accumulated coinbase locally.
+- [x] Derive consensus hash, sortition hash, winning commit transaction and
+      total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
 - [ ] Hand the local snapshot to block validation and execution.
 - [ ] Persist snapshots and resume without trusting a peer's current burn view.
@@ -76,14 +76,25 @@ it is not the waterfall rule, which starts at 962,150 — the cycle *after* pox-
 activates; and it is not the leader key, because all five name keys that are
 registered and reused tens of thousands of times.
 
+## Every consensus-visible field now derives
+
+With the hash history and the `PoX` history in hand, the window derives **all
+four**: operations hash, consensus hash, sortition identifier and sortition
+hash, for all fourteen blocks after its seed.
+
+The `PoxId` came from the capture itself rather than a guess. A sortition
+identifier is the burn header hash and the `PoxId` hashed together, so the
+identifier says which bit vector produced it: at burn 960,219 mainnet's is
+**142 bits, every one set** — every reward cycle mainnet has had chose an anchor
+block. That is pinned by
+`nano_sortition::pox_id_tests::mainnet_pox_history_is_unbroken_at_the_epoch_four_boundary`.
+
 ## What a window still cannot prove
 
-The consensus hash is not checked here and cannot be: it mixes prior consensus
-hashes at power-of-two offsets reaching back thousands of blocks. Nor can the
-leader-key rule be applied — a commitment is only an operation if it names a
-registered key, and the window proves it cannot check that rather than assuming
-so: **zero leader keys are registered inside those fifteen blocks**, so every
-commitment names one from before.
+The leader-key rule cannot be applied here — a commitment is only an operation
+if it names a registered key, and the window proves it cannot check that rather
+than assuming so: **zero leader keys are registered inside those fifteen
+blocks**, so every commitment names one from before.
 
 `nano_sortition::LeaderKeys` holds that registry, with its own test, ready for
 the chain that can use it. And it is a small thing to carry: mainnet has

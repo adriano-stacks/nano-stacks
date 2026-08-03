@@ -11,3 +11,6 @@ nano-primitives = { path = "../nano-primitives" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+hex = "0.4.3"
