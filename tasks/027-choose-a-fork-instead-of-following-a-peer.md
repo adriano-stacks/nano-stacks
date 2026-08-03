@@ -81,3 +81,20 @@ be talked into emptying its own chain by being told about someone else's.
 Both are pinned in `tests/fork_retraction.rs`. What remains is the follow path
 noticing the heavier fork and calling this, rather than raising `SyncError::Fork`.
 
+### From a burn block to a Stacks block
+
+`fork_point` compares two peers' views and answers with a **consensus hash** —
+a fork is agreed in burn blocks — while a retraction has to name a **Stacks
+block**. `last_block_of_tenure` is the bridge: everything up to the last block
+executed under that tenure is on both chains by construction, and everything
+after it is what the fork disputes.
+
+A tenure this node never executed names nothing, for the same reason retracting
+to an unknown block does nothing. Both answers come from what this node
+executed, never from what a peer says about it.
+
+With those two the chainstate side is complete: given a fork point from
+`/v3/tenures/fork_info`, a node can name where to stand and give back the rest.
+What is left is the follow path calling them instead of raising
+`SyncError::Fork`.
+

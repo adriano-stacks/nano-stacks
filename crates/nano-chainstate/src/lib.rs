@@ -1388,6 +1388,22 @@ impl ChainState {
         }
     }
 
+    /// The last block this node executed under `consensus_hash`.
+    ///
+    /// A fork point is agreed in terms of *burn* blocks — `fork_point` compares
+    /// two peers' views and answers with a consensus hash — while a retraction
+    /// has to name a Stacks block. The last block executed under that tenure is
+    /// the bridge: everything up to it is on both chains by construction, and
+    /// everything after it is what the fork disputes.
+    #[must_use]
+    pub fn last_block_of_tenure(&self, consensus_hash: ConsensusHash) -> Option<[u8; 32]> {
+        self.executed
+            .iter()
+            .rev()
+            .find(|block| block.consensus_hash == consensus_hash)
+            .map(|block| block.block_id)
+    }
+
     /// Give up every block executed after `block_id` and stand on it again.
     ///
     /// A Stacks fork is not a Bitcoin reorganization: the sortitions still

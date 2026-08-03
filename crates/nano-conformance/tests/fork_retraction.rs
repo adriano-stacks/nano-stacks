@@ -130,3 +130,60 @@ fn retracting_to_a_block_this_node_never_executed_does_nothing() {
         "and leaves the executed chain alone"
     );
 }
+
+#[test]
+fn a_fork_point_names_the_last_block_of_its_tenure() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (mut chainstate, source) = open(directory.path());
+    let mut tenures = Vec::new();
+    replay_into(
+        &mut chainstate,
+        source,
+        &fixtures(),
+        FixtureManifest {
+            mode: FixtureMode::Captured,
+            replay_blocks: BLOCKS,
+            receipts: true,
+        },
+        0,
+        &mut |block, _| tenures.push((block.header.consensus_hash, *block.block_id().as_bytes())),
+    );
+
+    // A fork point is agreed in burn blocks and answers with a consensus hash;
+    // a retraction has to name a Stacks block. Everything up to the last block
+    // of that tenure is on both chains, and everything after it is disputed.
+    let (consensus_hash, _) = tenures.first().copied().expect("a tenure");
+    let last = tenures
+        .iter()
+        .rev()
+        .find(|(hash, _)| *hash == consensus_hash)
+        .map(|(_, id)| *id)
+        .expect("a block in that tenure");
+    assert_eq!(
+        chainstate.last_block_of_tenure(consensus_hash),
+        Some(last),
+        "the bridge names the last block executed under the tenure"
+    );
+
+    let retraction = chainstate.retract_to(last);
+    assert_eq!(retraction.resume_from, Some(last));
+    assert!(
+        chainstate
+            .executed_blocks()
+            .last()
+            .is_some_and(|tip| *tip == last),
+        "and the node stands there"
+    );
+}
+
+#[test]
+fn a_tenure_this_node_never_executed_names_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (chainstate, _) = open(directory.path());
+    assert_eq!(
+        chainstate.last_block_of_tenure(nano_primitives::ConsensusHash::from_bytes([0x7f; 20])),
+        None,
+        "a tenure from another chain names no block of this one"
+    );
+}
+
