@@ -18,7 +18,10 @@ use nano_address::StacksAddress;
 use crate::runtime::BurnchainSource;
 use nano_chainstate::{NakamotoBlock, SignerSetError};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
+use std::sync::Arc;
+
 use nano_mempool::Mempool;
+use tokio::sync::Mutex;
 use nano_miner::{
     BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError, RegisteredLeaderKey,
     SortitionHashPoint, TenureExtension, TenureTip, build_tenure_continuation_block,
@@ -55,6 +58,8 @@ pub struct Runtime {
     pub peer: SyncClient,
     pub executor: SharedExecutor,
     pub dispatcher: EventDispatcher,
+    /// The pool the RPC admits transactions into, so they are the same ones.
+    pub mempool: Arc<Mutex<Mempool>>,
 }
 
 /// Commit on every Bitcoin block and mine every tenure this miner wins.
@@ -68,6 +73,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     let Runtime {
         config,
         miner,
+        mempool,
         network,
         pox,
         peer,
@@ -106,7 +112,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         },
         committed_at: 0,
         mined: Vec::new(),
-        mempool: Mempool::new(network),
+        mempool,
         tenure: None,
     };
     state.leader_key = state.registered_key(&wallet).await?;
@@ -218,7 +224,10 @@ struct State {
     /// Tenures already started, so a won sortition is not mined twice.
     mined: Vec<ConsensusHash>,
     /// The transactions this node holds for the blocks it still owes.
-    mempool: Mempool,
+    ///
+    /// Shared with the RPC: a node whose RPC admits transactions into a pool the
+    /// miner cannot see accepts them and never mines them.
+    mempool: Arc<Mutex<Mempool>>,
     tenure: Option<TenureState>,
 }
 
@@ -399,7 +408,7 @@ impl State {
     /// with no transactions and no tenure change would only ask the signers to
     /// sign the state they already agreed to.
     async fn continue_tenure(
-        &mut self,
+        &self,
         executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<Option<NakamotoBlock>, Box<dyn Error>> {
         let state = self.tenure.as_ref().expect("a tenure to continue");
@@ -410,10 +419,21 @@ impl State {
             return Ok(None);
         }
         let now = now_unix();
-        self.peer.fill_mempool(&mut self.mempool, now).await?;
-        let accounts = self.peer.accounts_for(&self.mempool).await?;
-        self.mempool.advance(&accounts, now);
-        let pending = self.mempool.candidates(&accounts);
+        // Held only while the pool is touched: the peer calls below await, and
+        // the RPC admits into the same pool meanwhile.
+        {
+            let mut mempool = self.mempool.lock().await;
+            self.peer.fill_mempool(&mut mempool, now).await?;
+        }
+        let accounts = {
+            let mempool = self.mempool.lock().await;
+            self.peer.accounts_for(&mempool).await?
+        };
+        let pending = {
+            let mut mempool = self.mempool.lock().await;
+            mempool.advance(&accounts, now);
+            mempool.candidates(&accounts)
+        };
         let extend_due = !state.extended
             && state.since.elapsed() >= Duration::from_secs(self.miner.tenure_extend_after_secs);
         if pending.is_empty() && !extend_due {
@@ -469,7 +489,7 @@ impl State {
         // A confirmed transaction leaves now rather than when the peer's
         // account nonces catch up, so the next block does not offer it again.
         for transaction in &block.transactions {
-            self.mempool.remove(transaction.txid());
+            self.mempool.lock().await.remove(transaction.txid());
         }
         Ok(Some(block))
     }

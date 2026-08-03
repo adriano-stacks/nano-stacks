@@ -26,8 +26,9 @@ execution.
 
 ## Tasks
 
-- [ ] Construct and share the mempool, block/proposal channel, proposal token,
-      reward sets and StackerDB configuration in runtime.
+- [x] Construct and share the mempool in runtime.
+- [ ] Construct and share the block/proposal channel, proposal token, reward sets
+      and StackerDB configuration in runtime.
 - [ ] Admit uploaded blocks and proposals through the same validator as followed
       blocks.
 - [x] Publish `new_block` only after execution, with nano's actual receipts,
@@ -71,4 +72,25 @@ the remaining work on this item.
 published, which is the harder half and says nothing about whether anything sends
 it. `tests/event_delivery.rs` is the other half: a listener, a dispatch, and the
 body arriving.
+
+## One mempool, shared
+
+The miner built its own `Mempool` and the RPC had none, so `/v2/transactions`
+answered `Unavailable` and there was nowhere for a submitted transaction to go.
+Worse would have been giving the RPC a second pool: a node that admits
+transactions the miner cannot see accepts them and never mines them, which reads
+as acceptance and behaves as a black hole.
+
+So the runtime builds one and hands it to both. The miner takes the lock only
+while it touches the pool — it awaits a peer between those points, and the RPC
+admits into the same pool meanwhile.
+
+`/v2/transactions` now decodes and rejects (`400`, "failed to decode
+transaction") rather than reporting itself unavailable, which is the route being
+live.
+
+Noticed while checking: `/v2/info` answers `503` even with an executed tip
+present, which `/nano/sync_status` reports happily. Whatever else it wants is not
+the tip, and that belongs to the "serve every route from the executed snapshot"
+item rather than this one.
 

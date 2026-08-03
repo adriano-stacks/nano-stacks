@@ -124,9 +124,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     };
     let dispatcher = EventDispatcher::new(config.node.event_observers()?);
     announce_executed_blocks(executor.as_ref(), &dispatcher).await;
+    // One mempool, shared: a node whose RPC admits transactions into a pool the
+    // miner cannot see accepts them and never mines them, which is worse than
+    // refusing them.
+    let mempool = Arc::new(Mutex::new(nano_mempool::Mempool::new(network)));
 
     let mut roles = JoinSet::new();
-    let state = start_rpc(&config, executor.clone(), &mut roles).await?;
+    let state = start_rpc(&config, executor.clone(), mempool.clone(), &mut roles).await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
@@ -141,6 +145,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             peer: peer.clone(),
             executor,
             dispatcher,
+            mempool: mempool.clone(),
         };
         roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
     }
@@ -488,12 +493,13 @@ async fn resume_from(
 async fn start_rpc(
     config: &Config,
     executor: Option<SharedExecutor>,
+    mempool: Arc<Mutex<nano_mempool::Mempool>>,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
 ) -> Result<Option<RpcState>, Box<dyn Error>> {
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
-    let mut state = RpcState::new();
+    let mut state = RpcState::new().with_mempool(mempool);
     if let Some(executor) = executor {
         state = state.with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
     }
