@@ -1437,6 +1437,28 @@ impl MarfStore {
         self.side_store.path().map(std::path::PathBuf::from)
     }
 
+    /// Whether a contract's stored definition can be run by the interpreter.
+    ///
+    /// clar2wasm's deploy writes placeholder function bodies — the real ones
+    /// live in the module — so a contract the compiler deployed is not
+    /// executable by the interpreter at all: it evaluates the placeholder and
+    /// returns whatever that is. This makes that answerable before the call
+    /// rather than after, when it looks like a type error in the contract.
+    ///
+    /// The repair this enables is safe to store, which is not obvious: contract
+    /// definitions live in `metadata_table`, a side store, and never reach the
+    /// MARF, so rewriting one changes no state root.
+    #[must_use]
+    pub fn contract_is_interpretable(&self, contract: &QualifiedContractIdentifier) -> bool {
+        let key = format!("clr-meta::{contract}::vm-metadata::9::contract");
+        self.side_store
+            .prepare_cached("SELECT value FROM metadata_table WHERE key = ?1 LIMIT 1")
+            .and_then(|mut statement| {
+                statement.query_row(params![key], |row| row.get::<_, String>(0))
+            })
+            .is_ok_and(|stored| !stored.contains(r#""body":{"expr":{"LiteralValue":{"Int":0}}"#))
+    }
+
     fn write_value(&self, value_hash: MarfValue, value: &str) -> Result<(), MarfStoreError> {
         self.side_store
             .prepare_cached("INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)")?

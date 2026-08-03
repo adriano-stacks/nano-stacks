@@ -1002,3 +1002,23 @@ The source is stored byte-identically to mainnet's, which is what makes the
 rebuild possible and is worth knowing before anyone reaches for the second
 option.
 
+### The repair is safe to store, which is the part that was not obvious
+
+A contract's definition lives in `metadata_table` — a side store — and never
+reaches the MARF. `import_side_store` copies it whole for exactly that reason:
+it holds analyses rather than per-key state. So **rewriting a stored contract
+context changes no state root**, which is what makes healing one on demand a
+legitimate repair rather than a consensus hazard.
+
+`MarfStore::contract_is_interpretable` answers the question before the call
+instead of after: a stored definition whose function bodies are the placeholder
+`{"expr":{"LiteralValue":{"Int":0}}}` cannot be run by the interpreter.
+
+What remains is the repair itself: parse the stored source — kept byte-identical
+to mainnet's — walk its `define-public`, `define-private` and `define-read-only`
+forms, rebuild each `DefinedFunction` with its real body, and write the context
+back. `DefinedFunction::new` and `ContractContext::functions` are both public, so
+no re-execution of top-level expressions is needed — which matters, because
+re-running them would reset every data variable the contract has changed since,
+and that *would* corrupt state.
+
