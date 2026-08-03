@@ -2956,6 +2956,34 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     // writes variables and maps under a branch, which is evidence rather than a
     // guarantee, so this remains for carrying a replay forward and finding the
     // next divergence. The costs the two charge do differ.
+    // A call that failed only because the compiler could not build a loadable
+    // module is the compiler's fault and never the chain's — mainnet ran this
+    // contract, on the interpreter. So that one failure answers from the
+    // interpreter by default, which is narrower than the blanket fallback
+    // below: a genuine runtime error stays a runtime error, because that is a
+    // real answer and replacing it would hide a divergence rather than carry
+    // one forward.
+    if let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
+        && reports_analysis_failure(error)
+    {
+        heal_reachable_contracts(store, bitcoin_context, &call.contract);
+        eprintln!(
+            "{}::{} was answered by the interpreter: the compiler refused a module ({error:?})",
+            call.contract, call.function
+        );
+        return execute_contract_call_outcome_in_context(
+            store,
+            bitcoin_context,
+            ContractCall {
+                sender: call.sender.clone(),
+                sponsor: call.sponsor.clone(),
+                contract: call.contract.clone(),
+                function: call.function,
+                arguments: call.arguments,
+            },
+            cost_tracker.clone(),
+        );
+    }
     let fall_back = std::env::var_os("NANO_INTERPRETER_FALLBACK").is_some();
     if (fall_back || std::env::var_os("NANO_CROSSCHECK").is_some())
         && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
