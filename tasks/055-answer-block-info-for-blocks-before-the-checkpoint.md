@@ -707,3 +707,25 @@ special-case wiring rather than anywhere general. The error now names the call
 that caused it, which is what turned this from "the interpreter does not work"
 into a specific thing to fix.
 
+### Where the PoX unwind goes wrong
+
+The chain is short and worth writing down. `handle_contract_call_special_cases`
+dispatches `pox-5` to `pox_5::handle_contract_call`, which for `stake-update`
+reaches `handle_stake_lockup_update_pox_v5`. That locks the STX and then calls
+
+```rust
+global_context.log_stacking(&staker, amount_ustx)?;
+```
+
+`log_stacking` appends to the *current* context's asset map. `destruct` refuses
+to unwind because a Clarity context — not the database — is still open, which is
+what happens when an error propagates out of the handler after the environment
+has pushed one. The wasm path drives the same handler through
+`stdlib.contract_call` and does not hit it.
+
+So the fix is in how nano's interpreter entry brackets a transaction against what
+the special-case handler expects, not in the handler. It is the last thing
+between the plan's own fallback and a node that can use it, and it is also
+[[M8d]] — the gate that `pox-5.stack-stx` must move locked STX rather than only
+map entries.
+
