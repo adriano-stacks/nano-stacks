@@ -748,3 +748,24 @@ first thing to trip over it, and onto what nano's interpreter path reads as
 Worth keeping as a habit: an error raised while unwinding is almost never the
 error worth reading.
 
+## A rejected deployment stopped the whole block
+
+The cost a transaction reports is the block's *running total*, and the caller
+subtracts what the block had already spent to get that transaction's own. A
+rejected deployment reported `ExecutionCost::ZERO`, so the subtraction underflowed
+and the block died with `transaction cost underflow` — a hard stop, where the
+transaction merely failing is what the network does.
+
+A rejected deployment costs nothing, which is the running total *unchanged*.
+With that, the block executes and 8,666,585 is an ordinary state-root divergence
+instead of a node that stops.
+
+## Where replay actually is
+
+Measured rather than assumed, on a clean run: **8,666,584**, advancing about 150
+blocks per ten minutes with zero state-root mismatches behind it. The blocks I
+had been treating as a wall — 8,665,893, 8,666,423 — go past; the fixes for
+`merge`, the constant-named contract, the deploy that never compiled its callees
+and the burn-header seeding carried them, and my reading of "stuck" was against a
+stale binary.
+

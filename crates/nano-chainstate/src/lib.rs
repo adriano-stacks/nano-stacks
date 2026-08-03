@@ -1897,7 +1897,7 @@ impl ChainState {
                 cost_tracker,
             ) {
                 Ok(result) => result,
-                Err(error) => failed_deployment(error, &mut runtime_error)?,
+                Err(error) => failed_deployment(error, execution_cost.clone(), &mut runtime_error)?,
             },
             TransactionPayloadData::VersionedSmartContract {
                 clarity_version,
@@ -1910,7 +1910,7 @@ impl ChainState {
                 cost_tracker,
             ) {
                 Ok(result) => result,
-                Err(error) => failed_deployment(error, &mut runtime_error)?,
+                Err(error) => failed_deployment(error, execution_cost.clone(), &mut runtime_error)?,
             },
             TransactionPayloadData::ContractCall {
                 address,
@@ -2346,6 +2346,7 @@ fn describe_mismatch(
 /// deployment naming a contract that had not been deployed yet.
 fn failed_deployment(
     error: ClarityEvalError,
+    execution_cost: ExecutionCost,
     runtime_error: &mut Option<String>,
 ) -> Result<TransactionResult, ChainStateError> {
     if !nano_vm::is_contract_analysis_failure(&error) {
@@ -2359,8 +2360,13 @@ fn failed_deployment(
     eprintln!("a deployment was rejected: {error}");
     *runtime_error = Some(error.to_string());
     Ok(TransactionResult {
+        // The cost a transaction reports is the block's running total, and the
+        // caller subtracts what the block had already spent to get this
+        // transaction's own. A rejected deployment costs nothing, which is the
+        // running total unchanged — reporting zero instead underflows that
+        // subtraction and stops the block.
         value: Some(Value::err_none()),
-        cost: ExecutionCost::ZERO,
+        cost: execution_cost,
         assets: AssetMap::new(),
         events: Vec::new(),
     })
