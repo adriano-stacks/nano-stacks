@@ -390,3 +390,23 @@ The transaction merely *failed* rather than erroring loudly, which is why the
 block's root diverged with all three receipts present: a failed call writes
 nothing, and nothing is a state the network never had.
 
+## Replay depth: 8,665,781 to 8,665,892
+
+With the three compiler and burn-view fixes the node executed **111 further
+blocks** in one run, across two tenures and three burn blocks, and stopped at
+8,665,893.
+
+That block is a different kind of divergence, and the first where nano's
+*receipts* disagree with the network's:
+
+| | mainnet | nano |
+|---|---|---|
+| `e855cacc` | `(ok (list (err u9) (err u9)))`, 44 writes | `(ok ((ok u1529) (err u9)))`, 45 writes |
+| `0a599bb5` | `… (err u9) (err u9) (ok u3742) (err u9) (ok u287)…`, 152 writes | `… (err u9) (err u2) (err u2) (err u2)…` |
+
+nano's first sub-swap *succeeds* where the network's fails, and later ones return
+the aggregator's `u2` where the network gets `u9` or a result. No contract failed
+to compile in this block, so this is a behavioural difference inside one of the
+pool contracts the aggregator routes through — the opposite direction from the
+last three, where nano did too little.
+
