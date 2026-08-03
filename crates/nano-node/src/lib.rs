@@ -71,6 +71,8 @@ pub struct CatchUpBudget {
 /// What one round of catching up actually did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CatchUpRound {
+    /// The block a fork switch stood on, when one happened.
+    pub reorganized: Option<[u8; 32]>,
     pub fetched: usize,
     pub executed: usize,
     /// Blocks fetched but not yet executed.
@@ -633,6 +635,19 @@ where
         }
         round.fetched = fetched;
         round.executed = self.execute_staged(node, pox, staging, budget.execute).await?;
+        // A descent that fetched blocks and executed none, while the peer is
+        // ahead, is what a fork looks like from here: the peer's chain walked
+        // past this node's tip on another branch, so nothing staged extends it
+        // and no later round ever will. Standing where the two chains agree is
+        // what turns that from a stall into a reorganisation.
+        if round.executed == 0
+            && round.fetched > 0
+            && let Ok(peer) = node.tenure_info().await
+            && let Some(resume) = self.switch_to_fork(node, peer.consensus_hash).await?
+        {
+            round.reorganized = Some(resume);
+            staging.clear()?;
+        }
         round.staged = staging.len()?;
         Ok(round)
     }

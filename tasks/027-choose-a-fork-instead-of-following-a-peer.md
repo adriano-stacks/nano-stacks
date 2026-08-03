@@ -1,7 +1,7 @@
 ---
 id: "027"
 title: "Choose a fork instead of following a peer"
-status: in-progress
+status: completed
 priority: high
 effort: large
 type: improvement
@@ -34,7 +34,7 @@ strands it.
       taken instead of refused.
 - [x] Give the executor a fork switch that finds where the chains parted and
       stands there.
-- [ ] Call it from the follow path instead of raising `SyncError::Fork`.
+- [x] Call it from the follow path instead of stalling.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
 - [x] Treat a peer that serves an invalid block as untrusted rather than fatal.
 
@@ -115,4 +115,22 @@ that makes "fork choice" worth having over "follow whoever is configured".
 consensus hashes and nothing else: it did not learn its chain from a `fork_info`
 answer, and making it fabricate burn heights to throw them away would be
 inventing evidence.
+
+### What a fork looks like from the follow path
+
+Not an error, as it turns out. A descent walks back from the peer's tip until it
+reaches a block at or below this node's height — and on a fork it reaches that
+height on *another branch*, stages it, and stops. Nothing raises. What happens
+instead is that nothing staged extends this node's tip, so the round executes
+zero blocks, and no later round ever will either.
+
+So the signal is: **fetched blocks, executed none**. `catch_up` now takes that as
+the question worth asking, and asks it of the peer's own tenure. A healthy chain
+never reaches it, because a healthy round executes what it fetched — confirmed
+against mainnet, where the switch has not fired once.
+
+Task 027 is complete: several peers are followed, candidates are chosen on
+length and signature weight rather than arrival, a peer serving an invalid block
+is untrusted rather than fatal, and a heavier fork is now taken instead of
+stalling.
 
