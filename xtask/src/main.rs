@@ -1722,6 +1722,23 @@ fn probe_orders(
     false
 }
 
+/// Read a call argument written as `u123`, `SP....name`, or raw hexadecimal.
+///
+/// Hand-encoding a contract principal is a c32 checksum away from being wrong in
+/// a way that looks like a missing contract, so the same parser Clarity uses
+/// does it here.
+fn clarity_argument(text: &str) -> Option<Vec<u8>> {
+    use clarity::vm::Value;
+    if let Some(number) = text.strip_prefix('u') {
+        return Value::UInt(number.parse().ok()?).serialize_to_vec().ok();
+    }
+    if text.contains('.') {
+        let contract = clarity::vm::types::QualifiedContractIdentifier::parse(text).ok()?;
+        return Value::Principal(contract.into()).serialize_to_vec().ok();
+    }
+    hex::decode(text).ok()
+}
+
 /// Run one contract call through both engines and print what each answered.
 ///
 /// The interpreter is what mainnet runs, so a call the two answer differently
@@ -1729,6 +1746,13 @@ fn probe_orders(
 /// chainstate it can be a read-only function of a contract that is only
 /// reachable through half a dozen others.
 fn call_both(arguments: &[String]) -> ExitCode {
+    // An optional leading `--sender <principal>`: a swap called by the wrong
+    // sender fails on a balance long before it reaches anything worth
+    // comparing, and the sender that matters is usually a contract.
+    let (sender, arguments) = match arguments {
+        [flag, principal, rest @ ..] if flag == "--sender" => (Some(principal.clone()), rest),
+        _ => (None, arguments),
+    };
     let [state, contract, function, rest @ ..] = arguments else {
         eprintln!(
             "usage: cargo xtask call-both <state-dir> <contract-id> <function> [hex-argument...]\n\
@@ -1742,13 +1766,11 @@ fn call_both(arguments: &[String]) -> ExitCode {
     };
     let mut encoded = Vec::new();
     for argument in rest {
-        match hex::decode(argument) {
-            Ok(bytes) => encoded.push(bytes),
-            Err(error) => {
-                eprintln!("{argument} is not hexadecimal: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
+        let Some(bytes) = clarity_argument(argument) else {
+            eprintln!("{argument} is not a uint, a contract principal, or hexadecimal");
+            return ExitCode::FAILURE;
+        };
+        encoded.push(bytes);
     }
 
     let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
@@ -1769,8 +1791,17 @@ fn call_both(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         vm.interpret_contract_calls(interpreted);
+        let caller = match sender.as_deref() {
+            Some(text) if text.contains('.') => {
+                clarity::vm::types::QualifiedContractIdentifier::parse(text)
+                    .map_or_else(|_| identifier.issuer.clone().into(), Into::into)
+            }
+            Some(text) => clarity::vm::types::PrincipalData::parse(text)
+                .unwrap_or_else(|_| identifier.issuer.clone().into()),
+            None => identifier.issuer.clone().into(),
+        };
         let outcome = vm.execute_contract_call_outcome(
-            identifier.issuer.clone().into(),
+            caller,
             None,
             identifier.clone(),
             function,

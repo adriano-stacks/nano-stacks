@@ -603,3 +603,24 @@ unit, a `u128` maximum, and a swap of almost the whole balance.
 So the divergence is not the curve. It is in the stateful swap path around it,
 which is where to look next.
 
+## Narrowing further: not the quote either
+
+`call-both` now takes arguments as `u123` or `SP....name` and parses them with
+Clarity's own parser — hand-encoding a contract principal is a c32 checksum away
+from looking like a missing contract, which cost one run — and takes an optional
+`--sender`, since a swap called by the wrong principal fails on a balance long
+before it reaches anything worth comparing.
+
+Against the stableswap pool both failing legs go through, the engines agree on:
+
+- `get-y`, the curve solver, across equal balances, a pool drained to one unit,
+  a `u128` maximum, and a swap of nearly the whole balance;
+- `get-dy`, the quote that wraps it;
+- `swap-x-for-y` itself, which both refuse identically for want of a balance.
+
+So the divergence is not the curve, not the quote, and not the swap's own
+refusal path. Reproducing it needs the transaction's real sender and amounts —
+the aggregator calls the leg `as-contract` with a buffer-encoded route — which
+means the next step is for the crosscheck to report the *sub-call* that first
+differs rather than only the transaction.
+
