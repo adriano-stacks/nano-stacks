@@ -565,3 +565,24 @@ sub-expression whose width the surrounding type fixes.
 
 Replay reaches **8,666,422**.
 
+## The oracle earns its keep: a compiler divergence proven against the chain
+
+Block 8,666,423's aggregator call is the first divergence settled by the
+dual-engine crosscheck rather than by reasoning:
+
+| | 5th | 6th | 7th sub-swap |
+|---|---|---|---|
+| compiler | `(err u9)` | `(err u2)` | `(err u2)` |
+| interpreter | `(err u9)` | `(err u9)` | `(ok u17539)` |
+| **mainnet** | `(err u9)` | `(err u9)` | `(ok u17539)` |
+
+The interpreter matches the chain exactly, so clarity-wasm is wrong — no
+argument about state, context or ordering is needed. That is the seventh
+clarity-wasm divergence this replay has found and the first where the answer
+came in one run from a tool rather than a day of narrowing.
+
+The same shape appeared at 8,665,893 and was left uncharacterised; it is this.
+The reduction still has to be done — the sub-swaps route through several DEX
+adapters and the failing one has to be isolated — but which engine is at fault
+is no longer in question.
+
