@@ -456,6 +456,30 @@ where
         self.bitcoin_height
     }
 
+    /// Ask a peer for something, waiting out the limits it answers with.
+    ///
+    /// A node writing down the headers it is missing cannot execute anything
+    /// until it has them, so it has nothing better to do than wait — unlike a
+    /// round of following, which gives up early and asks again next poll.
+    async fn wait_out_limits<T, F, Ask>(mut ask: F) -> Result<T, SyncError>
+    where
+        F: FnMut() -> Ask,
+        Ask: std::future::Future<Output = Result<T, SyncError>>,
+    {
+        let mut wait = std::time::Duration::from_secs(1);
+        loop {
+            match ask().await {
+                Err(error)
+                    if error.is_rate_limited() && wait < std::time::Duration::from_secs(32) =>
+                {
+                    tokio::time::sleep(wait).await;
+                    wait = wait.saturating_mul(2);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
     /// Write down the headers of blocks this node executed before it kept any.
     ///
     /// A contract reading the block it is standing on gets `none` otherwise,
@@ -476,7 +500,7 @@ where
         let mut walk = Vec::new();
         let mut cursor = self.tip.block_id();
         while *cursor.as_bytes() != from {
-            let block = match node.block(cursor).await {
+            let block = match Self::wait_out_limits(|| node.block(cursor)).await {
                 Ok(block) => block,
                 // A peer that is rate limiting has not refused: what was walked
                 // stands, and the next start carries on from the tip again.
@@ -497,7 +521,8 @@ where
         }
         let mut recorded = 0;
         for block in walk.iter().rev() {
-            let sortition = match node.sortition(block.header.consensus_hash).await {
+            let sortition =
+                match Self::wait_out_limits(|| node.sortition(block.header.consensus_hash)).await {
                 Ok(sortition) => sortition,
                 Err(error) if error.is_rate_limited() => break,
                 Err(error) => return Err(error.into()),
