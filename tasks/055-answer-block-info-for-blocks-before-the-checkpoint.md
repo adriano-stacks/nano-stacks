@@ -481,3 +481,25 @@ Worth keeping: a lookup that can reject a withdrawal the network accepted is
 worth being able to watch, so `NANO_TRACE_BURN_HEADERS` prints what every one
 answered.
 
+## 8,666,265: a deploy that does not commit
+
+Replay ran clean from 8,665,971 to **8,666,264** and stops on the next block with
+a hard error rather than a root mismatch:
+
+```
+no contract commitment for SPSX722NK9V3A8D3CVQT0CDY4EBQ3E9FSDDE61FT.linear-kinked-ir-v1
+Clarity evaluation error: NotInDatabase("compiled contract ...")
+```
+
+That contract is *deployed in this very block* — 8,666,265 — and something in the
+same block calls it. nano's deploy leaves no commitment, so the call cannot find
+it and the block dies.
+
+The contract is not the problem: fetched from the chain it is 8 KB and
+`cargo xtask check-module` compiles it to a module that loads under Clarity 3
+and 4 against nano's own state. So the deploy *transaction* is failing for some
+other reason — its version byte, a post-condition, or the deploy path itself —
+and that is the next thing to look at. Reading the source out of the block bytes
+by hand does not work; it has to be decoded properly, which is worth adding to
+`decode-blocks`.
+
