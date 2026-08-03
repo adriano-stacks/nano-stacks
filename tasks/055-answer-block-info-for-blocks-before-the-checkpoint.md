@@ -866,3 +866,19 @@ difference is in what nano's state gives it, not in the interpreter.
 Naming the call on the way out is what made this findable; the error alone says
 a public function returned the wrong shape and not which one.
 
+### Not the source, and not the `.dao` check
+
+Narrowed by elimination rather than guessed:
+
+- `.dao check-is-enabled`, the first thing `delegate` calls, **agrees** between
+  the engines against real state;
+- nano's stored `pox-5` source has `(define-public (stake …))` and
+  `(define-public (stake-update …))`, both declaring responses, so the contract
+  the interpreter evaluates is the right one;
+- its stored analysis agrees, giving `stake-update` a `ResponseType` return.
+
+So neither the source, the analysis, nor the call before it. What is left is the
+invocation itself — `pox-5 stake` reached through
+`try! (contract-call? …)` from `delegate` — with the arguments that transaction
+actually passes, which is where to pick this up.
+
