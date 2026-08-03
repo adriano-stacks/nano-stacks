@@ -495,9 +495,13 @@ where
             cursor = block.header.parent_block_id;
             walk.push(block);
         }
-        let recorded = walk.len();
+        let mut recorded = 0;
         for block in walk.iter().rev() {
-            let sortition = node.sortition(block.header.consensus_hash).await?;
+            let sortition = match node.sortition(block.header.consensus_hash).await {
+                Ok(sortition) => sortition,
+                Err(error) if error.is_rate_limited() => break,
+                Err(error) => return Err(error.into()),
+            };
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
@@ -505,6 +509,7 @@ where
             self.chainstate
                 .backfill_block_header(block, bitcoin_context)
                 .map_err(CheckpointExecutionError::from)?;
+            recorded += 1;
         }
         Ok(recorded)
     }
