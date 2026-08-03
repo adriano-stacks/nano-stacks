@@ -3508,6 +3508,75 @@ mod tests {
         assert_eq!(vm.recorded_header([7; 32]), Some(header));
     }
 
+    /// A trait call whose response carries a list of responses.
+    ///
+    /// A mainnet contract declares
+    /// `(response (list 20 (response uint uint)) uint)` on a trait and calls
+    /// it dynamically, and clarity-wasm compiled the caller to a module
+    /// wasmtime refused: "expected i64, found i32", which is a response's
+    /// payload width against its indicator's.
+    #[test]
+    fn a_trait_returning_a_list_of_responses_compiles() {
+        let caller =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.caller")
+                .expect("valid contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+
+        vm.deploy_contract(
+            caller,
+            ClarityVersion::Clarity3,
+            "(define-trait z ((ss ((buff 400)) (response (list 20 (response uint uint)) uint))))
+             (define-public (r (b (buff 400)) (t <z>))
+               (if (> (len b) u0) (contract-call? t ss b) (ok (list))))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("a contract calling such a trait deploys");
+    }
+
+    /// An empty list of responses is still a list of responses.
+    ///
+    /// A mainnet contract returns `(ok (list))` where the declared type is
+    /// `(list 20 (response uint uint))`, and clarity-wasm compiled it to a
+    /// module wasmtime refused — "expected i64, found i32", which is a
+    /// response's payload width against its indicator's.
+    #[test]
+    fn an_empty_list_of_responses_compiles() {
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.empty")
+                .expect("valid contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+
+        vm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity3,
+            "(define-public (go (n uint))
+               (if (> n u0) (ok (list (ok u1))) (ok (list))))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("a contract returning an empty list of responses deploys");
+
+        let mut argument = Vec::new();
+        Value::UInt(0)
+            .consensus_serialize(&mut argument)
+            .expect("serialize");
+        let outcome = vm
+            .execute_contract_call_outcome(
+                contract.issuer.clone().into(),
+                None,
+                contract,
+                "go",
+                &[argument],
+                &LimitedCostTracker::new_free(),
+            )
+            .expect("the call runs");
+        assert!(
+            matches!(outcome, ContractCallOutcome::Success(_)),
+            "the empty branch runs: {outcome:?}"
+        );
+    }
+
     /// A height falls in the epoch mainnet was in at the time.
     ///
     /// Answering "epoch 4.0" everywhere is only right at the tip, and a

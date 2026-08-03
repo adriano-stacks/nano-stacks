@@ -190,6 +190,27 @@ raises no event. `vm-metadata::` is the shape that fits — a contract's data si
 changes without an event — and this plan lists those among the Clarity key
 strings the MARF holds, where nano keeps them in the side store.
 
+### Knowing which epoch a height was in
+
+`get_stacks_epoch` answered "epoch 4.0" for every height, which is only right at
+the tip, and rebuilding a contract the current epoch rejects jumped to the
+oldest epoch its Clarity version allowed — sending a Clarity 1 contract back to
+epoch 2.0, the least exercised paths in the compiler. Mainnet's boundaries are
+now transcribed from stacks-core and pinned against it, and the rebuild walks
+epochs newest first.
+
+That took the contracts needing the interpreter from **forty crosschecks to
+one**: `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.flea`, which compiles under
+epoch 4.0 and produces a module wasmtime refuses — "expected i64, found i32" at
+byte offset 74,624.
+
+It is an adversarial contract: one trait returning
+`(response (list 20 (response uint uint)) uint)` and forty near-identical
+functions calling it. Neither shape reproduces the fault on its own — both are
+kept as regression coverage, since this plan expects divergences around trait
+lists — so the trigger is scale, and fixing it is work in the code generator
+rather than a word.
+
 **And the fallback itself is the likely answer.** Block 8,665,780 runs through
 the interpreter, because a contract in it compiles to wasm that will not load.
 A MARF packs a node's pointers in the order its keys were first written, so two
