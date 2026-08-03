@@ -2348,11 +2348,18 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     cost_tracker: &LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     let outcome = wasm_outcome(store, bitcoin_context, modules, call, cost_tracker)?;
-    // The interpreter is in the tree and is the oracle clarity-wasm is checked
-    // against, so a call the compiler refuses can be asked of it directly. A
-    // disagreement names a compiler bug; agreement says the state or the
+    // The interpreter is the oracle clarity-wasm is checked against and it is
+    // in the tree, so a call the compiler refuses can be asked of it directly.
+    // A disagreement names a compiler bug; agreement says the state or the
     // arguments are what differ.
-    if std::env::var_os("NANO_CROSSCHECK").is_some()
+    //
+    // Answering from it is a deliberate fallback rather than a default: this
+    // plan names the interpreter as the execution path to fall back to, and a
+    // node that would otherwise stop on a block the network accepted is better
+    // off carrying on and saying so. It is off unless asked for, because the
+    // costs the two charge are not guaranteed to agree.
+    let fall_back = std::env::var_os("NANO_INTERPRETER_FALLBACK").is_some();
+    if (fall_back || std::env::var_os("NANO_CROSSCHECK").is_some())
         && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
     {
         let interpreted = execute_contract_call_outcome_in_context(
@@ -2379,6 +2386,9 @@ fn execute_contract_call_outcome_with_wasm_in_context(
                 Err(error) => format!("error {error:?}"),
             }
         );
+        if fall_back && let Ok(interpreted) = interpreted {
+            return Ok(interpreted);
+        }
     }
     Ok(outcome)
 }
@@ -3213,6 +3223,38 @@ mod tests {
             ("(unwrap-panic (slice? 0x0102 u0 u2))", "0x0102"),
             // And one starting at the end is not, the same as for a list.
             ("(slice? 0x0102 u2 u2)", "none"),
+        ] {
+            let value = evaluate(Network::TESTNET, program)
+                .expect("the program evaluates")
+                .expect("the program returns a value");
+            assert_eq!(format!("{value}"), expected, "{program}");
+        }
+    }
+
+    /// `slice?` with a bound the compiler cannot see, which is the shape a
+    /// VAA check uses.
+    ///
+    /// Wormhole slices a nineteen-element list down to a signature count read
+    /// out of the message at run time, so the bound is a value rather than a
+    /// literal — and a compiler may treat the two differently.
+    #[test]
+    fn slice_over_a_list_with_a_runtime_bound() {
+        for (program, expected) in [
+            (
+                "(let ((n (unwrap-panic (slice? 0x0002 u1 u2)))) \
+                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
+                "(some (u1 u2))",
+            ),
+            (
+                "(let ((n (unwrap-panic (slice? 0x0000 u1 u2)))) \
+                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
+                "(some ())",
+            ),
+            (
+                "(let ((n (unwrap-panic (slice? 0x0009 u1 u2)))) \
+                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
+                "none",
+            ),
         ] {
             let value = evaluate(Network::TESTNET, program)
                 .expect("the program evaluates")
