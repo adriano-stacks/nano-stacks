@@ -42,6 +42,12 @@ pub struct CheckpointExecutor<S> {
     /// The burn view the current tenure is standing on, which a tenure change
     /// states and the blocks after it inherit.
     bitcoin_view: Option<nano_primitives::ConsensusHash>,
+    /// Where to announce the blocks this node executes.
+    ///
+    /// An observer's whole purpose is to see what a node *executed*, so this
+    /// belongs on the executor rather than beside it: a `new_block` sent from
+    /// anywhere else would announce a block that had only been downloaded.
+    observers: Option<nano_rpc::EventDispatcher>,
     bitcoin: S,
 }
 
@@ -370,6 +376,7 @@ where
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
+            observers: None,
             bitcoin,
         })
     }
@@ -388,6 +395,7 @@ where
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
+            observers: None,
             bitcoin,
         }
     }
@@ -691,6 +699,49 @@ where
     }
 
     /// Derive sortitions locally from here on, alongside the peer's answers.
+    /// Tell the observers what this node just executed.
+    ///
+    /// Only the fields a follower can answer from what it holds are filled in;
+    /// the rest are left at their defaults rather than invented, since an
+    /// observer comparing nano with stacks-core is better served by a field that
+    /// is plainly absent than by one that is confidently wrong.
+    fn block_event(
+        &self,
+        block: &NakamotoBlock,
+        applied: &AppliedBlock,
+        context: BitcoinBlockContext,
+    ) -> Option<(nano_rpc::EventDispatcher, serde_json::Value)> {
+        let observers = self.observers.as_ref()?;
+        let event = nano_rpc::BlockEventContext {
+            parent_block_hash: nano_primitives::BlockHeaderHash::from_bytes(
+                *block.header.parent_block_id.as_bytes(),
+            ),
+            bitcoin_block_hash: nano_primitives::BitcoinHeaderHash::from_bytes(
+                context.burn_header_hash,
+            ),
+            bitcoin_height: context.height,
+
+            v1_unlock_height: context.v1_unlock_height,
+            v2_unlock_height: context.v2_unlock_height,
+            v3_unlock_height: context.v3_unlock_height,
+            pox_5_activation_height: context.pox_5_activation_height,
+            ..Default::default()
+        };
+        Some((
+            observers.clone(),
+            nano_rpc::new_block_payload(block, applied, &event),
+        ))
+    }
+
+    /// Announce every block this node executes to these observers.
+    ///
+    /// An observer's whole purpose is to see what a node *executed*, so this
+    /// belongs on the executor: a `new_block` sent from anywhere else would be
+    /// announcing a block that had only been downloaded.
+    pub fn announce_to(&mut self, observers: nano_rpc::EventDispatcher) {
+        self.observers = Some(observers);
+    }
+
     pub fn track_sortitions(&mut self, tracker: crate::sortition::SortitionTracker) {
         self.sortition = Some(tracker);
     }
@@ -814,7 +865,13 @@ where
                     bitcoin_context,
                 )
                 .await?;
-            self.apply(&block, bitcoin_context)?;
+            let applied = self.apply(&block, bitcoin_context)?;
+            // Built before the await so the future does not hold the chainstate.
+            if let Some((observers, payload)) = self.block_event(&block, &applied, bitcoin_context) {
+                observers
+                    .dispatch(nano_rpc::EventKind::NewBlock, &payload)
+                    .await;
+            }
             staging.remove(block.block_id())?;
             executed += 1;
         }

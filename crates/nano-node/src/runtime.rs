@@ -123,29 +123,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         None
     };
     let dispatcher = EventDispatcher::new(config.node.event_observers()?);
+    announce_executed_blocks(executor.as_ref(), &dispatcher).await;
 
     let mut roles = JoinSet::new();
-    let state = match config.node.rpc_bind {
-        Some(address) => {
-            let mut state = RpcState::new();
-            if let Some(executor) = executor.clone() {
-                state = state.with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
-            }
-            let listener = TcpListener::bind(address).await?;
-            println!("serving the public RPC on {address}");
-            let served = state.clone();
-            roles.spawn(async move {
-                (
-                    Job::Rpc,
-                    serve(listener, served)
-                        .await
-                        .map_err(|error| error.to_string()),
-                )
-            });
-            Some(state)
-        }
-        None => None,
-    };
+    let state = start_rpc(&config, executor.clone(), &mut roles).await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
@@ -501,6 +482,44 @@ async fn resume_from(
         ancestors.len()
     )
     .into())
+}
+
+/// Serve the public RPC, if this node is configured to.
+async fn start_rpc(
+    config: &Config,
+    executor: Option<SharedExecutor>,
+    roles: &mut JoinSet<(Job, Result<(), String>)>,
+) -> Result<Option<RpcState>, Box<dyn Error>> {
+    let Some(address) = config.node.rpc_bind else {
+        return Ok(None);
+    };
+    let mut state = RpcState::new();
+    if let Some(executor) = executor {
+        state = state.with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
+    }
+    let listener = TcpListener::bind(address).await?;
+    println!("serving the public RPC on {address}");
+    let served = state.clone();
+    roles.spawn(async move {
+        (
+            Job::Rpc,
+            serve(listener, served)
+                .await
+                .map_err(|error| error.to_string()),
+        )
+    });
+    Ok(Some(state))
+}
+
+/// Send the blocks this node executes to the configured observers.
+///
+/// An observer wants what a node *executed*, which only the executor knows it
+/// has: everything else in the runtime sees blocks that have merely been
+/// downloaded.
+async fn announce_executed_blocks(executor: Option<&SharedExecutor>, dispatcher: &EventDispatcher) {
+    if let Some(executor) = executor {
+        executor.lock().await.announce_to(dispatcher.clone());
+    }
 }
 
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries

@@ -1,7 +1,7 @@
 ---
 id: "052"
 title: "Wire the complete RPC and event surface into the node"
-status: pending
+status: in-progress
 priority: high
 effort: large
 type: feature
@@ -30,7 +30,7 @@ execution.
       reward sets and StackerDB configuration in runtime.
 - [ ] Admit uploaded blocks and proposals through the same validator as followed
       blocks.
-- [ ] Publish `new_block` only after execution, with nano's actual receipts,
+- [x] Publish `new_block` only after execution, with nano's actual receipts,
       costs and events.
 - [ ] Dispatch burn-block, signer, proposal-response and mined-block events from
       their production transitions.
@@ -47,3 +47,28 @@ execution.
 - An observer receives receipt-equivalent payloads for the same executed blocks
   as stacks-core.
 - No RPC endpoint advertises or mutates state newer than the executed tip.
+
+## `new_block` now leaves the node
+
+The dispatcher was built from the configuration and then handed to the miner
+alone, so a node that only follows executed every block in silence. It is now
+given to the **executor**, which is the only part that knows a block was
+executed rather than merely downloaded, and every applied block is announced
+from there.
+
+The payload is built synchronously and dispatched with owned values: holding the
+chainstate across the await makes the future non-`Send`, since a `ChainState`
+carries `RefCell`s and a sqlite connection.
+
+Only the fields a follower can answer are filled in — the parent, the burn block
+and its height, and the unlock heights — and the rest are left at their defaults
+rather than invented. An observer comparing nano against stacks-core is better
+served by a field that is plainly absent than by one that is confidently wrong.
+Filling in the matured rewards, the reward set and the miner's winning txid is
+the remaining work on this item.
+
+`tests/event_observer.rs` already checks nano builds the same payload stacks-core
+published, which is the harder half and says nothing about whether anything sends
+it. `tests/event_delivery.rs` is the other half: a listener, a dispatch, and the
+body arriving.
+

@@ -79,6 +79,7 @@ pub struct RewardSetEvent {
 /// These come from the sortition and the header index rather than from
 /// execution, so the node supplies them alongside the executed block.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct BlockEventContext {
     pub parent_block_hash: BlockHeaderHash,
     pub bitcoin_block_hash: BitcoinHeaderHash,
