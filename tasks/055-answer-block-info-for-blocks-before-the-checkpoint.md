@@ -882,3 +882,23 @@ invocation itself — `pox-5 stake` reached through
 `try! (contract-call? …)` from `delegate` — with the arguments that transaction
 actually passes, which is where to pick this up.
 
+### What the network actually did with it
+
+The transaction is
+`0x107dab2b…`, calling `native-pool-v1::delegate` with
+`(.native-pool-signer, u2500000000, u96)`. Mainnet's outcome:
+
+```
+abort_by_post_condition   (ok u2500000000)
+```
+
+So the network **rolled it back on a post-condition** — a perfectly ordinary
+outcome, not a failure. What nano has to produce is that abort, and under the
+interpreter it raises an error instead. That reframes the bug: it is not that a
+pox-5 function answers wrongly, it is that the path which should end in a
+post-condition rollback ends in an unwind that loses the answer.
+
+(Reproducing it outside the node needs a tip where `.native-pool-signer` exists;
+probing at the current sealed tip reports it unknown, so the node is the place to
+work on it.)
+
