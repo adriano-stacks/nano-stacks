@@ -22,6 +22,8 @@ use crate::staging::{Staging, StagingError};
 #[derive(Debug)]
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
+    /// The sortitions this node derives for itself, when it has the history to.
+    sortition: Option<crate::sortition::SortitionTracker>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -353,6 +355,7 @@ where
         )?;
         Ok(Self {
             chainstate,
+            sortition: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin,
@@ -369,6 +372,7 @@ where
     pub const fn resume(chainstate: ChainState, tip: NakamotoBlock, bitcoin: S) -> Self {
         Self {
             chainstate,
+            sortition: None,
             tip,
             bitcoin_height: 0,
             bitcoin,
@@ -663,6 +667,41 @@ where
         Ok(fetched)
     }
 
+    /// Derive sortitions locally from here on, alongside the peer's answers.
+    pub fn track_sortitions(&mut self, tracker: crate::sortition::SortitionTracker) {
+        self.sortition = Some(tracker);
+    }
+
+    /// Derive this block's sortition locally and say if it differs.
+    ///
+    /// Reported rather than enforced while the chain is being brought up: a
+    /// node that stopped on its own arithmetic before that arithmetic was
+    /// trusted would be worse off than one that says so and carries on. Once
+    /// it agrees over a long enough run, execution takes the local answer and
+    /// the peer stops being asked.
+    fn check_local_sortition(&mut self, peer: &nano_sync::SortitionInfo) {
+        let Some(tracker) = self.sortition.as_mut() else {
+            return;
+        };
+        let expected = tracker.tip().bitcoin_height.saturating_add(1);
+        if peer.bitcoin_height != expected {
+            return;
+        }
+        let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
+            return;
+        };
+        // The running burn total is the peer's for now, being the one field a
+        // block does not carry.
+        match tracker.advance(&block, 0) {
+            Ok(derived) if derived.consensus_hash != peer.consensus_hash => eprintln!(
+                "locally derived consensus hash at burn {} is {} where the peer says {}",
+                peer.bitcoin_height, derived.consensus_hash, peer.consensus_hash
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("deriving the sortition locally failed: {error}"),
+        }
+    }
+
     /// Execute staged blocks forward from this node's tip, up to `budget`.
     async fn execute_staged(
         &mut self,
@@ -677,6 +716,7 @@ where
                 break;
             };
             let sortition = node.sortition(block.header.consensus_hash).await?;
+            self.check_local_sortition(&sortition);
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             // Clarity reads this back through `get-burn-block-info?`, and sBTC

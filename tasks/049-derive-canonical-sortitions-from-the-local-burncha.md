@@ -126,9 +126,19 @@ rule, so its operation set is the network's.
 the same consensus hash the network did at every block — the same claim the
 direct `SnapshotChain` test makes, through the code path a node actually runs.
 
-What is left here is the wiring rather than the arithmetic: persist the chain
-beside the other state, advance it from the follower's burnchain reads rather
-than a test's, and then hand its snapshot to execution in place of the peer's
-`/v3/sortitions` answer. Choosing between several eligible commitments is the
+It is wired into the node too. A checkpoint that carries a sortition history
+starts one at the burn height the node is sealed at, and every block the
+follower executes advances it from the node's own Bitcoin source and compares
+the consensus hash it derives against the peer's answer.
+
+Reported rather than enforced while it is being brought up: a node that stopped
+on its own arithmetic before that arithmetic was trusted would be worse off than
+one that says so and carries on. Once it agrees over a long enough run,
+execution takes the local answer and the peer stops being asked.
+
+What is left is persisting the chain across a restart, the running burn total
+(the one field a Bitcoin block does not carry, still taken from the peer), and
+choosing between several eligible commitments — the burn distribution's
+business; the tracker answers only where a block leaves no choice. Choosing between several eligible commitments is the
 burn distribution's business and still to come; the tracker currently answers
 only where a block leaves no choice to make.

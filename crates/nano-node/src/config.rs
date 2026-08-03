@@ -106,6 +106,13 @@ pub struct CheckpointConfig {
     pub attesting_block: Option<PathBuf>,
     /// The reward set that signed that block, obtained without the checkpoint.
     pub attesting_reward_set: Option<PathBuf>,
+    /// The sortition history this node derives its own snapshots from.
+    ///
+    /// Holds the snapshot to start at and the consensus hashes behind it,
+    /// because a consensus hash mixes the ones at power-of-two offsets back.
+    /// Without it a node has to ask a peer what the sortition was, which lets
+    /// that peer choose its consensus hashes and its fork.
+    pub sortition: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

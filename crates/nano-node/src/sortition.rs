@@ -168,3 +168,77 @@ const fn commit_lands_in_block_of(
         _ => false,
     }
 }
+
+/// A snapshot a capture holds, in the fields a seed needs.
+#[derive(Debug, Deserialize)]
+struct CapturedSnapshot {
+    block_height: u64,
+    burn_header_hash: String,
+    sortition_id: String,
+    consensus_hash: String,
+    sortition_hash: String,
+    total_burn: String,
+}
+
+impl SortitionTracker {
+    /// Start from a capture directory, at the snapshot for `burn_height`.
+    ///
+    /// The `PoX` history is taken from the seed's own sortition identifier,
+    /// which is the burn header hash and that bit vector hashed together — so
+    /// the capture states it rather than a node guessing.
+    pub fn from_capture(
+        directory: &Path,
+        burn_height: u64,
+        pox_id: PoxId,
+    ) -> Result<Self, TrackerError> {
+        let bytes = fs::read(directory.join("snapshots.json"))
+            .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
+            .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let seed = snapshots
+            .iter()
+            .find(|snapshot| snapshot.block_height == burn_height)
+            .ok_or_else(|| TrackerError::Seed(format!("no snapshot at burn {burn_height}")))?;
+        let history = Self::history_from(directory)?;
+        Self::new(seed_snapshot(seed, pox_id)?, history)
+    }
+}
+
+fn seed_snapshot(seed: &CapturedSnapshot, pox_id: PoxId) -> Result<SortitionSnapshot, TrackerError> {
+    let bytes = |value: &str, name: &str| -> Result<Vec<u8>, TrackerError> {
+        hex::decode(value).map_err(|_| TrackerError::Seed(format!("{name} is not hexadecimal")))
+    };
+    let thirty_two = |value: &str, name: &str| -> Result<[u8; 32], TrackerError> {
+        <[u8; 32]>::try_from(bytes(value, name)?.as_slice())
+            .map_err(|_| TrackerError::Seed(format!("{name} is not 32 bytes")))
+    };
+    Ok(SortitionSnapshot {
+        bitcoin_height: seed.block_height,
+        bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes(thirty_two(
+            &seed.burn_header_hash,
+            "burn header hash",
+        )?),
+        sortition_id: nano_primitives::SortitionId::from_bytes(thirty_two(
+            &seed.sortition_id,
+            "sortition id",
+        )?),
+        parent_sortition_id: nano_primitives::SortitionId::from_bytes([0; 32]),
+        // Never read: only the hash of a block *after* the seed is derived.
+        operations_hash: nano_sortition::OpsHash::from_txids(&[]),
+        consensus_hash: ConsensusHash::from_bytes(
+            <[u8; 20]>::try_from(bytes(&seed.consensus_hash, "consensus hash")?.as_slice())
+                .map_err(|_| TrackerError::Seed("consensus hash is not 20 bytes".to_owned()))?,
+        ),
+        total_burn: seed
+            .total_burn
+            .parse()
+            .map_err(|_| TrackerError::Seed("total burn is not a number".to_owned()))?,
+        sortition_hash: nano_sortition::SortitionHash::from_bytes(thirty_two(
+            &seed.sortition_hash,
+            "sortition hash",
+        )?),
+        winner_txid: None,
+        winner_vrf_seed: None,
+        pox_id,
+    })
+}

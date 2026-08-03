@@ -17,9 +17,11 @@ use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
+use nano_sortition::PoxId;
+
 use crate::{
     CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
-    config::Config, miner, signer, staging::Staging,
+    config::Config, miner, signer, sortition::SortitionTracker, staging::Staging,
 };
 
 /// How many blocks one round of catching up will fetch before executing.
@@ -305,6 +307,14 @@ async fn follow(
     };
     let mut node = Node::new(peer.clone());
     let mut pox = pox;
+    // Derive sortitions alongside the peer's answers, when the checkpoint
+    // carries the history that makes it possible.
+    if let (Some(executor), Some(directory)) =
+        (executor.as_ref(), config.checkpoint.sortition.as_ref())
+    {
+        start_deriving_sortitions(executor, directory).await;
+    }
+
     // A state built before headers were kept has none, so the first block it
     // executes cannot read the one it stands on. Written down once, at startup.
     if let Some(executor) = executor.as_ref() {
@@ -491,6 +501,19 @@ async fn resume_from(
         ancestors.len()
     )
     .into())
+}
+
+/// Derive sortitions alongside the peer's answers, when the checkpoint carries
+/// the history that makes it possible.
+async fn start_deriving_sortitions(executor: &SharedExecutor, directory: &Path) {
+    let burn_height = { executor.lock().await.bitcoin_height() };
+    match SortitionTracker::from_capture(directory, burn_height, PoxId::initial()) {
+        Ok(tracker) => {
+            println!("deriving sortitions locally from burn {burn_height}");
+            executor.lock().await.track_sortitions(tracker);
+        }
+        Err(error) => eprintln!("cannot derive sortitions locally: {error}"),
+    }
 }
 
 /// Check the checkpoint against a signed header before any of it is opened.
