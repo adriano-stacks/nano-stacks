@@ -1297,6 +1297,12 @@ impl ChainState {
         Ok(())
     }
 
+    /// What this node wrote down about a block, if anything.
+    #[must_use]
+    pub fn recorded_header(&self, block: [u8; 32]) -> Option<nano_vm::BlockHeader> {
+        self.vm.recorded_header(block)
+    }
+
     /// Whether this node has written down what Clarity may read about a block.
     #[must_use]
     pub fn has_recorded_header(&self, block: [u8; 32]) -> bool {

@@ -456,9 +456,17 @@ where
     }
 
     /// The Bitcoin height the sealed tip was executed under.
+    ///
+    /// A resumed executor has not applied a block yet, so it asks the header it
+    /// wrote down for the tip rather than reporting an unknown.
     #[must_use]
-    pub const fn bitcoin_height(&self) -> u64 {
-        self.bitcoin_height
+    pub fn bitcoin_height(&self) -> u64 {
+        if self.bitcoin_height > 0 {
+            return self.bitcoin_height;
+        }
+        self.chainstate
+            .recorded_header(*self.tip.block_id().as_bytes())
+            .map_or(0, |header| u64::from(header.burn_block_height))
     }
 
     /// Ask a peer for something, waiting out the limits it answers with.
