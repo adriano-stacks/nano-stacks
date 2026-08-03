@@ -744,6 +744,23 @@ impl ComplexWord for ContractCall {
             builder
                 .i32_const(id_offset as i32)
                 .i32_const(id_length as i32);
+        } else if let Some(TypeSignature::CallableType(CallableSubtype::Principal(
+            contract_identifier,
+        ))) = contract_expr
+            .match_atom()
+            .and_then(|name| generator.constants.get(name.as_str()))
+            .or_else(|| generator.get_expr_type(contract_expr))
+            .cloned()
+        {
+            // A name that resolves to a contract principal — a constant, most
+            // often — is as static a call as a literal is. Only the literal
+            // form was recognised, so `(contract-call? SOME_CONSTANT f)` was
+            // taken for a trait dispatch and refused for not being one.
+            builder.i32_const(0).i32_const(0);
+            let (id_offset, id_length) = generator.add_literal(&contract_identifier.into())?;
+            builder
+                .i32_const(id_offset as i32)
+                .i32_const(id_length as i32);
         } else {
             // This is a dynamic contract call (via a trait).
             // Push the trait name on the stack

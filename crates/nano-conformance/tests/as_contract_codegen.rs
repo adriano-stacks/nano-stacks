@@ -95,3 +95,39 @@ fn a_contract_principal_where_a_trait_is_expected_compiles() {
     .expect("a contract principal passed where a trait is expected compiles");
 }
 
+/// A constant naming a contract is as static a call as a literal is.
+///
+/// clarity-wasm only recognised the literal form, so
+/// `(contract-call? SOME_CONSTANT f)` was taken for a trait dispatch and refused
+/// for not being one. `SP3EWCDA3V8HCP64CSETSNYXZ25WC4AJ95EC0ZEST.dlmm-adapter`
+/// routes every swap through a `SWAP_ROUTER` constant and would not deploy.
+const CONSTANT_TARGET: &str = "
+(define-constant TARGET .token)
+(define-public (through (amount uint))
+  (contract-call? TARGET mint amount tx-sender))
+";
+
+#[test]
+fn a_constant_naming_a_contract_is_a_static_call() {
+    let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+    vm.begin_block(None, [19; 32]).expect("begin block");
+    vm.deploy_contract(
+        QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.token")
+            .expect("a contract identifier"),
+        ClarityVersion::Clarity2,
+        "(define-public (mint (amount uint) (who principal)) (ok true))",
+        clarity::vm::costs::LimitedCostTracker::new_free(),
+    )
+    .expect("the token deploys");
+
+    let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.router")
+        .expect("a contract identifier");
+    vm.check_module(
+        &contract,
+        ClarityVersion::Clarity2,
+        CONSTANT_TARGET,
+        StacksEpochId::Epoch34,
+    )
+    .expect("a call through a constant compiles");
+}
+

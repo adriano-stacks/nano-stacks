@@ -524,3 +524,23 @@ Replay is now at **8,666,344** and running.
 `decode-blocks` prints which contract each transaction publishes, for both the
 plain and versioned payloads, since that is what says where to look next.
 
+## And fixed: a constant naming a contract is a static call
+
+`SP3EWCDA3V8HCP64CSETSNYXZ25WC4AJ95EC0ZEST.dlmm-adapter` routes every swap
+through a `SWAP_ROUTER` constant and would not deploy:
+
+```
+Type error: Dynamic argument of contract-call? should be a trait
+```
+
+clarity-wasm recognised only the *literal* form of a static call, so a name that
+resolves to a contract principal was taken for a trait dispatch and refused for
+not being one. The generator already tracks constants by name and type, so the
+target is right there. clar2wasm's 1,375 tests stay green and the contract
+compiles under Clarity 4 and 5.
+
+That is the fifth clarity-wasm divergence this replay has found —
+`as-contract`, `block-height`, a contract principal where a trait is expected, a
+deploy that never compiled its callees, and now this — and every one of them was
+invisible until a mainnet block happened to depend on it.
+
