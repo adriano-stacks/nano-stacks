@@ -212,6 +212,33 @@ impl ComplexWord for TupleMerge {
             })?
             .clone();
 
+        let result_ty = generator
+            .get_expr_type(expr)
+            .cloned()
+            .ok_or_else(|| GeneratorError::TypeError("merge expression must be typed".to_owned()));
+
+        // The overriding tuple has to be built as the *result's* field types,
+        // not its own. `(merge t { f: none })` analyses `none` as
+        // `(optional NoType)`, and laying that out where the result's
+        // `(optional uint)` belongs writes an i32 where the value is an
+        // indicator and two i64s — a module that compiles and will not load.
+        let coerced_rhs = match (result_ty.as_ref().ok(), generator.get_expr_type(&args[1])) {
+            (Some(TypeSignature::TupleType(result_tuple)), Some(TypeSignature::TupleType(rhs))) => {
+                let fields: Vec<_> = rhs
+                    .get_type_map()
+                    .keys()
+                    .filter_map(|name| {
+                        Some((name.clone(), result_tuple.field_type(name)?.clone()))
+                    })
+                    .collect();
+                clarity::vm::types::TupleTypeSignature::try_from(fields).ok()
+            }
+            _ => None,
+        };
+        if let Some(coerced) = coerced_rhs {
+            generator.set_expr_type(&args[1], TypeSignature::TupleType(coerced))?;
+        }
+
         let rhs_tuple_ty = generator
             .get_expr_type(&args[1])
             .ok_or_else(|| GeneratorError::TypeError("tuple expression must be typed".to_string()))
@@ -220,10 +247,6 @@ impl ComplexWord for TupleMerge {
                 _ => Err(GeneratorError::TypeError("expected tuple type".to_string())),
             })?
             .clone();
-
-        let result_ty = generator
-            .get_expr_type(expr)
-            .ok_or_else(|| GeneratorError::TypeError("merge expression must be typed".to_owned()));
 
         // Those locals will contain the resulting tuple after the merge operation
         let result_locals: BTreeMap<_, Vec<_>> = result_ty

@@ -544,3 +544,24 @@ That is the fifth clarity-wasm divergence this replay has found —
 deploy that never compiled its callees, and now this — and every one of them was
 invisible until a mainnet block happened to depend on it.
 
+## And fixed: merging `none` over an optional field
+
+`SPSX722NK9V3A8D3CVQT0CDY4EBQ3E9FSDDE61FT.governance-v1` compiled to a module
+that would not load, so it would not deploy and took its four sibling deploys
+with it. Reduced from 55 KB to:
+
+```clarity
+(map-set proposals id (merge proposal { execute-at: none }))
+```
+
+where the field is `(optional uint)`. `none` analyses as `(optional NoType)`, and
+clarity-wasm laid the overriding tuple out with *its own* field types rather than
+the result's — writing an i32 where the value is an indicator and two i64s.
+
+This is the same fault as `as-contract`, in a different word: a value built as
+the type it was analysed with, where the type it is going into is what decides
+its layout. Worth looking for wherever clar2wasm reads `get_expr_type` on a
+sub-expression whose width the surrounding type fixes.
+
+Replay reaches **8,666,422**.
+

@@ -131,3 +131,35 @@ fn a_constant_naming_a_contract_is_a_static_call() {
     .expect("a call through a constant compiles");
 }
 
+/// `merge` overriding an optional field with `none`.
+///
+/// `none` analyses as `(optional NoType)`, and clarity-wasm laid the overriding
+/// tuple out with its own field types rather than the result's — writing an i32
+/// where an `(optional uint)` is an indicator and two i64s. The module compiled
+/// and would not load, so
+/// `SPSX722NK9V3A8D3CVQT0CDY4EBQ3E9FSDDE61FT.governance-v1` would not deploy,
+/// and the block that deploys it took four sibling deploys down with it.
+const MERGE_NONE: &str = "
+(define-map proposals (buff 32) { closed: bool, execute-at: (optional uint) })
+(define-private (close (id (buff 32)))
+  (let ((proposal (unwrap! (map-get? proposals id) (err u1))))
+    (begin
+      (map-set proposals id (merge proposal { execute-at: none }))
+      (ok true))))
+";
+
+#[test]
+fn merging_none_over_an_optional_field_compiles_to_a_module_that_loads() {
+    let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+    vm.begin_block(None, [23; 32]).expect("begin block");
+    let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.proposals")
+        .expect("a contract identifier");
+    vm.check_module(
+        &contract,
+        ClarityVersion::Clarity3,
+        MERGE_NONE,
+        StacksEpochId::Epoch34,
+    )
+    .expect("merging none over an optional field compiles");
+}
+
