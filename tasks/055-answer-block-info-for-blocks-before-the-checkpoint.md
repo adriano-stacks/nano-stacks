@@ -902,3 +902,22 @@ post-condition rollback ends in an unwind that loses the answer.
 probing at the current sealed tip reports it unknown, so the node is the place to
 work on it.)
 
+## Not a VM bug at all: an argument that names nothing
+
+`.native-pool-signer`, the trait argument `delegate` is passed, **does not exist
+on mainnet either** — and mainnet still returns `(ok u2500000000)` and aborts on
+a post-condition. Passing a contract principal that names nothing is fine; only
+*calling* it would fail.
+
+nano compiles every contract-principal argument ahead of the call, because a
+trait dispatch will need it and the call cannot say in advance which one. That is
+right as an optimisation and wrong as a requirement: one that cannot be compiled
+now leaves the call alone instead of failing it.
+
+That reframes three sightings that looked like different bugs — `pox-5
+stake-update` returning an `int`, `native-pool-v1::delegate` unwinding, and the
+compiler's "unknown contract" — as one thing seen from three angles. It is worth
+remembering how far the wrong frame carried: the pox-5 source, its analysis, the
+`.dao` call before it and the special-case handler were each investigated and
+each was fine.
+

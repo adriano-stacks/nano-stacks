@@ -2636,8 +2636,15 @@ fn call_contract_values_in_context(
     arguments: &[Value],
     cost_tracker: &LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
+    // A contract principal passed as an argument is compiled ahead of the call,
+    // because a trait dispatch will need it and the call cannot say in advance
+    // which. But the network does not require such an argument to name a
+    // contract that exists — it fails only if the call actually invokes it. So
+    // one that cannot be compiled is left alone rather than failing the call:
+    // mainnet passes `.native-pool-signer`, which is not deployed anywhere, and
+    // gets a value back.
     for argument in arguments.iter().filter_map(contract_argument) {
-        needed_module(store, bitcoin_context, modules, argument, cost_tracker)?;
+        let _ = needed_module(store, bitcoin_context, modules, argument, cost_tracker);
     }
     if let Some(failed) = needed_module(store, bitcoin_context, modules, contract, cost_tracker)? {
         return Ok(failed);
