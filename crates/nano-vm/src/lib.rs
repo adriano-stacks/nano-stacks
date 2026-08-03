@@ -2455,6 +2455,7 @@ fn execute_contract_call_outcome_in_context(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
+    let called = format!("{}::{}", call.contract, call.function);
     let result = environment.execute_transaction(
         call.sender,
         call.sponsor,
@@ -2463,9 +2464,12 @@ fn execute_contract_call_outcome_in_context(
         &arguments,
     );
     let (mut database, cost_tracker) = environment.destruct().ok_or_else(|| {
-        VmExecutionError::Internal(VmInternalError::Expect(
-            "contract execution left the database in an invalid state".to_owned(),
-        ))
+        // Naming the call is the difference between a mystery and a bug report:
+        // this fires when a nested context outlives the call that opened it, and
+        // which contract did that is the only thing worth knowing.
+        VmExecutionError::Internal(VmInternalError::Expect(format!(
+            "{called} left the database in an invalid state"
+        )))
     })?;
     match result {
         Ok((value, assets, events)) => {

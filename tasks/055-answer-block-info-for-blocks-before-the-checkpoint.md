@@ -679,3 +679,31 @@ it now is to trace the aggregator's *own* intermediate values rather than guess
 which word produced them. `NANO_TRACE_CALLS` reaches call boundaries; what is
 missing is inside one.
 
+## What stands between the plan's fallback and the node
+
+plan.md names pointing `nano-vm` at the Clarity interpreter as **the
+highest-value fallback in the plan**, and the crosscheck has now proved the
+interpreter right against mainnet receipts on exactly the transactions where
+clarity-wasm is wrong. So the obvious question is whether the fallback works.
+
+Half the answer is yes: with `NANO_INTERPRETER_ONLY` set, the captured replay
+passes all forty blocks **with matching state roots**. The interpreter is not
+merely an oracle; it executes.
+
+The other half is one named call. Against mainnet it fails immediately:
+
+```
+SP000000000000000000002Q6VF78.pox-5::stake-update left the database in an invalid state
+```
+
+That message is `OwnedEnvironment::destruct` returning `None`, which means a
+nested context outlived the call that opened it — and `pox-5` is exactly where
+nano installs a `SpecialCaseHandler`, the PoX locking hook that fires on the
+contract-call boundary ([[plan W6.4]]). The wasm path handles the same call; the
+interpreter path does not.
+
+So the fallback is one bug away from being available, and that bug is in the PoX
+special-case wiring rather than anywhere general. The error now names the call
+that caused it, which is what turned this from "the interpreter does not work"
+into a specific thing to fix.
+
