@@ -96,6 +96,28 @@ impl SortitionTracker {
         self.chain.tip()
     }
 
+    /// Walk the chain forward to `height`, reading blocks as it goes.
+    ///
+    /// A chain seeded from a window starts behind the node that owns it, so it
+    /// has ground to make up before its answers can be compared with anything.
+    pub fn catch_up_to<S: nano_bitcoin::BitcoinSource>(
+        &mut self,
+        source: &mut S,
+        height: u64,
+        limit: usize,
+    ) -> Result<u64, TrackerError> {
+        let mut walked = 0;
+        while self.chain.tip().bitcoin_height < height && walked < limit {
+            let next = self.chain.tip().bitcoin_height.saturating_add(1);
+            let block = source
+                .block_at(next)
+                .map_err(|_| TrackerError::Seed(format!("no Bitcoin block at {next}")))?;
+            self.advance(&block, 0)?;
+            walked += 1;
+        }
+        Ok(self.chain.tip().bitcoin_height)
+    }
+
     /// Extend the chain with one Bitcoin block.
     ///
     /// `total_burn` is the running total the network keeps, which a node
@@ -195,10 +217,16 @@ impl SortitionTracker {
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
         let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        // The newest snapshot at or below where the node stands: a capture is a
+        // window, and a node that has executed past it still starts from the
+        // last block the window describes and walks forward to meet the chain.
         let seed = snapshots
             .iter()
-            .find(|snapshot| snapshot.block_height == burn_height)
-            .ok_or_else(|| TrackerError::Seed(format!("no snapshot at burn {burn_height}")))?;
+            .filter(|snapshot| snapshot.block_height <= burn_height)
+            .max_by_key(|snapshot| snapshot.block_height)
+            .ok_or_else(|| {
+                TrackerError::Seed(format!("no snapshot at or below burn {burn_height}"))
+            })?;
         let history = Self::history_from(directory)?;
         Self::new(seed_snapshot(seed, pox_id)?, history)
     }

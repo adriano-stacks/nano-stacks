@@ -688,11 +688,24 @@ where
     /// it agrees over a long enough run, execution takes the local answer and
     /// the peer stops being asked.
     fn check_local_sortition(&mut self, peer: &nano_sync::SortitionInfo) {
+        const CATCH_UP_PER_ROUND: usize = 16;
+
         let Some(tracker) = self.sortition.as_mut() else {
             return;
         };
-        let expected = tracker.tip().bitcoin_height.saturating_add(1);
-        if peer.bitcoin_height != expected {
+        // A chain seeded from a capture starts behind this node; it walks the
+        // gap a few blocks at a time rather than stalling the follow loop.
+        if tracker.tip().bitcoin_height < peer.bitcoin_height.saturating_sub(1) {
+            match tracker.catch_up_to(
+                &mut self.bitcoin,
+                peer.bitcoin_height.saturating_sub(1),
+                CATCH_UP_PER_ROUND,
+            ) {
+                Ok(reached) => eprintln!("locally derived sortitions reach burn {reached}"),
+                Err(error) => eprintln!("catching the sortition chain up failed: {error}"),
+            }
+        }
+        if peer.bitcoin_height != tracker.tip().bitcoin_height.saturating_add(1) {
             return;
         }
         let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
