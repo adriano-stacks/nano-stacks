@@ -1475,6 +1475,21 @@ impl MarfStore {
         Ok(())
     }
 
+    /// A contract's stored definition, read straight from the side store.
+    ///
+    /// `get_contract` answers from the block being executed and did not find
+    /// contracts that are plainly present, which is the wrong question when the
+    /// point is to repair a definition rather than to run one.
+    #[must_use]
+    pub fn stored_contract(&self, contract: &QualifiedContractIdentifier) -> Option<String> {
+        let key = format!("clr-meta::{contract}::vm-metadata::9::contract");
+        self.side_store
+            .prepare_cached("SELECT value FROM metadata_table WHERE key = ?1 LIMIT 1")
+            .ok()?
+            .query_row(params![key], |row| row.get::<_, String>(0))
+            .ok()
+    }
+
     /// Every contract here whose stored definition is a placeholder.
     #[must_use]
     pub fn stubbed_contracts(&self) -> Vec<QualifiedContractIdentifier> {

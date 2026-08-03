@@ -1085,3 +1085,22 @@ limit is now a fact rather than a guess.
 
 23 of 27 healed either way, and the four are one deployer's family.
 
+### What the clarity API does and does not offer here
+
+Two facts worth having before anyone tries the last four again:
+
+- `Contract` implements `Deref<Target = ContractContext>`, so a stored
+  definition's variables, maps and functions **can** be read once you hold one.
+  That is what makes a rebuild-and-merge possible at all.
+- There is no public `deserialize` for `Contract`. Reading one back from the
+  side store as a string and turning it into a `Contract` is not available, so
+  seeding the throwaway store has to go through `get_contract` — which is the
+  very lookup that does not find these dependencies.
+
+So the remaining route is the one that needs no `Contract` at all: parse the
+source, build each `DefinedFunction` with `DefinedFunction::new`, and write the
+functions into a context obtained by `Deref` from the contract being healed —
+whose own `get_contract` does work, since it is the one being called.
+`MarfStore::stored_contract` is in the tree for reading the raw definition,
+which the stub check already needed.
+
