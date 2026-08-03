@@ -2469,6 +2469,16 @@ fn call_contract_values_in_context(
             arguments,
             cost_tracker.clone(),
         ) {
+            // A module the compiler produced but wasmtime will not load is
+            // the compiler's failure, not the node's, and the interpreter can
+            // still run the contract — so it becomes a failed call rather than
+            // a stopped node, like a source the compiler refuses.
+            Err(error) if reports_analysis_failure(&error) => {
+                return Ok(ContractCallOutcome::RuntimeFailure {
+                    cost: cost_tracker.get_total(),
+                    error,
+                });
+            }
             Err(error) => {
                 let Some(missing) = missing_compiled_contract(&error)
                     .filter(|_| attempts < MISSING_MODULE_ATTEMPTS)
