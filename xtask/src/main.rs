@@ -1528,20 +1528,18 @@ fn temporary_state_id() -> [u8; 32] {
 /// order they were made — which is the order that matters, since a trie packs a
 /// node's pointers as its children first arrive.
 fn probe_root(arguments: &[String]) -> ExitCode {
-    let [state, parent, block, expected, writes] = arguments else {
+    let [state, parent, expected, writes] = arguments else {
         eprintln!(
-            "usage: cargo xtask probe-root <state-dir> <parent-block-id> <block-id> \
-             <expected-root> <trace-file>"
+            "usage: cargo xtask probe-root <state-dir> <parent-block-id> <expected-root> \
+             <trace-file>"
         );
         return ExitCode::FAILURE;
     };
     let decode32 = |value: &str| -> Option<[u8; 32]> {
         <[u8; 32]>::try_from(hex::decode(value).ok()?.as_slice()).ok()
     };
-    let (Some(parent), Some(block), Some(expected)) =
-        (decode32(parent), decode32(block), decode32(expected))
-    else {
-        eprintln!("the parent, the block and the expected root must each be 32 hexadecimal bytes");
+    let (Some(parent), Some(expected)) = (decode32(parent), decode32(expected)) else {
+        eprintln!("the parent and the expected root must each be 32 hexadecimal bytes");
         return ExitCode::FAILURE;
     };
     let Ok(trace) = fs::read_to_string(writes) else {
@@ -1605,7 +1603,10 @@ fn probe_root(arguments: &[String]) -> ExitCode {
             marf.insert(key.as_bytes(), nano_marf::MarfValue::from_bytes(*value))
                 .ok()?;
         }
-        let root = marf.seal_to(block).ok()?;
+        // Read the root without sealing: a probe must not leave blocks behind
+        // in the state it is asking about.
+        let root = marf.pending_root().ok()?;
+        marf.abort().ok()?;
         Some(*root.as_bytes())
     };
 
@@ -1627,7 +1628,70 @@ fn probe_root(arguments: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    println!("no single write explains the difference");
+    println!("no single omitted write reaches it");
+
+    if probe_orders(&marf_path, parent, &pairs, &distinct, expected) {
+        return ExitCode::SUCCESS;
+    }
+    println!("no order of the traced writes reaches it either");
     ExitCode::SUCCESS
+}
+
+/// Try the same keys and values in several orders.
+///
+/// A trie packs a node's pointers as its children first arrive, so order is
+/// consensus — but only for keys that share a node, which thirty scattered
+/// paths in a chain this size rarely do.
+fn probe_orders(
+    marf_path: &Path,
+    parent: [u8; 32],
+    pairs: &[(String, [u8; 40])],
+    distinct: &[String],
+    expected: [u8; 32],
+) -> bool {
+    let final_value = |key: &str| -> [u8; 40] {
+        pairs
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate == key)
+            .map_or([0; 40], |(_, value)| *value)
+    };
+    let seal_order = |order: &[String]| -> Option<[u8; 32]> {
+        let mut marf = nano_marf::VersionedMarf::open(marf_path).ok()?;
+        marf.begin(Some(parent), temporary_state_id()).ok()?;
+        for key in order {
+            marf.insert(
+                key.as_bytes(),
+                nano_marf::MarfValue::from_bytes(final_value(key)),
+            )
+            .ok()?;
+        }
+        let root = marf.pending_root().ok()?;
+        marf.abort().ok()?;
+        Some(*root.as_bytes())
+    };
+
+    let mut by_key = distinct.to_vec();
+    by_key.sort();
+    let mut by_path = distinct.to_vec();
+    by_path.sort_by_key(|key| *nano_marf::key_path(key.as_bytes()).as_bytes());
+    let mut reversed = distinct.to_vec();
+    reversed.reverse();
+    for (name, order) in [
+        ("as traced", distinct.to_vec()),
+        ("sorted by key", by_key),
+        ("sorted by trie path", by_path),
+        ("traced, reversed", reversed),
+    ] {
+        match seal_order(&order) {
+            Some(root) if root == expected => {
+                println!("{name}: the expected root");
+                return true;
+            }
+            Some(root) => println!("{name}: {}", hex::encode(root)),
+            None => println!("{name}: cannot be sealed"),
+        }
+    }
+    false
 }
 

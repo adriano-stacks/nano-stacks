@@ -244,3 +244,20 @@ its first block; `block_time` is MARFed from epoch 3.3 and written once, as
 nano does; SIP-031 is gated on a new tenure in both. There were no lockups at
 8,665,779, 8,665,780 or 8,665,781, so unlocks are not it either.
 
+## Nor is it order
+
+The probe seals the same keys and values in four orders — as traced, sorted by
+key, sorted by trie path, and reversed — and all four give the same root. That
+is not a bug: thirty scattered `Sha512_256` paths in a trie of 8.6 million keys
+essentially never share a node, and order is only consensus for keys that do.
+It does mean ordering is ruled out here.
+
+So the difference is a **missing write** or a **wrong value under a right key**.
+Both are now cheap to test: the probe reproduces the node's root offline in
+seconds and, since it reads `pending_root` and aborts, leaves nothing behind.
+
+It did leave something behind at first — thirty-two blocks sealed at height
+8,665,780, one of them under the real block identifier, which would have made
+the node refuse to execute that block at all. They were removed and the probe
+no longer commits anything.
+
