@@ -72,3 +72,29 @@ Still to do here: signer weight and ordering, the miner signature against the
 local sortition winner, the VRF seed ([[024-verify-the-vrf-seed-a-block-commits-to]]),
 tenure-change and coinbase semantics, `bitcoin_spent` and PoX treatment.
 
+## Signer weight: derivable, but not provable against today's mainnet
+
+`signers::active_signer_set` derives the set that attests to a block's reward
+cycle from pox-5 in this node's own executed state, and `SignerSet::verify`
+already checks unique, reward-set-ordered signatures against a seven-tenths
+threshold. Wiring the two together is a few lines.
+
+Running it against mainnet says why it cannot be turned on yet:
+
+```
+no signer set for the cycle at burn 960248:
+  reward cycle 140 has no signer set: nothing stacked for it
+```
+
+Nothing is stacked in **pox-5** for cycle 140 because mainnet is still on
+**pox-4**. nano is a 4.0-only node by design and derives reward sets the
+waterfall way, so a set for a pre-4.0 cycle does not exist to check against.
+Mainnet replay from a 3.x checkpoint therefore cannot prove this path; it becomes
+provable when mainnet crosses the 4.0 boundary, or immediately against a pox-5
+chain.
+
+So the check is in the tree behind `NANO_CHECK_SIGNERS`, reporting rather than
+rejecting. A derivation that is subtly wrong would turn every block away and stop
+the node, which is a worse failure than a missing check — it becomes a rejection
+once a chain it can be proved against is replayed in silence.
+

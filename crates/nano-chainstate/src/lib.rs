@@ -1158,6 +1158,36 @@ impl ChainState {
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
     }
 
+    /// Check a block's signer signatures against a set this node derived.
+    ///
+    /// The set comes from pox-5 in this node's own executed state, so nothing
+    /// about who may attest to a block is taken from the peer that sent it.
+    ///
+    /// This reports rather than rejects while the derivation is being proved
+    /// against the chain: a set that is subtly wrong would turn every block away
+    /// and stop the node, which is a worse failure than a missing check. It
+    /// becomes a rejection once mainnet replay passes it in silence.
+    fn check_signer_signatures(&mut self, block: &NakamotoBlock, context: BitcoinBlockContext) {
+        if std::env::var_os("NANO_CHECK_SIGNERS").is_none() {
+            return;
+        }
+        match signers::active_signer_set(&mut self.vm, context) {
+            Ok(set) => {
+                if let Err(error) = set.verify(&block.header) {
+                    eprintln!(
+                        "block {} at height {} does not carry threshold signer weight: {error:?}",
+                        block.block_id(),
+                        block.header.chain_length
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "no signer set for the cycle at burn {}: {error}",
+                context.height
+            ),
+        }
+    }
+
     /// Check what a block claims about itself before any of it is executed.
     ///
     /// A state root only says the block computes what its header commits to; it
@@ -1228,6 +1258,7 @@ impl ChainState {
         // What the block claims about itself, before any of it runs.
         self.authenticate_block(block)
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        self.check_signer_signatures(block, bitcoin_context);
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // Everything this node keeps outside the MARF, as it stood before the

@@ -41,6 +41,36 @@ pub fn prepare_phase_reward_cycle(context: BitcoinBlockContext) -> Option<u64> {
     Some(if index == 0 { cycle } else { cycle + 1 })
 }
 
+/// The reward cycle a burn height falls in.
+#[must_use]
+pub const fn reward_cycle_at(context: BitcoinBlockContext) -> Option<u64> {
+    let length = context.prepare_phase_length as u64 + context.reward_phase_length as u64;
+    if context.height <= context.first_height || length == 0 {
+        return None;
+    }
+    Some((context.height - context.first_height) / length)
+}
+
+/// The signer set that attests to blocks in `context`'s reward cycle.
+///
+/// Derived from this node's own executed state — the pox-5 linked list the
+/// network derives it from — so a block's signatures can be checked against
+/// something no peer supplied.
+pub fn active_signer_set(
+    vm: &mut Vm,
+    context: BitcoinBlockContext,
+) -> Result<SignerSet, ChainStateError> {
+    let cycle = reward_cycle_at(context).ok_or(ChainStateError::NoSignerSet(0))?;
+    let reward_slots = context.reward_phase_length * OUTPUTS_PER_COMMIT;
+    let stakers = stake_entries(vm, cycle)?;
+    if stakers.is_empty() {
+        return Err(ChainStateError::NoSignerSet(cycle));
+    }
+    let (set, _) = SignerSet::from_reward_slots(stakers, reward_slots)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    Ok(set)
+}
+
 /// Compute and store the next cycle's signer set, if this block starts a prepare phase.
 pub fn update_signer_set(
     vm: &mut Vm,
