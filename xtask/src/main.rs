@@ -26,12 +26,13 @@ fn main() -> ExitCode {
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -1825,6 +1826,51 @@ fn call_both(arguments: &[String]) -> ExitCode {
         // Nothing is sealed, so the state is untouched either way.
         drop(vm.abort_block());
     }
+    ExitCode::SUCCESS
+}
+
+/// Make every contract in a state runnable by the interpreter.
+///
+/// The compiler's deploy stores placeholder function bodies, because the real
+/// ones live in the module — so a contract it deployed cannot be interpreted.
+/// A checkpoint carries real definitions, so the ones needing repair are only
+/// those this node deployed itself, and there are few of them.
+///
+/// Safe: contract definitions live in a side store that is not the MARF, so
+/// nothing here moves a state root.
+fn heal_contracts(state: Option<&str>) -> ExitCode {
+    let Some(state) = state else {
+        eprintln!("usage: cargo xtask heal-contracts <state-dir>\n\
+                   the node must not be running: it holds the state open");
+        return ExitCode::FAILURE;
+    };
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block");
+        return ExitCode::FAILURE;
+    };
+    if let Err(error) = vm.begin_block(Some(tip), [0xea; 32]) {
+        eprintln!("cannot begin a block on the tip: {error:?}");
+        return ExitCode::FAILURE;
+    }
+
+    let stubbed = vm.uninterpretable_contracts();
+    println!("{} contracts the interpreter cannot run", stubbed.len());
+    let mut healed = 0;
+    for contract in &stubbed {
+        match vm.heal_contract(contract) {
+            Ok(()) => healed += 1,
+            Err(error) => eprintln!("{contract}: {error}"),
+        }
+    }
+    drop(vm.abort_block());
+    println!("healed {healed} of {}", stubbed.len());
     ExitCode::SUCCESS
 }
 

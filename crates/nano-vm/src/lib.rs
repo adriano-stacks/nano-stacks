@@ -926,6 +926,24 @@ impl Vm {
     }
 
     /// Invoke a contract and retain acceptable runtime failures as transaction outcomes.
+    /// Contracts in this state the interpreter cannot run.
+    ///
+    /// Only the ones this node deployed with the compiler: a checkpoint carries
+    /// real definitions, so this is bounded by what has been executed since.
+    #[must_use]
+    pub fn uninterpretable_contracts(&self) -> Vec<QualifiedContractIdentifier> {
+        self.store.stubbed_contracts()
+    }
+
+    /// Make one runnable by the interpreter, changing no state root.
+    pub fn heal_contract(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+    ) -> Result<(), VmExecutionError> {
+        let Self { store, context, .. } = self;
+        heal_contract_for_interpreter(store, context, contract)
+    }
+
     /// Compile a contract in this state and report whether its module loads.
     ///
     /// This is the path a node takes when it meets a contract deployed before
@@ -1455,6 +1473,28 @@ impl MarfStore {
             )?
             .execute(params![key, definition])?;
         Ok(())
+    }
+
+    /// Every contract here whose stored definition is a placeholder.
+    #[must_use]
+    pub fn stubbed_contracts(&self) -> Vec<QualifiedContractIdentifier> {
+        let Ok(mut statement) = self.side_store.prepare(
+            "SELECT key FROM metadata_table WHERE key LIKE '%::vm-metadata::9::contract' \
+             AND value LIKE '%\"body\":{\"expr\":{\"LiteralValue\":{\"Int\":0}}%'",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok)
+            .filter_map(|key| {
+                let name = key
+                    .strip_prefix("clr-meta::")?
+                    .strip_suffix("::vm-metadata::9::contract")?;
+                QualifiedContractIdentifier::parse(name).ok()
+            })
+            .collect()
     }
 
     /// Whether a contract's stored definition can be run by the interpreter.

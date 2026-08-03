@@ -1046,3 +1046,22 @@ replay still passes under `NANO_INTERPRETER_ONLY` with matching roots, and the
 node reached 8,666,680 with no state-root mismatch before the peer began
 rate-limiting again.
 
+### And a one-off pass for what was deployed before the switch
+
+Healing on demand fixes a contract the moment a call reaches it, which leaves
+every earlier deploy still stubbed. `cargo xtask heal-contracts` does the whole
+state at once, and the scale is reassuring: **27 stubbed definitions out of
+146,141**. A checkpoint carries real ones, so the repair is bounded by what this
+node deployed itself.
+
+23 of the 27 healed. The four that did not are contracts referencing others —
+`constants-v1`, `constants-v2` — which the throwaway store does not have, since
+it is empty by design. Rebuilding those needs either their dependencies present
+or a rebuild that does not deploy at all: parsing the source and constructing
+each `DefinedFunction` directly, which touches no other contract. Both are open;
+the second is the better one and needs no state at all.
+
+With the pass run, the node executed to 8,666,680 with no execution error of any
+kind — only the peer's rate limiting, which is the one thing left in the way of
+measuring how far this path actually goes.
+
