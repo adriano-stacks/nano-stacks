@@ -163,3 +163,14 @@ By the plan's own rule that leaves write ordering or a native effect, not the
 VM's answers. It is the sharpest divergence signal the project has had: the
 execution is right and something around it is not.
 
+## The two engines agree on a state root
+
+The obvious suspect for a matching-receipts root divergence was the interpreter
+fallback writing in a different order than the compiler. `engine_state_roots`
+asks it directly — same contract, same call, same block identifier, one run
+through each engine — and **the roots are equal** for a contract that writes two
+variables and two map entries under a branch.
+
+That is evidence, not a guarantee, but it moves the suspicion off the fallback
+and onto write ordering across transactions or a native effect around them.
+
