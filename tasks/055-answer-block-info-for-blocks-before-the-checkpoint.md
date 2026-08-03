@@ -348,3 +348,23 @@ consensus, and it stays invisible until one does. Both bugs had been executing
 wrongly for every block before this one and cost nothing until a contract wrote
 one down.
 
+## Next: 8,665,782, and a trait argument the compiler will not type
+
+The same diff run against 8,665,782 named two root children with no writes under
+them at all, and the trace says why: the block's contract call produced *no
+writes*, because it failed with
+
+```
+contract analysis failed: Type error: contract-call? argument must be typed
+```
+
+The call is `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.loto`, passed a contract
+principal to use as a trait — the same shape as `.flea` before it. `.loto` is
+2 KB and `cargo xtask check-module` compiles it to a module that loads under
+**every** Clarity version, so the contract is not the problem: typing a trait
+argument arriving as a serialized principal at the top-level call boundary is.
+
+This is the third clarity-wasm divergence this block-by-block replay has turned
+up, after `as-contract` and `block-height`, and it has the same shape: the
+interpreter accepts what the compiler refuses, and mainnet is the interpreter.
+
