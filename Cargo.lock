@@ -5653,6 +5653,7 @@ dependencies = [
  "nano-chainstate",
  "nano-conformance",
  "nano-crypto",
+ "nano-marf",
  "nano-primitives",
  "nano-sync",
  "nano-vm",

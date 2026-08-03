@@ -24,12 +24,13 @@ fn main() -> ExitCode {
         }
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root>"
             );
             ExitCode::from(2)
         }
@@ -1509,3 +1510,124 @@ fn block_fees(block: &nano_chainstate::NakamotoBlock) -> u64 {
         .map(|transaction| transaction.auth().payer().fee())
         .sum()
 }
+
+/// The placeholder a block is executed under before it is sealed.
+fn temporary_state_id() -> [u8; 32] {
+    *nano_primitives::sha512_256(&[1; 52]).as_bytes()
+}
+
+/// Ask which single write, if any, stands between nano's root and the chain's.
+///
+/// A block whose receipts all match the network and whose state root does not
+/// has either written something the network did not, or written the same things
+/// in another order. The first is cheap to settle: seal the block again with
+/// each write left out in turn, and see whether any of them lands on the root
+/// the header commits to.
+///
+/// The writes come from a `NANO_TRACE_WRITES` log, which records them in the
+/// order they were made — which is the order that matters, since a trie packs a
+/// node's pointers as its children first arrive.
+fn probe_root(arguments: &[String]) -> ExitCode {
+    let [state, parent, block, expected, writes] = arguments else {
+        eprintln!(
+            "usage: cargo xtask probe-root <state-dir> <parent-block-id> <block-id> \
+             <expected-root> <trace-file>"
+        );
+        return ExitCode::FAILURE;
+    };
+    let decode32 = |value: &str| -> Option<[u8; 32]> {
+        <[u8; 32]>::try_from(hex::decode(value).ok()?.as_slice()).ok()
+    };
+    let (Some(parent), Some(block), Some(expected)) =
+        (decode32(parent), decode32(block), decode32(expected))
+    else {
+        eprintln!("the parent, the block and the expected root must each be 32 hexadecimal bytes");
+        return ExitCode::FAILURE;
+    };
+    let Ok(trace) = fs::read_to_string(writes) else {
+        eprintln!("cannot read the trace");
+        return ExitCode::FAILURE;
+    };
+
+    // One block's writes: from the first `block_time` to the next, which is
+    // where the node gave up and started the block again.
+    let mut pairs: Vec<(String, [u8; 40])> = Vec::new();
+    let mut started = false;
+    for line in trace.lines() {
+        let Some(rest) = line.strip_prefix("write ") else {
+            continue;
+        };
+        let Some((key, value)) = rest.split_once(" = ") else {
+            continue;
+        };
+        if key.ends_with("clarity_storage::block_time") {
+            if started {
+                break;
+            }
+            started = true;
+        }
+        let Ok(bytes) = hex::decode(value) else {
+            continue;
+        };
+        let Ok(value) = <[u8; 40]>::try_from(bytes.as_slice()) else {
+            continue;
+        };
+        pairs.push((key.to_owned(), value));
+    }
+    if pairs.is_empty() {
+        eprintln!("the trace holds no writes");
+        return ExitCode::FAILURE;
+    }
+    println!("{} writes traced for the block", pairs.len());
+
+    let marf_path = Path::new(state).join("chainstate").join("marf.sqlite");
+    let mut distinct: Vec<String> = Vec::new();
+    for (key, _) in &pairs {
+        if !distinct.contains(key) {
+            distinct.push(key.clone());
+        }
+    }
+    println!("{} distinct keys", distinct.len());
+
+    // A block writes its own identifier into the trie, so this has to seal to
+    // the real one — sealing to a stand-in gives a root that cannot be compared
+    // with anything. Each attempt therefore rolls its block back.
+    let seal = |omit: Option<&str>| -> Option<[u8; 32]> {
+        let mut marf = nano_marf::VersionedMarf::open(&marf_path).ok()?;
+        // The node executes under a placeholder identifier and renames the
+        // block when it seals, so the identifier the trie carries during
+        // execution is that placeholder, not the block's own.
+        marf.begin(Some(parent), temporary_state_id()).ok()?;
+        for (key, value) in &pairs {
+            if omit == Some(key.as_str()) {
+                continue;
+            }
+            marf.insert(key.as_bytes(), nano_marf::MarfValue::from_bytes(*value))
+                .ok()?;
+        }
+        let root = marf.seal_to(block).ok()?;
+        Some(*root.as_bytes())
+    };
+
+    match seal(None) {
+        Some(root) if root == expected => {
+            println!("the traced writes already seal the expected root");
+            return ExitCode::SUCCESS;
+        }
+        Some(root) => println!("all writes:      {}", hex::encode(root)),
+        None => {
+            eprintln!("cannot seal the block from the trace");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    for key in &distinct {
+        if seal(Some(key)) == Some(expected) {
+            println!("without {key}: the expected root");
+            return ExitCode::SUCCESS;
+        }
+    }
+    println!("no single write explains the difference");
+    ExitCode::SUCCESS
+}
+

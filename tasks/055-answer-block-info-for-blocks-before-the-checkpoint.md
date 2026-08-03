@@ -223,3 +223,24 @@ the network's, so the number of Clarity writes is right; what differs is their
 order, or something written outside them. That is the next thing to look at, and
 the fallback is no longer needed to get there.
 
+## The divergence is not one extra write
+
+`cargo xtask probe-root` replays a block's writes straight into the MARF from a
+`NANO_TRACE_WRITES` log and seals it the way the node does — under the
+placeholder identifier the node executes with, renamed on seal. It reproduces
+the node's root for 8,665,780 exactly, which is what makes it worth trusting,
+and it runs in seconds against the real state instead of minutes of replay.
+
+Leaving out each of the block's 30 distinct keys in turn reaches the expected
+root in **no** case. So the difference is not a single write the network did not
+make. What is left is a missing write, a wrong value under a right key, or the
+order the keys first arrive in — and the probe is the way to test the last of
+those, since it can seal the same set in any order.
+
+Ruled out along the way, each against stacks-core's own source: the liquid
+supply increment is unconditional there too (`finish_block`), so nano writing it
+when nothing unlocked is correct and guarding it broke the captured replay at
+its first block; `block_time` is MARFed from epoch 3.3 and written once, as
+nano does; SIP-031 is gated on a new tenure in both. There were no lockups at
+8,665,779, 8,665,780 or 8,665,781, so unlocks are not it either.
+
