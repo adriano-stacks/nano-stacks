@@ -158,7 +158,35 @@ incrementing the liquid supply by zero for matured rewards that did not exist,
 which stacks-core guards on having payouts at all — and a write the network did
 not make is a leaf in the trie it does not have.
 
-### The first tenure start, and what has been ruled out there
+## Replay depth 179, and the oracle that got it there
+
+Reading the *accounts back from the network at the diverging block* is what
+turns "the root differs" into "this key differs". It found a real consensus bug
+at 8,665,722 that no receipt could show: one account short by exactly
+26,404,093 uSTX, which is tenure 251,222's fees less tenure 251,221's. A
+Nakamoto tenure hands **its own** anchored fees to the tenure before it, and the
+derivation was paying the earlier tenure's — the right account, the wrong
+amount. The capture's export had the rule right; only the derivation did not,
+which is why it survived until a tenure matured that the checkpoint carried no
+effect for.
+
+That took replay from 118 to **179 blocks**, through two more compiler failures
+on the way: clarity-wasm emitting wasm that will not load for a contract it
+compiles under an older epoch, which now fails the call rather than the node.
+
+### Where it stops now: 8,665,780
+
+Same shape, and this time everything comparable agrees. All five receipts match
+mainnet's statuses and results; every account balance and nonce written in the
+block matches when read back from the network at that block; both pool data
+vars match; both `univ2-core` map entries match. And the root still differs.
+
+What that leaves is a key nano does **not** write — mainnet writing something
+nano never touches would look exactly like this, and nothing in the write trace
+can show it. Enumerating mainnet's own writes for a block is the missing oracle:
+either its `new_block` event, or its trie compared against nano's key by key.
+
+### The first tenure start, and what was ruled out there
 
 Replay now reaches **8,665,722**, the first tenure start past the checkpoint,
 and every observable at it agrees with mainnet:
