@@ -206,3 +206,20 @@ Getting there took three things:
   A short return is what makes it visible; without one the two layouts agree.
   Pinned by `tests/as_contract_codegen.rs`.
 
+## What the fix settled, and what it left
+
+With `as-contract` fixed the node runs block 8,665,780 entirely on clarity-wasm:
+no module refused, no crosscheck, no interpreter. The five receipts still match
+mainnet exactly, so the compiler and the interpreter agree on every value, cost
+dimension and event for this block.
+
+The state root still does not match — and it **changed**, from `ff87845b…` under
+the interpreter to `684…` under the compiler. So the two engines *do* write
+differently here, which `engine_state_roots` did not catch on a simpler
+contract, and neither of them writes what mainnet wrote.
+
+That narrows it further than before. Every transaction's `write_count` matches
+the network's, so the number of Clarity writes is right; what differs is their
+order, or something written outside them. That is the next thing to look at, and
+the fallback is no longer needed to get there.
+
