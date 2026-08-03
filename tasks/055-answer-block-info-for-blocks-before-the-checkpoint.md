@@ -659,3 +659,23 @@ cases already checked, so the next one added has somewhere to go.
 It is the instrument that turned "the engines disagree somewhere in this
 transaction" into a named argument of a named call, and it belongs in the tree.
 
+## Ten ways it is not wrong
+
+`tests/as_contract_sender.rs` now pins ten cases where the two engines agree,
+covering the three ways a routing contract works out where to send tokens:
+
+- `as-contract`'s `tx-sender` — plainly, doubly nested, read back out of a
+  `let`, through a called contract, and in a contract *called by another
+  contract*, which is the case that matters and the one a direct-invocation test
+  would miss;
+- `contract-of` on a trait argument, inside and outside `as-contract`;
+- `element-at?` into a `(list N <trait>)`, at every index, with the element
+  handed to a function the way `fold` hands it — the shape that has already
+  produced two clarity-wasm bugs on its own.
+
+None of them differs. Hypothesis-testing has stopped paying here: the divergence
+is a wrong principal in `transfer(amount, hilt, hilt, none)`, and the way to name
+it now is to trace the aggregator's *own* intermediate values rather than guess
+which word produced them. `NANO_TRACE_CALLS` reaches call boundaries; what is
+missing is inside one.
+
