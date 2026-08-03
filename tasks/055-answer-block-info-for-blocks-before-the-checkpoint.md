@@ -789,3 +789,22 @@ isolation reproduces: the plain form, the `try!` form, the `if`/`begin` wrapper
 and the `var-set` after it were each tried and each compiles. So the trigger is a
 combination still to be found, and the reduction is the place to find it.
 
+### It takes both halves
+
+`process-rewards` has two statements in sequence: a release half — `as-contract?`
+holding a `try!`, guarded by an `if`, followed by a `var-set` — and a keeper half,
+an `if` whose branches `print` tuples. Each half **on its own compiles to a module
+that loads**; the two together do not.
+
+So this is not a single word being generated wrongly. It is something about two
+statements in sequence, each of which leaves the stack in a state the other
+does not expect — which is the same family as `as-contract` and `merge` (a value
+laid out as one type where another is expected) but reached through statement
+composition rather than a single expression.
+
+The nine-form reduction is in the tree as
+`fixtures/contracts/rewards-stx-v1-reduced.clar`. Ruled out individually and
+recorded so nobody repeats them: the plain `as-contract?`, `as-contract?` holding
+a `try!`, an `if`/`begin` around it, a trailing `var-set`, two `print` branches of
+matching shape, the release half alone, the keeper half alone.
+
