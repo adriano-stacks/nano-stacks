@@ -2463,14 +2463,16 @@ fn execute_contract_call_outcome_in_context(
         call.function,
         &arguments,
     );
-    let (mut database, cost_tracker) = environment.destruct().ok_or_else(|| {
-        // Naming the call is the difference between a mystery and a bug report:
-        // this fires when a nested context outlives the call that opened it, and
-        // which contract did that is the only thing worth knowing.
-        VmExecutionError::Internal(VmInternalError::Expect(format!(
-            "{called} left the database in an invalid state"
-        )))
-    })?;
+    let Some((mut database, cost_tracker)) = environment.destruct() else {
+        // A context outlived the call that opened it. Whatever the call was
+        // actually complaining about is the useful half, and reporting only
+        // that the unwind failed throws it away — which is how this looked
+        // like a mystery rather than a bug report.
+        return Err(result.err().unwrap_or_else(|| {
+            VmInternalError::Expect(format!("{called} left the database in an invalid state"))
+                .into()
+        }));
+    };
     match result {
         Ok((value, assets, events)) => {
             database.commit()?;

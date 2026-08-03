@@ -729,3 +729,22 @@ between the plan's own fallback and a node that can use it, and it is also
 [[M8d]] — the gate that `pox-5.stack-stx` must move locked STX rather than only
 map entries.
 
+### The unwind was hiding the error
+
+Reporting only that the unwind failed threw away the half that mattered.
+`destruct` returning `None` happens *because* the call errored and left a
+context open, so the call's own error is the one to report. With it surfaced:
+
+```
+RuntimeCheck(Unreachable("Public function must return response: int"))
+```
+
+`pox-5::stake-update` is being taken to return an `int` where a public function
+must return a response. That is a contract-analysis answer, not a locking one —
+so the suspicion moves off the PoX handler, which merely happened to be the
+first thing to trip over it, and onto what nano's interpreter path reads as
+`pox-5`'s signature.
+
+Worth keeping as a habit: an error raised while unwinding is almost never the
+error worth reading.
+
