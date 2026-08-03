@@ -45,7 +45,7 @@ fn every_checkpointed_contract_is_reachable_in_the_imported_trie() {
         env::var("NANO_NODE_CLARITY"),
         env::var("NANO_MAINNET_BLOCK"),
     ) else {
-        eprintln!("set NANO_NODE_MARF, NANO_NODE_CLARITY and NANO_MAINNET_BLOCK to run this");
+        nano_conformance::skip_gate("NANO_NODE_MARF, NANO_NODE_CLARITY and NANO_MAINNET_BLOCK are needed");
         return;
     };
     let block: nano_marf::MarfBlockId =
@@ -113,7 +113,7 @@ fn nano_reports_a_key_at_a_block() {
         env::var("NANO_MAINNET_BLOCK"),
         env::var("NANO_MAINNET_KEY"),
     ) else {
-        eprintln!("set NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY");
+        nano_conformance::skip_gate("NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY are needed");
         return;
     };
     let block: nano_marf::MarfBlockId =
@@ -148,7 +148,7 @@ fn nano_reports_a_key_at_a_block() {
 fn stacks_core_finds_the_contract_nano_cannot() {
     let (Ok(path), Ok(block)) = (env::var("NANO_MAINNET_MARF"), env::var("NANO_MAINNET_BLOCK"))
     else {
-        eprintln!("set NANO_MAINNET_MARF and NANO_MAINNET_BLOCK to run this");
+        nano_conformance::skip_gate("NANO_MAINNET_MARF and NANO_MAINNET_BLOCK are needed");
         return;
     };
     let block = StacksBlockId::from_hex(&block).expect("the block identifier is hexadecimal");

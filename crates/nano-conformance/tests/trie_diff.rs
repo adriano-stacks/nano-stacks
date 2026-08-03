@@ -90,9 +90,7 @@ fn the_networks_root_children_name_the_missing_write() {
         setting("NANO_TRIE_PARENT"),
         setting("NANO_TRIE_WRITES"),
     ) else {
-        eprintln!(
-            "set NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES to run"
-        );
+        nano_conformance::skip_gate("NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES are needed");
         return;
     };
 

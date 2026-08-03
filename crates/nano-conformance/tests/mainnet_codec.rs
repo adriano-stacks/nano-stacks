@@ -49,7 +49,7 @@ fn core_blocks(bytes: &[u8]) -> Vec<CoreBlock> {
 #[test]
 fn nano_decodes_every_mainnet_block_stacks_core_does() {
     let Ok(path) = env::var("NANO_MAINNET_BLOCKS") else {
-        eprintln!("set NANO_MAINNET_BLOCKS to a captured block stream to run this");
+        nano_conformance::skip_gate("NANO_MAINNET_BLOCKS must name a captured block stream");
         return;
     };
     let bytes = fs::read(&path).expect("read the captured blocks");

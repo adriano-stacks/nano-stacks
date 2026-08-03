@@ -1,7 +1,7 @@
 ---
 id: "053"
 title: "Pass the mainnet node release gate"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 type: improvement
@@ -53,3 +53,28 @@ and steady state, with evidence tied to the durable executed chain.
 - RPC responses and events describe the same durable executed state.
 - Synchronization, propagation and consensus inputs do not require Hiro or any
   other hosted Stacks HTTP API.
+
+## A skipped gate can no longer report itself green
+
+Most mainnet tests need a capture or a node's state directory, and skipping when
+those are absent is right for a working tree. It is exactly wrong for a release
+gate: **a suite where every mainnet test skipped looks identical to one where
+every mainnet test passed**, and that difference is the whole question this task
+asks.
+
+`nano_conformance::skip_gate` is now what every one of them calls instead of
+printing and returning. It prints the same thing normally, and panics when
+`NANO_REQUIRE_MAINNET` is set — so a run that claims the mainnet gates are green
+had to actually run them.
+
+Demonstrated both ways, which is the point:
+
+```
+NANO_REQUIRE_MAINNET=1                          -> FAILED. 0 passed; 2 failed
+NANO_REQUIRE_MAINNET=1 NANO_MAINNET_CAPTURE=... -> ok. 2 passed
+(neither set)                                   -> ok, skipped
+```
+
+Seven gates across six files route through it. The remaining items on this task
+need the live run they describe.
+

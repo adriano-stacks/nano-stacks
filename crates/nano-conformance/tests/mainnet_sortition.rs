@@ -220,7 +220,7 @@ const MAINNET_MAGIC: [u8; 2] = *b"X2";
 #[test]
 fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
     let Some(root) = capture() else {
-        eprintln!("set NANO_MAINNET_CAPTURE to a capture directory to run this");
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
         return;
     };
     let captured: Vec<Captured> = serde_json::from_slice(
@@ -335,7 +335,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
 #[test]
 fn the_node_tracker_derives_the_same_window() {
     let Some(root) = capture() else {
-        eprintln!("set NANO_MAINNET_CAPTURE to a capture directory to run this");
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
         return;
     };
     let captured: Vec<Captured> = serde_json::from_slice(

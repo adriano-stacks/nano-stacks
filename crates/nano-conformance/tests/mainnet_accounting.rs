@@ -20,7 +20,7 @@ fn checkpoint() -> Option<PathBuf> {
 #[test]
 fn the_mainnet_checkpoint_owes_a_full_maturity_window() {
     let Some(directory) = checkpoint() else {
-        eprintln!("set NANO_MAINNET_CHECKPOINT to a checkpoint directory to run this");
+        nano_conformance::skip_gate("NANO_MAINNET_CHECKPOINT to a checkpoint directory to run this");
         return;
     };
     let bytes = fs::read(directory.join("native-effects.json")).expect("read the accounting");

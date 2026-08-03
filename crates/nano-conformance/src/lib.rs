@@ -670,6 +670,27 @@ struct ReplayInputs<'a> {
     receipts: bool,
 }
 
+/// Whether a gate that cannot run may quietly report nothing.
+///
+/// Most of these tests need a capture or a node's state directory, and skipping
+/// when it is absent is right for a working tree. It is exactly wrong for a
+/// release gate: a suite where every mainnet test skipped looks identical to one
+/// where every mainnet test passed, and the difference is the whole question.
+///
+/// Setting `NANO_REQUIRE_MAINNET` turns every such skip into a failure, so a run
+/// that claims the mainnet gates are green had to actually run them.
+///
+/// # Panics
+///
+/// When `NANO_REQUIRE_MAINNET` is set and the inputs a gate needs are not.
+pub fn skip_gate(reason: &str) {
+    assert!(
+        std::env::var_os("NANO_REQUIRE_MAINNET").is_none(),
+        "this gate cannot run and NANO_REQUIRE_MAINNET is set: {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 /// Execute the next captured block with a state root its header does not commit
 /// to, so that it is rejected exactly where a real divergence rejects it.
 ///
