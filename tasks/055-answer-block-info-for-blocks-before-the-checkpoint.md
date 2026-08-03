@@ -280,3 +280,37 @@ block and nano did not. It is not one of nano's writes being wrong, not an extra
 one, and not the order. `cargo xtask decode-blocks` now prints each
 transaction's origin, nonce and fee, which is what settled the nonces.
 
+## Where the missing write is not
+
+Checked against stacks-core's own `setup_block` and `finish_block`, in order:
+
+- `setup_block_metadata` writes `block_time` once, from epoch 3.3 — as nano does;
+- `set_tenure_height` is gated on a new tenure in both, and this block is not one;
+- `process_epoch_transition` writes only when the epoch changes;
+- `check_and_handle_reward_start` returns early once a cycle has been handled,
+  and burn 960,234 is 184 blocks into cycle 140, so it was handled long before
+  the checkpoint;
+- `check_and_handle_prepare_phase_start` fires at the prepare phase, which for
+  the next cycle begins at burn 962,050;
+- burnchain stacking, transfer and delegate ops come from the tenure's own burn
+  block and are empty mid-tenure;
+- `increment_ustx_liquid_supply` is unconditional after unlocks in both;
+- SIP-031 is gated on a new tenure in both.
+
+## What would actually find it
+
+Guessing has run out. The parent's root matches the network's, so the ancestor
+skip-list is identical and the difference is the block's own content hash —
+which means the root node's children differ, and exactly which child differs is
+a fact that can be read rather than inferred.
+
+`/v2/map_entry/...?proof=1` returns a MARF merkle proof, and stacks-core's proof
+for a `Node256` carries the hashes of every child but the one on the path. One
+proof against block 8,665,780 therefore yields all 256 of the network's root
+children; comparing them with nano's gives the first nibble of the missing key's
+path, and recursing gives the rest.
+
+That needs `TrieMerkleProof` deserialization, which `nano-conformance` already
+has through `stackslib`, and a way to read the children of nano's *pending* root.
+It is the next thing to build; nothing cheaper will name the key.
+
