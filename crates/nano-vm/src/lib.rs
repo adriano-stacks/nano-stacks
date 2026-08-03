@@ -2484,12 +2484,24 @@ fn execute_contract_call_outcome_in_context(
         // actually complaining about is the useful half, and reporting only
         // that the unwind failed throws it away — which is how this looked
         // like a mystery rather than a bug report.
-        // Name the call on the way out: the error alone says a public function
-        // returned the wrong shape and not which one, and finding that by
-        // bisection costs a day.
+        // Name the call on the way out, and say when the cause is a stub.
+        //
+        // clar2wasm's deploy stores placeholder function bodies — the real ones
+        // live in the module — so a contract the compiler deployed cannot be
+        // run by the interpreter at all: it evaluates the placeholder and
+        // reports whatever that is. Left unexplained it reads as a type error
+        // in the contract, which is three days of looking in the wrong place.
         return Err(result.err().map_or_else(
             || VmInternalError::Expect(format!("{called} left the database in an invalid state")).into(),
-            |error| VmInternalError::Expect(format!("{called}: {error}")).into(),
+            |error| {
+                let hint = if error.to_string().contains("must return response") {
+                    " (this contract was deployed by the compiler, which stores \
+                     placeholder bodies, so the interpreter cannot run it)"
+                } else {
+                    ""
+                };
+                VmInternalError::Expect(format!("{called}: {error}{hint}")).into()
+            },
         ));
     };
     match result {
