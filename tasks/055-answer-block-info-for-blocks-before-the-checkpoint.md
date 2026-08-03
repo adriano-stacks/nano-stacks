@@ -968,3 +968,37 @@ two engines, and it is now a two-second question instead of a node restart.
 The captured replay still passes under `NANO_INTERPRETER_ONLY` with matching
 roots, so removing the bracket did not loosen the path it guards.
 
+## Found: the compiler deploys contracts the interpreter cannot run
+
+The stored `ContractContext` for `signer-payout-v1` holds functions whose bodies
+are a **stub**:
+
+```json
+"define_type":"Private","arguments":["result"],
+"body":{"expr":{"LiteralValue":{"Int":0}},"id":0}
+```
+
+That is what clar2wasm's deploy writes, and it is not a bug in it: the real
+bodies live in the wasm module, so the context only has to name the functions and
+their types. The compiler runs the module and never looks. The **interpreter
+evaluates the stored body**, gets the literal `0`, and reports exactly what it
+found — "Public function must return response: **int**".
+
+So all three sightings — `pox-5::stake-update`, `native-pool-v1::delegate`,
+`signer-payout-v1::initialize` — are one thing: **a contract deployed by the
+compiler cannot be executed by the interpreter**. Nothing was wrong with pox-5,
+the analyses, or the calls preceding them, which is why none of that
+investigation found anything.
+
+It also says exactly what the fallback needs. Routing deploys through the
+interpreter, which is already done, is necessary but not sufficient: every
+contract deployed by the compiler *before* the switch still has a stub body, and
+so does every contract nano deploys if the switch is ever off. Either the
+interpreter rebuilds a contract's context from its stored source on demand — the
+mirror of `ensure_wasm_module`, and nano already keeps the source — or the two
+paths must never be mixed on one chainstate.
+
+The source is stored byte-identically to mainnet's, which is what makes the
+rebuild possible and is worth knowing before anyone reaches for the second
+option.
+
