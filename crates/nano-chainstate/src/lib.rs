@@ -594,6 +594,45 @@ pub struct ChainState {
     executed: Vec<ExecutedBlock>,
 }
 
+/// The header version epoch 4.0 blocks carry, below the shadow flag.
+pub const NAKAMOTO_BLOCK_VERSION_EPOCH_4: u8 = 1;
+
+/// What a block claimed about itself that this chain does not accept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsensusError {
+    HeaderVersion(u8),
+    TransactionNetwork { txid: [u8; 32] },
+    TransactionChainId { txid: [u8; 32], chain_id: u32 },
+    TransactionAnchorMode { txid: [u8; 32] },
+}
+
+impl std::fmt::Display for ConsensusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeaderVersion(version) => {
+                write!(formatter, "block header version {version} is not epoch 4.0's")
+            }
+            Self::TransactionNetwork { txid } => write!(
+                formatter,
+                "transaction {} is for another network",
+                hex::encode(txid)
+            ),
+            Self::TransactionChainId { txid, chain_id } => write!(
+                formatter,
+                "transaction {} names chain {chain_id:#010x}",
+                hex::encode(txid)
+            ),
+            Self::TransactionAnchorMode { txid } => write!(
+                formatter,
+                "transaction {} is anchored off-chain, which 4.0 has no place for",
+                hex::encode(txid)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConsensusError {}
+
 /// A block nano has executed, and the tenure it belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExecutedBlock {
@@ -1119,6 +1158,45 @@ impl ChainState {
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
     }
 
+    /// Check what a block claims about itself before any of it is executed.
+    ///
+    /// A state root only says the block computes what its header commits to; it
+    /// says nothing about whether the block belongs to this chain at all. A
+    /// transaction carrying another network's version byte or chain identifier
+    /// is not a transaction on this chain, and one anchored off-chain names
+    /// microblocks, which 4.0 does not have — none of which a root would catch,
+    /// because a node that executes them computes a perfectly self-consistent
+    /// state for a chain nobody else is on.
+    ///
+    /// Nothing here is asked of the peer that supplied the block.
+    pub fn authenticate_block(&self, block: &NakamotoBlock) -> Result<(), ConsensusError> {
+        let version = block.header.version & 0x7f;
+        if version != NAKAMOTO_BLOCK_VERSION_EPOCH_4 {
+            return Err(ConsensusError::HeaderVersion(block.header.version));
+        }
+        let network = self.vm.network();
+        for transaction in &block.transactions {
+            let mainnet = matches!(transaction.version(), nano_codec::TransactionVersion::Mainnet);
+            if mainnet != network.is_mainnet() {
+                return Err(ConsensusError::TransactionNetwork {
+                    txid: *transaction.txid().as_bytes(),
+                });
+            }
+            if transaction.chain_id() != network.chain_id() {
+                return Err(ConsensusError::TransactionChainId {
+                    txid: *transaction.txid().as_bytes(),
+                    chain_id: transaction.chain_id(),
+                });
+            }
+            if matches!(transaction.anchor_mode(), nano_codec::AnchorMode::OffChainOnly) {
+                return Err(ConsensusError::TransactionAnchorMode {
+                    txid: *transaction.txid().as_bytes(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Execute one block, optionally rejecting it before it is sealed when the
     /// state it produces does not match the root its header commits to.
     fn execute_nakamoto_block(
@@ -1147,6 +1225,9 @@ impl ChainState {
                 })?,
             );
         }
+        // What the block claims about itself, before any of it runs.
+        self.authenticate_block(block)
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // Everything this node keeps outside the MARF, as it stood before the
