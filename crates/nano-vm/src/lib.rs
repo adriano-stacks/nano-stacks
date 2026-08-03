@@ -863,15 +863,34 @@ impl Vm {
                 store, context, contract, version, source, cost_tracker,
             );
         }
-        deploy_contract_with_wasm_in_context(
+        match deploy_contract_with_wasm_in_context(
             store,
             context,
             modules,
-            contract,
+            contract.clone(),
             version,
             source,
-            cost_tracker,
-        )
+            cost_tracker.clone(),
+        ) {
+            Err(refused) if is_contract_analysis_failure(&refused) => {
+                // The compiler could not build this contract, and mainnet
+                // deployed it — so the compiler is wrong about it, not the
+                // chain. The interpreter is what mainnet runs, so it decides:
+                // it stores the contract if the contract is sound, and fails
+                // the same deploy if it is not. Either way the block carries on
+                // instead of stopping on a clarity-wasm codegen bug.
+                //
+                // Nothing was written: the analysis bracket above takes its own
+                // insert back out when the module is refused.
+                eprintln!(
+                    "{contract} was deployed by the interpreter: the compiler refused it ({refused})"
+                );
+                deploy_contract_in_context(
+                    store, context, contract, version, source, cost_tracker,
+                )
+            }
+            other => other,
+        }
     }
 
     /// Call a published contract with consensus-serialized Clarity arguments.
@@ -2452,6 +2471,13 @@ pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
     reports_analysis_failure(error)
 }
 
+/// The same question of a message, for callers holding the text rather than
+/// the error — a deploy that crossed an engine boundary is one.
+#[must_use]
+pub fn is_contract_analysis_failure_message(message: &str) -> bool {
+    reports_analysis_failure(&message)
+}
+
 /// The same question of anything that can say what went wrong.
 fn reports_analysis_failure(error: &impl std::fmt::Display) -> bool {
     let text = error.to_string();
@@ -2475,6 +2501,47 @@ pub fn deploy_contract(
     )
 }
 
+/// Type-check a deployment and store its analysis, as stacks-core does.
+fn analyse_for_deployment(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+    cost_tracker: &LimitedCostTracker,
+) -> Result<(), ClarityEvalError> {
+    let mut analysis = AnalysisDatabase::new(store);
+    analysis
+        .execute::<_, _, StaticCheckError>(|analysis_db| {
+            let expressions = build_ast(
+                contract,
+                source,
+                &mut LimitedCostTracker::new_free(),
+                version,
+                StacksEpochId::Epoch40,
+            )
+            .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?
+            .expressions;
+            clarity::vm::analysis::run_analysis(
+                contract,
+                &expressions,
+                analysis_db,
+                true,
+                cost_tracker.clone(),
+                StacksEpochId::Epoch40,
+                version,
+                false,
+                clarity::vm::resource_limiter::ResourceLimiter::unlimited(),
+            )
+            .map_err(|boxed| boxed.0)?;
+            Ok(())
+        })
+        .map_err(|error: StaticCheckError| {
+            ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(format!(
+                "{ANALYSIS_FAILED}: {error}"
+            ))))
+        })
+}
+
 fn deploy_contract_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
@@ -2484,6 +2551,12 @@ fn deploy_contract_in_context(
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, ClarityEvalError> {
     let network = store.network();
+    // stacks-core type-checks a deployment before it initializes it, and
+    // `initialize_versioned_contract` does not. Without this the interpreter
+    // accepts contracts the chain rejects — a contract naming a map that does
+    // not exist deploys — which is a consensus difference wherever the
+    // interpreter is the deployment path.
+    analyse_for_deployment(store, &contract, version, source, &cost_tracker)?;
     let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         network.is_mainnet(),
@@ -2530,7 +2603,13 @@ fn deploy_contract_with_wasm_in_context(
                     StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
                 })?;
                 analysis_db.insert_contract(&contract, &compiled.contract_analysis)?;
-                Ok(compiled.into_compiled_contract())
+                // Inside the analysis bracket on purpose: a module wasmtime
+                // will refuse must take its contract analysis back out with it,
+                // or the deploy leaves an analysis behind for a contract that
+                // was never stored, and the interpreter fallback below deploys
+                // on top of it.
+                Ok(loadable(&contract, compiled.into_compiled_contract())
+                    .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?)
             })
             .map_err(|error: StaticCheckError| {
                 ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
@@ -2539,10 +2618,6 @@ fn deploy_contract_with_wasm_in_context(
             })?;
         compiled
     };
-    // The same check the rebuild path makes: a module wasmtime will refuse is
-    // this contract's fault, and saying so here is what stops the failure
-    // surfacing later as the caller's.
-    let compiled = loadable(&contract, compiled)?;
 
     // A contract's top-level expressions run at deploy time and may call other
     // contracts, whose modules have to be built first. Only the *call* path did
