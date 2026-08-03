@@ -506,10 +506,12 @@ async fn resume_from(
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries
 /// the history that makes it possible.
 async fn start_deriving_sortitions(executor: &SharedExecutor, directory: &Path) {
-    let burn_height = { executor.lock().await.bitcoin_height() };
-    match SortitionTracker::from_capture(directory, burn_height, PoxId::initial()) {
+    match SortitionTracker::from_capture(directory, PoxId::initial()) {
         Ok(tracker) => {
-            println!("deriving sortitions locally from burn {burn_height}");
+            println!(
+                "deriving sortitions locally from burn {}",
+                tracker.tip().bitcoin_height
+            );
             executor.lock().await.track_sortitions(tracker);
         }
         Err(error) => eprintln!("cannot derive sortitions locally: {error}"),

@@ -208,26 +208,25 @@ impl SortitionTracker {
     /// The `PoX` history is taken from the seed's own sortition identifier,
     /// which is the burn header hash and that bit vector hashed together — so
     /// the capture states it rather than a node guessing.
-    pub fn from_capture(
-        directory: &Path,
-        burn_height: u64,
-        pox_id: PoxId,
-    ) -> Result<Self, TrackerError> {
+    pub fn from_capture(directory: &Path, pox_id: PoxId) -> Result<Self, TrackerError> {
         let bytes = fs::read(directory.join("snapshots.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
         let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        // The newest snapshot at or below where the node stands: a capture is a
-        // window, and a node that has executed past it still starts from the
-        // last block the window describes and walks forward to meet the chain.
+        // The one snapshot a history can seed is the one it ends at: the
+        // consensus hash of every block after it has to be derived, not stated,
+        // or the chain would be quoting the capture rather than checking it.
+        let history = Self::history_from(directory)?;
+        let anchor = history
+            .last()
+            .ok_or_else(|| TrackerError::Seed("the history is empty".to_owned()))?
+            .to_string();
         let seed = snapshots
             .iter()
-            .filter(|snapshot| snapshot.block_height <= burn_height)
-            .max_by_key(|snapshot| snapshot.block_height)
+            .find(|snapshot| snapshot.consensus_hash == anchor)
             .ok_or_else(|| {
-                TrackerError::Seed(format!("no snapshot at or below burn {burn_height}"))
+                TrackerError::Seed(format!("no snapshot for the hash the history ends at: {anchor}"))
             })?;
-        let history = Self::history_from(directory)?;
         Self::new(seed_snapshot(seed, pox_id)?, history)
     }
 }
