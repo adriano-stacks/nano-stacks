@@ -1993,10 +1993,18 @@ impl ClarityBackingStore for MarfStore {
                 // reports the contract as unresolved, so without saying it here
                 // a missing commitment is indistinguishable from a contract
                 // that was never deployed.
-                eprintln!(
-                    "no contract commitment for {contract} at key {}",
-                    make_contract_hash_key(contract)
-                );
+                //
+                // Behind a switch because it is not rare: every deployment that
+                // names a contract this node does not hold asks once per
+                // analysis pass, and a replay that retries a block emits it
+                // thousands of times — which buries the divergence the log is
+                // being read for.
+                if std::env::var_os("NANO_TRACE_MISSING_CONTRACTS").is_some() {
+                    eprintln!(
+                        "no contract commitment for {contract} at key {}",
+                        make_contract_hash_key(contract)
+                    );
+                }
                 VmInternalError::Expect(format!("unknown contract {contract}"))
             })?;
         let block = self
