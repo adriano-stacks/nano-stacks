@@ -53,10 +53,17 @@ operations, hashes them to the same `ops_hash`, identifies the same winning
 commitment among them, and chains the same `sortition_hash` from one to the
 next — none of it asked of a peer.
 
-It diverges at burn **960,230**, on the operations hash. That is the epoch 4.0
-boundary, where the set of transactions that count as burnchain operations
-changes, so it is the right place for the first disagreement and a precise thing
-to fix rather than a vague one.
+It diverges at burn **960,230**, on the operations hash, where nano finds five
+operations and all of them are leader block commits.
+
+960,230 is the epoch 4.0 boundary, but the obvious suspect is **not** the cause:
+`parse_pox_waterfall_commits` — which rejects a commit whose output 0 is
+unrecognised or pays nothing — only applies from `first_pox_waterfall_block`,
+and that is the first block of the cycle *after* the one holding pox-5's
+activation. Cycle 140 runs 960,050 to 962,149, so the waterfall rule starts at
+962,150, well past this block. Whatever differs at 960,230 is something else the
+epoch changes, and the test now prints the operations it found so the next look
+starts from evidence rather than a guess.
 
 The consensus hash is not checked by this test and cannot be: it mixes prior
 consensus hashes at power-of-two offsets reaching back thousands of blocks, so

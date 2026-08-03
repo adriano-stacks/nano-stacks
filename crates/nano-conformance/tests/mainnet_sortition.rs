@@ -44,6 +44,21 @@ fn decode(value: &str) -> Vec<u8> {
     hex::decode(value).expect("a captured field is hexadecimal")
 }
 
+/// What nano found in a block it disagrees about, so the next look starts from
+/// evidence rather than a guess.
+fn report_operations(height: u64, block: &BitcoinBlock) {
+    println!(
+        "  burn {height} yielded {} operations: {}",
+        block.operations.len(),
+        block
+            .operations
+            .iter()
+            .map(|operation| hex::encode(operation.txid))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}
+
 /// The snapshot a replay starts from, taken from the capture as given.
 fn seed_from(genesis: &Captured) -> SortitionSnapshot {
     SortitionSnapshot {
@@ -165,6 +180,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
             .expect("the chain extends");
 
         if hex::encode(derived.operations_hash.as_bytes()) != snapshot.ops_hash {
+            report_operations(snapshot.block_height, block);
             first_divergence = Some((snapshot.block_height, "operations hash"));
             break;
         }
