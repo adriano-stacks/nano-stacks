@@ -923,6 +923,24 @@ impl Vm {
             .map(|_| ())
     }
 
+    /// Record what a burn block's header hash is, for Clarity to read back.
+    ///
+    /// `get-burn-block-info? header-hash` answers from the burn blocks this node
+    /// has executed under, and a node that started at a checkpoint has none from
+    /// before it. sBTC's withdrawal path checks a sweep's Bitcoin block that
+    /// way, so an unanswered height rejects a withdrawal the network accepted.
+    pub fn record_burn_header(&mut self, height: u64, hash: [u8; 32]) {
+        if let Ok(height) = u32::try_from(height) {
+            self.context.burn_headers.insert(height, hash);
+        }
+    }
+
+    /// Whether Clarity can already answer for this burn block.
+    #[must_use]
+    pub fn knows_burn_header(&self, height: u64) -> bool {
+        u32::try_from(height).is_ok_and(|height| self.context.burn_headers.contains_key(&height))
+    }
+
     pub fn execute_contract_call_outcome(
         &mut self,
         sender: PrincipalData,

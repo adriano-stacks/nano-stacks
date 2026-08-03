@@ -23,6 +23,10 @@ use crate::staging::{Staging, StagingError};
 /// the Bitcoin block that ends it, so this only has to outlast one.
 const TENURE_WALK_LIMIT: usize = 512;
 
+/// How many burn blocks behind the current one to make readable from Clarity.
+/// An sBTC sweep is confirmed within a few, and a Bitcoin header is cheap.
+const BURN_HEADER_WINDOW: u64 = 32;
+
 #[derive(Debug)]
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
@@ -552,6 +556,7 @@ where
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
+            self.seed_burn_headers(sortition.bitcoin_height);
             bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
             self.chainstate
                 .backfill_block_header(block, bitcoin_context)
@@ -744,6 +749,25 @@ where
             parent = ancestor.header.parent_block_id;
         }
         Ok(None)
+    }
+
+    /// Tell the VM the header hash of the burn blocks just behind this one.
+    ///
+    /// Clarity can ask about any burn block, and a node that started at a
+    /// checkpoint has executed under almost none of them. sBTC withdrawals name
+    /// the Bitcoin block a sweep landed in, which is recent but not this one.
+    fn seed_burn_headers(&mut self, height: u64) {
+        for height in height.saturating_sub(BURN_HEADER_WINDOW)..=height {
+            if self.chainstate.knows_burn_header(height) {
+                continue;
+            }
+            match self.bitcoin.block_hash_at(height) {
+                Ok(hash) => self.chainstate.record_burn_header(height, hash),
+                // Worth saying: a burn block Clarity cannot be told about is a
+                // withdrawal this node will reject and the network accepted.
+                Err(_) => eprintln!("no Bitcoin header for burn block {height}"),
+            }
+        }
     }
 
     /// Execute staged blocks forward from this node's tip, up to `budget`.

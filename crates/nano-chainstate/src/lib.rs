@@ -1313,6 +1313,17 @@ impl ChainState {
         Ok(())
     }
 
+    /// Whether Clarity can already answer for this burn block.
+    #[must_use]
+    pub fn knows_burn_header(&self, height: u64) -> bool {
+        self.vm.knows_burn_header(height)
+    }
+
+    /// Make a burn block's header hash readable from Clarity.
+    pub fn record_burn_header(&mut self, height: u64, hash: [u8; 32]) {
+        self.vm.record_burn_header(height, hash);
+    }
+
     /// What this node wrote down about a block, if anything.
     #[must_use]
     pub fn recorded_header(&self, block: [u8; 32]) -> Option<nano_vm::BlockHeader> {

@@ -430,3 +430,35 @@ to `Success` where the compiler says `AbortedByResponse` — the same value and
 commit flag either way. Real disagreements are the ones where the *value*
 differs.
 
+## 8,665,971: an sBTC withdrawal the network accepted
+
+Two transactions diverge here, and the second is the clearer:
+`e220dcfb` calls `SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-withdrawal`
+`accept-withdrawal-request`, which does
+
+```clarity
+(asserts! (is-eq (some burn-hash) (get-burn-header burn-height)) ERR_INVALID_BURN_HASH)
+```
+
+with `burn-height u960240`. The network returns `(ok true)` and six writes; nano
+returns `(err u508)` — `ERR_INVALID_BURN_HASH` — and none. **Both engines agree**,
+so this is state or context rather than the compiler.
+
+The node now seeds the header hashes of the 32 burn blocks behind the one it is
+executing from its own Bitcoin source, skipping heights it already knows and
+saying so when a header cannot be had — a checkpoint-started node has executed
+under almost none of them, and an unanswered height rejects a withdrawal the
+network accepted. `decode_block_hash` keeps display order, which is the order the
+contract compares against, and the seeded value for 960,240 matches
+mempool.space.
+
+It is still `(err u508)`, and the seeding reports no missing header, so
+`get-burn-block-info? header-hash u960240` is answering with something other
+than what was recorded — the next thing to look at is the path Clarity takes to
+reach it, which goes through `get_tip_sortition_id` and a sortition identifier
+rather than the height directly.
+
+The other transaction, `055db235`, returns the aggregator's `(err u2)` where the
+network gets `(err u9)` on its third sub-swap — same family as 8,665,893's, and
+also not a compile failure.
+
