@@ -603,6 +603,12 @@ impl BurnStateDB for BitcoinContext {
 pub struct Vm {
     store: MarfStore,
     context: BitcoinContext,
+    /// Answer contract calls from the interpreter rather than the compiler.
+    ///
+    /// The interpreter is the oracle clarity-wasm is checked against, so a
+    /// caller that can roll a transaction back can run it both ways and see
+    /// which engine disagrees with the chain. Off unless asked for.
+    interpret: bool,
     modules: ModuleCache,
 }
 
@@ -612,6 +618,7 @@ impl Vm {
         Ok(Self {
             store: MarfStore::new(network)?,
             context: BitcoinContext::default(),
+            interpret: std::env::var_os("NANO_INTERPRETER_ONLY").is_some(),
             modules: ModuleCache::default(),
         })
     }
@@ -669,6 +676,7 @@ impl Vm {
                 headers_db,
                 ..BitcoinContext::default()
             },
+            interpret: std::env::var_os("NANO_INTERPRETER_ONLY").is_some(),
             modules: ModuleCache::default(),
         }
     }
@@ -824,6 +832,7 @@ impl Vm {
             store,
             context,
             modules,
+            ..
         } = self;
         deploy_contract_with_wasm_in_context(
             store,
@@ -875,6 +884,7 @@ impl Vm {
             store,
             context,
             modules,
+            ..
         } = self;
         match call_contract_values_in_context(
             store,
@@ -925,8 +935,10 @@ impl Vm {
         let Self {
             store,
             context,
+            interpret,
             modules,
         } = self;
+        let interpret = *interpret;
         execute_contract_call_outcome_with_wasm_in_context(
             store,
             context,
@@ -939,7 +951,13 @@ impl Vm {
                 arguments,
             },
             cost_tracker,
+            interpret,
         )
+    }
+
+    /// Answer contract calls from the interpreter until told otherwise.
+    pub const fn interpret_contract_calls(&mut self, interpret: bool) {
+        self.interpret = interpret;
     }
 
     /// Transfer STX between principals in the active block state.
@@ -2439,12 +2457,13 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     modules: &mut ModuleCache,
     call: &ContractCall<'_>,
     cost_tracker: &LimitedCostTracker,
+    interpret: bool,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
     // Running everything through the interpreter says whether a divergence is
     // the compiler's write order rather than its answers: mainnet is the
     // interpreter, so a state root that only matches this way names clarity-wasm
     // as what differs. A diagnostic, not a mode to follow a chain in.
-    if std::env::var_os("NANO_INTERPRETER_ONLY").is_some() {
+    if interpret {
         return execute_contract_call_outcome_in_context(
             store,
             bitcoin_context,

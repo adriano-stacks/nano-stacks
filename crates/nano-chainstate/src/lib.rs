@@ -1565,8 +1565,26 @@ impl ChainState {
         transaction: &Transaction,
         execution_cost: &ExecutionCost,
     ) -> Result<TransactionReceipt, ChainStateError> {
+        // Ask both engines the same transaction when told to. The interpreter
+        // is what mainnet ran, so a receipt that differs between them names
+        // clarity-wasm; one that agrees and still differs from the chain names
+        // the state around it. Rolling the first run back is what makes this
+        // safe, and it is the only way to compare a call that *succeeds* —
+        // the crosscheck inside the VM only fires when the compiler refuses.
+        let interpreted = std::env::var_os("NANO_CROSSCHECK_TRANSACTIONS").map(|_| {
+            self.vm.interpret_contract_calls(true);
+            self.vm.begin_transaction().ok();
+            let outcome = self.execute_transaction_in_transaction(transaction, execution_cost);
+            self.vm.rollback_transaction().ok();
+            self.vm.interpret_contract_calls(false);
+            outcome
+        });
+
         self.vm.begin_transaction()?;
         let result = self.execute_transaction_in_transaction(transaction, execution_cost);
+        if let Some(interpreted) = interpreted {
+            report_engine_disagreement(transaction, &result, &interpreted);
+        }
         match result {
             Ok(receipt) => {
                 self.vm.commit_transaction()?;
@@ -1930,6 +1948,25 @@ fn finalize_native_contract_call(
 }
 
 /// The fees a block's transactions paid, which its tenure collects.
+/// Say when the two engines answer one transaction differently.
+fn report_engine_disagreement(
+    transaction: &Transaction,
+    compiled: &Result<TransactionReceipt, ChainStateError>,
+    interpreted: &Result<TransactionReceipt, ChainStateError>,
+) {
+    let describe = |outcome: &Result<TransactionReceipt, ChainStateError>| match outcome {
+        Ok(receipt) => format!("{:?} {:?}", receipt.status, receipt.result.value),
+        Err(error) => format!("{error}"),
+    };
+    let (compiled, interpreted) = (describe(compiled), describe(interpreted));
+    if compiled != interpreted {
+        println!(
+            "engines disagree on {}:\n  compiler:    {compiled}\n  interpreter: {interpreted}",
+            transaction.txid()
+        );
+    }
+}
+
 fn block_fees(block: &NakamotoBlock) -> u128 {
     block
         .transactions

@@ -410,3 +410,23 @@ to compile in this block, so this is a behavioural difference inside one of the
 pool contracts the aggregator routes through — the opposite direction from the
 last three, where nano did too little.
 
+## A dual-engine oracle, and 8,665,970
+
+The crosscheck inside the VM only fires when the compiler *refuses* a call,
+which is no use when it answers and answers differently. `Vm` now has a runtime
+switch between engines, and `NANO_CROSSCHECK_TRANSACTIONS` runs each transaction
+through the interpreter inside a rolled-back bracket before running it for real,
+reporting any disagreement in status or value. Rolling the first run back is what
+makes comparing a *successful* call safe.
+
+Replay now reaches **8,665,970** — about 370 blocks past the checkpoint, from 179
+at the start of this work — and stops at 8,665,971, seven transactions. Verified
+without the crosscheck enabled, so the oracle is not masking anything.
+
+The oracle is noisy in one direction worth knowing about: the interpreter arm
+sometimes reports `contract execution left the database in an invalid state`,
+which is the bracket rather than the contract, and it maps an aborting response
+to `Success` where the compiler says `AbortedByResponse` — the same value and
+commit flag either way. Real disagreements are the ones where the *value*
+differs.
+
