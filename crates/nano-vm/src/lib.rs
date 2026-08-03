@@ -1,8 +1,13 @@
-use std::{collections::BTreeMap, path::Path, sync::Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Mutex,
+};
 
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
 use clarity::vm::ast::build_ast;
+use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::{
     AssetMap, CallStack, ContractContext, GlobalContext, OwnedEnvironment,
 };
@@ -18,8 +23,11 @@ use clarity::vm::database::{
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::representations::SymbolicExpression;
-use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
-use clarity::vm::{ClarityVersion, Value, eval_all};
+use clarity::vm::types::{
+    BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData, TypeSignature,
+    TypeSignatureExt,
+};
+use clarity::vm::{ClarityName, ClarityVersion, Value, eval_all};
 use nano_marf::{
     CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, VersionedMarf,
     import_checkpoint, import_checkpoint_into,
@@ -2052,6 +2060,75 @@ impl MarfStore {
     }
 }
 
+/// The functions a contract's source defines, with their real bodies.
+///
+/// Built straight from the parsed source, so nothing is deployed and no other
+/// contract has to be present — which is the difference between this and
+/// rebuilding by deploying into a throwaway store: a contract that names a
+/// contract cannot be deployed beside nothing, and can still be *parsed*.
+fn defined_functions(
+    contract: &QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+) -> HashMap<ClarityName, DefinedFunction> {
+    use clarity::vm::representations::SymbolicExpressionType::{Atom, List};
+    let epoch = epoch_for_version(version);
+    let mut tracker = LimitedCostTracker::new_free();
+    let Ok(parsed) = clarity::vm::ast::parse(contract, source, version, epoch) else {
+        return HashMap::new();
+    };
+    let mut functions = HashMap::new();
+    for expression in &parsed {
+        let List(form) = &expression.expr else {
+            continue;
+        };
+        let [head, signature, body] = form.as_slice() else {
+            continue;
+        };
+        let Atom(keyword) = &head.expr else { continue };
+        let define_type = match keyword.as_str() {
+            "define-public" => DefineType::Public,
+            "define-read-only" => DefineType::ReadOnly,
+            "define-private" => DefineType::Private,
+            _ => continue,
+        };
+        let List(signature) = &signature.expr else {
+            continue;
+        };
+        let Some((name, arguments)) = signature.split_first() else {
+            continue;
+        };
+        let Atom(name) = &name.expr else { continue };
+        let mut typed = Vec::new();
+        for argument in arguments {
+            let List(pair) = &argument.expr else { continue };
+            let [argument_name, argument_type] = pair.as_slice() else {
+                continue;
+            };
+            let Atom(argument_name) = &argument_name.expr else {
+                continue;
+            };
+            let Ok(signature) =
+                TypeSignature::parse_type_repr(epoch, argument_type, &mut tracker)
+            else {
+                continue;
+            };
+            typed.push((argument_name.clone(), signature));
+        }
+        functions.insert(
+            name.clone(),
+            DefinedFunction::new(
+                typed,
+                body.clone(),
+                define_type,
+                name,
+                &contract.to_string(),
+            ),
+        );
+    }
+    functions
+}
+
 /// Build a contract definition the interpreter can run, without touching state.
 ///
 /// clar2wasm's deploy stores placeholder function bodies, so a contract the
@@ -2623,12 +2700,47 @@ fn heal_contract_for_interpreter(
         }
         database.roll_back()?;
     }
-    let rebuilt = interpretable_contract(network, contract, version, &source, dependencies)
-        .map_err(|error| VmInternalError::Expect(error.to_string()))?;
+    let rebuilt = match interpretable_contract(network, contract, version, &source, dependencies) {
+        Ok(rebuilt) => rebuilt,
+        // A contract whose dependencies this node does not hold cannot be
+        // deployed beside them, however many are put in first. But it can still
+        // be *parsed*: the stub the compiler stored is right about everything
+        // except its function bodies, so take its own definition — which is
+        // present, being the one asked for — and put the real bodies back.
+        Err(_) => rebuilt_from_source(store, bitcoin_context, contract, version, &source)?,
+    };
     store
         .replace_contract_definition(contract, &rebuilt.serialize())
         .map_err(|error| VmInternalError::Expect(error.to_string()))?;
     Ok(())
+}
+
+/// The stored definition with its stub bodies replaced by the source's own.
+///
+/// Nothing is deployed, so no other contract has to be present and no top-level
+/// expression runs — re-running them would reset every data variable the
+/// contract has changed since, which would corrupt state rather than heal it.
+fn rebuilt_from_source(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    contract: &QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+) -> Result<clarity::vm::contracts::Contract, VmExecutionError> {
+    let functions = defined_functions(contract, version, source);
+    if functions.is_empty() {
+        return Err(VmInternalError::Expect(format!(
+            "no functions could be parsed from the source of {contract}"
+        ))
+        .into());
+    }
+    let mut database = clarity_database(store, bitcoin_context);
+    database.begin();
+    let stored = database.get_contract(contract);
+    database.roll_back()?;
+    let mut context = (*stored?).clone();
+    context.functions = functions;
+    Ok(context.into())
 }
 
 fn execute_contract_call_outcome_in_context(
@@ -4471,6 +4583,72 @@ mod tests {
         assert!(
             matches!(result, Ok(ref result) if matches!(result.value, Some(Value::UInt(_))),),
             "{result:?}"
+        );
+    }
+}
+
+/// Parsing a contract's functions needs nothing else to be present.
+///
+/// This is what heals a contract the compiler stored with stub bodies when its
+/// dependencies are not in this node's state: deploying it beside them is
+/// impossible, parsing it is not.
+#[cfg(test)]
+mod rebuild_tests {
+    use clarity::vm::ClarityVersion;
+    use clarity::vm::types::QualifiedContractIdentifier;
+
+    use super::defined_functions;
+
+    /// Names a contract this node does not hold, so it cannot be deployed.
+    const SOURCE: &str = "
+(define-constant target 'ST000000000000000000002AMW42H.absent)
+(define-public (pay (amount uint) (to principal))
+  (stx-transfer? amount tx-sender to))
+(define-read-only (double (n uint)) (* n u2))
+(define-private (helper) (ok true))
+(define-data-var counter uint u0)
+";
+
+    fn contract() -> QualifiedContractIdentifier {
+        QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.rebuilt")
+            .expect("a contract identifier")
+    }
+
+    #[test]
+    fn every_define_type_is_rebuilt_with_its_real_body() {
+        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, SOURCE);
+        for name in ["pay", "double", "helper"] {
+            assert!(
+                functions.contains_key(name),
+                "`{name}` was rebuilt from the source"
+            );
+        }
+        assert_eq!(functions.len(), 3, "only the functions, not the data var");
+
+        // The whole point: a real body, not the compiler's `(int 0)` stub.
+        let body = format!("{:?}", functions["double"]);
+        assert!(
+            body.contains('*') || body.contains("Multiply") || body.contains('n'),
+            "`double` carries its real body: {body}"
+        );
+    }
+
+    #[test]
+    fn arguments_keep_their_declared_types() {
+        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, SOURCE);
+        let pay = format!("{:?}", functions["pay"]);
+        assert!(
+            pay.contains("UInt") && pay.contains("Principal"),
+            "`pay` keeps `(uint, principal)`: {pay}"
+        );
+    }
+
+    #[test]
+    fn unparseable_source_yields_nothing_rather_than_a_wrong_contract() {
+        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, "(this is not");
+        assert!(
+            functions.is_empty(),
+            "a source that will not parse heals nothing"
         );
     }
 }
