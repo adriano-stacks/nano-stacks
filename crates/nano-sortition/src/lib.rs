@@ -1396,3 +1396,47 @@ mod leader_key_tests {
         assert_eq!(keys.available(), 0);
     }
 }
+
+/// Whether a commitment landed in the burn block it was aiming at.
+///
+/// A commitment carries the modulus of the block it was built against, and is
+/// only an operation if it arrives in the block that follows. One that arrives
+/// late is a *missed* commitment: still a transaction, still able to chain its
+/// UTXO so the mining window survives a gap, but not part of the sortition and
+/// not part of the operations hash.
+///
+/// nano hashed every commitment it could decode, so a single late one — at burn
+/// 960,230, one of five — gave a different operations hash and a different
+/// consensus hash from there on.
+#[must_use]
+pub const fn commit_lands_in_block(burn_parent_modulus: u8, block_height: u64) -> bool {
+    let intended = (burn_parent_modulus as u64 % BURN_BLOCK_MINED_AT_MODULUS + 1)
+        % BURN_BLOCK_MINED_AT_MODULUS;
+    block_height % BURN_BLOCK_MINED_AT_MODULUS == intended
+}
+
+#[cfg(test)]
+mod missed_commit_tests {
+    use super::{BURN_BLOCK_MINED_AT_MODULUS, commit_lands_in_block};
+
+    /// A commitment is an operation only in the block after the one it names.
+    #[test]
+    fn a_commitment_lands_in_the_block_after_the_one_it_names() {
+        // Burn 960,230 is 0 modulo five, so only a commitment built against
+        // the block before it — modulus four — belongs there. That is exactly
+        // the split mainnet made: four commitments accepted, one missed.
+        assert!(commit_lands_in_block(4, 960_230));
+        for late in [0, 1, 2, 3] {
+            assert!(
+                !commit_lands_in_block(late, 960_230),
+                "modulus {late} is not aiming at burn 960,230"
+            );
+        }
+
+        // The rule wraps, so the modulus before zero is the last one.
+        assert!(commit_lands_in_block(
+            u8::try_from(BURN_BLOCK_MINED_AT_MODULUS).expect("small") - 1,
+            0
+        ));
+    }
+}

@@ -29,8 +29,7 @@ never validation inputs.
 - [ ] Feed locally decoded Bitcoin operations into a persistent `SnapshotChain`.
 - [ ] Derive consensus hash, sortition hash, winning commit transaction, leader
       key, total burn and accumulated coinbase locally.
-- [~] Match the captured mainnet sortition window field for field — ten of
-      fifteen do, and the eleventh is the epoch 4.0 boundary.
+- [x] Match the captured mainnet sortition window field for field.
 - [ ] Hand the local snapshot to block validation and execution.
 - [ ] Persist snapshots and resume without trusting a peer's current burn view.
 - [ ] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
@@ -44,52 +43,48 @@ never validation inputs.
 - A Bitcoin reorganization selects the same surviving snapshot and Stacks fork
   as stacks-core after restart as well as in-process.
 
-## Ten mainnet sortitions derive exactly
+## The captured mainnet window derives exactly
 
 `crates/nano-conformance/tests/mainnet_sortition.rs` replays a captured window
 of mainnet snapshots from the raw Bitcoin blocks beneath them, taking only the
-first as given. For **ten consecutive burn blocks** nano finds the same
-operations, hashes them to the same `ops_hash`, identifies the same winning
-commitment among them, and chains the same `sortition_hash` from one to the
-next — none of it asked of a peer.
+first as given. **All fourteen derive**: the same operations found in each
+block, the same `ops_hash` over them, the same winning commitment identified
+among them, and the same `sortition_hash` chained from one to the next — none of
+it asked of a peer.
 
-It diverges at burn **960,230**, on the operations hash, where nano finds five
-operations and all of them are leader block commits.
+Getting there found a real rule nano did not apply. At burn 960,230 nano hashed
+five commitments where mainnet hashed four, and hashing subsets and orderings
+against the captured value named the odd one in a pass: mainnet's hash is over
+the first four **in nano's own order**, so only membership was ever wrong.
 
-**The network rejects exactly one of them.** Hashing subsets and orderings of
-the five against the captured `ops_hash` finds it in one pass: mainnet's hash is
-over the **first four, in nano's own order**. So the ordering is right, the
-decoding is right, and the fifth commit — `308dab22…`, at transaction index 573
-— is one nano accepts and the network does not.
+The archive settles what it is. `block_commits` has no row for that txid and
+`missed_commits` does:
 
-It is not malformed. All five carry the same shape, two `PoX` outputs and
-change: `[20000, 20000, 1406698]` against `[15000, 15000, …]` and
-`[21250, 21250, …]`. And it is not the waterfall rule, which rejects a commit
-paying nothing but only applies from `first_pox_waterfall_block` — the first
-block of the cycle *after* pox-5 activates. Cycle 140 runs 960,050 to 962,149,
-so that rule starts at 962,150, well past this block.
+```
+308dab22… | ["350c1699…",3] | 6147668178a7…
+```
 
-What is left is the validation nano does not do: **a commitment is only an
-operation if it names a leader key that was registered and not already spent.**
-nano accepts every commitment it decodes.
+A commitment carries the modulus of the block it was built against and is only
+an operation in the block that follows —
+`(burn_parent_modulus % 5 + 1) % 5 == block_height % 5`. One that arrives late
+is a *missed* commitment: still a transaction, still able to chain its UTXO so
+the mining window survives a gap, but not part of the sortition and not part of
+the hash. `nano_sortition::commit_lands_in_block` is that rule.
 
-`nano_sortition::LeaderKeys` now keeps that registry — a key is usable once, and
-only after it is registered — with its own test. Applying it needs history the
-window does not have, which the window itself proves: **zero leader keys are
-registered inside it**, so every commitment in those fifteen blocks names one
-from before, and filtering against what the window holds drops all five rather
-than the one the network drops.
+Two things were ruled out on the way, each by evidence rather than reasoning:
+it is not the waterfall rule, which starts at 962,150 — the cycle *after* pox-5
+activates; and it is not the leader key, because all five name keys that are
+registered and reused tens of thousands of times.
 
-So this is the same limit as the consensus hash, and the same answer: the rule
-needs a chain replayed from its own genesis rather than a slice of one. Building
-that chain in the node is the rest of this task, and the registry it needs is
-the one the VRF check in [[024-verify-the-vrf-seed-a-block-commits-to]] needs to
-find a tenure's public key.
+## What a window still cannot prove
 
-The consensus hash is not checked by this test and cannot be: it mixes prior
-consensus hashes at power-of-two offsets reaching back thousands of blocks, so
-it needs a chain replayed from its own genesis rather than a slice of one. That
-is what a node building the chain itself will exercise.
+The consensus hash is not checked here and cannot be: it mixes prior consensus
+hashes at power-of-two offsets reaching back thousands of blocks. Nor can the
+leader-key rule be applied — a commitment is only an operation if it names a
+registered key, and the window proves it cannot check that rather than assuming
+so: **zero leader keys are registered inside those fifteen blocks**, so every
+commitment names one from before.
 
-The test is a depth gate, like replay depth: ten is the floor already reached,
-and raising it is the measure of progress.
+`nano_sortition::LeaderKeys` holds that registry, with its own test, ready for
+the chain that can use it. Both limits have the same answer: a chain replayed
+from its own genesis in the node, which is the rest of this task.

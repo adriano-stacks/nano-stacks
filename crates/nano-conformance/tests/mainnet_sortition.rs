@@ -20,6 +20,7 @@ use nano_bitcoin::{BitcoinBlock, decode_block};
 use nano_primitives::{BitcoinHeaderHash, ConsensusHash, SortitionId};
 use nano_sortition::{
     LeaderKeys, OpsHash, PoxId, SnapshotChain, SortitionHash, SortitionSnapshot, SortitionWinner,
+    commit_lands_in_block,
 };
 
 /// What a captured snapshot says, in the fields nano derives.
@@ -42,6 +43,27 @@ fn capture() -> Option<PathBuf> {
 
 fn decode(value: &str) -> Vec<u8> {
     hex::decode(value).expect("a captured field is hexadecimal")
+}
+
+/// The transactions of a burn block that are operations for its sortition.
+///
+/// A commitment that arrived after the block it was aiming at is a *missed*
+/// commitment: still a transaction, still able to chain its UTXO so the mining
+/// window survives a gap, but not an operation and not part of the hash. This
+/// needs nothing but the block it landed in, unlike the leader-key rule, which
+/// needs history a window has none of.
+fn operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
+    block
+        .operations
+        .iter()
+        .filter(|operation| match &operation.kind {
+            nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
+                commit_lands_in_block(*parent_modulus, block.height)
+            }
+            _ => true,
+        })
+        .map(|operation| operation.txid)
+        .collect()
 }
 
 /// The leader keys a set of burn blocks registers.
@@ -70,14 +92,17 @@ fn keys_registered_in(blocks: &BTreeMap<u64, BitcoinBlock>) -> LeaderKeys {
 fn report_operations(height: u64, block: &BitcoinBlock) {
     for operation in &block.operations {
         println!(
-            "  burn {height} op {} index {} outputs {:?}",
+            "  burn {height} op {} index {} {}",
             hex::encode(operation.txid),
             operation.transaction_index,
-            operation
-                .outputs
-                .iter()
-                .map(|output| output.amount_sats)
-                .collect::<Vec<_>>()
+            match &operation.kind {
+                nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                    key_block_height,
+                    key_transaction_index,
+                    ..
+                } => format!("names key {key_block_height}/{key_transaction_index}"),
+                other => format!("{other:?}"),
+            }
         );
     }
 }
@@ -109,12 +134,8 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
     }
 }
 
-/// How many of the captured window already derive exactly.
-///
-/// Ten, which is every burn block up to epoch 4.0's boundary at 960,230. The
-/// boundary itself is where the operation set changes and nano and the network
-/// stop agreeing on which transactions count.
-const DERIVED_FLOOR: usize = 10;
+/// How many of the captured window derive exactly: all of it.
+const DERIVED_FLOOR: usize = 14;
 
 /// Mainnet's magic bytes, which decide what counts as a burnchain transaction.
 const MAINNET_MAGIC: [u8; 2] = *b"X2";
@@ -164,16 +185,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
         let block = blocks
             .get(&snapshot.block_height)
             .expect("every captured snapshot has its Bitcoin block");
-        // Not filtered by leader key here, though that is the rule: the keys
-        // these commitments name were registered long before a fifteen-block
-        // window, so applying it against what the window holds drops every
-        // commitment rather than the one the network drops. It is the same
-        // limit as the consensus hash — the rule needs a chain, not a slice.
-        let txids: Vec<[u8; 32]> = block
-            .operations
-            .iter()
-            .map(|operation| operation.txid)
-            .collect();
+        let txids = operation_txids(block);
         // The winner's seed is in its own commitment, which is among the
         // operations nano decoded — so finding it is part of the claim.
         let winning = <[u8; 32]>::try_from(decode(&snapshot.winning_block_txid).as_slice())
