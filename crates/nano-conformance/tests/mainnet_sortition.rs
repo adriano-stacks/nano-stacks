@@ -45,6 +45,43 @@ fn decode(value: &str) -> Vec<u8> {
     hex::decode(value).expect("a captured field is hexadecimal")
 }
 
+/// A chain seeded with the consensus hashes behind the window, when the
+/// capture carries them, because the skip-list reaches back past any window.
+fn chain_from(root: &std::path::Path, genesis: &SortitionSnapshot) -> SnapshotChain {
+    consensus_history(root).map_or_else(
+        || SnapshotChain::new(genesis.clone()),
+        |hashes| {
+            SnapshotChain::with_history(genesis.clone(), hashes)
+                .expect("the history ends at the snapshot it seeds")
+        },
+    )
+}
+
+/// The consensus hashes behind the window, if the capture carries them.
+///
+/// A consensus hash mixes the ones at power-of-two offsets behind it, reaching
+/// back thousands of blocks, so without these a window can derive every other
+/// field and not this one.
+fn consensus_history(root: &std::path::Path) -> Option<Vec<ConsensusHash>> {
+    #[derive(serde::Deserialize)]
+    struct History {
+        hashes: Vec<String>,
+    }
+    let bytes = fs::read(root.join("sortition/consensus-hashes.json")).ok()?;
+    let history: History = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        history
+            .hashes
+            .iter()
+            .map(|hash| {
+                ConsensusHash::from_bytes(
+                    <[u8; 20]>::try_from(decode(hash).as_slice()).expect("20 bytes"),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// The transactions of a burn block that are operations for its sortition.
 ///
 /// A commitment that arrived after the block it was aiming at is a *missed*
@@ -172,7 +209,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
 
     // The first captured snapshot is taken as given; everything after it is
     // derived, which is the claim being checked.
-    let mut chain = SnapshotChain::new(seed_from(&captured[0]));
+    let mut chain = chain_from(&root, &seed_from(&captured[0]));
 
 
     println!(
@@ -228,11 +265,10 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
             first_divergence = Some((snapshot.block_height, "operations hash"));
             break;
         }
-        // The sortition hash is a chain from the one before it, so a window
-        // proves it; the consensus hash mixes prior ones at power-of-two
-        // offsets reaching back thousands of blocks, which a window of fifteen
-        // cannot supply. That needs a chain replayed from its own genesis, and
-        // is what a node building the chain itself will exercise.
+        // The consensus hash is still not checked, though the history it needs
+        // is now carried: it also mixes the `PoxId`, one bit per reward cycle,
+        // and this replay passes `PoxId::initial()`. Deriving that bit vector
+        // is the next input, not the history.
         if hex::encode(derived.sortition_hash.as_bytes()) != snapshot.sortition_hash {
             first_divergence = Some((snapshot.block_height, "sortition hash"));
             break;

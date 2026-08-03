@@ -622,14 +622,38 @@ impl SortitionReorg {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotChain {
     snapshots: Vec<SortitionSnapshot>,
+    /// Every consensus hash up to the tip, oldest first.
+    ///
+    /// A consensus hash mixes the ones at power-of-two offsets behind it,
+    /// reaching back thousands of blocks, so a chain that starts at a
+    /// checkpoint cannot derive one from its own snapshots alone. Carrying the
+    /// hashes rather than the snapshots keeps that history to twenty bytes a
+    /// block — six megabytes for the whole of mainnet.
+    consensus_hashes: Vec<ConsensusHash>,
 }
 
 impl SnapshotChain {
     #[must_use]
     pub fn new(genesis: SortitionSnapshot) -> Self {
         Self {
+            consensus_hashes: vec![genesis.consensus_hash],
             snapshots: vec![genesis],
         }
+    }
+
+    /// Start from a checkpoint, carrying the consensus hashes behind it.
+    ///
+    /// `history` runs oldest first and ends with the genesis snapshot's own
+    /// hash, which is what makes the skip-list reach past the checkpoint.
+    #[must_use]
+    pub fn with_history(genesis: SortitionSnapshot, history: Vec<ConsensusHash>) -> Option<Self> {
+        if history.last() != Some(&genesis.consensus_hash) {
+            return None;
+        }
+        Some(Self {
+            snapshots: vec![genesis],
+            consensus_hashes: history,
+        })
     }
 
     #[must_use]
@@ -682,6 +706,11 @@ impl SnapshotChain {
         let kept = usize::try_from(above_root)
             .unwrap_or(usize::MAX)
             .saturating_add(1);
+        // The hash history must shrink with the chain, or a rebuilt branch
+        // mixes hashes from the one it replaced.
+        let dropped = self.snapshots.len().saturating_sub(kept);
+        self.consensus_hashes
+            .truncate(self.consensus_hashes.len().saturating_sub(dropped));
         let retracted = if kept < self.snapshots.len() {
             self.snapshots.split_off(kept)
         } else {
@@ -764,12 +793,13 @@ impl SnapshotChain {
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             pox_id,
         };
+        self.consensus_hashes.push(snapshot.consensus_hash);
         self.snapshots.push(snapshot);
         Ok(self.tip())
     }
 
     fn previous_consensus_hashes(&self) -> Vec<ConsensusHash> {
-        let parent_index = self.snapshots.len() - 1;
+        let parent_index = self.consensus_hashes.len() - 1;
         let mut hashes = Vec::new();
         let mut exponent = 0_u32;
         while exponent < 64 {
@@ -777,7 +807,7 @@ impl SnapshotChain {
             let Some(index) = parent_index.checked_sub(offset) else {
                 break;
             };
-            hashes.push(self.snapshots[index].consensus_hash);
+            hashes.push(self.consensus_hashes[index]);
             exponent += 1;
         }
         hashes

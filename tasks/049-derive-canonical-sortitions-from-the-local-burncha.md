@@ -86,5 +86,19 @@ so: **zero leader keys are registered inside those fifteen blocks**, so every
 commitment names one from before.
 
 `nano_sortition::LeaderKeys` holds that registry, with its own test, ready for
-the chain that can use it. Both limits have the same answer: a chain replayed
-from its own genesis in the node, which is the rest of this task.
+the chain that can use it. And it is a small thing to carry: mainnet has
+**2,477 leader keys** in total.
+
+### Reaching past a checkpoint without replaying to it
+
+A chain does not have to be replayed from genesis to derive a consensus hash —
+it has to *know the hashes behind it*, which is twenty bytes a block.
+`SnapshotChain::with_history` takes them, so a chain starting at a checkpoint
+mixes the same skip-list the network did. Mainnet's whole history is 294,170
+hashes, twelve megabytes, and the capture now carries it as
+`sortition/consensus-hashes.json`.
+
+That is necessary and not yet sufficient: seeded with it, the consensus hash
+still does not derive, because it also mixes the `PoxId` — one bit per reward
+cycle — and the replay passes `PoxId::initial()`. Deriving that bit vector is
+the next input, and it is a smaller thing than replaying a chain.
