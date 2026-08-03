@@ -5654,8 +5654,10 @@ dependencies = [
  "nano-conformance",
  "nano-crypto",
  "nano-primitives",
+ "nano-sync",
  "nano-vm",
  "serde_json",
+ "tokio",
  "wasmprinter",
 ]
 

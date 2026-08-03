@@ -24,9 +24,12 @@ fn main() -> ExitCode {
         }
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("rebuild-accounting") => {
+            rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
+        }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting>"
             );
             ExitCode::from(2)
         }
@@ -1344,3 +1347,165 @@ fn check_module(arguments: &[String]) -> ExitCode {
     }
 }
 
+/// Recompute every tenure's fees from the blocks themselves.
+///
+/// Tenure accounting lives outside the MARF, so a state root proves nothing
+/// about it. A node that retried a block it could not execute added that
+/// block's fees again on every attempt ([[056-roll-back-what-a-rejected-block-touched]]),
+/// and the only way to know which tenures that reached is to count them again
+/// from the chain: walk back from the tip block by block, start a new tenure
+/// wherever the consensus hash changes, and sum what each block's transactions
+/// paid.
+fn rebuild_accounting(arguments: &[String]) -> ExitCode {
+    let [state, peer, tip, tenure_height] = arguments else {
+        eprintln!(
+            "usage: cargo xtask rebuild-accounting <state-dir> <peer-url> <tip-block-id> \
+             <tip-tenure-height>"
+        );
+        return ExitCode::FAILURE;
+    };
+    let (Ok(tip), Ok(tenure_height)) = (hex::decode(tip), tenure_height.parse::<u64>()) else {
+        eprintln!("the tip must be hexadecimal and the tenure height a number");
+        return ExitCode::FAILURE;
+    };
+    let Ok(tip) = <[u8; 32]>::try_from(tip.as_slice()) else {
+        eprintln!("the tip must be 32 bytes");
+        return ExitCode::FAILURE;
+    };
+
+    let path = Path::new(state).join("chainstate").join("accounting.json");
+    let Ok(bytes) = fs::read(&path) else {
+        eprintln!("cannot read {}", path.display());
+        return ExitCode::FAILURE;
+    };
+    let Ok(mut accounting) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        eprintln!("cannot parse {}", path.display());
+        return ExitCode::FAILURE;
+    };
+    let Some(tenures) = accounting.get("tenures").and_then(serde_json::Value::as_array) else {
+        eprintln!("the accounting names no tenures");
+        return ExitCode::FAILURE;
+    };
+    let oldest = tenures
+        .iter()
+        .filter_map(|tenure| tenure.get("coinbase_height")?.as_u64())
+        .min()
+        .unwrap_or(tenure_height);
+
+    let counted = match count_fees(peer, tip, tenure_height, oldest) {
+        Ok(counted) => counted,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut corrected = 0;
+    if let Some(tenures) = accounting.get_mut("tenures").and_then(serde_json::Value::as_array_mut) {
+        for tenure in tenures.iter_mut() {
+            let Some(height) = tenure.get("coinbase_height").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            // A tenure the walk did not reach in full is left alone: counting
+            // part of one would replace a wrong number with another.
+            let Some(fees) = counted.get(&height) else {
+                continue;
+            };
+            let recorded = tenure.get("fees").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            if recorded != *fees {
+                println!("tenure {height}: {recorded} recorded, {fees} counted");
+                tenure["fees"] = serde_json::json!(fees);
+                corrected += 1;
+            }
+        }
+    }
+
+    if corrected == 0 {
+        println!("every tenure the walk covered already agrees with the chain");
+        return ExitCode::SUCCESS;
+    }
+    let backup = path.with_extension("json.before-rebuild");
+    if let Err(error) = fs::copy(&path, &backup).and_then(|_| {
+        fs::write(
+            &path,
+            serde_json::to_vec(&accounting).unwrap_or_default(),
+        )
+    }) {
+        eprintln!("cannot write the corrected accounting: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "corrected {corrected} tenures; the previous file is at {}",
+        backup.display()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Walk back from `tip`, summing each tenure's transaction fees.
+fn count_fees(
+    peer: &str,
+    tip: [u8; 32],
+    tenure_height: u64,
+    oldest: u64,
+) -> Result<std::collections::BTreeMap<u64, u64>, String> {
+    let url = peer.parse().map_err(|_| format!("{peer} is not a URL"))?;
+    let client = nano_sync::SyncClient::new(url).map_err(|error| format!("{error}"))?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| format!("{error}"))?;
+
+    let mut fees = std::collections::BTreeMap::new();
+    let mut block_id = nano_primitives::StacksBlockId::from_bytes(tip);
+    let mut height = tenure_height;
+    let mut consensus = None;
+    runtime.block_on(async {
+        while height >= oldest {
+            // A public peer rate-limits a walk this long, and being turned away
+            // is not a reason to give up on a repair that has to be complete to
+            // be worth anything.
+            let mut block = Err(String::new());
+            for attempt in 0..8u32 {
+                match client.block(block_id).await {
+                    Ok(fetched) => {
+                        block = Ok(fetched);
+                        break;
+                    }
+                    Err(error) => {
+                        block = Err(format!("cannot fetch {block_id}: {error}"));
+                        tokio::time::sleep(std::time::Duration::from_secs(u64::from(
+                            2 + attempt * 3,
+                        )))
+                        .await;
+                    }
+                }
+            }
+            let block = block?;
+            // The consensus hash changing is the tenure changing: walking back,
+            // that means the block before belongs to the tenure before.
+            let this = block.header.consensus_hash;
+            if consensus.is_some_and(|seen| seen != this) {
+                height = height.saturating_sub(1);
+                if height < oldest {
+                    break;
+                }
+            }
+            consensus = Some(this);
+            *fees.entry(height).or_insert(0u64) += block_fees(&block);
+            let parent = block.header.parent_block_id;
+            if parent == block_id {
+                break;
+            }
+            block_id = parent;
+        }
+        Ok::<_, String>(())
+    })?;
+    // The tenure the walk stopped inside was only partly counted.
+    fees.remove(&height);
+    Ok(fees)
+}
+
+fn block_fees(block: &nano_chainstate::NakamotoBlock) -> u64 {
+    block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.auth().payer().fee())
+        .sum()
+}
