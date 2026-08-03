@@ -1090,6 +1090,13 @@ impl ChainState {
             ChainStateError::InvalidTransaction("tenure height overflow".to_owned())
         })?;
         self.vm.set_tenure_height(next_height)?;
+        if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+            println!(
+                "tenure start at burn {} with {} burn operations",
+                bitcoin_context.height,
+                operations.len()
+            );
+        }
         self.execute_bitcoin_operations(operations, bitcoin_context.height)?;
         if let Some(schedule) = self.accounting.schedule() {
             let coinbase = schedule

@@ -158,7 +158,25 @@ incrementing the liquid supply by zero for matured rewards that did not exist,
 which stacks-core guards on having payouts at all — and a write the network did
 not make is a leaf in the trie it does not have.
 
-### Where it stops now
+### The first tenure start, and what has been ruled out there
+
+Replay now reaches **8,665,722**, the first tenure start past the checkpoint,
+and every observable at it agrees with mainnet:
+
+| what | nano | mainnet |
+|---|---|---|
+| transactions | tenure-change and coinbase, both `(ok true)` | the same |
+| matured credit | 1,000,000,000 to the tenure's recipient | the archive's own figure |
+| SIP-031 mint | 475,000,000 to `SP000000000000000000002Q6VF78.sip-031` | the same amount and recipient |
+| liquid supply after | 1,854,643,201.554249 STX | **1,854,643,201.554249 STX** |
+| write set | ten keys, in stacks-core's order | — |
+| burn operations | five, none writing Clarity state | — |
+
+and the root still differs. The trace that produced this covers `put_data`
+only, and `insert_metadata` writes land in the MARF too — so the next thing to
+instrument is metadata, not another data write.
+
+### Where it stopped before
 
 At **8,665,719**, and it is structural rather than arithmetic:
 [[055-answer-block-info-for-blocks-before-the-checkpoint]]. `HeadersDB` answers
