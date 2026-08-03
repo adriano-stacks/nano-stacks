@@ -808,3 +808,29 @@ recorded so nobody repeats them: the plain `as-contract?`, `as-contract?` holdin
 a `try!`, an `if`/`begin` around it, a trailing `var-set`, two `print` branches of
 matching shape, the release half alone, the keeper half alone.
 
+## An unattended run does not accumulate progress
+
+Worth correcting, because it was my own suggestion: leaving the node running does
+not find divergences in bulk. A divergence is a **hard stop** — the node retries
+the same block for as long as it runs and never reaches the next one. Ten minutes
+or ten hours, it sits at 8,666,584 with fifty identical rejections behind it.
+
+So there is no version of "let it run overnight and collect the failures". Every
+divergence has to be fixed before the one after it is even visible, which is what
+makes the per-divergence cost the whole cost.
+
+That leaves exactly two ways to go faster: fix them faster, or execute a path
+that does not produce them. The tooling has done the first as far as it goes —
+the last three bugs each fell out in one run. The second is the interpreter.
+
+## The interpreter's pox-5 failure is real, not an artifact
+
+Ruled out the obvious explanation: `call_contract_values_in_context`, which is
+how nano makes its own internal reads of `pox-5` and `signers` during signer-set
+derivation, always goes through `call_compiled_contract`. It never sees the
+interpret switch, so those reads are not what is failing.
+
+`pox-5::stake-update` returning `int` where a public function must return a
+response is therefore a genuine transaction-level failure of the interpreter
+path, and the remaining thing to understand before the fallback is usable.
+
