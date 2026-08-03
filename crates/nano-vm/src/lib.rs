@@ -841,9 +841,19 @@ impl Vm {
         let Self {
             store,
             context,
+            interpret,
             modules,
-            ..
         } = self;
+        // A contract whose module the runtime refuses cannot be deployed by the
+        // compiler at all, and a deploy that fails stops the block. The
+        // interpreter has no module to refuse, so where it is the execution path
+        // it has to be the deployment path too — otherwise the switch moves half
+        // the work and leaves behind the half that has been failing.
+        if *interpret {
+            return deploy_contract_in_context(
+                store, context, contract, version, source, cost_tracker,
+            );
+        }
         deploy_contract_with_wasm_in_context(
             store,
             context,
@@ -2472,10 +2482,13 @@ fn execute_contract_call_outcome_in_context(
         // actually complaining about is the useful half, and reporting only
         // that the unwind failed throws it away — which is how this looked
         // like a mystery rather than a bug report.
-        return Err(result.err().unwrap_or_else(|| {
-            VmInternalError::Expect(format!("{called} left the database in an invalid state"))
-                .into()
-        }));
+        // Name the call on the way out: the error alone says a public function
+        // returned the wrong shape and not which one, and finding that by
+        // bisection costs a day.
+        return Err(result.err().map_or_else(
+            || VmInternalError::Expect(format!("{called} left the database in an invalid state")).into(),
+            |error| VmInternalError::Expect(format!("{called}: {error}")).into(),
+        ));
     };
     match result {
         Ok((value, assets, events)) => {

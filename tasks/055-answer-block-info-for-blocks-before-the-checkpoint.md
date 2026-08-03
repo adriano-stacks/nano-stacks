@@ -834,3 +834,35 @@ interpret switch, so those reads are not what is failing.
 response is therefore a genuine transaction-level failure of the interpreter
 path, and the remaining thing to understand before the fallback is usable.
 
+## The fallback carries blocks the compiler cannot
+
+Routing *deploys* through the interpreter too was the missing half. The engine
+switch only moved contract *calls*, so a contract whose module wasmtime refuses
+still could not be deployed, and a deploy that fails stops the block — which is
+exactly what 8,666,585 is.
+
+With deploys routed as well, the interpreter **executed straight past
+`rewards-stx-v1`** and 66 blocks beyond it, to 8,666,650, with no state-root
+mismatch. That is the first direct evidence that the fallback does what plan.md
+says it does: carry a chain the compiler cannot.
+
+The captured replay still passes all forty blocks with matching roots under it,
+so the switch has not been bought by loosening anything.
+
+## What the interpreter path stops on
+
+`SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.native-pool-v1::delegate` —
+
+```
+RuntimeCheck(Unreachable("Public function must return response: int"))
+```
+
+The earlier `pox-5::stake-update` sighting is the same fault seen from one level
+down: `delegate` reaches pox-5 through `try! (contract-call? ...)`, and a pox-5
+public function is evaluating to an `int` under the interpreter where the
+compiler gets a response. Mainnet runs the same interpreter and succeeds, so the
+difference is in what nano's state gives it, not in the interpreter.
+
+Naming the call on the way out is what made this findable; the error alone says
+a public function returned the wrong shape and not which one.
+
