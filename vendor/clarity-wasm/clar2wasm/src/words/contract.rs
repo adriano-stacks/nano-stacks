@@ -62,7 +62,7 @@ impl ComplexWord for AsContract {
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
+        expr: &SymbolicExpression,
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
@@ -70,6 +70,20 @@ impl ComplexWord for AsContract {
         self.charge(generator, builder, 0)?;
 
         let inner = args.get_expr(0)?;
+
+        // The inner expression is what this evaluates to, so it has to be built
+        // as this type rather than the one it was analysed with. `(ok u1)` on
+        // its own is `(response uint NoType)`, and laying that out where a
+        // `(response uint uint)` is expected puts an i32 where the error is two
+        // i64s — a module that compiles and will not load. `begin` and
+        // `as-contract?` both already do this.
+        let expected = generator
+            .get_expr_type(expr)
+            .ok_or_else(|| {
+                GeneratorError::TypeError("as-contract expression must be typed".to_owned())
+            })?
+            .clone();
+        generator.set_expr_type(inner, expected)?;
 
         // Call the host interface function, `enter_as_contract`
         builder.call(generator.func_by_name("stdlib.enter_as_contract"));

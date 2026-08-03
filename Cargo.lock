@@ -2812,6 +2812,7 @@ dependencies = [
  "rusqlite",
  "stacks-common",
  "tempfile",
+ "wasmtime",
 ]
 
 [[package]]
@@ -4987,6 +4988,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmprinter"
+version = "0.207.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c2d8a7b4dabb460208e6b4334d9db5766e84505038b2529e69c3d07ac619115"
+dependencies = [
+ "anyhow",
+ "wasmparser 0.207.0",
+]
+
+[[package]]
 name = "wasmtime"
 version = "15.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5637,12 +5648,15 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "clarity",
  "hex",
  "nano-chainstate",
  "nano-conformance",
  "nano-crypto",
  "nano-primitives",
+ "nano-vm",
  "serde_json",
+ "wasmprinter",
 ]
 
 [[package]]

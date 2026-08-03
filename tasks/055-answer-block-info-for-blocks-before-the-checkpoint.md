@@ -174,3 +174,35 @@ variables and two map entries under a branch.
 That is evidence, not a guarantee, but it moves the suspicion off the fallback
 and onto write ordering across transactions or a native effect around them.
 
+## The compiler bug, found and fixed
+
+`as-contract` did not pass its own type down to the expression it wraps, so that
+expression was laid out with the type it was *analysed* with. `(ok u1)` alone is
+`(response uint NoType)`; written where a `(response uint uint)` belongs, the
+error slot gets one `i32` where two `i64`s are needed. The module compiles
+without a diagnostic and wasmtime refuses it. `begin` and `as-contract?` already
+propagated their type — `as-contract` was the one that did not.
+
+The whole fix is three lines in `words/contract.rs`. clar2wasm's own suite —
+1,375 tests — stays green.
+
+Getting there took three things:
+
+- **Naming the culprit.** nano now validates a module at the point it compiles
+  one, so the fault is attributed to the contract that owns it rather than the
+  contract that was called. Until then the error pointed at `.flea`, which only
+  passes `.hilt` as a trait argument.
+- **A checker that runs in seconds.** `cargo xtask check-module` compiles one
+  source against a node's own state. Reproducing this from source alone is not
+  possible — analysing `.hilt` needs 376 contracts and 2.9 MB — but a node
+  already has them.
+- **Delta debugging.** 30 KB reduced to one line, which needs no traits, no
+  folds and no other contracts:
+
+  ```clarity
+  (define-public (sr (a (response bool uint))) (as-contract (begin (try! a) (ok u1))))
+  ```
+
+  A short return is what makes it visible; without one the two layouts agree.
+  Pinned by `tests/as_contract_codegen.rs`.
+

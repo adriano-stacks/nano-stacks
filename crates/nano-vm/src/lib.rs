@@ -895,6 +895,24 @@ impl Vm {
     }
 
     /// Invoke a contract and retain acceptable runtime failures as transaction outcomes.
+    /// Compile a contract in this state and report whether its module loads.
+    ///
+    /// This is the path a node takes when it meets a contract deployed before
+    /// it started, resolving references against the state on disk. Pointing it
+    /// at an edited source is how a contract whose module the runtime refuses
+    /// gets narrowed down to the definition that causes it.
+    pub fn check_module(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        version: ClarityVersion,
+        source: &str,
+        epoch: StacksEpochId,
+    ) -> Result<(), VmExecutionError> {
+        compile_under(&mut self.store, contract, source, version, epoch)
+            .and_then(|compiled| loadable(contract, compiled))
+            .map(|_| ())
+    }
+
     pub fn execute_contract_call_outcome(
         &mut self,
         sender: PrincipalData,
@@ -2703,7 +2721,9 @@ fn ensure_wasm_module(
     // The current epoch first, so the costs baked in are the ones the chain
     // charges now. Only a contract it rejects — one using a word a later epoch
     // removed — is rebuilt under the epoch it was deployable in.
-    let compiled = match compile_under(store, contract, &source, version, StacksEpochId::Epoch40) {
+    let compiled = match compile_under(store, contract, &source, version, StacksEpochId::Epoch40)
+        .and_then(|compiled| loadable(contract, compiled))
+    {
         Ok(compiled) => compiled,
         Err(rejected) => {
             // Worth saying: a contract built under an older epoch is charged
@@ -2719,6 +2739,7 @@ fn ensure_wasm_module(
                 .filter(|epoch| **epoch >= epoch_for_version(version))
                 .find_map(|epoch| {
                     compile_under(store, contract, &source, version, *epoch)
+                        .and_then(|compiled| loadable(contract, compiled))
                         .ok()
                         .map(|compiled| (*epoch, compiled))
                 })
@@ -2729,6 +2750,33 @@ fn ensure_wasm_module(
     };
     modules.insert(contract.clone(), compiled);
     Ok(())
+}
+
+/// Reject a module the runtime would refuse to load.
+///
+/// A contract can compile and still emit wasm wasmtime rejects — nothing checks
+/// the two agree, and the failure otherwise surfaces at the call, naming the
+/// contract that was *called* rather than the one whose module is bad. Checking
+/// here names the culprit and lets the epoch retry above look for a build that
+/// does load, which is the difference between a stalled replay and a running
+/// one. The engine is the one clar2wasm instantiates with, so this is the same
+/// judgement the runtime would make.
+fn loadable(
+    contract: &QualifiedContractIdentifier,
+    compiled: CompiledContract,
+) -> Result<CompiledContract, VmExecutionError> {
+    if let Err(error) = wasmtime::Module::validate(&wasmtime::Engine::default(), &compiled.wasm) {
+        // A module the runtime refuses can only be read as bytes, so leave them
+        // somewhere a disassembler can reach when asked.
+        if let Some(path) = std::env::var_os("NANO_DUMP_REFUSED_WASM") {
+            let _ = std::fs::write(path, &compiled.wasm);
+        }
+        return Err(VmInternalError::Expect(format!(
+            "{ANALYSIS_FAILED}: {contract} compiles to a module that will not load: {error}"
+        ))
+        .into());
+    }
+    Ok(compiled)
 }
 
 fn wasm_compile_error(error: clar2wasm::CompileError) -> String {

@@ -23,9 +23,10 @@ fn main() -> ExitCode {
             verify_block(&env::args().skip(2).collect::<Vec<_>>())
         }
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
+        Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module>"
             );
             ExitCode::from(2)
         }
@@ -1254,3 +1255,92 @@ fn json_unsigned_field(response: &str, field: &str) -> Result<u64, String> {
 fn io_error(context: &'static str) -> impl FnOnce(std::io::Error) -> String {
     move |error| format!("could not {context}: {error}")
 }
+
+/// Compile one contract against a node's own state and say whether it loads.
+///
+/// A contract that compiles to wasm the runtime refuses cannot be reproduced
+/// from its source alone — analysing it needs every contract it references, and
+/// for a mainnet aggregator that is hundreds. A node already has them, so this
+/// borrows its state rather than rebuilding a fixture of it, which also makes
+/// bisecting an edited source a matter of seconds instead of a replay.
+fn check_module(arguments: &[String]) -> ExitCode {
+    let [state, contract, version, source] = arguments else {
+        eprintln!(
+            "usage: cargo xtask check-module <state-dir> <contract-id> <clarity-version> <source-file>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
+        eprintln!("{contract} is not a contract identifier");
+        return ExitCode::FAILURE;
+    };
+    let version = match version.as_str() {
+        "1" => clarity::vm::ClarityVersion::Clarity1,
+        "2" => clarity::vm::ClarityVersion::Clarity2,
+        "3" => clarity::vm::ClarityVersion::Clarity3,
+        "4" => clarity::vm::ClarityVersion::Clarity4,
+        "5" => clarity::vm::ClarityVersion::Clarity5,
+        "6" => clarity::vm::ClarityVersion::Clarity6,
+        other => {
+            eprintln!("{other} is not a Clarity version");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match fs::read_to_string(source) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("cannot read the source: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block, so there is nothing to compile against");
+        return ExitCode::FAILURE;
+    };
+    if let Err(error) = vm.begin_block(Some(tip), [0xcc; 32]) {
+        eprintln!("cannot begin a block on the tip: {error:?}");
+        return ExitCode::FAILURE;
+    }
+
+    match vm.check_module(
+        &identifier,
+        version,
+        &source,
+        clarity::types::StacksEpochId::Epoch40,
+    ) {
+        Ok(()) => {
+            println!("{contract} compiles to a module that loads");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            println!("{contract}: {error:?}");
+            // The bytes are only readable disassembled, and a refused module is
+            // exactly when someone wants to read them.
+            if let Some(path) = env::var_os("NANO_DUMP_REFUSED_WASM") {
+                match fs::read(&path).map(wasmprinter::print_bytes) {
+                    Ok(Ok(text)) => {
+                        let text_path = Path::new(&path).with_extension("wat");
+                        if let Err(error) = fs::write(&text_path, text) {
+                            eprintln!("cannot write the disassembly: {error}");
+                        } else {
+                            println!("disassembled to {}", text_path.display());
+                        }
+                    }
+                    Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
+                    Err(error) => eprintln!("cannot read the module: {error}"),
+                }
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
