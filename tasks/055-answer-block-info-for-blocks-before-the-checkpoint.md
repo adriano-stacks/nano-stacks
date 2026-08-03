@@ -586,3 +586,20 @@ The reduction still has to be done — the sub-swaps route through several DEX
 adapters and the failing one has to be isolated — but which engine is at fault
 is no longer in question.
 
+## Narrowing it: not the stableswap curve
+
+`(err u2)` is the aggregator's fallback when a **stableswap** leg fails —
+`SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXGB3M.stableswap-stx-ststx-v-1-2` and its
+`usda-aeusdc` siblings. Both compile to modules that load, so the fault is in
+what they compute rather than whether they build.
+
+`cargo xtask call-both` runs one contract call through each engine against a
+node's own state and prints both answers — the finest grain the crosscheck comes
+in, and the only way to ask about a contract reachable solely through half a
+dozen others. Pointed at `get-y`, the curve solver both legs go through, the two
+engines **agree** on every input tried: equal balances, a pool drained to one
+unit, a `u128` maximum, and a swap of almost the whole balance.
+
+So the divergence is not the curve. It is in the stateful swap path around it,
+which is where to look next.
+

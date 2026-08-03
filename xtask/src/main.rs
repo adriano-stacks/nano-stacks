@@ -25,12 +25,13 @@ fn main() -> ExitCode {
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both>"
             );
             ExitCode::from(2)
         }
@@ -1719,5 +1720,80 @@ fn probe_orders(
         }
     }
     false
+}
+
+/// Run one contract call through both engines and print what each answered.
+///
+/// The interpreter is what mainnet runs, so a call the two answer differently
+/// names clarity-wasm without any argument about state — and against a real
+/// chainstate it can be a read-only function of a contract that is only
+/// reachable through half a dozen others.
+fn call_both(arguments: &[String]) -> ExitCode {
+    let [state, contract, function, rest @ ..] = arguments else {
+        eprintln!(
+            "usage: cargo xtask call-both <state-dir> <contract-id> <function> [hex-argument...]\n\
+             arguments are consensus-serialized Clarity values in hexadecimal"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
+        eprintln!("{contract} is not a contract identifier");
+        return ExitCode::FAILURE;
+    };
+    let mut encoded = Vec::new();
+    for argument in rest {
+        match hex::decode(argument) {
+            Ok(bytes) => encoded.push(bytes),
+            Err(error) => {
+                eprintln!("{argument} is not hexadecimal: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block");
+        return ExitCode::FAILURE;
+    };
+
+    for interpreted in [false, true] {
+        if let Err(error) = vm.begin_block(Some(tip), [0xca; 32]) {
+            eprintln!("cannot begin a block: {error:?}");
+            return ExitCode::FAILURE;
+        }
+        vm.interpret_contract_calls(interpreted);
+        let outcome = vm.execute_contract_call_outcome(
+            identifier.issuer.clone().into(),
+            None,
+            identifier.clone(),
+            function,
+            &encoded,
+            &clarity::vm::costs::LimitedCostTracker::new_free(),
+        );
+        println!(
+            "{:<12} {}",
+            if interpreted { "interpreter" } else { "compiler" },
+            match &outcome {
+                Ok(
+                    nano_vm::ContractCallOutcome::Success(result)
+                    | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+                ) => format!("{:?}", result.value),
+                Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+                    format!("{error:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            }
+        );
+        // Nothing is sealed, so the state is untouched either way.
+        drop(vm.abort_block());
+    }
+    ExitCode::SUCCESS
 }
 
