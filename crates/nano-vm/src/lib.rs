@@ -2310,6 +2310,10 @@ fn deploy_contract_with_wasm_in_context(
             })?;
         compiled
     };
+    // The same check the rebuild path makes: a module wasmtime will refuse is
+    // this contract's fault, and saying so here is what stops the failure
+    // surfacing later as the caller's.
+    let compiled = loadable(&contract, compiled)?;
 
     // A contract's top-level expressions run at deploy time and may call other
     // contracts, whose modules have to be built first. Only the *call* path did

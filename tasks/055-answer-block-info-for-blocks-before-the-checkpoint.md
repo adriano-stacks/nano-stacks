@@ -769,3 +769,23 @@ had been treating as a wall — 8,665,893, 8,666,423 — go past; the fixes for
 and the burn-header seeding carried them, and my reading of "stuck" was against a
 stale binary.
 
+## 8,666,585: a deploy whose module will not load
+
+`SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.rewards-stx-v1` compiles and wasmtime
+refuses the result — "expected i64, found i32" — so the deploy fails where the
+network's succeeded, and both engines agree, which rules out the compiler's
+*answers* and leaves its codegen.
+
+The deploy path did not run the loadability check the rebuild path does, so this
+surfaced as an `UnableToLoadModule` from `initialize_contract` with no contract
+named. It does now, and says so in one run.
+
+Reduced from 3.7 KB to nine forms, kept as
+`fixtures/contracts/rewards-stx-v1-reduced.clar`. The shape around it is
+`as-contract?` — Clarity 4's replacement for `as-contract`, and a *different*
+word in the same file as the type-propagation bug already fixed — holding a
+`try!`, inside an `if`/`begin`, followed by a `var-set`. None of those in
+isolation reproduces: the plain form, the `try!` form, the `if`/`begin` wrapper
+and the `var-set` after it were each tried and each compiles. So the trigger is a
+combination still to be found, and the reduction is the place to find it.
+
