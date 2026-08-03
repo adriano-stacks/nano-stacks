@@ -624,3 +624,38 @@ the aggregator calls the leg `as-contract` with a buffer-encoded route — which
 means the next step is for the crosscheck to report the *sub-call* that first
 differs rather than only the transaction.
 
+## Named: a transfer from a contract to itself
+
+Diffing the two engines' *write* traces across a crosscheck bracket — the arms
+are marked, so the traces split cleanly — showed them agreeing for 111 writes and
+then parting: the interpreter goes on to a whole further leg, the compiler
+finalises the block.
+
+Tracing every cross-contract call the compiler makes, with its arguments, names
+it exactly:
+
+```
+call token-stx-v-1-2::get-balance(hilt)                        -> (ok u2676101)
+call token-stx-v-1-2::transfer(u3645770, hilt, hilt, none)     -> (err u2)
+```
+
+The balance is there, and `u2` from `stx-transfer?` is *sender and recipient are
+the same principal*. The **recipient argument is wrong**: it is `.hilt` itself
+where it should be the pool being swapped through.
+
+Ruled out since, each by running both engines against real state:
+
+- `as-contract`'s `tx-sender`, plainly, nested, through another contract, and
+  read back out of a `let` — all four agree;
+- `contract-of` on a trait argument, inside and outside `as-contract` — agrees;
+- the stableswap curve `get-y`, its quote `get-dy`, and `swap-x-for-y`'s refusal
+  path — all agree.
+
+So a principal the aggregator computes for the leg's recipient comes out as the
+calling contract under clarity-wasm. `tests/as_contract_sender.rs` holds the
+cases already checked, so the next one added has somewhere to go.
+
+`NANO_TRACE_CALLS` prints every cross-contract call with arguments and result.
+It is the instrument that turned "the engines disagree somewhere in this
+transaction" into a named argument of a named call, and it belongs in the tree.
+

@@ -1695,11 +1695,16 @@ impl ChainState {
         // safe, and it is the only way to compare a call that *succeeds* —
         // the crosscheck inside the VM only fires when the compiler refuses.
         let interpreted = std::env::var_os("NANO_CROSSCHECK_TRANSACTIONS").map(|_| {
+            // Mark the arms so a write trace can be split between them: the
+            // first write the two engines make differently names the contract
+            // they diverge in, which the returned value alone never does.
+            println!("--- interpreter {}", transaction.txid());
             self.vm.interpret_contract_calls(true);
             self.vm.begin_transaction().ok();
             let outcome = self.execute_transaction_in_transaction(transaction, execution_cost);
             self.vm.rollback_transaction().ok();
             self.vm.interpret_contract_calls(false);
+            println!("--- compiler {}", transaction.txid());
             outcome
         });
 

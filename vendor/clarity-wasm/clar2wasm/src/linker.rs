@@ -5720,6 +5720,22 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                             module_cache,
                         )?
                     };
+
+                    // Every cross-contract call and what it answered. Two
+                    // engines can return the same value from a transaction by
+                    // different routes, and the first call they answer
+                    // differently is the only thing that names where they part.
+                    if std::env::var_os("NANO_TRACE_CALLS").is_some() {
+                        println!(
+                            "call {contract_id}::{function_name}({}) -> {result}",
+                            arguments
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+
                     write_to_wasm(
                         &mut caller,
                         memory,
