@@ -33,8 +33,9 @@ execution.
       blocks.
 - [x] Publish `new_block` only after execution, with nano's actual receipts,
       costs and events.
-- [ ] Dispatch burn-block, signer, proposal-response and mined-block events from
-      their production transitions.
+- [x] Dispatch burn-block events from the transition that produces them.
+- [ ] Dispatch signer, proposal-response and mined-block events from their
+      production transitions.
 - [ ] Serve every route from the coherent executed snapshot established by
       [[046-distinguish-followed-and-executed-chain-tips]].
 - [ ] Exercise a stock `stacks-signer`, transaction submitter and event observer
@@ -106,3 +107,19 @@ it taken from there, `/v2/info` answers from the executed tip alone:
 That is also the acceptance criterion about no route advertising state newer than
 the executed tip: this one now cannot, because the tip is the only thing it
 reads.
+
+## Burn blocks are news exactly once
+
+A burn block becomes news when the tenure it elected begins, which the follow
+loop sees as the consensus hash changing between one executed block and the next.
+That is where `new_burn_block` is dispatched from.
+
+The one field a follower could otherwise not answer is `burn_amount`. The burn a
+block spends is the burn *distribution's* total, which nano cannot derive
+([[049-derive-sortitions-locally]]) — but `bitcoin_spent` in the header is a
+running total under threshold signer weight, so the difference between
+consecutive headers is exactly this burn block's. Nothing is invented.
+
+The reward recipients, slot holders and PoX transactions are still empty rather
+than wrong, for the same reason as `new_block`'s matured rewards.
+

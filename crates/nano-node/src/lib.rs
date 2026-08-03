@@ -865,7 +865,31 @@ where
                     bitcoin_context,
                 )
                 .await?;
+            // A burn block is news exactly once: when the tenure it elected
+            // begins. `bitcoin_spent` is a running total, so the difference
+            // between consecutive headers is what this burn block burned —
+            // which is the one field of the event a follower could otherwise
+            // not answer.
+            let previous_spent = self.tip.header.bitcoin_spent;
+            let announce_burn = self.tip.header.consensus_hash != block.header.consensus_hash;
+            let burned = block.header.bitcoin_spent.saturating_sub(previous_spent);
             let applied = self.apply(&block, bitcoin_context)?;
+            if announce_burn && let Some(observers) = self.observers.clone() {
+                let payload = nano_rpc::new_burn_block_payload(
+                    sortition.bitcoin_block_hash,
+                    sortition.bitcoin_height,
+                    sortition.consensus_hash,
+                    nano_primitives::BitcoinHeaderHash::from_bytes(
+                        self.bitcoin
+                            .block_hash_at(sortition.bitcoin_height.saturating_sub(1))
+                            .unwrap_or_default(),
+                    ),
+                    burned,
+                );
+                observers
+                    .dispatch(nano_rpc::EventKind::NewBurnBlock, &payload)
+                    .await;
+            }
             // Built before the await so the future does not hold the chainstate.
             if let Some((observers, payload)) = self.block_event(&block, &applied, bitcoin_context) {
                 observers
