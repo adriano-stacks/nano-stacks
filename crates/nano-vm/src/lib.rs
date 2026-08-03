@@ -3508,6 +3508,54 @@ mod tests {
         assert_eq!(vm.recorded_header([7; 32]), Some(header));
     }
 
+    /// The size at which a contract of trait calls stops compiling.
+    ///
+    /// A mainnet contract — one trait returning
+    /// `(response (list 20 (response uint uint)) uint)` and forty near
+    /// identical functions calling it — compiles to a module wasmtime refuses.
+    /// Neither shape does so alone, so this grows one until it breaks, which is
+    /// the only way to say where the generator gives out.
+    #[test]
+    #[ignore = "a search, run when hunting the generator bug"]
+    fn a_contract_of_trait_calls_compiles_at_size() {
+        let mut source = String::from(
+            "(define-trait z ((ss ((buff 400)) (response (list 20 (response uint uint)) uint))))\n",
+        );
+        for count in 1..=64 {
+            use std::fmt::Write;
+            if count == 1 {
+                writeln!(
+                    source,
+                    "(define-public (r (b (buff 400)) (t <z>)) \
+                     (if (> (len b) u0) (contract-call? t ss b) (ok (list))))"
+                )
+            } else {
+                // The rest pass the trait on rather than calling it, which is
+                // the shape the mainnet contract actually has.
+                writeln!(
+                    source,
+                    "(define-public (r{count} (b (buff 400)) (t <z>)) (r b t))"
+                )
+            }
+            .expect("writing to a string cannot fail");
+
+            let contract = QualifiedContractIdentifier::parse(&format!(
+                "ST000000000000000000002AMW42H.grow{count}"
+            ))
+            .expect("valid contract identifier");
+            let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+            vm.begin_block(None, [9; 32]).expect("begin block");
+            if let Err(error) = vm.deploy_contract(
+                contract,
+                ClarityVersion::Clarity3,
+                &source,
+                LimitedCostTracker::new_free(),
+            ) {
+                panic!("{count} functions is where it gives out: {error}");
+            }
+        }
+    }
+
     /// A trait call whose response carries a list of responses.
     ///
     /// A mainnet contract declares

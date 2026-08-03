@@ -116,3 +116,23 @@ beside them.
 
 The clarity-wasm bug itself is still to be found; every word that path stands on
 has been pinned and agrees, and the crosscheck is the oracle to bisect it with.
+
+## The one contract still needing the interpreter
+
+Knowing which epoch a Bitcoin height was in, and rebuilding a rejected contract
+newest-epoch-first rather than oldest, took the contracts needing the
+interpreter from **forty crosschecks to one**:
+`SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.flea`, whose module wasmtime refuses
+with "expected i64, found i32" at byte offset 74,624.
+
+It is deliberately awkward — one trait returning
+`(response (list 20 (response uint uint)) uint)` and forty near-identical
+functions passing that trait to one that calls it — but the awkwardness is not
+the trigger. Kept as `fixtures/contracts/flea.clar` and checked by
+`tests/mainnet_codegen.rs`, **it compiles and loads on its own under every
+Clarity version**, as do both of its shapes grown synthetically to sixty-four
+functions.
+
+So the trigger is the linking context: the node compiles it beside the contracts
+it calls, and one of those modules is what is refused. That is where the next
+look goes, and the guard is in the tree so a fix has something to satisfy.
