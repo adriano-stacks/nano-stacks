@@ -591,7 +591,13 @@ fn attesting_reward_set(bytes: &[u8]) -> Result<SignerSet, Box<dyn Error>> {
 fn accounting(config: &Config, directory: &Path) -> Result<TenureAccounting, Box<dyn Error>> {
     let persisted = directory.join(ACCOUNTING_FILE);
     if persisted.exists() {
-        return Ok(TenureAccounting::from_json(&fs::read(persisted)?)?);
+        let accounting = TenureAccounting::from_json(&fs::read(persisted)?)?;
+        // The same check the checkpoint gets: a state whose accounting was
+        // written before the checkpoint carried a full window owes less than
+        // the chain does, and only finds out at the first payout it cannot
+        // derive.
+        check_maturity_window(&accounting)?;
+        return Ok(accounting);
     }
     match &config.checkpoint.tenure_accounting {
         Some(path) => {
