@@ -2045,7 +2045,13 @@ fn compile_under(
             )
             .map(clar2wasm::CompileResult::into_compiled_contract)
             .map_err(|error: clar2wasm::CompileError| {
-                StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
+                // Name the contract: a compile failure surfaces at whatever
+                // call needed the module, which is routinely a different
+                // contract, and chasing that down took a day once already.
+                StaticCheckErrorKind::Unreachable(format!(
+                    "{contract}: {}",
+                    wasm_compile_error(error)
+                ))
             })?)
         })
         .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()).into())

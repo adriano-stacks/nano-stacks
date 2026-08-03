@@ -368,3 +368,25 @@ This is the third clarity-wasm divergence this block-by-block replay has turned
 up, after `as-contract` and `block-height`, and it has the same shape: the
 interpreter accepts what the compiler refuses, and mainnet is the interpreter.
 
+## And fixed: a contract principal where a trait is expected
+
+Naming the contract in a compile failure — the same lesson as the module check,
+applied to analysis errors — turned this one up in one run:
+`SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.arkadiko-swap-v2-1`. From there it
+reduced to three lines:
+
+```clarity
+(define-public (g (x uint))
+  (contract-call? .arkadiko-dao mint-token .wrapped-stx-token x tx-sender))
+```
+
+A contract principal written as a literal where the callee expects a trait
+carries no annotation from the type checker, so clarity-wasm refused the whole
+contract. On the wire it is a principal either way, which is what its size and
+layout depend on, so that is the fallback. clar2wasm's 1,375 tests stay green
+and the real 25 KB contract compiles to a module that loads.
+
+The transaction merely *failed* rather than erroring loudly, which is why the
+block's root diverged with all three receipts present: a failed call writes
+nothing, and nothing is a state the network never had.
+

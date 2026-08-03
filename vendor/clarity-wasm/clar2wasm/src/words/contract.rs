@@ -790,12 +790,25 @@ impl ComplexWord for ContractCall {
             .map(|arg| {
                 generator
                     .get_expr_type(arg)
+                    .cloned()
+                    .or_else(|| {
+                        // A contract principal written as a literal where the
+                        // callee expects a trait carries no annotation from the
+                        // type checker. On the wire it is a principal either
+                        // way, which is what its size and layout depend on.
+                        matches!(
+                            arg.expr,
+                            SymbolicExpressionType::LiteralValue(Value::Principal(
+                                PrincipalData::Contract(_)
+                            ))
+                        )
+                        .then_some(TypeSignature::PrincipalType)
+                    })
                     .ok_or_else(|| {
                         GeneratorError::TypeError(
                             "contract-call? argument must be typed".to_owned(),
                         )
                     })
-                    .cloned()
             })
             .collect::<Result<_, _>>()?;
 

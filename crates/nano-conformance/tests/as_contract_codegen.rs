@@ -53,3 +53,45 @@ fn an_early_return_inside_as_contract_compiles_to_a_module_that_loads() {
     compiles(NO_EARLY_RETURN).expect("a body without an early return compiles");
     compiles(EARLY_RETURN).expect("an early return followed by an expression compiles");
 }
+
+/// A contract principal written where the callee expects a trait.
+///
+/// The type checker leaves such an argument unannotated, and clarity-wasm
+/// refused to compile the contract at all — "contract-call? argument must be
+/// typed". On the wire it is a principal either way.
+///
+/// `SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.arkadiko-swap-v2-1` does this, and
+/// a mainnet transaction calling into it wrote nothing where the network wrote
+/// state, so block 8,665,782's root diverged with the transaction merely failing.
+const CONTRACT_AS_TRAIT: &str = "
+(define-trait mintable ((mint (uint principal) (response bool uint))))
+(define-public (mint-through (target <mintable>) (amount uint))
+  (contract-call? target mint amount tx-sender))
+(define-public (mint-here (amount uint))
+  (contract-call? .token mint amount tx-sender))
+";
+
+#[test]
+fn a_contract_principal_where_a_trait_is_expected_compiles() {
+    let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+    vm.begin_block(None, [17; 32]).expect("begin block");
+    vm.deploy_contract(
+        QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.token")
+            .expect("a contract identifier"),
+        ClarityVersion::Clarity2,
+        "(define-public (mint (amount uint) (who principal)) (ok true))",
+        clarity::vm::costs::LimitedCostTracker::new_free(),
+    )
+    .expect("the token deploys");
+
+    let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.minter")
+        .expect("a contract identifier");
+    vm.check_module(
+        &contract,
+        ClarityVersion::Clarity2,
+        CONTRACT_AS_TRAIT,
+        StacksEpochId::Epoch34,
+    )
+    .expect("a contract principal passed where a trait is expected compiles");
+}
+
