@@ -1149,6 +1149,18 @@ impl ChainState {
         }
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
+        // Everything this node keeps outside the MARF, as it stood before the
+        // block ran. Aborting the MARF is not a rollback on its own: a block
+        // that fails its state root has already moved the tenure accounting,
+        // and a node retries a failing block for as long as it is running, so
+        // the fees are added again on every attempt. Left alone that silently
+        // inflates a tenure's earnings by thousands of times and corrupts the
+        // miner rewards that mature from them, while the MARF looks clean.
+        let unwind = (
+            self.accounting.clone(),
+            self.tenure_start_heights.clone(),
+            self.executed.clone(),
+        );
         let mut effects = effects;
         let result = (|| {
             self.vm.setup_block_metadata(block.header.timestamp)?;
@@ -1198,7 +1210,10 @@ impl ChainState {
                 self.vm
                     .increment_liquid_stx_supply(effects.liquid_supply_increase)?;
             }
-            // Unlocks are unconditional, as they are there.
+            // Unlocks are unconditional, as they are there. Guarding this on a
+            // non-zero amount looks like the same fix as above and is not: the
+            // captured fixture rejects it at the first block, so the network
+            // does write the key here whether or not anything unlocked.
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
             if block_starts_new_tenure(block) {
@@ -1223,6 +1238,7 @@ impl ChainState {
         if result.is_err() {
             // Report why execution failed, not why the rollback did.
             drop(self.vm.abort_block());
+            (self.accounting, self.tenure_start_heights, self.executed) = unwind;
         }
         result
     }

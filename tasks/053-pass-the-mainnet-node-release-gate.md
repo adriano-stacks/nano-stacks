@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "051", "052", "054"]
+dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -26,6 +26,10 @@ and steady state, with evidence tied to the durable executed chain.
       recording every executed height and verified root.
 - [ ] Restart during catch-up and at tip, then prove the same durable tip, root
       and tenure accounting are resumed.
+- [ ] Inject failure and hard process termination at every block commit boundary
+      and prove recovery exposes no partially committed block.
+- [ ] Retry a rejected block repeatedly and prove no durable or in-memory state
+      changes before the accepted replacement arrives.
 - [ ] Remove and lie through one Stacks peer and prove neither event changes the
       canonical executed result.
 - [ ] Exercise a Bitcoin reorganization and a Stacks fork switch.
@@ -38,6 +42,8 @@ and steady state, with evidence tied to the durable executed chain.
 ## Acceptance Criteria
 
 - Offline mainnet replay and receipt gates are green before the live run starts.
+- Every required mainnet test reports that it actually ran; a missing fixture or
+  environment variable cannot be reported as a passing conformance gate.
 - The executed tip, not the followed tip, remains within the documented sync
   bound and survives restart.
 - Every accepted block passed local burnchain, signer, miner, VRF and state-root
@@ -45,3 +51,5 @@ and steady state, with evidence tied to the durable executed chain.
 - Peer failure, peer equivocation and ordinary reorganization do not stall or
   fork the node.
 - RPC responses and events describe the same durable executed state.
+- Synchronization, propagation and consensus inputs do not require Hiro or any
+  other hosted Stacks HTTP API.

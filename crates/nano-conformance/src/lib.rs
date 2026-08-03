@@ -607,6 +607,8 @@ pub fn replay_into(
             parent,
             &mut bitcoin_view,
             &path,
+            &mut |_| {},
+            ChainState::execute_nakamoto_block_with_bitcoin_operations,
         ) {
             Ok(block) => block,
             Err(divergence) => {
@@ -668,17 +670,91 @@ struct ReplayInputs<'a> {
     receipts: bool,
 }
 
+/// Execute the next captured block with a state root its header does not commit
+/// to, so that it is rejected exactly where a real divergence rejects it.
+///
+/// A node retries a block it cannot execute for as long as it runs, so what a
+/// rejection leaves behind is not a detail — and reaching the rejection needs a
+/// block whose transactions all succeed, which only a captured one does.
+/// Returns whether the block was rejected.
+pub fn reject_captured_block(
+    chainstate: &mut ChainState,
+    root: &Path,
+    manifest: FixtureManifest,
+    skip: usize,
+) -> bool {
+    let Some(snapshots) = captured_bitcoin_snapshots(root) else {
+        return false;
+    };
+    let Some(bitcoin_operations) = captured_bitcoin_operations(root) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
+        return false;
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let Some(path) = paths.into_iter().nth(skip) else {
+        return false;
+    };
+
+    let capture = ReplayInputs {
+        root,
+        snapshots: &snapshots,
+        bitcoin_operations: &bitcoin_operations,
+        receipts: manifest.receipts,
+    };
+    let mut bitcoin_view = String::new();
+    let parent = chainstate.tip();
+    // The replay path accepts whatever root execution produces and compares
+    // afterwards, which seals the block. A node following a chain verifies
+    // before sealing, and that is the path whose rollback is in question.
+    apply_captured_block(
+        &capture,
+        chainstate,
+        parent,
+        &mut bitcoin_view,
+        &path,
+        &mut |block| {
+            // Move the block time rather than the committed root: every
+            // transaction still executes and its fees still land, and only the
+            // state the block produces differs from what its header commits to.
+            // Corrupting the root instead gets the block turned away earlier,
+            // before it has touched anything worth rolling back.
+            block.header.timestamp = block.header.timestamp.wrapping_add(1);
+        },
+        ChainState::append_nakamoto_block_with_bitcoin_operations,
+    )
+    .is_err()
+}
+
+/// How a captured block is executed: the replay accepts whatever root it
+/// produces and compares afterwards, a following node verifies before sealing.
+type ExecuteBlock = fn(
+    &mut ChainState,
+    nano_chainstate::BitcoinBlockContext,
+    &[nano_bitcoin::BitcoinOperation],
+    Option<[u8; 32]>,
+    &NakamotoBlock,
+) -> Result<nano_chainstate::AppliedBlock, nano_chainstate::ChainStateError>;
+
 fn apply_captured_block(
     capture: &ReplayInputs<'_>,
     chainstate: &mut ChainState,
     parent: Option<[u8; 32]>,
     bitcoin_view: &mut String,
     path: &Path,
+    prepare: &mut dyn FnMut(&mut NakamotoBlock),
+    execute: ExecuteBlock,
 ) -> Result<(NakamotoBlock, nano_chainstate::AppliedBlock, Option<String>), ReplayDivergence> {
     let bytes =
         fs::read(path).map_err(|_| ReplayDivergence::Fixture("block cannot be read".to_owned()))?;
-    let block = NakamotoBlock::decode(&bytes)
+    let mut block = NakamotoBlock::decode(&bytes)
         .map_err(|_| ReplayDivergence::Fixture("block cannot be decoded".to_owned()))?;
+    prepare(&mut block);
     // A tenure extend moves the Clarity burn view without starting a tenure, so
     // the view carries forward until the next tenure change moves it again.
     if let Some(view) = block.bitcoin_view_consensus_hash() {
@@ -734,8 +810,7 @@ fn apply_captured_block(
                 "block consensus hash is absent from captured Bitcoin operations".to_owned(),
             )
         })?;
-    let applied = chainstate
-        .execute_nakamoto_block_with_bitcoin_operations(bitcoin_context, operations, parent, &block)
+    let applied = execute(chainstate, bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
     let cost_divergence = match &event {
         Some(event) => compare_receipts(event, &applied.receipts)?,
@@ -1860,6 +1935,8 @@ mod tests {
                 parent,
                 &mut bitcoin_view,
                 &path,
+                &mut |_| {},
+                ChainState::execute_nakamoto_block_with_bitcoin_operations,
             )
             .expect("apply captured block");
             parent = Some(*block.block_id().as_bytes());

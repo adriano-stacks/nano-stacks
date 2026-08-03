@@ -5,7 +5,7 @@ status: pending
 priority: critical
 effort: large
 type: feature
-dependencies: ["020", "021", "022", "023", "024", "025", "048"]
+dependencies: ["020", "021", "022", "023", "024", "025", "048", "056"]
 tags: ["mainnet", "replay", "conformance"]
 created_at: 2026-07-30
 ---
@@ -22,8 +22,8 @@ Everything before it is a component check. The oracle is the same as M10's —
 `state_index_root` per header and every receipt from the event observer — pointed
 at mainnet blocks after the 4.0 boundary instead of captured Hacknet ones.
 
-Replay depth is the metric again, and it stays at zero until the blockers this
-depends on are done.
+Replay depth is the metric again. It is measured from the durable executed tip,
+never from fetched, staged or peer-reported height.
 
 ## Tasks
 
@@ -32,11 +32,22 @@ depends on are done.
 - [x] Teach the fixture tooling and the scoreboard about a mainnet capture.
 - [x] Make `import_checkpoint` work in bounded memory, so a mainnet-sized MARF
       can be imported at all.
-- [ ] Replay forward and report the first divergence with the field that
+- [x] Replay forward and report the first divergence with the field that
       diverged.
 - [ ] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip.
+- [ ] At a matching-receipts root divergence, capture the exact ordered
+      `(key, serialized value)` journal from a pristine parent for every
+      transaction and native effect.
+- [ ] Feed one identical journal through nano's MARF and the pinned stacks-core
+      MARF, including rewrites, forks and the imported mainnet checkpoint, to
+      separate execution differences from trie differences.
+- [ ] Compare compiler and interpreter journals before sealing; a fallback that
+      reaches the same values in a different order is diagnostic, not a
+      production conformance result.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
+- [ ] Make the mainnet gate explicitly skip or fail when its fixture is absent;
+      an environment-variable early return must not appear as conformance.
 - [x] Check what mainnet *can* serve without a chainstate — the block envelope
       against the published reward set — and keep that in CI meanwhile.
 
@@ -48,6 +59,26 @@ depends on are done.
 - Every replayed transaction has the matching receipt, including status, costs
   and events.
 - The replay runs offline from captured fixtures.
+
+## Audited frontier and next oracle
+
+The checkpoint is 8,665,600 and the durable store is sealed through 8,665,779:
+**179 consecutive mainnet roots match**. The sync staging store separately holds
+28,458 later blocks through 8,694,237. That staged height is download progress,
+not conformance depth.
+
+The first current mismatch is 8,665,780. All five transaction results, costs,
+events and inspected values agree with mainnet, while the root does not. The
+`as-contract` compiler fix removed a real wasm failure but did not close this
+root mismatch. Skipping a zero-valued liquid-supply update changes the root but
+still does not produce mainnet's root.
+
+The next useful artifact is therefore the exact write journal from a clean
+8,665,779 parent. The in-progress direct MARF lockstep test is the right shape,
+but synthetic keys alone cannot decide whether this real block diverges before
+or during trie sealing. Runs must use clean accounting after
+[[056-make-rejected-block-execution-leave-no-state]]; the current live state has
+been altered by rejected retries.
 
 ## The boundary is now
 

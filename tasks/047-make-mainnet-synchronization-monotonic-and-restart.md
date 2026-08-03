@@ -6,7 +6,7 @@ priority: critical
 effort: large
 type: bug
 group: mainnet
-dependencies: ["046", "048"]
+dependencies: ["046", "048", "056", "057"]
 tags: ["mainnet", "sync", "persistence"]
 created_at: 2026-08-02
 ---
@@ -33,11 +33,14 @@ hundreds of failed attempts.
 - [x] Replace whole-gap buffering with bounded forward execution chunks.
 - [x] Make rate limits and bounded peer pages end a round successfully after all
       available progress is committed.
-- [x] Persist executed tip, parent links and tenure accounting together at each
-      chunk boundary.
-- [x] Resume after a process stop without refetching or re-executing sealed
-      blocks.
-- [ ] Bound caches and in-memory ancestry independently of distance from tip.
+- [ ] Persist executed tip, parent links and tenure accounting together only for
+      accepted blocks at each chunk boundary; this depends on
+      [[056-make-rejected-block-execution-leave-no-state]] and
+      [[057-commit-and-recover-accepted-block-state-atomically]].
+- [x] Resume after an orderly process stop without refetching or re-executing
+      sealed blocks.
+- [ ] Bound caches, response bodies and in-memory ancestry independently of
+      distance from tip or peer-controlled response size.
 - [ ] Test gaps spanning long tenures and multiple tenures with deterministic
       429s, short pages, tip movement and a restart after every chunk boundary.
 
@@ -49,6 +52,21 @@ hundreds of failed attempts.
   as uninterrupted execution.
 - A live mainnet soak crosses tenure boundaries without a permanent `Fork` loop
   and reports executed, rather than followed, lag.
+- Repeated failure of the same candidate does not change or persist any
+  accounting or chain context.
+
+## The persistence checkbox was not true
+
+The mainnet run retried the root mismatch at 8,665,780 1,417 times. Each attempt
+added the block's 458,250 uSTX fee before root verification, and aborting the VM
+did not roll that accounting back. The runtime then persisted it after catch-up
+returned the error. The resulting tenure total is exactly the original 24,851
+plus those 1,417 failed attempts.
+
+The durable executed tip is still 8,665,779, so monotonic MARF progress is real,
+but auxiliary state was not committed with it. The unchecked persistence item
+now names the two transactional and crash-recovery tasks required to make that
+claim true.
 
 ## Restarting reaches the same state
 

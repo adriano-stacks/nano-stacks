@@ -1,15 +1,14 @@
 ---
 id: "048"
 title: "Carry complete mainnet tenure accounting"
-status: completed
+status: in-progress
 priority: critical
 effort: medium
 type: bug
 group: mainnet
-dependencies: ["043"]
+dependencies: ["043", "056"]
 tags: ["mainnet", "checkpoint", "chainstate"]
 created_at: 2026-08-02
-completed_at: 2026-08-02
 ---
 
 # Carry complete mainnet tenure accounting
@@ -24,7 +23,7 @@ not explicitly seeded must fail with `UnknownTenure`.
 
 ## Tasks
 
-- [ ] Recapture mainnet accounting with the complete maturity window, emission
+- [x] Recapture mainnet accounting with the complete maturity window, emission
       schedule, current started tenure and accumulated fees.
 - [ ] Make capture fail when any required tenure in the maturity window is
       absent instead of writing a partial checkpoint.
@@ -32,7 +31,7 @@ not explicitly seeded must fail with `UnknownTenure`.
       schedule and entries.
 - [ ] Replay across at least 101 tenure starts, including a restart, and compare
       every state root.
-- [ ] Replace the incomplete mainnet artifact used by the node and scoreboard.
+- [x] Replace the incomplete mainnet artifact used by the node and scoreboard.
 
 ## Acceptance Criteria
 
@@ -42,3 +41,14 @@ not explicitly seeded must fail with `UnknownTenure`.
   stacks-core.
 - Missing, duplicate or short accounting windows are rejected during capture
   and startup.
+
+## Why this task is open again
+
+The replacement artifact now contains 102 tenures and three schedule entries,
+and its structural fixture test passes. That is necessary but it does not meet
+the behavioral acceptance criterion: replay has crossed only a few tenure
+starts, not the 101 required to observe nano-derived earnings mature.
+
+The live accounting file is also polluted by failed retries at 8,665,780 as
+described in [[056-make-rejected-block-execution-leave-no-state]]. It is not
+evidence for this task and must be regenerated before the 101-tenure replay.
