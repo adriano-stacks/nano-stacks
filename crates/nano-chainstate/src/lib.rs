@@ -454,9 +454,13 @@ impl TenureAccounting {
                     recipient: earned.recipient.clone(),
                     amount: earned.coinbase,
                 },
+                // A Nakamoto tenure hands *its own* anchored fees to the
+                // tenure before it. Paying that tenure's fees instead credits
+                // the right account the wrong amount, which is invisible in
+                // every receipt and shows up only in the state root.
                 NativeStxCredit {
-                    recipient: previous.map_or_else(boot, |earned| earned.recipient.clone()),
-                    amount: previous.map_or(0, |earned| earned.fees),
+                    recipient: previous.map_or_else(boot, |previous| previous.recipient.clone()),
+                    amount: earned.fees,
                 },
             ],
             liquid_supply_increase: earned.coinbase,
@@ -2729,13 +2733,21 @@ mod tests {
                 fees: 0,
             },
         );
+        // A tenure hands *its own* anchored fees to the tenure before it, so
+        // this is tenure 13's fees landing on tenure 12's recipient — not
+        // tenure 12's fees. Mainnet block 8,665,722 is the evidence: paying
+        // the earlier tenure's fees left its recipient short by exactly the
+        // difference between the two.
+        accounting.add_fees(13, 23);
         assert_eq!(
             accounting
                 .effects_for_tenure(Network::TESTNET, 113)
                 .expect("seeded and executed tenures")
-                .credits[1]
-                .amount,
-            13
+                .credits[1],
+            NativeStxCredit {
+                recipient: recipient("ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"),
+                amount: 23,
+            }
         );
 
         let effects = accounting
@@ -2751,7 +2763,7 @@ mod tests {
                 },
                 NativeStxCredit {
                     recipient: recipient("ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"),
-                    amount: 3,
+                    amount: 5,
                 },
             ]
         );
