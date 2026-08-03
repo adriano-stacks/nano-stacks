@@ -2232,8 +2232,14 @@ fn failed_deployment(
     runtime_error: &mut Option<String>,
 ) -> Result<TransactionResult, ChainStateError> {
     if !nano_vm::is_contract_analysis_failure(&error) {
+        // A deploy that fails any other way stops the block, and the reason is
+        // the only thing that says which contract to look at — several deploys
+        // in one block routinely depend on each other, so the first failure is
+        // what matters and the ones after it are noise.
+        eprintln!("a deployment failed and stopped the block: {error}");
         return Err(ChainStateError::from(error));
     }
+    eprintln!("a deployment was rejected: {error}");
     *runtime_error = Some(error.to_string());
     Ok(TransactionResult {
         value: Some(Value::err_none()),

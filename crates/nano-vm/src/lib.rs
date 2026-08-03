@@ -2311,6 +2311,18 @@ fn deploy_contract_with_wasm_in_context(
         compiled
     };
 
+    // A contract's top-level expressions run at deploy time and may call other
+    // contracts, whose modules have to be built first. Only the *call* path did
+    // this, so a deploy that calls anything died with the callee reported
+    // missing — and against mainnet a block of dependent deploys is routine.
+    for referenced in referenced_contracts(&contract, source, version) {
+        if modules.get(&referenced).is_none() {
+            // A contract that will not compile is the caller's problem to
+            // report, not a reason to give up before deploying anything.
+            let _ = ensure_wasm_module(store, bitcoin_context, modules, &referenced);
+        }
+    }
+
     let database = clarity_database(store, bitcoin_context);
     let mut global = GlobalContext::new(
         network.is_mainnet(),

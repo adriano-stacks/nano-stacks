@@ -503,3 +503,24 @@ and that is the next thing to look at. Reading the source out of the block bytes
 by hand does not work; it has to be decoded properly, which is worth adding to
 `decode-blocks`.
 
+## Fixed: a deploy never compiled what it calls
+
+The deploy that would not commit was not `linear-kinked-ir-v1` at all. Making a
+failed deployment say why named the real one in a single run:
+
+```
+a deployment failed and stopped the block:
+  NotInDatabase("compiled contract SP3M2BYF7RGF8WKW5FVDNJ6WR8D7AR9BHDXAKPXZE.constants-v1")
+```
+
+A contract's top-level expressions run at deploy time and may call other
+contracts. Only the *call* path ensured a callee's module was built; the deploy
+path did not, so a deploy that calls anything died with its callee reported
+missing — and a block of five dependent deploys from one address, which is what
+8,666,265 is, fails on the first of them and takes the rest with it.
+
+Replay is now at **8,666,344** and running.
+
+`decode-blocks` prints which contract each transaction publishes, for both the
+plain and versioned payloads, since that is what says where to look next.
+

@@ -211,6 +211,21 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
                         payer.fee(),
                         transaction.payload_type() as u8
                     );
+                    // A block of dependent deploys is routine on mainnet, and
+                    // which contract each transaction publishes is what says
+                    // where to look when one of them fails.
+                    match transaction.payload().data() {
+                        nano_codec::TransactionPayloadData::SmartContract {
+                            contract_name,
+                            source,
+                        }
+                        | nano_codec::TransactionPayloadData::VersionedSmartContract {
+                            contract_name,
+                            source,
+                            ..
+                        } => println!("    deploys {contract_name}, {} chars", source.len()),
+                        _ => {}
+                    }
                 }
             }
             Err(error) => {

@@ -5651,6 +5651,7 @@ dependencies = [
  "clarity",
  "hex",
  "nano-chainstate",
+ "nano-codec",
  "nano-conformance",
  "nano-crypto",
  "nano-marf",
