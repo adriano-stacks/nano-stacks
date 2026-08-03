@@ -543,7 +543,17 @@ impl BurnStateDB for BitcoinContext {
         height: u32,
         _sortition_id: &SortitionId,
     ) -> Option<BurnchainHeaderHash> {
-        self.burn_headers.get(&height).copied().map(BurnchainHeaderHash)
+        // A burn block Clarity cannot be told about is a withdrawal this node
+        // rejects and the network accepted, so it is worth being able to see
+        // what every lookup answered.
+        let found = self.burn_headers.get(&height).copied();
+        if std::env::var_os("NANO_TRACE_BURN_HEADERS").is_some() {
+            println!(
+                "burn header {height} -> {}",
+                found.map_or_else(|| "<none>".to_owned(), hex::encode)
+            );
+        }
+        found.map(BurnchainHeaderHash)
     }
 
     /// Name a sortition for a consensus hash, so that a burn header can be

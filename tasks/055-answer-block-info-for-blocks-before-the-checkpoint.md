@@ -462,3 +462,22 @@ The other transaction, `055db235`, returns the aggregator's `(err u2)` where the
 network gets `(err u9)` on its third sub-swap — same family as 8,665,893's, and
 also not a compile failure.
 
+## Fixed: the burn headers were seeded on one path of three
+
+`get-burn-block-info? header-hash u960240` was answering `none`, and the seeding
+that was supposed to prevent that reported nothing missing — because it ran on
+the path a following node takes and not on the two a resuming or catching-up node
+takes. Tracing the lookup itself said so in one run.
+
+With the window seeded wherever a Bitcoin context is built, 960,240 answers with
+`00000000000000000000f8ca2be9f81dd567c0bd4802334e3063a0dcbf82a825` — exactly what
+the withdrawal compares against — and the block executes.
+
+**Replay then ran from 8,665,971 to 8,666,264 without a single state root
+mismatch**, and was still going. That is about 660 blocks past the checkpoint,
+from 179 when this work started.
+
+Worth keeping: a lookup that can reject a withdrawal the network accepted is
+worth being able to watch, so `NANO_TRACE_BURN_HEADERS` prints what every one
+answered.
+

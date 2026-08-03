@@ -401,6 +401,7 @@ where
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.height = tenure.sortition.bitcoin_height;
         bitcoin_context.burn_header_hash = *tenure.sortition.bitcoin_block_hash.as_bytes();
+        self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
         let blocks = tenure
             .blocks
@@ -805,6 +806,7 @@ where
             // compares it against the hash a withdrawal was signed for. A
             // context that leaves it zero makes every such call fail.
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
+            self.seed_burn_headers(sortition.bitcoin_height);
             let bitcoin_context = node
                 .tenure_coinbase_context(
                     &block,
