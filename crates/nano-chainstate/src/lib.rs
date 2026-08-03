@@ -2086,6 +2086,18 @@ const fn matches_nonfungible_condition(condition: NonFungibleCondition, moved: b
     }
 }
 
+/// A short name for an event, for comparing a block against the network's own
+/// account of it.
+fn event_name(event: &clarity::vm::events::StacksTransactionEvent) -> String {
+    use clarity::vm::events::StacksTransactionEvent as Event;
+    match event {
+        Event::STXEvent(_) => "stx".to_owned(),
+        Event::NFTEvent(_) => "nft".to_owned(),
+        Event::FTEvent(_) => "ft".to_owned(),
+        Event::SmartContractEvent(data) => format!("print {}", data.key.0),
+    }
+}
+
 /// What a block's execution did, for describing a root that does not match.
 #[derive(Clone, Copy, Debug)]
 struct ExecutedSummary {
@@ -2121,6 +2133,9 @@ fn describe_mismatch(
         // The response value is the whole diagnosis for an aborted call: it
         // names the check inside the contract that refused, where the cost only
         // says how far it got.
+        for event in &receipt.result.events {
+            eprintln!("    event {}", event_name(event));
+        }
         eprintln!(
             "  receipt {} {:?} committed {} returned {} cost {:?}",
             receipt.txid,

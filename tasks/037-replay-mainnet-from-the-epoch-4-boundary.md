@@ -181,10 +181,22 @@ mainnet's statuses and results; every account balance and nonce written in the
 block matches when read back from the network at that block; both pool data
 vars match; both `univ2-core` map entries match. And the root still differs.
 
-What that leaves is a key nano does **not** write — mainnet writing something
-nano never touches would look exactly like this, and nothing in the write trace
-can show it. Enumerating mainnet's own writes for a block is the missing oracle:
-either its `new_block` event, or its trie compared against nano's key by key.
+Then the events, which is as far as the network will describe a block from
+outside: **1, 11, 1, 47, 1 per transaction, matching nano exactly**. So every
+STX movement, every token event and every `print` agrees, in count.
+
+What that leaves is a key nano does **not** write, that moves no balance and
+raises no event. `vm-metadata::` is the shape that fits — a contract's data size
+changes without an event — and this plan lists those among the Clarity key
+strings the MARF holds, where nano keeps them in the side store.
+
+Enumerating mainnet's own writes would settle it, and both routes are closed for
+now: there is no event observer on a mainnet node, and stacks-core will not open
+the archive's MARF to read it. That is not truncation — the blob file is exactly
+as long as the index says it should be — but an open path that seeks in a SQLite
+blob where the trie is in the flat file beside it, read-only and
+`external_blobs` alike. Getting that open to work is the one piece of tooling
+that would unlock the general oracle.
 
 ### The first tenure start, and what was ruled out there
 
