@@ -10,6 +10,7 @@ use clarity::vm::costs::{CostErrors, CostTracker, ExecutionCost, LimitedCostTrac
 use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
 };
+use clarity::vm::database::ClaritySerializable;
 use clarity::vm::database::{
     BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, HeadersDB,
     MemoryBackingStore,
@@ -1437,6 +1438,25 @@ impl MarfStore {
         self.side_store.path().map(std::path::PathBuf::from)
     }
 
+    /// Replace a contract's stored definition with one the interpreter can run.
+    ///
+    /// `insert_contract` refuses to overwrite, which is right for a deploy and
+    /// wrong for a repair. This writes the side store directly, which is safe
+    /// precisely because that store is not the MARF: no state root moves.
+    fn replace_contract_definition(
+        &self,
+        contract: &QualifiedContractIdentifier,
+        definition: &str,
+    ) -> Result<(), MarfStoreError> {
+        let key = format!("clr-meta::{contract}::vm-metadata::9::contract");
+        self.side_store
+            .prepare_cached(
+                "UPDATE metadata_table SET value = ?2 WHERE key = ?1",
+            )?
+            .execute(params![key, definition])?;
+        Ok(())
+    }
+
     /// Whether a contract's stored definition can be run by the interpreter.
     ///
     /// clar2wasm's deploy writes placeholder function bodies — the real ones
@@ -1977,6 +1997,40 @@ impl MarfStore {
     }
 }
 
+/// Build a contract definition the interpreter can run, without touching state.
+///
+/// clar2wasm's deploy stores placeholder function bodies, so a contract the
+/// compiler deployed cannot be interpreted. Rebuilding one means deploying it
+/// again — which would re-run its top-level expressions and reset every data
+/// variable it has changed since. So it is deployed into a **throwaway
+/// in-memory store** instead: the definition that comes out is the real one, and
+/// every side effect lands somewhere that is dropped a line later.
+fn interpretable_contract(
+    network: Network,
+    contract: &QualifiedContractIdentifier,
+    version: ClarityVersion,
+    source: &str,
+) -> Result<clarity::vm::contracts::Contract, ClarityEvalError> {
+    let mut backing_store = MemoryBackingStore::new();
+    let database = backing_store.as_clarity_db();
+    let mut environment = OwnedEnvironment::new_free(
+        network.is_mainnet(),
+        network.chain_id(),
+        database,
+        StacksEpochId::Epoch40,
+    );
+    environment.initialize_versioned_contract(contract.clone(), version, source, None)?;
+    let (mut database, _) = environment.destruct().ok_or_else(|| {
+        ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
+            "rebuilding a contract definition left the throwaway store nested".to_owned(),
+        )))
+    })?;
+    database.begin();
+    let rebuilt = database.get_contract(contract)?;
+    database.roll_back()?;
+    Ok(rebuilt)
+}
+
 /// Evaluate a Clarity 6 program under the consensus Epoch 4.0 rules against an
 /// ephemeral store, for programs that read and write nothing.
 pub fn evaluate(network: Network, source: &str) -> Result<Option<Value>, ClarityEvalError> {
@@ -2458,6 +2512,46 @@ struct ContractCall<'a> {
     arguments: &'a [Vec<u8>],
 }
 
+/// Heal a contract and the ones it names, so the interpreter can run the call.
+///
+/// A contract that cannot be healed is the call's problem to report, not a
+/// reason to refuse before running anything — the call may never reach it.
+fn heal_reachable_contracts(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    contract: &QualifiedContractIdentifier,
+) {
+    let referenced = contract_source(store, bitcoin_context, contract)
+        .map(|(source, version)| referenced_contracts(contract, &source, version))
+        .unwrap_or_default();
+    for reachable in std::iter::once(contract.clone()).chain(referenced) {
+        if !store.contract_is_interpretable(&reachable) {
+            let _ = heal_contract_for_interpreter(store, bitcoin_context, &reachable);
+        }
+    }
+}
+
+/// Make a contract the compiler deployed runnable by the interpreter.
+///
+/// Safe to store: contract definitions live in `metadata_table`, a side store
+/// that never reaches the MARF, so this changes no state root. Nothing is
+/// re-executed either — the real definition is built in a throwaway store — so
+/// the contract's data variables keep whatever they have since become.
+fn heal_contract_for_interpreter(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    contract: &QualifiedContractIdentifier,
+) -> Result<(), VmExecutionError> {
+    let network = store.network();
+    let (source, version) = contract_source(store, bitcoin_context, contract)?;
+    let rebuilt = interpretable_contract(network, contract, version, &source)
+        .map_err(|error| VmInternalError::Expect(error.to_string()))?;
+    store
+        .replace_contract_definition(contract, &rebuilt.serialize())
+        .map_err(|error| VmInternalError::Expect(error.to_string()))?;
+    Ok(())
+}
+
 fn execute_contract_call_outcome_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
@@ -2561,6 +2655,14 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     // interpreter, so a state root that only matches this way names clarity-wasm
     // as what differs. A diagnostic, not a mode to follow a chain in.
     if interpret {
+        // A contract the compiler deployed carries placeholder bodies, which the
+        // interpreter would evaluate and report as a type error. Rebuild its
+        // definition first, once: after this it is runnable by either engine.
+        // The call's own contract and everything it reaches: a nested
+        // `contract-call?` lands in a contract the compiler may also have
+        // deployed, and healing only the one named here leaves the failure one
+        // level down where nothing names it.
+        heal_reachable_contracts(store, bitcoin_context, &call.contract);
         return execute_contract_call_outcome_in_context(
             store,
             bitcoin_context,

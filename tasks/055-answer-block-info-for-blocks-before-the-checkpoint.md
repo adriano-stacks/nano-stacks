@@ -1022,3 +1022,27 @@ no re-execution of top-level expressions is needed — which matters, because
 re-running them would reset every data variable the contract has changed since,
 and that *would* corrupt state.
 
+## Built: the interpreter heals what the compiler deployed
+
+A contract the compiler deployed carries placeholder bodies, so the interpreter
+cannot run it. Rebuilding one means deploying it again — which would re-run its
+top-level expressions and reset every data variable it has changed since. So it
+is deployed into a **throwaway in-memory store**: the definition that comes out
+is the real one, and every side effect lands somewhere dropped a line later.
+
+The rebuilt definition then replaces the stored one directly.
+`insert_contract` refuses to overwrite, which is right for a deploy and wrong for
+a repair, and writing the side store is safe precisely because that store is not
+the MARF — no state root moves.
+
+It heals the contract a call names *and* the contracts that contract references,
+because a nested `contract-call?` lands in one the compiler may also have
+deployed, and healing only the named one leaves the failure a level down where
+nothing names it.
+
+`signer-payout-v1::initialize`, which answered `(ok true)` under the compiler and
+an `int` under the interpreter, now answers `(ok true)` under both. The captured
+replay still passes under `NANO_INTERPRETER_ONLY` with matching roots, and the
+node reached 8,666,680 with no state-root mismatch before the peer began
+rate-limiting again.
+
