@@ -1,23 +1,26 @@
-//! A contract clarity-wasm cannot build stops the node and names itself.
+//! A `let`-bound tuple carrying a placeholder is laid out for the use, not the
+//! binding.
 //!
 //! Mainnet block 8,667,467 deploys
-//! `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-egroup`, which clar2wasm
-//! compiles into a module wasmtime refuses: "expected i64, found i32".
+//! `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-egroup`, which clar2wasm built
+//! into a module wasmtime refused: "expected i64, found i32".
 //!
-//! Delta-debugging its 49 top-level forms down to two names the cause. A tuple
-//! literal bound in a `let` types a bare `none` as `(optional NoType)` — one
-//! wasm slot — and `fold` then reads it where the accumulator's
-//! `(optional uint)` needs three. Passing the same tuple *inline* works,
-//! because `fold` sets the expected type on the expression it is about to lay
-//! out; a `let` has already stored the narrow one by then. `words/tuples.rs`
-//! carries two workarounds for the same fault.
+//! Delta-debugging its 49 top-level forms down to two names it. A `let` stores
+//! a binding laid out for the type its *value* analysed as, and
+//! `{ t: target, r: none }` analyses `none` as `(optional NoType)` — an
+//! indicator and one `i32`, where `(optional uint)` is an indicator and two
+//! `i64`s. `fold` then sets its accumulator's type on the expression it is
+//! about to read, and reads a value two slots short.
 //!
-//! This once fell back to the interpreter so the block could carry on. That was
-//! wrong: clarity-wasm is the consensus engine, and deploying with the other
-//! one means the chain advances on a contract the compiler never built. The
-//! fallback is gone, so the deploy fails — and these tests hold that failure in
-//! place, and hold it *legible*, until the codegen bug is fixed under
-//! [[060-make-the-consensus-execution-engine-explicit-and-r]].
+//! The `let` cannot know: the type it needs comes from a use it has not reached
+//! yet. So the widening happens where both types are in hand — at the read —
+//! and the placeholder slot is dropped for zeros the indicator already says are
+//! absent.
+//!
+//! Passing the same tuple *inline* always worked, because `fold` sets the type
+//! on the tuple literal itself before it is laid out. An empty `(list)` in the
+//! same position always worked too: a sequence is an offset and a length
+//! whatever it holds, so there is nothing to widen.
 
 use clarity::vm::ClarityVersion;
 use clarity::vm::costs::LimitedCostTracker;
@@ -27,8 +30,8 @@ use nano_vm::Vm;
 
 /// The shape reduced from `v0-egroup`, by delta-debugging its 49 forms to four
 /// and then by hand to two. The iterator is the identity: nothing about *it* is
-/// wrong, which is what says the fault is in how `init` was stored.
-const REFUSED: &str = "
+/// wrong, which is what says the fault was in how `init` was stored.
+const LET_BOUND: &str = "
 (define-private (it (m uint) (acc {t: uint, r: (optional uint)})) acc)
 (define-private (f (target uint) (masks (list 128 uint)))
   (let ((init { t: target, r: none }))
@@ -65,13 +68,8 @@ fn deploys(name: &str, source: &str) -> Result<(), String> {
 }
 
 #[test]
-fn a_contract_the_compiler_refuses_is_not_deployed_at_all() {
-    // Not "deployed by the interpreter". A conformance bug has to be visible.
-    let error = deploys("refused", REFUSED).expect_err("clarity-wasm refuses it and nothing else deploys it");
-    assert!(
-        error.contains("refused") || error.contains("will not load") || error.contains("analysis"),
-        "the refusal names what went wrong, so the contract can be found: {error}"
-    );
+fn a_let_bound_placeholder_is_widened_at_the_use() {
+    deploys("widened", LET_BOUND).expect("clarity-wasm builds a module that loads");
 }
 
 #[test]

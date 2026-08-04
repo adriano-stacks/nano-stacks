@@ -268,6 +268,74 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
     }
 }
 
+/// One step of reading a stored value out as a wider type.
+///
+/// A value laid out for a type carrying `NoType` placeholders has fewer wasm
+/// slots than the same shape with those placeholders resolved — `(optional
+/// NoType)` is an indicator and one `i32`, `(optional uint)` an indicator and
+/// two `i64`s. The placeholder slot is discarded and zeros stand in for the
+/// value that is not there, which the indicator already says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Widen {
+    /// Read the next stored slot.
+    Take,
+    /// Skip a placeholder slot, which has no counterpart.
+    Skip,
+    /// Push a zero the stored value has no slot for.
+    Zero(ValType),
+}
+
+/// How to read a value stored as `stored` where `expected` is wanted.
+///
+/// `None` when the two are not the same shape, which is a real type error
+/// rather than a placeholder to fill in.
+pub(crate) fn widen_actions(
+    stored: &TypeSignature,
+    expected: &TypeSignature,
+) -> Option<Vec<Widen>> {
+    if stored == expected {
+        return Some(vec![Widen::Take; clar2wasm_ty(stored).len()]);
+    }
+    match (stored, expected) {
+        // The placeholder itself: its slot goes, the real layout arrives.
+        (TypeSignature::NoType, _) => {
+            let mut actions = vec![Widen::Skip];
+            actions.extend(clar2wasm_ty(expected).into_iter().map(Widen::Zero));
+            Some(actions)
+        }
+        (TypeSignature::OptionalType(inside), TypeSignature::OptionalType(wanted)) => {
+            let mut actions = vec![Widen::Take];
+            actions.extend(widen_actions(inside, wanted)?);
+            Some(actions)
+        }
+        (TypeSignature::ResponseType(inside), TypeSignature::ResponseType(wanted)) => {
+            let mut actions = vec![Widen::Take];
+            actions.extend(widen_actions(&inside.0, &wanted.0)?);
+            actions.extend(widen_actions(&inside.1, &wanted.1)?);
+            Some(actions)
+        }
+        (TypeSignature::TupleType(inside), TypeSignature::TupleType(wanted)) => {
+            let (inside, wanted) = (inside.get_type_map(), wanted.get_type_map());
+            if inside.len() != wanted.len() {
+                return None;
+            }
+            let mut actions = Vec::new();
+            for ((left_name, left), (right_name, right)) in inside.iter().zip(wanted.iter()) {
+                if left_name != right_name {
+                    return None;
+                }
+                actions.extend(widen_actions(left, right)?);
+            }
+            Some(actions)
+        }
+        // A sequence is an offset and a length whatever it holds, so an empty
+        // list needs nothing done to it — which is why `(list)` in the same
+        // position never produced this failure.
+        _ => (clar2wasm_ty(stored) == clar2wasm_ty(expected))
+            .then(|| vec![Widen::Take; clar2wasm_ty(stored).len()]),
+    }
+}
+
 #[derive(Debug)]
 pub enum SequenceElementType {
     /// A byte, from a string-ascii or buffer.
@@ -2117,6 +2185,44 @@ impl WasmGenerator {
         let (values, ty) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
+
+        // A `let` stores a binding laid out for the type its *value* analysed
+        // as, and `{ t: target, r: none }` analyses `none` as `(optional
+        // NoType)`. If this occurrence is wanted as something wider — `fold`
+        // sets its accumulator's type on the expression it is about to read —
+        // the stored value is short by the slots the placeholder does not have,
+        // and reading it as-is emits a module that will not load. Mainnet block
+        // 8,667,467 is that module.
+        //
+        // The `let` cannot know: the type it needs comes from a use it has not
+        // reached yet. So the widening happens here, where both types are in
+        // hand, and only when they differ.
+        let expected = self.get_expr_type(expr).cloned();
+        if let Some(expected) = expected.filter(|expected| *expected != ty) {
+            if let Some(actions) = widen_actions(&ty, &expected) {
+                let mut stored = values.iter();
+                for action in actions {
+                    match action {
+                        Widen::Take => {
+                            if let Some(value) = stored.next() {
+                                builder.local_get(*value);
+                            }
+                        }
+                        Widen::Skip => {
+                            stored.next();
+                        }
+                        Widen::Zero(ValType::I64) => {
+                            builder.i64_const(0);
+                        }
+                        Widen::Zero(_) => {
+                            builder.i32_const(0);
+                        }
+                    }
+                }
+                self.charge_variable_lookup(builder, self.bindings.depth())?;
+                return Ok(());
+            }
+        }
 
         for value in values {
             builder.local_get(value);
