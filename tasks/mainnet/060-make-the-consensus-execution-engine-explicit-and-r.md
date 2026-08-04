@@ -205,3 +205,29 @@ The `as-contract` fix adds two `i32` locals to *every* function prologue. 1,375
 tests stay green, but that is the shape of thing #575 is about, and a cheaper
 form — only emitting the save/restore for functions whose body contains an
 `as-contract` — would avoid adding to it.
+
+## The fast way to test a compiler fix against mainnet
+
+A pristine import costs 4.5 hours, which is the wrong unit for iterating on
+clarity-wasm. Two cheaper routes, in order of preference:
+
+1. **Snapshot after import.** The state directory straight after a checkpoint
+   import is byte-identical every time. Copy it once (~30 GB, minutes) and every
+   pristine run starts from the copy.
+
+2. **Rewind an existing state.** `ChainState::retract_to` already rewinds
+   everything kept *beside* the MARF — executed chain, tenure start heights,
+   accounting — and deliberately deletes nothing from the MARF itself, because a
+   state is addressed by the block that sealed it. So a state that ran past a
+   divergence can be wound back to the block before it and re-executed under a
+   changed compiler, with no import at all.
+
+   What is missing is the durable half: the node's tip on startup comes from the
+   MARF's own tip, so a rewind tool has to move that too. Worth building — it
+   turns "test this fix against mainnet block N" from 4.5 hours into seconds,
+   and it is the same mechanism a Bitcoin reorganization already needs.
+
+Neither was available while chasing 8,667,467 and 8,668,161, which is why both
+cost hours of wall-clock each rather than minutes. `xtask call-both` against a
+live state is what actually found them, and it is fast — the expensive part was
+having no way to *re-run a block* after changing the compiler.
