@@ -459,13 +459,20 @@ impl TenureAccounting {
                     recipient: earned.recipient.clone(),
                     amount: earned.coinbase,
                 },
-                // A Nakamoto tenure hands *its own* anchored fees to the
-                // tenure before it. Paying that tenure's fees instead credits
-                // the right account the wrong amount, which is invisible in
-                // every receipt and shows up only in the state root.
+                // The parent tenure is paid **its own** fees, which is what
+                // stacks-core schedules as `parent_fees`
+                // (`make_scheduled_miner_reward`, `nakamoto/tenure.rs:283`,
+                // called at `:1013`).
+                //
+                // Paying the maturing tenure's fees instead credits the right
+                // account the wrong amount, and mainnet miners alternate — with
+                // recipients A, B, A, B the tenure before and the tenure after
+                // are the same account, so it looks right until the amounts
+                // stop cancelling. That took ~7,200 blocks to surface, at
+                // 8,673,864.
                 NativeStxCredit {
                     recipient: previous.map_or_else(boot, |previous| previous.recipient.clone()),
-                    amount: earned.fees,
+                    amount: previous.map_or(0, |previous| previous.fees),
                 },
             ],
             liquid_supply_increase: earned.coinbase,
@@ -3098,11 +3105,22 @@ mod tests {
                 fees: 0,
             },
         );
-        // A tenure hands *its own* anchored fees to the tenure before it, so
-        // this is tenure 13's fees landing on tenure 12's recipient — not
-        // tenure 12's fees. Mainnet block 8,665,722 is the evidence: paying
-        // the earlier tenure's fees left its recipient short by exactly the
-        // difference between the two.
+        // The parent tenure is paid **its own** fees, so maturing tenure 13
+        // credits tenure 12's recipient with tenure 12's fees, not tenure 13's
+        // 23. Tenure 12 was seeded from a checkpoint, so its fees are the 13
+        // the checkpoint measured and not the 17 added above — the assertion
+        // covers both rules at once.
+        //
+        // Measured on mainnet rather than observed. Tenure 251321 runs
+        // 8,665,610..8,665,721, and summing every transaction fee the chain
+        // reports in those blocks gives 22,539,299; the chain paid its miner
+        // 22,539,119 at block 8,673,864, one edge block apart. nano paid that
+        // account tenure 251322's 625,846 instead. This is also what
+        // stacks-core schedules as `parent_fees`.
+        //
+        // The two rules agree whenever miners alternate, which mainnet's do, so
+        // an earlier version of this test asserted the opposite from a single
+        // block and was consistent with it.
         accounting.add_fees(13, 23);
         assert_eq!(
             accounting
@@ -3111,7 +3129,7 @@ mod tests {
                 .credits[1],
             NativeStxCredit {
                 recipient: recipient("ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"),
-                amount: 23,
+                amount: 13,
             }
         );
 
@@ -3126,9 +3144,11 @@ mod tests {
                     recipient: recipient("ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z"),
                     amount: 9,
                 },
+                // Tenure 10's own fees, paid to tenure 10's miner — not
+                // tenure 11's 5.
                 NativeStxCredit {
                     recipient: recipient("ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"),
-                    amount: 5,
+                    amount: 3,
                 },
             ]
         );
