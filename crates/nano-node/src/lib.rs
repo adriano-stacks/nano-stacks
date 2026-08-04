@@ -411,6 +411,12 @@ where
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.height = tenure.sortition.bitcoin_height;
         bitcoin_context.burn_header_hash = *tenure.sortition.bitcoin_block_hash.as_bytes();
+        // `get-tenure-info? time` and `vrf-seed` read these back. Left zero they
+        // answer zero, which is not a failure a replay notices — it is a wrong
+        // number in a receipt, and a state root that differs for no visible
+        // reason. The sortition already carries both.
+        bitcoin_context.burn_block_time = tenure.sortition.bitcoin_timestamp;
+        bitcoin_context.vrf_seed = tenure.sortition.vrf_seed.unwrap_or_default();
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
         let blocks = tenure
@@ -569,6 +575,7 @@ where
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
             self.seed_burn_headers(sortition.bitcoin_height);
             bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
+            bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
             self.chainstate
                 .backfill_block_header(block, bitcoin_context)
                 .map_err(CheckpointExecutionError::from)?;
@@ -914,6 +921,10 @@ where
             // compares it against the hash a withdrawal was signed for. A
             // context that leaves it zero makes every such call fail.
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
+            // As in `apply_followed_tenure`: zero here is a wrong answer rather
+            // than a stall.
+            bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
+            bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
             self.seed_burn_headers(sortition.bitcoin_height);
             let bitcoin_context = node
                 .tenure_coinbase_context(
