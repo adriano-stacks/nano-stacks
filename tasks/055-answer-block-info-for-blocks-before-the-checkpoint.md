@@ -1166,3 +1166,38 @@ to come from a peer. Everything needed is served by a stock node — no Hiro:
 `SyncClient::block` and `SyncClient::sortition` already exist and are already
 cached, so the first eight are a small change.
 
+
+## Measured: the checkpoint's state ends one block below the anchor
+
+`cargo xtask probe-header <state-dir> <block-id>` reads a block's tenure height
+out of the trie and prints it beside the recorded header, so a rebuilt field can
+be checked wherever a recorded one exists. Against the live mainnet state:
+
+| Stacks height | tenure height read | recorded header | verdict |
+|---|---|---|---|
+| 8,661,474 | 8,661,475 | no | **wrong** — the Stacks height, not a tenure |
+| 8,665,000 | 8,665,001 | no | **wrong** — same |
+| 8,665,600 | 251,320 | no | right |
+| 8,665,601 (anchor) | 251,320 | yes | right |
+| 8,669,000 | 251,363 | yes | right, and MATCHES the recorded header |
+
+So `marf_block` holds all 8,669,751 blocks — the block index the ancestor
+skip-list needs — but **state** exists only from the anchor's parent forward.
+Below that the tenure-height key is absent and the read does not fail: it
+answers with the block height.
+
+That is the whole danger of this task in one measurement. Reading pre-checkpoint
+state *looks* like it works. A backfill that trusted it would have written
+`tenure_height = 8,661,475` into a header, and every `block-height` a contract
+read at that block would have been wrong — a divergence with no error attached
+to it, surfacing later as a state root that does not match for no visible
+reason.
+
+It also rules out the route that looked most promising, which was to recover the
+hard fields from the imported trie rather than from a peer. They are not there.
+The peer fetch in the task list is not one option among several; it is the only
+source, and `burn_spend_winner`, `block_reward`, `miner_address` and
+`tenure_height` all still need one that is exact.
+
+The probe prints `NOT A TENURE HEIGHT` rather than a number whenever the answer
+equals the block height, so this cannot be misread again.

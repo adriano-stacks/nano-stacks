@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
+        Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
@@ -37,6 +38,98 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Read what a header could be rebuilt from, at a block older than the checkpoint.
+///
+/// Task 055 turns on one question: which of a `BlockHeader`'s fields can be
+/// recovered for a block this node never executed. Guessing the answer is how a
+/// contract ends up reading an invented miner address, so this measures it —
+/// against a block whose header *is* recorded, where every answer can be
+/// checked, before anything relies on it for one that cannot.
+fn probe_header(arguments: &[String]) -> ExitCode {
+    let [state, block] = arguments else {
+        eprintln!(
+            "usage: cargo xtask probe-header <state-dir> <block-id>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(id) = hex::decode(block)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+    else {
+        eprintln!("the block id must be 32 hexadecimal bytes");
+        return ExitCode::FAILURE;
+    };
+    let chainstate = Path::new(state).join("chainstate");
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, &chainstate) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let stacks_height = u64::from(vm.height_of(id).unwrap_or(0));
+    println!("Stacks height: {stacks_height}");
+
+    let recorded = vm.recorded_block_header(&id);
+    println!(
+        "recorded header: {}",
+        if recorded.is_some() {
+            "yes, so every rebuilt field can be checked"
+        } else {
+            "no, so this is the case the node actually stalls on"
+        }
+    );
+
+    // Tenure height is a Clarity value, so it lives *in* the MARF, and the
+    // checkpoint imports the trie graph — which makes a read here look like it
+    // must be exact. It is not: below the anchor's parent the key is absent and
+    // the read answers with the block height instead, silently. Printing the
+    // value beside the Stacks height is what makes that visible.
+    match vm.begin_block(Some(id), [0xce; 32]) {
+        Ok(()) => match vm.tenure_height() {
+            Ok(height) => {
+                // A tenure height equal to the Stacks height is the tell: this
+                // block's trie has no tenure-height key and the read fell
+                // through, so the answer is not this block's at all.
+                println!(
+                    "tenure height at this block: {height}{}",
+                    if u64::from(height) >= stacks_height {
+                        " -- NOT A TENURE HEIGHT: no state at this block, the read fell through"
+                    } else {
+                        " (read from this block's trie)"
+                    }
+                );
+                if let Some(header) = recorded {
+                    println!(
+                        "recorded tenure height:      {} -> {}",
+                        header.tenure_height,
+                        if header.tenure_height == height {
+                            "MATCHES"
+                        } else {
+                            "DIFFERS"
+                        }
+                    );
+                }
+            }
+            Err(error) => println!("tenure height unreadable here: {error:?}"),
+        },
+        Err(error) => println!("cannot open the trie at this block: {error:?}"),
+    }
+    let _ = vm.abort_block();
+    if let Some(header) = recorded {
+        println!(
+            "recorded burn height {}, burn time {}, miner {:?}, reward {}",
+            header.burn_block_height,
+            header.burn_block_time,
+            header.miner_address,
+            header.block_reward
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// Print the compressed public key a private key signs with.

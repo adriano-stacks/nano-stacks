@@ -361,7 +361,7 @@ impl BitcoinContext {
         Ok(())
     }
 
-    fn header(&self, id: &StacksBlockId) -> Option<BlockHeader> {
+    pub(crate) fn header(&self, id: &StacksBlockId) -> Option<BlockHeader> {
         if let Some(header) = self.headers.get(id.as_bytes()) {
             return Some(*header);
         }
@@ -778,6 +778,19 @@ impl Vm {
     }
 
     /// Record what Clarity may later read about a block nano has executed.
+    /// The Stacks height of a block, from the block index the checkpoint
+    /// imports — which covers every block, including ones with no state.
+    #[must_use]
+    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
+        self.store.height_of(block)
+    }
+
+    /// The header this node holds for a block, if it holds one.
+    #[must_use]
+    pub fn recorded_block_header(&self, block: &[u8; 32]) -> Option<BlockHeader> {
+        self.context.header(&StacksBlockId(*block))
+    }
+
     pub fn record_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
         self.context
             .tenure_starts
@@ -1411,7 +1424,8 @@ impl MarfStore {
         Ok(())
     }
 
-    fn height_of(&self, block: [u8; 32]) -> Option<u32> {
+    #[must_use]
+    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
         self.marf
             .height(block)
             .or_else(|| self.checkpoint_heights.get(&block).copied())
