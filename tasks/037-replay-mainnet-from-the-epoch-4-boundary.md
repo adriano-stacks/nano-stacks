@@ -790,3 +790,35 @@ pragma.
 straight after an import is the same bytes every time. Snapshot it once and a
 pristine run becomes a ~30 GB copy of a few minutes instead of 4.5 hours. That
 is the cheap win and it should be the default way to start one.
+
+### Why the import is slow, and the change that would fix it
+
+```sql
+CREATE TABLE marf_node (
+    block INTEGER NOT NULL, idx INTEGER NOT NULL,
+    hash BLOB NOT NULL, data BLOB NOT NULL,
+    PRIMARY KEY (block, idx)
+) WITHOUT ROWID;
+```
+
+`WITHOUT ROWID` means the table **is** the B-tree keyed by `(block, idx)`, and
+the import writes in trie order — hopping between blocks as it follows
+back-pointers. Every insert therefore lands somewhere random in a tree that
+grows to 16 GB. Deferring an index is not available: there is no separate index
+to defer.
+
+The change that would work is staging:
+
+1. import into `marf_node_staging`, a plain rowid table with no primary key, so
+   every write is an append
+2. `INSERT INTO marf_node SELECT block, idx, hash, data FROM marf_node_staging
+   ORDER BY block, idx` — one sequential build of the B-tree
+3. drop the staging table
+
+`temp_store` has to come off `MEMORY` for that sort, which is otherwise 16 GB
+resident.
+
+Until then: **snapshot the state directory straight after an import.** The bytes
+are identical every time, so a pristine run is a ~30 GB copy of a few minutes
+rather than 4.5 hours, and that is the difference between iterating on the
+compiler once a day and once an hour.
