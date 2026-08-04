@@ -1,24 +1,23 @@
-//! A contract the compiler cannot build still deploys, because mainnet built it.
+//! A contract clarity-wasm cannot build stops the node and names itself.
 //!
-//! Mainnet block 8,667,467 diverges on a deployment of
+//! Mainnet block 8,667,467 deploys
 //! `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-egroup`, which clar2wasm
 //! compiles into a module wasmtime refuses: "expected i64, found i32".
 //!
-//! The cause is a third instance of a known clarity-wasm typechecker
-//! limitation. A tuple literal bound in a `let` types a bare `none` as
-//! `(optional NoType)` — one wasm slot — and `fold` then reads it where the
-//! accumulator's `(optional uint)` needs three. Passing the same tuple *inline*
-//! works, because `fold` sets the expected type on the expression it is about
-//! to lay out; a `let` has already stored the narrow one by then.
-//! `words/tuples.rs` carries two workarounds for the same fault, one of them
-//! written for this project.
+//! Delta-debugging its 49 top-level forms down to two names the cause. A tuple
+//! literal bound in a `let` types a bare `none` as `(optional NoType)` — one
+//! wasm slot — and `fold` then reads it where the accumulator's
+//! `(optional uint)` needs three. Passing the same tuple *inline* works,
+//! because `fold` sets the expected type on the expression it is about to lay
+//! out; a `let` has already stored the narrow one by then. `words/tuples.rs`
+//! carries two workarounds for the same fault.
 //!
-//! Fixing the compiler properly means resolving `NoType` placeholders from
-//! usage, which is type unification and not a small change. But the chain does
-//! not need it: mainnet runs the *interpreter*, so when the compiler refuses a
-//! contract the interpreter decides. It deploys what is sound and rejects what
-//! is not, and either way the block carries on rather than stopping on a
-//! codegen bug.
+//! This once fell back to the interpreter so the block could carry on. That was
+//! wrong: clarity-wasm is the consensus engine, and deploying with the other
+//! one means the chain advances on a contract the compiler never built. The
+//! fallback is gone, so the deploy fails — and these tests hold that failure in
+//! place, and hold it *legible*, until the codegen bug is fixed under
+//! [[060-make-the-consensus-execution-engine-explicit-and-r]].
 
 use clarity::vm::ClarityVersion;
 use clarity::vm::costs::LimitedCostTracker;
@@ -66,8 +65,13 @@ fn deploys(name: &str, source: &str) -> Result<(), String> {
 }
 
 #[test]
-fn a_contract_the_compiler_refuses_is_deployed_by_the_interpreter() {
-    deploys("refused", REFUSED).expect("the interpreter deploys what the compiler refused");
+fn a_contract_the_compiler_refuses_is_not_deployed_at_all() {
+    // Not "deployed by the interpreter". A conformance bug has to be visible.
+    let error = deploys("refused", REFUSED).expect_err("clarity-wasm refuses it and nothing else deploys it");
+    assert!(
+        error.contains("refused") || error.contains("will not load") || error.contains("analysis"),
+        "the refusal names what went wrong, so the contract can be found: {error}"
+    );
 }
 
 #[test]

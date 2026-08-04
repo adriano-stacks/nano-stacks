@@ -637,7 +637,7 @@ impl Vm {
         Ok(Self {
             store: MarfStore::new(network)?,
             context: BitcoinContext::default(),
-            interpret: std::env::var_os("NANO_INTERPRETER_ONLY").is_some(),
+            interpret: interpret_only(network),
             modules: ModuleCache::default(),
         })
     }
@@ -683,7 +683,8 @@ impl Vm {
         // The context answers header reads from the same file the store writes
         // them to, through a connection of its own because the two are
         // borrowed at once while Clarity runs.
-        let mainnet = store.network().is_mainnet();
+        let store_network = store.network();
+        let mainnet = store_network.is_mainnet();
         let headers_db = store
             .side_store_path()
             .and_then(|path| rusqlite::Connection::open(path).ok())
@@ -695,7 +696,7 @@ impl Vm {
                 headers_db,
                 ..BitcoinContext::default()
             },
-            interpret: std::env::var_os("NANO_INTERPRETER_ONLY").is_some(),
+            interpret: interpret_only(store_network),
             modules: ModuleCache::default(),
         }
     }
@@ -876,34 +877,20 @@ impl Vm {
                 store, context, contract, version, source, cost_tracker,
             );
         }
-        match deploy_contract_with_wasm_in_context(
+        // No interpreter fallback here on purpose. A contract clarity-wasm
+        // cannot build is a compiler conformance bug, and deploying it with the
+        // other engine hides that behind a chain that appears to advance —
+        // which is how a replay reached 8,673,863 while the compiler had
+        // actually stopped at 8,668,161. It has to stop and name the contract.
+        deploy_contract_with_wasm_in_context(
             store,
             context,
             modules,
-            contract.clone(),
+            contract,
             version,
             source,
-            cost_tracker.clone(),
-        ) {
-            Err(refused) if is_contract_analysis_failure(&refused) => {
-                // The compiler could not build this contract, and mainnet
-                // deployed it — so the compiler is wrong about it, not the
-                // chain. The interpreter is what mainnet runs, so it decides:
-                // it stores the contract if the contract is sound, and fails
-                // the same deploy if it is not. Either way the block carries on
-                // instead of stopping on a clarity-wasm codegen bug.
-                //
-                // Nothing was written: the analysis bracket above takes its own
-                // insert back out when the module is refused.
-                eprintln!(
-                    "{contract} was deployed by the interpreter: the compiler refused it ({refused})"
-                );
-                deploy_contract_in_context(
-                    store, context, contract, version, source, cost_tracker,
-                )
-            }
-            other => other,
-        }
+            cost_tracker,
+        )
     }
 
     /// Call a published contract with consensus-serialized Clarity arguments.
@@ -2978,34 +2965,11 @@ fn execute_contract_call_outcome_with_wasm_in_context(
     // writes variables and maps under a branch, which is evidence rather than a
     // guarantee, so this remains for carrying a replay forward and finding the
     // next divergence. The costs the two charge do differ.
-    // A call that failed only because the compiler could not build a loadable
-    // module is the compiler's fault and never the chain's — mainnet ran this
-    // contract, on the interpreter. So that one failure answers from the
-    // interpreter by default, which is narrower than the blanket fallback
-    // below: a genuine runtime error stays a runtime error, because that is a
-    // real answer and replacing it would hide a divergence rather than carry
-    // one forward.
-    if let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
-        && reports_analysis_failure(error)
-    {
-        heal_reachable_contracts(store, bitcoin_context, &call.contract);
-        eprintln!(
-            "{}::{} was answered by the interpreter: the compiler refused a module ({error:?})",
-            call.contract, call.function
-        );
-        return execute_contract_call_outcome_in_context(
-            store,
-            bitcoin_context,
-            ContractCall {
-                sender: call.sender.clone(),
-                sponsor: call.sponsor.clone(),
-                contract: call.contract.clone(),
-                function: call.function,
-                arguments: call.arguments,
-            },
-            cost_tracker.clone(),
-        );
-    }
+    // The interpreter does not answer a production call, however the compiler
+    // failed. It is the oracle clarity-wasm is checked against, not a second
+    // engine to fall through to: a module the compiler will not build is a
+    // conformance bug to fix, and answering around it means the chain advances
+    // on results the compiler never produced.
     let fall_back = std::env::var_os("NANO_INTERPRETER_FALLBACK").is_some();
     if (fall_back || std::env::var_os("NANO_CROSSCHECK").is_some())
         && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
@@ -3315,6 +3279,30 @@ fn ensure_wasm_module(
     };
     modules.insert(contract.clone(), compiled);
     Ok(())
+}
+
+/// Whether to run every call through the interpreter, which mainnet forbids.
+///
+/// The interpreter is the differential oracle clarity-wasm is checked against.
+/// Letting it execute mainnet means the chain advances on results the engine
+/// under test never produced, so the switch is refused there outright rather
+/// than trusted to be unset.
+fn interpret_only(network: Network) -> bool {
+    interpreter_allowed(network, std::env::var_os("NANO_INTERPRETER_ONLY").is_some())
+}
+
+/// The policy itself, so it can be asserted without touching the environment.
+///
+/// # Panics
+/// If the interpreter is asked to execute mainnet.
+#[must_use]
+pub fn interpreter_allowed(network: Network, asked: bool) -> bool {
+    assert!(
+        !(asked && network.is_mainnet()),
+        "the interpreter is a diagnostic and cannot execute mainnet: \
+         clarity-wasm is the consensus engine"
+    );
+    asked
 }
 
 /// Reject a module the runtime would refuse to load.
