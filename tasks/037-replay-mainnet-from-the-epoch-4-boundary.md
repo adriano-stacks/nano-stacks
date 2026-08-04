@@ -643,3 +643,56 @@ dead. The question is now narrow and answerable: sum the actual transaction fees
 in tenure 251322's blocks from the chain and compare with what `add_fees`
 accumulated — `TenureAccounting::started` only counts fees for a tenure whose own
 start block nano executed, and that guard is the first thing to look at.
+
+### Confirmed by arithmetic: the parent is paid its *own* fees, and nano's record of them is short
+
+Two measurements, both exact.
+
+**1. The pairing.** Tenure 251321 runs 8,665,610–8,665,721. Summing every
+transaction fee the chain reports in those blocks:
+
+```
+tenure 251321 fees, summed from the chain   22,539,299
+chain paid miner(251321) at 8,673,864       22,539,119   (180 apart, one edge block)
+```
+
+So at the maturity of tenure T the chain pays `miner(T) ← coinbase(T)` and
+`miner(T-1) ← fees(T-1)` — **the parent's own fees**, which is exactly what
+stacks-core's `parent_fees` parameter says
+(`make_scheduled_miner_reward`, `nakamoto/tenure.rs:283`).
+
+nano pays `miner(T-1) ← fees(T)`. One tenure off, and invisible while miners
+alternate because the recipient still comes out right.
+
+This overrides `derived_effects_split_a_matured_tenure`, whose comment cites
+block 8,665,722 for the opposite rule. That test was written to make a
+divergence pass and there is no arithmetic in it — this has two independent
+totals agreeing to 180 parts in 22.5 million. **The test encodes the
+compensation, not the rule**, and it compensated because of the second bug:
+
+**2. The fee totals.** nano's own records, against the same chain sums:
+
+| tenure | nano | chain | |
+|---|---|---|---|
+| 251322 | 625,846 | **625,846** | exact |
+| 251321 | 15,114 | **22,539,119** | short by 1,500× |
+
+Tenure 251322 is 12 blocks and nano has it to the unit. Tenure 251321 is **112
+blocks** — an extended tenure — and nano captured almost none of its fees. So
+fee accumulation is right for an ordinary tenure and fails for a long or
+extended one, which is why paying the wrong tenure's fees looked correct: nano
+was substituting one wrong number for another.
+
+`TenureAccounting::started` is persisted (currently 251421), so a plain restart
+is not the explanation. The tenure-extend path is.
+
+### The fix, in order
+
+1. Establish why an extended tenure loses its fees — compare nano's `add_fees`
+   calls across 8,665,610–8,665,721 against the 112 blocks the chain reports.
+   Fix that first: correcting the pairing alone would pay the parent nano's
+   short number instead of the chain's.
+2. Then change `effects_for_tenure` to credit `previous.fees` rather than
+   `earned.fees`, and rewrite `derived_effects_split_a_matured_tenure` around
+   the arithmetic above rather than the 8,665,722 observation.
+3. Re-derive the affected tenures' accounting before resuming replay.
