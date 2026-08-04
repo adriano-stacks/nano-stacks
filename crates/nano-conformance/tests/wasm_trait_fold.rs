@@ -58,6 +58,21 @@ const ROUTER: &str = "
 (define-read-only (bound-then-as-contract)
   (let ((v3 tx-sender) (other (as-contract tx-sender)))
     { v3: v3, other: other, same: (is-eq v3 other) }))
+
+;; `hilt::sr` returns `(err u9)` from an `asserts!` *inside* `as-contract`, and
+;; `map` then runs it again. If unwinding out of `as-contract` that way leaves
+;; the sender switched, the next call believes it is the contract.
+(define-private (leave-early (i uint))
+  (if (is-eq i u0)
+      (as-contract (begin (asserts! false (err u9)) (ok tx-sender)))
+      (ok tx-sender)))
+(define-read-only (early-return-then-read) (map leave-early (list u0 u1)))
+(define-private (failing) (if true (err u9) (ok tx-sender)))
+(define-private (try-early (i uint))
+  (if (is-eq i u0)
+      (as-contract (begin (try! (failing)) (ok tx-sender)))
+      (ok tx-sender)))
+(define-read-only (try-out-of-as-contract) (map try-early (list u0 u1)))
 ";
 
 fn id(name: &str) -> QualifiedContractIdentifier {
@@ -152,6 +167,25 @@ fn as_contract_beside_a_reader_of_tx_sender_agrees() {
         assert_eq!(
             compiled, interpreted,
             "`{function}` sees the same principals in both engines"
+        );
+    }
+}
+
+/// Unwinding out of `as-contract` must put `tx-sender` back.
+///
+/// This is the shape `hilt::sr` actually takes: it enters `as-contract`, hits
+/// `(asserts! (>= v5 v2) (err u9))`, and returns from inside it — and `map`
+/// then calls it a second time. `sr` on either chunk *alone* agrees between the
+/// engines; only the two in sequence disagree, which points at what the first
+/// call leaves behind rather than at what either computes.
+#[test]
+fn returning_out_of_as_contract_restores_the_sender() {
+    for function in ["early-return-then-read", "try-out-of-as-contract"] {
+        let (compiled, interpreted) = both(function, &[]);
+        assert_eq!(
+            compiled, interpreted,
+            "`{function}`: the call after an early return out of `as-contract` \
+             sees the same sender in both engines"
         );
     }
 }

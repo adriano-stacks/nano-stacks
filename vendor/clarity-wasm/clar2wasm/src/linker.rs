@@ -293,6 +293,7 @@ pub fn link_host_functions(
     link_chain_id_fn(linker)?;
     link_enter_as_contract_fn(linker)?;
     link_exit_as_contract_fn(linker)?;
+    link_principal_depth_fns(linker)?;
     link_enter_as_contract_safe_fn(linker)?;
     link_exit_as_contract_safe_fn(linker)?;
     link_cleanup_as_contract_safe_fn(linker)?;
@@ -1522,6 +1523,55 @@ fn link_exit_as_contract_fn(
         .map_err(|e| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "exit_as_contract".to_string(),
+                e,
+            ))
+        })
+}
+
+/// Link host interface functions that record and restore how deep the sender
+/// and caller stacks are.
+///
+/// `as-contract` pushes on entry and pops on exit, and an early return out of
+/// its body branches straight past the pop — so the sender stays switched and
+/// the *next* call inherits it. Mainnet block 8,668,161 is that: a function
+/// that `asserts!` its way out of `as-contract`, called twice by `map`, whose
+/// second call then paid itself and answered `(err u2)`.
+///
+/// A function records the depth on entry and unwinds to it on the way out, so
+/// no path can leave the stacks deeper than it found them.
+fn link_principal_depth_fns(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "principal_depth",
+            |caller: Caller<'_, ClarityWasmContext>| {
+                let (sender, caller_depth) = caller.data().principal_depth();
+                Ok((sender as i32, caller_depth as i32))
+            },
+        )
+        .map_err(|e| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "principal_depth".to_string(),
+                e,
+            ))
+        })?;
+    linker
+        .func_wrap(
+            "clarity",
+            "restore_principal_depth",
+            |mut caller: Caller<'_, ClarityWasmContext>, sender: i32, callers: i32| {
+                caller
+                    .data_mut()
+                    .restore_principal_depth((sender.max(0) as usize, callers.max(0) as usize));
+                Ok(())
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "restore_principal_depth".to_string(),
                 e,
             ))
         })
@@ -7222,6 +7272,14 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         println!("as-contract: exit");
         Ok(())
     })?;
+
+    linker.func_wrap("clarity", "principal_depth", |_: Caller<'_, ()>| Ok((0i32, 0i32)))?;
+
+    linker.func_wrap(
+        "clarity",
+        "restore_principal_depth",
+        |_: Caller<'_, ()>, _sender: i32, _callers: i32| Ok(()),
+    )?;
 
     linker.func_wrap(
         "clarity",

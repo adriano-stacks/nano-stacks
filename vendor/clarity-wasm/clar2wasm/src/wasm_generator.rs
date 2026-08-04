@@ -867,6 +867,25 @@ impl WasmGenerator {
         // restore after.
         let top_level_locals = std::mem::replace(&mut self.bindings, bindings);
 
+        // How deep the sender and caller stacks are before this function runs.
+        //
+        // `as-contract` pushes on entry and pops on exit, but an early return
+        // out of its body — `asserts!` or `try!` inside it — branches straight
+        // past the pop, and the switched sender is then inherited by whatever
+        // runs next. Recording the depth here and unwinding to it in the
+        // postlude below makes that impossible on every path, rather than
+        // relying on the body reaching its own `exit_as_contract`.
+        //
+        // Mainnet block 8,668,161 is the case: a function that `asserts!` its
+        // way out of `as-contract`, called twice by `map`, whose second call
+        // then transferred to itself.
+        let sender_depth = self.module.locals.add(ValType::I32);
+        let caller_depth = self.module.locals.add(ValType::I32);
+        func_body
+            .call(self.func_by_name("stdlib.principal_depth"))
+            .local_set(caller_depth)
+            .local_set(sender_depth);
+
         let mut block = func_body.dangling_instr_seq(InstrSeqType::new(
             &mut self.module.types,
             &[],
@@ -910,6 +929,13 @@ impl WasmGenerator {
         func_body
             .local_get(frame_pointer)
             .global_set(self.stack_pointer);
+
+        // And the sender and caller stacks, which an early return out of
+        // `as-contract` would otherwise leave deeper than it found them.
+        func_body
+            .local_get(sender_depth)
+            .local_get(caller_depth)
+            .call(self.func_by_name("stdlib.restore_principal_depth"));
 
         // Restore the top-level locals map.
         self.bindings = top_level_locals;

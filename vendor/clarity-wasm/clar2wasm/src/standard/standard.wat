@@ -49,6 +49,8 @@
                                                   (param $serialized_ty_length i32)))
     (import "clarity" "enter_as_contract" (func $stdlib.enter_as_contract))
     (import "clarity" "exit_as_contract" (func $stdlib.exit_as_contract))
+    (import "clarity" "principal_depth" (func $stdlib.principal_depth (result i32 i32)))
+    (import "clarity" "restore_principal_depth" (func $stdlib.restore_principal_depth (param i32) (param i32)))
     (import "clarity" "enter_as_contract_safe" (func $stdlib.enter_as_contract_safe (result externref)))
     (import "clarity" "exit_as_contract_safe" (func $stdlib.exit_as_contract_safe (param externref) (result i64 i64 i32)))
     (import "clarity" "cleanup_as_contract_safe" (func $stdlib.cleanup_as_contract_safe))

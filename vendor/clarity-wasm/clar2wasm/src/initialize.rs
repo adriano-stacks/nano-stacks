@@ -117,6 +117,29 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             })
     }
 
+    /// How deep the sender and caller stacks are, so a function can put them
+    /// back where it found them.
+    ///
+    /// `as-contract` pushes on entry and pops on exit, but an early return out
+    /// of its body — `asserts!` or `try!` inside it — branches straight past
+    /// the pop. Restoring at the function boundary is what makes the leak
+    /// impossible rather than merely unlikely: the next call then cannot
+    /// inherit a sender the previous one left switched.
+    #[must_use]
+    pub fn principal_depth(&self) -> (usize, usize) {
+        (self.sender_stack.len(), self.caller_stack.len())
+    }
+
+    /// Unwind the sender and caller stacks back to a recorded depth.
+    pub fn restore_principal_depth(&mut self, (sender, caller): (usize, usize)) {
+        while self.sender_stack.len() > sender {
+            let _ = self.pop_sender();
+        }
+        while self.caller_stack.len() > caller {
+            let _ = self.pop_caller();
+        }
+    }
+
     pub fn push_caller(&mut self, caller: PrincipalData) {
         if let Some(current) = self.caller.take() {
             self.caller_stack.push(current);
