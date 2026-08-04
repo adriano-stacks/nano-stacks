@@ -169,7 +169,7 @@ pub fn import_checkpoint_into(
     expected_root: TrieHash,
 ) -> Result<VersionedMarf, CheckpointError> {
     import_into(
-        TrieStorage::open(marf_path.as_ref())?,
+        TrieStorage::open_for_import(marf_path.as_ref())?,
         sqlite_path.as_ref(),
         source,
         expected_root,

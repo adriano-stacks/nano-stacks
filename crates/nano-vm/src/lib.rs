@@ -1345,8 +1345,14 @@ impl MarfStore {
             return Self::open(network, directory);
         }
         let marf = import_checkpoint_into(&marf_path, checkpoint.as_ref(), source, expected_root)?;
+        {
+            // Journalling off only while the import runs; the store is then
+            // reopened normally, so everything executed on top of it is
+            // durable.
+            let importing = open_side_store_for_import(&clarity_path)?;
+            import_side_store(&importing, checkpoint.as_ref(), Some(&marf_path))?;
+        }
         let side_store = open_side_store(&clarity_path)?;
-        import_side_store(&side_store, checkpoint.as_ref(), Some(&marf_path))?;
         Ok(Self::assemble(network, marf, side_store, Some(source)))
     }
 
@@ -1778,8 +1784,29 @@ fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
 }
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    open_side_store_with_journal(path, true)
+}
+
+/// The side store while a checkpoint is being imported into it.
+///
+/// 369,694,685 values arrive in one transaction, and under WAL that grows a
+/// log which cannot be checkpointed until the end — after which every page
+/// lookup searches it and throughput decays. Journalling buys nothing during an
+/// import that is discarded if it does not finish.
+fn open_side_store_for_import(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    open_side_store_with_journal(path, false)
+}
+
+fn open_side_store_with_journal(
+    path: &Path,
+    journal: bool,
+) -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open(path)?;
-    connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+    let mode = if journal { "WAL" } else { "OFF" };
+    connection.query_row(&format!("PRAGMA journal_mode = {mode}"), [], |_| Ok(()))?;
+    if !journal {
+        connection.execute_batch("PRAGMA synchronous = OFF;")?;
+    }
     // Importing a mainnet checkpoint copies 369,694,685 values keyed by a hex
     // string, in the source's row order rather than key order, so every insert
     // lands somewhere else in the destination's B-tree. The same two megabytes

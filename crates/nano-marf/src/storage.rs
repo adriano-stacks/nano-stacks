@@ -111,8 +111,32 @@ impl TrieStorage {
 
     /// Open, creating if absent, the store held in `path`.
     pub(crate) fn open(path: &Path) -> Result<Self, MarfError> {
+        Self::open_with_journal(path, true)
+    }
+
+    /// Open a store that is about to be written in one enormous transaction.
+    ///
+    /// A checkpoint import is a single write of the whole trie graph, and under
+    /// WAL that grows a write-ahead log it can never checkpoint until the end —
+    /// sixteen gigabytes of it for mainnet, after which every page lookup
+    /// searches that log and throughput decays. A mainnet import fell from
+    /// 60 MB/s to under 3.
+    ///
+    /// Journalling buys nothing here: an import that does not finish leaves a
+    /// state directory with no provenance, which is discarded and done again.
+    /// So it is turned off for the duration and the state is durable from the
+    /// first block executed on top of it.
+    pub(crate) fn open_for_import(path: &Path) -> Result<Self, MarfError> {
+        Self::open_with_journal(path, false)
+    }
+
+    fn open_with_journal(path: &Path, journal: bool) -> Result<Self, MarfError> {
         let connection = Connection::open(path)?;
-        connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        let mode = if journal { "WAL" } else { "OFF" };
+        connection.query_row(&format!("PRAGMA journal_mode = {mode}"), [], |_| Ok(()))?;
+        if !journal {
+            connection.execute_batch("PRAGMA synchronous = OFF;")?;
+        }
         // `marf_node` is a B-tree keyed by (block, idx), and a checkpoint
         // import writes it in trie order rather than key order: it hops
         // between blocks as it follows back-pointers, so every insert lands

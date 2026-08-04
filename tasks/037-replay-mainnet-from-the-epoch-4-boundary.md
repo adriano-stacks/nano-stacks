@@ -762,3 +762,31 @@ wrong root.
    `derived_effects_split_a_matured_tenure` around the chain arithmetic rather
    than the 8,665,722 observation.
 4. Re-export `native-effects.json`, which carries the same wrong rule.
+
+## Importing a mainnet checkpoint takes ~4.5 hours, and the WAL was not why
+
+A pristine clarity-wasm replay needs a fresh import of the 146 GB checkpoint,
+and that is the slowest step in the whole loop. Two things were measured rather
+than assumed:
+
+**Journalling.** The import is one transaction, so under WAL the log grows until
+the end — 16 GB for mainnet — and `wchar` reached 45 GB to produce a 14 GB file:
+**three times write amplification**. Turning journalling off for the import
+(`open_for_import`, `open_side_store_for_import`) removes it: 8.1 GB written for
+a 7.6 GB file. An import that does not finish leaves a state directory with no
+provenance, which is discarded and redone, so the journal buys nothing.
+
+**It did not make it faster.** Same file size, same wall clock — 7.6 GB at 44
+minutes against 40. So the bottleneck is what the code comments already say it
+is: `marf_node` is a B-tree keyed by `(block, idx)` and the import writes in
+*trie* order, hopping between blocks as it follows back-pointers, so every
+insert lands somewhere random in the tree. Less I/O, same number of seeks.
+
+The fix that would actually work is to insert in key order — stage the nodes and
+sort, or build the index after the rows — and that is a real change, not a
+pragma.
+
+**Meanwhile the loop does not need re-importing at all.** The state directory
+straight after an import is the same bytes every time. Snapshot it once and a
+pristine run becomes a ~30 GB copy of a few minutes instead of 4.5 hours. That
+is the cheap win and it should be the default way to start one.
