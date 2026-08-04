@@ -460,3 +460,42 @@ Two things are worth keeping from the wrong turn: the reachability check over an
 imported checkpoint is a real gate and stays in the tree, and the diagnostics
 that separate "the trie has no such key" from "the side store has no such value"
 are what made the wrong answer cheap to disprove.
+
+## Next divergence: 8,673,864, a tenure start with matching receipts
+
+```
+state root mismatch at height 8673864: tenure start true, 2 transactions,
+2 receipts, Bitcoin height 960382, tenure height 251422, 2 credits,
+liquid supply +1000000000
+expected 626fd51b107e40ea4f8843aaebcb4160e01133c36002cfab83dac4890e102c4b
+got      35a33905186439176ee34887606b3a0fde2353a0c0880c707abd976663a3ec5e
+```
+
+The block holds a tenure change and a coinbase and nothing else. Both succeed,
+and mainnet's own receipts for the same two transactions are `(ok true)` and
+`(ok true)` — so unlike 8,668,161 this really is a root-only divergence with no
+contract call anywhere in it to blame.
+
+That points at what a tenure start does in pure Rust rather than at the VM:
+`setup_block`'s tenure height, the matured miner rewards `finish_block` pays,
+`process_stx_unlocks`, and the SIP-031 mint. `2 credits, liquid supply
++1000000000` says a coinbase of 1,000 STX was minted and two accounts credited,
+which is the first thing to check against the chain.
+
+**Ruled out: the burn-time fix.** It changed `burn_block_time` and `vrf_seed`,
+which reach only the header side store and `get-tenure-info?`. The MARFed block
+time comes from `setup_block_metadata(block.header.timestamp)` — the Stacks
+timestamp, untouched. And several hundred blocks with tenure changes in them
+executed cleanly after the fix before this one failed.
+
+## Two things the run exposed about observing a replay
+
+- `/nano/sync_status` **blocks while a catch-up round holds the executor lock**,
+  so during a long round it does not answer at all. A measurement taken through
+  it reads as a stalled node when the node is executing hard. Reading
+  `MAX(height)` from `marf.sqlite` is lock-free and was what actually showed
+  progress.
+- `max_sync_blocks` bounds a round, and it was 100,000. The durable tip and the
+  accounting are written **after** a round returns, so that setting also sets
+  how long the node runs with neither persisted. Lowered to 500 for this
+  deployment; the right default is worth deciding rather than inheriting.
