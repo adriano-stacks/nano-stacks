@@ -52,3 +52,16 @@ starts, not the 101 required to observe nano-derived earnings mature.
 The live accounting file is also polluted by failed retries at 8,665,780 as
 described in [[056-make-rejected-block-execution-leave-no-state]]. It is not
 evidence for this task and must be regenerated before the 101-tenure replay.
+
+## `rebuild-accounting` needs to say where it is
+
+Re-deriving mainnet accounting from a public peer walks every block of every
+tenure in the maturity window — roughly 200 tenures — and a rate-limited peer
+turns most requests away. In practice that is **over an hour with no output at
+all**, and nothing distinguishes it from a hang: no tenure counter, no block
+counter, no note when a request is retried.
+
+The retry itself is right (`count_fees` backs off up to 8 times, because a
+repair that is not complete is worth nothing). What is missing is saying so.
+It should log the tenure it has reached, so a run can be judged rather than
+waited on.
