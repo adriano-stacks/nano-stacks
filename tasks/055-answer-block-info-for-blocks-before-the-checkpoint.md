@@ -1273,3 +1273,14 @@ NOT FILLED: burn_block_time, vrf_seed, burn_spend_total, miner_address,
   question and a real divergence if it does — worth its own check.
 - The backfill is a manual command. Wiring it into the node's retry loop is the
   remaining task-list item; the mechanism is now proven and oracle-tested.
+
+## Result
+
+With the header backfilled, replay passed 8,669,750 and reached **8,670,485** —
+735 blocks — on a clean log: no state root mismatch, no execution error, and no
+`no burnchain block height found` at all.
+
+So the mechanism is proven end to end and oracle-checked. What remains on this
+task is wiring it into the node's retry loop so a missing header is fetched
+without a manual command, and the two open questions above about
+`burn_block_time` and `vrf_seed` being zero for every nano header.
