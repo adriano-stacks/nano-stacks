@@ -1772,6 +1772,16 @@ fn count_fees(
                     break;
                 }
             }
+            if consensus != Some(this) {
+                // A walk of ~200 tenures against a rate-limited peer takes
+                // hours, and without this it is indistinguishable from a hang —
+                // which is exactly how one run was left going for 1h45m.
+                println!(
+                    "tenure {height}: {} counted, {} to go",
+                    fees.len(),
+                    height.saturating_sub(oldest)
+                );
+            }
             consensus = Some(this);
             *fees.entry(height).or_insert(0u64) += block_fees(&block);
             let parent = block.header.parent_block_id;
