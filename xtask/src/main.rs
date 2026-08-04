@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("eval") => eval_in_state(&env::args().skip(2).collect::<Vec<_>>()),
         Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
@@ -95,6 +96,41 @@ fn compare_headers(rebuilt: &nano_vm::BlockHeader, recorded: &nano_vm::BlockHead
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Evaluate a Clarity expression against a state directory's tip.
+///
+/// The fastest question to ask a divergence: what does this node actually
+/// answer, right where it stopped. Read-only and rolled back.
+fn eval_in_state(arguments: &[String]) -> ExitCode {
+    let [state, source] = arguments else {
+        eprintln!(
+            "usage: cargo xtask eval <state-dir> <clarity-expression>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::FAILURE;
+    };
+    let mut store = match nano_vm::MarfStore::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = store.tip() else {
+        eprintln!("the state is sealed at no block");
+        return ExitCode::FAILURE;
+    };
+    if let Err(error) = store.begin(Some(tip), [0xef; 32]) {
+        eprintln!("cannot open a block on the tip: {error:?}");
+        return ExitCode::FAILURE;
+    }
+    match nano_vm::evaluate_in_store(&mut store, source) {
+        Ok(value) => println!("{value:?}"),
+        Err(error) => println!("error: {error}"),
+    }
+    let _ = store.abort();
+    ExitCode::SUCCESS
 }
 
 /// Rebuild one pre-checkpoint header from a peer, so a replay can pass it.

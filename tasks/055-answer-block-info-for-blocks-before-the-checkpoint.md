@@ -1367,3 +1367,28 @@ That redirects this task. The header work stands on its own (the epoch lookup
 genuinely does need them, and 8,669,750 was genuinely that), but **8,665,719 is
 a height-accounting question**, and the next step is to print the tenure height
 the contract asks for beside the one the node believes it is at.
+
+### And it is not the block-info read either
+
+`cargo xtask eval <state-dir> <expression>` evaluates any Clarity expression
+against a state directory's tip, read-only and rolled back — seconds, no node,
+no peer. Against the pristine state stopped at 8,665,718:
+
+```
+(is-some (get-stacks-block-info? id-header-hash u251320))  -> true
+                                              u251319     -> true
+                                              u251310     -> true
+                                              u251300     -> true
+                                              u251200     -> true
+(contract-call? …block-info-nakamoto-ststx-ratio-v2 get-ststx-ratio) -> (ok u1796712)
+```
+
+Every read this task attributed the failure to **works**. So the
+`UnwrapFailure` in `v0-4-market.borrow` is some other `unwrap!` in that
+contract, and this task's diagnosis has now been wrong twice: it is not a
+missing header, and it is not `get-stacks-block-info?`.
+
+The header work is still right for what it was actually needed for — the epoch
+lookup at 8,669,750 — and should stay. But **8,665,719 does not belong to this
+task**, and the next step is to find which unwrap in `borrow` fails, which
+`eval` now makes a matter of minutes.
