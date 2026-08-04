@@ -1201,3 +1201,32 @@ source, and `burn_spend_winner`, `block_reward`, `miner_address` and
 
 The probe prints `NOT A TENURE HEIGHT` rather than a number whenever the answer
 equals the block height, so this cannot be misread again.
+
+## What the stalling contract actually reads
+
+`block-info-nakamoto-ststx-ratio-v2` makes exactly one such call:
+
+```clarity
+(get-stacks-block-info? id-header-hash block)
+```
+
+`id-header-hash` is the `StacksBlockId`, which nano holds for every block in
+`marf_block`. So the answer this contract needs is already local; what stops it
+is the epoch check in front of the read, and that check wants a burn height.
+
+This splits the task in two, and only the first half is needed to move replay:
+
+1. **Burn context** — `burn_header_hash`, `burn_block_height`, `burn_block_time`,
+   `vrf_seed`, plus `consensus_hash`, `stacks_block_time`, `block_header_hash`
+   and `burn_spend_total`. All exactly recoverable from a stock peer:
+   `/v3/blocks/:id` for the header, `/v3/sortitions/consensus/:ch` for the
+   sortition. No invention.
+2. **Tenure and reward** — `miner_address`, `burn_spend_winner`, `block_reward`,
+   `tenure_height`, `tenure_start_height`. Not in the trie (measured above), not
+   in one peer call, and not needed by this contract.
+
+The trap is that `BlockHeader` has no absent state, so a backfill that fills
+group 1 has to put *something* in group 2, and zeros read as real answers. A
+header rebuilt from a peer therefore needs to record which fields it actually
+knows, and a read of one it does not must fail loudly and name the field —
+which is the same principle as the probe printing `NOT A TENURE HEIGHT`.
