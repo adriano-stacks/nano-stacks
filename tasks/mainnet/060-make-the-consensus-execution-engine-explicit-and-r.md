@@ -97,3 +97,55 @@ candidates are `(element-at? kft v0)` picking the wrong contract from the
 constant list, the nested `as-contract (begin (fold sw …))`, or the second
 `transfer` inside it. Bisect `sr` against the live state with `call-both`
 rather than synthetically — the synthetic shapes keep agreeing.
+
+## Both known divergences are fixed in the compiler
+
+**8,668,161 — `as-contract` leaked its sender on an early return.** It compiles
+to `enter_as_contract`, the body, `exit_as_contract`. An `asserts!` or `try!`
+inside the body branches straight to the function's return block and never
+reaches the exit, so the host's sender and caller stacks stay pushed and
+whatever runs next inherits the contract as `tx-sender`. `hilt::sr` asserts its
+way out with `(err u9)`, `map` calls it again, and the second call transfers to
+itself — `(err u2)`.
+
+```
+before   compiler [(err u9), (err u2)]   interpreter [(err u9), (err u9)]
+after    compiler [(err u9), (err u9)]   interpreter [(err u9), (err u9)]
+```
+
+and the chain says `(err u9)`. Fixed at the *function* boundary rather than at
+`as-contract`: a function records the stack depths on entry and unwinds to them
+in its postlude, which already runs on every path including the early return.
+
+What located it was bisection, not a hypothesis. `sr` on **either chunk alone**
+agrees between the engines; only the two in sequence disagree, which points at
+what the first call leaves behind rather than at what either computes.
+
+**8,667,467 — a `let`-bound placeholder was laid out for the binding.** A `let`
+stores a binding laid out for the type its *value* analysed as, and
+`{ t: target, r: none }` analyses `none` as `(optional NoType)`: an indicator
+and one `i32`, where `(optional uint)` is an indicator and two `i64`s. `fold`
+then sets its accumulator's type on the expression it is about to read, and
+reads a value two slots short — "expected i64, found i32".
+
+The `let` cannot know; the type comes from a use it has not reached. So the
+widening happens at the *read*, where both types are in hand. `v0-egroup` now
+compiles and deploys under clarity-wasm.
+
+Both fixes keep clar2wasm's own 1,375 tests green.
+
+## The interpreter cannot execute mainnet any more
+
+`interpreter_allowed` refuses the switch on mainnet outright rather than
+trusting it to be unset, and both production fallbacks — deploy and call — are
+gone. A module clarity-wasm will not build now stops the node and names the
+contract, which is how the two bugs above became findable at all.
+
+That is also why the reported depth *fell*: 8,673,863 was the interpreter's
+work, not nano's.
+
+## Pristine replay, in progress
+
+Running from a fresh state directory with no interpreter switch, importing the
+146 GB checkpoint (~17 GB written). This is the only number that counts, and it
+is the remaining item.
