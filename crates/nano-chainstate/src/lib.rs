@@ -374,7 +374,12 @@ impl TenureAccounting {
         self.matured_effects
             .retain(|height, _| *height < coinbase_height);
         if self.started.is_some_and(|started| started >= coinbase_height) {
-            self.started = None;
+            // Not `None`: execution resumes inside the highest tenure that
+            // survived, and this accounting *did* see that tenure's start block
+            // — it is only later ones that were taken off the chain. Clearing
+            // the marker instead silences `add_fees` for the rest of that
+            // tenure permanently, because a start block is executed once.
+            self.started = self.earnings.keys().next_back().copied();
         }
     }
 
@@ -3153,6 +3158,49 @@ mod tests {
             42
         );
         assert!(TenureAccounting::from_json(br#"{"matured_effects": [], "extra": 1}"#).is_err());
+    }
+
+    /// A retraction into a tenure must not stop counting that tenure's fees.
+    ///
+    /// `add_fees` counts only while `started` names the tenure, and `started` is
+    /// set only by `record_earnings` at a tenure's **start block**. A retraction
+    /// that clears it therefore silences fee accumulation for the rest of that
+    /// tenure for good, because its start block will not be executed again.
+    ///
+    /// Mainnet tenure 251321 is the evidence: 112 blocks, in flight during the
+    /// rejected-block retry storm at 8,665,780 that retracted repeatedly, and
+    /// recorded with 15,114 of fees where the chain's own transactions in those
+    /// blocks sum to 22,539,119.
+    #[test]
+    fn a_retraction_does_not_stop_the_surviving_tenure_earning_fees() {
+        let recipient =
+            PrincipalData::parse("ST000000000000000000002AMW42H").expect("boot principal");
+        let mut accounting = TenureAccounting::default();
+        for height in [10, 11] {
+            accounting.record_earnings(
+                height,
+                TenureEarnings {
+                    recipient: recipient.clone(),
+                    coinbase: 1_000,
+                    fees: 0,
+                },
+            );
+        }
+        // Tenure 11 is in progress and earning.
+        accounting.add_fees(11, 7);
+
+        // A reorganization takes tenure 11 off the chain. Execution resumes
+        // inside tenure 10, whose own start block this accounting did see.
+        accounting.retract_from(11);
+        accounting.add_fees(10, 500);
+
+        assert_eq!(
+            accounting.earnings_at(10).expect("tenure 10 survives").fees,
+            500,
+            "tenure 10 keeps earning after the retraction: its start block was \
+             executed and will not be executed again, so nothing else can \
+             restore the count"
+        );
     }
 
     /// A node writes its accounting back out on every block, and a restart owes
