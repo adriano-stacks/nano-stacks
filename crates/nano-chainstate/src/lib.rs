@@ -1328,14 +1328,14 @@ impl ChainState {
             // does write the key here whether or not anything unlocked.
             let unlocked = self.vm.process_scheduled_unlocks()?;
             self.vm.increment_liquid_stx_supply(unlocked)?;
-            if block_starts_new_tenure(block) {
-                self.mint_sip_031(bitcoin_context.height, block, &mut receipts)?;
-            }
+            let sip_031_minted =
+                self.mint_sip_031_on_new_tenure(bitcoin_context.height, block, &mut receipts)?;
             let executed = ExecutedSummary {
                 bitcoin_height: bitcoin_context.height,
                 tenure_height: self.vm.tenure_height().unwrap_or(0),
                 credited,
                 liquid_supply_increase: effects.liquid_supply_increase,
+                sip_031_minted,
             };
             self.settle_state_root(block, root, &receipts, executed)?;
             self.record_block_header(block, bitcoin_context)?;
@@ -1639,6 +1639,20 @@ impl ChainState {
         Ok(())
     }
 
+    /// The SIP-031 emission, when this block starts a tenure and none otherwise.
+    fn mint_sip_031_on_new_tenure(
+        &mut self,
+        bitcoin_height: u64,
+        block: &NakamotoBlock,
+        receipts: &mut [TransactionReceipt],
+    ) -> Result<u128, ChainStateError> {
+        if block_starts_new_tenure(block) {
+            self.mint_sip_031(bitcoin_height, block, receipts)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Mint the SIP-031 emission a new tenure owes, to the `.sip-031` contract.
     ///
     /// The supply is raised before the recipient is credited, and the mint event
@@ -1651,11 +1665,11 @@ impl ChainState {
         bitcoin_height: u64,
         block: &NakamotoBlock,
         receipts: &mut [TransactionReceipt],
-    ) -> Result<(), ChainStateError> {
+    ) -> Result<u128, ChainStateError> {
         let network = self.vm.network();
         let amount = sip_031_emission(network, bitcoin_height);
         if amount == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let recipient = PrincipalData::Contract(
             QualifiedContractIdentifier::parse(&network.boot_contract_id("sip-031"))
@@ -1678,7 +1692,7 @@ impl ChainState {
                     STXEventType::STXMintEvent(STXMintEventData { recipient, amount }),
                 ));
         }
-        Ok(())
+        Ok(amount)
     }
 
     fn execute_bitcoin_operations(
@@ -2417,6 +2431,11 @@ struct ExecutedSummary {
     tenure_height: u32,
     credited: usize,
     liquid_supply_increase: u128,
+    /// Reported separately because it is minted straight onto the VM rather
+    /// than through the block's effects, so the counters above do not see it.
+    /// A divergence caused by the SIP-031 schedule was invisible in the line
+    /// meant to diagnose it until this was here.
+    sip_031_minted: u128,
 }
 
 /// Say what was executed when a root does not match.
@@ -2431,7 +2450,8 @@ fn describe_mismatch(
 ) {
     eprintln!(
         "state root mismatch at height {}: tenure start {}, {} transactions, {} receipts, \
-         Bitcoin height {}, tenure height {}, {} credits, liquid supply +{}",
+         Bitcoin height {}, tenure height {}, {} credits, liquid supply +{}, \
+         SIP-031 mint {}",
         block.header.chain_length,
         block_starts_new_tenure(block),
         block.transactions.len(),
@@ -2440,6 +2460,7 @@ fn describe_mismatch(
         executed.tenure_height,
         executed.credited,
         executed.liquid_supply_increase,
+        executed.sip_031_minted,
     );
     for receipt in receipts {
         // The response value is the whole diagnosis for an aborted call: it
