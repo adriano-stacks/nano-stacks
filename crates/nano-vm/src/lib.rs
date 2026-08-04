@@ -195,6 +195,10 @@ struct BitcoinContext {
     headers: BTreeMap<[u8; 32], BlockHeader>,
     /// Every block this node knows about, including the checkpoint's ancestry.
     headers_db: Option<Mutex<rusqlite::Connection>>,
+    /// Blocks a contract asked about whose headers are not held, so the node
+    /// can fetch them and try the block again rather than seal a root built on
+    /// a `none` the network never answered.
+    missing_headers: Mutex<Vec<[u8; 32]>>,
     /// Stacks height each tenure started at, for the tenure-height mapping.
     tenure_starts: BTreeMap<u32, u32>,
     /// The Bitcoin block at each burn height, as `get-burn-block-info?` reads
@@ -322,6 +326,7 @@ fn burn_height_of(sortition: &SortitionId) -> u32 {
 
 /// A context that knows no chain, for evaluating programs that read none.
 static NULL_CONTEXT: BitcoinContext = BitcoinContext {
+    missing_headers: Mutex::new(Vec::new()),
     mainnet: false,
     height: 0,
     first_height: 0,
@@ -375,10 +380,34 @@ impl BitcoinContext {
                 )
                 .ok()
         };
-        if bytes.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
-            println!("no header for block {id}");
+        if bytes.is_none() {
+            // A checkpointed node holds the block index for all of history but
+            // headers only from the anchor forward, so a contract asking about
+            // an older block gets `none` — and a contract that reads `none` as
+            // "no such block" takes its error path and seals a state root the
+            // network never had. That is silent: unlike the epoch lookup, which
+            // fails loudly, nothing here says a header was wanted and missing.
+            //
+            // So it is written down, and the node backfills what was asked for
+            // before it tries the block again.
+            if let Ok(mut missing) = self.missing_headers.lock()
+                && !missing.contains(id.as_bytes())
+            {
+                missing.push(*id.as_bytes());
+            }
+            if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+                println!("no header for block {id}");
+            }
         }
         decode_block_header(&bytes?)
+    }
+
+    /// Blocks a contract asked about whose headers this node does not hold.
+    pub(crate) fn take_missing_headers(&self) -> Vec<[u8; 32]> {
+        self.missing_headers
+            .lock()
+            .map(|mut missing| std::mem::take(&mut *missing))
+            .unwrap_or_default()
     }
 }
 
@@ -784,6 +813,14 @@ impl Vm {
     #[must_use]
     pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
         self.store.height_of(block)
+    }
+
+    /// Blocks a contract asked about whose headers this node does not hold.
+    ///
+    /// Taken, not read: each caller sees what has been missed since it last
+    /// looked, so a retry that fetches them does not keep refetching.
+    pub fn take_missing_headers(&self) -> Vec<[u8; 32]> {
+        self.context.take_missing_headers()
     }
 
     /// The header this node holds for a block, if it holds one.

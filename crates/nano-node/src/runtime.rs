@@ -562,9 +562,25 @@ async fn backfill_missing_header(
     peer: &SyncClient,
     error: &str,
 ) {
-    let Some(block) = block_without_a_header(error) else {
-        return;
-    };
+    // Two ways a header can be wanted and absent. The epoch lookup fails loudly
+    // and names the block in its message; an ordinary `get-stacks-block-info?`
+    // just answers `none`, the contract takes its error path, and the only
+    // symptom is a state root that does not match. So take both: what the error
+    // named, and what the VM recorded asking for.
+    let mut wanted = executor.chainstate.take_missing_headers();
+    if let Some(named) = block_without_a_header(error) {
+        wanted.push(named);
+    }
+    for block in wanted {
+        backfill_one_header(executor, peer, block).await;
+    }
+}
+
+async fn backfill_one_header(
+    executor: &mut CheckpointExecutor<BurnchainSource>,
+    peer: &SyncClient,
+    block: [u8; 32],
+) {
     if executor.chainstate.knows_block_header(&block) {
         return;
     }

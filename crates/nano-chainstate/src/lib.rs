@@ -1520,6 +1520,11 @@ impl ChainState {
         self.vm.record_burn_header(height, hash);
     }
 
+    /// Blocks a contract asked about whose headers this node does not hold.
+    pub fn take_missing_headers(&mut self) -> Vec<[u8; 32]> {
+        self.vm.take_missing_headers()
+    }
+
     /// Whether a block's header is already answerable.
     #[must_use]
     pub fn knows_block_header(&self, block: &[u8; 32]) -> bool {
