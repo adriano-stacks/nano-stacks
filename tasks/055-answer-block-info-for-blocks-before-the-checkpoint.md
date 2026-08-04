@@ -1340,3 +1340,30 @@ an authenticated long-term source; [[049-derive-canonical-sortitions-from-the-lo
 [[050-authenticate-every-followed-nakamoto-block]] and
 [[054-join-and-synchronize-over-the-stacks-p2p-network]] must eventually supply
 or validate that history.
+
+## The pristine clarity-wasm replay says 8,665,719 is *not* a missing header
+
+Replaying from a freshly imported checkpoint with no interpreter, no healed
+contracts and no hand-placed headers, execution reaches 8,665,718 and stops:
+
+```
+chain   0x04edb5c4… v0-4-market.borrow   success (ok true)
+nano    04edb5c4…   RuntimeFailure("Runtime(UnwrapFailure, Some([])))"  (err none)
+```
+
+which is the `(unwrap! (get-stacks-block-info? id-header-hash block) …)` this
+task was opened for. But with `NANO_TRACE_WRITES` on, the run records
+**zero** "no header for block" lookups — and the node's backfill, which now
+takes both the loudly-named block and everything the header lookup could not
+answer, finds nothing to fetch.
+
+So `get-stacks-block-info?` is answering `none` **before it ever reaches
+`HeadersDB`**. In `ClarityDatabase` that happens in the guard ahead of the
+lookup — `if current_height <= tenure_height { return Ok(None) }` — which is
+about what this node thinks the *current* height is, not about which headers it
+holds.
+
+That redirects this task. The header work stands on its own (the epoch lookup
+genuinely does need them, and 8,669,750 was genuinely that), but **8,665,719 is
+a height-accounting question**, and the next step is to print the tenure height
+the contract asks for beside the one the node believes it is at.
