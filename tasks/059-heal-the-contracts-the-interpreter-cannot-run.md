@@ -1,3 +1,24 @@
+---
+id: "059"
+title: "Heal the contracts the interpreter cannot run"
+status: completed
+priority: critical
+effort: medium
+type: bug
+group: mainnet
+dependencies: ["037"]
+tags: ["mainnet", "vm", "clarity"]
+created_at: 2026-08-03
+---
+
+# Heal the contracts the interpreter cannot run
+
+## Objective
+
+A contract deployed by clar2wasm stores placeholder function bodies, because the
+real ones live in the wasm module. The interpreter cannot run such a contract,
+so any path that falls back to it fails on a contract the compiler deployed.
+
 
 ## All 27 contracts heal, and the compiler stopped being able to stop the chain
 

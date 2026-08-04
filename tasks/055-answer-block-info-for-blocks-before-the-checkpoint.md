@@ -1104,3 +1104,65 @@ whose own `get_contract` does work, since it is the one being called.
 `MarfStore::stored_contract` is in the tree for reading the raw definition,
 which the stub check already needed.
 
+
+
+## It stops replay again at 8,669,750, and the cheap fix is ruled out
+
+
+## Objective
+
+Mainnet replay stops at **8,669,750**:
+
+```
+FATAL: no burnchain block height found for Stacks block dd254a16…
+```
+
+A contract called `get-block-info?` on an older height. The id resolves fine —
+that block is at Stacks height **8,661,474**, and nano's MARF holds it, along
+with all 8,669,751 entries the checkpoint imported. What nano does not hold is
+its **header**: `block_header` carries 4,150 rows, only from the checkpoint
+forward.
+
+So the MARF import is not at fault. The headers table beside it is, and a
+checkpointed node has to answer for history it did not execute.
+
+## Why this cannot be guessed
+
+The stall is inside `ClarityDatabase::get_stacks_epoch_for_block`
+(`clarity_db.rs:2629`), reached from the `get-block-info?` / `get-tenure-info?`
+paths (`1265, 1318, 1333, 1341, 1383`). Those sites want the epoch only to ask
+`uses_nakamoto_blocks()` — but they are *about to read a real field*.
+
+That rules out the cheap fix. Synthesising a header to get past the epoch check
+makes the contract read invented values, and a contract that reads a wrong
+miner address or block time answers wrongly and seals a wrong root. **A wrong
+answer is worse than the stall**, because the stall is loud and a wrong answer
+is a divergence somewhere else entirely.
+
+It also rules out deriving the epoch from a pinned Stacks-height boundary: it
+would clear the check and then feed exactly those invented fields.
+
+## What is available
+
+The capture holds 100 blocks from 8,665,601, so this block is not local; it has
+to come from a peer. Everything needed is served by a stock node — no Hiro:
+
+| `BlockHeader` field | source | exact? |
+|---|---|---|
+| `consensus_hash` | `/v3/blocks/:id` header | yes |
+| `stacks_block_time` | `/v3/blocks/:id` header timestamp | yes |
+| `block_header_hash` | `block_hash()` of that header | yes |
+| `burn_spend_total` | header `burn_spent` | yes |
+| `burn_header_hash` | `/v3/sortitions/consensus/:ch` | yes |
+| `burn_block_height` | same | yes |
+| `burn_block_time` | same | yes |
+| `vrf_seed` | same | yes |
+| `miner_address` | sortition `miner_public_key_hash` | needs checking |
+| `burn_spend_winner` | — | no |
+| `block_reward` | — | no |
+| `tenure_height` | walk the tenure | no |
+| `tenure_start_height` | walk the tenure | no |
+
+`SyncClient::block` and `SyncClient::sortition` already exist and are already
+cached, so the first eight are a small change.
+
