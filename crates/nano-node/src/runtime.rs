@@ -361,7 +361,10 @@ async fn follow(
                     // reporting only successful rounds left a node that had
                     // executed eighty-three blocks claiming twenty-two, and
                     // left its accounting behind its own chain.
-                    Err(error) => eprintln!("executing the peer's chain failed: {error}"),
+                    Err(error) => {
+                        eprintln!("executing the peer's chain failed: {error}");
+                        backfill_missing_header(&mut executor, &peer, &error.to_string()).await;
+                    }
                 }
                 persist_accounting(&directory, &mut executor)?;
                 executed_height = executor.tip().header.chain_length;
@@ -534,6 +537,64 @@ async fn announce_executed_blocks(executor: Option<&SharedExecutor>, dispatcher:
     if let Some(executor) = executor {
         executor.lock().await.announce_to(dispatcher.clone());
     }
+}
+
+/// The block a "no burnchain block height" failure names, if that is the failure.
+fn block_without_a_header(error: &str) -> Option<[u8; 32]> {
+    let marker = "no burnchain block height found for Stacks block ";
+    let rest = error.split_once(marker)?.1;
+    let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    <[u8; 32]>::try_from(hex::decode(hex).ok()?.as_slice()).ok()
+}
+
+/// Fetch the header of an ancestor older than the checkpoint, so the retry can pass.
+///
+/// A checkpointed node holds the block index for all of history but state only
+/// from the anchor's parent forward, so a contract asking about an older block
+/// stops it — and stops it for good, because the node retries the same block
+/// forever. The five fields a stock peer can answer exactly are enough to get
+/// past the epoch check that guards every `get-stacks-block-info?`.
+///
+/// Nothing is retried here: the block is written down and the ordinary next
+/// round picks it up, so a peer that cannot answer costs one request.
+async fn backfill_missing_header(
+    executor: &mut CheckpointExecutor<BurnchainSource>,
+    peer: &SyncClient,
+    error: &str,
+) {
+    let Some(block) = block_without_a_header(error) else {
+        return;
+    };
+    if executor.chainstate.knows_block_header(&block) {
+        return;
+    }
+    let id = nano_primitives::StacksBlockId::from_bytes(block);
+    let fetched = async {
+        let header = peer.block(id).await?.header;
+        let sortition = peer.sortition(header.consensus_hash).await?;
+        Ok::<_, nano_sync::SyncError>((header, sortition))
+    }
+    .await;
+    let Ok((header, sortition)) = fetched else {
+        eprintln!("cannot fetch the header of {}", hex::encode(block));
+        return;
+    };
+    let Ok(burn_block_height) = u32::try_from(sortition.bitcoin_height) else {
+        return;
+    };
+    executor.chainstate.backfill_ancestor_header(
+        block,
+        *sortition.bitcoin_block_hash.as_bytes(),
+        burn_block_height,
+        header.timestamp,
+        *header.block_hash().as_bytes(),
+        *header.consensus_hash.as_bytes(),
+    );
+    println!(
+        "wrote down the header of ancestor {} at burn height {burn_block_height}, \
+         which this node never executed",
+        hex::encode(block)
+    );
 }
 
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries
@@ -884,5 +945,54 @@ mod tests {
         assert!(Job::Follower.is_fatal());
         assert!(!Job::Miner.is_fatal());
         assert!(!Job::Rpc.is_fatal());
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::block_without_a_header;
+
+    /// The shape the node actually printed when replay stopped at 8,669,750.
+    const REAL: &str = "executing the peer's chain failed: node execution failed: \
+checkpoint execution failed: Clarity execution error: Internal(Expect(\"FATAL: no burnchain \
+block height found for Stacks block dd254a1691f90df22c1d4585c6526feda3b88b941f6ffa8c85d2e6b4bfb0b291\"))";
+
+    #[test]
+    fn the_block_is_taken_out_of_the_message_the_node_printed() {
+        let block = block_without_a_header(REAL).expect("the block is named");
+        assert_eq!(
+            hex::encode(block),
+            "dd254a1691f90df22c1d4585c6526feda3b88b941f6ffa8c85d2e6b4bfb0b291"
+        );
+    }
+
+    #[test]
+    fn a_trailing_quote_does_not_become_part_of_the_block() {
+        // The id is followed by `"))` in the real message, so stopping at the
+        // first non-hexadecimal character is what makes this work at all.
+        let block = block_without_a_header(REAL).expect("the block is named");
+        assert_eq!(block.len(), 32);
+    }
+
+    #[test]
+    fn other_failures_are_not_mistaken_for_this_one() {
+        for error in [
+            "state root mismatch: expected 5a301da0, got 6fb41024",
+            "a deployment was rejected: contract analysis failed",
+            "",
+        ] {
+            assert!(
+                block_without_a_header(error).is_none(),
+                "{error} is not a missing header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_block_is_refused_rather_than_padded() {
+        // A short id would otherwise be padded into some *other* block, and
+        // writing a header under the wrong id is worse than not writing one.
+        let error = "no burnchain block height found for Stacks block dd254a16";
+        assert!(block_without_a_header(error).is_none());
     }
 }

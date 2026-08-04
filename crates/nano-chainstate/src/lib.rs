@@ -1508,6 +1508,59 @@ impl ChainState {
         self.vm.record_burn_header(height, hash);
     }
 
+    /// Whether a block's header is already answerable.
+    #[must_use]
+    pub fn knows_block_header(&self, block: &[u8; 32]) -> bool {
+        self.vm.recorded_block_header(block).is_some()
+    }
+
+    /// Write down a header for a block this node never executed.
+    ///
+    /// A checkpointed node holds the block *index* for all of history but state
+    /// only from the anchor's parent forward, so a contract asking about an
+    /// older block stops it. The five fields below are exactly recoverable from
+    /// a stock peer; the rest are left at nano's own convention for them, which
+    /// `xtask backfill-header` checks by rebuilding a header the node already
+    /// holds and diffing it field by field.
+    ///
+    /// It is deliberately not a full header: a contract reading `miner-address`
+    /// or `block-reward` at such a block gets zero rather than the chain's
+    /// answer. That is a narrower wrong than the alternative — inventing values
+    /// that look right — and narrower still than refusing to advance at all.
+    ///
+    /// Distinct from `backfill_block_header`, which is for blocks near the tip:
+    /// that one reads a tenure height and records an `ExecutedBlock`, and both
+    /// would be wrong here. This node did not execute this block and cannot
+    /// read state at it.
+    pub fn backfill_ancestor_header(
+        &mut self,
+        block: [u8; 32],
+        burn_header_hash: [u8; 32],
+        burn_block_height: u32,
+        stacks_block_time: u64,
+        block_header_hash: [u8; 32],
+        consensus_hash: [u8; 20],
+    ) {
+        self.vm.record_block_header(
+            block,
+            nano_vm::BlockHeader {
+                burn_header_hash,
+                burn_block_height,
+                stacks_block_time,
+                block_header_hash,
+                consensus_hash,
+                burn_block_time: 0,
+                vrf_seed: [0; 32],
+                burn_spend_total: 0,
+                miner_address: (0, [0; 20]),
+                burn_spend_winner: 0,
+                block_reward: 0,
+                tenure_height: 0,
+                tenure_start_height: 0,
+            },
+        );
+    }
+
     /// What this node wrote down about a block, if anything.
     #[must_use]
     pub fn recorded_header(&self, block: [u8; 32]) -> Option<nano_vm::BlockHeader> {
