@@ -499,3 +499,31 @@ executed cleanly after the fix before this one failed.
   accounting are written **after** a round returns, so that setting also sets
   how long the node runs with neither persisted. Lowered to 500 for this
   deployment; the right default is worth deciding rather than inheriting.
+
+### SIP-031 ruled out
+
+The mismatch line now reports the mint, and it reads:
+
+```
+... 2 credits, liquid supply +1000000000, SIP-031 mint 1140000000
+```
+
+So the mint happened, at the post-960,300 rate. nano's schedule matches
+stacks-core's `SIP031_EMISSION_INTERVALS_MAINNET` interval for interval
+(`stacks-common/src/types/mod.rs:345-373`), including the 960,300 step to
+1,140 STX that sits 82 burn blocks before this divergence and looked like the
+obvious suspect. It is not the cause.
+
+Worth keeping: reading the *old* line — `2 credits, liquid supply +1000000000` —
+I concluded the mint had not happened at all, because 1,000,000,000 is exactly
+the coinbase. That was wrong, and the line invited it by omitting the one
+quantity that would have settled it.
+
+### What is left
+
+`+1000000000` of liquid supply and 2 credits at a tenure start, with no contract
+call in the block. That is the matured reward path: `finish_block`'s matured
+miner rewards, `process_stx_unlocks` over `.lockup`, and the tenure height
+`setup_block` writes. The next check is whose two accounts nano credited and by
+how much, against the chain's own balances at 8,673,863 and 8,673,864 — the
+first divergence in ~7,200 blocks that is neither the VM nor a missing header.
