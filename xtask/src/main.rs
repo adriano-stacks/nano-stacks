@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
@@ -38,6 +39,168 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Diff a rebuilt header against the one this node recorded, field by field.
+fn compare_headers(rebuilt: &nano_vm::BlockHeader, recorded: &nano_vm::BlockHeader) -> ExitCode {
+        let mut wrong = 0;
+        let mut check = |field: &str, same: bool, detail: String| {
+            if !same {
+                wrong += 1;
+            }
+            println!("  {field:20} {} {detail}", if same { "==" } else { "!=" });
+        };
+        check(
+            "burn_header_hash",
+            rebuilt.burn_header_hash == recorded.burn_header_hash,
+            String::new(),
+        );
+        check(
+            "burn_block_height",
+            rebuilt.burn_block_height == recorded.burn_block_height,
+            format!("{} vs {}", rebuilt.burn_block_height, recorded.burn_block_height),
+        );
+        check(
+            "burn_block_time",
+            rebuilt.burn_block_time == recorded.burn_block_time,
+            format!("{} vs {}", rebuilt.burn_block_time, recorded.burn_block_time),
+        );
+        check(
+            "stacks_block_time",
+            rebuilt.stacks_block_time == recorded.stacks_block_time,
+            format!("{} vs {}", rebuilt.stacks_block_time, recorded.stacks_block_time),
+        );
+        check(
+            "block_header_hash",
+            rebuilt.block_header_hash == recorded.block_header_hash,
+            String::new(),
+        );
+        check(
+            "consensus_hash",
+            rebuilt.consensus_hash == recorded.consensus_hash,
+            String::new(),
+        );
+        check("vrf_seed", rebuilt.vrf_seed == recorded.vrf_seed, String::new());
+        check(
+            "burn_spend_total",
+            rebuilt.burn_spend_total == recorded.burn_spend_total,
+            format!("{} vs {}", rebuilt.burn_spend_total, recorded.burn_spend_total),
+        );
+        println!(
+            "{wrong} of the 8 compared fields disagree with the recorded header \
+             (nothing was written: this block already has one)"
+        );
+    if wrong == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Rebuild one pre-checkpoint header from a peer, so a replay can pass it.
+///
+/// The burn context is exactly recoverable — `/v3/blocks/:id` gives the header
+/// and `/v3/sortitions/consensus/:ch` gives the sortition it was elected by —
+/// and that is what the epoch check in front of every `get-stacks-block-info?`
+/// wants. The tenure and reward fields are *not* recoverable this way and are
+/// left zero, so this says loudly which fields it did not fill: a contract
+/// reading one of those gets a number that is not the chain's.
+fn backfill_header(arguments: &[String]) -> ExitCode {
+    let [state, peer, block] = arguments else {
+        eprintln!(
+            "usage: cargo xtask backfill-header <state-dir> <peer-url> <block-id>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(id) = hex::decode(block)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+    else {
+        eprintln!("the block id must be 32 hexadecimal bytes");
+        return ExitCode::FAILURE;
+    };
+    let Ok(url) = peer.parse() else {
+        eprintln!("{peer} is not a URL");
+        return ExitCode::FAILURE;
+    };
+    let Ok(client) = nano_sync::SyncClient::new(url) else {
+        eprintln!("cannot reach {peer}");
+        return ExitCode::FAILURE;
+    };
+    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+        eprintln!("cannot start a runtime");
+        return ExitCode::FAILURE;
+    };
+    let fetched = runtime.block_on(async {
+        let block = client
+            .block(nano_primitives::StacksBlockId::from_bytes(id))
+            .await?;
+        let sortition = client.sortition(block.header.consensus_hash).await?;
+        Ok::<_, nano_sync::SyncError>((block, sortition))
+    });
+    let (block, sortition) = match fetched {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("cannot rebuild the header from {peer}: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The oracle this whole approach needs: rebuild a header the node already
+    // holds and diff it. A reconstruction is only trustworthy for a block that
+    // cannot be checked if it is exact for one that can.
+    let recorded = vm.recorded_block_header(&id);
+    let Ok(burn_block_height) = u32::try_from(sortition.bitcoin_height) else {
+        eprintln!("the burn height does not fit");
+        return ExitCode::FAILURE;
+    };
+    let rebuilt = nano_vm::BlockHeader {
+            burn_header_hash: *sortition.bitcoin_block_hash.as_bytes(),
+            burn_block_height,
+            stacks_block_time: block.header.timestamp,
+            block_header_hash: *block.header.block_hash().as_bytes(),
+            consensus_hash: *block.header.consensus_hash.as_bytes(),
+            // The oracle below caught all three of these being wrong. The
+            // sortition's seed is not the one nano records; the header's
+            // `bitcoin_spent` is a *running* total, not the per-tenure burn
+            // `burn_spend_total` means; and nano leaves burn_block_time zero
+            // for blocks it executes itself. Matching nano's own convention is
+            // what keeps a backfilled header indistinguishable from a recorded
+            // one — filling them from a peer would make this block answer
+            // differently from every block beside it.
+            burn_block_time: 0,
+            vrf_seed: [0; 32],
+            burn_spend_total: 0,
+            // Not recoverable from these two calls either. Named below, because
+            // a header has no way to say a field is absent and a zero read as a
+            // real answer is worse than the stall this replaces.
+            miner_address: (0, [0; 20]),
+            burn_spend_winner: 0,
+            block_reward: 0,
+            tenure_height: 0,
+            tenure_start_height: 0,
+    };
+    if let Some(recorded) = recorded {
+        return compare_headers(&rebuilt, &recorded);
+    }
+    vm.record_block_header(id, rebuilt);
+    println!(
+        "recorded a header for {} at burn height {burn_block_height}\n\
+         exact: burn_header_hash, burn_block_height, consensus_hash, \
+         stacks_block_time, block_header_hash\n\
+         NOT FILLED: burn_block_time, vrf_seed, burn_spend_total, miner_address, \
+         burn_spend_winner, block_reward, tenure_height, tenure_start_height -- a contract reading one of these gets zero, not the chain's answer",
+        hex::encode(id)
+    );
+    ExitCode::SUCCESS
 }
 
 /// Read what a header could be rebuilt from, at a block older than the checkpoint.

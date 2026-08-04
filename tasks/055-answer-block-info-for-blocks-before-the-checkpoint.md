@@ -1230,3 +1230,46 @@ group 1 has to put *something* in group 2, and zeros read as real answers. A
 header rebuilt from a peer therefore needs to record which fields it actually
 knows, and a read of one it does not must fail loudly and name the field —
 which is the same principle as the probe printing `NOT A TENURE HEIGHT`.
+
+## The oracle caught the reconstruction being wrong, before anything used it
+
+`cargo xtask backfill-header <state-dir> <peer-url> <block-id>` rebuilds a
+header from `/v3/blocks/:id` and `/v3/sortitions/consensus/:ch`. When the node
+already holds a header for that block it writes nothing and diffs instead,
+which is the check that makes a reconstruction trustworthy for a block that
+cannot be checked.
+
+Run against a known block it immediately failed 3 of 8, and every one was a real
+mistake in the section above:
+
+| field | rebuilt | recorded | what was wrong |
+|---|---|---|---|
+| `burn_spend_total` | 437,713,689,148 | 0 | `header.bitcoin_spent` is a **running** total; `burn_spend_total` is the per-tenure burn. Different quantity. |
+| `burn_block_time` | 1,785,437,160 | 0 | nano leaves this zero for blocks it executes itself |
+| `vrf_seed` | sortition's | different | the sortition's seed is not the one nano records |
+
+So the earlier claim that eight fields were exactly recoverable was wrong: five
+are. The other three are only *plausible*, and filling them from a peer would
+have made one block answer differently from every block beside it — the same
+silent-divergence shape as trusting the trie.
+
+Matching nano's own convention (zero) instead brings it to **0 of 8 disagreeing**,
+and a backfilled header is then indistinguishable from a recorded one.
+
+Applied to the block that stalls replay:
+
+```
+recorded a header for dd254a16… at burn height 960142
+exact: burn_header_hash, burn_block_height, consensus_hash,
+       stacks_block_time, block_header_hash
+NOT FILLED: burn_block_time, vrf_seed, burn_spend_total, miner_address,
+       burn_spend_winner, block_reward, tenure_height, tenure_start_height
+```
+
+### Still open
+
+- `burn_block_time` and `vrf_seed` are zero for **every** nano header, not just
+  backfilled ones. Whether stacks-core answers a real value there is a separate
+  question and a real divergence if it does — worth its own check.
+- The backfill is a manual command. Wiring it into the node's retry loop is the
+  remaining task-list item; the mechanism is now proven and oracle-tested.
