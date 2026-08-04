@@ -65,3 +65,26 @@ The retry itself is right (`count_fees` backs off up to 8 times, because a
 repair that is not complete is worth nothing). What is missing is saying so.
 It should log the tenure it has reached, so a run can be judged rather than
 waited on.
+
+## The silence was hiding a starved backoff, not a slow walk
+
+`/proc/<pid>/io` showed the 1h45m run had read **nothing in 90 seconds**, on the
+same socket, with 6 seconds of CPU. It was not slow; it was starved.
+
+The cause was in `nano-sync`'s 429 handling: it took the peer's `Retry-After`
+and applied the same 2-second ceiling it uses for its own guess, so a peer
+asking for a minute was asked again two seconds later — earning another 429,
+indefinitely. Fixed: a peer's answer is honoured as given, bounded at two
+minutes so a broken header cannot park a catch-up.
+
+With that and the progress line in, the same walk runs visibly:
+
+```
+tenure 251419: 2 counted, 199 to go
+...
+tenure 251394: 27 counted, 174 to go
+```
+
+About 0.6 tenures a minute against a public peer, so the full window is a
+multi-hour run — but a bounded and observable one, and it reaches the tenure
+that matters (251321) around the halfway point.
