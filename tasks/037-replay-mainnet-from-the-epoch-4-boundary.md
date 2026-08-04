@@ -5,7 +5,7 @@ status: pending
 priority: critical
 effort: large
 type: feature
-dependencies: ["020", "021", "022", "023", "024", "025", "048", "056", "060"]
+dependencies: ["020", "021", "022", "023", "024", "025", "048", "056", "060", "061", "062"]
 tags: ["mainnet", "replay", "conformance"]
 created_at: 2026-07-30
 ---

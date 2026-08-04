@@ -29,16 +29,20 @@ engine switch is not mainnet conformance evidence.
 
 ## Tasks
 
-- [ ] Reproduce and minimize every known mainnet clarity-wasm divergence,
+- [x] Reproduce and minimize every known mainnet clarity-wasm divergence,
       including the trait-reference/wrong-principal failure at 8,668,161.
-- [ ] Fix the compiler, runtime ABI or generated-code boundary responsible for
-      each disagreement; do not route the transaction or deployment through the
-      interpreter in production.
-- [ ] Remove interpreter-only and interpreter-fallback behavior from the
-      production node configuration, or make startup reject those diagnostic
-      switches on mainnet.
-- [ ] Keep the interpreter differential oracle behind an explicit test or
-      diagnostic mode whose writes are always rolled back.
+- [x] Fix the two known compiler/runtime boundary disagreements without routing
+      their transaction or deployment through the interpreter.
+- [x] Reject `NANO_INTERPRETER_ONLY` on mainnet.
+- [ ] Remove or reject `NANO_INTERPRETER_FALLBACK`, `NANO_CROSSCHECK` and
+      `NANO_CROSSCHECK_TRANSACTIONS` in the production mainnet node; every path
+      that toggles `Vm::interpret_contract_calls` must enforce the same network
+      policy.
+- [ ] Keep the interpreter differential oracle and contract healing in explicit
+      test or `xtask` tooling whose writes are always rolled back and which the
+      release runtime cannot invoke.
+- [ ] Answer `/v2/accounts` without evaluating `(stx-account ...)` through the
+      reference interpreter; use direct state access or clarity-wasm.
 - [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
       compiler-hostile deployments and calls, with no healing or engine switch.
 - [ ] Compare clarity-wasm with the interpreter before sealing in the
@@ -63,6 +67,11 @@ engine switch is not mainnet conformance evidence.
 - Deliberately forcing a clarity-wasm/interpreter disagreement in a regression
   test stops the conformance run before sealing rather than accepting the
   interpreter's answer.
+- Starting mainnet with any interpreter or crosscheck environment switch fails
+  before opening mutable chainstate, and no public Rust or RPC path can enable
+  interpreter execution afterwards.
+- Account and read-only RPCs execute no Clarity expression in the reference
+  interpreter.
 
 ## Where the 8,668,161 divergence is, and two shapes that are not it
 
@@ -134,12 +143,20 @@ compiles and deploys under clarity-wasm.
 
 Both fixes keep clar2wasm's own 1,375 tests green.
 
-## The interpreter cannot execute mainnet any more
+## Interpreter-only is blocked, but the production boundary is not closed
 
 `interpreter_allowed` refuses the switch on mainnet outright rather than
-trusting it to be unset, and both production fallbacks — deploy and call — are
-gone. A module clarity-wasm will not build now stops the node and names the
+trusting it to be unset, and the automatic deploy fallback is gone. A module
+clarity-wasm will not build now stops the ordinary node path and names the
 contract, which is how the two bugs above became findable at all.
+
+The wider audit found remaining routes around that guard. The call path still
+reads `NANO_INTERPRETER_FALLBACK` and returns the interpreter's answer after a
+wasm runtime failure; `NANO_CROSSCHECK` and `NANO_CROSSCHECK_TRANSACTIONS` still
+invoke it; and `Vm::interpret_contract_calls(true)` itself has no network check.
+The account RPC also calls `Vm::execute`, which evaluates `stx-account` through
+`eval_all`. None is enabled in the current pristine run, but a release boundary
+must make them impossible rather than depend on operator discipline.
 
 That is also why the reported depth *fell*: 8,673,863 was the interpreter's
 work, not nano's.
@@ -149,3 +166,42 @@ work, not nano's.
 Running from a fresh state directory with no interpreter switch, importing the
 146 GB checkpoint (~17 GB written). This is the only number that counts, and it
 is the remaining item.
+
+## Upstream: what is already solved, and what is not
+
+`stx-labs/clarity-wasm` has nine open PRs, and several sit exactly where this
+work does. Checked before carrying any of these fixes further:
+
+| PR | What it is | Bearing on this |
+|---|---|---|
+| 826 | merge changes from stacks-core | the Epoch40/Clarity6 rebase (M8a) |
+| 825 | allow contract call to be constant (#816) | **duplicates a fix already made here** in `words/contract.rs` — a constant naming a contract was not recognised as a static call |
+| 824 | Clarity 1 return type of contracts (#818) | touches `duck_type.rs`, `wasm_utils.rs` |
+| 823 | right type for contract call v1 (#819) | `wasm_generator.rs` +60 |
+| 812 | Clarity 4 costs | `cost/clar4.rs` and `costs-4.clar` — this is **W6.3 / M8c**, unimplemented here |
+| 620 | copy only after `concat` args traversal | `words/sequences.rs` |
+| 734 | gate datastore under `developer-mode` | W6.5's dev-only datastore |
+
+**`duck_type` already exists.** `clar2wasm/src/duck_type.rs` converts a value's
+representation from one type to another, handles memory as well as stack, and
+`need_ducktyping` already treats `NoType` as needing conversion.
+`lookup_constant_variable` calls it for exactly the reason a local binding needs
+it — so the placeholder fix here is a narrower re-implementation of machinery
+that is already in the tree.
+
+Calling `duck_type` from `visit_atom` directly does *not* work: the error moves
+from "expected i64, found i32" to "expected i32, found i64", because it wants
+the value in a different form than a flattened read of the binding's locals.
+Reconciling the two is the right end state and is not guesswork to do blind —
+`widen_actions` stays until then, and this note is why it should not stay
+forever.
+
+**Not known upstream:** no open issue or PR covers `as-contract` failing to
+restore the sender on an early return. That fix looks genuinely new and is worth
+sending up.
+
+**Worth heeding:** issue #575, "let function throwing a too many locals issue".
+The `as-contract` fix adds two `i32` locals to *every* function prologue. 1,375
+tests stay green, but that is the shape of thing #575 is about, and a cheaper
+form — only emitting the save/restore for functions whose body contains an
+`as-contract` — would avoid adding to it.

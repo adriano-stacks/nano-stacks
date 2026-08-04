@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060"]
+dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
