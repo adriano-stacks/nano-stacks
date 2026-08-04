@@ -1284,3 +1284,34 @@ So the mechanism is proven end to end and oracle-checked. What remains on this
 task is wiring it into the node's retry loop so a missing header is fetched
 without a manual command, and the two open questions above about
 `burn_block_time` and `vrf_seed` being zero for every nano header.
+
+## Closed: burn time and VRF seed were zero for every block, not just backfilled ones
+
+The oracle's third and second disagreements were not backfill bugs. Both
+execution paths built a Bitcoin context with the height and burn header hash
+from the sortition and left `burn_block_time` at zero, and **nothing in the node
+ever set `vrf_seed` at all**. So `(get-tenure-info? time)` and
+`(get-tenure-info? vrf-seed)` answered zero for every block nano executed, where
+mainnet answers real values.
+
+This is the shape of bug that does not announce itself. A missing header stops
+the node and says which block; a zero here is a wrong number in a receipt and a
+state root that differs for no visible reason, arbitrarily far from the contract
+that read it.
+
+The conformance harness builds its context from the sortition snapshot
+(`nano-conformance/src/lib.rs:1175`) and so had the right values all along —
+which is why its assertion passed while the node was wrong. The gap was between
+the harness and the node, not in the oracle.
+
+Fixed on all three paths; the sortition already carried both values on each.
+Verified live: a block executed after the fix records `burn time 1785481080`
+where every block before it recorded 0.
+
+**Wiring, also done.** The node now fetches a missing ancestor header itself
+rather than needing `xtask backfill-header` by hand. The failure names the
+block, the five exactly-recoverable fields are written down, and the ordinary
+next round picks it up. The parsing is the fragile part and is what has tests:
+the real message, the trailing quote that must not join the id, other failures
+that must not be mistaken for this one, and a truncated id refused rather than
+padded into some other block.
