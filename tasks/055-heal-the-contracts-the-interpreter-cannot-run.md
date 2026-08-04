@@ -61,3 +61,54 @@ only the state root differs*. Per plan.md that reads as MARF or write ordering
 rather than execution — the first divergence in a while that is not a VM bug,
 and the next thing to look at.
 
+
+## The divergence at 8,668,161 was not the MARF, and it invoked the tripwire
+
+The receipts *looked* fine because every transaction succeeded. Against
+mainnet's own receipts two differ:
+
+| tx | mainnet | nano (compiler) |
+|---|---|---|
+| `3ff1aff7` | `(ok u418181) (err u9) (err u9) …` | `(ok u418181) (err u9) (err u2) …` |
+| `88d21a09` | `(err u9) (ok u748)` | `(err u9) (err u2)` |
+
+`(err u2)` from `stx-transfer?` is sender == recipient — the wrong-principal
+class again. `xtask call-both` on `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV
+.loto::ri`, whose argument is a trait reference to `.hilt`, settles it:
+
+```
+compiler     [(err u9), (err u2)]
+interpreter  [(err u9), (err u9)]
+```
+
+The engines disagree, so it is clarity-wasm — the third such bug in this same
+routing shape, after `as-contract` typing and `merge` coercion. **Checking
+receipts against the chain rather than only reading them is what told the
+difference**; a root mismatch with all-successful receipts reads as MARF, and
+this was not.
+
+### `NANO_INTERPRETER_ONLY=1` replays mainnet where the compiler cannot
+
+plan.md's highest-value tripwire, invoked: *"clarity-wasm not compiling … point
+`nano-vm` at the clarity interpreter instead."* The switch already existed. With
+it set the node cleared 8,668,161 and kept going:
+
+**8,668,160 → 8,669,750, zero state root mismatches.**
+
+That is the answer to the write-ordering worry recorded beside the fallback: the
+two engines were only *evidenced* to seal the same roots by `engine_state_roots`,
+and 1,590 consecutive mainnet blocks is much better evidence.
+
+One thing it needs, and it is not optional: **a contract the compiler deployed
+cannot be run by the interpreter**, so switching engines mid-chain strands every
+contract deployed by the earlier arm. 39 had accumulated over the compiler's
+1,344 blocks, and `xtask heal-contracts` fixed all 39. Deploys in interpreter
+mode store real bodies, so this is self-correcting from here — but a run that
+switches engines must heal first, or it stops on the first call into one of them
+(here `pox-5::stake`, which is how it was found).
+
+### Where replay stands
+
+**8,666,680 → 8,669,750 this session (+3,070).** Mainnet tip is 8,698,348, so
+the remaining gap is ~28,600 blocks and the checkpoint means those are the only
+ones that ever need executing.
