@@ -222,10 +222,21 @@ clarity-wasm. Two cheaper routes, in order of preference:
    divergence can be wound back to the block before it and re-executed under a
    changed compiler, with no import at all.
 
-   What is missing is the durable half: the node's tip on startup comes from the
-   MARF's own tip, so a rewind tool has to move that too. Worth building — it
-   turns "test this fix against mainnet block N" from 4.5 hours into seconds,
-   and it is the same mechanism a Bitcoin reorganization already needs.
+   Two things are missing. The node's tip on startup is
+   `SELECT hash FROM marf_block ORDER BY height DESC` — the highest block — so a
+   rewind has to *delete* the blocks above the target and their nodes (6,397
+   blocks and 1,091,821 nodes, to wind back from 8,673,863 to 8,667,466). The
+   comment on `retract_to` about deleting nothing is about forks, where the
+   abandoned branch stays reachable; a rewind is not that.
+
+   **And it does not give a pristine state.** The side store keys contract
+   definitions by contract, not by block, so a contract the interpreter deployed
+   or healed survives a MARF rewind untouched. A rewound state is good for
+   asking whether a compiler fix changes a block's outcome; it cannot answer
+   [[060]]'s question, which is what clarity-wasm does from a checkpoint with no
+   interpreter having touched anything.
+
+   So: build it for iteration, and keep importing for evidence.
 
 Neither was available while chasing 8,667,467 and 8,668,161, which is why both
 cost hours of wall-clock each rather than minutes. `xtask call-both` against a
