@@ -45,6 +45,9 @@ const BRIDGE_WALK: usize = 1024;
 const RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 const RATE_LIMIT_RETRIES: usize = 3;
 const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
+/// A bound on what a *peer* may ask this node to wait, so a hostile or broken
+/// `Retry-After` cannot park a catch-up for an hour. Well above any real one.
+const RETRY_AFTER_CEILING: std::time::Duration = std::time::Duration::from_mins(2);
 
 #[derive(Clone, Debug)]
 pub struct SyncClient {
@@ -934,14 +937,22 @@ impl SyncClient {
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Ok(response.error_for_status()?);
             }
-            // Honour the peer's own answer when it gives one.
+            // Honour the peer's own answer when it gives one — and honour it
+            // *as given*. Capping `Retry-After` at the ceiling meant a peer
+            // asking for a minute was asked again in two seconds, which earns
+            // another 429 and keeps earning them: the ceiling is a bound on
+            // what this node invents for itself, not on what it was told.
+            //
+            // Its own guess stays bounded, because a peer that says nothing
+            // should not be able to stall a catch-up either.
             let told = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
-            tokio::time::sleep(told.unwrap_or(wait).min(RATE_LIMIT_CEILING)).await;
+                .map(std::time::Duration::from_secs)
+                .map(|told| told.min(RETRY_AFTER_CEILING));
+            tokio::time::sleep(told.unwrap_or(wait)).await;
             wait = wait.saturating_mul(2).min(RATE_LIMIT_CEILING);
         }
         Ok(self
@@ -1672,6 +1683,44 @@ mod tests {
         assert!(limited.is_rate_limited(), "{limited}");
         let missing = client.node_info().await.expect_err("the peer said 404");
         assert!(!missing.is_rate_limited(), "{missing}");
+    }
+
+    /// A peer asking for a longer wait than this node would choose gets it.
+    ///
+    /// Capping `Retry-After` at the self-chosen ceiling meant a peer asking for
+    /// a minute was asked again two seconds later, which earns another 429 and
+    /// keeps earning them. A mainnet accounting rebuild ran for 1h45m against a
+    /// rate-limited peer with 6 seconds of CPU to show for it.
+    #[tokio::test]
+    async fn a_peer_asking_for_a_long_wait_is_waited_for() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                let response = "HTTP/1.1 429 Too Many Requests\r\n\
+                                retry-after: 30\r\ncontent-length: 0\r\n\r\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+
+        // Under the old cap the three retries took ~6s in total and returned.
+        // Honouring the header they take 30s each, so the call is still running
+        // when a generous bound on the old behaviour has passed.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.node_info(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the peer asked for 30s and was waited for, rather than asked again in 2"
+        );
     }
 
     /// A cached block is served without a request, which is what makes a round
