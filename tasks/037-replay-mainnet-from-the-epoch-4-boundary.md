@@ -569,3 +569,43 @@ Next: read `finish_block`'s matured-reward split in stacks-core
 carries, then fix nano's `TenureAccounting::earnings_at` to match. The two
 `credits` nano makes at a tenure start are the coinbase and the fee; the chain
 makes them in different blocks.
+
+### Attempted and reverted: pairing the coinbase with the parent tenure's fees
+
+stacks-core schedules a tenure's reward as its own coinbase plus its **parent
+tenure's** fees, both to its own miner:
+
+```
+make_scheduled_miner_reward(.., parent_fees, .., coinbase_reward_ustx)
+    chainstate/nakamoto/tenure.rs:283, called at :1013
+```
+
+nano pairs the other way — a tenure's own fees go to the tenure *before* it —
+so changing it to match the source looked like the fix. It is not, and the
+existing unit test says why:
+
+> `derived_effects_split_a_matured_tenure` … Mainnet block **8,665,722** is the
+> evidence: paying the earlier tenure's fees left its recipient short by exactly
+> the difference between the two.
+
+That rule was derived from a real divergence and is empirically right at least
+there. A source reading that contradicts a measured block means the mapping
+between nano's `coinbase_height` and stacks-core's tenure index is off by one
+somewhere in my reading, not that the code is wrong. Reverted; the test stays.
+
+**So the cause is still open.** What is established:
+
+- The chain credits the maturing miner exactly `+1,000,000,000` at 8,673,864,
+  and nano credits `1,000,000,000 + 625,846`.
+- The extra credit is the *second* one, and nano's first credit already matches.
+- The recorded fee amounts are right (251320 = 1,260 and 251321 = 15,114 both
+  agree with the chain), so this is attribution or timing, not arithmetic.
+- Mainnet miners alternate (A, B, A, B …), so the tenure before and the tenure
+  after are frequently the same account. Any off-by-one in *this* direction is
+  invisible until the alternation breaks — which is what makes reasoning from a
+  few tenures unreliable and why 8,665,722 and 8,673,864 can both be right.
+
+The next step is not another hypothesis: it is to take a tenure where the
+alternation *does* break (251324 is `SP30ZB6…` between two `SP2N4YMH…`) and read
+what the chain paid whom, at block granularity rather than `until_block`
+snapshots.
