@@ -527,3 +527,45 @@ miner rewards, `process_stx_unlocks` over `.lockup`, and the tenure height
 `setup_block` writes. The next check is whose two accounts nano credited and by
 how much, against the chain's own balances at 8,673,863 and 8,673,864 — the
 first divergence in ~7,200 blocks that is neither the VM nor a missing header.
+
+### The cause: nano pays a tenure's fees with its coinbase; the chain does not
+
+The miner maturing at 8,673,864 is `SP70B98HWSFY2M7JB6V6P563TR3JSBWW3S43GS8M`,
+and its balance across that block moves by **exactly the coinbase**:
+
+```
+until_block 8673863   balance 2002701297
+until_block 8673864   balance 3002701297     +1,000,000,000
+```
+
+nano wants to pay `coinbase 1,000,000,000 + fees 625,846 = 1,000,625,846`, from
+its record of tenure 251322 (= 251422 - 100, the maturity). Hence the extra
+credit, and hence the root.
+
+Walking the same balance backwards shows the chain paying the two apart:
+
+| range | delta | what |
+|---|---|---|
+| 8,673,800 → 8,673,840 | **+1,000,000,000** | a coinbase, exactly, no fees |
+| 8,673,840 → 8,673,855 | **+15,114** | a fee payment on its own |
+
+`15,114` is precisely nano's fee figure for tenure **251321** — a tenure nano
+credits to `SP2N4YMH4XNWTD…`, not to this miner. So the chain both **separates
+the fee from the coinbase** and attributes it to a different tenure's miner than
+nano does.
+
+That is one off-by-one at a tenure boundary, and it is why this survived ~7,200
+blocks: it only shows when consecutive tenures have different miners *and* the
+fees are large enough to move a root before the two payments cancel out.
+
+**Not the accounting corruption.** That was the first suspicion, since 251322 is
+inside the window the rejected-block bug touched ([[056]]) and 251323 was
+repaired by hand. But nano's neighbouring figures (251320 = 1,260, 251321 =
+15,114) are exactly what the chain pays, so the recorded fees are right. It is
+the attribution that is wrong.
+
+Next: read `finish_block`'s matured-reward split in stacks-core
+(`MinerPaymentSchedule`) and check which tenure's fees a coinbase maturity
+carries, then fix nano's `TenureAccounting::earnings_at` to match. The two
+`credits` nano makes at a tenure start are the coinbase and the fee; the chain
+makes them in different blocks.
