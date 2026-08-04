@@ -609,3 +609,37 @@ The next step is not another hypothesis: it is to take a tenure where the
 alternation *does* break (251324 is `SP30ZB6…` between two `SP2N4YMH…`) and read
 what the chain paid whom, at block granularity rather than `until_block`
 snapshots.
+
+### Read at block granularity: the pairing is right, the fee total is not
+
+Both recipients, across the diverging block:
+
+| account | 8,673,863 | 8,673,864 | chain delta | nano credits |
+|---|---|---|---|---|
+| `SP70B98…` (miner of 251322) | 2,002,701,297 | 3,002,701,297 | **+1,000,000,000** | 1,000,000,000 ✓ |
+| `SP2N4YMH…` (miner of 251321) | 3,500,856,786 | 3,523,395,905 | **+22,539,119** | 625,846 ✗ |
+
+Both deltas are entirely `total_miner_rewards_received`, so both are reward
+payments and nothing else.
+
+This overturns the earlier reading from `until_block` snapshots, which suggested
+the chain paid only a coinbase. It pays **two** accounts — the tenure's miner and
+its parent's — which is exactly the shape nano already produces, and matches
+stacks-core's `MaturedMinerRewards { recipient, parent_reward }`.
+
+So nano's **attribution is right**: same two accounts, and the coinbase to the
+penny. The whole divergence is the parent's fee figure, and it is not off by a
+small amount — 625,846 against 22,539,119, a factor of 36.
+
+That figure appears nowhere in nano's accounting: no tenure has fees equal to
+22,539,119, and no run of consecutive tenures around 251322 sums to it. nano's
+recorded fees in that range are 1,260 / 15,114 / 625,846 / 3,769,882 while the
+same records elsewhere reach 200,829,082, so the accounting is not uniformly
+small — it is this tenure's total that is short.
+
+**So this is a fee-accumulation bug, not an attribution one**, and the two
+earlier hypotheses (SIP-031, and re-pairing coinbase with parent fees) are both
+dead. The question is now narrow and answerable: sum the actual transaction fees
+in tenure 251322's blocks from the chain and compare with what `add_fees`
+accumulated — `TenureAccounting::started` only counts fees for a tenure whose own
+start block nano executed, and that guard is the first thing to look at.
