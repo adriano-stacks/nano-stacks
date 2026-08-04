@@ -696,3 +696,63 @@ is not the explanation. The tenure-extend path is.
    `earned.fees`, and rewrite `derived_effects_split_a_matured_tenure` around
    the arithmetic above rather than the 8,665,722 observation.
 3. Re-derive the affected tenures' accounting before resuming replay.
+
+### Every artefact that disagrees with the chain is nano's own
+
+The checkpoint's `native-effects.json` records, for the maturity at 251321:
+
+```
+credits[1] = 27,865,898   fees(T)   = 27,865,898   miner(T)   = SP70B98…
+                          fees(T-1) = 47,345,226   miner(T-1) = SP70B98…
+```
+
+It discriminates on the amount, and it says `fees(T)` — the same rule as
+`derived_effects_split_a_matured_tenure`, and the opposite of what the chain
+paid at 8,673,864.
+
+But that file is **nano's own export**, recaptured by nano's tooling
+([[048-carry-complete-mainnet-tenure-accounting]]: "Recapture mainnet accounting
+with the complete maturity window", "Replace the incomplete mainnet artifact").
+So the runtime, the unit test and the checkpoint all encode one rule and none of
+them is independent evidence for it — they are three copies of the same
+assumption. The chain is the only outside witness, and it agrees with
+stacks-core's `parent_fees` parameter to 180 parts in 22.5 million.
+
+### Why tenure 251321's fees are short, most likely
+
+```rust
+pub fn retract_from(&mut self, coinbase_height: u64) {
+    ...
+    if self.started.is_some_and(|started| started >= coinbase_height) {
+        self.started = None;          // crates/nano-chainstate/src/lib.rs:376
+    }
+}
+```
+
+`add_fees` counts only while `started == coinbase_height`, and `started` is set
+only by `record_earnings` at a tenure's **start block**. So a retraction into an
+in-progress tenure clears `started` and every remaining fee in that tenure is
+dropped silently — the tenure keeps whatever it had accumulated and never
+resumes, because its start block will not be executed again.
+
+Tenure 251321 is exactly the tenure that was in flight during the rejected-block
+retry storm at 8,665,780 ([[056]]), which retracted repeatedly. 15,114 against a
+true 22,539,119 is what that looks like.
+
+That makes the short total most likely **damaged data from the rollback-bug era
+rather than a live defect** — but "most likely" is not good enough to build on,
+and it is why the pairing fix cannot be shipped on its own: it would pay the
+parent nano's 15,114 instead of the chain's 22,539,119 and produce a different
+wrong root.
+
+### Order of work, unchanged but now grounded
+
+1. Reproduce the `started` loss deliberately: retract into an in-progress tenure
+   in a test and assert the tenure's fee total afterwards. If it drops, that is
+   the live bug and `retract_from` must reseed `started` from the tenure the
+   retraction lands in.
+2. Re-derive tenure 251321's fees (the chain says 22,539,119).
+3. Then flip `effects_for_tenure` to `previous.fees`, and rewrite
+   `derived_effects_split_a_matured_tenure` around the chain arithmetic rather
+   than the 8,665,722 observation.
+4. Re-export `native-effects.json`, which carries the same wrong rule.
