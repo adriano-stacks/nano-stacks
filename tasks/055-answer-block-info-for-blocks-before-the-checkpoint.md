@@ -45,6 +45,12 @@ executed, is never written down, and a restart loses it.
       run before it answered.
 - [ ] Distinguish a header that is genuinely absent from one this node never
       carried, rather than answering `none` as though the block never existed.
+- [ ] Represent field availability explicitly: a partially reconstructed
+      header must fail on an unknown field rather than returning a plausible
+      zero for miner, reward, burn-spend or tenure information.
+- [ ] Recover and oracle-check every consensus-visible field, including miner
+      address, block reward, burn spends, tenure height and tenure start, for a
+      representative pre-checkpoint window.
 - [ ] Replay across a block whose transactions read pre-checkpoint history and
       compare state roots.
 
@@ -52,6 +58,9 @@ executed, is never written down, and a restart loses it.
 
 - `get-stacks-block-info?` answers for any ancestor of the executed tip,
   including blocks from before the checkpoint.
+- `get-tenure-info?` and `get-burn-block-info?` return the same values as
+  stacks-core for pre-checkpoint ancestors; an unavailable value is never
+  encoded as a real zero.
 - The answer survives a restart.
 - Memory does not grow with distance from the checkpoint.
 - Mainnet replay passes 8,665,719.
@@ -1315,3 +1324,19 @@ next round picks it up. The parsing is the fragile part and is what has tests:
 the real message, the trailing quote that must not join the id, other failures
 that must not be mistaken for this one, and a truncated id refused rather than
 padded into some other block.
+
+## The narrow backfill is not full header conformance
+
+The automatic path is enough for the contract encountered in replay because it
+needed an identifier and burn context. It still writes zero for fields it
+cannot reconstruct: miner address, block reward, burn-spend winner and total,
+tenure height and tenure start. Those zeros are observable Clarity answers, not
+an internal placeholder.
+
+This task therefore remains open after the replay moved on. Its completion bar
+is every historical field, with explicit absence until an exact value is known.
+Fetching the five known fields from one HTTP peer is a bootstrap mechanism, not
+an authenticated long-term source; [[049-derive-canonical-sortitions-from-the-local-burncha]],
+[[050-authenticate-every-followed-nakamoto-block]] and
+[[054-join-and-synchronize-over-the-stacks-p2p-network]] must eventually supply
+or validate that history.

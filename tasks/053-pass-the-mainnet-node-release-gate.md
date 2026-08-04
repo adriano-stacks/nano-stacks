@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058"]
+dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -22,6 +22,8 @@ and steady state, with evidence tied to the durable executed chain.
 ## Tasks
 
 - [ ] Bootstrap a clean state directory from an attested mainnet checkpoint.
+- [ ] Start with clarity-wasm as the production execution engine, with
+      interpreter fallback and healing disabled for the whole run.
 - [ ] Catch up using a local Bitcoin source and multiple Stacks peers while
       recording every executed height and verified root.
 - [ ] Restart during catch-up and at tip, then prove the same durable tip, root
@@ -53,6 +55,8 @@ and steady state, with evidence tied to the durable executed chain.
 - RPC responses and events describe the same durable executed state.
 - Synchronization, propagation and consensus inputs do not require Hiro or any
   other hosted Stacks HTTP API.
+- The release configuration executes consensus through clarity-wasm and cannot
+  hide a compiler divergence by retrying under the interpreter.
 
 ## A skipped gate can no longer report itself green
 
@@ -77,4 +81,3 @@ NANO_REQUIRE_MAINNET=1 NANO_MAINNET_CAPTURE=... -> ok. 2 passed
 
 Seven gates across six files route through it. The remaining items on this task
 need the live run they describe.
-

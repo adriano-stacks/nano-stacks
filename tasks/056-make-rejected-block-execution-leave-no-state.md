@@ -47,6 +47,9 @@ the observed retries is not a recovery procedure.
 - [ ] Add a deterministic test that retries the same rejected block many times,
       restarts, and proves memory and disk remain byte-for-byte equivalent to
       the state before the first attempt.
+- [x] Exercise a real mainnet tenure-start rejection with non-zero fees and
+      native maturity effects repeatedly without persisting the rejected
+      tenure.
 - [ ] Rebuild the live mainnet accounting from the attested checkpoint and
       accepted chain after the fix; do not repair it with a retry-count-specific
       adjustment.
@@ -126,3 +129,18 @@ in its life, so the same loop may have inflated them; a spot check of tenure
 is concluded. Until the whole file is rebuilt from the chain, this state
 directory cannot be trusted to mature miner rewards correctly — maturity is 100
 tenures, so the affected ones start paying out soon.
+
+## Strong live rollback evidence at the maturity boundary
+
+The next divergence is block 8,673,864, a tenure start with two credits, liquid
+and SIP-031 emissions, and a matured-tenure payout. It was rejected roughly 138
+times. The durable accounting still reports `started = 251421` and contains no
+tenure 251422, so the rejected block no longer leaks this non-zero accounting
+state across retries.
+
+That is stronger than the zero-fee regression fixture, but it does not close the
+task. The auxiliary accounting already lost 44 older tenure records, and the
+deterministic restart test still has to cover every side store named in the
+acceptance criteria. Close only after the reconstruction in
+[[048-carry-complete-mainnet-tenure-accounting]] and the crash boundary in
+[[057-commit-and-recover-accepted-block-state-atomically]] agree with the MARF.

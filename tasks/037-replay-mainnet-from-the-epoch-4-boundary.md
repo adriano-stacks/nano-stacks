@@ -5,7 +5,7 @@ status: pending
 priority: critical
 effort: large
 type: feature
-dependencies: ["020", "021", "022", "023", "024", "025", "048", "056"]
+dependencies: ["020", "021", "022", "023", "024", "025", "048", "056", "060"]
 tags: ["mainnet", "replay", "conformance"]
 created_at: 2026-07-30
 ---
@@ -45,6 +45,10 @@ never from fetched, staged or peer-reported height.
 - [ ] Compare compiler and interpreter journals before sealing; a fallback that
       reaches the same values in a different order is diagnostic, not a
       production conformance result.
+- [ ] Replay from a pristine checkpoint entirely with clarity-wasm after
+      [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
+      interpreter fallback, a mid-run engine switch or healed compiler state as
+      production evidence.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
 - [ ] Make the mainnet gate explicitly skip or fail when its fixture is absent;
       an environment-variable early return must not appear as conformance.
@@ -59,6 +63,8 @@ never from fetched, staged or peer-reported height.
 - Every replayed transaction has the matching receipt, including status, costs
   and events.
 - The replay runs offline from captured fixtures.
+- The reported production depth is clarity-wasm-only and uses the same
+  configuration the mainnet release enables by default.
 
 ## Audited frontier and next oracle
 

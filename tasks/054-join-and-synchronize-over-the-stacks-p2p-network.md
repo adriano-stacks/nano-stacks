@@ -39,6 +39,10 @@ steady-state operation may require a hosted Stacks API.
 - [ ] Exchange inventories and acquire Nakamoto blocks, tenures and required
       sortition data from multiple peers without making any one peer a
       consensus input.
+- [ ] Route bulk history consumers, including accounting reconstruction and
+      missing historical-header acquisition, through a local or P2P-backed
+      source so repair does not serialize thousands of requests through a
+      hosted API rate limit.
 - [ ] Persist enough authenticated canonical block data to answer peer inventory
       and block requests after a restart.
 - [ ] Relay locally accepted transactions and blocks, and carry the signer and
@@ -66,3 +70,5 @@ steady-state operation may require a hosted Stacks API.
   wrong-network and malformed messages, and passes `clippy` without warnings.
 - The mainnet release gate records no dependency on Hiro or another hosted
   Stacks API for synchronization, propagation or consensus inputs.
+- Rebuilding the maturity window and filling required historical headers
+  completes with hosted HTTP APIs disabled.

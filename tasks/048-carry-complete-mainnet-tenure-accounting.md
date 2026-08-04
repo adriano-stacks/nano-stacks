@@ -31,6 +31,12 @@ not explicitly seeded must fail with `UnknownTenure`.
       schedule and entries.
 - [ ] Replay across at least 101 tenure starts, including a restart, and compare
       every state root.
+- [x] Pay the maturing tenure's parent its own tenure fees, not the child
+      tenure's fees.
+- [ ] Rebuild the live accounting from accepted chain history and reject the
+      result unless all 201 required tenures are present and contiguous.
+- [ ] Re-execute mainnet block 8,673,864 from the reconstructed state and match
+      its expected root before counting any later replay depth.
 - [x] Replace the incomplete mainnet artifact used by the node and scoreboard.
 
 ## Acceptance Criteria
@@ -41,6 +47,8 @@ not explicitly seeded must fail with `UnknownTenure`.
   stacks-core.
 - Missing, duplicate or short accounting windows are rejected during capture
   and startup.
+- Repeatedly rejecting the first maturity block cannot change `started`, tenure
+  earnings or matured effects on disk.
 
 ## Why this task is open again
 
@@ -88,3 +96,21 @@ tenure 251394: 27 counted, 174 to go
 About 0.6 tenures a minute against a public peer, so the full window is a
 multi-hour run — but a bounded and observable one, and it reaches the tenure
 that matters (251321) around the halfway point.
+
+## The replay reached the first nano-derived maturity
+
+The durable mainnet chain now matches **8,263 consecutive roots**, through
+8,673,863. Block 8,673,864 starts tenure 251,422 and is the first block that
+matures a tenure nano accounted for itself. Its receipts succeed, but its root
+does not match.
+
+The discrepancy named a consensus rule: the new tenure pays its parent the
+parent's own accumulated fees. Nano paid the new tenure's fees instead. The rule
+is fixed and covered by a focused test, but it is not yet live-root evidence:
+the existing `accounting.json` has only 158 tenure records and is missing 44,
+including 251,335–251,336 and 251,378–251,419.
+
+`rebuild-accounting` is reconstructing the 201-tenure window from chain history.
+Do not resume against the old file or close this task on the formula unit test.
+The acceptance event is a clean reconstruction followed by a matching root at
+8,673,864 and a restart that preserves the same accounting.

@@ -1,8 +1,8 @@
 ---
 id: "027"
 title: "Choose a fork instead of following a peer"
-status: completed
-priority: high
+status: in-progress
+priority: critical
 effort: large
 type: improvement
 dependencies: ["026", "049", "050"]
@@ -27,16 +27,22 @@ strands it.
 
 ## Tasks
 
-- [x] Follow several peers and keep the candidate tips they report.
-- [x] Choose between candidates on chain length and valid signature weight
-      against the burn view, not on arrival.
+- [x] Implement a `PeerPool` that can gather candidate tips, rank them
+      deterministically and distrust a peer that serves invalid data.
+- [ ] Wire the production runtime and `catch_up` to poll that pool instead of
+      selecting the first reachable HTTP peer and constructing one
+      `SyncClient`.
+- [ ] Choose between candidates using enforced signer authentication and the
+      locally derived burn view from [[049-derive-canonical-sortitions-from-the-local-burncha]]
+      and [[050-authenticate-every-followed-nakamoto-block]], not peer claims.
 - [x] Give back the blocks after a named ancestor, so a heavier fork can be
       taken instead of refused.
 - [x] Give the executor a fork switch that finds where the chains parted and
       stands there.
 - [x] Call it from the follow path instead of stalling.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
-- [x] Treat a peer that serves an invalid block as untrusted rather than fatal.
+- [ ] Exercise two simultaneous peers through the production runtime: one
+      stale, withholding or invalid, and one serving the canonical chain.
 
 ## Acceptance Criteria
 
@@ -129,8 +135,16 @@ the question worth asking, and asks it of the peer's own tenure. A healthy chain
 never reaches it, because a healthy round executes what it fetched — confirmed
 against mainnet, where the switch has not fired once.
 
-Task 027 is complete: several peers are followed, candidates are chosen on
-length and signature weight rather than arrival, a peer serving an invalid block
-is untrusted rather than fatal, and a heavier fork is now taken instead of
-stalling.
+## Reopened after production-path audit
 
+The fork-switch machinery above is real, but the completion claim was not.
+`nano-node` still calls `reachable_peer`, takes the first configured HTTP peer
+that answers and passes one `SyncClient` into `catch_up`. `PeerPool` is therefore
+library machinery, not the source of the production chain view, and no second
+peer can currently prevent withholding or override a stale first peer.
+
+This task closes only when the assembled runtime uses the pool and the
+acceptance criteria pass end to end. [[054-join-and-synchronize-over-the-stacks-p2p-network]]
+will replace hosted HTTP transport, but it must feed this same locally
+authenticated selection boundary rather than becoming another single source of
+truth.

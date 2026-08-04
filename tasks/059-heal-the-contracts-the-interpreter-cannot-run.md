@@ -19,6 +19,13 @@ A contract deployed by clar2wasm stores placeholder function bodies, because the
 real ones live in the wasm module. The interpreter cannot run such a contract,
 so any path that falls back to it fails on a contract the compiler deployed.
 
+This is diagnostic and migration tooling, not the production execution plan.
+Mainnet conformance requires clarity-wasm to execute without interpreter
+fallback as tracked by
+[[060-make-the-consensus-execution-engine-explicit-and-r]]. A replay that heals
+contracts or switches to the interpreter can locate a compiler bug, but cannot
+close the release gate.
+
 
 ## All 27 contracts heal, and the compiler stopped being able to stop the chain
 
