@@ -112,3 +112,33 @@ switches engines must heal first, or it stops on the first call into one of them
 **8,666,680 → 8,669,750 this session (+3,070).** Mainnet tip is 8,698,348, so
 the remaining gap is ~28,600 blocks and the checkpoint means those are the only
 ones that ever need executing.
+
+## Next blocker: a contract asking about a block older than the checkpoint
+
+At 8,669,750 replay stops on:
+
+```
+FATAL: no burnchain block height found for Stacks block dd254a16…
+```
+
+That is `ClarityDatabase::get_stacks_epoch_for_block`, reached from the
+`get-block-info?` / `get-tenure-info?` paths (`clarity_db.rs:1265, 1318, 1333,
+1341, 1383`). A contract asks about an older height, the id is resolved through
+the MARF's `__MARF_BLOCK_HEIGHT_TO_HASH`, and `HeadersDB` is then asked for that
+block's burn height — which nano does not have, because it holds headers only
+from the checkpoint forward.
+
+Note what is *not* wrong: the MARF answers correctly, so the checkpoint import
+is fine. The gap is the headers table beside it.
+
+The epoch is all these call sites want, and only to ask
+`epoch.uses_nakamoto_blocks()`. Two routes, neither yet chosen:
+
+- carry pre-checkpoint headers (or just burn heights) in the checkpoint, beside
+  the `(height → block_hash, archival_root_hash)` table PCS already imports
+- answer from the mainnet epoch schedule, whose boundaries are fixed constants
+
+The second is far less data but has to be exactly right about the 3.0 boundary,
+since a wrong `uses_nakamoto_blocks()` changes what a contract reads. It wants
+its own oracle test against stacks-core before it goes in — this is consensus,
+and guessing it would be worse than the stall.
