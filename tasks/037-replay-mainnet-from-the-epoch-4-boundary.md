@@ -807,7 +807,7 @@ back-pointers. Every insert therefore lands somewhere random in a tree that
 grows to 16 GB. Deferring an index is not available: there is no separate index
 to defer.
 
-The change that would work is staging:
+Staging was tried, and did not work either — see below. The change is:
 
 1. import into `marf_node_staging`, a plain rowid table with no primary key, so
    every write is an append
@@ -822,3 +822,36 @@ Until then: **snapshot the state directory straight after an import.** The bytes
 are identical every time, so a pristine run is a ~30 GB copy of a few minutes
 rather than 4.5 hours, and that is the difference between iterating on the
 compiler once a day and once an hour.
+
+### Measured: the import is read-bound, and both write-side fixes bought nothing
+
+Two optimisations, each of which cut I/O and neither of which cut time:
+
+| | file at 22-25min | at 32-35min | at 44-45min |
+|---|---|---|---|
+| journalling off | 6.8 GB | 7.2 GB | 7.6 GB |
+| + staged inserts | 6.9 GB | 7.3 GB | 7.7 GB |
+
+Identical. What they *did* achieve is real but not speed: journalling off removed
+3× write amplification (45 GB written for a 14 GB file, down to 8 GB), and
+staging turns random B-tree inserts into appends. Both are kept — less I/O and
+no 16 GB write-ahead log are worth having — but neither is why the import takes
+4.5 hours.
+
+The counter that matters is on the other side:
+
+```
+rchar: 169,216,506,453     for a 146 GB source
+```
+
+**It reads more than the whole checkpoint, and keeps going.** The import walks
+the source in *trie* order, following back-pointers, and looks each node up by
+hash — so it random-accesses a 146 GB B-tree rather than streaming it. That is
+the cost, and it is on the read side, where neither change touched.
+
+Fixing it means iterating the source in *its* key order and assembling the trie
+from that, which is a restructuring of the importer rather than a pragma or a
+staging table.
+
+**So the operational answer stands and should be taken first:** snapshot the
+state directory straight after an import. The bytes are identical every time.

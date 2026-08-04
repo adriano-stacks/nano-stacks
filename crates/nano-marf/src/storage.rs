@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS marf_node (
 ) WITHOUT ROWID;
 ";
 
+/// Nodes staged during a checkpoint import, before the B-tree is built once.
+const STAGING_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS marf_node_staging (
+    block INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    data BLOB NOT NULL
+);
+";
+
 /// How many trie nodes and block records stay resident per cache generation.
 const NODE_CACHE: usize = 20_000;
 const BLOCK_CACHE: usize = 4_096;
@@ -101,6 +111,8 @@ pub struct TrieStorage {
     nodes: RefCell<Cache<(u32, u32), Arc<TrieNode>>>,
     blocks: RefCell<Cache<MarfBlockId, BlockRecord>>,
     hashes: RefCell<Cache<u32, MarfBlockId>>,
+    /// Whether nodes are being staged for a checkpoint import.
+    staging: std::cell::Cell<bool>,
 }
 
 impl TrieStorage {
@@ -158,6 +170,7 @@ impl TrieStorage {
             nodes: RefCell::new(Cache::new(NODE_CACHE)),
             blocks: RefCell::new(Cache::new(BLOCK_CACHE)),
             hashes: RefCell::new(Cache::new(BLOCK_CACHE)),
+            staging: std::cell::Cell::new(false),
         })
     }
 
@@ -307,9 +320,49 @@ impl TrieStorage {
         hash: TrieHash,
         node: &TrieNode,
     ) -> Result<(), MarfError> {
+        let statement = if self.staging.get() {
+            "INSERT INTO marf_node_staging (block, idx, hash, data) VALUES (?1, ?2, ?3, ?4)"
+        } else {
+            "INSERT OR REPLACE INTO marf_node (block, idx, hash, data) VALUES (?1, ?2, ?3, ?4)"
+        };
         self.connection
-            .prepare_cached("INSERT OR REPLACE INTO marf_node (block, idx, hash, data) VALUES (?1, ?2, ?3, ?4)")?
+            .prepare_cached(statement)?
             .execute(params![block, index, &hash.as_bytes()[..], encode(node)?])?;
+        Ok(())
+    }
+
+    /// Stage a checkpoint import's nodes instead of writing them in place.
+    ///
+    /// `marf_node` is `WITHOUT ROWID` keyed by `(block, idx)`, so the table *is*
+    /// the B-tree, and an import writes in trie order — hopping between blocks
+    /// as it follows back-pointers. Every insert therefore lands somewhere
+    /// random in a tree that grows to sixteen gigabytes, and there is no
+    /// separate index to defer.
+    ///
+    /// Staging into a plain rowid table makes every write an append, and the
+    /// B-tree is then built once, in order, by `finish_staged_import`.
+    ///
+    /// Safe because a checkpoint import never reads a node back: it follows the
+    /// source's records and tracks what it has already imported in memory.
+    pub(crate) fn begin_staged_import(&self) -> Result<(), MarfError> {
+        self.connection.execute_batch(STAGING_SCHEMA)?;
+        self.staging.set(true);
+        Ok(())
+    }
+
+    /// Build the node B-tree from the staged rows, in key order, once.
+    pub(crate) fn finish_staged_import(&self) -> Result<(), MarfError> {
+        self.staging.set(false);
+        // Sorting sixteen gigabytes cannot be resident, whatever the rest of
+        // the import wants.
+        self.connection.execute_batch(
+            "PRAGMA temp_store = FILE;
+             INSERT OR REPLACE INTO marf_node (block, idx, hash, data)
+                 SELECT block, idx, hash, data FROM marf_node_staging
+                 ORDER BY block, idx;
+             DROP TABLE marf_node_staging;
+             PRAGMA temp_store = MEMORY;",
+        )?;
         Ok(())
     }
 

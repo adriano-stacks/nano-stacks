@@ -224,6 +224,7 @@ fn import_chain(
     expected_root: TrieHash,
 ) -> Result<(), CheckpointError> {
     let transaction = storage.transaction()?;
+    storage.begin_staged_import()?;
     let empty_root = internal_node_hash(
         TrieNodeId::Node256,
         &vec![
@@ -292,6 +293,7 @@ fn import_chain(
         .get(&source_record.block_id)
         .ok_or(CheckpointError::MissingBlock(source))?;
     storage.complete_block(source, id, expected_root, content, Some(index))?;
+    storage.finish_staged_import()?;
     transaction.commit()?;
     Ok(())
 }
