@@ -1,4 +1,3 @@
-use clarity::vm::types::{ASCIIData, CharType};
 use clarity::vm::{ClarityName, SymbolicExpression};
 
 use super::{ComplexWord, Word};
@@ -6,7 +5,7 @@ use crate::check_args;
 use crate::cost::WordCharge;
 use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
-use crate::wasm_utils::{signature_from_string, ArgumentCountCheck};
+use crate::wasm_utils::ArgumentCountCheck;
 
 #[derive(Debug)]
 pub struct Print;
@@ -42,23 +41,7 @@ impl ComplexWord for Print {
         // Save the value to locals
         let val_locals = generator.save_to_locals(builder, &ty, true);
 
-        let ty_for_serde = generator.type_for_serialization(&ty);
-        let serialized_ty = ty_for_serde.to_string();
-        // Ensure (at compile time) type can be reconstructed
-        signature_from_string(
-            &serialized_ty,
-            generator.contract_analysis.clarity_version,
-            generator.contract_analysis.epoch,
-        )
-        .map_err(|e| {
-            GeneratorError::TypeError(format!("serialized type cannot be deserialized: {e:?}"))
-        })?;
-        let serialized_ty = serialized_ty.bytes().collect();
-
-        let (serialized_ty_offset, serialized_ty_len) =
-            generator.add_clarity_string_literal(&CharType::ASCII(ASCIIData {
-                data: serialized_ty,
-            }))?;
+        let (serialized_ty_offset, serialized_ty_len) = generator.serialized_type_of(value)?;
 
         // `special_print` charges for the size of the value, not for how long
         // its type is to write down. The two are close for simple values and
@@ -80,8 +63,8 @@ impl ComplexWord for Print {
 
         // Push type offset and length onto the stack
         builder
-            .i32_const(serialized_ty_offset as i32)
-            .i32_const(serialized_ty_len as i32);
+            .i32_const(serialized_ty_offset)
+            .i32_const(serialized_ty_len);
 
         // Call the host interface function, `print`
         builder.call(generator.func_by_name("stdlib.print"));

@@ -1080,6 +1080,41 @@ impl WasmGenerator {
         Ok(())
     }
 
+    /// Write `expr`'s analysed type into the module's literal memory, so a host
+    /// function can read a value of it back out of Wasm memory.
+    ///
+    /// The compiler is the only place that knows an expression's type, and some
+    /// host functions need it: `print` has to serialize the value it is given,
+    /// and `with_nft` has to read a list of asset identifiers whose element type
+    /// no NFT definition need supply. Answers the literal's offset and length.
+    ///
+    /// The round trip is checked here, at compile time, so a type that cannot be
+    /// reconstructed fails the build rather than the call.
+    pub(crate) fn serialized_type_of(
+        &mut self,
+        expr: &SymbolicExpression,
+    ) -> Result<(i32, i32), GeneratorError> {
+        let ty = self
+            .get_expr_type(expr)
+            .ok_or_else(|| {
+                GeneratorError::TypeError("expression must be typed to be serialized".to_owned())
+            })?
+            .clone();
+        let serialized = self.type_for_serialization(&ty).to_string();
+        signature_from_string(
+            &serialized,
+            self.contract_analysis.clarity_version,
+            self.contract_analysis.epoch,
+        )
+        .map_err(|error| {
+            GeneratorError::TypeError(format!("serialized type cannot be deserialized: {error:?}"))
+        })?;
+        let (offset, length) = self.add_clarity_string_literal(&CharType::ASCII(ASCIIData {
+            data: serialized.into_bytes(),
+        }))?;
+        Ok((offset as i32, length as i32))
+    }
+
     /// Try to change `ty` for serialization/deserialization (as stringified signature)
     /// In case of failure, clones the input `ty`
     #[allow(clippy::only_used_in_recursion)]

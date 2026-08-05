@@ -779,3 +779,73 @@ the first, so binding a name that shadows an *enclosing local* — `(let ((x 1))
 and widening a rejection is the direction that risks refusing a contract the
 network accepted. Recorded so the next person finds it named rather than
 guesses.
+
+## The seventh: an allowance over somebody else's NFT (8,671,301)
+
+Replay parked at **8,671,301**, and unlike the six before it this one failed the
+*whole block* rather than one transaction:
+
+```
+SP3JNSEXAZP4BDSHV0DN3M8R3P0MY0EEBQQZX743X.xtrata-market-sponsored-stx-v1-1::buy
+  compiler     Internal(InvariantViolation(… Expect("NoSuchNFT(\"xtrata-inscription\")")))
+  interpreter  Response { committed: true, data: Bool(true) }
+```
+
+`Expect` is clar2wasm saying "this cannot happen", so it comes back as an
+invariant violation rather than a failed transaction, and the node retried the
+block forever instead of divergng on a root.
+
+The contract is an NFT marketplace, and `buy` hands an escrowed inscription to
+the buyer inside a Clarity 4 allowance:
+
+```clarity
+(as-contract? ((with-nft (contract-of nft-contract) NFT-ASSET-NAME (list token-id)))
+  (contract-call? nft-contract transfer token-id CONTRACT-PRINCIPAL buyer))
+```
+
+**The market defines no NFT.** The asset belongs to whichever inscription core
+the listing named — the market is a router with an allowlist. clarity-wasm's
+`with_nft` host function needed the asset's *key type* to know how to read the
+identifier list out of Wasm memory, and looked it up in
+`contract_context().meta_nft` — the **calling** contract. There was nothing
+there, so it refused a call mainnet accepted.
+
+**The reference asks nothing of the asset.** `check_allowance_with_nft` requires
+only that the third argument is a list of at most `MAX_NFT_IDENTIFIERS`, and
+`special_allowance` evaluates the three arguments straight into an
+`NftAllowance` — no `meta_nft` lookup, no `get_contract`, no existence check of
+any kind. An allowance may name an asset that exists nowhere; it simply never
+matches anything. Read, not inferred, in
+`clarity/src/vm/functions/post_conditions.rs` and
+`analysis/type_checker/v2_1/natives/post_conditions.rs`.
+
+So there was no key type to find, and the fix is not to look somewhere else: the
+*compiler* knows the list's type, because analysis gave it one. `with-nft` now
+writes that type into literal memory beside the list and the host reads the list
+by it, the same way `print` already did — `WasmGenerator::serialized_type_of` is
+that shared machinery, and `print` now goes through it too. Both database reads
+are gone from the path, including one in the wildcard case that was charging a
+contract load for a type the compiler already had.
+
+Three shapes a lookup would have answered *wrongly* rather than not at all are
+pinned alongside the mainnet one in `wasm_nft_allowance.rs`: the `"*"` wildcard
+over a foreign asset, an allowance naming an asset whose key type is a `(buff
+32)` where the list holds `uint`s, and an allowance naming an asset that exists
+in no contract. Plus the negative — allowing a *different* identifier still
+refuses the transfer — because a fix in the permissive direction here would turn
+an allowance into a formality, and that is the dangerous direction.
+
+`cargo test --release -p clar2wasm` is 1,378 passed, 6 ignored. Two test-side
+arities had to move with the host's: `standard.wat`'s import (whose sixth and
+seventh parameters were both named `$identifiers_offset` — the second was the
+length) and the developer-mode stub linker.
+
+### Not the same family as the first six
+
+The four bugs at 8,665,719 / 8,666,585 / 8,667,467 / 8,668,161 were all one
+mistake: a value laid out for one type and read as another. The fifth was an
+unbalanced stack from the same override, and the sixth was a rejection that came
+too early. This one is different again — **a host function reading state to
+recover something the compiler already knew**, and reading the wrong state. Worth
+naming as a class, because `with_ft` and `with_stacking` are next door and the
+same question applies to them.

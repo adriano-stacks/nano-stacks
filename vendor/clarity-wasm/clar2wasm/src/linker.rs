@@ -21,7 +21,7 @@ use clarity::vm::types::{
     TupleTypeSignature, TypeSignature,
 };
 use clarity::vm::{ClarityName, ClarityVersion, SymbolicExpression, Value};
-use clarity_types::types::{ResponseData, MAX_VALUE_SIZE};
+use clarity_types::types::ResponseData;
 use stacks_common::address::{
     AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
@@ -1963,7 +1963,9 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              token_name_offset: i32,
              token_name_length: i32,
              identifiers_offset: i32,
-             identifiers_length: i32| {
+             identifiers_length: i32,
+             identifiers_ty_offset: i32,
+             identifiers_ty_length: i32| {
                 let memory = caller
                     .get_export("memory")
                     .and_then(|export| export.into_memory())
@@ -2000,74 +2002,36 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                     }
                 };
 
-                // We need the NFT's key type to know how to read the identifiers list.
-                let key_type = if token_name == "*" {
-                    // Wildcard: grab the key type from the first NFT in the
-                    // target contract (the type checker already verified this).
-                    let contract = caller
-                        .data_mut()
-                        .global_context
-                        .database
-                        .get_contract(contract_id)?;
-                    contract
-                        .meta_nft
-                        .values()
-                        .next()
-                        .ok_or_else(|| {
-                            WasmError::Expect(
-                                StaticCheckErrorKind::NoSuchNFT(token_name.clone()).to_string(),
-                            )
-                        })?
-                        .key_type
-                        .clone()
-                } else {
-                    // Named NFT: get the key type from the current contract.
-                    let nft_info = caller
-                        .data()
-                        .contract_context()
-                        .meta_nft
-                        .get(&asset_name)
-                        .ok_or_else(|| {
-                            WasmError::Expect(
-                                StaticCheckErrorKind::NoSuchNFT(token_name.clone()).to_string(),
-                            )
-                        })?;
-                    let key_type = nft_info.key_type.clone();
+                // The type of the identifiers list comes from the compiler, not
+                // from an NFT definition. The reference builds this allowance
+                // out of its three arguments and checks nothing about the asset
+                // (`check_allowance_with_nft` requires only that the third is a
+                // list, and `special_allowance` reads it as a `Value`) — so an
+                // allowance may perfectly well name an asset that exists in
+                // neither the calling nor the named contract, and mainnet
+                // 8,671,301 does: `xtrata-market-sponsored-stx-v1-1::buy`
+                // allows another contract's `xtrata-inscription` and defines no
+                // NFT of its own. Taking a key type from the calling contract's
+                // `meta_nft` refused that call outright, where the chain accepted
+                // it, and reading the named contract at all is a database lookup
+                // the reference never makes.
+                let identifiers_ty = signature_from_string(
+                    &read_identifier_from_wasm(
+                        memory,
+                        &mut caller,
+                        identifiers_ty_offset,
+                        identifiers_ty_length,
+                    )?,
+                    *caller.data().contract_context().get_clarity_version(),
+                    epoch,
+                )?;
 
-                    // Make sure this NFT also exists in the target contract.
-                    let contract = caller
-                        .data_mut()
-                        .global_context
-                        .database
-                        .get_contract(contract_id)?;
-                    contract
-                        .meta_nft
-                        .contains_key(&asset_name)
-                        .then_some(())
-                        .ok_or_else(|| {
-                            WasmError::Expect(
-                                StaticCheckErrorKind::NoSuchNFT(token_name.clone()).to_string(),
-                            )
-                        })?;
-
-                    key_type
-                };
-
-                // Figure out the max number of identifiers that fit within
-                // MAX_VALUE_SIZE so we don't hit a ValueTooLarge error.
-                let entry_size = key_type.size()?;
-                let max_list_len = (MAX_VALUE_SIZE.saturating_sub(entry_size + 5)) / entry_size;
-
-                // We use read_from_wasm (not read_identifier_from_wasm) because
-                // this is a typed list of NFT key values, not a string identifier.
-                // The wildcard ("*") case also requires this since the key type
-                // is resolved dynamically from the target contract.
+                // `read_from_wasm` rather than `read_identifier_from_wasm`:
+                // this is a typed list of NFT key values, not a string.
                 let identifiers_value = read_from_wasm(
                     memory,
                     &mut caller,
-                    &TypeSignature::SequenceType(SequenceSubtype::ListType(
-                        ListTypeData::new_list(key_type, max_list_len)?,
-                    )),
+                    &identifiers_ty,
                     identifiers_offset,
                     identifiers_length,
                     epoch,
@@ -7381,7 +7345,9 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
          _token_name_offset: i32,
          _token_name_length: i32,
          _identifiers_offset: i32,
-         _identifiers_length: i32| {
+         _identifiers_length: i32,
+         _identifiers_ty_offset: i32,
+         _identifiers_ty_length: i32| {
             println!("with_nft: enter");
             Ok(())
         },

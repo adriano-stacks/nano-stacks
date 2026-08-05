@@ -566,8 +566,21 @@ impl ComplexWord for WithNft {
             // Traverse the token name
             generator.traverse_expr(builder, token_name)?;
 
-            // Traverse the allowances list
+            // Traverse the allowances list, which leaves (offset, length) on the
+            // data stack.
             generator.traverse_expr(builder, allowance)?;
+
+            // And say what type is at that offset. The host has to know to read
+            // the list back, and the compiler is the only place that knows:
+            // the reference makes no requirement that the asset named here
+            // exists anywhere (`check_allowance_with_nft` checks only that this
+            // argument is a list), so there is no NFT definition to take a key
+            // type from. Reading one out of the *calling* contract is what
+            // mainnet 8,671,301 fell over — `xtrata-market-sponsored-stx-v1-1`
+            // allows an NFT belonging to another contract and defines none of
+            // its own.
+            let (ty_offset, ty_length) = generator.serialized_type_of(allowance)?;
+            builder.i32_const(ty_offset).i32_const(ty_length);
 
             // Call the host interface function, `with_nft`
             builder.call(generator.func_by_name("stdlib.with_nft"));
