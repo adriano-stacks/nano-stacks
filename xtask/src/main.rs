@@ -3773,7 +3773,7 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
     if !output.status.success() {
         let (unrunnable, broken) = classify_failures(&combined);
         if !unrunnable.is_empty() {
-            let total: usize = unrunnable.values().len();
+            let total: usize = unrunnable.values().map(Vec::len).sum();
             let _ = write!(
                 detail,
                 "\n           {total} gate(s) could not run, so the run is not \
