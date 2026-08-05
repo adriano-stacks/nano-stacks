@@ -33,7 +33,7 @@ hundreds of failed attempts.
 - [x] Replace whole-gap buffering with bounded forward execution chunks.
 - [x] Make rate limits and bounded peer pages end a round successfully after all
       available progress is committed.
-- [ ] Persist executed tip, parent links and tenure accounting together only for
+- [x] Persist executed tip, parent links and tenure accounting together only for
       accepted blocks at each chunk boundary; this depends on
       [[056-make-rejected-block-execution-leave-no-state]] and
       [[057-commit-and-recover-accepted-block-state-atomically]].
@@ -149,3 +149,29 @@ handler — a harness timeout was killing the process group); "all cores saturat
 per block, which corrupted every throughput number until it was found. Sample
 `/proc/<pid>/stat` and `/proc/<pid>/io` before believing any story about where
 time goes.
+
+## The persistence checkbox is true now, and what made it true
+
+Both tasks it named have closed. The ledger — executed chain, tenure start
+heights, accounting, reorganization reach, parent tenure proof — is written in the
+same transaction that seals the block's state root, with `prepare_commit` at
+`synchronous = FULL` and `marf.seal_to` as the decision, so a hard kill leaves
+either the complete parent or the complete child and never a mixture. Twenty
+scattered `SIGKILL`s and eight aimed at tenure transitions each reopen with a
+ledger whose executed suffix ends exactly at the tip that has state, and the
+survivor replays forward to the same final root as an uninterrupted run.
+
+A rejected block now rolls its fees back with everything else, and the retry loop
+that put 1,417 attempts' fees into a tenure total cannot recur.
+
+**One thing this exposed that no test covered:** the recovery path validated the
+ledger not at all. `check_maturity_window` ran on the checkpoint and on
+`accounting.json` and not on a recovered ledger — the one artifact a running node
+executes from. It does now. Written up on
+[[048-carry-complete-mainnet-tenure-accounting]], because the hole it found was
+that task's.
+
+The two items still open are the memory bounds — `TenureAccounting::earnings` and
+`BitcoinContext::headers` both grow with the chain — and a deterministic harness
+for rate limits and short pages, which the live mainnet run exercises and no test
+pins.

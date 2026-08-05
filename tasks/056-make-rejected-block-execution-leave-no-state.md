@@ -1,7 +1,7 @@
 ---
 title: "Make rejected block execution leave no state"
 id: "056"
-status: in-progress
+status: completed
 priority: critical
 type: bug
 group: mainnet
@@ -9,6 +9,7 @@ tags: ["mainnet", "chainstate", "accounting", "persistence"]
 created_at: "2026-08-03"
 effort: medium
 dependencies: ["043"]
+completed_at: 2026-08-05
 ---
 
 # Make rejected block execution leave no state
@@ -50,7 +51,7 @@ the observed retries is not a recovery procedure.
 - [x] Exercise a real mainnet tenure-start rejection with non-zero fees and
       native maturity effects repeatedly without persisting the rejected
       tenure.
-- [ ] Rebuild the live mainnet accounting from the attested checkpoint and
+- [x] Rebuild the live mainnet accounting from the attested checkpoint and
       accepted chain after the fix; do not repair it with a retry-count-specific
       adjustment.
 
@@ -265,3 +266,23 @@ has to consult it on the resume path is named in [[057]].
   — the node no longer reads `accounting.json` once a block has sealed.
 - Crash consistency between the sealed root and everything beside it is
   [[057-commit-and-recover-accepted-block-state-atomically]], now closed.
+
+## The live accounting is rebuilt, and not by counting retries
+
+Two measurements settle this item. First, the inflation is gone: the largest
+tenure in the durable ledger owes 200,829,082 uSTX against the 649,365,101 the
+1,417-attempt loop had accumulated, so nothing carries the retries' fees any more.
+
+Second, what was actually wrong with the live ledger was not inflation at all but a
+*hole* — eight tenures, 251,322 to 251,329, that nano executed and never recorded.
+That is written up on [[048-carry-complete-mainnet-tenure-accounting]] along with
+its repair, and the repair is deliberately not a retry-count adjustment: `xtask
+repair-ledger` takes each missing tenure's recipient, coinbase and fee total from
+**stacks-core's own `payments` rows** in the archive, the same source
+`capture-fixtures` reads. Verified against the checkpoint for every tenure the two
+share before being trusted for the eight it does not hold.
+
+The distinction this item was asking for is exactly the one that mattered: a
+retry-count adjustment would have had to guess tenure 251,329's coinbase, which is
+2,000,000,000 rather than the schedule's 1,000,000,000 because the burn block
+before it produced no sortition.

@@ -1,7 +1,7 @@
 ---
 id: "062"
 title: "Keep stacks-core test features out of the production node"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["061"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "vm", "dependencies", "release", "conformance"]
 created_at: 2026-08-04
 type: bug
 group: mainnet
+completed_at: 2026-08-05
 ---
 
 # Keep stacks-core test features out of the production node
@@ -34,10 +35,10 @@ or broad reference-node crates by accident.
 - [x] Remove `features = ["testing"]` from clar2wasm's normal `clarity`
       dependency; feature-gate or relocate the crosscheck utilities that need
       it.
-- [ ] Disable unnecessary `stacks-common` and Clarity default/developer features
+- [x] Disable unnecessary `stacks-common` and Clarity default/developer features
       in the production dependency closure and enable only the required ABI,
       database and cryptographic surfaces.
-- [ ] Keep `stackslib`, `stacks-codec`, `libsigner`, `libstackerdb`, the
+- [x] Keep `stackslib`, `stacks-codec`, `libsigner`, `libstackerdb`, the
       reference PoX implementation from
       [[061-replace-stacks-core-pox-locking-with-nano-owned-ep]] and every
       test-only interpreter/healing entry point out of the release node's
@@ -98,6 +99,26 @@ it, and all it does is keep source spans on AST nodes. Turning it off to tidy a
 feature list would make nano's parser report differently from the network's for
 no benefit, which is the opposite of what this task is for.
 
-**Still open:** `pox-locking` is in the normal graph, and taking it out is
-[[061-replace-stacks-core-pox-locking-with-nano-owned-ep]] rather than a
-dependency edit — the node needs its own Epoch 4 lock/unlock semantics first.
+## Both closed
+
+**`pox-locking` is out.** [[061-replace-stacks-core-pox-locking-with-nano-owned-ep]]
+gave nano its own Epoch 4 lock semantics — 500 lines against the reference crate's
+5,848, because a 4.0-only node needs one PoX contract's rules and not five — and
+that closed this by making the dependency edit possible rather than by making it.
+`cargo tree -p nano-node -e normal` now names none of `pox-locking`, `stackslib`,
+`stacks-codec`, `libsigner` or `libstackerdb`.
+
+**The feature set is chosen rather than inherited.** `clarity` asks for
+`stacks_common` with `default-features = false`, so everything `stacks-common`'s
+own default carried reached nano through nano's *own* two direct dependencies on
+it — `nano-vm`'s and vendored `clar2wasm`'s. That put `ctrlc-handler` in the
+release graph: `nix`, `winapi`, and a SIGINT handler nano never installs, next to
+the SIGTERM handling it does have. Both lines now spell the list out:
+`developer-mode` for the parser's source spans, `rand` for the reference's crypto
+helpers, `rusqlite` because the Clarity database ABI is SQLite-backed. `default`
+is gone.
+
+`the_node_enables_only_the_reference_features_it_asked_for` asserts that as an
+**exact set** rather than a deny-list, because a deny-list only refuses what
+somebody already thought of and the failure here is a feature arriving that
+nobody chose. clar2wasm's own 1,378 tests stay green.
