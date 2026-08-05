@@ -1,13 +1,14 @@
 ---
 id: "024"
 title: "Verify the VRF seed a block commits to"
-status: in-progress
+status: completed
 priority: high
 effort: small
 type: feature
 dependencies: []
 tags: ["mainnet", "chainstate", "consensus"]
 created_at: 2026-07-30
+completed_at: 2026-08-06
 ---
 
 # Verify the VRF seed a block commits to
@@ -227,5 +228,64 @@ obsolete, so in production the winner is usually `None` and both the proof check
 and the signature check report rather than run. The hedge is a one-line removal.
 
 And still true from the note above: `nano-miner`'s
+`hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
+block header hash where it should match on the txid.
+
+## Closed: the checkpoint carries the leader keys, and the proof is checked
+
+The last input this task was waiting on was never going to arrive from the
+burnchain window. A leader key is registered **once** and named by commitments for
+years afterwards: the five keys mainnet's miners used across the epoch 4.0
+boundary sit at burn 867,772, 872,156, 873,313, 929,456 and 939,759 — twenty to
+ninety thousand blocks below it. There is no window size that reaches them and no
+amount of walking that is affordable, so the registration has to come *with* the
+checkpoint, the same way [[055]]'s headers do.
+
+It does now. `xtask export-leader-keys` reads stacks-core's own `leader_keys`
+rows, `capture-fixtures` writes them into the capture's `sortition/` directory
+beside the snapshots and the consensus hashes, and `SortitionTracker` loads them
+at seed time — from the state directory when it saved some, else from the capture,
+because a state written before this existed has none. It saves them too, and has
+to: a chain resumed from a saved tip reads the burn blocks *after* it and never
+those before, so a registration walked past would otherwise be lost on the next
+start.
+
+Mainnet's whole history is **2,477 registrations, 323 KB of JSON**. 101 of them
+carry the block-signing key hash as well, and every key its 4.0 miners use is
+among those 101 — both halves come out of the same row, so a registry that carried
+only the VRF key would have to be exported again to check the other rule.
+
+**The oracle is the chain, not the fixture.** A capture records the winning
+*transaction* and not its key, so there is nothing to compare a resolved key
+against by equality.
+`mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure`
+asks the chain instead: it shows the window resolves **no** key on its own,
+resolves **all ten** of its sortitions once the registry is loaded, and that the
+resolved key together with the locally derived sortition hash verifies the VRF
+proof in the coinbase of the tenure that sortition elected. Three independent
+things meet there — a Bitcoin registration ninety thousand blocks back, a
+sortition hash chained from raw Bitcoin blocks, and a proof out of a Stacks block
+— and nothing is asked of a peer. Another miner's key fails, so it is a check and
+not a formality.
+
+**Live, on mainnet.** Against a copy of the running replay's state (burn 960,473
+onward, `mainnet-sortition-live`), the node reports `2477 leader-key registrations
+carried with the checkpoint` and then prints the coinbase-proof complaint
+**zero** times across the tenures at burn 960,474 through 960,479 — where the same
+state on the previous binary printed it once a tenure, four hundred times over a
+run. The rule runs, and it accepts the chain the network produced.
+
+What is left of this task is one lookup in somebody else's file, and it is
+[[050]]'s: the *miner signature* is still reported rather than checked, and the
+message says why — "it knows which leader key won the sortition but not the
+block-signing key that key was registered with". The registry holds that hash for
+all five active keys; `check_miner_won_the_sortition` resolves it with
+`registered_signing_key_hash(operations, key)`, over the operations of the
+tenure's *own* burn block, which is the one place it cannot be. It needs the
+registry's answer to travel the way `winner_vrf_public_key` does — one field on
+`SortitionSnapshot`, one on `BitcoinBlockContext`, one line in `local_sortition`
+— and the field it reads is in a function this change was not allowed to touch.
+
+Still true and still outside this task's files: `nano-miner`'s
 `hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
 block header hash where it should match on the txid.

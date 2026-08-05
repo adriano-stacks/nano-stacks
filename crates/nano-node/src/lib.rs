@@ -1011,7 +1011,12 @@ where
             payouts,
             crate::sortition::CATCH_UP_LIMIT,
         ) {
-            Ok(walk) if walk.advanced > 0 => {
+            // Priming counts as work worth reporting even when the chain was
+            // already standing where it needed to be: it is six Bitcoin block
+            // downloads, seven seconds on mainnet, and it is paid on every start
+            // — the largest single item in this phase, and it used to print
+            // nothing at all because no sortition came out of it.
+            Ok(walk) if walk.advanced > 0 || walk.primed > 0 => {
                 // The split, and not a total, because a total here was read as
                 // a per-Stacks-block cost once and it is not one: a sortition
                 // belongs to a burn block, and this line is printed once per
