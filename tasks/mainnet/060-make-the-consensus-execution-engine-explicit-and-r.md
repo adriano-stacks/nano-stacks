@@ -572,3 +572,39 @@ than inferred. The two fixes already made both narrowed to a *read* that wanted 
 value in a form the binding was not laid out for; this is very likely a third
 position of the same mistake, and `duck_type` is the machinery it should be using
 — see the note above about `visit_atom`.
+
+## 8,666,585 is passed, and the fourth bug is fixed
+
+Depth moved 8,666,584 → **8,666,650** with no divergence, so the tuple-narrowing
+fix is confirmed against the chain and not only against its minimisation. The
+`#[ignore]` is gone from
+`two_tuple_shapes_under_one_if_compile_to_a_loadable_module`, and
+`narrowing_a_tuple_keeps_the_fields_it_kept` covers a dropped middle field, a
+nested narrowing, a narrowing beside a list, and — the important one — a
+*homogeneous* tuple, which is the only shape where mispairing fields survives wasm
+validation and returns a wrong answer instead of refusing to load.
+
+**Four found, four fixed.** `as-contract` leaking its sender on an early return
+(8,668,161), a `let`-bound placeholder laid out for the binding (8,667,467), a
+fold over a buffer not widening its accumulator (8,665,719), and a tuple narrowed
+by position rather than by name (8,666,585). All four were the same underlying
+mistake in different positions: a value laid out for one type and read as another.
+
+## Two things this leaves open
+
+**A supertype asymmetry that no conversion reconciles.** `least_supertype` walks
+the true arm's fields and looks each up in the false arm's, so
+`(if c { a, b } { a, b, c })` types as `{ a, b }` while the reverse is rejected by
+analysis outright. When such an `if` is a function's *return value*, the
+interpreter yields the taken branch's wide tuple where wasm must yield the
+narrowed layout — a genuinely different value. The new tests read surviving fields
+back rather than returning the tuple, so they do not paper over it. It needs a
+decision at the analysis layer, and a mainnet contract returning such an `if`
+across a contract-call boundary or into a receipt would surface it.
+
+**The follower exits after each round.** `stopping: every sealed block is already
+on disk` — the node consumes its staged backlog, ends the follower job, and the
+process exits, so depth advances about thirty blocks per start rather than
+continuously. Startup is 20 s now, so this is cheap to work around by hand and
+wrong to leave: unattended catch-up does not happen. That belongs to
+[[047-make-mainnet-synchronization-monotonic-and-restart]].
