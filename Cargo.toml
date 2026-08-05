@@ -13,6 +13,7 @@ members = [
     "crates/nano-wasm-cache",
     "crates/nano-oracle",
     "crates/nano-chainstate",
+    "crates/nano-p2p",
     "crates/nano-sync",
     "crates/nano-stackerdb",
     "crates/nano-signer",

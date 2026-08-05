@@ -38,6 +38,7 @@ mod mainnet_envelope;
 mod mainnet_sortition;
 mod marf_lockstep;
 mod mempool;
+mod p2p_wire;
 mod pox_locking;
 mod rejected_blocks;
 mod release_dependencies;
