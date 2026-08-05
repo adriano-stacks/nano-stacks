@@ -171,6 +171,231 @@ async fn hostile(
     (address, task)
 }
 
+/// A peer that completes a real handshake and then keeps talking.
+///
+/// `hostile` answers one message with fixed bytes, which is enough to test a
+/// handshake and nothing after it. These two tests are about what a *live* session
+/// does with what a peer says in the middle of it, so the peer has to survive past
+/// its own handshake.
+async fn chatty(
+    key: StacksPrivateKey,
+    after_handshake: impl FnOnce(Conversation) -> tokio::task::JoinHandle<()> + Send + 'static,
+) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let request = read_message(&mut stream).await.expect("a handshake arrives");
+        let accept = nano_p2p::wire::HandshakeAccept {
+            handshake: nano_p2p::Handshake {
+                address: nano_p2p::PeerAddress::from_bytes([0; 16]),
+                port: address.port(),
+                services: 0,
+                public_key: key.public_key().to_bytes_compressed(),
+                expire_bitcoin_height: u64::MAX,
+                data_url: String::new(),
+            },
+            heartbeat_interval: 60,
+        };
+        let mut conversation = Conversation { stream, key };
+        conversation
+            .say(request.preamble.seq, Payload::HandshakeAccept(accept))
+            .await;
+        let _ = after_handshake(conversation).await;
+    });
+    address
+}
+
+/// One end of a conversation, with the key to sign what it says.
+struct Conversation {
+    stream: tokio::net::TcpStream,
+    key: StacksPrivateKey,
+}
+
+impl Conversation {
+    async fn say(&mut self, seq: u32, payload: Payload) {
+        let message = Message::sign(
+            Protocol::testnet().peer_version,
+            Protocol::testnet().network_id,
+            &view(900_000),
+            seq,
+            payload,
+            &self.key,
+        )
+        .expect("sign");
+        let _ = self.stream.write_all(&message.encode()).await;
+    }
+
+    async fn hear(&mut self) -> Option<Message> {
+        read_message(&mut self.stream).await
+    }
+}
+
+/// Read one whole message from a raw stream.
+async fn read_message(stream: &mut tokio::net::TcpStream) -> Option<Message> {
+    let mut header = [0; PREAMBLE_LEN];
+    stream.read_exact(&mut header).await.ok()?;
+    let preamble = Preamble::decode(&header).ok()?;
+    let mut frame = vec![0; preamble.payload_len as usize];
+    stream.read_exact(&mut frame).await.ok()?;
+    Message::decode(preamble, frame).ok()
+}
+
+/// A peer relaying at mainnet's rate is not a peer that misbehaved.
+///
+/// This is the regression test for the finding that mattered most in this slice: the
+/// running mainnet node was isolating four of seven peers, and the reason was that a
+/// session refused more than thirty-two unsolicited messages before a reply. Mainnet
+/// pushes signer chunks, blocks and transactions at between 0.2 and 0.8 a second per
+/// peer (`tests/live_unsolicited.rs` counted it), and the swarm reads a session once
+/// every fifty seconds — so a *fixed count* is crossed by any rate at all given
+/// enough silence, and the busiest and most useful peers crossed it first.
+#[tokio::test]
+async fn a_peer_that_pushes_a_lot_between_rounds_is_not_isolated() {
+    // Comfortably past the old limit of thirty-two, and past the buffer bound too, so
+    // that both the "this is fine" and the "we are dropping data" halves are checked.
+    const PUSHES: u32 = 300;
+
+    let key = StacksPrivateKey::from_seed(b"a busy honest peer");
+    let address = chatty(key, |mut conversation| {
+        tokio::spawn(async move {
+            while let Some(request) = conversation.hear().await {
+                // Everything the peer has queued arrives before the answer, which is
+                // exactly what fifty seconds of silence produces on mainnet.
+                for nonce in 0..PUSHES {
+                    conversation
+                        .say(
+                            0x8000_0000 + nonce,
+                            Payload::NatPunchReply(nano_p2p::wire::NatPunch {
+                                address: nano_p2p::PeerAddress::from_bytes([0; 16]),
+                                port: 20444,
+                                nonce,
+                            }),
+                        )
+                        .await;
+                }
+                let reply = match request.payload {
+                    Payload::Ping(nonce) => Payload::Pong(nonce),
+                    Payload::GetNeighbors => Payload::Neighbors(Vec::new()),
+                    _ => continue,
+                };
+                conversation.say(request.preamble.seq, reply).await;
+            }
+        })
+    })
+    .await;
+
+    let (round, known) = swarm_against(address).await;
+    assert_eq!(round.dialled, 1);
+    assert_eq!(round.connected, 1);
+    assert_eq!(round.isolated, 0, "a peer was isolated for relaying data");
+    assert_eq!(round.dropped, 0);
+    assert_eq!(known.consecutive_failures, 0);
+    // The pushes are collected rather than merely tolerated: a caller that never sees
+    // them cannot relay or validate them, which is the next item in task 054. Two
+    // requests are made in a round — the ping and the neighbour walk — so the count is
+    // what the peer sent, less whatever the bounded buffer had to shed.
+    assert!(
+        round.collected >= usize::try_from(PUSHES).expect("fits"),
+        "collected only {} of {PUSHES} pushes",
+        round.collected
+    );
+}
+
+/// A peer nano dialled can ask nano things, and gets answers.
+///
+/// The other half of the same finding. `Ping`, `Handshake` and `GetNeighbors` are
+/// things a stock node sends on any conversation regardless of who opened it — its
+/// heartbeat and its neighbour walk do not care — and nano used to read them, count
+/// them as "unsolicited" and never reply. A peer blocked on an answer that never
+/// comes is a peer that sets this node aside.
+#[tokio::test]
+async fn a_peer_we_dialled_gets_its_own_requests_answered() {
+    let key = StacksPrivateKey::from_seed(b"a curious peer");
+    let announced = key.public_key().to_bytes_compressed();
+    let (heard, recorder) = std::sync::mpsc::channel();
+    let address = chatty(key.clone(), move |mut conversation| {
+        tokio::spawn(async move {
+            // Three requests of the peer's own, on its own sequence numbers, with
+            // nothing of nano's outstanding.
+            conversation.say(0x0101, Payload::Ping(0xfeed)).await;
+            conversation.say(0x0202, Payload::GetNeighbors).await;
+            conversation
+                .say(
+                    0x0303,
+                    Payload::Handshake(nano_p2p::Handshake {
+                        address: nano_p2p::PeerAddress::from_bytes([0; 16]),
+                        port: 20444,
+                        services: 0,
+                        public_key: announced,
+                        expire_bitcoin_height: u64::MAX,
+                        data_url: String::new(),
+                    }),
+                )
+                .await;
+            while let Some(message) = conversation.hear().await {
+                if heard
+                    .send((message.preamble.seq, message.payload.name().to_owned()))
+                    .is_err()
+                {
+                    return;
+                }
+                // Answer nano's own liveness check too, so that the assertion at the
+                // end — that the session is still nano's to use — is about nano's
+                // behaviour rather than about this stub's.
+                if let Payload::Ping(nonce) = message.payload {
+                    conversation
+                        .say(message.preamble.seq, Payload::Pong(nonce))
+                        .await;
+                }
+            }
+        })
+    })
+    .await;
+
+    let dialler = LocalPeer::quiet(StacksPrivateKey::from_seed(b"dialler"), 20444);
+    let mut session = Session::open(address, &dialler, Protocol::testnet(), view(900_001), TIMEOUT)
+        .await
+        .expect("the handshake completes");
+    // Without a service there is nothing to answer `GetNeighbors` with, which is
+    // correct for a node that serves nothing and is not what this test is about.
+    session.serving(Arc::new(TestService {
+        height: 900_000,
+        ..TestService::default()
+    }));
+
+    // Collecting is what the swarm does every round, and it is where a peer's own
+    // requests get answered: nothing here is a request of nano's.
+    let mut answers = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while answers.len() < 3 && tokio::time::Instant::now() < deadline {
+        session.collect().await.expect("collect what the peer sent");
+        while let Ok(answer) = recorder.try_recv() {
+            answers.push(answer);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    answers.sort();
+    assert_eq!(
+        answers,
+        vec![
+            (0x0101, "Pong".to_owned()),
+            (0x0202, "Neighbors".to_owned()),
+            (0x0303, "HandshakeAccept".to_owned()),
+        ],
+        "a peer's own requests went unanswered"
+    );
+    // None of them counted as pushed data: a request answered is not a message the
+    // caller has to deal with.
+    assert!(session.take_pushed().is_empty());
+    // And the session is still nano's to use.
+    session.ping().await.expect("the session still works");
+}
+
 /// Dial one hostile peer and report what the swarm made of it.
 async fn swarm_against(address: SocketAddr) -> (nano_p2p::Round, nano_p2p::KnownPeer) {
     let mut swarm = Swarm::new(
@@ -187,7 +412,7 @@ async fn swarm_against(address: SocketAddr) -> (nano_p2p::Round, nano_p2p::Known
         .seed(&address.to_string())
         .await
         .expect("record the seed");
-    let round = swarm.maintain(view(900_001)).await;
+    let round = swarm.maintain(view(900_001), None).await;
     let known = swarm
         .peer_table()
         .get(nano_p2p::PeerAddress::from_ip(address.ip()), address.port())
@@ -331,7 +556,7 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     }
     let discovered = swarm.discovered();
 
-    let round = swarm.maintain(view(900_001)).await;
+    let round = swarm.maintain(view(900_001), Some(KNOWN_CYCLE)).await;
     assert_eq!(round.dialled, 3);
     assert_eq!(round.connected, 3);
     assert_eq!(round.isolated, 0);
@@ -346,10 +571,16 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     );
     // Three dialled peers plus the three addresses one of them gossiped.
     assert_eq!(discovered.known(), 6);
+    // All three answered the inventory; the two with an HTTP endpoint are the ones
+    // worth fetching from, because the third has nothing at the other end to ask.
+    assert_eq!(round.claiming, 2);
+    let mut claiming = discovered.claiming();
+    claiming.sort();
+    assert_eq!(claiming, endpoints);
 
     // Every peer answers the same inventory question, because one peer's inventory
     // is one peer's claim.
-    let claims = swarm.tenure_claims(KNOWN_CYCLE).await;
+    let claims = swarm.tenure_claims(KNOWN_CYCLE, &mut nano_p2p::Round::default()).await;
     assert_eq!(claims.len(), 3);
     assert!(claims.iter().all(|claim| claim.tenures.get(0) == Some(true)));
     assert_eq!(
@@ -357,15 +588,29 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
         2
     );
     // A nack is an answer and not a fault, so nobody is dropped for it.
-    assert!(swarm.tenure_claims(UNKNOWN_CYCLE).await.is_empty());
+    assert!(
+        swarm
+            .tenure_claims(UNKNOWN_CYCLE, &mut nano_p2p::Round::default())
+            .await
+            .is_empty()
+    );
     assert_eq!(swarm.discovered().connected(), 3);
 
     // One peer goes away. It is dropped, not isolated: not answering is a restart,
     // and a peer punished for restarting is a peer a small network cannot afford.
     first_task.abort();
-    let round = swarm.maintain(view(900_002)).await;
+    let round = swarm.maintain(view(900_002), Some(KNOWN_CYCLE)).await;
     assert_eq!(round.connected, 2);
     assert_eq!(round.isolated, 0);
+    // The one that went away is reported, which is not free: `retire` used to
+    // penalise into a `Round` it threw away, so a peer lost during an inventory
+    // exchange left the round claiming it still had it.
+    assert_eq!(round.dropped, 1);
+    // And the two that stayed still answer, which is what the inbound idle budget
+    // buys: the round above spent five seconds waiting on the peer that had gone, and
+    // a conversation closed at its read deadline would have taken the other two with
+    // it.
+    assert_eq!(round.claiming, 1);
     assert_eq!(discovered.connected(), 2);
     assert!(!discovered.endpoints().contains(&"http://127.0.0.1:20443".to_owned()));
     // And it is still known, with a failure against it rather than forgotten.

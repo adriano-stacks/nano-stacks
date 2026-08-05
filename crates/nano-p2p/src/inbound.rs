@@ -72,6 +72,39 @@ pub trait Service: Send + Sync {
     }
 }
 
+/// The reply a peer's request calls for, answered from what the node already holds.
+///
+/// Shared by both directions on purpose. Once a handshake has happened this protocol
+/// is symmetric: a peer nano dialled sends the same `Ping` and `GetNeighbors` as one
+/// that dialled nano, and stacks-core sends them on its heartbeat regardless of who
+/// opened the connection. Answering in only one direction is what left the running
+/// mainnet node counting a stock peer's requests as "unsolicited" and never replying
+/// to them.
+///
+/// Returns `None` for anything that is not a request — a reply to one of our own, an
+/// announcement, or a payload this node does not model — because a message the peer
+/// is not waiting on must not be answered. Nacking a `Pong` is a conversation that
+/// never ends.
+pub(crate) fn answer_request<S: Service + ?Sized>(
+    payload: &Payload,
+    service: &S,
+) -> Option<Payload> {
+    match payload {
+        Payload::Ping(nonce) => Some(Payload::Pong(*nonce)),
+        Payload::GetNeighbors => Some(Payload::Neighbors(service.neighbors())),
+        // `None` from the service becomes a `Nack`, which is the honest answer: a bit
+        // vector this node guessed at would make it look like it was withholding
+        // tenures it has, or offering ones it does not. A stock node reads the nack as
+        // "ask somebody else" rather than "it has nothing".
+        Payload::GetNakamotoInventory(cycle_start) => Some(
+            service
+                .tenure_inventory(*cycle_start)
+                .map_or(Payload::Nack(nack::NO_SUCH_BITCOIN_BLOCK), Payload::NakamotoInventory),
+        ),
+        _ => None,
+    }
+}
+
 /// Bounds on one inbound conversation.
 ///
 /// Both matter for the same reason: an inbound peer costs this node a task and a
@@ -80,6 +113,17 @@ pub trait Service: Send + Sync {
 pub struct InboundLimits {
     /// How long to wait on any single read or write.
     pub timeout: Duration,
+    /// How long a conversation may be silent before it is closed.
+    ///
+    /// Distinct from `timeout`, and the distinction was a real bug: closing at the
+    /// read deadline meant nano hung up on any stock node that had nothing to say for
+    /// thirty seconds, which is *most of the time* — stacks-core advertises a 3600
+    /// second heartbeat and pings on it. A node that drops its inbound peers twice a
+    /// minute is not a peer anyone keeps.
+    ///
+    /// Bounded all the same, because a silently dead socket would otherwise hold one
+    /// of `MAX_INBOUND_PEERS` slots forever.
+    pub idle: Duration,
     /// How many messages one conversation may carry before it is closed. A peer
     /// that wants to keep talking reconnects, which costs it a handshake.
     pub max_messages: u64,
@@ -89,6 +133,7 @@ impl Default for InboundLimits {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            idle: Duration::from_mins(15),
             max_messages: 4096,
         }
     }
@@ -155,7 +200,7 @@ pub async fn serve_peer<S: Service + ?Sized>(
     let mut served = Served::default();
     let ours = local.private_key.public_key();
     for _ in 0..limits.max_messages {
-        let message = match framed.read().await {
+        let message = match framed.read_idle(limits.idle).await {
             Ok(message) => message,
             // A peer that closes cleanly is not a peer that did anything wrong,
             // and treating a hang-up as a fault is how an honest neighbour ends up
@@ -226,13 +271,8 @@ pub async fn serve_peer<S: Service + ?Sized>(
             }
             // Everything past here needs a handshake first.
             _ if served.peer.is_none() => Some(Payload::Nack(nack::HANDSHAKE_REQUIRED)),
-            Payload::Ping(nonce) => Some(Payload::Pong(nonce)),
-            Payload::GetNeighbors => Some(Payload::Neighbors(service.neighbors())),
-            Payload::GetNakamotoInventory(cycle_start) => {
-                Some(service.tenure_inventory(cycle_start).map_or(
-                    Payload::Nack(nack::NO_SUCH_BITCOIN_BLOCK),
-                    Payload::NakamotoInventory,
-                ))
+            Payload::Ping(_) | Payload::GetNeighbors | Payload::GetNakamotoInventory(_) => {
+                answer_request(&message.payload, service)
             }
             // Pushed data is handed on and never answered. The peer is not waiting
             // for a reply, and this node has no opinion until its own checks have

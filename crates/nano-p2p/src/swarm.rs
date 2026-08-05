@@ -89,6 +89,12 @@ pub struct Round {
     pub isolated: usize,
     /// Addresses learned from a neighbour walk.
     pub learned: usize,
+    /// How many peers answered an inventory request claiming at least one tenure of
+    /// the cycle asked about.
+    pub claiming: usize,
+    /// Messages peers sent unprompted and this round collected: pushed blocks,
+    /// relayed transactions, signer chunks, and the requests that were answered.
+    pub collected: usize,
 }
 
 /// One live outbound peer.
@@ -174,6 +180,7 @@ pub struct Discovered {
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
     endpoints: Vec<String>,
+    claiming: Vec<String>,
     connected: usize,
     known: usize,
 }
@@ -183,6 +190,18 @@ impl Discovered {
     #[must_use]
     pub fn endpoints(&self) -> Vec<String> {
         self.read().endpoints
+    }
+
+    /// The endpoints of peers whose inventory says they hold tenures of the cycle
+    /// this node last asked about.
+    ///
+    /// This is what an inventory *buys*, on a downloader that walks parent links
+    /// backwards: not a schedule but a shortlist. A peer that claims none of the
+    /// cycle being walked is a wasted round trip, and finding that out by asking it
+    /// for a tenure is exactly the round trip an inventory exists to avoid.
+    #[must_use]
+    pub fn claiming(&self) -> Vec<String> {
+        self.read().claiming
     }
 
     /// How many outbound sessions are live.
@@ -234,9 +253,15 @@ pub struct Swarm {
     limits: SwarmLimits,
     connected: Vec<Connected>,
     discovered: Discovered,
+    /// What to answer a peer's own requests with, when this node serves anything.
+    service: Option<Arc<dyn crate::inbound::Service>>,
     /// Which session to ask for neighbours next, so the walk moves around rather
     /// than learning one peer's whole view of the network and stopping.
     walk_cursor: usize,
+    /// The endpoints of peers that claimed tenures the last time inventories were
+    /// exchanged, kept so that a round which asks about no cycle does not erase what
+    /// the previous one learned.
+    claiming: Vec<String>,
 }
 
 impl Swarm {
@@ -255,8 +280,22 @@ impl Swarm {
             limits,
             connected: Vec::new(),
             discovered: Discovered::default(),
+            service: None,
             walk_cursor: 0,
+            claiming: Vec::new(),
         }
+    }
+
+    /// Answer the requests peers send on the connections *this node opened*.
+    ///
+    /// The same `Service` the listener answers with, because the protocol is
+    /// symmetric once handshook: a stock node that nano dialled will ask nano for
+    /// neighbours and inventories on that same socket, and a node that only answered
+    /// the connections dialled *to* it is invisible to every peer behind a NAT.
+    #[must_use]
+    pub fn serving(mut self, service: Arc<dyn crate::inbound::Service>) -> Self {
+        self.service = Some(service);
+        self
     }
 
     /// The handle the rest of the node reads while this runs.
@@ -297,14 +336,38 @@ impl Swarm {
     /// Every failure in here is per-peer and swallowed into the returned counts:
     /// the one thing a maintenance round must not do is fail, because the node's
     /// only alternative to a thin peer set is no peer set.
-    pub async fn maintain(&mut self, view: ChainView) -> Round {
+    pub async fn maintain(&mut self, view: ChainView, cycle_start: Option<ConsensusHash>) -> Round {
         let mut round = Round::default();
         self.check_liveness(view, &mut round).await;
         self.dial_up_to_strength(view, &mut round).await;
         round.learned = self.walk_neighbors().await;
+        if let Some(cycle_start) = cycle_start {
+            round.claiming = self.exchange_inventories(cycle_start, &mut round).await;
+        }
+        round.collected = self.collect(&mut round).await;
         round.connected = self.connected.len();
         self.publish();
         round
+    }
+
+    /// Read what every peer said while we were not listening.
+    ///
+    /// The round ends here rather than beginning here, so a peer dialled *this* round
+    /// is read too. It matters that this happens at all: a session nobody reads
+    /// accumulates whatever the peer relays, and mainnet relays between 0.2 and 0.8
+    /// messages a second per peer — enough that fifty seconds of not listening looks
+    /// like a flood, which is what nano used to mistake it for.
+    async fn collect(&mut self, round: &mut Round) -> usize {
+        let mut faults = Vec::new();
+        let mut collected = 0;
+        for (index, peer) in self.connected.iter_mut().enumerate() {
+            if let Err(error) = peer.session.collect().await {
+                faults.push((index, error));
+            }
+            collected += peer.session.take_unsolicited_count();
+        }
+        self.retire(&faults, round);
+        collected
     }
 
     /// Ping every session, and act on whichever ones do not answer.
@@ -357,7 +420,10 @@ impl Swarm {
             )
             .await;
             match dialled {
-                Ok(session) => {
+                Ok(mut session) => {
+                    if let Some(service) = &self.service {
+                        session.serving(service.clone());
+                    }
                     // A completed handshake is the only thing that proves a key, so
                     // it is the only thing allowed to write one down.
                     let _ = self.peers.record_handshake(
@@ -414,7 +480,11 @@ impl Swarm {
     /// Several peers on purpose. One peer's inventory is one peer's claim, and a
     /// tenure that only one peer admits to having is exactly the case where a
     /// second opinion is worth the request.
-    pub async fn tenure_claims(&mut self, cycle_start: ConsensusHash) -> Vec<TenureClaim> {
+    pub async fn tenure_claims(
+        &mut self,
+        cycle_start: ConsensusHash,
+        round: &mut Round,
+    ) -> Vec<TenureClaim> {
         let mut claims = Vec::new();
         let mut faults = Vec::new();
         for (index, peer) in self.connected.iter_mut().enumerate() {
@@ -433,20 +503,60 @@ impl Swarm {
                 Err(error) => faults.push((index, error)),
             }
         }
-        self.retire(&faults);
+        self.retire(&faults, round);
         claims
     }
 
+    /// Ask every peer about a reward cycle, and remember who has any of it.
+    ///
+    /// The result is a shortlist of endpoints, not a schedule, because nano's
+    /// downloader walks parent links backwards and so always knows the one tenure it
+    /// wants next — there is no set of wanted tenures to spread. What an inventory is
+    /// worth on that downloader is still real: a peer that claims none of the cycle
+    /// being walked has nothing to serve, and asking it for a tenure to find out is
+    /// exactly the round trip the inventory exists to avoid.
+    ///
+    /// [`assign_tenures`] is the scheduler for a forward download driven by bit
+    /// indices, which is a different downloader; it stays where it is until there is
+    /// one.
+    pub async fn exchange_inventories(
+        &mut self,
+        cycle_start: ConsensusHash,
+        round: &mut Round,
+    ) -> usize {
+        let claims = self.tenure_claims(cycle_start, round).await;
+        // A peer that answered with an all-zero vector is answering honestly and has
+        // nothing for this cycle; it stays a peer and stops being a place to fetch
+        // from until the cycle moves.
+        let claiming: Vec<String> = claims
+            .iter()
+            .filter(|claim| (0..claim.tenures.len()).any(|bit| claim.tenures.get(bit) == Some(true)))
+            .filter_map(|claim| claim.endpoint.clone())
+            .collect();
+        let answered = claiming.len();
+        self.claiming = claiming;
+        self.publish();
+        answered
+    }
+
     /// Close the sessions that failed during a request, penalising each.
-    fn retire(&mut self, faults: &[(usize, SessionError)]) {
+    ///
+    /// The round is the caller's, not a local one. It used to be local and thrown
+    /// away, so a peer lost during an inventory exchange left a round reporting three
+    /// peers connected and one dropped when it had in fact lost all three — the count
+    /// that made a real failure look like a passing test.
+    fn retire(&mut self, faults: &[(usize, SessionError)], round: &mut Round) {
         if faults.is_empty() {
             return;
         }
         let doomed: HashSet<usize> = faults.iter().map(|(index, _)| *index).collect();
-        let mut round = Round::default();
         for (index, error) in faults {
             if let Some(peer) = self.connected.get(*index) {
-                self.penalize(peer, error, &mut round);
+                eprintln!(
+                    "p2p: dropping peer {} after {error}",
+                    peer.address.to_socket_addr(peer.port)
+                );
+                self.penalize(peer, error, round);
             }
         }
         let mut kept = Vec::with_capacity(self.connected.len());
@@ -485,6 +595,7 @@ impl Swarm {
         endpoints.dedup();
         self.discovered.publish(Snapshot {
             endpoints,
+            claiming: self.claiming.clone(),
             connected: self.connected.len(),
             known: self.peers.count().unwrap_or(0),
         });

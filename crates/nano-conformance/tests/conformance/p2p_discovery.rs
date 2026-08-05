@@ -107,15 +107,19 @@ async fn nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api() {
     // ever talk to its seed list would still have four services as a dependency.
     let mut learned_beyond_the_seeds = false;
     for round in 1..=2 {
-        let outcome = swarm.maintain(fresh_node_view()).await;
+        // No cycle to ask inventories about: a fresh table has no locally derived
+        // sortitions, so there is no consensus hash this node could name a cycle by
+        // without quoting a peer for it.
+        let outcome = swarm.maintain(fresh_node_view(), None).await;
         println!(
             "round {round}: {} connected, {} dialled, {} isolated, {} addresses learned, \
-             {} known",
+             {} known, {} unprompted messages",
             outcome.connected,
             outcome.dialled,
             outcome.isolated,
             outcome.learned,
             discovered.known(),
+            outcome.collected,
         );
         learned_beyond_the_seeds |= outcome.learned > 0;
     }
@@ -182,4 +186,93 @@ async fn nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api() {
         answered >= 2,
         "only {answered} discovered peers answer, so one of them is load bearing"
     );
+}
+
+/// Bulk history really is fetched from many peers, and not from one.
+///
+/// The other half of the same criterion, and the half that was still a claim about
+/// the transport rather than about catching up: `catch_up`'s descent walks a tenure
+/// at a time, and from the mainnet checkpoint that is tens of thousands of blocks. As
+/// long as they all went down one connection, one service's rate limit *was* nano's
+/// catch-up speed, whatever the peer table held.
+///
+/// So this walks a real descent — the tip's tenure, then its parent's, and so on —
+/// through `TenureSource` over the peers discovery found, and asserts that the
+/// requests actually landed on several of them.
+#[tokio::test]
+async fn bulk_history_comes_from_several_mainnet_peers() {
+    // Enough tenures to tell a pool from a favourite, and few enough that this stays a
+    // test rather than a load generator against strangers' nodes.
+    const TENURES: usize = 10;
+    if std::env::var_os("NANO_P2P_MAINNET").is_none() {
+        println!("skipped: set NANO_P2P_MAINNET=1 to reach mainnet");
+        return;
+    }
+    let mut swarm = Swarm::new(
+        PeerDb::in_memory().expect("a peer table"),
+        LocalPeer::quiet(StacksPrivateKey::from_seed(b"nano-p2p bulk history"), 20444),
+        Protocol::mainnet(),
+        SwarmLimits {
+            outbound: 8,
+            dials_per_round: 8,
+            timeout: Duration::from_secs(20),
+        },
+    );
+    for seed in MAINNET_SEEDS {
+        swarm.seed(seed).await.expect("record the bootstrap peer");
+    }
+    let discovered = swarm.discovered();
+    swarm.maintain(fresh_node_view(), None).await;
+    let endpoints = discovered.endpoints();
+    check_endpoints(&endpoints);
+
+    // Where to start: whichever peer the same fork choice the production loop uses
+    // picks, and its tip. Nothing below trusts that peer for anything — every tenure
+    // is fetched from whoever `TenureSource` picks next.
+    let pool = PeerPool::from_endpoints(&endpoints);
+    let (_, chosen) = pool
+        .choose_source(None)
+        .await
+        .expect("a discovered peer serves a tip");
+    let mut cursor = chosen
+        .tenure_info()
+        .await
+        .expect("the chosen peer names its tip")
+        .tip_block_id;
+
+    let mut history = nano_sync::TenureSource::new(pool.into_clients());
+    let mut fetched = 0;
+    let mut blocks = 0;
+    for _ in 0..TENURES {
+        let tenure = match history.blocks_of_tenure(cursor).await {
+            Ok(tenure) => tenure,
+            Err(error) => {
+                println!("the descent stopped after {fetched} tenures: {error}");
+                break;
+            }
+        };
+        let lowest = tenure
+            .iter()
+            .min_by_key(|block| block.header.chain_length)
+            .expect("a tenure has blocks");
+        let next = lowest.header.parent_block_id;
+        blocks += tenure.len();
+        fetched += 1;
+        if next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    println!("{fetched} tenures, {blocks} blocks, over {} peers", history.len());
+    assert!(
+        fetched >= 3,
+        "only {fetched} tenures came back, so nothing was measured"
+    );
+    // The point of the whole thing: a descent that used one peer would report one.
+    assert!(
+        history.served_by() >= 2,
+        "every tenure came from {} peer(s), so the descent is still single-peer",
+        history.served_by()
+    );
+    println!("{} distinct peers served history", history.served_by());
 }

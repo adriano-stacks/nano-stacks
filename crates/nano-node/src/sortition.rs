@@ -136,6 +136,20 @@ impl SortitionTracker {
         self.engine.snapshots().tip()
     }
 
+    /// The consensus hash this chain derived for `bitcoin_height`.
+    ///
+    /// The history is one hash per burn block, ending at the tip, because
+    /// `ConsensusHash::from_ops` mixes the hashes behind it at power-of-two offsets
+    /// and none may be skipped. So a height maps to an index by subtraction, and
+    /// nothing has to be searched or trusted: this is the hash *this node* derived,
+    /// which is what makes it usable for naming a reward cycle to a peer.
+    #[must_use]
+    pub fn consensus_hash_at(&self, bitcoin_height: u64) -> Option<ConsensusHash> {
+        let history = self.engine.snapshots().history();
+        let back = usize::try_from(self.tip().bitcoin_height.checked_sub(bitcoin_height)?).ok()?;
+        history.get(history.len().checked_sub(back + 1)?).copied()
+    }
+
     /// Commitments the burn block at the tip put up for its sortition.
     ///
     /// Reporting, not a gate: the winner derives whether or not the block left a
