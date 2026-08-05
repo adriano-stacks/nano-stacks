@@ -525,7 +525,24 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
                             contract_name,
                             source,
                             ..
-                        } => println!("    deploys {contract_name}, {} chars", source.len()),
+                        } => {
+                            println!("    deploys {contract_name}, {} chars", source.len());
+                            // The source of a deployment that *failed* is not in
+                            // the state -- the transaction that would have put it
+                            // there is the one that did not run -- so the block is
+                            // the only place it exists. Written out so
+                            // `check-module` can be pointed at it.
+                            if let Some(directory) = env::var_os("NANO_DUMP_DEPLOYS") {
+                                let path =
+                                    Path::new(&directory).join(format!("{contract_name}.clar"));
+                                match fs::write(&path, source) {
+                                    Ok(()) => println!("    wrote {}", path.display()),
+                                    Err(error) => {
+                                        eprintln!("    cannot write the source: {error}");
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1634,29 +1651,39 @@ fn check_module(arguments: &[String]) -> ExitCode {
         eprintln!("cannot begin a block on the tip: {error:?}");
         return ExitCode::FAILURE;
     }
-    // The state's own source and version, unless told otherwise: a contract the
-    // compiler refuses is one already on the chain, and bisecting the wrong text
-    // or the wrong version answers a question nobody asked.
-    let (stored_source, stored_version) = match vm.contract_source(&identifier) {
-        Ok(pair) => pair,
-        Err(error) => {
-            eprintln!("the state has no source for {contract}: {error:?}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let version = asked_version.unwrap_or(stored_version);
-    if version != stored_version {
-        println!("the state holds {contract} as {stored_version:?}, not {version:?}");
+    // A source file is asked for only when the state does not have one -- a
+    // deployment that *failed* leaves no contract behind, so the block is the
+    // only place its source exists. So the state is consulted for its version,
+    // not required to answer.
+    let stored = vm.contract_source(&identifier).ok();
+    if let (Some((_, stored_version)), Some(asked)) = (stored.as_ref(), asked_version)
+        && *stored_version != asked
+    {
+        println!("the state holds {contract} as {stored_version:?}, not {asked:?}");
     }
-    let source = match rest.get(1) {
-        Some(path) => match fs::read_to_string(path) {
+    let source = if let Some(path) = rest.get(1) {
+        match fs::read_to_string(path) {
             Ok(source) => source,
             Err(error) => {
                 eprintln!("cannot read the source: {error}");
                 return ExitCode::FAILURE;
             }
-        },
-        None => stored_source,
+        }
+    } else {
+        let Some((source, _)) = stored.as_ref() else {
+            eprintln!(
+                "the state has no source for {contract}, so one has to be given: \
+                 `xtask decode-blocks` with NANO_DUMP_DEPLOYS writes out the source \
+                 of every deployment in a block"
+            );
+            return ExitCode::FAILURE;
+        };
+        source.clone()
+    };
+    let Some(version) = asked_version.or_else(|| stored.as_ref().map(|(_, version)| *version))
+    else {
+        eprintln!("neither the state nor the arguments say which Clarity version to use");
+        return ExitCode::FAILURE;
     };
     if let Some(path) = env::var_os("NANO_DUMP_SOURCE")
         && let Err(error) = fs::write(&path, &source)

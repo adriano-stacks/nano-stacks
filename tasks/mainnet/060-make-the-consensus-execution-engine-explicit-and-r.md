@@ -438,6 +438,46 @@ this unambiguous:
   omission and no reordering reaches the chain's, so it is a value or a missing
   write rather than a trie or ordering fault.
 
+## 8,666,585 minimised: two tuple shapes under one `if`
+
+Eight lines, and it reproduces the mainnet error exactly:
+
+```clarity
+(define-data-var v uint u0)
+(define-public (go (n uint))
+  (begin
+    (if (> n u0)
+      (print { a: n, b: u1 })
+      (print { a: n, b: u1, c: true }))
+    (ok n)))
+```
+
+`type mismatch: expected i64, found i32 (at offset 0x1a37)` — the same signature,
+the fourth of the family. `rewards-stx-v1`'s `process-rewards` ends in exactly
+this: an `if` whose two arms `print` tuples with different field sets, one carrying
+an extra `keeper-only`.
+
+The telling part is that the same `if` **without** `print` is refused by analysis
+with "Tuples fields should be typed". So it is `print` accepting two unrelated
+tuple types that lets codegen reach a layout it cannot honour — which points at
+`print`'s analysed return type rather than at `if`, and is a narrower place to look
+than the previous three were.
+
+Pinned as `two_tuple_shapes_under_one_if_compile_to_a_loadable_module` in
+`wasm_response_fold`, `#[ignore]`d with the reason, because a red suite teaches
+people to ignore red suites. `cargo test -- --ignored` runs it in 0.01 s.
+
+## Two tools this needed, and now has
+
+`xtask decode-blocks` with `NANO_DUMP_DEPLOYS=<dir>` writes out the source of every
+deployment in a block. A deployment that *failed* leaves no contract in the state —
+the transaction that would have put it there is the one that did not run — so the
+block is the only place its source exists, and there was no way to get it out.
+
+`check-module` no longer *requires* the state to hold the contract. It consults the
+state for a version and takes a source file when given one, so a contract that was
+never deployed can be compiled against a real chainstate. Both modes verified.
+
 ## The next step, exactly
 
 `rewards-stx-v1` is not in the state — the transaction that deploys it is the one

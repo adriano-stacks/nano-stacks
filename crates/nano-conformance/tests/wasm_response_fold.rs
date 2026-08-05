@@ -287,3 +287,47 @@ fn hashing_the_parsed_proof_agrees() {
         assert_eq!(compiled, interpreted, "checked over {count} hashes");
     }
 }
+
+/// The shape mainnet block 8,666,585 stops on: two tuple types under one `if`.
+///
+/// `SP4SZE…rewards-stx-v1` is deployed by that block, mainnet accepted it, and
+/// clarity-wasm emits a module wasmtime refuses to load:
+///
+/// ```text
+/// type mismatch: expected i64, found i32 (at offset 0x1a37)
+/// ```
+///
+/// which is the placeholder-layout signature again — the fourth of this family
+/// after 8,667,467's `let`-bound `none` and the fold-over-a-buffer above.
+///
+/// The contract's `process-rewards` ends in an `if` whose two arms `print` tuples
+/// with *different field sets*, one carrying an extra `keeper-only`. Minimised to
+/// eight lines below. Note that the same `if` **without** `print` is rejected by
+/// analysis ("Tuples fields should be typed"), so it is `print` accepting two
+/// unrelated tuple types that lets codegen reach a layout it cannot honour.
+///
+/// Ignored rather than deleted or left failing: it is a real, reduced,
+/// reproducible compiler bug with nothing yet fixed behind it, and a red suite
+/// teaches people to ignore red suites. Remove the attribute with the fix.
+#[test]
+#[ignore = "clarity-wasm lays out an i32 where it reads an i64: mainnet 8,666,585"]
+fn two_tuple_shapes_under_one_if_compile_to_a_loadable_module() {
+    const SHAPES: &str = "
+(define-data-var v uint u0)
+(define-public (go (n uint))
+  (begin
+    (if (> n u0)
+      (print { a: n, b: u1 })
+      (print { a: n, b: u1, c: true }))
+    (ok n)))
+";
+    let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
+    wasm.begin_block(None, [0x51; 32]).expect("begin");
+    wasm.deploy_contract(
+        id("shapes"),
+        ClarityVersion::Clarity6,
+        SHAPES,
+        LimitedCostTracker::new_free(),
+    )
+    .expect("mainnet accepted this contract, so the compiler has to build it");
+}
