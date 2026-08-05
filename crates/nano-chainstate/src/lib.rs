@@ -2097,7 +2097,14 @@ impl ChainState {
         block_header_hash: [u8; 32],
         consensus_hash: [u8; 20],
     ) -> Result<(), ChainStateError> {
-        self.vm.record_block_header(
+        // Recorded as *partial*, naming the five fields a peer can answer for.
+        // The eight zeros below are not answers -- a miner address of all zeros,
+        // a block reward of zero and a tenure height of zero are things a
+        // contract can read and be wrong about -- and `record_block_header`
+        // means "every field here is an answer". `PEER_BURN_CONTEXT` says which
+        // five, so a read of any other one stops the node with the block and the
+        // field named instead of handing Clarity a plausible zero.
+        self.vm.record_partial_header(
             block,
             nano_vm::BlockHeader {
                 burn_header_hash,
@@ -2114,6 +2121,7 @@ impl ChainState {
                 tenure_height: 0,
                 tenure_start_height: 0,
             },
+            nano_vm::HeaderFields::PEER_BURN_CONTEXT,
         )?;
         Ok(())
     }

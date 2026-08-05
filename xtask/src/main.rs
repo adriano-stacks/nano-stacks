@@ -34,12 +34,15 @@ fn main() -> ExitCode {
         Some("snapshot-state") => snapshot_state(&env::args().skip(2).collect::<Vec<_>>()),
         Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("repair-ledger") => repair_ledger(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("export-headers") => export_headers(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("import-headers") => import_headers(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -47,6 +50,11 @@ fn main() -> ExitCode {
 }
 
 /// Diff a rebuilt header against the one this node recorded, field by field.
+///
+/// The oracle this whole approach needs, and it earns its keep: run against a
+/// block whose header nano *does* hold, it caught three fields being plausible
+/// rather than right. Only the fields the rebuild claims are compared — a field
+/// it does not claim has no value to compare.
 fn compare_headers(rebuilt: &nano_vm::BlockHeader, recorded: &nano_vm::BlockHeader) -> ExitCode {
         let mut wrong = 0;
         let mut check = |field: &str, same: bool, detail: String| {
@@ -234,21 +242,638 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
             tenure_start_height: 0,
     };
     if let Some(recorded) = recorded {
-        return compare_headers(&rebuilt, &recorded);
+        return compare_headers(&rebuilt, &recorded.header);
     }
-    if let Err(error) = vm.record_block_header(id, rebuilt) {
+    if let Err(error) = vm.record_partial_header(id, rebuilt, nano_vm::HeaderFields::PEER_BURN_CONTEXT)
+    {
         eprintln!("recording the header failed: {error}");
         return ExitCode::FAILURE;
     }
     println!(
-        "recorded a header for {} at burn height {burn_block_height}\n\
+        "recorded a partial header for {} at burn height {burn_block_height}\n\
          exact: burn_header_hash, burn_block_height, consensus_hash, \
          stacks_block_time, block_header_hash\n\
-         NOT FILLED: burn_block_time, vrf_seed, burn_spend_total, miner_address, \
-         burn_spend_winner, block_reward, tenure_height, tenure_start_height -- a contract reading one of these gets zero, not the chain's answer",
-        hex::encode(id)
+         NOT KNOWN: {} -- a Clarity read of one of these now stops the node and \
+         names the field, rather than answering with the zero in its place",
+        hex::encode(id),
+        nano_vm::HeaderFields::PEER_BURN_CONTEXT.absent_names().join(", ")
     );
     ExitCode::SUCCESS
+}
+
+/// Export the header fields Clarity can read, for a checkpoint's whole ancestry.
+///
+/// A checkpoint carries the trie for all of history and, until this existed, no
+/// headers at all, so every `get-stacks-block-info?`, `get-tenure-info?` and
+/// epoch lookup below the anchor had to be answered by asking a peer for one
+/// block at a time — five fields out of thirteen, with zeros for the rest. A
+/// stacks-core chainstate holds all thirteen for every block it ever processed,
+/// so this is an export and an import rather than a reconstruction, and it needs
+/// no peer at all.
+///
+/// Read straight out of the tables stacks-core's own `HeadersDB` reads
+/// (`nakamoto_block_headers`, `block_headers`, `nakamoto_tenure_events`,
+/// `payments`, `matured_rewards`), through the same joins: a field resolved at
+/// the wrong block is a wrong answer, and five of these are resolved at the
+/// block's *tenure start* rather than at the block.
+fn export_headers(arguments: &[String]) -> ExitCode {
+    let [index, out, height] = arguments else {
+        eprintln!(
+            "usage: cargo xtask export-headers <stacks-core index.sqlite> <out.sqlite> <to-height>\n\
+             the height is the checkpoint's: a checkpoint has no business shipping \
+             headers for blocks its state does not cover"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(to_height) = height.parse::<u64>() else {
+        eprintln!("{height} is not a height");
+        return ExitCode::FAILURE;
+    };
+    match run_header_export(Path::new(index), Path::new(out), to_height) {
+        Ok((nakamoto, epoch2, partial)) => {
+            println!(
+                "exported {} headers ({nakamoto} Nakamoto, {epoch2} from epoch 2.x) up to height {to_height}\n\
+                 {partial} of them are incomplete, and say so",
+                nakamoto + epoch2
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("header export failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print everything Clarity can read about a Stacks height, as Clarity reads it.
+///
+/// `xtask eval` cannot answer this: it evaluates against a context that knows no
+/// chain, so every header read there is `none` whatever the state holds. This
+/// goes through the state's own context and through `ClarityDatabase`, which is
+/// where the guards live that decide when `none` is the chain's answer rather
+/// than this node's ignorance.
+fn block_info(arguments: &[String]) -> ExitCode {
+    let [state, height] = arguments else {
+        eprintln!(
+            "usage: cargo xtask block-info <state-dir> <stacks-height>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(height) = height.parse::<u32>() else {
+        eprintln!("{height} is not a height");
+        return ExitCode::FAILURE;
+    };
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block");
+        return ExitCode::FAILURE;
+    };
+    // The tip's own burn height, so the epoch of the block being stood on is the
+    // one it really ran under. Every read below resolves its own block's epoch
+    // from that block's header, so this only has to be sane.
+    let mut context = nano_vm::BitcoinBlockContext::at_height(0);
+    if let Some(header) = vm.recorded_header(tip) {
+        context.height = u64::from(header.burn_block_height);
+    }
+    if let Err(error) = vm.begin_block_with_bitcoin_context(Some(tip), [0xef; 32], context) {
+        eprintln!("cannot open a block on the tip: {error}");
+        return ExitCode::FAILURE;
+    }
+    print_block_info(&mut vm.clarity_db(), height);
+    let _ = vm.abort_block();
+    ExitCode::SUCCESS
+}
+
+/// Print every header answer for a height, saying which stop the node.
+fn print_block_info(database: &mut clarity::vm::database::ClarityDatabase<'_>, height: u32) {
+    database.begin();
+    let say = |name: &str, answer: Result<String, clarity::vm::errors::VmExecutionError>| {
+        println!(
+            "  {name:<28} {}",
+            match answer {
+                Ok(value) => value,
+                // The loud failure this task chose over answering `none`: it names
+                // the block and the field, and the node fetches what it lacks.
+                Err(error) => format!("STOPS THE NODE: {error}"),
+            }
+        );
+    };
+    println!("get-stacks-block-info? at height {height}");
+    say(
+        "id-header-hash",
+        database
+            .get_index_block_header_hash(height)
+            .map(|id| id.to_string()),
+    );
+    say(
+        "header-hash",
+        database
+            .get_block_header_hash(height)
+            .map(|hash| hash.to_string()),
+    );
+    say(
+        "time",
+        database.get_block_time(height).map(|value| value.to_string()),
+    );
+    let tenure_height = database.get_tenure_height().unwrap_or(0);
+    println!(
+        "get-tenure-info? for the tenure at that height (this state is at tenure {tenure_height})"
+    );
+    say(
+        "burnchain-header-hash",
+        database
+            .get_burnchain_block_header_hash(height)
+            .map(|hash| hash.to_string()),
+    );
+    say(
+        "miner-address",
+        database
+            .get_miner_address(height)
+            .map(|address| format!("{address}")),
+    );
+    say(
+        "block-reward",
+        database.get_block_reward(height).map(|reward| {
+            reward.map_or_else(
+                || "none -- and that is the chain's own answer".to_owned(),
+                |value| value.to_string(),
+            )
+        }),
+    );
+    say(
+        "miner-spend-total",
+        database
+            .get_miner_spend_total(height)
+            .map(|value| value.to_string()),
+    );
+    say(
+        "miner-spend-winner",
+        database
+            .get_miner_spend_winner(height)
+            .map(|value| value.to_string()),
+    );
+    say(
+        "vrf-seed",
+        database
+            .get_block_vrf_seed(height)
+            .map(|seed| seed.to_string()),
+    );
+    say(
+        "time",
+        database
+            .get_burn_block_time(height, None)
+            .map(|value| value.to_string()),
+    );
+}
+
+/// Take a header export into a state that already exists.
+///
+/// A checkpoint import does this itself. This is for the state that was imported
+/// before the export existed, which is every mainnet state on this machine and
+/// would otherwise have to be imported again from a 380 GB checkpoint.
+fn import_headers(arguments: &[String]) -> ExitCode {
+    let [state, export] = arguments else {
+        eprintln!(
+            "usage: cargo xtask import-headers <state-dir> <block-headers.sqlite>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::from(2);
+    };
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match vm.import_block_headers(Path::new(export)) {
+        Ok(imported) => {
+            println!("imported {imported} headers");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("importing the headers failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A tenure's start block, which is where five of a header's fields live.
+struct TenureStart {
+    block_id: String,
+    tenure_height: u32,
+}
+
+/// What a tenure's start block answers for every block of that tenure.
+struct TenureFacts {
+    start_height: u32,
+    vrf_seed: Option<[u8; 32]>,
+    miner: Option<(u8, [u8; 20])>,
+    spends: Option<(u128, u128)>,
+    reward: Option<u128>,
+}
+
+fn run_header_export(
+    index: &Path,
+    out: &Path,
+    to_height: u64,
+) -> Result<(usize, usize, usize), String> {
+    let source = open_archive(index)?;
+    let destination = create_export(out)?;
+    let tenures = read_tenure_starts(&source)?;
+    let mut facts: std::collections::HashMap<String, TenureFacts> =
+        std::collections::HashMap::new();
+    let mut partial = 0;
+    let transaction = destination
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let nakamoto = export_rows(
+        &source,
+        &destination,
+        to_height,
+        true,
+        &tenures,
+        &mut facts,
+        &mut partial,
+    )?;
+    let epoch2 = export_rows(
+        &source,
+        &destination,
+        to_height,
+        false,
+        &tenures,
+        &mut facts,
+        &mut partial,
+    )?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok((nakamoto, epoch2, partial))
+}
+
+/// Open a stacks-core chainstate index without being able to write to it.
+fn open_archive(index: &Path) -> Result<rusqlite::Connection, String> {
+    rusqlite::Connection::open_with_flags(
+        format!("file:{}?mode=ro&immutable=1", index.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", index.display()))
+}
+
+fn create_export(out: &Path) -> Result<rusqlite::Connection, String> {
+    if out.exists() {
+        return Err(format!("{} already exists", out.display()));
+    }
+    let connection = rusqlite::Connection::open(out).map_err(|error| error.to_string())?;
+    connection
+        .query_row("PRAGMA journal_mode = OFF", [], |_| Ok(()))
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "PRAGMA synchronous = OFF;
+             PRAGMA cache_size = -200000;
+             PRAGMA temp_store = MEMORY;",
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(nano_vm::HEADER_EXPORT_SCHEMA)
+        .map_err(|error| error.to_string())?;
+    Ok(connection)
+}
+
+/// Every tenure's start block and tenure height, by the tenure's consensus hash.
+///
+/// This is what stacks-core reaches through the MARF key
+/// `nakamoto::headers::tenure_start_block_id::<ch>`; the same fact is in this
+/// table, keyed the same way, and a table can be read in one pass.
+fn read_tenure_starts(
+    source: &rusqlite::Connection,
+) -> Result<std::collections::HashMap<String, TenureStart>, String> {
+    let mut statement = source
+        .prepare(
+            "SELECT tenure_id_consensus_hash, block_id, coinbase_height \
+             FROM nakamoto_tenure_events WHERE cause = 0",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    let mut starts = std::collections::HashMap::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let consensus_hash: String = row.get(0).map_err(|error| error.to_string())?;
+        let block_id: String = row.get(1).map_err(|error| error.to_string())?;
+        let tenure_height: u32 = row.get(2).map_err(|error| error.to_string())?;
+        starts.insert(
+            consensus_hash,
+            TenureStart {
+                block_id,
+                tenure_height,
+            },
+        );
+    }
+    Ok(starts)
+}
+
+/// Export one header table, Nakamoto's or epoch 2.x's.
+fn export_rows(
+    source: &rusqlite::Connection,
+    destination: &rusqlite::Connection,
+    to_height: u64,
+    nakamoto: bool,
+    tenures: &std::collections::HashMap<String, TenureStart>,
+    facts: &mut std::collections::HashMap<String, TenureFacts>,
+    partial: &mut usize,
+) -> Result<usize, String> {
+    let time_column = if nakamoto { "timestamp" } else { "0" };
+    let table = header_table(nakamoto);
+    let mut statement = source
+        .prepare(&format!(
+            "SELECT index_block_hash, block_height, burn_header_hash, burn_header_height, \
+                    burn_header_timestamp, {time_column}, block_hash, consensus_hash \
+             FROM {table} WHERE block_height <= ?1"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query(rusqlite::params![to_height])
+        .map_err(|error| error.to_string())?;
+    let mut exported = 0;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let text = |index: usize| -> Result<String, String> {
+            row.get(index).map_err(|error: rusqlite::Error| error.to_string())
+        };
+        let block_id = text(0)?;
+        let stacks_height: u64 = row.get(1).map_err(|error| error.to_string())?;
+        // A Nakamoto block's tenure fields come from its tenure's start block; an
+        // epoch 2.x block *is* its own tenure, which is what
+        // `get_first_block_in_tenure` returns for one.
+        let consensus_hash = text(7)?;
+        let tenure = if nakamoto {
+            tenures.get(&consensus_hash)
+        } else {
+            None
+        };
+        let tenure_start_id = tenure.map_or_else(|| block_id.clone(), |start| start.block_id.clone());
+        if !facts.contains_key(&tenure_start_id) {
+            let computed = read_tenure_facts(source, &tenure_start_id, nakamoto, tenures)?;
+            facts.insert(tenure_start_id.clone(), computed);
+        }
+        let known = facts.get(&tenure_start_id).ok_or("tenure facts vanished")?;
+        let fields = exported_fields(nakamoto, known, tenure.is_some());
+        if !fields.is_complete() {
+            *partial += 1;
+        }
+        let (spend_total, spend_winner) = known.spends.unwrap_or((0, 0));
+        let (miner_version, miner_hash) = known.miner.unwrap_or((0, [0; 20]));
+        // Parsed before the insert closure, whose errors have to be SQLite's.
+        let block = parse_hash::<32>(&block_id)?;
+        let burn_header_hash = parse_hash::<32>(&text(2)?)?;
+        let block_header_hash = parse_hash::<32>(&text(6)?)?;
+        let consensus = parse_hash::<20>(&consensus_hash)?;
+        destination
+            .prepare_cached(
+                "INSERT OR REPLACE INTO exported_header (\
+                    block_id, stacks_height, burn_header_hash, burn_block_height, \
+                    burn_block_time, stacks_block_time, block_header_hash, consensus_hash, \
+                    vrf_seed, miner_version, miner_hash, burn_spend_total, burn_spend_winner, \
+                    block_reward, tenure_height, tenure_start_height, known) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            )
+            .and_then(|mut insert| {
+                insert.execute(rusqlite::params![
+                    block.as_slice(),
+                    stacks_height,
+                    burn_header_hash.as_slice(),
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, u64>(5)?,
+                    block_header_hash.as_slice(),
+                    consensus.as_slice(),
+                    known.vrf_seed.unwrap_or([0; 32]).as_slice(),
+                    miner_version,
+                    miner_hash.as_slice(),
+                    spend_total.to_string(),
+                    spend_winner.to_string(),
+                    known.reward.unwrap_or(0).to_string(),
+                    tenure.map_or(0, |start| start.tenure_height),
+                    if tenure.is_some() { known.start_height } else { 0 },
+                    fields.bits(),
+                ])
+            })
+            .map_err(|error| error.to_string())?;
+        exported += 1;
+    }
+    Ok(exported)
+}
+
+/// Which of a block's fields the archive actually answered.
+///
+/// A zero in an unanswered column is not an answer, and this is where that is
+/// decided: an epoch 2.x block has no Nakamoto timestamp and no tenure height,
+/// and a tenure with no matured reward row has no reward, because stacks-core has
+/// not matured it either.
+const fn exported_fields(
+    nakamoto: bool,
+    facts: &TenureFacts,
+    has_tenure: bool,
+) -> nano_vm::HeaderFields {
+    let mut fields = nano_vm::HeaderFields::BURN_HEADER_HASH
+        .union(nano_vm::HeaderFields::BURN_BLOCK_HEIGHT)
+        .union(nano_vm::HeaderFields::BURN_BLOCK_TIME)
+        .union(nano_vm::HeaderFields::BLOCK_HEADER_HASH)
+        .union(nano_vm::HeaderFields::CONSENSUS_HASH);
+    if nakamoto {
+        fields = fields.union(nano_vm::HeaderFields::STACKS_BLOCK_TIME);
+    }
+    if facts.vrf_seed.is_some() {
+        fields = fields.union(nano_vm::HeaderFields::VRF_SEED);
+    }
+    if facts.miner.is_some() {
+        fields = fields.union(nano_vm::HeaderFields::MINER_ADDRESS);
+    }
+    if facts.spends.is_some() {
+        fields = fields
+            .union(nano_vm::HeaderFields::BURN_SPEND_TOTAL)
+            .union(nano_vm::HeaderFields::BURN_SPEND_WINNER);
+    }
+    if facts.reward.is_some() {
+        fields = fields.union(nano_vm::HeaderFields::BLOCK_REWARD);
+    }
+    if has_tenure {
+        fields = fields
+            .union(nano_vm::HeaderFields::TENURE_HEIGHT)
+            .union(nano_vm::HeaderFields::TENURE_START_HEIGHT);
+    }
+    fields
+}
+
+const fn header_table(nakamoto: bool) -> &'static str {
+    if nakamoto {
+        "nakamoto_block_headers"
+    } else {
+        "block_headers"
+    }
+}
+
+/// The five fields resolved at a tenure's start block rather than at the block.
+fn read_tenure_facts(
+    source: &rusqlite::Connection,
+    tenure_start_id: &str,
+    nakamoto: bool,
+    tenures: &std::collections::HashMap<String, TenureStart>,
+) -> Result<TenureFacts, String> {
+    let table = header_table(nakamoto);
+    let proof_column = if nakamoto { "vrf_proof" } else { "proof" };
+    let start: Option<(u64, Option<String>, String)> = source
+        .query_row(
+            &format!(
+                "SELECT block_height, {proof_column}, parent_block_id FROM {table} \
+                 WHERE index_block_hash = ?1"
+            ),
+            rusqlite::params![tenure_start_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional_row()?;
+    let Some((start_height, proof, parent_block_id)) = start else {
+        return Ok(TenureFacts {
+            start_height: 0,
+            vrf_seed: None,
+            miner: None,
+            spends: None,
+            reward: None,
+        });
+    };
+    let payment: Option<(String, u64, u64)> = source
+        .query_row(
+            "SELECT address, burnchain_sortition_burn, burnchain_commit_burn FROM payments \
+             WHERE index_block_hash = ?1 AND miner = 1",
+            rusqlite::params![tenure_start_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional_row()?;
+    Ok(TenureFacts {
+        start_height: u32::try_from(start_height).map_err(|_| "height overflows u32".to_owned())?,
+        vrf_seed: proof.as_deref().and_then(vrf_seed_of_proof),
+        miner: payment.as_ref().and_then(|(address, _, _)| miner_address(address)),
+        spends: payment.map(|(_, sortition, commit)| (u128::from(sortition), u128::from(commit))),
+        reward: read_matured_reward(source, tenure_start_id, &parent_block_id, tenures)?,
+    })
+}
+
+/// What the tenure earned once its reward matured, as stacks-core totals it.
+///
+/// Keyed by the *parent tenure* and this tenure, and split across two rows: the
+/// child's carries the coinbase and the parent's carries the streamed fees it
+/// produced. Any other shape is not a reward this node may claim to know, so it
+/// is left absent rather than summed anyway — the last hundred tenures before a
+/// checkpoint have no rows at all, because stacks-core has not matured them yet
+/// either.
+fn read_matured_reward(
+    source: &rusqlite::Connection,
+    tenure_start_id: &str,
+    parent_block_id: &str,
+    tenures: &std::collections::HashMap<String, TenureStart>,
+) -> Result<Option<u128>, String> {
+    let parent_tenure_id = parent_tenure(source, parent_block_id, tenures)?;
+    let Some(parent_tenure_id) = parent_tenure_id else {
+        return Ok(None);
+    };
+    let mut statement = source
+        .prepare_cached(
+            "SELECT coinbase, tx_fees_anchored, tx_fees_streamed_confirmed, \
+                    tx_fees_streamed_produced FROM matured_rewards \
+             WHERE parent_index_block_hash = ?1 AND child_index_block_hash = ?2 AND vtxindex = 0",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query(rusqlite::params![parent_tenure_id, tenure_start_id])
+        .map_err(|error| error.to_string())?;
+    let mut child = None;
+    let mut streamed_by_parent = None;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let amount = |index: usize| -> Result<u128, String> {
+            row.get::<_, String>(index)
+                .map_err(|error| error.to_string())?
+                .parse()
+                .map_err(|_| "malformed reward amount".to_owned())
+        };
+        let (coinbase, anchored, confirmed, produced) =
+            (amount(0)?, amount(1)?, amount(2)?, amount(3)?);
+        if coinbase > 0 && produced == 0 {
+            child = Some(coinbase + anchored + confirmed);
+        } else if coinbase == 0 {
+            streamed_by_parent = Some(produced);
+        }
+    }
+    Ok(match (child, streamed_by_parent) {
+        (Some(child), Some(streamed)) => Some(child + streamed),
+        _ => None,
+    })
+}
+
+/// The tenure a block belongs to, which for an epoch 2.x block is itself.
+fn parent_tenure(
+    source: &rusqlite::Connection,
+    block_id: &str,
+    tenures: &std::collections::HashMap<String, TenureStart>,
+) -> Result<Option<String>, String> {
+    let epoch2: Option<u32> = source
+        .query_row(
+            "SELECT 1 FROM block_headers WHERE index_block_hash = ?1",
+            rusqlite::params![block_id],
+            |row| row.get(0),
+        )
+        .optional_row()?;
+    if epoch2.is_some() {
+        return Ok(Some(block_id.to_owned()));
+    }
+    let consensus_hash: Option<String> = source
+        .query_row(
+            "SELECT consensus_hash FROM nakamoto_block_headers WHERE index_block_hash = ?1",
+            rusqlite::params![block_id],
+            |row| row.get(0),
+        )
+        .optional_row()?;
+    Ok(consensus_hash
+        .and_then(|hash| tenures.get(&hash))
+        .map(|start| start.block_id.clone()))
+}
+
+/// A VRF seed is the hash of the tenure's proof, as `VRFSeed::from_proof` has it.
+fn vrf_seed_of_proof(proof: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(proof).ok()?;
+    Some(*nano_primitives::sha512_256(&bytes).as_bytes())
+}
+
+/// A miner's c32 address as the version byte and hash Clarity answers with.
+fn miner_address(address: &str) -> Option<(u8, [u8; 20])> {
+    use clarity::types::Address as _;
+    let parsed = clarity::types::chainstate::StacksAddress::from_string(address)?;
+    Some((parsed.version(), parsed.bytes().0))
+}
+
+fn parse_hash<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], String> {
+    hex::decode(value)
+        .ok()
+        .and_then(|bytes| <[u8; LENGTH]>::try_from(bytes.as_slice()).ok())
+        .ok_or_else(|| format!("{value} is not {LENGTH} hex bytes"))
+}
+
+/// `Option`-shaped row reads, since a missing row is ordinary here.
+trait OptionalRow<T> {
+    fn optional_row(self) -> Result<Option<T>, String>;
+}
+
+impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
+    fn optional_row(self) -> Result<Option<T>, String> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// Read what a header could be rebuilt from, at a block older than the checkpoint.
@@ -285,15 +910,35 @@ fn probe_header(arguments: &[String]) -> ExitCode {
     let stacks_height = u64::from(vm.height_of(id).unwrap_or(0));
     println!("Stacks height: {stacks_height}");
 
-    let recorded = vm.recorded_block_header(&id);
-    println!(
-        "recorded header: {}",
-        if recorded.is_some() {
-            "yes, so every rebuilt field can be checked"
-        } else {
-            "no, so this is the case the node actually stalls on"
+    // Three different answers, and the point of printing which: a block with no
+    // header at all is one to fetch, a block that is not on this fork is a bug
+    // somewhere else, and a header that is present but incomplete answers some
+    // Clarity reads and stops the node on others.
+    let recorded = match vm.header_knowledge(id) {
+        nano_vm::HeaderKnowledge::Held(known) => {
+            println!(
+                "header: held, {} of 13 fields known{}",
+                known.count(),
+                if known.is_complete() {
+                    String::new()
+                } else {
+                    format!("; NOT KNOWN: {}", known.absent_names().join(", "))
+                }
+            );
+            vm.recorded_block_header(&id)
         }
-    );
+        nano_vm::HeaderKnowledge::NeverCarried => {
+            println!(
+                "header: none, though the block is in this node's index -- \
+                 this is the case the node stalls on, and the case a header export fixes"
+            );
+            None
+        }
+        nano_vm::HeaderKnowledge::Absent => {
+            println!("header: none, and the block is not in this node's index either");
+            None
+        }
+    };
 
     // Tenure height is a Clarity value, so it lives *in* the MARF, and the
     // checkpoint imports the trie graph — which makes a read here look like it
@@ -314,11 +959,15 @@ fn probe_header(arguments: &[String]) -> ExitCode {
                         " (read from this block's trie)"
                     }
                 );
-                if let Some(header) = recorded {
+                if let Some(recorded) = recorded
+                    && let Some(tenure_height) =
+                        recorded.field(nano_vm::HeaderFields::TENURE_HEIGHT, |header| {
+                            header.tenure_height
+                        })
+                {
                     println!(
-                        "recorded tenure height:      {} -> {}",
-                        header.tenure_height,
-                        if header.tenure_height == height {
+                        "recorded tenure height:      {tenure_height} -> {}",
+                        if tenure_height == height {
                             "MATCHES"
                         } else {
                             "DIFFERS"
@@ -331,16 +980,48 @@ fn probe_header(arguments: &[String]) -> ExitCode {
         Err(error) => println!("cannot open the trie at this block: {error:?}"),
     }
     let _ = vm.abort_block();
-    if let Some(header) = recorded {
-        println!(
-            "recorded burn height {}, burn time {}, miner {:?}, reward {}",
-            header.burn_block_height,
-            header.burn_block_time,
-            header.miner_address,
-            header.block_reward
-        );
+    if let Some(recorded) = recorded {
+        print_recorded_fields(&recorded);
     }
     ExitCode::SUCCESS
+}
+
+/// Print the fields a recorded header answers, and name the ones it does not.
+fn print_recorded_fields(recorded: &nano_vm::RecordedHeader) {
+    // Each field asked for by name, so an absent one prints as absent rather than
+    // as the zero sitting in its place.
+    let say = |field: nano_vm::HeaderFields, value: String| {
+        println!(
+            "  {:<20} {}",
+            field.name(),
+            if recorded.known.contains(field) {
+                value
+            } else {
+                "NOT KNOWN HERE".to_owned()
+            }
+        );
+    };
+    let header = recorded.header;
+    say(
+        nano_vm::HeaderFields::BURN_BLOCK_HEIGHT,
+        header.burn_block_height.to_string(),
+    );
+    say(
+        nano_vm::HeaderFields::BURN_BLOCK_TIME,
+        header.burn_block_time.to_string(),
+    );
+    say(
+        nano_vm::HeaderFields::MINER_ADDRESS,
+        format!("{:?}", header.miner_address),
+    );
+    say(
+        nano_vm::HeaderFields::BLOCK_REWARD,
+        header.block_reward.to_string(),
+    );
+    say(
+        nano_vm::HeaderFields::TENURE_START_HEIGHT,
+        header.tenure_start_height.to_string(),
+    );
 }
 
 /// Print the compressed public key a private key signs with.
@@ -927,6 +1608,17 @@ impl CaptureConfig {
             .boot_address(),
             self.pox_calendar()?.0,
         )?;
+        // The headers Clarity can read for everything below the anchor. Without
+        // them a node that starts here answers `none` for the whole ancestry, or
+        // asks a peer for five fields of thirteen and fills the rest with zeros
+        // that read as the chain's answers.
+        if let Err(error) = run_header_export(
+            &node_root.join("chainstate/vm/index.sqlite"),
+            &checkpoint_dir.join(nano_vm::HEADER_EXPORT_FILE),
+            checkpoint.height,
+        ) {
+            return Err(format!("exporting the ancestry's headers failed: {error}"));
+        }
         let checkpoint_manifest = format!(
             "format = \"stacks-core-marf-sqlite-v2\"\ncheckpoint_stacks_height = {}\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = {}\n",
             checkpoint.height, checkpoint.index_block_hash, checkpoint_root, first_bitcoin_height

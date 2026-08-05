@@ -44,6 +44,7 @@ mod p2p_discovery;
 mod p2p_inbound;
 mod p2p_wire;
 mod pox_five_replay;
+mod pre_checkpoint_headers;
 mod pox_locking;
 mod rejected_blocks;
 mod release_dependencies;

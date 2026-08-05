@@ -144,6 +144,11 @@ impl BitcoinBlockContext {
 /// These are the fields behind `get-stacks-block-info?` and `get-tenure-info?`.
 /// A follower that answers them from nowhere returns `none` where the network
 /// returns a value, so every contract that consults chain history diverges.
+///
+/// Every field here is the chain's own answer. A header rebuilt for a block this
+/// node never executed may know only some of them, and that is a
+/// [`RecordedHeader`] — the two are separate types so that a partial
+/// reconstruction cannot be read as a complete header by forgetting to check.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BlockHeader {
     pub burn_header_hash: [u8; 32],
@@ -165,6 +170,220 @@ pub struct BlockHeader {
     pub tenure_height: u32,
     /// The Stacks height that tenure's first block sits at.
     pub tenure_start_height: u32,
+}
+
+/// Which of a header's fields this node holds the chain's own answer for.
+///
+/// A header has no absent state of its own — every field is a number or a hash
+/// — so a reconstruction that could not recover one had nowhere to say so and
+/// wrote a zero. That zero is a Clarity answer, and a contract reading it gets a
+/// confidently wrong miner, reward or tenure height with no error attached.
+/// Recording which fields were actually recovered is what makes the difference
+/// between "the chain says zero" and "this node does not know" expressible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderFields(u16);
+
+impl HeaderFields {
+    pub const BURN_HEADER_HASH: Self = Self(1 << 0);
+    pub const BURN_BLOCK_HEIGHT: Self = Self(1 << 1);
+    pub const BURN_BLOCK_TIME: Self = Self(1 << 2);
+    pub const STACKS_BLOCK_TIME: Self = Self(1 << 3);
+    pub const BLOCK_HEADER_HASH: Self = Self(1 << 4);
+    pub const CONSENSUS_HASH: Self = Self(1 << 5);
+    pub const VRF_SEED: Self = Self(1 << 6);
+    pub const MINER_ADDRESS: Self = Self(1 << 7);
+    pub const BURN_SPEND_TOTAL: Self = Self(1 << 8);
+    pub const BURN_SPEND_WINNER: Self = Self(1 << 9);
+    pub const BLOCK_REWARD: Self = Self(1 << 10);
+    pub const TENURE_HEIGHT: Self = Self(1 << 11);
+    pub const TENURE_START_HEIGHT: Self = Self(1 << 12);
+
+    /// Every field, which is what a block this node executed itself answers.
+    pub const ALL: Self = Self(0x1fff);
+    /// No field, which is what a block whose header was never carried answers.
+    pub const NONE: Self = Self(0);
+    /// What one `/v3/blocks/:id` and one `/v3/sortitions/consensus/:ch` recover
+    /// exactly, and no more: the burn context the epoch lookup in front of every
+    /// `get-stacks-block-info?` needs, plus the block's own identifiers.
+    ///
+    /// Deliberately excludes `burn_block_time`, `vrf_seed` and
+    /// `burn_spend_total`: `xtask backfill-header` diffed a rebuilt header
+    /// against a recorded one and caught all three being *plausible* rather than
+    /// right — the sortition's seed is not the one a header records, and a
+    /// header's `bitcoin_spent` is a running total where `burn_spend_total` is
+    /// one sortition's.
+    pub const PEER_BURN_CONTEXT: Self = Self(
+        Self::BURN_HEADER_HASH.0
+            | Self::BURN_BLOCK_HEIGHT.0
+            | Self::STACKS_BLOCK_TIME.0
+            | Self::BLOCK_HEADER_HASH.0
+            | Self::CONSENSUS_HASH.0,
+    );
+
+    /// The fields of a header for a block that ran under epoch 2.x.
+    ///
+    /// stacks-core reads `timestamp` from the Nakamoto header table only, and a
+    /// tenure height is a Nakamoto notion, so for such a block there is no
+    /// answer to record rather than one nano failed to recover. `ClarityDatabase`
+    /// never asks: `get_block_time` falls back to the burn time and
+    /// `get_block_height_for_tenure_height` answers a 2.x tenure height with
+    /// itself, both before reaching `HeadersDB`.
+    pub const EPOCH_2_BLOCK: Self = Self(
+        Self::ALL.0
+            & !Self::STACKS_BLOCK_TIME.0
+            & !Self::TENURE_HEIGHT.0
+            & !Self::TENURE_START_HEIGHT.0,
+    );
+
+    /// Whether every field in `fields` is known here.
+    #[must_use]
+    pub const fn contains(self, fields: Self) -> bool {
+        self.0 & fields.0 == fields.0
+    }
+
+    /// Both sets of fields.
+    #[must_use]
+    pub const fn union(self, fields: Self) -> Self {
+        Self(self.0 | fields.0)
+    }
+
+    /// Whether this is a complete header: every field the chain's own answer.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.0 == Self::ALL.0
+    }
+
+    /// How many fields are known, so two reconstructions can be compared.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// The bits, for a store that holds them beside the header.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// A field set from stored bits, keeping only the ones this build names.
+    #[must_use]
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// The name of a single field, for an error that has to say which one.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BURN_HEADER_HASH => "burn_header_hash",
+            Self::BURN_BLOCK_HEIGHT => "burn_block_height",
+            Self::BURN_BLOCK_TIME => "burn_block_time",
+            Self::STACKS_BLOCK_TIME => "stacks_block_time",
+            Self::BLOCK_HEADER_HASH => "block_header_hash",
+            Self::CONSENSUS_HASH => "consensus_hash",
+            Self::VRF_SEED => "vrf_seed",
+            Self::MINER_ADDRESS => "miner_address",
+            Self::BURN_SPEND_TOTAL => "burn_spend_total",
+            Self::BURN_SPEND_WINNER => "burn_spend_winner",
+            Self::BLOCK_REWARD => "block_reward",
+            Self::TENURE_HEIGHT => "tenure_height",
+            Self::TENURE_START_HEIGHT => "tenure_start_height",
+            _ => "several fields",
+        }
+    }
+
+    /// The names of the fields not known here, for a report.
+    #[must_use]
+    pub fn absent_names(self) -> Vec<&'static str> {
+        (0..13)
+            .map(|bit| Self(1 << bit))
+            .filter(|field| !self.contains(*field))
+            .map(Self::name)
+            .collect()
+    }
+}
+
+/// A header this node holds, and how much of it is the chain's own answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedHeader {
+    /// The values. A field not named by `known` holds no answer at all: it is
+    /// whatever the reconstruction left there, and must never be read.
+    pub header: BlockHeader,
+    pub known: HeaderFields,
+}
+
+impl RecordedHeader {
+    /// A header for a block this node executed itself: every field is the
+    /// chain's answer, because this node computed the chain.
+    #[must_use]
+    pub const fn complete(header: BlockHeader) -> Self {
+        Self {
+            header,
+            known: HeaderFields::ALL,
+        }
+    }
+
+    /// A header rebuilt from partial sources, knowing only the named fields.
+    #[must_use]
+    pub const fn partial(header: BlockHeader, known: HeaderFields) -> Self {
+        Self { header, known }
+    }
+
+    /// One field, or nothing when this node does not hold the chain's answer.
+    #[must_use]
+    pub fn field<T>(&self, field: HeaderFields, read: impl FnOnce(&BlockHeader) -> T) -> Option<T> {
+        self.known.contains(field).then(|| read(&self.header))
+    }
+
+    /// Whichever of two records for one block knows more, keeping this one on a
+    /// tie.
+    ///
+    /// Not a field-wise union, deliberately. A field a header does not know may be
+    /// one the *chain* has no answer for — an epoch 2.x block has no Nakamoto
+    /// timestamp — and a peer fetch will happily produce a plausible value for it.
+    /// Unioning would take that value and answer where stacks-core answers
+    /// nothing, which is the same class of divergence in the other direction.
+    ///
+    /// The rule that matters is that nothing here can *lose* a field: a node that
+    /// meets a block whose imported header is complete but for its unmatured
+    /// reward asks a peer about it, and the five fields that comes back with must
+    /// not replace the twelve already held.
+    #[must_use]
+    const fn keeping_the_better(self, other: Self) -> Self {
+        if other.known.count() > self.known.count() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+impl From<BlockHeader> for RecordedHeader {
+    fn from(header: BlockHeader) -> Self {
+        Self::complete(header)
+    }
+}
+
+/// What this node can say about a block Clarity asked about.
+///
+/// The three cases are three different faults and want three different
+/// responses, which is why answering `none` for all of them was wrong: a block
+/// off this fork is a bug in whatever resolved a height to it, a block on this
+/// fork with no header is a header to fetch, and a header missing one field is a
+/// header to fetch *again* from a source that carries that field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderKnowledge {
+    /// A header is held, and these are the fields of it that are answers. The
+    /// values come from [`Vm::recorded_block_header`]; they are not repeated here
+    /// so that "what does this node know" stays a cheap question.
+    Held(HeaderFields),
+    /// The block is in this node's block index — it is on this fork and this
+    /// node knows its height — but no header was ever carried for it. That is
+    /// what a checkpoint without exported headers leaves behind.
+    NeverCarried,
+    /// No such block here at all. Not the same as the above: nothing can be
+    /// fetched to fix it, because on this fork the block does not exist.
+    Absent,
 }
 
 /// Everything an accepted block makes durable outside the MARF.
@@ -211,9 +430,12 @@ struct BitcoinContext {
     pox_5_activation_height: u32,
     /// Headers this node has executed, which a query consults before the
     /// store — a block being executed is asked about before it is written.
-    headers: BTreeMap<[u8; 32], BlockHeader>,
+    headers: BTreeMap<[u8; 32], RecordedHeader>,
     /// Every block this node knows about, including the checkpoint's ancestry.
     headers_db: Option<Mutex<rusqlite::Connection>>,
+    /// The block index, to tell a block this node never carried a header for
+    /// from one that is not on its fork at all.
+    index_db: Option<Mutex<rusqlite::Connection>>,
     /// Blocks a contract asked about whose headers are not held, so the node
     /// can fetch them and try the block again rather than seal a root built on
     /// a `none` the network never answered.
@@ -230,9 +452,35 @@ struct BitcoinContext {
     burn_headers: BTreeMap<u32, [u8; 32]>,
 }
 
+/// A recorded header's fixed byte layout, so a store can hold one without serde.
+///
+/// The field values first, then the two bytes saying which of them are answers.
+/// The mask is a suffix so that a row written before it existed decodes as it
+/// always did — as a complete header, which is what the only path that wrote one
+/// (sealing a block this node executed) actually meant.
+fn encode_recorded_header(recorded: &RecordedHeader) -> Vec<u8> {
+    let mut bytes = encode_block_header(&recorded.header);
+    bytes.extend_from_slice(&recorded.known.bits().to_be_bytes());
+    bytes
+}
+
+fn decode_recorded_header(bytes: &[u8]) -> Option<RecordedHeader> {
+    let header = decode_block_header(bytes)?;
+    let known = match bytes.get(BLOCK_HEADER_BYTES..) {
+        Some([high, low]) => HeaderFields::from_bits(u16::from_be_bytes([*high, *low])),
+        // A row from before the mask, which only the seal wrote.
+        Some([]) | None => HeaderFields::ALL,
+        Some(_) => return None,
+    };
+    Some(RecordedHeader { header, known })
+}
+
+/// How many bytes the field values themselves occupy.
+const BLOCK_HEADER_BYTES: usize = 213;
+
 /// A header's fixed byte layout, so a store can hold one without serde.
 fn encode_block_header(header: &BlockHeader) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(180);
+    let mut bytes = Vec::with_capacity(BLOCK_HEADER_BYTES);
     bytes.extend_from_slice(&header.burn_header_hash);
     bytes.extend_from_slice(&header.burn_block_height.to_be_bytes());
     bytes.extend_from_slice(&header.burn_block_time.to_be_bytes());
@@ -364,6 +612,7 @@ static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     pox_5_activation_height: 0,
     headers: BTreeMap::new(),
     headers_db: None,
+    index_db: None,
     tenure_starts: BTreeMap::new(),
     burn_headers: BTreeMap::new(),
 };
@@ -391,7 +640,7 @@ impl BitcoinContext {
         Ok(())
     }
 
-    pub(crate) fn header(&self, id: &StacksBlockId) -> Option<BlockHeader> {
+    pub(crate) fn header(&self, id: &StacksBlockId) -> Option<RecordedHeader> {
         if let Some(header) = self.headers.get(id.as_bytes()) {
             return Some(*header);
         }
@@ -405,26 +654,114 @@ impl BitcoinContext {
                 )
                 .ok()
         };
-        if bytes.is_none() {
-            // A checkpointed node holds the block index for all of history but
-            // headers only from the anchor forward, so a contract asking about
-            // an older block gets `none` — and a contract that reads `none` as
-            // "no such block" takes its error path and seals a state root the
-            // network never had. That is silent: unlike the epoch lookup, which
-            // fails loudly, nothing here says a header was wanted and missing.
-            //
-            // So it is written down, and the node backfills what was asked for
-            // before it tries the block again.
-            if let Ok(mut missing) = self.missing_headers.lock()
-                && !missing.contains(id.as_bytes())
-            {
-                missing.push(*id.as_bytes());
+        decode_recorded_header(&bytes?)
+    }
+
+    /// What this node can say about a block, before any field is read.
+    pub(crate) fn knowledge(&self, id: &StacksBlockId) -> HeaderKnowledge {
+        if let Some(header) = self.header(id) {
+            return HeaderKnowledge::Held(header.known);
+        }
+        // A checkpointed node holds the block index for all of history but
+        // headers only from the anchor forward. Which of those two a lookup has
+        // landed in decides what to do about it, so the index is asked rather
+        // than assumed: a block that is here has a header to fetch, and a block
+        // that is not is a bug in whatever resolved a height to it.
+        if self.in_index(id) {
+            HeaderKnowledge::NeverCarried
+        } else {
+            HeaderKnowledge::Absent
+        }
+    }
+
+    /// Whether the block index holds this block, so it is on this node's fork.
+    ///
+    /// Read through a connection of the context's own, for the same reason the
+    /// headers are: the store is mutably borrowed while Clarity runs. A read that
+    /// cannot be made answers "yes", because the consequences are asymmetric —
+    /// asking a peer for a header this node turns out not to need costs a
+    /// request, while declaring a block absent that is really here would hide a
+    /// header that could have been fetched.
+    fn in_index(&self, id: &StacksBlockId) -> bool {
+        let Some(index) = self.index_db.as_ref() else {
+            return true;
+        };
+        let Ok(guard) = index.lock() else {
+            return true;
+        };
+        guard
+            .query_row(
+                "SELECT 1 FROM marf_block WHERE hash = ?1",
+                params![id.as_bytes().as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_or(true, |found| found.is_some())
+    }
+
+    /// One field of a block's header, or nothing when this node has no answer.
+    ///
+    /// Absence here is deliberately *not* a Clarity `none`.
+    /// `ClarityDatabase::get_miner_address` and its siblings map a `None` from
+    /// `HeadersDB` to a fatal `Expect` — "Failed to get block data", "FATAL: no
+    /// total burnchain token spend record for block" — and never to a Clarity
+    /// value. The `none`s a contract can see come from the guards *above* the
+    /// lookup instead: a height at or beyond the current one, height zero, or a
+    /// reward whose maturity window has not passed. So a block that reaches
+    /// `HeadersDB` at all is one the network answered for, and answering `none`
+    /// there would be a divergence of its own — and a quiet one, since the
+    /// contract would take an error path and seal a root nobody else has.
+    ///
+    /// Stopping is therefore the only safe failure. It matches stacks-core's own
+    /// behaviour for a block it does not have, it is loud, and it names the
+    /// field, so the node can fetch what it is missing and try the block again
+    /// instead of writing down an answer the chain never gave.
+    fn field<T>(
+        &self,
+        id: &StacksBlockId,
+        field: HeaderFields,
+        read: impl FnOnce(&BlockHeader) -> T,
+    ) -> Option<T> {
+        match self.header(id) {
+            Some(header) => {
+                let answer = header.field(field, read);
+                if answer.is_none() {
+                    self.want_header(id, &format!("holds no {}", field.name()));
+                }
+                answer
             }
-            if std::env::var_os("NANO_TRACE_WRITES").is_some() {
-                println!("no header for block {id}");
+            None if self.in_index(id) => {
+                self.want_header(id, "has no header here at all");
+                None
+            }
+            None => {
+                // Nothing to fetch: on this fork there is no such block, so a
+                // backfill would either fail or write down a block from another
+                // chain. Whatever resolved a height to this identifier is the
+                // fault, and the `Expect` this produces is where it surfaces.
+                if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+                    println!("block {id} is not on this fork, so it has no {}", field.name());
+                }
+                None
             }
         }
-        decode_block_header(&bytes?)
+    }
+
+    /// Note a block whose header this node needs and does not fully hold.
+    ///
+    /// Unlike the epoch lookup, which fails loudly and names the block, a field
+    /// read that comes up empty leaves the block unnamed — so it is written down
+    /// here, and the node fetches what was asked for before trying the block
+    /// again.
+    fn want_header(&self, id: &StacksBlockId, why: &str) {
+        if let Ok(mut missing) = self.missing_headers.lock()
+            && !missing.contains(id.as_bytes())
+        {
+            missing.push(*id.as_bytes());
+        }
+        if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+            println!("block {id} {why}");
+        }
     }
 
     /// The Bitcoin block at a burn height, from memory or from the store.
@@ -466,16 +803,18 @@ impl HeadersDB for BitcoinContext {
         id_bhh: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<BlockHeaderHash> {
-        self.header(id_bhh)
-            .map(|header| BlockHeaderHash(header.block_header_hash))
+        self.field(id_bhh, HeaderFields::BLOCK_HEADER_HASH, |header| {
+            BlockHeaderHash(header.block_header_hash)
+        })
     }
 
     fn get_burn_header_hash_for_block(
         &self,
         id_bhh: &StacksBlockId,
     ) -> Option<BurnchainHeaderHash> {
-        self.header(id_bhh)
-            .map(|header| BurnchainHeaderHash(header.burn_header_hash))
+        self.field(id_bhh, HeaderFields::BURN_HEADER_HASH, |header| {
+            BurnchainHeaderHash(header.burn_header_hash)
+        })
     }
 
     fn get_consensus_hash_for_block(
@@ -483,8 +822,9 @@ impl HeadersDB for BitcoinContext {
         id_bhh: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<ConsensusHash> {
-        self.header(id_bhh)
-            .map(|header| ConsensusHash(header.consensus_hash))
+        self.field(id_bhh, HeaderFields::CONSENSUS_HASH, |header| {
+            ConsensusHash(header.consensus_hash)
+        })
     }
 
     fn get_vrf_seed_for_block(
@@ -493,11 +833,15 @@ impl HeadersDB for BitcoinContext {
         _tip: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<VRFSeed> {
-        self.header(id_bhh).map(|header| VRFSeed(header.vrf_seed))
+        self.field(id_bhh, HeaderFields::VRF_SEED, |header| {
+            VRFSeed(header.vrf_seed)
+        })
     }
 
     fn get_stacks_block_time_for_block(&self, id_bhh: &StacksBlockId) -> Option<u64> {
-        self.header(id_bhh).map(|header| header.stacks_block_time)
+        self.field(id_bhh, HeaderFields::STACKS_BLOCK_TIME, |header| {
+            header.stacks_block_time
+        })
     }
 
     fn get_burn_block_time_for_block(
@@ -505,11 +849,15 @@ impl HeadersDB for BitcoinContext {
         id_bhh: &StacksBlockId,
         _epoch: Option<&StacksEpochId>,
     ) -> Option<u64> {
-        self.header(id_bhh).map(|header| header.burn_block_time)
+        self.field(id_bhh, HeaderFields::BURN_BLOCK_TIME, |header| {
+            header.burn_block_time
+        })
     }
 
     fn get_burn_block_height_for_block(&self, id_bhh: &StacksBlockId) -> Option<u32> {
-        self.header(id_bhh).map(|header| header.burn_block_height)
+        self.field(id_bhh, HeaderFields::BURN_BLOCK_HEIGHT, |header| {
+            header.burn_block_height
+        })
     }
 
     fn get_miner_address(
@@ -518,9 +866,10 @@ impl HeadersDB for BitcoinContext {
         _tip: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<StacksAddress> {
-        self.header(id_bhh).and_then(|header| {
-            StacksAddress::new(header.miner_address.0, Hash160(header.miner_address.1)).ok()
+        self.field(id_bhh, HeaderFields::MINER_ADDRESS, |header| {
+            header.miner_address
         })
+        .and_then(|(version, hash)| StacksAddress::new(version, Hash160(hash)).ok())
     }
 
     fn get_burnchain_tokens_spent_for_block(
@@ -529,7 +878,9 @@ impl HeadersDB for BitcoinContext {
         _tip: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<u128> {
-        self.header(id_bhh).map(|header| header.burn_spend_total)
+        self.field(id_bhh, HeaderFields::BURN_SPEND_TOTAL, |header| {
+            header.burn_spend_total
+        })
     }
 
     fn get_burnchain_tokens_spent_for_winning_block(
@@ -538,7 +889,9 @@ impl HeadersDB for BitcoinContext {
         _tip: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<u128> {
-        self.header(id_bhh).map(|header| header.burn_spend_winner)
+        self.field(id_bhh, HeaderFields::BURN_SPEND_WINNER, |header| {
+            header.burn_spend_winner
+        })
     }
 
     fn get_tokens_earned_for_block(
@@ -547,15 +900,35 @@ impl HeadersDB for BitcoinContext {
         _tip: &StacksBlockId,
         _epoch: &StacksEpochId,
     ) -> Option<u128> {
-        self.header(id_bhh).map(|header| header.block_reward)
+        self.field(id_bhh, HeaderFields::BLOCK_REWARD, |header| {
+            header.block_reward
+        })
     }
 
+    /// The Stacks height a tenure began at.
+    ///
+    /// Memory first, because that is the fork being executed, and the store only
+    /// for tenures older than anything this node ran. Unlike every other read
+    /// here, `ClarityDatabase` turns a `None` from this one into a Clarity
+    /// `none` rather than an error — so a checkpointed node that answered from
+    /// memory alone told a contract a pre-checkpoint tenure never happened, and
+    /// nothing raised a word about it.
     fn get_stacks_height_for_tenure_height(
         &self,
         _tip: &StacksBlockId,
         tenure_height: u32,
     ) -> Option<u32> {
-        self.tenure_starts.get(&tenure_height).copied()
+        if let Some(height) = self.tenure_starts.get(&tenure_height) {
+            return Some(*height);
+        }
+        let guard = self.headers_db.as_ref()?.lock().ok()?;
+        guard
+            .query_row(
+                "SELECT stacks_height FROM tenure_start WHERE tenure_height = ?1",
+                params![tenure_height],
+                |row| row.get(0),
+            )
+            .ok()
     }
 }
 
@@ -657,8 +1030,13 @@ impl BurnStateDB for BitcoinContext {
     ) -> Option<SortitionId> {
         self.headers
             .values()
-            .find(|header| header.consensus_hash == consensus_hash.0)
-            .map(|header| sortition_of_burn_height(header.burn_block_height))
+            .filter(|recorded| {
+                recorded
+                    .known
+                    .contains(HeaderFields::CONSENSUS_HASH.union(HeaderFields::BURN_BLOCK_HEIGHT))
+            })
+            .find(|recorded| recorded.header.consensus_hash == consensus_hash.0)
+            .map(|recorded| sortition_of_burn_height(recorded.header.burn_block_height))
             .or_else(|| Some(sortition_of_burn_height(self.height)))
     }
 
@@ -760,12 +1138,17 @@ impl Vm {
             .side_store_path()
             .and_then(|path| rusqlite::Connection::open(path).ok())
             .map(Mutex::new);
+        let index_db = store
+            .marf_path()
+            .and_then(|path| rusqlite::Connection::open(path).ok())
+            .map(Mutex::new);
         Self {
             modules: native_module_cache(store.side_store_path().as_deref()),
             store,
             context: BitcoinContext {
                 mainnet,
                 headers_db,
+                index_db,
                 ..BitcoinContext::default()
             },
         }
@@ -780,10 +1163,63 @@ impl Vm {
         self.recorded_header(block).is_some()
     }
 
-    /// What this node knows about a block, for tests and diagnostics.
+    /// A block's header when this node holds *all* of it.
+    ///
+    /// A partially reconstructed header is deliberately not one: every caller
+    /// here reads a field straight off the result, and a header rebuilt for a
+    /// block this node never executed has no answer for most of them. Ask
+    /// [`Vm::header_knowledge`] to see a partial one.
     #[must_use]
     pub fn recorded_header(&self, block: [u8; 32]) -> Option<BlockHeader> {
-        self.context.header(&StacksBlockId(block))
+        self.context
+            .header(&StacksBlockId(block))
+            .filter(|recorded| recorded.known.is_complete())
+            .map(|recorded| recorded.header)
+    }
+
+    /// What this node can say about a block: all of a header, some of one, or
+    /// which kind of nothing.
+    #[must_use]
+    pub fn header_knowledge(&self, block: [u8; 32]) -> HeaderKnowledge {
+        self.context.knowledge(&StacksBlockId(block))
+    }
+
+    /// The Clarity database this VM reads the chain through, over the block that
+    /// is open.
+    ///
+    /// The only way to ask a *Clarity-level* question — `get-stacks-block-info?`
+    /// and `get-tenure-info?` reach a header through guards that decide when the
+    /// answer is a legitimate `none`, and those guards are the difference between
+    /// "the chain says nothing here" and "this node cannot say". Asking
+    /// `HeadersDB` directly skips them.
+    pub fn clarity_db(&mut self) -> ClarityDatabase<'_> {
+        clarity_database(&mut self.store, &self.context)
+    }
+
+    /// What Clarity reads the chain through, for a test that has to ask exactly
+    /// what Clarity asks.
+    ///
+    /// A header's fields are only reachable this way — a `HeadersDB` answer is
+    /// per field, and comparing headers as whole values would compare the zeros
+    /// sitting where an unknown field is against real answers.
+    #[must_use]
+    pub const fn chain_context(&self) -> &impl ChainContext {
+        &self.context
+    }
+
+    /// Take a checkpoint's header export into a state that already exists.
+    ///
+    /// A checkpoint import does this itself. This is for the other case, which is
+    /// the common one while this is new: a state imported before the export
+    /// existed, which holds the trie for all of history and headers only from the
+    /// anchor forward, and would otherwise have to be imported again from a
+    /// 380 GB checkpoint to gain them.
+    pub fn import_block_headers(&mut self, export: &Path) -> Result<usize, MarfStoreError> {
+        let imported = self.store.import_block_headers(export)?;
+        // The in-memory map is not seeded from it: it holds the block being
+        // executed and its recent neighbours, and eight million imported rows
+        // are exactly what belongs on disk instead.
+        Ok(imported)
     }
 
     /// The deepest state on disk, which is where a restart resumes.
@@ -864,13 +1300,17 @@ impl Vm {
         self.context.take_missing_headers()
     }
 
-    /// The header this node holds for a block, if it holds one.
+    /// The header this node holds for a block, complete or not.
     #[must_use]
-    pub fn recorded_block_header(&self, block: &[u8; 32]) -> Option<BlockHeader> {
+    pub fn recorded_block_header(&self, block: &[u8; 32]) -> Option<RecordedHeader> {
         self.context.header(&StacksBlockId(*block))
     }
 
     /// Write a header down for a block this node is not sealing.
+    ///
+    /// Every field is taken to be the chain's own answer, which it is for a block
+    /// this node executed. A reconstruction that could not recover them all must
+    /// use [`Vm::record_partial_header`] and say which it has.
     ///
     /// The failure is returned rather than printed: a header a later block reads
     /// through is not optional, and a caller that cannot write one has to stop
@@ -880,8 +1320,35 @@ impl Vm {
         block: [u8; 32],
         header: BlockHeader,
     ) -> Result<(), MarfStoreError> {
-        self.store.write_block_header(block, &header)?;
-        self.remember_block_header(block, header);
+        self.record_recorded_header(block, RecordedHeader::complete(header))
+    }
+
+    /// Write down the part of a header this node could recover.
+    ///
+    /// The unnamed fields are not zero, absent or defaulted: they have no value
+    /// at all, and a Clarity read of one stops the node with the field named
+    /// rather than answering. See `BitcoinContext::field` for why stopping is the
+    /// only safe failure here.
+    pub fn record_partial_header(
+        &mut self,
+        block: [u8; 32],
+        header: BlockHeader,
+        known: HeaderFields,
+    ) -> Result<(), MarfStoreError> {
+        self.record_recorded_header(block, RecordedHeader::partial(header, known))
+    }
+
+    fn record_recorded_header(
+        &mut self,
+        block: [u8; 32],
+        recorded: RecordedHeader,
+    ) -> Result<(), MarfStoreError> {
+        let recorded = self
+            .context
+            .header(&StacksBlockId(block))
+            .map_or(recorded, |held| held.keeping_the_better(recorded));
+        self.store.write_block_header(block, &recorded)?;
+        self.remember_block_header(block, recorded);
         Ok(())
     }
 
@@ -891,15 +1358,31 @@ impl Vm {
     /// block being sealed it must not run until the MARF has committed, or a
     /// block that failed to seal would fix its tenure's start height for every
     /// later block.
-    fn remember_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
-        self.context
-            .tenure_starts
-            .entry(header.tenure_height)
-            .or_insert(header.tenure_start_height);
-        self.context
-            .burn_headers
-            .insert(header.burn_block_height, header.burn_header_hash);
-        self.context.headers.insert(block, header);
+    ///
+    /// A field the header does not know is not remembered either. A partial
+    /// header claiming tenure 0 started at height 0 would answer
+    /// `get-tenure-info?` for a tenure it knows nothing about, and first-write
+    /// wins, so it would keep answering.
+    fn remember_block_header(&mut self, block: [u8; 32], recorded: RecordedHeader) {
+        let header = recorded.header;
+        if recorded
+            .known
+            .contains(HeaderFields::TENURE_HEIGHT.union(HeaderFields::TENURE_START_HEIGHT))
+        {
+            self.context
+                .tenure_starts
+                .entry(header.tenure_height)
+                .or_insert(header.tenure_start_height);
+        }
+        if recorded
+            .known
+            .contains(HeaderFields::BURN_BLOCK_HEIGHT.union(HeaderFields::BURN_HEADER_HASH))
+        {
+            self.context
+                .burn_headers
+                .insert(header.burn_block_height, header.burn_header_hash);
+        }
+        self.context.headers.insert(block, recorded);
     }
 
     /// Seal a block together with everything that describes it.
@@ -915,7 +1398,7 @@ impl Vm {
         commit: &BlockCommit,
     ) -> Result<StateRoot, MarfStoreError> {
         let root = self.store.commit_to(block, commit)?;
-        self.remember_block_header(block, commit.header);
+        self.remember_block_header(block, RecordedHeader::complete(commit.header));
         Ok(root)
     }
 
@@ -1389,6 +1872,11 @@ pub enum MarfStoreError {
     TransactionInProgress,
     NoTransaction,
     BitcoinHeightOverflow(u64),
+    /// A header export row that could not be read as a header. Refused rather
+    /// than skipped: a missing header is answered as `none`, and a checkpoint
+    /// quietly short of some of its ancestry is what this whole path exists to
+    /// stop.
+    MalformedHeaderExport,
 }
 
 impl std::fmt::Display for MarfStoreError {
@@ -1403,6 +1891,9 @@ impl std::fmt::Display for MarfStoreError {
             Self::NoTransaction => formatter.write_str("no active VM transaction"),
             Self::BitcoinHeightOverflow(height) => {
                 write!(formatter, "Bitcoin height {height} exceeds u32")
+            }
+            Self::MalformedHeaderExport => {
+                formatter.write_str("the checkpoint's header export holds a row that is not a header")
             }
         }
     }
@@ -1620,11 +2111,11 @@ impl MarfStore {
     fn write_block_header(
         &self,
         block: [u8; 32],
-        header: &BlockHeader,
+        recorded: &RecordedHeader,
     ) -> Result<(), MarfStoreError> {
         self.side_store
             .prepare_cached("INSERT OR REPLACE INTO block_header (block_id, data) VALUES (?1, ?2)")?
-            .execute(params![block.as_slice(), encode_block_header(header)])?;
+            .execute(params![block.as_slice(), encode_recorded_header(recorded)])?;
         Ok(())
     }
 
@@ -1669,6 +2160,26 @@ impl MarfStore {
     /// Where this store keeps what is not in the trie, when it is on disk.
     fn side_store_path(&self) -> Option<std::path::PathBuf> {
         self.side_store.path().map(std::path::PathBuf::from)
+    }
+
+    /// Take a header export into this store's `block_header` table.
+    pub fn import_block_headers(&self, export: &Path) -> Result<usize, MarfStoreError> {
+        import_block_headers(&self.side_store, export)
+    }
+
+    /// Where the trie itself lives, when it is on disk.
+    ///
+    /// Derived from the side store rather than asked of the MARF, because the two
+    /// files are placed in one directory by `open` and nothing else may name them.
+    ///
+    /// The file name is checked, not assumed: an in-memory store reports a path
+    /// that names no file, and deriving a sibling from that produced a relative
+    /// `marf.sqlite` — which a read connection then *created*, in whatever
+    /// directory the process happened to be in. Two of them turned up in crate
+    /// roots after one test run.
+    fn marf_path(&self) -> Option<std::path::PathBuf> {
+        let path = self.side_store_path()?;
+        (path.file_name()? == CLARITY_FILE).then(|| path.with_file_name(MARF_FILE))
     }
 
     /// Replace a contract's stored definition with one the interpreter can run.
@@ -1840,7 +2351,7 @@ impl MarfStore {
             self.side_store.execute_batch("PRAGMA synchronous = FULL")?;
             let transaction = self.side_store.unchecked_transaction()?;
             self.write_metadata(block)?;
-            self.write_block_header(block, &commit.header)?;
+            self.write_block_header(block, &RecordedHeader::complete(commit.header))?;
             self.write_ledger(block, &commit.ledger)?;
             transaction.commit()?;
             Ok(())
@@ -2030,6 +2541,15 @@ CREATE TABLE IF NOT EXISTS chain_ledger (
     data BLOB NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS chain_ledger_sequence ON chain_ledger(sequence);
+-- The Stacks height each tenure began at, for tenures older than anything this
+-- node executed. `get-tenure-info?` reaches every field of a tenure through this
+-- mapping, and a node that could not answer it told a contract the tenure never
+-- happened -- the one header read `ClarityDatabase` turns into a Clarity `none`
+-- rather than an error.
+CREATE TABLE IF NOT EXISTS tenure_start (
+    tenure_height INTEGER PRIMARY KEY,
+    stacks_height INTEGER NOT NULL
+) WITHOUT ROWID;
 -- The Bitcoin block at each burn height. A fact about Bitcoin, not about any
 -- Stacks block, so it is written as it is learned rather than with a seal.
 CREATE TABLE IF NOT EXISTS burn_header (
@@ -2077,8 +2597,139 @@ fn import(
         // missing values its leaves name, which reads as a finished import.
         let importing = open_side_store_for_import(&clarity_path)?;
         import_side_store(&importing, checkpoint, Some(&marf_path))?;
+        // Inside the mark as well. A state whose trie covers the ancestry but
+        // whose headers stop at the anchor is exactly the state this import
+        // exists to stop shipping: it answers Clarity for history it holds no
+        // header for, and it does so silently.
+        import_block_headers(&importing, &checkpoint.join(HEADER_EXPORT_FILE))?;
     }
     Ok(unfinished.finish(&[marf_path, clarity_path])?)
+}
+
+/// What a checkpoint calls the headers of the ancestry it carries.
+pub const HEADER_EXPORT_FILE: &str = "block-headers.sqlite";
+
+/// The header export's own schema, so a writer and this reader share one.
+///
+/// Typed columns rather than nano's packed encoding: a checkpoint artifact that
+/// can be queried with `sqlite3` is worth more than the bytes it saves, and the
+/// encoding is this crate's business and should not be a file format anyone else
+/// has to reproduce.
+pub const HEADER_EXPORT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS exported_header (
+    block_id BLOB PRIMARY KEY,
+    stacks_height INTEGER NOT NULL,
+    burn_header_hash BLOB NOT NULL,
+    burn_block_height INTEGER NOT NULL,
+    burn_block_time INTEGER NOT NULL,
+    stacks_block_time INTEGER NOT NULL,
+    block_header_hash BLOB NOT NULL,
+    consensus_hash BLOB NOT NULL,
+    vrf_seed BLOB NOT NULL,
+    miner_version INTEGER NOT NULL,
+    miner_hash BLOB NOT NULL,
+    -- The three amounts are u128 in Clarity, so they travel as decimal text,
+    -- which is how stacks-core stores them too.
+    burn_spend_total TEXT NOT NULL,
+    burn_spend_winner TEXT NOT NULL,
+    block_reward TEXT NOT NULL,
+    tenure_height INTEGER NOT NULL,
+    tenure_start_height INTEGER NOT NULL,
+    -- Which of the above are the chain's own answers. A column, not an
+    -- assumption: an epoch 2.x block has no Nakamoto timestamp and no tenure
+    -- height, and a block whose miner payment the archive does not hold has no
+    -- miner or burn spends. Zeros in those columns are not answers.
+    known INTEGER NOT NULL
+) WITHOUT ROWID;
+";
+
+/// Read a header export into a side store's `block_header` table.
+///
+/// Nothing to do when the checkpoint carries no export, which is the state every
+/// checkpoint captured before this existed is in: the node then falls back to
+/// asking a peer, block by block, as it meets them.
+fn import_block_headers(
+    destination: &rusqlite::Connection,
+    export: &Path,
+) -> Result<usize, MarfStoreError> {
+    if !export.exists() {
+        return Ok(0);
+    }
+    let source = rusqlite::Connection::open_with_flags(
+        export,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut rows = source.prepare(
+        "SELECT block_id, burn_header_hash, burn_block_height, burn_block_time, \
+                stacks_block_time, block_header_hash, consensus_hash, vrf_seed, \
+                miner_version, miner_hash, burn_spend_total, burn_spend_winner, \
+                block_reward, tenure_height, tenure_start_height, known \
+         FROM exported_header",
+    )?;
+    let mut records = rows.query([])?;
+    let transaction = destination.unchecked_transaction()?;
+    let mut imported = 0;
+    while let Some(row) = records.next()? {
+        let block = row
+            .get::<_, Vec<u8>>(0)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .ok_or(MarfStoreError::MalformedHeaderExport)?;
+        let recorded = exported_header(row).ok_or(MarfStoreError::MalformedHeaderExport)?;
+        // Replaced rather than merged, unlike `Vm::record_recorded_header`: an
+        // export stops at the checkpoint's height and a node's own headers start
+        // above it, so the only row this can land on is a peer reconstruction of
+        // the same block — which knows five fields where this knows the chain's.
+        destination
+            .prepare_cached(
+                "INSERT OR REPLACE INTO block_header (block_id, data) VALUES (?1, ?2)",
+            )?
+            .execute(params![block.as_slice(), encode_recorded_header(&recorded)])?;
+        // The tenure mapping beside it, from the blocks that know their tenure.
+        // Ignored rather than replaced: a tenure's start is its lowest block, and
+        // the first row to name it is the one the export walked from.
+        if recorded
+            .known
+            .contains(HeaderFields::TENURE_HEIGHT.union(HeaderFields::TENURE_START_HEIGHT))
+        {
+            destination
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO tenure_start (tenure_height, stacks_height) \
+                     VALUES (?1, ?2)",
+                )?
+                .execute(params![
+                    recorded.header.tenure_height,
+                    recorded.header.tenure_start_height
+                ])?;
+        }
+        imported += 1;
+    }
+    transaction.commit()?;
+    Ok(imported)
+}
+
+/// One exported row as the header it describes.
+fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
+    let bytes = |index: usize| -> Option<Vec<u8>> { row.get(index).ok() };
+    let amount = |index: usize| -> Option<u128> { row.get::<_, String>(index).ok()?.parse().ok() };
+    Some(RecordedHeader {
+        header: BlockHeader {
+            burn_header_hash: bytes(1)?.as_slice().try_into().ok()?,
+            burn_block_height: row.get(2).ok()?,
+            burn_block_time: row.get(3).ok()?,
+            stacks_block_time: row.get(4).ok()?,
+            block_header_hash: bytes(5)?.as_slice().try_into().ok()?,
+            consensus_hash: bytes(6)?.as_slice().try_into().ok()?,
+            vrf_seed: bytes(7)?.as_slice().try_into().ok()?,
+            miner_address: (row.get(8).ok()?, bytes(9)?.as_slice().try_into().ok()?),
+            burn_spend_total: amount(10)?,
+            burn_spend_winner: amount(11)?,
+            block_reward: amount(12)?,
+            tenure_height: row.get(13).ok()?,
+            tenure_start_height: row.get(14).ok()?,
+        },
+        known: HeaderFields::from_bits(row.get(15).ok()?),
+    })
 }
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
@@ -3552,13 +4203,15 @@ mod tests {
     use std::path::Path;
 
     use clar2wasm::ModuleCache;
-    use clarity::vm::database::ClarityBackingStore;
     use clarity::vm::database::clarity_store::make_contract_hash_key;
+    use clarity::vm::database::{ClarityBackingStore, HeadersDB};
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
     use clarity::vm::{ClarityVersion, Value};
     use nano_primitives::{Network, TrieHash};
 
-    use super::{BlockCommit, BlockHeader};
+    use stacks_common::types::StacksEpochId;
+
+    use super::{BlockCommit, BlockHeader, HeaderFields, HeaderKnowledge, RecordedHeader};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -4088,6 +4741,183 @@ mod tests {
                 height
             );
         }
+    }
+
+    /// A header's fields and which of them are answers survive the store.
+    #[test]
+    fn a_recorded_header_round_trips_with_the_fields_it_knows() {
+        let header = BlockHeader {
+            burn_header_hash: [0x11; 32],
+            burn_block_height: 960_231,
+            burn_block_time: 1_785_400_408,
+            stacks_block_time: 1_785_400_646,
+            block_header_hash: [0x22; 32],
+            consensus_hash: [0x33; 20],
+            vrf_seed: [0x44; 32],
+            miner_address: (22, [0x55; 20]),
+            burn_spend_total: 145_000,
+            burn_spend_winner: 30_000,
+            block_reward: 1_001_260,
+            tenure_height: 251_320,
+            tenure_start_height: 8_665_575,
+        };
+        for known in [
+            HeaderFields::ALL,
+            HeaderFields::PEER_BURN_CONTEXT,
+            HeaderFields::EPOCH_2_BLOCK,
+            HeaderFields::NONE,
+        ] {
+            let recorded = RecordedHeader::partial(header, known);
+            assert_eq!(
+                super::decode_recorded_header(&super::encode_recorded_header(&recorded)),
+                Some(recorded)
+            );
+        }
+        // A row written before the mask existed, which only the seal wrote, and
+        // the seal only ever wrote headers for blocks this node executed.
+        assert_eq!(
+            super::decode_recorded_header(&super::encode_block_header(&header)),
+            Some(RecordedHeader::complete(header))
+        );
+    }
+
+    /// A field a partial header does not know is not answered as a zero.
+    ///
+    /// The whole of the bug this guards: a reconstruction that recovered five
+    /// fields wrote zeros in the other eight, and Clarity read those zeros as the
+    /// chain's answer for the miner, the reward and the burn spends. Absent here
+    /// means `ClarityDatabase` raises rather than answering, which is what
+    /// stacks-core does for a block it has no header for.
+    #[test]
+    fn a_partial_header_answers_nothing_where_it_knows_nothing() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        let block = [7; 32];
+        vm.record_partial_header(
+            block,
+            BlockHeader {
+                burn_header_hash: [0x4a; 32],
+                burn_block_height: 960_231,
+                stacks_block_time: 1_785_400_646,
+                block_header_hash: [0x2c; 32],
+                consensus_hash: [0x3d; 20],
+                ..BlockHeader::default()
+            },
+            HeaderFields::PEER_BURN_CONTEXT,
+        )
+        .expect("record a partial header");
+        let id = StacksBlockId(block);
+        let context = vm.chain_context();
+        let epoch = StacksEpochId::Epoch40;
+        assert_eq!(
+            context.get_burn_block_height_for_block(&id),
+            Some(960_231),
+            "a field the reconstruction recovered is answered"
+        );
+        assert_eq!(
+            context.get_miner_address(&id, &id, &epoch),
+            None,
+            "a field it did not recover is absent, not the burn address"
+        );
+        assert_eq!(context.get_tokens_earned_for_block(&id, &id, &epoch), None);
+        assert_eq!(
+            context.get_burnchain_tokens_spent_for_block(&id, &id, &epoch),
+            None
+        );
+        assert_eq!(context.get_vrf_seed_for_block(&id, &id, &epoch), None);
+        assert_eq!(context.get_burn_block_time_for_block(&id, Some(&epoch)), None);
+        assert_eq!(
+            context.get_stacks_height_for_tenure_height(&id, 0),
+            None,
+            "and a tenure it knows nothing about did not start at height zero"
+        );
+        // The block is named as wanted, which is what makes the node fetch the
+        // rest rather than stall on the same block for as long as it runs.
+        assert!(vm.take_missing_headers().contains(&block));
+    }
+
+    /// A peer's five fields cannot replace an export's thirteen.
+    ///
+    /// The node asks a peer about any block a field read came up empty for, and a
+    /// header can be short of a field the *chain* has no answer for — an unmatured
+    /// reward, an epoch 2.x timestamp. So the block a checkpoint answered
+    /// completely for is exactly the block a peer gets asked about, and a write
+    /// that took the peer's word for it would undo the import.
+    #[test]
+    fn a_partial_header_cannot_overwrite_what_is_already_known() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        let block = [4; 32];
+        let complete = BlockHeader {
+            miner_address: (22, [0x77; 20]),
+            block_reward: 1_000_000_000,
+            tenure_height: 9,
+            tenure_start_height: 5,
+            ..BlockHeader::default()
+        };
+        vm.record_block_header(block, complete)
+            .expect("record a complete header");
+        vm.record_partial_header(
+            block,
+            BlockHeader {
+                burn_block_height: 960_231,
+                ..BlockHeader::default()
+            },
+            HeaderFields::PEER_BURN_CONTEXT,
+        )
+        .expect("record a partial header over it");
+        assert_eq!(
+            vm.recorded_block_header(&block),
+            Some(RecordedHeader::complete(complete)),
+            "the complete header stands"
+        );
+        // And the other way round, which is the repair a backfill is for.
+        let other = [5; 32];
+        vm.record_partial_header(other, complete, HeaderFields::PEER_BURN_CONTEXT)
+            .expect("record a partial header");
+        vm.record_block_header(other, complete)
+            .expect("record a complete one over it");
+        assert_eq!(
+            vm.recorded_block_header(&other),
+            Some(RecordedHeader::complete(complete))
+        );
+    }
+
+    /// A complete header answers every field, and says so.
+    #[test]
+    fn a_header_this_node_executed_answers_every_field() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        let block = [8; 32];
+        vm.record_block_header(
+            block,
+            BlockHeader {
+                miner_address: (26, [0x99; 20]),
+                block_reward: 1_000_000_000,
+                tenure_height: 12,
+                tenure_start_height: 40,
+                ..BlockHeader::default()
+            },
+        )
+        .expect("record a header");
+        let HeaderKnowledge::Held(known) = vm.header_knowledge(block) else {
+            panic!("the header is held");
+        };
+        assert!(known.is_complete());
+        assert_eq!(known.absent_names(), Vec::<&str>::new());
+        let id = StacksBlockId(block);
+        let context = vm.chain_context();
+        assert_eq!(
+            context
+                .get_miner_address(&id, &id, &StacksEpochId::Epoch40)
+                .map(|address| address.bytes().0),
+            Some([0x99; 20])
+        );
+        assert_eq!(
+            context.get_stacks_height_for_tenure_height(&id, 12),
+            Some(40)
+        );
+        assert!(
+            vm.take_missing_headers().is_empty(),
+            "nothing was missed, so nothing is fetched"
+        );
     }
 
     /// `get-burn-block-info? header-hash` has to answer for the block being

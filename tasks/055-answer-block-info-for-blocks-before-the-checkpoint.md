@@ -45,18 +45,18 @@ executed, is never written down, and a restart loses it.
 ## Tasks
 
 - [x] Persist executed block headers rather than holding them in memory.
-- [ ] Export the header fields Clarity can read for the checkpoint's ancestry,
+- [x] Export the header fields Clarity can read for the checkpoint's ancestry,
       and import them alongside the trie.
 - [x] Backfill the blocks this node executed before it began writing headers
       down, which it can refetch from a peer.
 - [x] Serve `HeadersDB` from the persisted store, so a restart answers what the
       run before it answered.
-- [ ] Distinguish a header that is genuinely absent from one this node never
+- [x] Distinguish a header that is genuinely absent from one this node never
       carried, rather than answering `none` as though the block never existed.
-- [ ] Represent field availability explicitly: a partially reconstructed
+- [x] Represent field availability explicitly: a partially reconstructed
       header must fail on an unknown field rather than returning a plausible
       zero for miner, reward, burn-spend or tenure information.
-- [ ] Recover and oracle-check every consensus-visible field, including miner
+- [x] Recover and oracle-check every consensus-visible field, including miner
       address, block reward, burn spends, tenure height and tenure start, for a
       representative pre-checkpoint window.
 - [ ] Replay across a block whose transactions read pre-checkpoint history and
@@ -1425,3 +1425,219 @@ and `eval` can ask each of them directly against the same state.
 `burn-block-height` reads `0` there and means nothing. State-derived answers are
 real; burn-context ones are not. Noted in the tool's own documentation so the
 zero is not chased.
+
+## The consensus decision: an unknown field stops the node, it does not answer `none`
+
+This is the question the task turned on, and it is settled by reading what
+stacks-core does with a `HeadersDB` that answers nothing, rather than by taste.
+In `ClarityDatabase` (`clarity_db.rs:1311-1537`) every one of these:
+
+```rust
+self.headers_db.get_stacks_block_header_hash_for_block(&id_bhh, &epoch)
+    .ok_or_else(|| VmInternalError::Expect("Failed to get block data.".into()))?
+self.headers_db.get_burnchain_tokens_spent_for_block(&id_bhh, &query_tip, &epoch)
+    .ok_or_else(|| VmInternalError::Expect("FATAL: no total burnchain token spend record for block".into()))?
+self.headers_db.get_tokens_earned_for_block(&id_bhh, &query_tip, &epoch)
+    .ok_or_else(|| VmInternalError::Expect("FATAL: matured block has no recorded reward".into()))?
+```
+
+maps a missing field to a **fatal internal error**, never to a Clarity value. The
+`none`s a contract can legitimately see come from the guards *above* the lookup:
+a height at or beyond the current one, height zero, and — for `block-reward` —
+the maturity window. So a block that reaches `HeadersDB` at all is one the
+network answered for.
+
+That makes the choice one-sided:
+
+- **Answering `none`** would be a divergence for every block the network has an
+  answer for, and a *silent* one: the contract takes its error path, the
+  transaction returns something the chain never returned, and the only symptom is
+  a state root that differs for no visible reason, arbitrarily far from the read.
+- **Stopping** is identical to stacks-core's own behaviour for a header it does
+  not have, it is loud, it names the block and the field, and the node's backfill
+  can then fetch exactly what is missing and try the block again.
+
+The one exception is real and worth naming, because it is the only header read
+`ClarityDatabase` turns into a Clarity `none`:
+`get_block_height_for_tenure_height` returns the `HeadersDB` answer as an
+`Option`. A checkpointed node answering that from memory alone told contracts
+that every pre-checkpoint tenure never happened, and nothing raised a word. It
+now falls back to a `tenure_start` table the export fills.
+
+Where absence is genuinely the chain's answer, the export records it as absence
+rather than guessing: an epoch 2.x block has no Nakamoto `timestamp` and no
+tenure height (stacks-core reads `timestamp` from the Nakamoto table only), and a
+tenure whose reward has not matured has no reward — `matured_rewards` is written
+100 *tenures* later while Clarity's guard is 100 *Stacks blocks*, so mainnet
+itself would raise `FATAL: matured block has no recorded reward` in that window.
+nano now behaves identically there, which is the point.
+
+## Built: the checkpoint carries its ancestry's headers
+
+`cargo xtask export-headers <index.sqlite> <out.sqlite> <to-height>` reads
+stacks-core's chainstate index and writes one row per block, through the same
+joins stacks-core's own `HeadersDB` uses — which matters, because five of the
+thirteen fields are resolved at the block's **tenure start** and not at the
+block: `vrf_seed` (the hash of the tenure's proof), `miner_address`,
+`burn_spend_total` (`payments.burnchain_sortition_burn`), `burn_spend_winner`
+(`burnchain_commit_burn`) and `block_reward` (two `matured_rewards` rows
+combined, the child's coinbase and anchored fees plus the parent's streamed).
+
+Measured on the mainnet archive at the capture's own checkpoint height:
+
+```
+exported 8679508 headers (8493877 Nakamoto, 185631 from epoch 2.x) up to height 8665600
+188014 of them are incomplete, and say so
+```
+
+11 minutes, 2.4 GB beside a 380 GB checkpoint. The import is one pass into the
+side store — `cargo xtask import-headers <state-dir> <export>` for a state that
+already exists, and automatically inside the checkpoint import for a new one,
+*inside* the unfinished-import mark, because a state whose trie covers the
+ancestry and whose headers stop at the anchor is exactly the state this exists to
+stop shipping. 8,679,508 headers imported into a live 11 GB `clarity.sqlite` in
+110 seconds.
+
+`capture-fixtures` now runs the export into `checkpoint-H/`, so a capture carries
+it without a second command. A field the checkpoint carries needs no peer, which
+is the end state the task asked for.
+
+## The oracle: stacks-core's own `HeadersDB`, field by field
+
+`tests/conformance/pre_checkpoint_headers.rs` opens the archive as a read-only
+`MARF<StacksBlockId>` — which stacks-core implements `HeadersDB` for — and asks
+it all thirteen questions about sixteen blocks spread from height 1 to the
+anchor, across the 2.x/Nakamoto boundary. nano is asked the same questions
+through its own context after importing the export. **Every field matches, and
+every absence matches too.**
+
+Field by field rather than header by header, deliberately: a header compared as a
+whole value would compare the zero sitting where an unknown field is against a
+real answer and pass.
+
+Two details cost a run each and are worth writing down: the archive must be
+opened with `external_blobs`, or the fork index reads the blob column and reports
+the archive corrupt; and the epoch passed to each read has to be the epoch of the
+*block being read*, since it decides which header table stacks-core looks in.
+
+What the run leaves behind replays with neither archive nor capture: the answers
+and a 16-row slice of the export are written to
+`fixtures/mainnet/headers/`, and the second test in the file checks them offline.
+They are written only after the comparison passes, so the offline fixture cannot
+record an answer the oracle disagreed with.
+
+## What a pre-checkpoint block now answers
+
+`cargo xtask block-info <state-dir> <height>` asks through `ClarityDatabase`,
+which is where the guards live. `xtask eval` cannot answer this and it is worth
+knowing why: it evaluates against `null_context()`, so every header read there is
+`none` whatever the state holds — the documented "burn-block-height reads 0"
+caveat is really "no chain at all".
+
+Against the live mainnet state with the export imported:
+
+```
+get-stacks-block-info? at height 8660000
+  id-header-hash    957c5bf4b16420479e7326a8077194c3eeb6788e4e68fc57928173d58bd60b59
+  header-hash       1b3644b6bedf928e2e37f970e45d2178aafb32c96ecc983e29d5c0b96d9c9d27
+  time              1785343118
+get-tenure-info? for the tenure at that height
+  burnchain-header-hash 000000000000000000016792d9c1460bfa4db07da3b724db76c3dd0640ca5754
+  miner-address         SPVYF6M3FD0738FWDGDMJ84EFMGM38JS0N7DE42K
+  block-reward          1084578350
+  miner-spend-total     185000
+  miner-spend-winner    40000
+  vrf-seed              e324660f2da92ea029443b170eb4896de109aa5b15f92dec7b4d2396734b67c2
+  time                  1785342267
+```
+
+Every one of those is the value stacks-core answers. Before the import the same
+state said:
+
+```
+header: none, though the block is in this node's index -- this is the case the
+node stalls on, and the case a header export fixes
+```
+
+## Three kinds of nothing, and why the difference is worth a table
+
+`HeaderKnowledge` now distinguishes `Held`, `NeverCarried` and `Absent`, and
+`probe-header` prints which. They are three different faults:
+
+| | means | what to do |
+|---|---|---|
+| `Held` with every field | this node executed the block, or imported it | nothing |
+| `Held` short of a field | a reconstruction that recovered part of one | fetch the rest; a read of a missing field stops the node and names it |
+| `NeverCarried` | in the block index, so on this fork, but no header | fetch it |
+| `Absent` | not on this fork at all | nothing to fetch — whatever resolved a height to this identifier is the fault |
+
+The index is asked rather than assumed, through a second read-only connection to
+`marf.sqlite` — the same reason the headers already have one, since the store is
+mutably borrowed while Clarity runs. A read that cannot be made answers "on this
+fork", because asking a peer for a header this node turns out not to need costs
+one request, while calling a block absent that is really here hides a header that
+could have been fetched.
+
+## Two things the traces caught, which reasoning had missed
+
+**A partial header could undo an import.** The node writes down any block a field
+read came up empty for, and a header can be short of a field *the chain* has no
+answer for — an unmatured reward, an epoch 2.x timestamp. So the very blocks the
+export answers twelve fields for are the blocks a peer gets asked about, and
+`record_partial_header` would have replaced those twelve with five. It now keeps
+whichever record knows more, tie to the one already held. Deliberately not a
+field-wise union: a peer will happily produce a plausible `stacks_block_time` for
+an epoch 2.x block, where stacks-core answers nothing, and unioning would take it.
+Pinned both directions by `a_partial_header_cannot_overwrite_what_is_already_known`.
+
+**The captured window reads no pre-checkpoint history at all.** Measured, not
+assumed: the whole conformance suite under `NANO_TRACE_WRITES` makes 14,234 writes
+and exactly **zero** reads of a header this node does not hold — the ten traces
+that do appear are this task's own test asking every field of every sampled block,
+including the ones stacks-core also answers `None` for. That is why the last
+task-list item cannot be closed from the fixtures in the tree: no captured block
+depends on this, and the block known to depend on it is 8,669,750.
+
+**An in-memory VM wrote a file to disk.** The second read-only connection needs
+the trie's path, which is derived from the side store's — and an in-memory store
+reports a path naming no file, so the derived sibling was a *relative*
+`marf.sqlite` that the connection then created in whatever directory the process
+was in. Two turned up in crate roots after one test run. The file name is now
+checked rather than assumed.
+
+**A height can name more than one block.** At heights up to 1,000 the export holds
+1,074 rows, because 2.x forks left several blocks per height in the archive.
+Harmless, and worth knowing: rows are keyed by `index_block_hash`, so no
+non-canonical block can shadow a canonical one, and Clarity only ever reaches a
+block by resolving a height through the MARF on the fork being executed. The
+export therefore does not need an ancestry walk — the extra rows are unreachable.
+
+The refactor for `clippy::too_many_lines` was checked rather than eyeballed: a
+second export of every block up to height 1,000 is byte-identical to the 2.4 GB
+run in all seventeen columns, all 1,074 rows.
+
+## What is left, and one change outside this branch's files
+
+The last task-list item — replaying across a block whose transactions read
+pre-checkpoint history and matching the state root — is not checked off. The
+block known to need it is 8,669,750, four thousand blocks past the state
+available here, and reaching it needs a peer and hours rather than a command.
+What is proven instead is stronger per unit of evidence and weaker in kind: every
+field the network answers for such a block is answered, and answered with the
+network's value, checked against stacks-core rather than against nano's own
+export.
+
+**Needed in `nano-chainstate`, which this branch does not own:**
+`backfill_ancestor_header` (`crates/nano-chainstate/src/lib.rs:1937`) builds a
+`nano_vm::BlockHeader` with zeros for the eight fields a peer cannot answer and
+calls `record_block_header`, which means "every field is the chain's answer". It
+should call
+
+```rust
+self.vm.record_partial_header(block, header, nano_vm::HeaderFields::PEER_BURN_CONTEXT)
+```
+
+instead — one call, no signature change. Until it does, the node's automatic peer
+backfill still records those zeros as answers. `HeaderFields::PEER_BURN_CONTEXT`
+exists precisely so that change is a one-liner, and `xtask backfill-header`
+already records partially, so the mechanism is exercised.

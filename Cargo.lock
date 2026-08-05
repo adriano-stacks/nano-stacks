@@ -5700,6 +5700,7 @@ dependencies = [
  "nano-primitives",
  "nano-sync",
  "nano-vm",
+ "rusqlite",
  "serde_json",
  "tokio",
  "wasmprinter",
