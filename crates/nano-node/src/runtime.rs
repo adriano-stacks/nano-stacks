@@ -87,10 +87,45 @@ impl std::fmt::Display for Job {
     }
 }
 
+/// Say how long a startup phase took, so a slow start names itself.
+///
+/// A node that prints nothing for six minutes on a mainnet state teaches an
+/// operator — and whoever is chasing a divergence — to guess. Every guess made
+/// about this so far has been wrong: the sortition derivation cannot advance
+/// there, the header backfill prints per ancestor and printed nothing, and the
+/// process turned out to be at 30% CPU rather than blocked on a peer. The cost of
+/// measuring it is one line per phase.
+struct Phase {
+    name: &'static str,
+    started: std::time::Instant,
+}
+
+impl Phase {
+    fn start(name: &'static str) -> Self {
+        Self {
+            name,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        // Only the slow ones: a list of sub-second phases is noise an operator
+        // learns to skip, and skipping it is how the slow one stays hidden.
+        if elapsed.as_millis() > 500 {
+            println!("startup: {} took {:.1}s", self.name, elapsed.as_secs_f64());
+        }
+    }
+}
+
 /// Run a node until it is asked to stop or a role gives up.
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&config.node.working_dir)?;
+    let phase = Phase::start("reaching a peer");
     let peer = reachable_peer(&config).await?;
+    drop(phase);
     let network = match config.network() {
         Some(network) => network,
         // A private network's chain identifier is only knowable from the chain,
@@ -109,21 +144,24 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // signer-only node validates proposals in its own store and would be
     // executing every block twice for nobody.
     let executor = if config.node.rpc_bind.is_some() || config.miner.is_some() {
-        Some(Arc::new(Mutex::new(
-            open_executor(
-                &config,
-                network,
-                &pox,
-                &peer,
-                &config.chainstate_dir(NODE_CHAINSTATE),
-            )
-            .await?,
-        )))
+        let phase = Phase::start("opening the executed state");
+        let executor = open_executor(
+            &config,
+            network,
+            &pox,
+            &peer,
+            &config.chainstate_dir(NODE_CHAINSTATE),
+        )
+        .await?;
+        drop(phase);
+        Some(Arc::new(Mutex::new(executor)))
     } else {
         None
     };
     let dispatcher = EventDispatcher::new(config.node.event_observers()?);
+    let phase = Phase::start("announcing the blocks already executed");
     announce_executed_blocks(executor.as_ref(), &dispatcher).await;
+    drop(phase);
     // One mempool, shared: a node whose RPC admits transactions into a pool the
     // miner cannot see accepts them and never mines them, which is worse than
     // refusing them.
@@ -305,12 +343,15 @@ async fn follow(
     if let (Some(executor), Some(directory)) =
         (executor.as_ref(), config.checkpoint.sortition.as_ref())
     {
+        let phase = Phase::start("seeding the local sortition chain");
         start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
+        drop(phase);
     }
 
     // A state built before headers were kept has none, so the first block it
     // executes cannot read the one it stands on. Written down once, at startup.
     if let Some(executor) = executor.as_ref() {
+        let _phase = Phase::start("backfilling ancestor headers");
         let mut executor = executor.lock().await;
         match executor.backfill_headers(&peer, &pox, source).await {
             Ok(0) => {}
@@ -433,10 +474,19 @@ pub async fn open_chainstate(
     // up, not a chain that moved: it is worth waiting for. A peer that never
     // produces it means this state descends from a block the network dropped,
     // and no amount of waiting fixes that.
-    // Collected before any request, so the store is not borrowed across one.
+    //
+    // Collected before any request, so the store is not borrowed across one, and
+    // *bounded*. A checkpoint import brings the whole ancestry with it — 8.6
+    // million blocks on mainnet — and walking all of it was one SQLite row read
+    // per block against a 23 GB database: minutes of a node printing nothing,
+    // gigabytes read, and a 277 MB list, on every start. To reach a fork race
+    // that is one block deep. The bound is what the list is actually for.
     let mut ancestors = Vec::new();
     let mut walk = tip;
-    while let Some(parent) = chainstate.parent_of(walk) {
+    while ancestors.len() < RESUME_ANCESTORS {
+        let Some(parent) = chainstate.parent_of(walk) else {
+            break;
+        };
         ancestors.push(parent);
         walk = parent;
     }
@@ -458,6 +508,13 @@ pub async fn open_chainstate(
 /// and the answer is to walk back to the nearest ancestor the peer does have
 /// rather than to refuse to start. Only a state with no ancestor on the
 /// network at all is one nothing can extend.
+/// How far back a resumed node looks for a block the network still has.
+///
+/// A tip that lost a fork race while the node was down is one block behind the
+/// canonical chain, sometimes a few. This is generous for that and cheap, where
+/// the whole ancestry is neither.
+const RESUME_ANCESTORS: usize = 256;
+
 async fn resume_from(
     ancestors: Vec<[u8; 32]>,
     peer: &SyncClient,
