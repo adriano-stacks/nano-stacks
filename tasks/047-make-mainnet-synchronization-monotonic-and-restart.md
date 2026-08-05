@@ -79,3 +79,23 @@ That is the property a catch-up depends on, and it is checked offline against
 the captured fixture rather than by stopping a live node and hoping. The
 remaining unchecked item is a deterministic harness for rate limits and short
 pages, which the live mainnet run exercises but no test yet pins.
+
+## Restart re-derives every sortition since the checkpoint
+
+Measured, not suspected. Restarting the mainnet replay at executed height
+8,666,159 resumes the Clarity state instantly — `resuming … sealed at block
+701653fb…` — and then logs `deriving sortitions locally from burn 960219` and
+does no block work for minutes. The checkpoint's burn anchor is 960,231 and the
+burn tip is past 964,000, so that is roughly four thousand burn blocks fetched
+one at a time over the Bitcoin REST source, on every start.
+
+The Clarity state is durable and the sortition chain is not, so the cost of a
+restart grows with the distance between the checkpoint and the burn tip — which
+grows forever. That is the same class of problem as the executed-tip item above:
+part of what a node knows is persisted and part is rebuilt, and the split is not
+where an operator would guess.
+
+`snapshots.json` in the capture shows what the persisted shape should hold, and
+`mainnet_sortition`'s `the_node_tracker_derives_the_same_window` already proves
+the derivation is right — so this is about keeping the answer, not about
+computing it.
