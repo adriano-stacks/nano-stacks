@@ -2821,6 +2821,7 @@ dependencies = [
  "hex",
  "nano-marf",
  "nano-primitives",
+ "nano-wasm-cache",
  "rusqlite",
  "stacks-common",
  "tempfile",
