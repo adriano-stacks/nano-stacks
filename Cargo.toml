@@ -47,3 +47,22 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# The loop profile: release code generation with incremental compilation on.
+#
+# Everything here is built `--release`, because the node executes mainnet blocks
+# and a debug build is too slow to replay with. That makes the write/test loop
+# pay full LLVM optimization across roughly sixty downstream units for a one-line
+# change -- 353 s of CPU, of which the edited crate is 12.
+#
+# `incremental = true` is deliberately *not* on `[profile.release]`. It changes
+# how rustc partitions codegen units, which limits cross-unit inlining, and this
+# node's replay throughput is a thing worth measuring before trading. So it lives
+# in a separate profile: iterate with `--profile loop`, and let the release
+# profile stay the one whose numbers mean something.
+#
+# Measured steady state with it on: the node binary 12.6 s -> 2.8 s, `nano-vm`
+# 3.9 s -> 0.5 s. The cost is one cold build and about 10-15 GB.
+[profile.loop]
+inherits = "release"
+incremental = true

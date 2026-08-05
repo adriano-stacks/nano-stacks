@@ -113,8 +113,13 @@ fn the_production_closure_compiles_without_a_dev_dependencys_features() {
     // dev-dependency can reach into. `check` rather than `build` because the
     // question is whether it compiles, and a release build of all sixteen took
     // four minutes — a gate against a slow loop should not be the slow part of it.
+    // `--release --tests`, not `check --all-targets`: a debug-profile check builds
+    // a whole second graph of the same crates, and this workspace only ever builds
+    // release -- 452 GB of `target/debug` had accumulated for no other reason.
+    // `--tests` because `--all-targets` adds benches and examples, which answer
+    // nothing this asks.
     let mut command = Command::new(env!("CARGO"));
-    command.arg("check").arg("--all-targets");
+    command.arg("check").arg("--release").arg("--tests");
     for crate_name in PRODUCTION {
         command.arg("--package").arg(crate_name);
     }
