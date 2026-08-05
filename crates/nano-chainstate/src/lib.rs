@@ -1471,7 +1471,7 @@ impl ChainState {
                 // fix a tenure's start height for every later block. The seal is
                 // what makes a block real, so it goes first.
                 self.vm
-                    .record_block_header(*block.block_id().as_bytes(), header);
+                    .record_block_header(*block.block_id().as_bytes(), header)?;
                 self.adopt(ledger);
                 Ok(applied)
             }
@@ -1700,7 +1700,7 @@ impl ChainState {
         stacks_block_time: u64,
         block_header_hash: [u8; 32],
         consensus_hash: [u8; 20],
-    ) {
+    ) -> Result<(), ChainStateError> {
         self.vm.record_block_header(
             block,
             nano_vm::BlockHeader {
@@ -1718,7 +1718,8 @@ impl ChainState {
                 tenure_height: 0,
                 tenure_start_height: 0,
             },
-        );
+        )?;
+        Ok(())
     }
 
     /// What this node wrote down about a block, if anything.
@@ -1746,7 +1747,7 @@ impl ChainState {
     ) -> Result<(), ChainStateError> {
         let header = note_executed_block(&mut self.vm, &mut self.ledger, block, bitcoin_context)?;
         self.vm
-            .record_block_header(*block.block_id().as_bytes(), header);
+            .record_block_header(*block.block_id().as_bytes(), header)?;
         Ok(())
     }
 

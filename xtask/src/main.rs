@@ -235,7 +235,10 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
     if let Some(recorded) = recorded {
         return compare_headers(&rebuilt, &recorded);
     }
-    vm.record_block_header(id, rebuilt);
+    if let Err(error) = vm.record_block_header(id, rebuilt) {
+        eprintln!("recording the header failed: {error}");
+        return ExitCode::FAILURE;
+    }
     println!(
         "recorded a header for {} at burn height {burn_block_height}\n\
          exact: burn_header_hash, burn_block_height, consensus_hash, \

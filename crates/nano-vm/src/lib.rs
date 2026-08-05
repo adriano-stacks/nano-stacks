@@ -830,7 +830,28 @@ impl Vm {
         self.context.header(&StacksBlockId(*block))
     }
 
-    pub fn record_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
+    /// Write a header down for a block this node is not sealing.
+    ///
+    /// The failure is returned rather than printed: a header a later block reads
+    /// through is not optional, and a caller that cannot write one has to stop
+    /// rather than carry on answering `none` where the chain has an answer.
+    pub fn record_block_header(
+        &mut self,
+        block: [u8; 32],
+        header: BlockHeader,
+    ) -> Result<(), MarfStoreError> {
+        self.store.write_block_header(block, &header)?;
+        self.remember_block_header(block, header);
+        Ok(())
+    }
+
+    /// Keep in memory what a written-down header answers.
+    ///
+    /// `tenure_starts` is first-write-wins, which is why this is separate: for a
+    /// block being sealed it must not run until the MARF has committed, or a
+    /// block that failed to seal would fix its tenure's start height for every
+    /// later block.
+    fn remember_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
         self.context
             .tenure_starts
             .entry(header.tenure_height)
@@ -838,11 +859,6 @@ impl Vm {
         self.context
             .burn_headers
             .insert(header.burn_block_height, header.burn_header_hash);
-        // Written down as well as remembered: a contract may ask about any
-        // ancestor, and a restart has to answer what the run before it did.
-        if let Err(error) = self.store.write_block_header(block, &header) {
-            eprintln!("recording the header of {} failed: {error}", hex::encode(block));
-        }
         self.context.headers.insert(block, header);
     }
 
@@ -3345,11 +3361,13 @@ mod tests {
             PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid principal");
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [1; 32]).expect("begin checkpoint");
-        vm.record_block_header([1; 32], BlockHeader::default());
+        vm.record_block_header([1; 32], BlockHeader::default())
+            .expect("record a header");
         vm.seal_block().expect("seal checkpoint");
         vm.begin_block(Some([1; 32]), [2; 32])
             .expect("begin successor");
-        vm.record_block_header([2; 32], BlockHeader::default());
+        vm.record_block_header([2; 32], BlockHeader::default())
+            .expect("record a header");
         vm.credit_stx(&principal, 42).expect("credit STX");
 
         let value = read_through_a_contract(
@@ -3434,7 +3452,8 @@ mod tests {
 
         {
             let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("open");
-            vm.record_block_header([7; 32], header);
+            vm.record_block_header([7; 32], header)
+                .expect("record a header");
         }
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
@@ -3629,7 +3648,8 @@ mod tests {
                 burn_block_height: 960_231,
                 ..BlockHeader::default()
             },
-        );
+        )
+        .expect("record a header");
         vm.begin_block(None, parent).expect("begin parent");
         vm.seal_block().expect("seal parent");
 
@@ -3640,7 +3660,8 @@ mod tests {
                 burn_block_height: 960_232,
                 ..BlockHeader::default()
             },
-        );
+        )
+        .expect("record a header");
         let mut context = super::BitcoinBlockContext::at_height(960_232);
         context.burn_header_hash = hash;
         vm.begin_block_with_bitcoin_context(Some(parent), [9; 32], context)

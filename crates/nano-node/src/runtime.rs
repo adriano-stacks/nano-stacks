@@ -653,14 +653,23 @@ async fn backfill_one_header(
     let Ok(burn_block_height) = u32::try_from(sortition.bitcoin_height) else {
         return;
     };
-    executor.chainstate.backfill_ancestor_header(
+    if let Err(error) = executor.chainstate.backfill_ancestor_header(
         block,
         *sortition.bitcoin_block_hash.as_bytes(),
         burn_block_height,
         header.timestamp,
         *header.block_hash().as_bytes(),
         *header.consensus_hash.as_bytes(),
-    );
+    ) {
+        // Said rather than swallowed: the next round tries the same block and
+        // stops on the same missing header, so an operator has to be able to see
+        // why one never arrives.
+        eprintln!(
+            "writing down the header of ancestor {} failed: {error}",
+            hex::encode(block)
+        );
+        return;
+    }
     println!(
         "wrote down the header of ancestor {} at burn height {burn_block_height}, \
          which this node never executed",
