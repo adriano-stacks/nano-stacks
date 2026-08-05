@@ -40,6 +40,7 @@ mod mainnet_envelope;
 mod mainnet_sortition;
 mod marf_lockstep;
 mod mempool;
+mod one_engine_in_the_artifact;
 mod p2p_discovery;
 mod p2p_inbound;
 mod p2p_wire;
