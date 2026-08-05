@@ -1033,6 +1033,9 @@ pub struct TenureSource {
     next: usize,
     /// Peers that have rate-limited since the round began.
     throttled: BTreeSet<usize>,
+    /// Peers that have actually served a tenure, which is what makes "spread over the
+    /// pool" a measurement rather than an intention.
+    served: BTreeSet<usize>,
 }
 
 impl TenureSource {
@@ -1043,6 +1046,7 @@ impl TenureSource {
             peers,
             next: 0,
             throttled: BTreeSet::new(),
+            served: BTreeSet::new(),
         }
     }
 
@@ -1060,6 +1064,15 @@ impl TenureSource {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.peers.is_empty()
+    }
+
+    /// How many distinct peers have actually served a tenure.
+    ///
+    /// The measurement the spreading exists for: a descent that reports one peer is a
+    /// descent that has not been spread, whatever the pool holds.
+    #[must_use]
+    pub fn served_by(&self) -> usize {
+        self.served.len()
     }
 
     /// Whether every peer has rate-limited, so there is nobody left to ask.
@@ -1103,6 +1116,7 @@ impl TenureSource {
                     // Start the next tenure at the peer *after* this one, so the work
                     // walks around the pool instead of settling on one member.
                     self.next = index + 1;
+                    self.served.insert(index);
                     return Ok(blocks);
                 }
                 Err(error) if error.is_rate_limited() => {

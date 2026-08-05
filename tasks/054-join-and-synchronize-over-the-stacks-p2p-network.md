@@ -36,10 +36,10 @@ steady-state operation may require a hosted Stacks API.
       liveness messages, neighbor discovery and persistent peer database.
 - [x] Maintain bounded outbound and inbound peer sets with connection limits,
       retry backoff, scoring and isolation of malformed or dishonest peers.
-- [ ] Exchange inventories and acquire Nakamoto blocks, tenures and required
+- [x] Exchange inventories and acquire Nakamoto blocks, tenures and required
       sortition data from multiple peers without making any one peer a
       consensus input.
-- [ ] Route bulk history consumers, including accounting reconstruction and
+- [x] Route bulk history consumers, including accounting reconstruction and
       missing historical-header acquisition, through a local or P2P-backed
       source so repair does not serialize thousands of requests through a
       hosted API rate limit.
@@ -433,3 +433,239 @@ matter.
   now and the test calls it.
 - **`is_due` doubling once too early**, so a peer's *first* failure cost it 60 s
   instead of 30. Caught by its own test.
+
+## The third slice: peers were being isolated for working
+
+Two items were named for this slice and both landed, but the thing worth reading
+first is the bug the *running node* reported and the code could not have.
+
+### 4 of 7 peers isolated, and none of them had done anything
+
+The mainnet node's own log:
+
+```
+p2p: 7 connected (4 new, 0 lost, 1 isolated), 3 addresses learned
+p2p: 115 unsolicited messages dropped
+p2p: 3 connected (0 new, 0 lost, 4 isolated), 0 addresses learned
+```
+
+`tests/live_unsolicited.rs` was written to answer it, and it answers it flatly.
+Across three stacks-core mainnet seeds, over several minutes each, **every single
+unprompted message was an announcement**:
+
+| seed | window | `StackerDBPushChunk` (25) | `Transaction` (13) | `NakamotoBlocks` (28) | requests |
+|---|---|---|---|---|---|
+| `seed.mainnet.hiro.so` | 60 s | 43 | 3 | 3 | **0** |
+| `seed.mainnet.hiro.so` | 90 s | 67 | 0 | 2 | **0** |
+| `cet.stacksnodes.org` | 45 s | 14 | 0 | 0 | **0** |
+| `sgt.stacksnodes.org` | 45 s | 8 | 1 | 0 | **0** |
+
+Identifier 25 is `StackerDBPushChunk` — mainnet's signer traffic, which is most of
+what a mainnet peer says — and the aggregate rate is 0.2 to 0.8 messages a second
+per peer. The message identifier is the whole of the finding, which is why the
+census prints it: every unmodelled message shares the name `Unhandled`, and
+identifier 25 (an announcement, safe to drop) reads exactly like identifier 5
+(`GetBlocksInv`, a peer blocked on an answer) until you look.
+
+So the peers were behaving perfectly. A session refused more than
+`MAX_UNSOLICITED_PER_REQUEST = 32` interleaved messages before a reply and raised
+`TooChatty`, which `is_protocol_fault` counted as misbehaviour and the swarm turned
+into the peer table's longest penalty. The swarm reads a session once every fifty
+seconds — `poll_interval_secs * 10` — so **any rate at all crosses a fixed count
+given enough silence**: the hiro seed queued 59 messages in one gap. And because
+the busiest peer crosses it first, nano was isolating the most useful half of the
+network, worst first. That is the opposite of what scoring is for.
+
+Two fixes, and they are different mistakes.
+
+**Volume is not a fault.** A request is bounded by one overall deadline now instead
+of a message count, so a peer that lets the deadline pass comes back as a `Timeout`
+— a backoff, not an isolation, because a slow peer is nearly always a busy one.
+`SessionError::TooChatty` is gone. The push buffer is bounded at 256 and sheds the
+oldest, counted, because a dropped signer chunk costs timeliness and another peer
+will push it again, while a queue that grows with a peer's output is memory the
+peer chose.
+
+**The session is read every round, not only when it wants something.** That is what
+kept fifty seconds of relay traffic out of the kernel buffer in the first place, and
+it is also the thing that makes relay possible at all. `Framed::drain` uses
+`try_read`, so "the peer has nothing queued" and "the peer is slow" cannot be
+confused.
+
+Framing had to move onto an internal buffer for that, and the reason is worth
+writing down: **`read_exact` is not cancel-safe.** A deadline expiring part-way
+through a message consumes bytes and loses them, leaving the stream permanently out
+of frame. That is survivable when the only response to a timeout is to throw the
+session away, and fatal for a drain whose entire purpose is to stop and carry on
+using the connection.
+
+### The other half was a handler gap after all
+
+The census found no requests, but it could not have: stacks-core advertises a
+3600-second heartbeat, and a 60-second window sees none of it. A stock node does
+send `Ping`, `Handshake`, `GetNeighbors` and `NatPunchRequest` on any conversation
+regardless of who dialled — the protocol is symmetric once handshook — and nano was
+reading those, counting them as "unsolicited" and never replying.
+
+So an unsolicited message is now *answered* when the peer is waiting on one:
+`Ping`, `NatPunchRequest` and `Handshake` from memory, and `GetNeighbors` and
+`GetNakamotoInv` through the same `Service` the listener answers with, shared rather
+than reimplemented. A mid-session `Handshake` updates the key the session
+authenticates against — the peer proves possession by signing with it, and refusing
+would isolate an honest peer for rotating a key — but deliberately **not**
+`Session::remote`, so a peer cannot redirect nano's fetches mid-conversation by
+advertising a new endpoint.
+
+`tests/live_unsolicited.rs` now asserts the fix rather than only measuring: a
+session that has read a mainnet peer across a full fifty-second gap must still be
+usable, and must still answer `GetNeighbors` afterwards. `loopback.rs` gates both
+halves offline — a peer that pushes 300 messages before answering is not isolated,
+and a peer nano dialled gets its `Ping`, `GetNeighbors` and `Handshake` answered.
+
+### Two more bugs that only fell out of testing the first
+
+**`Swarm::retire` penalised into a `Round` it constructed and threw away.** A round
+that lost every peer during an inventory exchange reported three connected and one
+dropped. The round is the caller's now, and a dropped peer says why it went. This is
+the one that made a genuinely failing test look like it passed.
+
+**An inbound conversation was closed at its *read* deadline.** So nano hung up on
+any stock node that had nothing to say for thirty seconds, which — against a
+3600-second heartbeat — is most of the time. `InboundLimits` now separates how long
+one read may take from how long a conversation may be silent (15 minutes, bounded so
+a silently dead socket does not hold a slot forever). A node that drops its inbound
+peers twice a minute is not a peer anyone keeps, and nothing offline would have
+found it, because every offline test finishes inside the timeout.
+
+### Bulk history: measured, not claimed
+
+`catch_up`'s descent asked *one* client for every tenure. From the mainnet
+checkpoint that is tens of thousands of blocks down one connection, so a hosted
+API's rate limit **was** the catch-up speed — which is what joining the peer network
+was for, and which stayed true for two slices after the transport landed because
+nothing changed who the descent asked.
+
+`nano_sync::TenureSource` is the work list. Consecutive tenures go to different
+peers; a throttled peer is set aside for the round and its tenure asked of somebody
+else; a peer that cannot serve one tenure costs a request rather than the descent.
+Only when *every* peer has throttled does the round report itself rate limited, and
+by then waiting genuinely is the only option.
+
+`p2p_discovery.rs::bulk_history_comes_from_several_mainnet_peers`, against real
+mainnet with no hosted API anywhere:
+
+```
+4 endpoints to fetch from: 3.122.176.89, 34.150.184.50, 52.77.118.154, 54.91.222.127
+10 tenures, 414 blocks, over 4 peers
+4 distinct peers served history
+```
+
+`served_by()` exists for that last line: a descent that reports one peer has not
+been spread, whatever the pool holds. And the discovery gate itself now reaches
+further than it did — eight endpoints rather than six, none isolated, twenty
+unprompted messages collected in a round instead of counted and dropped.
+
+### Driving from the inventory, and what an inventory is actually worth here
+
+`Swarm::exchange_inventories` asks every peer about the cycle being walked and
+publishes the endpoints of those claiming any of it; the descent puts those first.
+A peer claiming none of the cycle has nothing to serve, and asking it for a tenure
+to find that out is exactly the round trip an inventory exists to avoid.
+
+**`assign_tenures` is still uncalled, and now there is a reason rather than a
+todo.** It schedules a *forward* download driven by bit indices — given a set of
+wanted tenures, spread them over the peers that claim them. Nano's downloader walks
+parent links backwards from a tip, so it always knows the single tenure it wants
+next and there is no set to spread. Making `assign_tenures` the scheduler means
+rewriting the downloader to be inventory-driven and forward, which is a larger
+change than this slice and should be its own. The shortlist is the part of an
+inventory that applies to the downloader that exists.
+
+### The cycle-keyed rule, applied
+
+Naming a cycle needs the consensus hash of its *first sortition*, and it is derived
+locally: `SortitionTracker::consensus_hash_at` indexes the history the tracker
+already keeps — one hash per burn block, ending at the tip, because
+`ConsensusHash::from_ops` mixes the hashes behind it and none may be skipped — so a
+height maps to an index by subtraction. On the running mainnet node that history is
+**294,442 entries**, which is every burn block since the chain began.
+
+The boundary comes from `RewardCycleSchedule::starts_at`, which is waterfall-aware:
+offset 0 once the waterfall is on, offset 1 before it. A node that decided from
+where its tip happened to sit would move the boundary part-way through a prepare
+phase and name a cycle no peer recognises. And it is local on purpose — a cycle
+identifier taken from a peer would make that peer's view of the burnchain the thing
+nano's own requests are keyed on.
+
+### Serving inventories, and the honest bound on it
+
+`Service::tenure_inventory` returned `None`, so nano nacked every cycle and no stock
+node could sync *from* it. It now answers from the two local sources above: the
+derived history places the cycle, the executed ledger says which of its tenures nano
+ran and will serve.
+
+A bit is set only where both hold, so the vector says **less** than the node knows
+rather than more. That direction is chosen: an unset bit means "do not ask me" and
+costs a peer nothing, while a set bit nano could not honour costs that peer a failed
+fetch.
+
+It says much less. `ChainLedger`'s executed suffix reaches `REORG_REACH = 256`
+blocks back, so the honest answer covers the recent end of a 2,100-block cycle and
+nothing older. A complete answer needs a durable consensus-hash-to-tenure index —
+`block_header` in the side store is keyed by block id, so there is no way to ask
+"did I run the tenure at this consensus hash" without a scan — and that is a
+chainstate change, not this one. Partial and truthful still beats the nack it
+replaces, because a nack tells a peer to give up on nano for the whole cycle instead
+of fetching the tenures nano has.
+
+It is answered from the snapshot the follow loop publishes, never by asking the
+executor: `Service` is synchronous by design, and a reply that could take the
+executor's lock is a reply that lets one inbound peer stall the loop that executes
+blocks.
+
+### The node was advertising a stale view for the life of the process
+
+Found while wiring the above, and it had been true since the transport landed.
+`start_transport` runs *before* the chainstate exists — that is its whole point,
+since it is the way in that does not need a configured HTTP peer — so it was passed
+`None` for the executor and `advertised_view` returned its deliberately-old fallback
+every round, forever. A stale view is one no peer will walk toward.
+
+`Advertised` is the handle the follow loop writes each round and the peer-facing
+loops read: the Bitcoin height this node executed under, the cycle to ask
+inventories about, and the inventory to serve. All three are nano's own answers,
+because repeating a peer's claim back at the network is how a gossip hint becomes a
+consensus input.
+
+### What is left
+
+1. **Relay.** Still counted and dropped. `encode_frame` takes a relayer list for it,
+   and pushed blocks and transactions are now *collected* every round rather than
+   left in the socket — which was the prerequisite — but acting on one means putting
+   it through staging and the authenticated selection boundary, and doing it from the
+   discovery loop would be the one place in the crate that trusted a peer.
+2. **A complete served inventory**, which needs the consensus-hash-to-tenure index
+   above.
+3. **An inventory-driven forward downloader**, which is what would make
+   `assign_tenures` the scheduler.
+4. **Deterministic integration against a stock node**, including restart and reorg.
+   `p2p_inbound.rs` is still the reference *codec* on the other end rather than a
+   reference node.
+5. **Restart-durable inventory**: the served vector is derived per round from the
+   executed ledger, so it is correct after a restart but no larger.
+
+### Tried and reverted
+
+- **A drain that used `readable()` with a zero timeout** to check whether bytes were
+  waiting. Readiness can be reported spuriously, and a spurious wake followed by a
+  `read_exact` is a blocking wait inside a call whose whole contract is not to wait.
+  `try_read` into an owned buffer has no such edge.
+- **A 16 KB stack array per read.** Clippy's `large_futures` measured sixteen
+  kilobytes per session future, which is real memory once eight of them nest inside a
+  swarm round. Reads land straight in the buffer instead, which also removes a copy.
+- **Keeping `TooChatty` but raising the cap.** Any fixed count is crossed by any rate
+  given enough silence, so a larger number would have moved the bug rather than fixed
+  it. The bound that means something is time.
+- **Calling `prefer` every round.** It resets the round-robin cursor and the learned
+  throttles, so applying it unconditionally left the descent asking the same first
+  peer forever. It runs when the shortlist *changes*.
