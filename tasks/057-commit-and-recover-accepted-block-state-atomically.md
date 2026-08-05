@@ -1,7 +1,7 @@
 ---
 title: "Commit and recover accepted block state atomically"
 id: "057"
-status: in-progress
+status: completed
 priority: critical
 type: bug
 group: mainnet
@@ -156,13 +156,13 @@ Also landed:
   prepares a child and stops exactly where a SIGKILL would land, then reopens: the
   tip is the parent and the ledger is the parent's.
 - `nano-conformance`: `kill_during_replay` spawns `replay-blocks`, waits for it to
-  seal its first block, sleeps a scattered 0–80 ms and sends **SIGKILL**, then
+  seal its first block, sleeps a scattered 0–20 ms and sends **SIGKILL**, then
   reopens and compares all four ledger fields and the sealed content root against
   an uninterrupted run at the same block — 20 kills a run. The first version killed
   on a wall-clock delay alone and was wrong: as the state grew, reopening it took
   longer than the delay, so the later kills all landed during the open and sealed
   nothing. Waiting for the first sealed block is what makes every kill land inside
-  the replay.
+  the replay. The second version was wrong too, for a subtler reason — see below.
 - `nano-conformance`: `restart.rs` no longer carries the accounting across by hand.
   A test that hands the state over cannot catch the fields nobody thought to hand
   over.
@@ -186,3 +186,63 @@ Also landed:
   test.
 - **`BitcoinContext::headers` keeps every header this process recorded in memory as
   well as on disk.** Bounded by uptime rather than by anything that reads it.
+
+## The kills were racing a broken pipe, and mostly winning
+
+`kill_during_replay` took the child's stdout, read one line to know a block had
+sealed, and dropped the reader. That closes the read end of the pipe, so the
+child's next `println!` fails — and a failed `println!` **panics**, and a panic
+unwinds, and unwinding drops the chainstate, and dropping it closes every store
+cleanly. The one case this file exists to avoid was racing the signal for the
+whole 0–80 ms window, and a child prints every three to five milliseconds.
+
+The measurement says how often it won. Holding the reader open until after `wait`
+returns, the same twenty kills reach 226 blocks instead of stalling in the low
+hundreds, and the per-kill depths spread evenly rather than clustering. The window
+is now 20 ms, because it is no longer free: with the child surviving until it is
+killed, the window is how much of the reference each kill consumes, and the
+reference has to outlast all twenty put together.
+
+Also landed here:
+
+- **A tenure transition is interrupted on purpose.**
+  `a_kill_inside_a_tenure_transition_leaves_the_complete_parent` reads the captured
+  blocks for the heights that start a tenure, watches the child's per-block output
+  for the block *before* one, and kills as it begins the tenure — eight different
+  tenure starts a run (471, 475, 485, 489, 493, 505, 516, 525), asserted distinct.
+  A tenure-start block is the widest commit a block makes: matured rewards a
+  hundred tenures back, a liquid-supply mint, the new tenure's earnings and the
+  proof the next tenure is checked against, all in the same ledger blob as the
+  state root. Scattered kills land in one sometimes, which is not the same as
+  testing it.
+- **`kill_during_replay` is a module of the conformance binary**, not a target of
+  its own, so `cargo test -p nano-conformance --test conformance` runs it. It was
+  the one file the 28-targets-into-one merge left behind, and the gate everyone
+  quotes did not include it.
+- **Killing during the *open* is not a case.** A reopen of a directory that already
+  holds state writes nothing — the import path is [[051]]'s — so a kill there
+  leaves the disk exactly as the previous process left it, which is what the
+  surviving-state assertions already check.
+
+## A recovered ledger's accounting is not checked at all
+
+Found while looking for what a hard kill leaves. `nano-node` runs
+`check_maturity_window` on the accounting it reads from a file, and the resume path
+that recovers the ledger row skips it entirely — so the one accounting a running
+node actually uses is the one nothing validates.
+
+The live mainnet state is the case. Its ledger row carries 167 tenures from
+251,220 to 251,394 with **251,322 through 251,329 missing**: the checkpoint
+artifact is contiguous 251,220–251,321, the node began mid-tenure 251,323, and the
+catch-up rounds that would have recorded the next few died before writing
+`accounting.json`. Read as an outer pair that is a 175-tenure window and passes.
+The first payout it cannot make is the maturity of 251,322 at tenure 251,422; the
+node had reached 251,395, so it had 27 tenures of execution left to throw away.
+
+`TenureAccounting::known_earnings_span` now answers the **contiguous** run reaching
+the highest known tenure, so a hole shortens the window instead of hiding inside
+it, and the two existing call sites become correct without changing them
+(`a_hole_shortens_the_window_that_can_actually_be_paid_out`). What is still needed
+is outside this task's files: `nano-node/src/runtime.rs::recover_ledger` has to run
+`check_maturity_window` on the recovered accounting, the way the file path does.
+Filling the hole itself is [[048]]'s.

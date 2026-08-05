@@ -53,6 +53,83 @@ reorganization after restart has no complete executed suffix to retract.
 - Recovery work and memory are bounded independently of distance from the
   checkpoint.
 
+## The reorganization half: writing the test found two bugs
+
+The restart-then-retract case turned out not to need a fixture with a fork in it.
+`retract_to` names an ancestor and a competing block is one the *test* makes: the
+captured tenure-start block with one second added to its timestamp is a different
+block sealing a different state over the same parent, which is exactly a fork. The
+same block replayed is not, and the MARF refuses it — `VersionAlreadyExists`.
+
+Writing it found two things a retraction did not give back. Both are invisible to
+every state root, both were confirmed by putting the old code back, and neither
+had anything to do with restarting: a retraction in one process was already wrong.
+
+**The VM's tenure-start map is not keyed by branch.** `retract` rewound
+`ChainLedger::tenure_start_heights` and left `BitcoinContext::tenure_starts` — the
+map `get_stacks_height_for_tenure_height` answers `get-tenure-info?` from — holding
+the abandoned branch's heights. Two branches can genuinely disagree about the
+Stacks height a tenure height started at. Put back, the test reports
+`Some(493)` where the retracted tenure must answer `None`.
+
+**The parent tenure's coinbase proof was the abandoned tenure's.** Only the *last*
+tenure's proof is kept, so nothing in a field-by-field rewind could restore the
+surviving one. The consequence is not subtle: the honest tenure that replaces the
+retracted one commits a seed that hashes to the tenure before it, so
+`verify_committed_vrf_seed` refuses it —
+
+```
+InvalidTransaction("committed seed is not the hash of the parent tenure's VRF proof")
+```
+
+— and a node that reorganizes is stuck on a fork it has already left. That is the
+error the fork test gets with the old rewind in place.
+
+Both have one fix, and it is the same route a restart takes: `stand_on` reads back
+the ledger the surviving block committed. Not a rewind at all. The four fields are
+one row, that row is immutable and keyed by the block that wrote it, so the state
+after a retraction *is* a state some block already sealed. There is no second
+rewind to keep in step with the first, and the field that no rewind could reach
+comes for free. `TenureAccounting::retract_from` survives only for the case where
+every executed block is retracted and the chain goes back to the checkpoint, which
+has no ledger row of its own.
+
+Three tests in `restart.rs`, each run once in a single process and once across a
+restart, demanding equality:
+
+- `a_restart_before_a_bitcoin_reorganization_retracts_the_same_suffix` — retracts
+  the last tenure the capture starts, and asserts the discarded suffix, the
+  resumed block, both tenure-start maps and the proof directly, then compares the
+  whole canonical value between the two runs.
+- `a_restart_before_a_stacks_fork_reaches_the_same_canonical_state` — retracts to
+  the block before that tenure and executes a competing tenure over it. The
+  competing block's **state root** is the assertion: it is sealed after the
+  retraction, so it reads the tenure heights and the accounting the retraction
+  left, and a restart that recovered any of them differently seals a different
+  root with every receipt matching.
+- `a_retraction_leaves_the_disk_where_it_found_it` — pins the crash window rather
+  than closing it. See below.
+
+`Canonical` carries both tenure-start answers, the durable one and Clarity's, so
+the two disagreeing is itself an inequality. And the direct assertions matter as
+much as the comparison: a bug that moves neither map moves neither map in both
+runs, and equality alone would be satisfied.
+
+## The crash window after a retraction is pinned, not closed
+
+`retract` writes nothing. It reads a row that was already there, so the disk after
+a retraction is byte-identical to the disk before it, and a crash in the window
+between a fork switch and the next sealed block leaves the abandoned chain —
+`marf.tip()` is the abandoned block and the recovered ledger is its. `nano-node`
+then walks back for a block the network still has and stands on that block's
+ledger, which is how the switch is re-derived.
+
+`a_retraction_leaves_the_disk_where_it_found_it` asserts exactly that, and the
+fork test asserts `tip()` is still the abandoned block after the switch. Making the
+retraction durable was considered and rejected: it would be a second durable
+answer to "which chain am I on", beside the sortitions and the peers that decided
+it, and reconciling two is the failure this group of tasks exists to remove.
+
 ## Recovered rather than rebuilt
 
 Nothing is re-derived. The context is written down with the block that produced
@@ -76,7 +153,9 @@ Three findings shaped it:
 - **The VM's map has to be reseeded, not just the chainstate's.**
   `get_stacks_height_for_tenure_height` — `get-tenure-info?`, consensus-visible —
   answers from `BitcoinContext::tenure_starts`, which is memory. So
-  `recover_ledger_at` pushes the recovered map into it.
+  `recover_ledger_at` pushes the recovered map into it. It *replaces* rather than
+  merges, which the retraction bug above is why: merging keeps answers belonging
+  to a chain this node has left.
 - **Burn headers were memory-only too.** `get-burn-block-info?` answered `none`
   after a restart for any burn block outside the 32 the node re-seeds, where the
   run before it answered a hash. They are now a table in the side store, written as

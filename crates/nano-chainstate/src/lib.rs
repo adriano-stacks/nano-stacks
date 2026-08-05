@@ -405,16 +405,31 @@ impl TenureAccounting {
         }
     }
 
-    /// The lowest and highest coinbase heights whose earnings are known.
+    /// The span of coinbase heights whose earnings this can actually pay out.
     ///
     /// A checkpoint has to carry a full maturity window of these, because every
     /// tenure a node executes before its own mature pays out one from inside
     /// it. A short window executes perfectly until the first payout it cannot
     /// derive, which is why startup checks the span rather than waiting.
+    ///
+    /// *Contiguous*, ending at the highest known tenure, and not merely the
+    /// lowest and highest keys. A hole is not a shorter window, it is a delayed
+    /// one: the live mainnet state holds 167 tenures from 251,220 to 251,394 with
+    /// 251,322 through 251,329 missing, so the outer pair says the window is 175
+    /// long and the first payout it cannot make is still 27 tenures out — hours of
+    /// execution, all of it thrown away, exactly the outcome saying so at startup
+    /// exists to avoid. Counting from the top rather than the bottom because the
+    /// tenures a node needs next are the ones nearest its tip.
     #[must_use]
     pub fn known_earnings_span(&self) -> Option<(u64, u64)> {
-        let first = *self.earnings.keys().next()?;
         let last = *self.earnings.keys().next_back()?;
+        let mut first = last;
+        for height in self.earnings.keys().rev().skip(1) {
+            if *height != first.saturating_sub(1) {
+                break;
+            }
+            first = *height;
+        }
         Some((first, last))
     }
 
@@ -1006,7 +1021,7 @@ impl ChainState {
         // The VM answers `get-tenure-info?` from a map of its own, which is
         // memory: without this a restart mid-tenure reports the first block it
         // executes as that tenure's start height, for every block after it.
-        self.vm.restore_tenure_starts(
+        self.vm.stand_on_tenure_starts(
             ledger
                 .tenure_start_heights
                 .iter()
@@ -1017,9 +1032,25 @@ impl ChainState {
     }
 
     /// The Stacks height a tenure's first block sits at, as this chain has it.
+    ///
+    /// The durable copy: this is what is written down with each block and read
+    /// back at a restart or a retraction.
     #[must_use]
     pub fn tenure_start_height(&self, tenure_height: u32) -> Option<u32> {
         self.ledger.tenure_start_heights.get(&tenure_height).copied()
+    }
+
+    /// The same height as Clarity answers it, from the VM's own map.
+    ///
+    /// Two accessors rather than one because these are two copies of one fact
+    /// and the bugs here have all been the two disagreeing — a restart that
+    /// recovered the durable map but left the VM answering for the tenure in
+    /// flight, a retraction that rewound the durable map and left the VM
+    /// answering for the branch it abandoned. Which one is wrong names the fix,
+    /// so a caller that can only read one cannot see the disagreement at all.
+    #[must_use]
+    pub fn clarity_tenure_start_height(&self, tenure_height: u32) -> Option<u32> {
+        self.vm.tenure_start_answer(tenure_height)
     }
 
     /// The coinbase VRF proof of the last tenure this chain accepted.
@@ -1655,6 +1686,62 @@ impl ChainState {
         *ledger = sealed;
     }
 
+    /// Stand on the ledger of the block a retraction left this chain on.
+    ///
+    /// The discarded blocks are not undone field by field, because one field
+    /// cannot be: only the *last* tenure's coinbase VRF proof is kept, so
+    /// rewinding it means reading back the one the surviving block held. And
+    /// every other field has its answer in the same place — the ledger row that
+    /// block committed with its seal — so a retraction stands on a ledger by
+    /// exactly the route a restart does, and there is no second rewind to keep
+    /// in step with the first.
+    ///
+    /// Rewound field by field it was wrong in two ways, both invisible to any
+    /// state root. The proof kept was the *abandoned* tenure's, so the honest
+    /// tenure that replaced it committed a seed that hashed to something else
+    /// and was rejected — a node stuck on a fork it had already left. And the
+    /// VM's own tenure-start map, which is what `get-tenure-info?` answers from
+    /// and is not keyed by branch, still held the abandoned branch's heights.
+    ///
+    /// Retracting everything executed goes back to what the checkpoint gave:
+    /// no tenure this node started and no proof for the one before its first.
+    fn stand_on(&mut self, resume_from: Option<[u8; 32]>, discarded_from_tenure: u32) {
+        if let Some(block) = resume_from {
+            match self.recover_ledger_at(block) {
+                Ok(true) => return,
+                // Practically unreachable: a block on the executed chain was
+                // sealed, and sealing it wrote its ledger row. Reported rather
+                // than asserted because a retraction answers what it retracted,
+                // not whether it could — the caller cannot act on this either
+                // way, and the rewind below is the best that is left.
+                Ok(false) => eprintln!(
+                    "block {} sealed no ledger to stand on after a retraction, so this \
+                     chain rewinds what it can instead",
+                    hex::encode(block)
+                ),
+                Err(error) => eprintln!(
+                    "the ledger block {} sealed cannot be read back after a retraction, \
+                     so this chain rewinds what it can instead: {error}",
+                    hex::encode(block)
+                ),
+            }
+        }
+        let Self { vm, ledger } = self;
+        ledger
+            .accounting
+            .retract_from(u64::from(discarded_from_tenure));
+        ledger
+            .tenure_start_heights
+            .retain(|tenure, _| *tenure < discarded_from_tenure);
+        vm.stand_on_tenure_starts(
+            ledger
+                .tenure_start_heights
+                .iter()
+                .map(|(tenure, height)| (*tenure, *height)),
+        );
+        ledger.parent_tenure_proof = None;
+    }
+
     /// Take back the blocks a Bitcoin reorganization removed from the chain.
     ///
     /// A retracted sortition takes its whole tenure with it, so every block
@@ -1678,16 +1765,12 @@ impl ChainState {
             };
         };
         let discarded: Vec<_> = self.ledger.executed.split_off(fork);
+        let resume_from = self.ledger.executed.last().map(|block| block.block_id);
         if let Some(first) = discarded.first() {
-            self.ledger
-                .accounting
-                .retract_from(u64::from(first.tenure_height));
-            self.ledger
-                .tenure_start_heights
-                .retain(|tenure, _| *tenure < first.tenure_height);
+            self.stand_on(resume_from, first.tenure_height);
         }
         ChainRetraction {
-            resume_from: self.ledger.executed.last().map(|block| block.block_id),
+            resume_from,
             discarded: discarded.into_iter().map(|block| block.block_id).collect(),
         }
     }
@@ -1735,10 +1818,11 @@ impl ChainState {
     /// Nothing is deleted. The MARF addresses a state by the block that sealed
     /// it, so the abandoned branch simply stops being reachable — and if the
     /// fork changes its mind, those states are still there to stand on. What
-    /// has to be rewound is everything kept beside the MARF: the executed
-    /// chain, the tenure start heights and the accounting, none of which is
-    /// addressed by block and all of which would otherwise describe a chain
-    /// this node is no longer on.
+    /// has to be given up is everything kept beside the MARF, which is not
+    /// addressed by block and would otherwise describe a chain this node is no
+    /// longer on. That is [`Self::stand_on`]'s job, and it does it by reading
+    /// back the ledger the surviving block committed rather than by undoing the
+    /// discarded ones.
     ///
     /// Retracting to a block this node never executed does nothing: a node
     /// cannot stand on a state it did not compute.
@@ -1756,12 +1840,7 @@ impl ChainState {
         };
         let discarded: Vec<_> = self.ledger.executed.split_off(position + 1);
         if let Some(first) = discarded.first() {
-            self.ledger
-                .accounting
-                .retract_from(u64::from(first.tenure_height));
-            self.ledger
-                .tenure_start_heights
-                .retain(|tenure, _| *tenure < first.tenure_height);
+            self.stand_on(Some(block_id), first.tenure_height);
         }
         ChainRetraction {
             resume_from: Some(block_id),
@@ -3781,6 +3860,51 @@ mod tests {
              executed and will not be executed again, so nothing else can \
              restore the count"
         );
+    }
+
+    /// A hole in the maturity window is a window that is not there yet.
+    ///
+    /// The live mainnet state is the case: 167 tenures from 251,220 to 251,394
+    /// with 251,322 through 251,329 missing, because the node began mid-tenure
+    /// 251,323 and the rounds that would have recorded the next few died before
+    /// writing. Read as an outer pair that is a 175-tenure window and passes every
+    /// startup check; the first payout it cannot make is the maturity of 251,322,
+    /// twenty-seven tenures past where the node had reached.
+    #[test]
+    fn a_hole_shortens_the_window_that_can_actually_be_paid_out() {
+        let recipient =
+            PrincipalData::parse("ST000000000000000000002AMW42H").expect("boot principal");
+        let mut accounting = TenureAccounting::default();
+        for height in (100..=110).chain(120..=130) {
+            accounting.record_earnings(
+                height,
+                TenureEarnings {
+                    recipient: recipient.clone(),
+                    coinbase: 1_000,
+                    fees: 0,
+                },
+            );
+        }
+        assert_eq!(
+            accounting.known_earnings_span(),
+            Some((120, 130)),
+            "the span is the run reaching the top, not the outer pair: the tenures below \
+             the hole cannot be paid out until the hole is filled, and reporting 100 to \
+             130 is what let a node run for hours towards a payout it could never make"
+        );
+
+        // Filled, the whole thing is usable again.
+        for height in 111..=119 {
+            accounting.record_earnings(
+                height,
+                TenureEarnings {
+                    recipient: recipient.clone(),
+                    coinbase: 1_000,
+                    fees: 0,
+                },
+            );
+        }
+        assert_eq!(accounting.known_earnings_span(), Some((100, 130)));
     }
 
     /// A node writes its accounting back out on every block, and a restart owes
