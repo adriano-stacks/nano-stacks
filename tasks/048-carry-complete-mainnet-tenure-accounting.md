@@ -225,3 +225,42 @@ input, where there is no limit to hit.
 
 Both are the same lesson in different clothes: verify through the path the reader
 uses, not the path the writer took.
+
+## The `fees` field named the wrong tenure, and both ends agreed on it
+
+251,321's oddly small **15,114** was recorded above as a value a reconstruction
+would get wrong. It is stranger than that: it is not tenure 251,321's fee total
+at all. It is tenure 251,320's.
+
+stacks-core cannot total a tenure's fees until the next tenure change proves the
+tenure over, so `payments.tx_fees_anchored` on tenure *T*'s schedule row holds
+the fees of *T − 1* — the field is literally `MinerPaymentTxFees::Nakamoto {
+parent_fees }`. `capture-fixtures` copied it into the checkpoint's `fees` under
+*T*'s name, and `effects_for_tenure` read it as *T*'s own and paid it to *T − 1*'s
+recipient. Two mistakes cancelling: for every tenure the checkpoint carried, the
+amount and the recipient were both right.
+
+They stop cancelling at the first tenure nano totals itself, because `add_fees`
+counts the *current* tenure's blocks. That is 251,321, which starts nine blocks
+past the anchor, and its maturity is 100 tenures later at block **8,673,846** —
+where the replay parked with matching receipts and a wrong root
+([[060-make-the-consensus-execution-engine-explicit-and-r]] has the diagnosis).
+
+One convention now, held at both ends: **`fees` is what this tenure's own
+transactions paid**. `capture-fixtures` reads it from the following tenure's
+schedule, as `hacknet/signer-checkpoint.sh` already did; `effects_for_tenure`
+takes the recipient and the amount of the second credit from the same entry,
+`earnings[matured - 1]`, so they cannot come apart again.
+
+`repair-ledger` restates the field as well as filling holes, from the same
+`payments` rows, and that makes it a checker rather than only a repair tool:
+against the parked state it moved 110 of 201 entries and left 91 alone — the 110
+being everything the checkpoint handed over or a previous repair had filled, and
+the 91 being every tenure nano totalled itself, agreeing with stacks-core to the
+microSTX. The split falls exactly on the seam between carried and executed, which
+is what a convention mismatch looks like when you measure it instead of arguing
+about it.
+
+Checkpoints already written stay readable, but they carry the field one tenure
+out of phase and have to be restated. `/home/aldur/mainnet-capture` was, with the
+original kept beside it as `native-effects.json.parent-fees`.

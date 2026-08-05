@@ -70,15 +70,19 @@ pub struct NativeStxCredit {
 /// Number of sortition-created tenures before a miner reward matures.
 pub const MINER_REWARD_MATURITY: u64 = 100;
 
-/// What a tenure earned for the recipients it pays once it matures.
+/// What a tenure earned for the recipient it pays once it matures.
 ///
-/// `MINER_REWARD_MATURITY` tenures later the coinbase lands on the tenure's own
-/// recipient and the fees its transactions paid land on the recipient of the
-/// tenure before it.
+/// Both halves go to the same recipient — this tenure's — but not in the same
+/// block. The coinbase matures `MINER_REWARD_MATURITY` tenures later; the fees
+/// this tenure's own transactions paid mature one tenure after that, because
+/// stacks-core cannot total them until the *next* tenure change proves the
+/// tenure is over, and so records them in the next tenure's payment schedule
+/// (`MinerPaymentTxFees::Nakamoto { parent_fees }`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TenureEarnings {
     pub recipient: PrincipalData,
     pub coinbase: u128,
+    /// The fees the transactions of *this* tenure paid, not those of any other.
     pub fees: u128,
 }
 
@@ -483,9 +487,8 @@ impl TenureAccounting {
             .earnings
             .get(&matured)
             .ok_or(TenureAccountingError::UnknownTenure(matured))?;
-        // The tenure *before* the maturing one is the recipient, and the amount
-        // is the maturing tenure's own fees. The two halves come from different
-        // tenures, which is the whole trap here.
+        // Two tenures pay out here, one tenure apart: the maturing one's
+        // coinbase, and the fees of the one before it.
         let previous = self.earnings.get(&matured.saturating_sub(1));
         let boot = || {
             PrincipalData::parse(network.boot_address())
@@ -501,25 +504,26 @@ impl TenureAccounting {
                     recipient: earned.recipient.clone(),
                     amount: earned.coinbase,
                 },
-                // stacks-core pays this out of the *maturing* tenure's schedule,
-                // whose `parent_fees` field is the fee total that tenure
-                // accumulated, and pays it to the recipient of the tenure before
-                // it (`get_parent_matured_miner` resolves the schedule at the
-                // maturing block's parent).
+                // The fees of the tenure *before* the maturing one, paid to that
+                // tenure's own recipient. stacks-core reads both out of the
+                // maturing tenure's schedule, whose `parent_fees` field holds the
+                // fee total of its parent tenure, and resolves the recipient
+                // through `get_parent_matured_miner` — but the pair is one
+                // tenure's earnings, not two, and taking them from one entry is
+                // what keeps them in step.
                 //
-                // Which fee total goes here is not decidable by reading
-                // `make_scheduled_miner_reward` alone, and reading it wrongly is
-                // invisible for a long time: mainnet miners alternate, so with
-                // recipients A, B, A, B the amounts nearly cancel. The chain
-                // settled it at 8,665,722 — the first tenure start nano derived
-                // for itself rather than taking from the checkpoint. There
-                // `SP70B98…` holds 2,582,898,874 uSTX, which is 54,269,991 more
-                // than before the block, and 54,269,991 is the maturing tenure's
-                // own fee total. Paying the previous tenure's 27,865,898 instead
-                // matches every receipt and no state root.
+                // Reading this off `make_scheduled_miner_reward` alone is not
+                // possible, and reading it wrongly hides for a long time: with a
+                // checkpoint whose `fees` field carried `parent_fees` verbatim,
+                // paying `earned.fees` to `previous.recipient` is arithmetically
+                // the same thing, so it matched every tenure the checkpoint
+                // covered. It first differs at the first tenure nano totalled
+                // itself, which is 100 tenures further on. Mainnet settled it at
+                // 8,673,846: `SP70B98…` gains 15,114 uSTX, which is tenure
+                // 251,320's own fee total, not tenure 251,321's 22,539,119.
                 NativeStxCredit {
                     recipient: previous.map_or_else(boot, |previous| previous.recipient.clone()),
-                    amount: earned.fees,
+                    amount: previous.map_or(0, |previous| previous.fees),
                 },
             ],
             liquid_supply_increase: earned.coinbase,
@@ -3701,22 +3705,17 @@ mod tests {
         assert_eq!(schedule.accumulated_at(440, None), 0);
     }
 
-    /// A matured tenure pays its coinbase to its own recipient and its fees to
-    /// the recipient of the tenure before it.
+    /// A tenure start pays the maturing tenure's coinbase and the *previous*
+    /// tenure's fees, each to its own tenure's recipient.
     ///
-    /// The two halves come from different tenures, which is what makes this easy
-    /// to get wrong, and getting it wrong is invisible: every receipt still
-    /// matches and only the state root moves. Mainnet miners alternate, so with
-    /// recipients A, B, A, B the two candidate rules nearly cancel.
+    /// Two tenures pay out here, one tenure apart, and getting the pairing wrong
+    /// is invisible for a hundred tenures: every receipt still matches and only
+    /// the state root moves.
     ///
-    /// Settled against the chain at 8,665,722, the first tenure start nano
-    /// derived for itself instead of taking from the checkpoint. Before that
-    /// block `SP70B98…` holds 2,528,628,883 uSTX; the chain has it at
-    /// 2,582,898,874 after it. The difference is 54,269,991, which is exactly the
-    /// fee total the checkpoint records for the *maturing* tenure, 251,222 — not
-    /// the 27,865,898 of the tenure before it. The recipient is still the earlier
-    /// tenure's, since `SPVYF6M…` (251,222's own recipient) took only the
-    /// coinbase.
+    /// Settled against the chain at 8,673,846, where `SP70B98…` gains 15,114 uSTX
+    /// — tenure 251,320's own fee total, paid to 251,320's own recipient. Tenure
+    /// 251,321, the one whose coinbase matures there, paid 22,539,119 in fees,
+    /// and none of it lands in that block.
     #[test]
     fn derived_effects_split_a_matured_tenure() {
         let recipient = |address: &str| PrincipalData::parse(address).expect("valid recipient");
@@ -3757,9 +3756,9 @@ mod tests {
                 fees: 0,
             },
         );
-        // Maturing tenure 13 credits tenure 12's recipient with tenure *13's*
-        // fees. Tenure 13 was executed rather than seeded, so its fees are the
-        // 23 added below.
+        // Tenure 13's own 23 is not paid when 13 matures; 12's seeded 13 is,
+        // and to 12's own recipient. That is what makes the seeded value load
+        // bearing: nothing nano executes can recover it.
         accounting.add_fees(13, 23);
         assert_eq!(
             accounting
@@ -3768,7 +3767,7 @@ mod tests {
                 .credits[1],
             NativeStxCredit {
                 recipient: recipient("ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"),
-                amount: 23,
+                amount: 13,
             }
         );
 
@@ -3783,11 +3782,11 @@ mod tests {
                     recipient: recipient("ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z"),
                     amount: 9,
                 },
-                // Tenure 11's fees, paid to tenure 10's miner. Tenure 11 was
-                // recorded with none and then earned 5.
+                // Tenure 10's own fees, paid to tenure 10's miner. Tenure 11's
+                // own 5 waits for the next tenure start.
                 NativeStxCredit {
                     recipient: recipient("ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"),
-                    amount: 5,
+                    amount: 3,
                 },
             ]
         );

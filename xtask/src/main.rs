@@ -1092,16 +1092,30 @@ impl CaptureConfig {
         // the earnings of that whole window travel with the checkpoint, and
         // `effects_for_tenure` derives the payouts from them.
         let mut tenures = Vec::new();
-        let earliest = last.saturating_sub(MINER_REWARD_MATURITY + 1);
+        // One tenure deeper than the payouts need, because the entry for a tenure
+        // is only complete once the archive also holds its successor.
+        let earliest = last.saturating_sub(MINER_REWARD_MATURITY + 2);
         for coinbase_height in earliest..=last {
             let Some(earned) = Self::scheduled_payment(chainstate_db, coinbase_height)? else {
+                continue;
+            };
+            // A tenure's fee total is not in its own schedule. stacks-core can
+            // only total it once the next tenure change proves the tenure over,
+            // so it lands in the *following* tenure's schedule as `parent_fees`
+            // — and a checkpoint that copies `anchored` from the same row it took
+            // the recipient and coinbase from carries every tenure's fees under
+            // its successor's name. That reads correctly for as long as the
+            // checkpoint's own window lasts and then diverges by one tenure's
+            // fees, which is how 8,673,846 was found.
+            let Some(following) = Self::scheduled_payment(chainstate_db, coinbase_height + 1)?
+            else {
                 continue;
             };
             tenures.push(json!({
                 "coinbase_height": coinbase_height,
                 "recipient": earned.recipient,
                 "coinbase": earned.coinbase,
-                "fees": earned.anchored,
+                "fees": following.anchored,
             }));
         }
         let covered = u64::try_from(tenures.len()).unwrap_or(0);
@@ -2592,17 +2606,18 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
 }
 
 
-/// Fill one ledger row's holes, or say why it could not be.
+/// Fill one ledger row's holes and restate its fee totals, or say why it could
+/// not be.
 ///
-/// Answers the tenures it filled, empty when the row already owed a contiguous
-/// window. Split out of `repair_ledger` because a per-row body and a per-state
-/// loop are two jobs.
+/// Answers the tenures it filled and how many fee totals it restated, both empty
+/// when the row already owed a contiguous window under the right rule. Split out
+/// of `repair_ledger` because a per-row body and a per-state loop are two jobs.
 fn repair_ledger_row(
     side_store: &Path,
-    archive: &Path,
+    archive: &mut ArchivedPayments,
     block: &str,
     data: &str,
-) -> Result<Vec<u64>, ()> {
+) -> Result<(Vec<u64>, usize), ()> {
     let Some(bytes) = decode_hex(data.trim()) else {
         eprintln!("the ledger committed with {block} is not hexadecimal");
         return Err(())
@@ -2618,11 +2633,18 @@ fn repair_ledger_row(
             return Err(())
         }
     };
-    if missing.is_empty() {
-        return Ok(Vec::new());
+    let restated = match restate_tenure_fees(&mut ledger, archive) {
+        Ok(restated) => restated,
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(())
+        }
+    };
+    if missing.is_empty() && restated == 0 {
+        return Ok((Vec::new(), 0));
     }
     for height in &missing {
-        let entry = match archived_tenure(archive, *height) {
+        let entry = match archive.tenure(*height) {
             Ok(Some(entry)) => entry,
             Ok(None) => {
                 eprintln!("the archive has no scheduled payment for tenure {height}");
@@ -2664,14 +2686,27 @@ fn repair_ledger_row(
                 eprintln!("the repaired ledger for {block} owes nothing");
                 return Err(())
             };
-            println!("{block}: filled {} tenures, window {first}..{last}", missing.len());
+            println!(
+                "{block}: filled {} tenures, restated {restated} fee totals, window {first}..{last}",
+                missing.len()
+            );
         }
         Err(error) => {
             eprintln!("the repaired accounting for {block} does not read back: {error}");
             return Err(())
         }
     }
-    let encoded = serde_json::to_vec(&ledger).unwrap_or_default();
+    write_ledger_row(side_store, block, &ledger)?;
+    Ok((missing, restated))
+}
+
+/// Write one repaired ledger row back, and prove it went in as the node reads it.
+fn write_ledger_row(
+    side_store: &Path,
+    block: &str,
+    ledger: &serde_json::Value,
+) -> Result<(), ()> {
+    let encoded = serde_json::to_vec(ledger).unwrap_or_default();
     if let Err(error) = sqlite_script(
         side_store,
         &format!(
@@ -2702,13 +2737,57 @@ fn repair_ledger_row(
                 eprintln!("the repaired row for {block} did not come back as it went in");
                 return Err(())
             }
+            Ok(())
         }
         Err(error) => {
             eprintln!("cannot read back the repaired ledger for {block}: {error}");
-            return Err(())
+            Err(())
         }
     }
-    Ok(missing)
+}
+
+/// Restate every tenure's fee total from the archive, and answer how many moved.
+///
+/// A tenure's `fees` is the total *its own* transactions paid, which stacks-core
+/// keeps in the following tenure's schedule. A checkpoint written before that was
+/// understood carried each total under its successor's name, so a state imported
+/// from one owes the wrong tenure's fees for as long as its window lasts. Where
+/// the archive and the state already agree this changes nothing, which is what
+/// makes running it over a whole state safe: it is a check on the tenures the
+/// node totalled itself and a correction only on the ones it was handed.
+fn restate_tenure_fees(
+    ledger: &mut serde_json::Value,
+    archive: &mut ArchivedPayments,
+) -> Result<usize, String> {
+    let tenures = ledger
+        .get_mut("accounting")
+        .and_then(|accounting| accounting.get_mut("tenures"))
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "the ledger names no tenures".to_owned())?;
+    let mut restated = 0;
+    for tenure in tenures.iter_mut() {
+        let Some(height) = tenure
+            .get("coinbase_height")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        // Only the successor's row is needed: the recipient and coinbase already
+        // in the ledger are the tenure's own and are not in question here.
+        let Some((_, _, own_fees)) = archive.payment(height + 1)? else {
+            continue;
+        };
+        let recorded = tenure
+            .get("fees")
+            .and_then(serde_json::Value::as_u64)
+            .map(u128::from);
+        if recorded == Some(own_fees) {
+            continue;
+        }
+        tenure["fees"] = json!(own_fees);
+        restated += 1;
+    }
+    Ok(restated)
 }
 
 /// Fill a hole in a state's tenure accounting from stacks-core's own archive.
@@ -2769,13 +2848,16 @@ fn repair_ledger(arguments: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let mut payments = ArchivedPayments::new(archive);
     let mut repaired = 0_usize;
     let mut filled = std::collections::BTreeSet::new();
+    let mut restated = 0_usize;
     for (block, data) in &rows {
-        match repair_ledger_row(&side_store, archive, block, data) {
-            Ok(missing) if missing.is_empty() => {}
-            Ok(missing) => {
+        match repair_ledger_row(&side_store, &mut payments, block, data) {
+            Ok((missing, moved)) if missing.is_empty() && moved == 0 => {}
+            Ok((missing, moved)) => {
                 filled.extend(missing);
+                restated += moved;
                 repaired += 1;
             }
             Err(()) => return ExitCode::FAILURE,
@@ -2786,9 +2868,9 @@ fn repair_ledger(arguments: &[String]) -> ExitCode {
         println!("every ledger row already owes a contiguous window");
     } else {
         println!(
-            "repaired {repaired} of {} ledger rows, filling tenures {:?}",
-            rows.len(),
-            filled
+            "repaired {repaired} of {} ledger rows, filling tenures {filled:?} and restating \
+             {restated} fee totals",
+            rows.len()
         );
     }
     ExitCode::SUCCESS
@@ -2817,8 +2899,59 @@ fn missing_tenures(ledger: &serde_json::Value) -> Result<Vec<u64>, String> {
         .collect())
 }
 
-/// One tenure's earnings, as stacks-core's archive recorded them.
-fn archived_tenure(archive: &Path, coinbase_height: u64) -> Result<Option<serde_json::Value>, String> {
+/// stacks-core's scheduled payments, read once each.
+///
+/// A repair walks every ledger row and every row owes the same window of
+/// tenures, so without this the same two queries run tens of thousands of times.
+struct ArchivedPayments {
+    archive: PathBuf,
+    read: std::collections::HashMap<u64, Option<(String, u128, u128)>>,
+}
+
+impl ArchivedPayments {
+    fn new(archive: &Path) -> Self {
+        Self {
+            archive: archive.to_path_buf(),
+            read: std::collections::HashMap::new(),
+        }
+    }
+
+    fn payment(&mut self, coinbase_height: u64) -> Result<Option<(String, u128, u128)>, String> {
+        if let Some(payment) = self.read.get(&coinbase_height) {
+            return Ok(payment.clone());
+        }
+        let payment = archived_payment(&self.archive, coinbase_height)?;
+        self.read.insert(coinbase_height, payment.clone());
+        Ok(payment)
+    }
+
+    /// One tenure's earnings, as stacks-core's archive recorded them.
+    ///
+    /// The fee total comes from the *next* tenure's schedule, which is the only
+    /// place stacks-core keeps it: a tenure is not over, and so cannot be
+    /// totalled, until the next tenure change. A tenure whose successor the
+    /// archive has not reached therefore has no complete entry here.
+    fn tenure(&mut self, coinbase_height: u64) -> Result<Option<serde_json::Value>, String> {
+        let Some(earned) = self.payment(coinbase_height)? else {
+            return Ok(None);
+        };
+        let Some(following) = self.payment(coinbase_height + 1)? else {
+            return Ok(None);
+        };
+        Ok(Some(json!({
+            "coinbase_height": coinbase_height,
+            "recipient": earned.0,
+            "coinbase": earned.1,
+            "fees": following.2,
+        })))
+    }
+}
+
+/// A tenure's archived scheduled payment: recipient, coinbase, `parent_fees`.
+fn archived_payment(
+    archive: &Path,
+    coinbase_height: u64,
+) -> Result<Option<(String, u128, u128)>, String> {
     let tenure = sqlite(
         archive,
         &format!(
@@ -2843,13 +2976,9 @@ fn archived_tenure(archive: &Path, coinbase_height: u64) -> Result<Option<serde_
     let mut fields = payment.split('|');
     let recipient = fields
         .next()
-        .ok_or_else(|| format!("tenure {coinbase_height} has no recipient"))?;
+        .ok_or_else(|| format!("tenure {coinbase_height} has no recipient"))?
+        .to_owned();
     let coinbase = parse_u128("archived coinbase", fields.next())?;
-    let fees = parse_u128("archived anchored fees", fields.next())?;
-    Ok(Some(json!({
-        "coinbase_height": coinbase_height,
-        "recipient": recipient,
-        "coinbase": coinbase,
-        "fees": fees,
-    })))
+    let anchored = parse_u128("archived anchored fees", fields.next())?;
+    Ok(Some((recipient, coinbase, anchored)))
 }
