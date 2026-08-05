@@ -602,9 +602,11 @@ back rather than returning the tuple, so they do not paper over it. It needs a
 decision at the analysis layer, and a mainnet contract returning such an `if`
 across a contract-call boundary or into a receipt would surface it.
 
-**The follower exits after each round.** `stopping: every sealed block is already
-on disk` — the node consumes its staged backlog, ends the follower job, and the
-process exits, so depth advances about thirty blocks per start rather than
-continuously. Startup is 20 s now, so this is cheap to work around by hand and
-wrong to leave: unattended catch-up does not happen. That belongs to
-[[047-make-mainnet-synchronization-monotonic-and-restart]].
+**The follower does *not* exit after each round — that was my own harness.**
+`stopping: every sealed block is already on disk` is printed by the SIGTERM
+handler, not by a completed round. The node was being launched as
+`nohup … &` inside a shell that a two-minute command timeout then killed, taking
+the whole process group with it. Launched with `setsid` it runs continuously and
+depth climbs without help. Recorded because the wrong version of this was
+published, and because "the node stops on its own" would have sent someone into
+`supervise` looking for a bug that is not there.
