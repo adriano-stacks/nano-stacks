@@ -26,13 +26,17 @@ never validation inputs.
 
 ## Tasks
 
-- [~] Feed locally decoded Bitcoin operations into a `SnapshotChain` the node
-      owns — done, though not yet persistent nor driving execution.
+- [x] Feed locally decoded Bitcoin operations into a `SnapshotChain` the node
+      owns.
 - [x] Derive consensus hash, sortition hash, winning commit transaction and
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
-- [ ] Hand the local snapshot to block validation and execution.
-- [ ] Persist snapshots and resume without trusting a peer's current burn view.
+- [~] Hand the local snapshot to block validation and execution — validation
+      takes the sortition hash from it; execution's Clarity-visible inputs
+      (`vrf_seed`, `burn_block_time`, the burn header hash) still come from the
+      peer, because they move state roots.
+- [x] Persist snapshots and resume without trusting a peer's current burn view.
+- [ ] Name the winner when several commitments compete: 12 of the captured 14.
 - [ ] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
       path and replay the affected Stacks tenures.
 
@@ -177,4 +181,119 @@ capture's window is the offline oracle for everything else, and it stays green.
 A tracker also cannot be seeded anywhere except where its consensus-hash history
 ends — every hash after that has to be derived rather than quoted, which is the
 whole point — so a live node needs a capture reaching its own tip.
+
+## The burn total does derive, and the burn distribution is why
+
+The paragraph above is now wrong in its conclusion and right in its reasoning.
+The running total is indeed the burn *distribution*'s total rather than the sum of
+what a block's commitments paid — and `SortitionEngine` already computes that
+distribution, so the number derives. What was missing was three inputs it was
+never given:
+
+- **How many of a commitment's outputs are payouts.** Two in a reward phase, one
+  in a prepare phase, one under the waterfall; everything after them is the
+  miner's change, which is the output the next commitment spends to chain through
+  the window. Counting every output makes a candidate's weight the size of its
+  wallet: mainnet miners chain 16–23 million sats behind a 30,000-sat commitment.
+  `nano_sortition::PayoutSchedule` is the rule, built in the node from the same
+  `/v2/pox` constants every `BitcoinBlockContext` is already made of.
+- **Six blocks of mining window behind the seed.** The distribution weighs a
+  candidate over `MINING_COMMITMENT_WINDOW` blocks, and a chain starting at a
+  checkpoint has none of them. Priming with seven instead of six moves each
+  candidate's median burn and turns mainnet's sortition at burn 960,226 into no
+  sortition at all — a short or long window is not a rougher answer, it is a
+  different one.
+- **The seed's own winning VRF seed**, which the sampling of the block after it
+  mixes. A capture does not record it, but every eligible commitment in a Nakamoto
+  burn block carries the same `new_seed` — the hash of the parent tenure's
+  coinbase proof, which every miner computes identically — so the seed's own burn
+  block states it. Burn 960,230 has five commitments naming five different leader
+  keys and one seed between them.
+
+With those, the captured window derives **the running burn total at all fourteen
+blocks**, alongside the consensus hash, sortition identifier and sortition hash it
+already did. `tests/mainnet_sortition.rs::the_node_tracker_derives_the_same_window`
+now hands the tracker nothing but Bitcoin blocks and asserts all four.
+
+The total is also the one field with an oracle on a *live* chain: a Nakamoto
+header's `bitcoin_spent` is the burn view's running total under threshold signer
+weight, so `SortitionTracker::agrees_with_header` puts the derived distribution
+against something the reward set signed, at every tenure. A disagreement stops the
+derivation rather than being logged — every consensus hash after it would be
+derived from a wrong number, and reporting that once per block for the rest of the
+run says nothing the first line did not.
+
+## The `PoxId` was one bit where mainnet has 142
+
+The production wiring passed `PoxId::initial()`. The consensus hash mixes the
+`PoX` history, so every hash the node derived was wrong for that reason alone,
+however right the rest of the arithmetic was — and nothing said so, because the
+check never ran far enough to compare one.
+
+It does not need configuring. A sortition identifier is the burn header hash and
+the bit vector hashed together, so a capture that records the identifier states
+the vector: `nano_sortition::unbroken_pox_id_for` searches unbroken histories —
+one bit per reward cycle, every bit set — and mainnet's seed resolves to 142. Only
+unbroken ones are searched on purpose: the space of arbitrary vectors is
+exponential, and a vector that happens to hash right is not evidence. A chain that
+missed an anchor block does not resolve, and says so instead of guessing.
+
+## The catch-up, and its bound
+
+`SortitionTracker::catch_up` walks every burn block between where the chain stands
+and the block being executed. Nothing is skipped — a consensus hash mixes the ones
+behind it, so a height left out changes every hash after it — which is why the
+previous version could not work: it advanced exactly one block and bailed out
+otherwise, so on mainnet, where the checkpoint's seed is twelve blocks below the
+first block executed, the check never ran once.
+
+The bound is 144 burn blocks a round, about a day of Bitcoin. It covers the two
+gaps that legitimately occur — the checkpoint's own, and the run of sortition-less
+burn blocks between two tenures — and refuses a burn height further off, which is
+a tracker seeded on another chain or a peer on one rather than a gap to walk. Each
+step costs a full Bitcoin block download, which is what made the unbounded version
+of this walk (commit 2ee576b8) so expensive. Bounded per round, so a round that
+runs out keeps what it derived.
+
+## What the winner still needs
+
+The winner's identity derives for **12 of the captured 14**, and the two it misses
+— burn 960,230 and 960,233 — both name a different commitment carrying the *same*
+`new_seed`. So the sortition hash still derives; what does not is which miner's
+leader key authorised the tenure, and that is the input
+[[024-verify-the-vrf-seed-a-block-commits-to]] needs.
+
+The difference is in `make_burn_sample`'s min-median weighting of window slots a
+candidate has no commitment in, which nano fills with 1. A variant that takes the
+median over only the slots a candidate *does* have fixes 960,230 and 960,233 and
+breaks 960,228 — 13 of 14 either way — so neither rule is the network's, and it was
+tried and reverted rather than shipped on a coin flip. That is the next thing to
+close, and `WINNERS_FLOOR` in `tests/mainnet_sortition.rs` is the number that has
+to go up.
+
+Until it does, the node publishes the winner's leader key only where the burn
+block leaves no choice — one eligible commitment — and says, per burn block, how
+many competed. Publishing a 12-in-14 answer into a check that *rejects* would
+reject one valid tenure in seven.
+
+## It keeps pace on mainnet
+
+Against a mainnet state at Stacks height 8,666,584, the node closed the
+checkpoint's gap in one round (`derived 33 sortitions locally, now standing on
+burn 960252`) and then advanced one burn block at a time with execution, through
+960,255, 960,256 and 960,257 — reporting no consensus-hash difference, no VRF-seed
+difference and no burn-total difference with the headers at any of them. Burn
+960,257's derived `sortition_id` `d9d17c4f…` and `consensus_hash` `67d48bbf…`
+match `api.hiro.so/v3/sortitions/burn_height/960257` exactly. A restart resumed
+from the saved chain at burn 960,254 rather than re-deriving from the capture.
+
+## The capture needs six blocks below its span
+
+`xtask capture` writes Bitcoin blocks only for the burn span its Stacks blocks sit
+in, so a capture cannot fill the mining window behind its own seed. The six blocks
+below `/home/aldur/mainnet-capture`'s span were added by hand; the test finds them
+by walking the previous-block hash out of each header, which also proves they are
+the seed's real ancestors. `xtask capture` should reach
+`MINING_COMMITMENT_WINDOW - 1` blocks below the span, and until it does the
+tracker test skips with that as its reason rather than quietly asserting less.
 

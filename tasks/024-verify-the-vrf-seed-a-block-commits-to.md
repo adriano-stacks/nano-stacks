@@ -112,15 +112,42 @@ proof is unknown for the very first tenure. Both print what they could not check
 and why. That is the honest state, not a closed hole: a node in that window is
 accepting proofs it has not verified, and it says so.
 
-**What is left is plumbing, and it belongs to
-[[049-derive-canonical-sortitions-from-the-local-burncha]].** The fields are on
-the context but the follow path still fills the per-block context from the
-peer-supplied `/v3/sortitions` response (`nano-node/src/lib.rs`, three sites),
-which carries neither a sortition hash nor a leader key. Until those read from the
-local `SortitionTracker` instead, the check runs with `None` on both inputs on a
-live follow and only the conformance test exercises it for real. Taking them from
-the peer would mean trusting the peer for a validation input, which is the thing
-this task exists to avoid.
+## The sortition hash is local now; the leader key is not
+
+The plumbing landed with
+[[049-derive-canonical-sortitions-from-the-local-burncha]]. `SortitionTracker` now
+keeps pace with the block being executed — it walks every burn block between its
+tip and that block's burn view, bounded at a day of Bitcoin a round — and
+`nano-node`'s `CheckpointExecutor::local_sortition` fills
+`BitcoinBlockContext::sortition_hash` from the snapshot it derived rather than from
+the peer. The sortition hash derives exactly for all fourteen blocks of the
+captured mainnet window and matched at every burn block of a live follow.
+
+`winner_vrf_public_key` is still usually `None`, and the reason is now a precise
+one rather than "the registration predates the window". Every eligible commitment
+in a Nakamoto burn block carries the same `new_seed` and a *different* leader key —
+burn 960,230 has five commitments, five keys, one seed — so naming the key means
+naming which commitment won, which is the burn distribution's answer, and that
+derives 12 of the captured 14. The node therefore publishes the key only where the
+burn block leaves no choice (one eligible commitment) and otherwise says how many
+competed. Publishing a 12-in-14 answer here would reject one valid tenure in
+seven, since `check_tenure_vrf` rejects rather than warns.
+
+So the remaining work on this task is not plumbing any more, it is
+`make_burn_sample`'s min-median weighting — see 049's "What the winner still
+needs". When that closes, the key follows with no further wiring.
+
+Two smaller things this turned up:
+
+- `check_tenure_vrf`'s message for an absent key still says the registration
+  predates the burnchain window, which is no longer the usual reason. It should say
+  the winner is unnamed when that is what happened.
+- `context.vrf_seed` is still the peer's, and it is a validation input as well as a
+  Clarity-visible one: `verify_committed_vrf_seed` reads it. The locally derived
+  `winner_vrf_seed` matched the peer's at all fourteen captured blocks and at every
+  block of the live follow, so switching is a small step — but it moves a state
+  root, so it wants its own change rather than riding along with a
+  validation-only one.
 
 ## Correction: the parent proof is lost on every restart, not only at a checkpoint
 

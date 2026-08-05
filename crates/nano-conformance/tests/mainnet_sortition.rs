@@ -328,12 +328,55 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
     );
 }
 
-/// The node's own tracker derives what the network derived.
+/// Winners the burn distribution names correctly across the window.
 ///
-/// The window test above drives `SnapshotChain` directly, which proves the
-/// arithmetic. This drives `nano_node::sortition::SortitionTracker`, which is
-/// what a node actually runs — the same blocks through the code path that will
-/// replace asking a peer.
+/// Twelve of the fourteen, and the two it misses — burn 960,230 and 960,233 —
+/// both name a *different* commitment carrying the *same* `new_seed`, because in
+/// Nakamoto every candidate in a burn block commits the hash of the parent
+/// tenure's coinbase proof and they are all identical. So the sortition hash
+/// still derives; what does not is which miner's leader key authorised the
+/// tenure. The remaining difference is in the min-median weighting of window
+/// slots a candidate has no commitment in — a variant that counts only the slots
+/// it does have fixes these two and breaks burn 960,228, so neither rule is the
+/// network's.
+const WINNERS_FLOOR: usize = 12;
+
+/// The mining window a chain is weighed over, which reaches behind the seed.
+///
+/// `nano_sortition::MINING_COMMITMENT_WINDOW` blocks, and the capture's own seed
+/// is the last of them, so five sit below anything `snapshots.json` describes.
+/// They are found by walking the previous-block hash out of each block's header,
+/// which also proves they are the seed's real ancestors rather than whatever was
+/// dropped into the directory.
+fn priming_blocks(root: &std::path::Path, seed: &Captured) -> Option<Vec<BitcoinBlock>> {
+    let mut hash = seed.burn_header_hash.clone();
+    let mut height = seed.block_height;
+    let mut blocks = Vec::new();
+    for _ in 0..nano_sortition::MINING_COMMITMENT_WINDOW {
+        let raw = fs::read_to_string(root.join("bitcoin/blocks").join(format!("{hash}.hex"))).ok()?;
+        let bytes = hex::decode(raw.trim()).expect("the block is hexadecimal");
+        // A Bitcoin header is version(4) then the previous block hash, stored in
+        // the reverse of the order it is written in.
+        let mut previous = <[u8; 32]>::try_from(&bytes[4..36]).expect("32 bytes");
+        previous.reverse();
+        blocks.push(decode_block(height, &bytes, MAINNET_MAGIC).expect("decode the block"));
+        hash = hex::encode(previous);
+        height -= 1;
+    }
+    blocks.reverse();
+    Some(blocks)
+}
+
+/// The node's own tracker derives what the network derived, asking nothing.
+///
+/// The window test above drives `SnapshotChain` directly and is *given* the
+/// winner and the running burn total. This drives
+/// `nano_node::sortition::SortitionTracker`, which is what a node actually runs,
+/// and hands it nothing but Bitcoin blocks: the burn total, the winner and the
+/// sortition hash are all derived. The burn total is the one that matters most,
+/// because it is neither the sum of what a block's commitments paid nor a number
+/// any Bitcoin block carries — it comes out of the burn distribution, and a block
+/// whose sortition went to the null miner adds nothing to it at all.
 #[test]
 fn the_node_tracker_derives_the_same_window() {
     let Some(root) = capture() else {
@@ -344,37 +387,104 @@ fn the_node_tracker_derives_the_same_window() {
         &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
     )
     .expect("parse the snapshots");
+    let Some(priming) = priming_blocks(&root, &captured[0]) else {
+        nano_conformance::skip_gate(
+            "the capture holds no Bitcoin blocks below its seed, so the mining window \
+             cannot be filled — `xtask capture` needs to reach MINING_COMMITMENT_WINDOW \
+             blocks below the burn span",
+        );
+        return;
+    };
     let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
         .expect("the capture carries the consensus hashes");
 
-    let mut tracker =
-        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
-            .expect("the tracker starts");
+    let mut tracker = nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
+        .expect("the tracker starts");
+    // Mainnet's calendar, and the waterfall opening with cycle 141 at 962,150 —
+    // past this window, so every block in it sits in a reward phase and its
+    // commitments pay two recipients.
+    let payouts = nano_sortition::PayoutSchedule::new(
+        nano_sortition::RewardCycleSchedule::new(666_050, 2100, Some(962_150))
+            .expect("valid cycle schedule"),
+        100,
+    )
+    .expect("valid payout schedule");
+
+    let blocks: BTreeMap<u64, BitcoinBlock> = priming
+        .into_iter()
+        .map(|block| (block.height, block))
+        .chain(captured.iter().skip(1).map(|snapshot| {
+            let raw = fs::read_to_string(
+                root.join("bitcoin/blocks")
+                    .join(format!("{}.hex", snapshot.burn_header_hash)),
+            )
+            .expect("read the captured Bitcoin block");
+            let block = decode_block(
+                snapshot.block_height,
+                &hex::decode(raw.trim()).expect("the block is hexadecimal"),
+                MAINNET_MAGIC,
+            )
+            .expect("decode the captured Bitcoin block");
+            (snapshot.block_height, block)
+        }))
+        .collect();
 
     let mut checked = 0;
+    let mut winners = 0;
+    tracker
+        .catch_up(
+            |height| {
+                blocks
+                    .get(&height)
+                    .cloned()
+                    .ok_or_else(|| format!("no Bitcoin block at {height}"))
+            },
+            captured[0].block_height,
+            payouts,
+            u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("window fits u64"),
+        )
+        .expect("the mining window fills from behind the seed");
     for snapshot in captured.iter().skip(1) {
-        let raw = fs::read_to_string(
-            root.join("bitcoin/blocks")
-                .join(format!("{}.hex", snapshot.burn_header_hash)),
-        )
-        .expect("read the captured Bitcoin block");
-        let block = decode_block(
-            snapshot.block_height,
-            &hex::decode(raw.trim()).expect("the block is hexadecimal"),
-            MAINNET_MAGIC,
-        )
-        .expect("decode the captured Bitcoin block");
-
-        let derived = tracker
-            .advance(&block, snapshot.total_burn.parse().expect("a burn total"))
-            .expect("the tracker advances");
-        assert_eq!(
-            hex::encode(derived.consensus_hash.as_bytes()),
-            snapshot.consensus_hash,
-            "the node derives the consensus hash at burn {}",
-            snapshot.block_height
-        );
+        let block = blocks
+            .get(&snapshot.block_height)
+            .expect("every captured snapshot has its Bitcoin block");
+        let derived = tracker.advance(block, payouts).expect("the tracker advances");
+        for (field, derived, captured) in [
+            (
+                "consensus hash",
+                hex::encode(derived.consensus_hash.as_bytes()),
+                snapshot.consensus_hash.clone(),
+            ),
+            (
+                "sortition hash",
+                hex::encode(derived.sortition_hash.as_bytes()),
+                snapshot.sortition_hash.clone(),
+            ),
+            (
+                "total burn",
+                derived.total_burn.to_string(),
+                snapshot.total_burn.clone(),
+            ),
+        ] {
+            assert_eq!(
+                derived, captured,
+                "the node derives the {field} at burn {}",
+                snapshot.block_height
+            );
+        }
+        let expected_winner =
+            (snapshot.sortition != 0).then(|| snapshot.winning_block_txid.clone());
+        if derived.winner_txid.map(hex::encode) == expected_winner {
+            winners += 1;
+        }
         checked += 1;
     }
     assert_eq!(checked, DERIVED_FLOOR, "the node derived the whole window");
+    // A floor rather than equality, for the same reason `DERIVED_FLOOR` is one:
+    // the winner's identity is the field still to close, and this is the number
+    // that has to go up.
+    assert!(
+        winners >= WINNERS_FLOOR,
+        "named {winners} winners, below the {WINNERS_FLOOR} already reached"
+    );
 }

@@ -37,6 +37,10 @@ pub struct CheckpointExecutor<S> {
     /// The burn height a reported sortition gap was last complained about, so
     /// the complaint is made once rather than for every block behind it.
     sortition_gap: Option<u64>,
+    /// The burn height whose winner could not be named was last said, for the
+    /// same reason: a tenure is many Stacks blocks and the sortition is one fact
+    /// about it, so saying it per block buries every other line in the log.
+    sortition_winner: Option<u64>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -54,6 +58,67 @@ pub struct CheckpointExecutor<S> {
     /// anywhere else would announce a block that had only been downloaded.
     observers: Option<nano_rpc::EventDispatcher>,
     bitcoin: S,
+}
+
+/// What this node derived for the burn block a Stacks block executes under.
+///
+/// Both fields are validation inputs and nothing else: `check_tenure_vrf` reads
+/// them and no Clarity word does, so filling them from the local burnchain rather
+/// than from a peer moves no state root. Taking them from the peer would mean
+/// trusting the peer for the input that decides whether a tenure is the one the
+/// network elected, which is the whole point of deriving sortitions here.
+#[derive(Clone, Copy, Debug)]
+struct LocalSortition {
+    sortition_hash: [u8; 32],
+    /// The winning commitment's leader-key VRF public key, when this node can
+    /// name the winner without leaning on the burn distribution.
+    winner_vrf_public_key: Option<[u8; 32]>,
+}
+
+/// The `PoX` payout calendar a node's own constants imply.
+///
+/// A commitment's burn is the sum of what it paid its `PoX` recipients, and how
+/// many outputs those are moves with the reward cycle and again at the waterfall
+/// — so this decides every candidate's weight in the distribution. The waterfall
+/// opens with the reward cycle *after* the one pox-5 activates in
+/// (`burnchains/mod.rs:636`).
+///
+/// These are the same constants every `BitcoinBlockContext` is already built
+/// from, so reading them here adds no new trust.
+fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> {
+    let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+    let waterfall = pox.pox_5_activation_height.map(|activation| {
+        pox.first_bitcoin_height
+            + (pox.reward_cycle(u64::from(activation)) + 1) * length
+    });
+    let cycles =
+        nano_sortition::RewardCycleSchedule::new(pox.first_bitcoin_height, length, waterfall).ok()?;
+    nano_sortition::PayoutSchedule::new(cycles, u64::from(pox.prepare_phase_length)).ok()
+}
+
+/// Say where a locally derived sortition and the peer's answer part company.
+///
+/// Reported rather than enforced while the derivation is being brought up, and
+/// per field, because which field disagrees names which arithmetic is wrong: the
+/// consensus hash covers the operation set, the burn total and the `PoX` history
+/// together, while the VRF seed is the winning commitment's alone.
+fn report_disagreements(local: &nano_sortition::SortitionSnapshot, peer: &nano_sync::SortitionInfo) {
+    if local.consensus_hash != peer.consensus_hash {
+        eprintln!(
+            "locally derived consensus hash at burn {} is {} where the peer says {}",
+            peer.bitcoin_height, local.consensus_hash, peer.consensus_hash
+        );
+    }
+    if let Some(seed) = peer.vrf_seed
+        && local.winner_vrf_seed != Some(seed)
+    {
+        eprintln!(
+            "locally derived VRF seed at burn {} is {:?} where the peer says {}",
+            peer.bitcoin_height,
+            local.winner_vrf_seed.map(hex::encode),
+            hex::encode(seed)
+        );
+    }
 }
 
 /// Where a descent stops: the block this node has executed, by identity and by
@@ -382,6 +447,7 @@ where
             sortition: None,
             sortition_state: None,
             sortition_gap: None,
+            sortition_winner: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
@@ -403,6 +469,7 @@ where
             sortition: None,
             sortition_state: None,
             sortition_gap: None,
+            sortition_winner: None,
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
@@ -426,6 +493,18 @@ where
         // reason. The sortition already carries both.
         bitcoin_context.burn_block_time = tenure.sortition.bitcoin_timestamp;
         bitcoin_context.vrf_seed = tenure.sortition.vrf_seed.unwrap_or_default();
+        // As in `execute_staged`: the tenure VRF rules read these two, and they
+        // have to be this node's own answers rather than the peer's. The burn
+        // total comes from the first block of the tenure, which is the one that
+        // can start it.
+        let bitcoin_spent = tenure
+            .blocks
+            .first()
+            .map_or(0, |block| block.header.bitcoin_spent);
+        if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent) {
+            bitcoin_context.sortition_hash = local.sortition_hash;
+            bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
+        }
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
         let blocks = tenure
@@ -585,6 +664,11 @@ where
             self.seed_burn_headers(sortition.bitcoin_height);
             bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
             bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
+            // No sortition hash or leader key here, deliberately: this walk
+            // writes down headers for blocks already executed and validates
+            // nothing, and a header records neither field. Deriving sortitions
+            // backwards from the tip would also run the tracker in the one
+            // direction its consensus-hash skip-list cannot go.
             self.chainstate
                 .backfill_block_header(block, bitcoin_context)
                 .map_err(CheckpointExecutionError::from)?;
@@ -787,77 +871,142 @@ where
         self.sortition_state = Some(state);
     }
 
-    /// Derive this block's sortition locally and say if it differs.
+    /// Derive the sortition a block executes under, from this node's burnchain.
     ///
-    /// Reported rather than enforced while the chain is being brought up: a
-    /// node that stopped on its own arithmetic before that arithmetic was
-    /// trusted would be worse off than one that says so and carries on. Once
-    /// it agrees over a long enough run, execution takes the local answer and
-    /// the peer stops being asked.
-    /// Compare a peer's sortition against one this node derives itself.
+    /// The tracker walks every burn block up to the one the block stands on —
+    /// nothing is skipped, because a consensus hash mixes the ones behind it and
+    /// a height left out changes every hash from there on. That walk is what the
+    /// previous version of this could not do: it advanced exactly one block and
+    /// bailed out otherwise, so on mainnet, where the checkpoint's sortition seed
+    /// is twelve blocks older than the first block executed, the check never ran
+    /// once.
     ///
-    /// The chain can only be advanced from where its consensus-hash history
-    /// ends, and the running burn total is not derivable yet — it is the burn
-    /// distribution's total, not the sum of what a block's commitments spent —
-    /// so it is taken from the header, whose `bitcoin_spent` is that number
-    /// under threshold signer weight.
-    fn check_local_sortition(&mut self, peer: &nano_sync::SortitionInfo, burn_spent: u64) {
-        let Some(tracker) = self.sortition.as_mut() else {
-            return;
+    /// Two answers come back to the caller and are its own, not the peer's: the
+    /// tenure's sortition hash, and the winning commitment's leader key when the
+    /// burn block left no choice about which commitment won. Both are
+    /// validation-only — no Clarity word reads either — so neither moves a state
+    /// root.
+    ///
+    /// Differences with the peer are reported, not enforced, with one exception:
+    /// a burn total that disagrees with a signed header means every consensus hash
+    /// from here on is derived from a wrong number, so deriving stops rather than
+    /// reporting the same wrongness at every block after it.
+    fn local_sortition(
+        &mut self,
+        pox: &PoxInfo,
+        peer: &nano_sync::SortitionInfo,
+        bitcoin_spent: u64,
+    ) -> Option<LocalSortition> {
+        let payouts = payout_schedule(pox)?;
+        // Split the borrow: the tracker reads burn blocks through the same
+        // source the executor holds.
+        let Self {
+            sortition: Some(tracker),
+            bitcoin,
+            ..
+        } = self
+        else {
+            return None;
         };
-        // The chain can only be extended one burn block at a time, and each one
-        // needs its cumulative `total_burn` — which the node has only from a
-        // tenure header's `bitcoin_spent`. So a tracker that has fallen behind
-        // cannot simply skip forward, and on mainnet it starts behind: the
-        // checkpoint's sortition seed is older than the first block executed.
-        //
-        // The effect is that this check silently does nothing there, which is the
-        // failure mode worth being loud about — a validation that never runs looks
-        // exactly like one that always passes. Said once per gap rather than per
-        // block, so it names the condition without burying the log.
-        let expected = tracker.tip().bitcoin_height.saturating_add(1);
-        if peer.bitcoin_height != expected {
+        let behind = peer
+            .bitcoin_height
+            .saturating_sub(tracker.tip().bitcoin_height);
+        // Named before the walk, not after: every burn block costs a whole
+        // Bitcoin block download, so a node closing a checkpoint's gap can be
+        // busy for minutes, and a node that prints nothing for minutes teaches
+        // an operator to guess at what it is doing.
+        if behind > 1 {
+            println!(
+                "catching up the local sortition chain from burn {} to {}, {behind} blocks, \
+                 one Bitcoin block download each",
+                tracker.tip().bitcoin_height,
+                peer.bitcoin_height
+            );
+        }
+        match tracker.catch_up(
+            |height| bitcoin.block_at(height),
+            peer.bitcoin_height,
+            payouts,
+            crate::sortition::CATCH_UP_LIMIT,
+        ) {
+            Ok(advanced) if advanced > 0 => println!(
+                "derived {advanced} sortitions locally, now standing on burn {}",
+                tracker.tip().bitcoin_height
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("deriving the sortition locally failed: {error}");
+                self.sortition = None;
+                return None;
+            }
+        }
+        let tip = tracker.tip();
+        if tip.bitcoin_height != peer.bitcoin_height {
+            // Said once per gap rather than per block: a validation that never
+            // runs looks exactly like one that always passes, so the condition
+            // has to be named, but not at every block behind it.
             if self.sortition_gap != Some(peer.bitcoin_height) {
                 self.sortition_gap = Some(peer.bitcoin_height);
                 eprintln!(
-                    "not deriving sortitions: the local chain ends at burn {} and this block \
-                     is at {}, and closing that gap needs each intervening block's total burn, \
-                     which only a tenure header carries. Every sortition this node executes \
-                     under until then is the peer's, unchecked.",
-                    expected.saturating_sub(1),
-                    peer.bitcoin_height
+                    "the local sortition chain ends at burn {} and this block stands on {}, \
+                     {} away — more than one round of catching up may walk. Until it \
+                     closes, the sortition this node executes under is the peer's, unchecked.",
+                    tip.bitcoin_height,
+                    peer.bitcoin_height,
+                    peer.bitcoin_height.saturating_sub(tip.bitcoin_height)
                 );
             }
-            return;
+            return None;
         }
         self.sortition_gap = None;
-        let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
-            return;
+        report_disagreements(tip, peer);
+        // The winner's identity comes out of the burn distribution once a block
+        // holds more than one eligible commitment, and that distribution derives
+        // 12 of the 14 sortitions in the captured mainnet window — so the key is
+        // published only where the block leaves no choice to get wrong. Publishing
+        // it otherwise would reject roughly one valid tenure in seven.
+        let candidates = tracker.candidates();
+        let local = LocalSortition {
+            sortition_hash: *tip.sortition_hash.as_bytes(),
+            winner_vrf_public_key: (candidates == 1)
+                .then_some(tip.winner_vrf_public_key)
+                .flatten(),
         };
-        let derived = match tracker.advance(&block, burn_spent) {
-            Ok(derived) => {
-                if derived.consensus_hash != peer.consensus_hash {
-                    eprintln!(
-                        "locally derived consensus hash at burn {} is {} where the peer says {}",
-                        peer.bitcoin_height, derived.consensus_hash, peer.consensus_hash
-                    );
-                }
-                true
-            }
-            Err(error) => {
-                eprintln!("deriving the sortition locally failed: {error}");
-                false
-            }
-        };
+        if local.winner_vrf_public_key.is_none()
+            && tip.winner_txid.is_some()
+            && self.sortition_winner != Some(peer.bitcoin_height)
+        {
+            self.sortition_winner = Some(peer.bitcoin_height);
+            eprintln!(
+                "the tenure at burn {} carries a coinbase proof this node checks the \
+                 sortition hash of but not the key: {candidates} commitments competed for \
+                 this sortition and naming the winner among them needs the burn \
+                 distribution, which derives 12 of the captured window's 14",
+                peer.bitcoin_height
+            );
+        }
+        if !tracker.agrees_with_header(bitcoin_spent) {
+            eprintln!(
+                "the locally derived burn total at burn {} is {} where the header signed by \
+                 the reward set says {} — every consensus hash after this one would be \
+                 derived from a wrong total, so this node stops deriving and goes back to \
+                 the peer's sortitions",
+                peer.bitcoin_height,
+                tip.total_burn,
+                bitcoin_spent
+            );
+            self.sortition = None;
+            return None;
+        }
         // Written down as it advances rather than at shutdown, because a node
         // that is killed is exactly the one that must not start over.
-        if derived
-            && let (Some(tracker), Some(state)) =
-                (self.sortition.as_ref(), self.sortition_state.as_ref())
+        if let (Some(tracker), Some(state)) =
+            (self.sortition.as_ref(), self.sortition_state.as_ref())
             && let Err(error) = tracker.save(state)
         {
             eprintln!("the derived sortition chain could not be written down: {error}");
         }
+        Some(local)
     }
 
     /// Stand on the last block a peer's chain and this one agree about.
@@ -972,7 +1121,7 @@ where
             }
             let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
             let sortition = node.sortition(view).await?;
-            self.check_local_sortition(&sortition, block.header.bitcoin_spent);
+            let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             // Clarity reads this back through `get-burn-block-info?`, and sBTC
@@ -983,6 +1132,14 @@ where
             // than a stall.
             bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
             bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
+            // The two validation-only inputs the tenure VRF rules read, from
+            // this node's own burnchain. Absent, `check_tenure_vrf` says which
+            // rule it could not run and why, which is the honest state; filled
+            // from the peer, it would be checking the peer against itself.
+            if let Some(local) = local {
+                bitcoin_context.sortition_hash = local.sortition_hash;
+                bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
+            }
             self.seed_burn_headers(sortition.bitcoin_height);
             let bitcoin_context = node
                 .tenure_coinbase_context(

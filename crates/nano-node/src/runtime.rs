@@ -17,8 +17,6 @@ use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
-use nano_sortition::PoxId;
-
 use crate::{
     CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
     config::Config, miner, signer, sortition::SortitionTracker, staging::Staging,
@@ -673,11 +671,14 @@ async fn backfill_one_header(
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries
 /// the history that makes it possible.
 async fn start_deriving_sortitions(executor: &SharedExecutor, capture: &Path, state: &Path) {
-    match SortitionTracker::resume_or_capture(state, capture, PoxId::initial()) {
+    // No `PoxId` is passed: the seed's own sortition identifier states the bit
+    // vector it was produced under, so the tracker reads it off the checkpoint.
+    match SortitionTracker::resume_or_capture(state, capture) {
         Ok(tracker) => {
             println!(
-                "deriving sortitions locally from burn {}",
-                tracker.tip().bitcoin_height
+                "deriving sortitions locally from burn {} on PoX history {}",
+                tracker.tip().bitcoin_height,
+                tracker.tip().pox_id
             );
             executor
                 .lock()

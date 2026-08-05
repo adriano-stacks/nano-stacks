@@ -3,28 +3,51 @@
 //! Asking a peer what the sortition was lets that peer choose this node's
 //! consensus hashes, its winners and its fork. The arithmetic belongs here, and
 //! a captured window of mainnet proves it produces what the network produced:
-//! the same operations, operations hash, consensus hash, sortition identifier
-//! and sortition hash, from the raw Bitcoin blocks and nothing else.
+//! the same operations, operations hash, consensus hash, sortition identifier,
+//! sortition hash and running burn total, from the raw Bitcoin blocks and
+//! nothing else.
 //!
 //! A chain that starts at a checkpoint cannot derive a consensus hash from its
 //! own snapshots — the hash mixes the ones at power-of-two offsets behind it,
 //! reaching back thousands of blocks — so the checkpoint carries those hashes.
 //! They are twenty bytes a block: mainnet's whole history is twelve megabytes.
 
-use std::{fs, path::Path};
+use std::{fmt::Display, fs, path::Path};
 
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
 use nano_primitives::ConsensusHash;
 use nano_sortition::{
-    LeaderKeys, PoxId, SnapshotChain, SortitionError, SortitionSnapshot, SortitionWinner,
-    commit_lands_in_block,
+    LeaderKeys, MINING_COMMITMENT_WINDOW, PayoutSchedule, PoxId, SortitionEngine, SortitionError,
+    SortitionSnapshot, accepted_operation_txids, commitment_is_on_time, commitment_window_block,
+    unbroken_pox_id_for,
 };
 use serde::{Deserialize, Serialize};
+
+/// Reward cycles the seed's `PoX` history is searched for.
+///
+/// Mainnet has had 142 and gains one every fortnight, so this is decades of
+/// slack over a search that costs one hash per cycle.
+const POX_HISTORY_SEARCH_LIMIT: usize = 1024;
+
+/// How many burn blocks one round of catching up may walk.
+///
+/// A catch-up exists to close two gaps and no others: the one between the
+/// checkpoint's sortition seed and the first block the node executes — twelve
+/// blocks on mainnet, because the seed is the last block the capture's hash
+/// history reaches — and the run of burn blocks with no sortition between two
+/// tenures, which is a handful. A burn height further off than a day of Bitcoin
+/// is not a gap to walk but a tracker seeded on another chain or a peer on one,
+/// and walking toward it costs a full Bitcoin block download per step: the
+/// unbounded version of this walk once tried to cross 8.6 million of them
+/// (commit 2ee576b8). Bounded per round, so a round that runs out still keeps
+/// what it derived and the next one carries on.
+pub const CATCH_UP_LIMIT: u64 = 144;
 
 /// Why a locally derived sortition chain could not be started or advanced.
 #[derive(Debug)]
 pub enum TrackerError {
     Seed(String),
+    Bitcoin(String),
     Sortition(SortitionError),
 }
 
@@ -32,6 +55,7 @@ impl std::fmt::Display for TrackerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Seed(reason) => write!(formatter, "sortition seed: {reason}"),
+            Self::Bitcoin(reason) => write!(formatter, "burnchain: {reason}"),
             Self::Sortition(error) => write!(formatter, "sortition: {error:?}"),
         }
     }
@@ -54,7 +78,7 @@ struct History {
 /// A snapshot chain this node advances from its own burnchain.
 #[derive(Debug)]
 pub struct SortitionTracker {
-    chain: SnapshotChain,
+    engine: SortitionEngine,
     pox_id: PoxId,
     /// Leader keys registered by the burn blocks this tracker has walked.
     ///
@@ -64,22 +88,26 @@ pub struct SortitionTracker {
     /// so a lookup can miss — which is reported rather than treated as "no check
     /// needed".
     keys: LeaderKeys,
+    /// Whether the six burn blocks the distribution weighs over have been read.
+    ///
+    /// They come from behind the seed, so they are not blocks the chain takes a
+    /// snapshot of. Without them the window is short and the winner is not the
+    /// one the network picked.
+    primed: bool,
 }
 
 impl SortitionTracker {
     /// Start from a seed snapshot and the consensus hashes behind it.
-    pub fn new(
-        seed: SortitionSnapshot,
-        history: Vec<ConsensusHash>,
-    ) -> Result<Self, TrackerError> {
+    pub fn new(seed: SortitionSnapshot, history: Vec<ConsensusHash>) -> Result<Self, TrackerError> {
         let pox_id = seed.pox_id.clone();
-        let chain = SnapshotChain::with_history(seed, history).ok_or_else(|| {
+        let engine = SortitionEngine::with_history(seed, history).ok_or_else(|| {
             TrackerError::Seed("the history does not end at the snapshot it seeds".to_owned())
         })?;
         Ok(Self {
-            chain,
+            engine,
             pox_id,
             keys: LeaderKeys::new(),
+            primed: false,
         })
     }
 
@@ -87,14 +115,14 @@ impl SortitionTracker {
     pub fn history_from(directory: &Path) -> Result<Vec<ConsensusHash>, TrackerError> {
         let bytes = fs::read(directory.join("consensus-hashes.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let history: History = serde_json::from_slice(&bytes)
-            .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let history: History =
+            serde_json::from_slice(&bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
         history
             .hashes
             .iter()
             .map(|hash| {
-                let bytes = hex::decode(hash)
-                    .map_err(|error| TrackerError::Seed(error.to_string()))?;
+                let bytes =
+                    hex::decode(hash).map_err(|error| TrackerError::Seed(error.to_string()))?;
                 <[u8; 20]>::try_from(bytes.as_slice())
                     .map(ConsensusHash::from_bytes)
                     .map_err(|_| TrackerError::Seed("a consensus hash is not 20 bytes".to_owned()))
@@ -105,22 +133,118 @@ impl SortitionTracker {
     /// The snapshot this chain is standing on.
     #[must_use]
     pub fn tip(&self) -> &SortitionSnapshot {
-        self.chain.tip()
+        self.engine.snapshots().tip()
     }
 
-    /// Extend the chain with one Bitcoin block.
+    /// Commitments the burn block at the tip put up for its sortition.
     ///
-    /// `total_burn` is the running total the network keeps. A node cannot yet
-    /// derive it — it is the burn *distribution*'s total, not the sum of what a
-    /// block's commitments spent — so it comes from the Nakamoto header, whose
-    /// `burn_spent` is that number and carries threshold signer weight.
+    /// One means the block left no choice and its winner follows from the block
+    /// alone; more means the winner came out of the burn distribution. See
+    /// [`SortitionEngine::candidates`].
+    #[must_use]
+    pub fn candidates(&self) -> usize {
+        self.engine.candidates()
+    }
+
+    /// Extend the chain with one Bitcoin block, deriving everything about it.
+    ///
+    /// The running burn total is derived here rather than taken from a Nakamoto
+    /// header: it is the burn distribution's total over the six-block mining
+    /// window, which is why the sum of what a block's commitments paid out is
+    /// not it — a block whose sortition went to the null miner adds nothing at
+    /// all, as mainnet's burn 960,222 does. [`Self::agrees_with_header`] is what
+    /// checks the derivation against threshold signer weight.
     pub fn advance(
         &mut self,
         block: &BitcoinBlock,
-        total_burn: u64,
+        payouts: PayoutSchedule,
     ) -> Result<&SortitionSnapshot, TrackerError> {
-        // Registrations first: a commitment in this very block may name a key
-        // this block registers, and a lookup that ran first would miss it.
+        // A reward cycle opening adds a bit to the `PoX` history, and the
+        // consensus hash mixes that history — so a chain that carried the seed's
+        // vector across a boundary would derive a wrong hash for every block
+        // after it. Whether the new cycle chose an anchor block is not something
+        // this node can answer yet, and assuming it did is a guess the consensus
+        // hash would silently encode.
+        if payouts.starts_reward_cycle(block.height) {
+            return Err(TrackerError::Seed(format!(
+                "burn {} opens a reward cycle, which adds a bit to the PoX history \
+                 the consensus hash mixes, and this node cannot yet say whether \
+                 that cycle chose an anchor block",
+                block.height
+            )));
+        }
+        self.register_keys(block);
+        let commitments =
+            commitment_window_block(block, payouts.outputs_at(block.height), &self.keys);
+        let txids = accepted_operation_txids(block);
+        Ok(self
+            .engine
+            .append(block, &txids, commitments, self.pox_id.clone())?)
+    }
+
+    /// Walk the burnchain until the chain stands on `target`, or the bound runs
+    /// out. Returns how many burn blocks it advanced.
+    ///
+    /// Nothing is skipped: every burn block between here and there is read and
+    /// snapshotted, because a consensus hash mixes the ones behind it and a
+    /// height left out changes every hash from there on.
+    pub fn catch_up<E: Display>(
+        &mut self,
+        mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
+        target: u64,
+        payouts: PayoutSchedule,
+        limit: u64,
+    ) -> Result<u64, TrackerError> {
+        if !self.primed {
+            self.prime(&mut block_at, payouts)?;
+        }
+        let mut advanced = 0;
+        while self.tip().bitcoin_height < target && advanced < limit {
+            let height = self
+                .tip()
+                .bitcoin_height
+                .checked_add(1)
+                .ok_or(SortitionError::HeightOverflow)?;
+            let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            self.advance(&block, payouts)?;
+            advanced += 1;
+        }
+        Ok(advanced)
+    }
+
+    /// Read the mining window behind the seed, which the seed itself is not in.
+    ///
+    /// A short window is not a smaller version of the right answer: it computes
+    /// each candidate's median burn over fewer blocks than the network did, and
+    /// so picks a different winner. Priming with seven blocks instead of six is
+    /// what turned mainnet's sortition at burn 960,226 into no sortition at all.
+    fn prime<E: Display>(
+        &mut self,
+        block_at: &mut impl FnMut(u64) -> Result<BitcoinBlock, E>,
+        payouts: PayoutSchedule,
+    ) -> Result<(), TrackerError> {
+        let tip = self.tip().bitcoin_height;
+        let behind = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64") - 1;
+        for height in tip.saturating_sub(behind)..=tip {
+            let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            self.register_keys(&block);
+            if height == tip && let Some(seed) = unanimous_winner_seed(&block) {
+                self.engine.adopt_root_winner_seed(seed);
+            }
+            let commitments =
+                commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
+            self.engine.prime(commitments);
+        }
+        self.primed = true;
+        Ok(())
+    }
+
+    /// Record the leader keys a burn block registers.
+    ///
+    /// Before its commitments are read, because a commitment in this very block
+    /// may name a key this block registers and a lookup that ran first would
+    /// miss it.
+    fn register_keys(&mut self, block: &BitcoinBlock) {
         for operation in &block.operations {
             if let BitcoinOperationKind::LeaderKeyRegistration { vrf_public_key, .. } =
                 &operation.kind
@@ -129,80 +253,43 @@ impl SortitionTracker {
                     .register(block.height, operation.transaction_index, *vrf_public_key);
             }
         }
-        let txids = operation_txids(block);
-        let winner = winner_of(block, &self.keys);
-        Ok(self.chain.append_with_operations(
-            block,
-            &txids,
-            total_burn,
-            self.pox_id.clone(),
-            winner,
-        )?)
+    }
+
+    /// Whether the derived burn total is the one a signed header states.
+    ///
+    /// A Nakamoto header's `bitcoin_spent` is the burn view's running total and
+    /// carries threshold signer weight, so this is the one check that puts the
+    /// locally derived distribution against something the network signed. A
+    /// disagreement means every consensus hash from here on is derived from a
+    /// wrong total, so it is not a difference to log and continue past.
+    #[must_use]
+    pub fn agrees_with_header(&self, bitcoin_spent: u64) -> bool {
+        self.tip().total_burn == bitcoin_spent
     }
 }
 
-/// What the eligible commitments of a burn block spent, in satoshis.
+/// The seed every eligible commitment in a burn block carries, when they agree.
 ///
-/// The transactions of a burn block that are operations for its sortition.
-///
-/// A commitment that arrived after the block it was aiming at is a *missed*
-/// commitment: still a transaction, still able to chain its UTXO so the mining
-/// window survives a gap, but not an operation and not part of the hash.
-fn operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
-    block
-        .operations
-        .iter()
-        .filter(|operation| match &operation.kind {
-            BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
-                commit_lands_in_block(*parent_modulus, block.height)
-            }
-            _ => true,
-        })
-        .map(|operation| operation.txid)
-        .collect()
-}
-
-/// The commitment that won this block, if one did.
-///
-/// Choosing between several is the burn distribution's business; a block with
-/// one eligible commitment has no choice to make, which is the common case and
-/// the one this answers.
-fn winner_of(block: &BitcoinBlock, keys: &LeaderKeys) -> Option<SortitionWinner> {
-    let mut eligible = block.operations.iter().filter_map(|operation| {
-        match (&operation.kind, commit_lands_in_block_of(operation, block)) {
-            (
-                BitcoinOperationKind::LeaderBlockCommit {
-                    new_seed,
-                    key_block_height,
-                    key_transaction_index,
-                    ..
-                },
-                true,
-            ) => Some(SortitionWinner {
-                txid: operation.txid,
-                vrf_seed: *new_seed,
-                vrf_public_key: keys.usable(
-                    u64::from(*key_block_height),
-                    u32::from(*key_transaction_index),
-                ),
-            }),
+/// In Nakamoto a commitment's `new_seed` is the hash of the parent tenure's
+/// coinbase proof, which every miner can compute, so all the candidates in one
+/// burn block carry the same one — mainnet's burn 960,230 has five commitments
+/// naming five different leader keys and one seed between them. That is what
+/// lets a checkpoint's seed snapshot recover the winning seed it does not record,
+/// which the sampling of the block after it reads. Candidates that disagree give
+/// nothing: there is no telling which of them won.
+fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
+    let mut seeds = block.operations.iter().filter_map(|operation| {
+        match &operation.kind {
+            BitcoinOperationKind::LeaderBlockCommit {
+                new_seed,
+                parent_modulus,
+                ..
+            } if commitment_is_on_time(*parent_modulus, block.height) => Some(*new_seed),
             _ => None,
         }
     });
-    let first = eligible.next()?;
-    eligible.next().is_none().then_some(first)
-}
-
-const fn commit_lands_in_block_of(
-    operation: &nano_bitcoin::BitcoinOperation,
-    block: &BitcoinBlock,
-) -> bool {
-    match &operation.kind {
-        BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
-            commit_lands_in_block(*parent_modulus, block.height)
-        }
-        _ => false,
-    }
+    let first = seeds.next()?;
+    seeds.all(|seed| seed == first).then_some(first)
 }
 
 /// A snapshot a capture holds, in the fields a seed needs.
@@ -233,14 +320,10 @@ impl SortitionTracker {
     ///
     /// The saved form is the capture's own, so this is the same loader either way
     /// and a saved chain cannot be read more loosely than a captured one.
-    pub fn resume_or_capture(
-        state: &Path,
-        capture: &Path,
-        pox_id: PoxId,
-    ) -> Result<Self, TrackerError> {
-        match Self::from_capture(state, pox_id.clone()) {
+    pub fn resume_or_capture(state: &Path, capture: &Path) -> Result<Self, TrackerError> {
+        match Self::from_capture(state) {
             Ok(tracker) => Ok(tracker),
-            Err(saved) => Self::from_capture(capture, pox_id).map_err(|captured| {
+            Err(saved) => Self::from_capture(capture).map_err(|captured| {
                 TrackerError::Seed(format!(
                     "neither the saved sortitions ({saved}) nor the capture ({captured}) \
                      can seed a chain"
@@ -265,7 +348,7 @@ impl SortitionTracker {
             fs::write(&temporary, bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
             fs::rename(&temporary, &path).map_err(|error| TrackerError::Seed(error.to_string()))
         };
-        let tip = self.chain.tip();
+        let tip = self.tip();
         let snapshots = vec![CapturedSnapshot {
             block_height: tip.bitcoin_height,
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
@@ -276,7 +359,8 @@ impl SortitionTracker {
         }];
         let history = History {
             hashes: self
-                .chain
+                .engine
+                .snapshots()
                 .history()
                 .iter()
                 .map(ToString::to_string)
@@ -292,11 +376,11 @@ impl SortitionTracker {
         )
     }
 
-    pub fn from_capture(directory: &Path, pox_id: PoxId) -> Result<Self, TrackerError> {
+    pub fn from_capture(directory: &Path) -> Result<Self, TrackerError> {
         let bytes = fs::read(directory.join("snapshots.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
-            .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let snapshots: Vec<CapturedSnapshot> =
+            serde_json::from_slice(&bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
         // The one snapshot a history can seed is the one it ends at: the
         // consensus hash of every block after it has to be derived, not stated,
         // or the chain would be quoting the capture rather than checking it.
@@ -309,13 +393,15 @@ impl SortitionTracker {
             .iter()
             .find(|snapshot| snapshot.consensus_hash == anchor)
             .ok_or_else(|| {
-                TrackerError::Seed(format!("no snapshot for the hash the history ends at: {anchor}"))
+                TrackerError::Seed(format!(
+                    "no snapshot for the hash the history ends at: {anchor}"
+                ))
             })?;
-        Self::new(seed_snapshot(seed, pox_id)?, history)
+        Self::new(seed_snapshot(seed)?, history)
     }
 }
 
-fn seed_snapshot(seed: &CapturedSnapshot, pox_id: PoxId) -> Result<SortitionSnapshot, TrackerError> {
+fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerError> {
     let bytes = |value: &str, name: &str| -> Result<Vec<u8>, TrackerError> {
         hex::decode(value).map_err(|_| TrackerError::Seed(format!("{name} is not hexadecimal")))
     };
@@ -323,16 +409,30 @@ fn seed_snapshot(seed: &CapturedSnapshot, pox_id: PoxId) -> Result<SortitionSnap
         <[u8; 32]>::try_from(bytes(value, name)?.as_slice())
             .map_err(|_| TrackerError::Seed(format!("{name} is not 32 bytes")))
     };
+    let bitcoin_header_hash = nano_primitives::BitcoinHeaderHash::from_bytes(thirty_two(
+        &seed.burn_header_hash,
+        "burn header hash",
+    )?);
+    let sortition_id =
+        nano_primitives::SortitionId::from_bytes(thirty_two(&seed.sortition_id, "sortition id")?);
+    // The capture's own identifier says which `PoX` bit vector produced it, so
+    // the vector is read off the checkpoint rather than configured. Configured,
+    // it was `PoxId::initial()` — one bit where mainnet has 142 — and since the
+    // consensus hash mixes the vector, every hash this node derived was wrong for
+    // that reason alone, however right the rest of the arithmetic was.
+    let pox_id = unbroken_pox_id_for(bitcoin_header_hash, sortition_id, POX_HISTORY_SEARCH_LIMIT)
+        .ok_or_else(|| {
+            TrackerError::Seed(format!(
+                "the seed's sortition identifier {} is not the burn header hash and an \
+                 unbroken PoX history hashed together, so this node cannot tell which \
+                 reward-cycle history the checkpoint stands on",
+                seed.sortition_id
+            ))
+        })?;
     Ok(SortitionSnapshot {
         bitcoin_height: seed.block_height,
-        bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes(thirty_two(
-            &seed.burn_header_hash,
-            "burn header hash",
-        )?),
-        sortition_id: nano_primitives::SortitionId::from_bytes(thirty_two(
-            &seed.sortition_id,
-            "sortition id",
-        )?),
+        bitcoin_header_hash,
+        sortition_id,
         parent_sortition_id: nano_primitives::SortitionId::from_bytes([0; 32]),
         // Never read: only the hash of a block *after* the seed is derived.
         operations_hash: nano_sortition::OpsHash::from_txids(&[]),
@@ -349,6 +449,10 @@ fn seed_snapshot(seed: &CapturedSnapshot, pox_id: PoxId) -> Result<SortitionSnap
             "sortition hash",
         )?),
         winner_txid: None,
+        // The seed's own winner is unknown, and only the *next* block's sampling
+        // reads it — so the first sortition after a checkpoint is derived from a
+        // zero previous seed and its winner is not this node's to trust. It is
+        // reported for that reason rather than published.
         winner_vrf_seed: None,
         winner_vrf_public_key: None,
         pox_id,

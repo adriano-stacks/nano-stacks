@@ -142,6 +142,126 @@ pub struct MissedCommitment {
     pub spent_output: u32,
 }
 
+/// How many of a mining commitment's outputs are payouts.
+///
+/// A commitment's burn is the sum of the outputs it pays `PoX` recipients with,
+/// and everything after them is the miner's change — which is the output the
+/// next commitment spends to chain through the mining window. So this one number
+/// decides both a commitment's weight in the distribution and whether the chain
+/// links at all, and getting it wrong makes every candidate's burn a change
+/// amount tens of thousands of times too large.
+///
+/// A reward phase pays two recipients; a prepare phase burns to one address; the
+/// waterfall pays the one sBTC address. Mainnet's totals derive exactly under
+/// this rule across the captured window, which spans a reward phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PayoutSchedule {
+    cycles: RewardCycleSchedule,
+    prepare_phase_length: u64,
+}
+
+/// Recipients a commitment pays in a reward phase (`OUTPUTS_PER_COMMIT`).
+pub const OUTPUTS_PER_COMMIT: usize = 2;
+
+impl PayoutSchedule {
+    pub const fn new(
+        cycles: RewardCycleSchedule,
+        prepare_phase_length: u64,
+    ) -> Result<Self, SortitionError> {
+        if prepare_phase_length >= cycles.reward_cycle_length {
+            return Err(SortitionError::ZeroRewardCycleLength);
+        }
+        Ok(Self {
+            cycles,
+            prepare_phase_length,
+        })
+    }
+
+    /// How many payout outputs a commitment in this Bitcoin block carries.
+    #[must_use]
+    pub fn outputs_at(&self, bitcoin_height: u64) -> usize {
+        if self.cycles.is_waterfall_at(bitcoin_height) {
+            return 1;
+        }
+        if self.cycles.offset_in_cycle(bitcoin_height)
+            >= self.cycles.reward_cycle_length - self.prepare_phase_length
+        {
+            1
+        } else {
+            OUTPUTS_PER_COMMIT
+        }
+    }
+
+    /// Whether this Bitcoin block opens a reward cycle, and so adds a bit to the
+    /// `PoX` history the consensus hash mixes.
+    #[must_use]
+    pub fn starts_reward_cycle(&self, bitcoin_height: u64) -> bool {
+        self.cycles.starts_at(bitcoin_height)
+    }
+}
+
+/// The commitments a Bitcoin block contributes to the mining window.
+///
+/// A commitment that missed the block it aimed at is kept apart: it is not a
+/// candidate and not part of the operations hash, but its UTXO still chains, so
+/// dropping it entirely would break the window of every miner behind it.
+#[must_use]
+pub fn commitment_window_block(
+    block: &BitcoinBlock,
+    payouts: usize,
+    keys: &LeaderKeys,
+) -> CommitmentWindowBlock {
+    let mut commitments = Vec::new();
+    let mut missed_commitments = Vec::new();
+    for operation in &block.operations {
+        let BitcoinOperationKind::LeaderBlockCommit {
+            new_seed,
+            parent_modulus,
+            key_block_height,
+            key_transaction_index,
+            ..
+        } = &operation.kind
+        else {
+            continue;
+        };
+        // The first input is the UTXO the commitment chained from, which is what
+        // links it to the miner's previous commitment in the window.
+        let (spent_txid, spent_output) = operation
+            .inputs
+            .first()
+            .map_or(([0; 32], 0), |input| (input.txid, input.output_index));
+        if commitment_is_on_time(*parent_modulus, block.height) {
+            commitments.push(MiningCommitment {
+                txid: operation.txid,
+                spent_txid,
+                spent_output,
+                burn_sats: operation
+                    .outputs
+                    .iter()
+                    .take(payouts)
+                    .map(|output| output.amount_sats)
+                    .sum(),
+                vrf_seed: *new_seed,
+                vrf_public_key: keys.usable(
+                    u64::from(*key_block_height),
+                    u32::from(*key_transaction_index),
+                ),
+            });
+        } else {
+            missed_commitments.push(MissedCommitment {
+                txid: operation.txid,
+                spent_txid,
+                spent_output,
+            });
+        }
+    }
+    CommitmentWindowBlock {
+        commitments,
+        missed_commitments,
+        requires_single_commit: payouts == 1,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitmentWindowBlock {
     pub commitments: Vec<MiningCommitment>,
@@ -448,12 +568,24 @@ impl RewardCycleSchedule {
         })
     }
 
-    fn starts_at(&self, bitcoin_height: u64) -> bool {
-        let relative_height = bitcoin_height.saturating_sub(self.first_bitcoin_height);
-        if self
-            .first_waterfall_height
+    /// How far into its reward cycle a Bitcoin block sits.
+    #[must_use]
+    pub const fn offset_in_cycle(&self, bitcoin_height: u64) -> u64 {
+        bitcoin_height.saturating_sub(self.first_bitcoin_height) % self.reward_cycle_length
+    }
+
+    /// Whether the waterfall pays this Bitcoin block's commitments.
+    #[must_use]
+    pub fn is_waterfall_at(&self, bitcoin_height: u64) -> bool {
+        self.first_waterfall_height
             .is_some_and(|height| bitcoin_height >= height)
-        {
+    }
+
+    /// Whether a Bitcoin block opens a reward cycle.
+    #[must_use]
+    pub fn starts_at(&self, bitcoin_height: u64) -> bool {
+        let relative_height = bitcoin_height.saturating_sub(self.first_bitcoin_height);
+        if self.is_waterfall_at(bitcoin_height) {
             relative_height.is_multiple_of(self.reward_cycle_length)
         } else {
             relative_height % self.reward_cycle_length == 1
@@ -752,6 +884,28 @@ impl SnapshotChain {
         self.snapshots.first().expect("snapshot chain has genesis")
     }
 
+    /// Adopt the winning seed of the snapshot the chain was seeded at.
+    ///
+    /// Only the sampling of the block *after* the root reads it, and a captured
+    /// checkpoint does not record it — but every eligible commitment in a
+    /// Nakamoto burn block carries the same `new_seed`, so the root's own burn
+    /// block states it. Left unset, the first sortition after a checkpoint is
+    /// sampled against a zero seed and names a miner that did not win.
+    ///
+    /// Refused once the chain has moved past its root, where it would be
+    /// rewriting a seed the snapshots above it were already derived from.
+    pub fn adopt_root_winner_seed(&mut self, seed: [u8; 32]) -> bool {
+        if self.snapshots.len() != 1 {
+            return false;
+        }
+        let root = self
+            .snapshots
+            .first_mut()
+            .expect("snapshot chain has genesis");
+        root.winner_vrf_seed = Some(seed);
+        true
+    }
+
     pub fn append(
         &mut self,
         block: &BitcoinBlock,
@@ -841,6 +995,31 @@ impl SnapshotChain {
     }
 }
 
+/// The `PoX` history a captured sortition identifier was produced from.
+///
+/// A sortition identifier is the burn header hash and the `PoX` bit vector
+/// hashed together, so a capture that records the identifier *states* the vector
+/// rather than leaving a node to configure one — and the consensus hash mixes
+/// that vector, so a node standing on `PoxId::initial()` derives a different
+/// hash for every block however right the rest of its arithmetic is.
+///
+/// Only unbroken histories are searched, one bit per reward cycle with every bit
+/// set, because that is what a chain that has never missed an anchor block has —
+/// mainnet's is 142 such bits at the epoch 4.0 boundary. A chain that did miss
+/// one does not resolve here, which is a report rather than a guess: the search
+/// space of arbitrary vectors is exponential and picking one that happens to
+/// hash right is not evidence of anything.
+#[must_use]
+pub fn unbroken_pox_id_for(
+    bitcoin_header_hash: BitcoinHeaderHash,
+    identifier: SortitionId,
+    max_cycles: usize,
+) -> Option<PoxId> {
+    (1..=max_cycles)
+        .map(|cycles| PoxId::from_bits(vec![true; cycles]))
+        .find(|pox_id| sortition_id(bitcoin_header_hash, pox_id) == identifier)
+}
+
 fn sortition_id(bitcoin_header_hash: BitcoinHeaderHash, pox_id: &PoxId) -> SortitionId {
     let mut bytes = Vec::with_capacity(bitcoin_header_hash.as_bytes().len() + pox_id.0.len());
     bytes.extend_from_slice(bitcoin_header_hash.as_bytes());
@@ -861,6 +1040,55 @@ impl SortitionEngine {
             snapshots: SnapshotChain::new(genesis),
             commitment_window: Vec::new(),
         }
+    }
+
+    /// Start from a checkpoint, carrying the consensus hashes behind it.
+    ///
+    /// See [`SnapshotChain::with_history`]: the hashes are what let the
+    /// skip-list reach past the checkpoint.
+    #[must_use]
+    pub fn with_history(genesis: SortitionSnapshot, history: Vec<ConsensusHash>) -> Option<Self> {
+        Some(Self {
+            snapshots: SnapshotChain::with_history(genesis, history)?,
+            commitment_window: Vec::new(),
+        })
+    }
+
+    /// Add a burn block to the mining window without taking a snapshot of it.
+    ///
+    /// The distribution weighs a candidate over the six blocks behind it, so an
+    /// engine starting at a checkpoint has to be given those blocks before its
+    /// first snapshot. Without them the window is short, every candidate's
+    /// median burn is computed over fewer blocks than the network used, and the
+    /// winner it picks is not the one the network picked — which is how a
+    /// seven-block window turned mainnet's sortition at burn 960,226 into no
+    /// sortition at all.
+    ///
+    /// Feed the blocks oldest first, ending with the snapshot's own burn block.
+    pub fn prime(&mut self, commitments: CommitmentWindowBlock) {
+        self.commitment_window.push(commitments);
+        if self.commitment_window.len() > MINING_COMMITMENT_WINDOW {
+            self.commitment_window.remove(0);
+        }
+    }
+
+    /// See [`SnapshotChain::adopt_root_winner_seed`].
+    pub fn adopt_root_winner_seed(&mut self, seed: [u8; 32]) -> bool {
+        self.snapshots.adopt_root_winner_seed(seed)
+    }
+
+    /// Commitments the most recent burn block put up for its sortition.
+    ///
+    /// One means the block left no choice to make, and the winner follows from
+    /// the block alone. More than one means the winner came out of the burn
+    /// distribution, which is weighed over six blocks and is not yet exact —
+    /// see `docs`/task 049 — so a caller that would *reject* a block on the
+    /// strength of the winner's identity has to know which case it is in.
+    #[must_use]
+    pub fn candidates(&self) -> usize {
+        self.commitment_window
+            .last()
+            .map_or(0, |block| block.commitments.len())
     }
 
     #[must_use]
@@ -1297,6 +1525,35 @@ mod tests {
         assert_eq!(tracker.pox_id().bits().len(), bits);
     }
 
+    /// A commitment's burn is what it paid out, never what it kept.
+    ///
+    /// Mainnet miners chain a change output tens of thousands of times larger
+    /// than the commitment itself, so counting every output makes each
+    /// candidate's weight the size of its wallet and the total burn absurd. The
+    /// count of payout outputs is what separates the two, and it moves twice: in
+    /// a prepare phase, where a commitment burns to one address, and under the
+    /// waterfall, where it pays the one sBTC address.
+    #[test]
+    fn payout_outputs_follow_the_reward_cycle_and_the_waterfall() {
+        // Mainnet: cycle 140 runs 960,050..962,149, its prepare phase the last
+        // hundred of those. The exact block the prepare phase opens on is one
+        // nano has no capture for — every captured block sits deep in a reward
+        // phase — and mainnet leaves the question behind at 962,150, where the
+        // waterfall decides it instead.
+        let cycles =
+            RewardCycleSchedule::new(666_050, 2100, Some(962_150)).expect("valid cycle schedule");
+        let schedule = super::PayoutSchedule::new(cycles, 100).expect("valid schedule");
+        assert_eq!(schedule.outputs_at(960_230), super::OUTPUTS_PER_COMMIT);
+        assert_eq!(schedule.outputs_at(962_049), super::OUTPUTS_PER_COMMIT);
+        assert_eq!(schedule.outputs_at(962_050), 1, "the prepare phase burns");
+        assert_eq!(schedule.outputs_at(962_150), 1, "the waterfall pays one");
+        // Past the waterfall the cycle phase no longer decides it.
+        assert_eq!(schedule.outputs_at(963_000), 1);
+        assert!(schedule.starts_reward_cycle(962_150), "cycle 141 opens here");
+        assert!(!schedule.starts_reward_cycle(962_151));
+        assert!(super::PayoutSchedule::new(cycles, 2100).is_err());
+    }
+
     #[test]
     fn pox_tracker_records_an_unknown_anchor() {
         let schedule = RewardCycleSchedule::new(0, 20, None).expect("valid schedule");
@@ -1509,6 +1766,46 @@ mod pox_id_tests {
         assert_ne!(
             hex::encode(sortition_id(header, &PoxId::from_bits(vec![true; 141])).as_bytes()),
             "f49a1a55f7fa56cb1f5a27992ec2fec6545e94e1f37d82a3eb5485c3ec0c2f0c"
+        );
+    }
+
+    /// A capture's own identifier says which bit vector produced it.
+    ///
+    /// This is how a node standing on a checkpoint learns the vector instead of
+    /// configuring one, and getting it wrong is not subtle: the consensus hash
+    /// mixes it, so `PoxId::initial()` derives a different hash at every block.
+    #[test]
+    fn a_captured_sortition_identifier_names_its_pox_history() {
+        let header = BitcoinHeaderHash::from_bytes(
+            <[u8; 32]>::try_from(
+                hex::decode("00000000000000000000fbd11b102b2b1b9c85645d5b0dd8812d618e7a6ffd81")
+                    .expect("hexadecimal")
+                    .as_slice(),
+            )
+            .expect("32 bytes"),
+        );
+        let identifier = nano_primitives::SortitionId::from_bytes(
+            <[u8; 32]>::try_from(
+                hex::decode("f49a1a55f7fa56cb1f5a27992ec2fec6545e94e1f37d82a3eb5485c3ec0c2f0c")
+                    .expect("hexadecimal")
+                    .as_slice(),
+            )
+            .expect("32 bytes"),
+        );
+        assert_eq!(
+            super::unbroken_pox_id_for(header, identifier, 256),
+            Some(PoxId::from_bits(vec![true; 142]))
+        );
+        // A search too short to reach it finds nothing rather than something
+        // close, and an identifier from another chain resolves to nothing.
+        assert_eq!(super::unbroken_pox_id_for(header, identifier, 141), None);
+        assert_eq!(
+            super::unbroken_pox_id_for(
+                header,
+                nano_primitives::SortitionId::from_bytes([0; 32]),
+                256
+            ),
+            None
         );
     }
 }
