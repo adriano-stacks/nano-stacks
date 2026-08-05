@@ -42,7 +42,7 @@ fn the_compiler_and_the_interpreter_answer_block_height_alike() {
 
     let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
     store.begin(None, [0x42; 32]).expect("begin");
-    nano_vm::deploy_contract(
+    nano_oracle::deploy_contract(
         &mut store,
         contract(),
         ClarityVersion::Clarity2,
@@ -62,7 +62,7 @@ fn the_compiler_and_the_interpreter_answer_block_height_alike() {
             &LimitedCostTracker::new_free(),
         )
         .expect("the compiled call runs");
-    let interpreted = nano_vm::execute_contract_call_outcome(
+    let interpreted = nano_oracle::execute_contract_call_outcome(
         &mut store,
         contract().issuer.into(),
         None,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     path::Path,
     sync::Mutex,
 };
@@ -7,7 +7,6 @@ use std::{
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
 use clarity::vm::ast::build_ast;
-use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::{
     AssetMap, CallStack, ContractContext, GlobalContext, OwnedEnvironment,
 };
@@ -15,19 +14,16 @@ use clarity::vm::costs::{CostErrors, CostTracker, ExecutionCost, LimitedCostTrac
 use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
 };
-use clarity::vm::database::ClaritySerializable;
 use clarity::vm::database::{
     BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, HeadersDB,
-    MemoryBackingStore,
 };
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::representations::SymbolicExpression;
 use clarity::vm::types::{
-    BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData, TypeSignature,
-    TypeSignatureExt,
+    BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData,
 };
-use clarity::vm::{ClarityName, ClarityVersion, Value, eval_all};
+use clarity::vm::{ClarityVersion, Value};
 use nano_marf::{
     CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, VersionedMarf,
     import_checkpoint, import_checkpoint_into,
@@ -60,13 +56,6 @@ pub const EPOCH_4_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub state_root: StateRoot,
-}
-
-/// The value and consensus-cost dimensions produced by one Clarity evaluation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Evaluation {
-    pub value: Option<Value>,
-    pub cost: ExecutionCost,
 }
 
 /// The observable result of a transaction executed by the Clarity VM.
@@ -322,6 +311,12 @@ fn sortition_of_burn_height(height: u32) -> SortitionId {
 /// The burn height a sortition identifier names.
 fn burn_height_of(sortition: &SortitionId) -> u32 {
     u32::from_be_bytes(sortition.0[..4].try_into().unwrap_or([0; 4]))
+}
+
+/// A context that knows no chain, for reads that need none.
+#[must_use]
+pub fn null_context() -> &'static (impl ChainContext + 'static) {
+    &NULL_CONTEXT
 }
 
 /// A context that knows no chain, for evaluating programs that read none.
@@ -651,12 +646,6 @@ impl BurnStateDB for BitcoinContext {
 pub struct Vm {
     store: MarfStore,
     context: BitcoinContext,
-    /// Answer contract calls from the interpreter rather than the compiler.
-    ///
-    /// The interpreter is the oracle clarity-wasm is checked against, so a
-    /// caller that can roll a transaction back can run it both ways and see
-    /// which engine disagrees with the chain. Off unless asked for.
-    interpret: bool,
     modules: ModuleCache,
 }
 
@@ -666,7 +655,6 @@ impl Vm {
         Ok(Self {
             store: MarfStore::new(network)?,
             context: BitcoinContext::default(),
-            interpret: interpret_only(network),
             modules: ModuleCache::default(),
         })
     }
@@ -725,7 +713,6 @@ impl Vm {
                 headers_db,
                 ..BitcoinContext::default()
             },
-            interpret: interpret_only(store_network),
             modules: ModuleCache::default(),
         }
     }
@@ -850,16 +837,6 @@ impl Vm {
         self.store.set_checkpoint_height(block, height);
     }
 
-    /// Execute a Clarity 6 program with the supplied consensus cost tracker.
-    pub fn execute(
-        &mut self,
-        source: &str,
-        cost_tracker: LimitedCostTracker,
-    ) -> Result<Evaluation, ClarityEvalError> {
-        let Self { store, context, .. } = self;
-        evaluate_with_tracker_in_context(store, context, source, cost_tracker)
-    }
-
     /// Store the timestamp supplied by the current Nakamoto block header.
     pub fn setup_block_metadata(&mut self, timestamp: u64) -> Result<(), VmExecutionError> {
         let Self { store, context, .. } = self;
@@ -901,24 +878,13 @@ impl Vm {
         let Self {
             store,
             context,
-            interpret,
             modules,
         } = self;
-        // A contract whose module the runtime refuses cannot be deployed by the
-        // compiler at all, and a deploy that fails stops the block. The
-        // interpreter has no module to refuse, so where it is the execution path
-        // it has to be the deployment path too — otherwise the switch moves half
-        // the work and leaves behind the half that has been failing.
-        if *interpret {
-            return deploy_contract_in_context(
-                store, context, contract, version, source, cost_tracker,
-            );
-        }
-        // No interpreter fallback here on purpose. A contract clarity-wasm
-        // cannot build is a compiler conformance bug, and deploying it with the
-        // other engine hides that behind a chain that appears to advance —
-        // which is how a replay reached 8,673,863 while the compiler had
-        // actually stopped at 8,668,161. It has to stop and name the contract.
+        // There is no other engine to deploy with. A contract clarity-wasm
+        // cannot build is a compiler conformance bug, and deploying it another
+        // way would hide that behind a chain that appears to advance — which is
+        // how a replay reached 8,673,863 while the compiler had actually stopped
+        // at 8,668,161. It has to stop and name the contract.
         deploy_contract_with_wasm_in_context(
             store,
             context,
@@ -976,6 +942,7 @@ impl Vm {
             context,
             modules,
             sender,
+            None,
             contract,
             function,
             arguments,
@@ -987,25 +954,6 @@ impl Vm {
             }),
             ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
         }
-    }
-
-    /// Invoke a contract and retain acceptable runtime failures as transaction outcomes.
-    /// Contracts in this state the interpreter cannot run.
-    ///
-    /// Only the ones this node deployed with the compiler: a checkpoint carries
-    /// real definitions, so this is bounded by what has been executed since.
-    #[must_use]
-    pub fn uninterpretable_contracts(&self) -> Vec<QualifiedContractIdentifier> {
-        self.store.stubbed_contracts()
-    }
-
-    /// Make one runnable by the interpreter, changing no state root.
-    pub fn heal_contract(
-        &mut self,
-        contract: &QualifiedContractIdentifier,
-    ) -> Result<(), VmExecutionError> {
-        let Self { store, context, .. } = self;
-        heal_contract_for_interpreter(store, context, contract)
     }
 
     /// Compile a contract in this state and report whether its module loads.
@@ -1068,10 +1016,8 @@ impl Vm {
         let Self {
             store,
             context,
-            interpret,
             modules,
         } = self;
-        let interpret = *interpret;
         execute_contract_call_outcome_with_wasm_in_context(
             store,
             context,
@@ -1084,13 +1030,16 @@ impl Vm {
                 arguments,
             },
             cost_tracker,
-            interpret,
         )
     }
 
-    /// Answer contract calls from the interpreter until told otherwise.
-    pub const fn interpret_contract_calls(&mut self, interpret: bool) {
-        self.interpret = interpret;
+    /// The state and the chain context the engine reads, for a differential
+    /// oracle built outside this crate.
+    ///
+    /// Handing these out cannot make the node execute anything differently: an
+    /// engine has to be linked in to be run, and this crate contains one.
+    pub const fn state_and_context(&mut self) -> (&mut MarfStore, &impl ChainContext) {
+        (&mut self.store, &self.context)
     }
 
     /// Transfer STX between principals in the active block state.
@@ -1127,6 +1076,15 @@ impl Vm {
     ) -> Result<u128, VmExecutionError> {
         let Self { store, context, .. } = self;
         account_balance_in_context(store, context, principal)
+    }
+
+    /// Read an account's locked and unlocked STX and its nonce, from state.
+    pub fn account_state(
+        &mut self,
+        principal: &PrincipalData,
+    ) -> Result<AccountState, VmExecutionError> {
+        let Self { store, context, .. } = self;
+        account_state_in_context(store, context, principal)
     }
 
     /// Debit a transaction fee from an account's available STX balance.
@@ -1544,7 +1502,7 @@ impl MarfStore {
     /// `insert_contract` refuses to overwrite, which is right for a deploy and
     /// wrong for a repair. This writes the side store directly, which is safe
     /// precisely because that store is not the MARF: no state root moves.
-    fn replace_contract_definition(
+    pub fn replace_contract_definition(
         &self,
         contract: &QualifiedContractIdentifier,
         definition: &str,
@@ -2164,204 +2122,11 @@ impl MarfStore {
     }
 }
 
-/// The functions a contract's source defines, with their real bodies.
-///
-/// Built straight from the parsed source, so nothing is deployed and no other
-/// contract has to be present — which is the difference between this and
-/// rebuilding by deploying into a throwaway store: a contract that names a
-/// contract cannot be deployed beside nothing, and can still be *parsed*.
-fn defined_functions(
-    contract: &QualifiedContractIdentifier,
-    version: ClarityVersion,
-    source: &str,
-) -> HashMap<ClarityName, DefinedFunction> {
-    use clarity::vm::representations::SymbolicExpressionType::{Atom, List};
-    let epoch = epoch_for_version(version);
-    let mut tracker = LimitedCostTracker::new_free();
-    let Ok(parsed) = clarity::vm::ast::parse(contract, source, version, epoch) else {
-        return HashMap::new();
-    };
-    let mut functions = HashMap::new();
-    for expression in &parsed {
-        let List(form) = &expression.expr else {
-            continue;
-        };
-        let [head, signature, body] = form.as_slice() else {
-            continue;
-        };
-        let Atom(keyword) = &head.expr else { continue };
-        let define_type = match keyword.as_str() {
-            "define-public" => DefineType::Public,
-            "define-read-only" => DefineType::ReadOnly,
-            "define-private" => DefineType::Private,
-            _ => continue,
-        };
-        let List(signature) = &signature.expr else {
-            continue;
-        };
-        let Some((name, arguments)) = signature.split_first() else {
-            continue;
-        };
-        let Atom(name) = &name.expr else { continue };
-        let mut typed = Vec::new();
-        for argument in arguments {
-            let List(pair) = &argument.expr else { continue };
-            let [argument_name, argument_type] = pair.as_slice() else {
-                continue;
-            };
-            let Atom(argument_name) = &argument_name.expr else {
-                continue;
-            };
-            let Ok(signature) =
-                TypeSignature::parse_type_repr(epoch, argument_type, &mut tracker)
-            else {
-                continue;
-            };
-            typed.push((argument_name.clone(), signature));
-        }
-        functions.insert(
-            name.clone(),
-            DefinedFunction::new(
-                typed,
-                body.clone(),
-                define_type,
-                name,
-                &contract.to_string(),
-            ),
-        );
-    }
-    functions
-}
-
-/// Build a contract definition the interpreter can run, without touching state.
-///
-/// clar2wasm's deploy stores placeholder function bodies, so a contract the
-/// compiler deployed cannot be interpreted. Rebuilding one means deploying it
-/// again — which would re-run its top-level expressions and reset every data
-/// variable it has changed since. So it is deployed into a **throwaway
-/// in-memory store** instead: the definition that comes out is the real one, and
-/// every side effect lands somewhere that is dropped a line later.
-fn interpretable_contract(
-    network: Network,
-    contract: &QualifiedContractIdentifier,
-    version: ClarityVersion,
-    source: &str,
-    dependencies: Vec<(QualifiedContractIdentifier, clarity::vm::contracts::Contract)>,
-) -> Result<clarity::vm::contracts::Contract, ClarityEvalError> {
-    let mut backing_store = MemoryBackingStore::new();
-    let mut database = backing_store.as_clarity_db();
-    // A contract that names another cannot be deployed beside nothing, and the
-    // throwaway store starts empty. Its dependencies are put in first, taken
-    // from the state this node already holds.
-    if !dependencies.is_empty() {
-        database.begin();
-        for (identifier, definition) in dependencies {
-            database.insert_contract(&identifier, definition)?;
-        }
-        database.commit()?;
-    }
-    let mut environment = OwnedEnvironment::new_free(
-        network.is_mainnet(),
-        network.chain_id(),
-        database,
-        StacksEpochId::Epoch40,
-    );
-    environment.initialize_versioned_contract(contract.clone(), version, source, None)?;
-    let (mut database, _) = environment.destruct().ok_or_else(|| {
-        ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
-            "rebuilding a contract definition left the throwaway store nested".to_owned(),
-        )))
-    })?;
-    database.begin();
-    let rebuilt = database.get_contract(contract)?;
-    database.roll_back()?;
-    Ok(rebuilt)
-}
-
-/// Evaluate a Clarity 6 program under the consensus Epoch 4.0 rules against an
-/// ephemeral store, for programs that read and write nothing.
-pub fn evaluate(network: Network, source: &str) -> Result<Option<Value>, ClarityEvalError> {
-    let contract_id = QualifiedContractIdentifier::transient();
-    let mut backing_store = MemoryBackingStore::new();
-    let database = backing_store.as_clarity_db();
-    let mut context = GlobalContext::new(
-        network.is_mainnet(),
-        network.chain_id(),
-        database,
-        LimitedCostTracker::new_free(),
-        StacksEpochId::Epoch40,
-    );
-    let expressions = build_ast(
-        &contract_id,
-        source,
-        &mut context.cost_track,
-        ClarityVersion::Clarity6,
-        StacksEpochId::Epoch40,
-    )?
-    .expressions;
-    let mut contract = ContractContext::new(contract_id, ClarityVersion::Clarity6);
-
-    context
-        .execute(|global| eval_all(&expressions, &mut contract, global, None))
-        .map_err(ClarityEvalError::from)
-}
-
-/// Evaluate a Clarity 6 program against an active MARF-backed state.
-pub fn evaluate_in_store(
-    store: &mut MarfStore,
-    source: &str,
-) -> Result<Option<Value>, ClarityEvalError> {
-    Ok(evaluate_with_tracker(store, source, LimitedCostTracker::new_free())?.value)
-}
-
-/// Evaluate a Clarity 6 program with the supplied consensus cost tracker.
-pub fn evaluate_with_tracker(
-    store: &mut MarfStore,
-    source: &str,
-    cost_tracker: LimitedCostTracker,
-) -> Result<Evaluation, ClarityEvalError> {
-    evaluate_with_tracker_in_context(store, &NULL_CONTEXT, source, cost_tracker)
-}
-
-fn evaluate_with_tracker_in_context(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    source: &str,
-    cost_tracker: LimitedCostTracker,
-) -> Result<Evaluation, ClarityEvalError> {
-    let network = store.network();
-    let contract_id = QualifiedContractIdentifier::transient();
-    let database = clarity_database(store, bitcoin_context);
-    let mut context = GlobalContext::new(
-        network.is_mainnet(),
-        network.chain_id(),
-        database,
-        cost_tracker,
-        StacksEpochId::Epoch40,
-    );
-    let expressions = build_ast(
-        &contract_id,
-        source,
-        &mut context.cost_track,
-        ClarityVersion::Clarity6,
-        StacksEpochId::Epoch40,
-    )?
-    .expressions;
-    let mut contract = ContractContext::new(contract_id, ClarityVersion::Clarity6);
-
-    let value = context
-        .execute(|global| eval_all(&expressions, &mut contract, global, None))
-        .map_err(ClarityEvalError::from)?;
-    Ok(Evaluation {
-        value,
-        cost: context.cost_track.get_total(),
-    })
-}
-
 /// Publish a versioned Clarity contract in an active MARF-backed state.
 /// Every contract a contract's source names, so their modules can be built
 /// before the call that needs them rather than by failing it.
-fn referenced_contracts(
+#[must_use]
+pub fn referenced_contracts(
     contract: &QualifiedContractIdentifier,
     source: &str,
     version: ClarityVersion,
@@ -2447,7 +2212,8 @@ fn compile_under(
 /// The cost table this bakes in is the deploy epoch's rather than the current
 /// one's. Costs are not in a block's state root, so a replay still matches;
 /// receipts for such contracts may not.
-const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
+#[must_use]
+pub const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
     match version {
         ClarityVersion::Clarity1 => StacksEpochId::Epoch20,
         ClarityVersion::Clarity2 => StacksEpochId::Epoch21,
@@ -2459,7 +2225,7 @@ const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
 }
 
 /// The source a deployed contract was published with, and its Clarity version.
-fn contract_source(
+pub fn contract_source(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
     contract: &QualifiedContractIdentifier,
@@ -2569,25 +2335,8 @@ fn reports_analysis_failure(error: &impl std::fmt::Display) -> bool {
     text.contains(ANALYSIS_FAILED) || text.contains("UnableToLoadModule")
 }
 
-pub fn deploy_contract(
-    store: &mut MarfStore,
-    contract: QualifiedContractIdentifier,
-    version: ClarityVersion,
-    source: &str,
-    cost_tracker: LimitedCostTracker,
-) -> Result<TransactionResult, ClarityEvalError> {
-    deploy_contract_in_context(
-        store,
-        &NULL_CONTEXT,
-        contract,
-        version,
-        source,
-        cost_tracker,
-    )
-}
-
 /// Type-check a deployment and store its analysis, as stacks-core does.
-fn analyse_for_deployment(
+pub fn analyse_for_deployment(
     store: &mut MarfStore,
     contract: &QualifiedContractIdentifier,
     version: ClarityVersion,
@@ -2625,40 +2374,6 @@ fn analyse_for_deployment(
                 "{ANALYSIS_FAILED}: {error}"
             ))))
         })
-}
-
-fn deploy_contract_in_context(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    contract: QualifiedContractIdentifier,
-    version: ClarityVersion,
-    source: &str,
-    cost_tracker: LimitedCostTracker,
-) -> Result<TransactionResult, ClarityEvalError> {
-    let network = store.network();
-    // stacks-core type-checks a deployment before it initializes it, and
-    // `initialize_versioned_contract` does not. Without this the interpreter
-    // accepts contracts the chain rejects — a contract naming a map that does
-    // not exist deploys — which is a consensus difference wherever the
-    // interpreter is the deployment path.
-    analyse_for_deployment(store, &contract, version, source, &cost_tracker)?;
-    let database = clarity_database(store, bitcoin_context);
-    let mut environment = OwnedEnvironment::new_cost_limited(
-        network.is_mainnet(),
-        network.chain_id(),
-        database,
-        cost_tracker,
-        StacksEpochId::Epoch40,
-    );
-    let ((), assets, events) =
-        environment.initialize_versioned_contract(contract, version, source, None)?;
-
-    Ok(TransactionResult {
-        value: None,
-        cost: environment.get_cost_total(),
-        assets,
-        events,
-    })
 }
 
 fn deploy_contract_with_wasm_in_context(
@@ -2757,56 +2472,6 @@ fn deploy_contract_with_wasm_in_context(
     })
 }
 
-/// Call a Clarity contract using the encoded arguments found in a transaction payload.
-pub fn execute_contract_call(
-    store: &mut MarfStore,
-    sender: PrincipalData,
-    sponsor: Option<PrincipalData>,
-    contract: QualifiedContractIdentifier,
-    function: &str,
-    arguments: &[Vec<u8>],
-    cost_tracker: LimitedCostTracker,
-) -> Result<TransactionResult, VmExecutionError> {
-    match execute_contract_call_outcome(
-        store,
-        sender,
-        sponsor,
-        contract,
-        function,
-        arguments,
-        cost_tracker,
-    )? {
-        ContractCallOutcome::Success(result) | ContractCallOutcome::AbortedByResponse(result) => {
-            Ok(*result)
-        }
-        ContractCallOutcome::RuntimeFailure { error, .. } => Err(error),
-    }
-}
-
-/// Call a contract while retaining acceptable runtime failures and their costs.
-pub fn execute_contract_call_outcome(
-    store: &mut MarfStore,
-    sender: PrincipalData,
-    sponsor: Option<PrincipalData>,
-    contract: QualifiedContractIdentifier,
-    function: &str,
-    arguments: &[Vec<u8>],
-    cost_tracker: LimitedCostTracker,
-) -> Result<ContractCallOutcome, VmExecutionError> {
-    execute_contract_call_outcome_in_context(
-        store,
-        &NULL_CONTEXT,
-        ContractCall {
-            sender,
-            sponsor,
-            contract,
-            function,
-            arguments,
-        },
-        cost_tracker,
-    )
-}
-
 struct ContractCall<'a> {
     sender: PrincipalData,
     sponsor: Option<PrincipalData>,
@@ -2815,270 +2480,19 @@ struct ContractCall<'a> {
     arguments: &'a [Vec<u8>],
 }
 
-/// Heal a contract and the ones it names, so the interpreter can run the call.
-///
-/// A contract that cannot be healed is the call's problem to report, not a
-/// reason to refuse before running anything — the call may never reach it.
-fn heal_reachable_contracts(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    contract: &QualifiedContractIdentifier,
-) {
-    let referenced = contract_source(store, bitcoin_context, contract)
-        .map(|(source, version)| referenced_contracts(contract, &source, version))
-        .unwrap_or_default();
-    for reachable in std::iter::once(contract.clone()).chain(referenced) {
-        if !store.contract_is_interpretable(&reachable) {
-            let _ = heal_contract_for_interpreter(store, bitcoin_context, &reachable);
-        }
-    }
-}
-
-/// Make a contract the compiler deployed runnable by the interpreter.
-///
-/// Safe to store: contract definitions live in `metadata_table`, a side store
-/// that never reaches the MARF, so this changes no state root. Nothing is
-/// re-executed either — the real definition is built in a throwaway store — so
-/// the contract's data variables keep whatever they have since become.
-fn heal_contract_for_interpreter(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    contract: &QualifiedContractIdentifier,
-) -> Result<(), VmExecutionError> {
-    let network = store.network();
-    let (source, version) = contract_source(store, bitcoin_context, contract)?;
-    // Everything the source names, as this node already holds it.
-    let referenced = referenced_contracts(contract, &source, version);
-    let mut dependencies = Vec::new();
-    {
-        let mut database = clarity_database(store, bitcoin_context);
-        database.begin();
-        for identifier in referenced {
-            if let Ok(definition) = database.get_contract(&identifier) {
-                dependencies.push((identifier, definition));
-            }
-        }
-        database.roll_back()?;
-    }
-    let rebuilt = match interpretable_contract(network, contract, version, &source, dependencies) {
-        Ok(rebuilt) => rebuilt,
-        // A contract whose dependencies this node does not hold cannot be
-        // deployed beside them, however many are put in first. But it can still
-        // be *parsed*: the stub the compiler stored is right about everything
-        // except its function bodies, so take its own definition — which is
-        // present, being the one asked for — and put the real bodies back.
-        Err(_) => rebuilt_from_source(store, bitcoin_context, contract, version, &source)?,
-    };
-    store
-        .replace_contract_definition(contract, &rebuilt.serialize())
-        .map_err(|error| VmInternalError::Expect(error.to_string()))?;
-    Ok(())
-}
-
-/// The stored definition with its stub bodies replaced by the source's own.
-///
-/// Nothing is deployed, so no other contract has to be present and no top-level
-/// expression runs — re-running them would reset every data variable the
-/// contract has changed since, which would corrupt state rather than heal it.
-fn rebuilt_from_source(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    contract: &QualifiedContractIdentifier,
-    version: ClarityVersion,
-    source: &str,
-) -> Result<clarity::vm::contracts::Contract, VmExecutionError> {
-    let functions = defined_functions(contract, version, source);
-    if functions.is_empty() {
-        return Err(VmInternalError::Expect(format!(
-            "no functions could be parsed from the source of {contract}"
-        ))
-        .into());
-    }
-    let mut database = clarity_database(store, bitcoin_context);
-    database.begin();
-    let stored = database.get_contract(contract);
-    database.roll_back()?;
-    let mut context = (*stored?).clone();
-    context.functions = functions;
-    Ok(context.into())
-}
-
-fn execute_contract_call_outcome_in_context(
-    store: &mut MarfStore,
-    bitcoin_context: &dyn ChainContext,
-    call: ContractCall<'_>,
-    cost_tracker: LimitedCostTracker,
-) -> Result<ContractCallOutcome, VmExecutionError> {
-    let network = store.network();
-    let arguments = call
-        .arguments
-        .iter()
-        .map(|argument| {
-            let mut bytes = argument.as_slice();
-            let value = Value::deserialize_read(&mut bytes, None, false).map_err(|error| {
-                VmInternalError::Expect(format!("invalid transaction argument: {error}"))
-            })?;
-            if !bytes.is_empty() {
-                return Err(VmInternalError::Expect(
-                    "transaction argument has trailing bytes".to_owned(),
-                )
-                .into());
-            }
-            Ok(SymbolicExpression::atom_value(value))
-        })
-        .collect::<Result<Vec<_>, VmExecutionError>>()?;
-    // No `begin` here: `execute_transaction` brackets the call itself, and an
-    // extra level leaves the environment nested when it tries to unwind — which
-    // `destruct` refuses, losing the call's own answer with it.
-    let database = clarity_database(store, bitcoin_context);
-    let mut environment = OwnedEnvironment::new_cost_limited(
-        network.is_mainnet(),
-        network.chain_id(),
-        database,
-        cost_tracker,
-        StacksEpochId::Epoch40,
-    );
-    let called = format!("{}::{}", call.contract, call.function);
-    let result = environment.execute_transaction(
-        call.sender,
-        call.sponsor,
-        call.contract,
-        call.function,
-        &arguments,
-    );
-    let Some((_database, cost_tracker)) = environment.destruct() else {
-        // A context outlived the call that opened it. Whatever the call was
-        // actually complaining about is the useful half, and reporting only
-        // that the unwind failed throws it away — which is how this looked
-        // like a mystery rather than a bug report.
-        // Name the call on the way out, and say when the cause is a stub.
-        //
-        // clar2wasm's deploy stores placeholder function bodies — the real ones
-        // live in the module — so a contract the compiler deployed cannot be
-        // run by the interpreter at all: it evaluates the placeholder and
-        // reports whatever that is. Left unexplained it reads as a type error
-        // in the contract, which is three days of looking in the wrong place.
-        return Err(result.err().map_or_else(
-            || VmInternalError::Expect(format!("{called} left the database in an invalid state")).into(),
-            |error| {
-                let hint = if error.to_string().contains("must return response") {
-                    " (this contract was deployed by the compiler, which stores \
-                     placeholder bodies, so the interpreter cannot run it)"
-                } else {
-                    ""
-                };
-                VmInternalError::Expect(format!("{called}: {error}{hint}")).into()
-            },
-        ));
-    };
-    match result {
-        Ok((value, assets, events)) => {
-            Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
-                value: Some(value),
-                cost: cost_tracker.get_total(),
-                assets,
-                events,
-            })))
-        }
-        Err(error) => {
-            if is_acceptable_runtime_failure(&error) {
-                Ok(ContractCallOutcome::RuntimeFailure {
-                    cost: cost_tracker.get_total(),
-                    error,
-                })
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
 fn execute_contract_call_outcome_with_wasm_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     call: &ContractCall<'_>,
     cost_tracker: &LimitedCostTracker,
-    interpret: bool,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
-    // Running everything through the interpreter says whether a divergence is
-    // the compiler's write order rather than its answers: mainnet is the
-    // interpreter, so a state root that only matches this way names clarity-wasm
-    // as what differs. A diagnostic, not a mode to follow a chain in.
-    if interpret {
-        // A contract the compiler deployed carries placeholder bodies, which the
-        // interpreter would evaluate and report as a type error. Rebuild its
-        // definition first, once: after this it is runnable by either engine.
-        // The call's own contract and everything it reaches: a nested
-        // `contract-call?` lands in a contract the compiler may also have
-        // deployed, and healing only the one named here leaves the failure one
-        // level down where nothing names it.
-        heal_reachable_contracts(store, bitcoin_context, &call.contract);
-        return execute_contract_call_outcome_in_context(
-            store,
-            bitcoin_context,
-            ContractCall {
-                sender: call.sender.clone(),
-                sponsor: call.sponsor.clone(),
-                contract: call.contract.clone(),
-                function: call.function,
-                arguments: call.arguments,
-            },
-            cost_tracker.clone(),
-        );
-    }
-    let outcome = wasm_outcome(store, bitcoin_context, modules, call, cost_tracker)?;
-    // The interpreter is the oracle clarity-wasm is checked against and it is
-    // in the tree, so a call the compiler refuses can be asked of it directly.
-    // A disagreement names a compiler bug; agreement says the state or the
-    // arguments are what differ.
-    //
-    // Answering from it is a deliberate fallback rather than a default. A MARF
-    // packs a node's pointers in the order its keys were first written, so two
-    // runs reaching the same values by writing them in a different order seal
-    // different roots — and nothing guarantees the two engines write in the
-    // same order. `engine_state_roots` shows they do agree on a contract that
-    // writes variables and maps under a branch, which is evidence rather than a
-    // guarantee, so this remains for carrying a replay forward and finding the
-    // next divergence. The costs the two charge do differ.
-    // The interpreter does not answer a production call, however the compiler
-    // failed. It is the oracle clarity-wasm is checked against, not a second
-    // engine to fall through to: a module the compiler will not build is a
-    // conformance bug to fix, and answering around it means the chain advances
-    // on results the compiler never produced.
-    let fall_back = std::env::var_os("NANO_INTERPRETER_FALLBACK").is_some();
-    if (fall_back || std::env::var_os("NANO_CROSSCHECK").is_some())
-        && let ContractCallOutcome::RuntimeFailure { error, .. } = &outcome
-    {
-        let interpreted = execute_contract_call_outcome_in_context(
-            store,
-            bitcoin_context,
-            ContractCall {
-                sender: call.sender.clone(),
-                sponsor: call.sponsor.clone(),
-                contract: call.contract.clone(),
-                function: call.function,
-                arguments: call.arguments,
-            },
-            cost_tracker.clone(),
-        );
-        println!(
-            "crosscheck {}::{}: wasm failed with {error:?}, interpreter answered {}",
-            call.contract,
-            call.function,
-            match &interpreted {
-                Ok(ContractCallOutcome::Success(result)) => format!("success {:?}", result.value),
-                Ok(ContractCallOutcome::AbortedByResponse(result)) =>
-                    format!("aborted {:?}", result.value),
-                Ok(ContractCallOutcome::RuntimeFailure { error, .. }) => format!("{error:?}"),
-                Err(error) => format!("error {error:?}"),
-            }
-        );
-        if fall_back && let Ok(interpreted) = interpreted {
-            return Ok(interpreted);
-        }
-    }
-    Ok(outcome)
+    // One engine, and no route around it. A module clarity-wasm will not build,
+    // a trap and a host failure all reject the candidate: answering them another
+    // way means the chain advances on results the consensus engine never
+    // produced. The reference interpreter is a differential oracle and lives in
+    // `nano-oracle`, which nothing this crate can reach depends on.
+    wasm_outcome(store, bitcoin_context, modules, call, cost_tracker)
 }
 
 fn wasm_outcome(
@@ -3110,6 +2524,7 @@ fn wasm_outcome(
         bitcoin_context,
         modules,
         &call.sender,
+        call.sponsor.as_ref(),
         &call.contract,
         call.function,
         &arguments,
@@ -3123,6 +2538,7 @@ fn call_contract_values_in_context(
     bitcoin_context: &dyn ChainContext,
     modules: &mut ModuleCache,
     sender: &PrincipalData,
+    sponsor: Option<&PrincipalData>,
     contract: &QualifiedContractIdentifier,
     function: &str,
     arguments: &[Value],
@@ -3154,6 +2570,7 @@ fn call_contract_values_in_context(
             bitcoin_context,
             modules,
             sender.clone(),
+            sponsor.cloned(),
             contract,
             function,
             arguments,
@@ -3234,6 +2651,7 @@ fn call_compiled_contract(
     bitcoin_context: &dyn ChainContext,
     modules: &ModuleCache,
     sender: PrincipalData,
+    sponsor: Option<PrincipalData>,
     contract: &QualifiedContractIdentifier,
     function: &str,
     arguments: &[Value],
@@ -3267,7 +2685,9 @@ fn call_compiled_contract(
         &mut call_stack,
         Some(sender.clone()),
         Some(sender),
-        None,
+        // `tx-sponsor?` is a consensus-visible read, and a sponsored contract
+        // call that answers `none` here answers something the chain does not.
+        sponsor,
         modules,
     );
     match result {
@@ -3357,30 +2777,6 @@ fn ensure_wasm_module(
     Ok(())
 }
 
-/// Whether to run every call through the interpreter, which mainnet forbids.
-///
-/// The interpreter is the differential oracle clarity-wasm is checked against.
-/// Letting it execute mainnet means the chain advances on results the engine
-/// under test never produced, so the switch is refused there outright rather
-/// than trusted to be unset.
-fn interpret_only(network: Network) -> bool {
-    interpreter_allowed(network, std::env::var_os("NANO_INTERPRETER_ONLY").is_some())
-}
-
-/// The policy itself, so it can be asserted without touching the environment.
-///
-/// # Panics
-/// If the interpreter is asked to execute mainnet.
-#[must_use]
-pub fn interpreter_allowed(network: Network, asked: bool) -> bool {
-    assert!(
-        !(asked && network.is_mainnet()),
-        "the interpreter is a diagnostic and cannot execute mainnet: \
-         clarity-wasm is the consensus engine"
-    );
-    asked
-}
-
 /// Reject a module the runtime would refuse to load.
 ///
 /// A contract can compile and still emit wasm wasmtime rejects — nothing checks
@@ -3421,7 +2817,8 @@ fn wasm_compile_error(error: clar2wasm::CompileError) -> String {
     }
 }
 
-fn is_acceptable_runtime_failure(error: &VmExecutionError) -> bool {
+#[must_use]
+pub fn is_acceptable_runtime_failure(error: &VmExecutionError) -> bool {
     matches!(
         error,
         VmExecutionError::Runtime(_, _) | VmExecutionError::EarlyReturn(_)
@@ -3664,6 +3061,55 @@ pub fn account_nonce(
     account_nonce_in_context(store, &NULL_CONTEXT, principal)
 }
 
+/// What an account holds, locked and unlocked, and when the lock lifts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountState {
+    pub unlocked: u128,
+    pub locked: u128,
+    pub unlock_height: u64,
+    pub nonce: u64,
+}
+
+/// Read an account's whole position straight from the state.
+///
+/// `stx-account` is the Clarity view of this, and evaluating it would need an
+/// execution engine to answer an RPC — which is not a thing a node with one
+/// consensus engine should do for a read the database already holds. These are
+/// the same three reads `special_stx_account` makes, in the same order.
+fn account_state_in_context(
+    store: &mut MarfStore,
+    bitcoin_context: &dyn ChainContext,
+    principal: &PrincipalData,
+) -> Result<AccountState, VmExecutionError> {
+    let network = store.network();
+    let database = clarity_database(store, bitcoin_context);
+    let mut context = GlobalContext::new(
+        network.is_mainnet(),
+        network.chain_id(),
+        database,
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+    );
+    context.execute(|global| {
+        let balance = global
+            .database
+            .get_stx_balance_snapshot(principal)?
+            .canonical_balance_repr()?;
+        let unlock_height = balance.effective_unlock_height(
+            global.database.get_v1_unlock_height(),
+            global.database.get_v2_unlock_height()?,
+            global.database.get_v3_unlock_height()?,
+            global.database.get_v4_unlock_height()?,
+        );
+        Ok(AccountState {
+            unlocked: balance.amount_unlocked(),
+            locked: balance.amount_locked(),
+            unlock_height,
+            nonce: global.database.get_account_nonce(principal)?,
+        })
+    })
+}
+
 /// Read an account's spendable STX in an isolated database transaction.
 fn account_balance_in_context(
     store: &mut MarfStore,
@@ -3731,7 +3177,7 @@ fn set_account_nonce_in_context(
     context.execute(|global| global.database.set_account_nonce(principal, nonce))
 }
 
-fn clarity_database<'a>(
+pub fn clarity_database<'a>(
     store: &'a mut MarfStore,
     bitcoin_context: &'a dyn ChainContext,
 ) -> ClarityDatabase<'a> {
@@ -3803,37 +3249,30 @@ mod tests {
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
-    use super::{
-        ContractCallOutcome, MarfStore, Vm, deploy_contract, evaluate, evaluate_in_store,
-        execute_contract_call, execute_contract_call_outcome,
-    };
+    use super::{ContractCallOutcome, MarfStore, Vm};
     use clarity::vm::costs::LimitedCostTracker;
 
-    #[test]
-    fn evaluates_clarity_six_programs() {
-        let value = evaluate(Network::TESTNET, "(+ u20 u22)").expect("Clarity 6 program should evaluate");
-
-        assert_eq!(value, Some(Value::UInt(42)));
+    /// Read a Clarity expression the only way this node evaluates anything:
+    /// through a deployed contract, compiled and run by clarity-wasm.
+    fn read_through_a_contract(vm: &mut Vm, name: &str, body: &str) -> Value {
+        let contract = QualifiedContractIdentifier::parse(&format!(
+            "ST000000000000000000002AMW42H.{name}"
+        ))
+        .expect("a contract identifier");
+        vm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            &format!("(define-read-only (answer) {body})"),
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the reader");
+        let sender: PrincipalData = contract.issuer.clone().into();
+        vm.call_contract_values(&sender, &contract, "answer", &[])
+            .expect("read through the reader")
     }
 
-    #[test]
-    fn supports_epoch_four_clarity_six_words() {
-        let concatenated =
-            evaluate(Network::TESTNET, "(concat 0x01 0x02 0x03)").expect("variadic concat should evaluate");
-        let parsed_bitcoin = evaluate(Network::TESTNET, "(get-bitcoin-tx-output? 0x00 u0)")
-            .expect("bitcoin transaction parser should evaluate");
 
-        assert_eq!(
-            concatenated,
-            Some(Value::buff_from(vec![1, 2, 3]).expect("valid buffer"))
-        );
-        assert_eq!(parsed_bitcoin, Some(Value::err_uint(1)));
-    }
 
-    #[test]
-    fn rejects_invalid_programs() {
-        assert!(evaluate(Network::TESTNET, "(unknown-word u1)").is_err());
-    }
 
     #[test]
     fn marf_store_keeps_forked_values_and_roots() {
@@ -3881,17 +3320,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn evaluates_against_an_active_marf_store() {
-        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
-        store.begin(None, [1; 32]).expect("begin state");
-
-        let value =
-            evaluate_in_store(&mut store, "(+ u20 u22)").expect("evaluate against MARF store");
-
-        assert_eq!(value, Some(Value::UInt(42)));
-        store.seal().expect("seal state");
-    }
 
     #[test]
     fn credits_liquid_stx_without_a_transaction_event() {
@@ -3906,32 +3334,15 @@ mod tests {
         vm.record_block_header([2; 32], BlockHeader::default());
         vm.credit_stx(&principal, 42).expect("credit STX");
 
-        let value = vm
-            .execute(
-                "(stx-get-balance 'ST000000000000000000002AMW42H)",
-                LimitedCostTracker::new_free(),
-            )
-            .expect("read balance");
+        let value = read_through_a_contract(
+            &mut vm,
+            "balance",
+            "(stx-get-balance 'ST000000000000000000002AMW42H)",
+        );
 
-        assert_eq!(value.value, Some(Value::UInt(42)));
+        assert_eq!(value, Value::UInt(42));
     }
 
-    #[test]
-    fn persists_clarity_data_variables_in_the_marf_store() {
-        let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
-        let block = [1; 32];
-        store.begin(None, block).expect("begin state");
-
-        let value = evaluate_in_store(
-            &mut store,
-            "(define-data-var counter uint u1) (var-set counter u2) (var-get counter)",
-        )
-        .expect("evaluate persistent data variable");
-
-        assert_eq!(value, Some(Value::UInt(2)));
-        store.seal().expect("seal state");
-        assert!(store.root(block).is_some());
-    }
 
     #[test]
     fn transaction_rollback_restores_active_state() {
@@ -3967,190 +3378,16 @@ mod tests {
         vm.begin_block(Some([2; 32]), [3; 32])
             .expect("begin grandchild");
 
-        let height = vm
-            .execute("stacks-block-height", LimitedCostTracker::new_free())
-            .expect("read the height")
-            .value;
+        let height = read_through_a_contract(&mut vm, "height", "stacks-block-height");
 
         // Genesis is 0, its child 1, this one 2.
-        assert_eq!(height, Some(Value::UInt(2)));
+        assert_eq!(height, Value::UInt(2));
     }
 
-    /// Reading a length out of a buffer, which decides how much work follows.
-    ///
-    /// Wormhole reads its signature count from one byte of the VAA and slices a
-    /// nineteen-element list down to it. A count that comes out too large makes
-    /// that slice answer `none`, `unwrap-panic` fail, and the recovery loop run
-    /// longer on the way — which is the shape of the divergence at 8,665,719.
-    #[test]
-    fn a_length_read_from_a_buffer_is_what_the_bytes_say() {
-        for (program, expected) in [
-            // One byte at an offset, as `read-uint-8` does it.
-            ("(buff-to-uint-be (unwrap-panic (slice? 0x00000000000d u5 u6)))", "u13"),
-            ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000000ff u5 u6)))", "u255"),
-            // Four bytes, as `read-uint-32` does it.
-            ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000007ff u1 u5)))", "u7"),
-            // A buffer slice at its exact end is still in range.
-            ("(unwrap-panic (slice? 0x0102 u0 u2))", "0x0102"),
-            // And one starting at the end is not, the same as for a list.
-            ("(slice? 0x0102 u2 u2)", "none"),
-        ] {
-            let value = evaluate(Network::TESTNET, program)
-                .expect("the program evaluates")
-                .expect("the program returns a value");
-            assert_eq!(format!("{value}"), expected, "{program}");
-        }
-    }
 
-    /// `slice?` with a bound the compiler cannot see, which is the shape a
-    /// VAA check uses.
-    ///
-    /// Wormhole slices a nineteen-element list down to a signature count read
-    /// out of the message at run time, so the bound is a value rather than a
-    /// literal — and a compiler may treat the two differently.
-    #[test]
-    fn slice_over_a_list_with_a_runtime_bound() {
-        for (program, expected) in [
-            (
-                "(let ((n (unwrap-panic (slice? 0x0002 u1 u2)))) \
-                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
-                "(some (u1 u2))",
-            ),
-            (
-                "(let ((n (unwrap-panic (slice? 0x0000 u1 u2)))) \
-                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
-                "(some ())",
-            ),
-            (
-                "(let ((n (unwrap-panic (slice? 0x0009 u1 u2)))) \
-                   (slice? (list u1 u2 u3) u0 (buff-to-uint-be n)))",
-                "none",
-            ),
-        ] {
-            let value = evaluate(Network::TESTNET, program)
-                .expect("the program evaluates")
-                .expect("the program returns a value");
-            assert_eq!(format!("{value}"), expected, "{program}");
-        }
-    }
 
-    /// `map` across two lists, which is how signatures meet their hashes.
-    ///
-    /// Wormhole recovers a key per signature with
-    /// `(map recover-public-key signatures vaa-body-hash-list)`, so a two-list
-    /// map that pairs wrongly or stops at the wrong length recovers the wrong
-    /// keys from good signatures.
-    #[test]
-    fn map_across_two_lists_pairs_them_in_order() {
-        for (program, expected) in [
-            ("(map + (list u1 u2 u3) (list u10 u20 u30))", "(u11 u22 u33)"),
-            // The shorter list decides how far it goes.
-            ("(map + (list u1 u2 u3) (list u10 u20))", "(u11 u22)"),
-            ("(map + (list u1) (list u10 u20 u30))", "(u11)"),
-        ] {
-            let value = evaluate(Network::TESTNET, program)
-                .expect("map evaluates")
-                .expect("map returns a value");
-            assert_eq!(format!("{value}"), expected, "{program}");
-        }
-    }
 
-    /// `slice?` over a list, which a VAA check unwraps without a fallback.
-    ///
-    /// Wormhole's core contract slices a nineteen-element list down to the
-    /// number of signatures it has and `unwrap-panic`s the result, so a `slice?`
-    /// answering `none` fails the whole verification and reads as an unwrap of
-    /// an error far from the word that was wrong. The bounds are the subtle
-    /// part, and they are stacks-core's rather than the obvious ones.
-    #[test]
-    fn slice_over_a_list_answers_for_every_range() {
-        for (range, expected) in [
-            ("u0 u2", Some("(u1 u2)")),
-            ("u0 u3", Some("(u1 u2 u3)")),
-            ("u1 u3", Some("(u2 u3)")),
-            ("u0 u0", Some("()")),
-            // `left >= len` is out of bounds even when the range is empty,
-            // which is stacks-core's check and not an obvious one.
-            ("u3 u3", None),
-            ("u2 u1", None),
-            ("u0 u4", None),
-        ] {
-            let value = evaluate(
-                Network::TESTNET,
-                &format!("(slice? (list u1 u2 u3) {range})"),
-            )
-            .expect("slice? evaluates")
-            .expect("slice? returns a value");
-            let shown = format!("{value}");
-            match expected {
-                Some(items) => assert_eq!(shown, format!("(some {items})"), "slice? {range}"),
-                None => assert_eq!(shown, "none", "slice? {range}"),
-            }
-        }
-    }
 
-    /// The crypto words a signature-verifying contract stands on.
-    ///
-    /// A mainnet market reaches a wormhole guardian-set check on its way
-    /// through `borrow`, and a recovery or a hash that differs makes the whole
-    /// verification fail — which reads as an unwrap of an error, nowhere near
-    /// the word that was wrong.
-    #[test]
-    fn the_signature_words_agree_with_their_known_vectors() {
-        // keccak256 of the empty buffer, the canonical vector.
-        assert_eq!(
-            evaluate(Network::TESTNET, "(keccak256 0x)").expect("keccak256 evaluates"),
-            Some(
-                Value::buff_from(
-                    hex::decode(
-                        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-                    )
-                    .expect("a hash")
-                )
-                .expect("a buffer")
-            )
-        );
-
-        // A recovery, which is what a guardian check actually does.
-        let recovered = evaluate(
-            Network::TESTNET,
-            "(secp256k1-recover? \
-             0xde5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04 \
-             0x8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b873\
-             554428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301)",
-        )
-        .expect("secp256k1-recover? evaluates");
-        assert_eq!(
-            recovered,
-            Some(
-                Value::okay(
-                    Value::buff_from(
-                        hex::decode(
-                            "03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110"
-                        )
-                        .expect("a key")
-                    )
-                    .expect("a buffer")
-                )
-                .expect("ok")
-            )
-        );
-
-        // sha256 of the empty buffer, for contrast: a contract hashing a
-        // message the wrong way recovers the wrong key from a good signature.
-        assert_eq!(
-            evaluate(Network::TESTNET, "(sha256 0x)").expect("sha256 evaluates"),
-            Some(
-                Value::buff_from(
-                    hex::decode(
-                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                    )
-                    .expect("a hash")
-                )
-                .expect("a buffer")
-            )
-        );
-    }
 
     /// A header a node recorded is still there after it restarts.
     ///
@@ -4391,20 +3628,15 @@ mod tests {
         vm.begin_block_with_bitcoin_context(Some(parent), [9; 32], context)
             .expect("begin block");
 
-        let value = vm
-            .execute(
-                "(get-burn-block-info? header-hash u960232)",
-                LimitedCostTracker::new_free(),
-            )
-            .expect("execute")
-            .value;
+        let value = read_through_a_contract(
+            &mut vm,
+            "burn-header",
+            "(get-burn-block-info? header-hash u960232)",
+        );
 
         assert_eq!(
             value,
-            Some(
-                Value::some(Value::buff_from(hash.to_vec()).expect("a buffer"))
-                    .expect("an optional")
-            )
+            Value::some(Value::buff_from(hash.to_vec()).expect("a buffer")).expect("an optional")
         );
     }
 
@@ -4414,15 +3646,24 @@ mod tests {
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, block).expect("begin block");
 
-        let evaluation = vm
-            .execute(
-                "(define-data-var counter uint u1) (var-set counter u2) (var-get counter)",
-                LimitedCostTracker::new_free(),
-            )
-            .expect("execute block");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
+            .expect("a contract identifier");
+        vm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            "(define-data-var counter uint u1)
+             (var-set counter u2)
+             (define-read-only (answer) (var-get counter))",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy in block");
+        let sender: PrincipalData = contract.issuer.clone().into();
+        let value = vm
+            .call_contract_values(&sender, &contract, "answer", &[])
+            .expect("read the variable a deploy set");
         let root = vm.seal_block().expect("seal block");
 
-        assert_eq!(evaluation.value, Some(Value::UInt(2)));
+        assert_eq!(value, Value::UInt(2));
         assert_eq!(vm.root(block), Some(root));
     }
 
@@ -4534,153 +3775,8 @@ mod tests {
         assert_eq!(result.value, Some(Value::err_uint(1)));
     }
 
-    fn assert_successful_wasm_call_matches_interpreter(
-        wasm: &mut Vm,
-        store: &mut MarfStore,
-        sender: PrincipalData,
-        contract: QualifiedContractIdentifier,
-        function: &str,
-        arguments: &[Vec<u8>],
-    ) {
-        let wasm_result = wasm
-            .execute_contract_call(
-                sender.clone(),
-                None,
-                contract.clone(),
-                function,
-                arguments,
-                &LimitedCostTracker::new_free(),
-            )
-            .expect("call WASM contract");
-        let interpreter_result = execute_contract_call(
-            store,
-            sender,
-            None,
-            contract,
-            function,
-            arguments,
-            LimitedCostTracker::new_free(),
-        )
-        .expect("call interpreter contract");
 
-        assert_eq!(wasm_result.value, interpreter_result.value);
-        assert_eq!(wasm_result.cost, interpreter_result.cost);
-        assert_eq!(wasm_result.assets, interpreter_result.assets);
-        assert_eq!(wasm_result.events, interpreter_result.events);
-    }
 
-    fn assert_wasm_failure_matches_interpreter(
-        wasm: &mut Vm,
-        store: &mut MarfStore,
-        sender: PrincipalData,
-        contract: QualifiedContractIdentifier,
-        function: &str,
-        arguments: &[Vec<u8>],
-    ) {
-        let wasm_failure = wasm
-            .execute_contract_call_outcome(
-                sender.clone(),
-                None,
-                contract.clone(),
-                function,
-                arguments,
-                &LimitedCostTracker::new_free(),
-            )
-            .expect("execute WASM failure");
-        let interpreter_failure = execute_contract_call_outcome(
-            store,
-            sender,
-            None,
-            contract,
-            function,
-            arguments,
-            LimitedCostTracker::new_free(),
-        )
-        .expect("execute interpreter failure");
-        let (
-            ContractCallOutcome::RuntimeFailure {
-                cost: wasm_cost,
-                error: wasm_error,
-            },
-            ContractCallOutcome::RuntimeFailure {
-                cost: interpreter_cost,
-                error: interpreter_error,
-            },
-        ) = (wasm_failure, interpreter_failure)
-        else {
-            panic!("{function} should fail at runtime")
-        };
-        assert_eq!(wasm_cost, interpreter_cost);
-        assert_eq!(wasm_error.to_string(), interpreter_error.to_string());
-    }
-
-    #[test]
-    fn wasm_calls_match_the_clarity_six_interpreter() {
-        let contract =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.crosscheck")
-                .expect("valid contract identifier");
-        let source = "
-            (define-public (describe (value (optional int)) (items (list 3 int)))
-                (let ((count (len items)) (number (default-to 0 value)))
-                    (ok (tuple (count count) (number number)))))
-            (define-public (must-have (value (optional int)))
-                (ok (unwrap-panic value)))
-        ";
-        let arguments = [
-            Value::some(Value::Int(7))
-                .expect("valid optional")
-                .serialize_to_vec()
-                .expect("serialize optional"),
-            Value::list_from(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
-                .expect("valid list")
-                .serialize_to_vec()
-                .expect("serialize list"),
-        ];
-        let sender: PrincipalData = contract.issuer.clone().into();
-
-        let mut wasm = Vm::new(Network::TESTNET).expect("create WASM VM");
-        wasm.begin_block(None, [0x71; 32])
-            .expect("begin WASM block");
-        wasm.deploy_contract(
-            contract.clone(),
-            ClarityVersion::Clarity6,
-            source,
-            LimitedCostTracker::new_free(),
-        )
-        .expect("deploy WASM contract");
-        let mut store = MarfStore::new(Network::TESTNET).expect("create interpreter store");
-        store
-            .begin(None, [0x72; 32])
-            .expect("begin interpreter block");
-        deploy_contract(
-            &mut store,
-            contract.clone(),
-            ClarityVersion::Clarity6,
-            source,
-            LimitedCostTracker::new_free(),
-        )
-        .expect("deploy interpreter contract");
-        assert_successful_wasm_call_matches_interpreter(
-            &mut wasm,
-            &mut store,
-            sender,
-            contract.clone(),
-            "describe",
-            &arguments,
-        );
-
-        let none = Value::none()
-            .serialize_to_vec()
-            .expect("serialize optional none");
-        assert_wasm_failure_matches_interpreter(
-            &mut wasm,
-            &mut store,
-            contract.issuer.clone().into(),
-            contract,
-            "must-have",
-            std::slice::from_ref(&none),
-        );
-    }
 
     /// The captured corpus is recaptured wholesale, so tests read its checkpoint
     /// identity from the manifest rather than pinning one capture's hashes.
@@ -4776,68 +3872,3 @@ mod tests {
     }
 }
 
-/// Parsing a contract's functions needs nothing else to be present.
-///
-/// This is what heals a contract the compiler stored with stub bodies when its
-/// dependencies are not in this node's state: deploying it beside them is
-/// impossible, parsing it is not.
-#[cfg(test)]
-mod rebuild_tests {
-    use clarity::vm::ClarityVersion;
-    use clarity::vm::types::QualifiedContractIdentifier;
-
-    use super::defined_functions;
-
-    /// Names a contract this node does not hold, so it cannot be deployed.
-    const SOURCE: &str = "
-(define-constant target 'ST000000000000000000002AMW42H.absent)
-(define-public (pay (amount uint) (to principal))
-  (stx-transfer? amount tx-sender to))
-(define-read-only (double (n uint)) (* n u2))
-(define-private (helper) (ok true))
-(define-data-var counter uint u0)
-";
-
-    fn contract() -> QualifiedContractIdentifier {
-        QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.rebuilt")
-            .expect("a contract identifier")
-    }
-
-    #[test]
-    fn every_define_type_is_rebuilt_with_its_real_body() {
-        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, SOURCE);
-        for name in ["pay", "double", "helper"] {
-            assert!(
-                functions.contains_key(name),
-                "`{name}` was rebuilt from the source"
-            );
-        }
-        assert_eq!(functions.len(), 3, "only the functions, not the data var");
-
-        // The whole point: a real body, not the compiler's `(int 0)` stub.
-        let body = format!("{:?}", functions["double"]);
-        assert!(
-            body.contains('*') || body.contains("Multiply") || body.contains('n'),
-            "`double` carries its real body: {body}"
-        );
-    }
-
-    #[test]
-    fn arguments_keep_their_declared_types() {
-        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, SOURCE);
-        let pay = format!("{:?}", functions["pay"]);
-        assert!(
-            pay.contains("UInt") && pay.contains("Principal"),
-            "`pay` keeps `(uint, principal)`: {pay}"
-        );
-    }
-
-    #[test]
-    fn unparseable_source_yields_nothing_rather_than_a_wrong_contract() {
-        let functions = defined_functions(&contract(), ClarityVersion::Clarity3, "(this is not");
-        assert!(
-            functions.is_empty(),
-            "a source that will not parse heals nothing"
-        );
-    }
-}

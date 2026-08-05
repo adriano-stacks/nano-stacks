@@ -2224,11 +2224,12 @@ mod tests {
         let network = captured_network(&fixtures);
         let temporary = temporary_fixture_root()?;
 
-        // One variable per block, so every block moves the state root.
+        // One contract per block, so every block moves the state root, and
+        // through the engine the node actually runs.
         let programs = [
-            "(define-data-var first uint u1)",
-            "(define-data-var second uint u2)",
-            "(define-data-var third uint u3)",
+            ("first", "(define-data-var counter uint u1)"),
+            ("second", "(define-data-var counter uint u2)"),
+            ("third", "(define-data-var counter uint u3)"),
         ];
         let blocks = [[0xa1; 32], [0xa2; 32], [0xa3; 32]];
 
@@ -2241,10 +2242,15 @@ mod tests {
         )?;
         let mut parent = source;
         let mut expected = Vec::new();
-        for (block, program) in blocks.iter().zip(programs) {
+        for (block, (name, source)) in blocks.iter().zip(programs) {
             open.begin_block(Some(parent), *block)?;
-            open.execute(program, LimitedCostTracker::new_free())
-                .expect("execute block");
+            open.deploy_contract(
+                deployed_contract(name),
+                clarity::vm::ClarityVersion::Clarity6,
+                source,
+                LimitedCostTracker::new_free(),
+            )
+            .expect("deploy in block");
             expected.push(open.seal_block()?);
             parent = *block;
         }
@@ -2253,7 +2259,7 @@ mod tests {
         let directory = temporary.join("reopened");
         let mut parent = source;
         let mut reopened_roots = Vec::new();
-        for (block, program) in blocks.iter().zip(programs) {
+        for (block, (name, contract_source)) in blocks.iter().zip(programs) {
             let mut reopened = nano_vm::Vm::open_from_checkpoint(
                 network,
                 &directory,
@@ -2263,8 +2269,13 @@ mod tests {
             )?;
             assert_eq!(reopened.tip(), Some(parent), "resumes from the tip on disk");
             reopened.begin_block(Some(parent), *block)?;
-            reopened.execute(program, LimitedCostTracker::new_free())
-                .expect("execute block");
+            reopened.deploy_contract(
+                deployed_contract(name),
+                clarity::vm::ClarityVersion::Clarity6,
+                contract_source,
+                LimitedCostTracker::new_free(),
+            )
+            .expect("deploy in block");
             reopened_roots.push(reopened.seal_block()?);
             parent = *block;
         }
@@ -2272,6 +2283,26 @@ mod tests {
         assert_eq!(reopened_roots, expected);
         fs::remove_dir_all(temporary)?;
         Ok(())
+    }
+
+    /// The block and tenure reads a contract on the chain would make, as a
+    /// contract, because that is the only way the node answers them.
+    const READER: &str = "
+(define-read-only (block-header-hash (h uint)) (get-stacks-block-info? header-hash h))
+(define-read-only (block-time (h uint)) (get-stacks-block-info? time h))
+(define-read-only (tenure-burn-hash (h uint)) (get-tenure-info? burnchain-header-hash h))
+(define-read-only (tenure-time (h uint)) (get-tenure-info? time h))
+(define-read-only (tenure-vrf-seed (h uint)) (get-tenure-info? vrf-seed h))
+(define-read-only (tenure-spend-winner (h uint)) (get-tenure-info? miner-spend-winner h))
+(define-read-only (tenure-spend-total (h uint)) (get-tenure-info? miner-spend-total h))
+";
+
+    /// A contract identifier under a fixed test principal.
+    fn deployed_contract(name: &str) -> clarity::vm::types::QualifiedContractIdentifier {
+        clarity::vm::types::QualifiedContractIdentifier::parse(&format!(
+            "ST000000000000000000002AMW42H.{name}"
+        ))
+        .expect("a contract identifier")
     }
 
     fn append_reference_marf_state(
@@ -2750,16 +2781,31 @@ mod tests {
         }
 
         let (target, context) = &executed[1];
-        let height = target.header.chain_length;
-        let mut read = |source: &str| {
-            chainstate
-                .evaluate(source)
-                .unwrap_or_else(|error| panic!("evaluate {source}: {error}"))
-                .unwrap_or_else(|| panic!("{source} produced no value"))
+        let height = Value::UInt(u128::from(target.header.chain_length));
+
+        // Read through a deployed contract rather than a bare program: the node
+        // has one execution engine, and a read it answers by another route is
+        // not the read a contract on the chain would get.
+        let reader = deployed_contract("reader");
+        let sender: clarity::vm::types::PrincipalData = reader.issuer.clone().into();
+        let (_, last_context) = executed.last().expect("a block was executed");
+        let vm = chainstate.vm_mut();
+        vm.begin_block_with_bitcoin_context(parent, [0xbb; 32], *last_context)
+            .expect("begin a block to read from");
+        vm.deploy_contract(
+            reader.clone(),
+            clarity::vm::ClarityVersion::Clarity6,
+            READER,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the reader");
+        let mut read = |function: &str| {
+            vm.call_contract_values(&sender, &reader, function, std::slice::from_ref(&height))
+                .unwrap_or_else(|error| panic!("{function}: {error}"))
         };
 
         assert_eq!(
-            read(&format!("(get-stacks-block-info? header-hash u{height})")),
+            read("block-header-hash"),
             Value::some(
                 Value::buff_from(target.header.block_hash().as_bytes().to_vec())
                     .expect("32-byte buffer")
@@ -2767,33 +2813,35 @@ mod tests {
             .expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-stacks-block-info? time u{height})")),
+            read("block-time"),
             Value::some(Value::UInt(u128::from(target.header.timestamp))).expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-tenure-info? burnchain-header-hash u{height})")),
+            read("tenure-burn-hash"),
             Value::some(
                 Value::buff_from(context.burn_header_hash.to_vec()).expect("32-byte buffer")
             )
             .expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-tenure-info? time u{height})")),
+            read("tenure-time"),
             Value::some(Value::UInt(u128::from(context.burn_block_time))).expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-tenure-info? vrf-seed u{height})")),
+            read("tenure-vrf-seed"),
             Value::some(Value::buff_from(context.vrf_seed.to_vec()).expect("32-byte buffer"))
                 .expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-tenure-info? miner-spend-winner u{height})")),
+            read("tenure-spend-winner"),
             Value::some(Value::UInt(context.burn_spend_winner)).expect("optional"),
         );
         assert_eq!(
-            read(&format!("(get-tenure-info? miner-spend-total u{height})")),
+            read("tenure-spend-total"),
             Value::some(Value::UInt(context.burn_spend_total)).expect("optional"),
         );
+        // Nothing is sealed: this block only existed to read from.
+        drop(chainstate.vm_mut().abort_block());
         assert_ne!(
             context.burn_spend_winner, 0,
             "the capture must record a real commitment for the read to mean anything"

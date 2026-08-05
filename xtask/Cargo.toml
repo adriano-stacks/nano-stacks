@@ -12,6 +12,7 @@ nano-primitives = { path = "../crates/nano-primitives" }
 nano-chainstate = { path = "../crates/nano-chainstate" }
 nano-crypto = { path = "../crates/nano-crypto" }
 nano-vm = { path = "../crates/nano-vm" }
+nano-oracle = { path = "../crates/nano-oracle" }
 nano-marf = { path = "../crates/nano-marf" }
 nano-codec = { path = "../crates/nano-codec" }
 nano-node = { path = "../crates/nano-node" }

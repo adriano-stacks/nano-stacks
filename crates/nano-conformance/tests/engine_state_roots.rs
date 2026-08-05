@@ -78,7 +78,7 @@ fn compiled() -> ([u8; 32], Value) {
 fn interpreted() -> ([u8; 32], Value) {
     let mut store = MarfStore::new(Network::TESTNET).expect("create store");
     store.begin(None, BLOCK).expect("begin block");
-    nano_vm::deploy_contract(
+    nano_oracle::deploy_contract(
         &mut store,
         contract(),
         ClarityVersion::Clarity6,
@@ -86,7 +86,7 @@ fn interpreted() -> ([u8; 32], Value) {
         LimitedCostTracker::new_free(),
     )
     .expect("the contract deploys");
-    let outcome = nano_vm::execute_contract_call_outcome(
+    let outcome = nano_oracle::execute_contract_call_outcome(
         &mut store,
         contract().issuer.into(),
         None,

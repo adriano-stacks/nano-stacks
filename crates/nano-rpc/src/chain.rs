@@ -54,37 +54,18 @@ pub trait ChainAccess: Send {
 }
 
 impl ChainAccess for Vm {
+    /// Straight from the state: `stx-account` is Clarity's view of these three
+    /// numbers, and a node with one consensus engine should not start one to
+    /// answer a read the database already holds.
     fn account(&mut self, principal: &PrincipalData) -> Result<AccountEntry, ChainAccessError> {
-        let nonce = self
-            .account_nonce(principal)
-            .map_err(|error| ChainAccessError::Unavailable(error.to_string()))?;
-        // `stx-account` is the only view that reports the lock alongside the
-        // spendable balance, and it applies the unlock schedule while it reads.
         let account = self
-            .execute(
-                &format!("(stx-account '{principal})"),
-                LimitedCostTracker::new_free(),
-            )
-            .map_err(|error| ChainAccessError::Unavailable(error.to_string()))?
-            .value;
-        let Some(Value::Tuple(account)) = account else {
-            return Err(ChainAccessError::Unavailable(
-                "stx-account did not evaluate to a tuple".to_owned(),
-            ));
-        };
-        let field = |name: &str| -> Result<u128, ChainAccessError> {
-            match account.get(name) {
-                Ok(Value::UInt(amount)) => Ok(*amount),
-                _ => Err(ChainAccessError::Unavailable(format!(
-                    "stx-account is missing {name}"
-                ))),
-            }
-        };
+            .account_state(principal)
+            .map_err(|error| ChainAccessError::Unavailable(error.to_string()))?;
         Ok(AccountEntry {
-            balance: field("unlocked")?,
-            locked: field("locked")?,
-            unlock_height: u64::try_from(field("unlock-height")?).unwrap_or(u64::MAX),
-            nonce,
+            balance: account.unlocked,
+            locked: account.locked,
+            unlock_height: account.unlock_height,
+            nonce: account.nonce,
         })
     }
 

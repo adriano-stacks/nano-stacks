@@ -817,14 +817,6 @@ impl ChainState {
         &mut self.vm
     }
 
-    /// Evaluate a read-only Clarity program against the state just executed.
-    pub fn evaluate(&mut self, source: &str) -> Result<Option<Value>, ChainStateError> {
-        Ok(self
-            .vm
-            .execute(source, LimitedCostTracker::new_free())?
-            .value)
-    }
-
     /// Read an account's spendable STX at the state this chainstate reads from.
     pub fn account_balance(
         &mut self,
@@ -870,25 +862,6 @@ impl ChainState {
         prefix: &[u8],
     ) -> Option<Vec<(TriePointer, TrieHash)>> {
         self.vm.pointers_at(block, prefix)
-    }
-
-    /// Execute a Clarity program for a block and seal its consensus state root.
-    pub fn append_program(
-        &mut self,
-        snapshot: &SortitionSnapshot,
-        parent: Option<[u8; 32]>,
-        block: [u8; 32],
-        source: &str,
-    ) -> Result<AppliedBlock, ChainStateError> {
-        self.vm.begin_block(parent, block)?;
-        self.vm.execute(source, LimitedCostTracker::new_free())?;
-        let state_root = self.vm.seal_block()?;
-        Ok(AppliedBlock {
-            bitcoin_height: snapshot.bitcoin_height,
-            execution: ExecutionResult { state_root },
-            execution_cost: ExecutionCost::ZERO,
-            receipts: Vec::new(),
-        })
     }
 
     /// Execute the supported transaction forms in a block and verify its committed state root.
@@ -1844,31 +1817,9 @@ impl ChainState {
         transaction: &Transaction,
         execution_cost: &ExecutionCost,
     ) -> Result<TransactionReceipt, ChainStateError> {
-        // Ask both engines the same transaction when told to. The interpreter
-        // is what mainnet ran, so a receipt that differs between them names
-        // clarity-wasm; one that agrees and still differs from the chain names
-        // the state around it. Rolling the first run back is what makes this
-        // safe, and it is the only way to compare a call that *succeeds* —
-        // the crosscheck inside the VM only fires when the compiler refuses.
-        let interpreted = std::env::var_os("NANO_CROSSCHECK_TRANSACTIONS").map(|_| {
-            // Mark the arms so a write trace can be split between them: the
-            // first write the two engines make differently names the contract
-            // they diverge in, which the returned value alone never does.
-            println!("--- interpreter {}", transaction.txid());
-            self.vm.interpret_contract_calls(true);
-            self.vm.begin_transaction().ok();
-            let outcome = self.execute_transaction_in_transaction(transaction, execution_cost);
-            self.vm.rollback_transaction().ok();
-            self.vm.interpret_contract_calls(false);
-            println!("--- compiler {}", transaction.txid());
-            outcome
-        });
-
         self.vm.begin_transaction()?;
         let result = self.execute_transaction_in_transaction(transaction, execution_cost);
-        if let Some(interpreted) = interpreted {
-            report_engine_disagreement(transaction, &result, &interpreted);
-        }
+
         match result {
             Ok(receipt) => {
                 self.vm.commit_transaction()?;
@@ -2232,25 +2183,6 @@ fn finalize_native_contract_call(
 }
 
 /// The fees a block's transactions paid, which its tenure collects.
-/// Say when the two engines answer one transaction differently.
-fn report_engine_disagreement(
-    transaction: &Transaction,
-    compiled: &Result<TransactionReceipt, ChainStateError>,
-    interpreted: &Result<TransactionReceipt, ChainStateError>,
-) {
-    let describe = |outcome: &Result<TransactionReceipt, ChainStateError>| match outcome {
-        Ok(receipt) => format!("{:?} {:?}", receipt.status, receipt.result.value),
-        Err(error) => format!("{error}"),
-    };
-    let (compiled, interpreted) = (describe(compiled), describe(interpreted));
-    if compiled != interpreted {
-        println!(
-            "engines disagree on {}:\n  compiler:    {compiled}\n  interpreter: {interpreted}",
-            transaction.txid()
-        );
-    }
-}
-
 fn block_fees(block: &NakamotoBlock) -> u128 {
     block
         .transactions
@@ -2878,24 +2810,6 @@ mod tests {
         TenureAccounting, TenureAccountingError, TransactionStatus, check_postconditions,
         principal_from_address,
     };
-
-    #[test]
-    fn append_program_seals_the_vm_state_root() {
-        let snapshot = SortitionSnapshot::genesis(42, BitcoinHeaderHash::from_bytes([0; 32]));
-        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
-
-        let applied = chainstate
-            .append_program(
-                &snapshot,
-                None,
-                [1; 32],
-                "(define-data-var counter uint u1) (var-set counter u2) (var-get counter)",
-            )
-            .expect("append program");
-
-        assert_eq!(applied.bitcoin_height, 42);
-        assert_ne!(applied.execution.state_root, nano_marf::StateRoot::empty());
-    }
 
     #[test]
     fn executes_decoded_contract_deployments_and_calls() {

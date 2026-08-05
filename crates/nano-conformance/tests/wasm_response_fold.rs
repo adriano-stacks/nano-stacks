@@ -178,7 +178,7 @@ fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, Stri
 
     let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
     store.begin(None, [0x42; 32]).expect("begin");
-    nano_vm::deploy_contract(
+    nano_oracle::deploy_contract(
         &mut store,
         id("f"),
         ClarityVersion::Clarity3,
@@ -204,7 +204,7 @@ fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, Stri
         arguments,
         &LimitedCostTracker::new_free(),
     ));
-    let interpreted = describe(nano_vm::execute_contract_call_outcome(
+    let interpreted = describe(nano_oracle::execute_contract_call_outcome(
         &mut store,
         id("f").issuer.into(),
         None,

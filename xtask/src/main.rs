@@ -131,7 +131,7 @@ fn eval_in_state(arguments: &[String]) -> ExitCode {
         eprintln!("cannot open a block on the tip: {error:?}");
         return ExitCode::FAILURE;
     }
-    match nano_vm::evaluate_in_store(&mut store, source) {
+    match nano_oracle::evaluate_in_store(&mut store, source) {
         Ok(value) => println!("{value:?}"),
         Err(error) => println!("error: {error}"),
     }
@@ -2131,47 +2131,30 @@ fn call_both(arguments: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    for interpreted in [false, true] {
-        if let Err(error) = vm.begin_block(Some(tip), [0xca; 32]) {
-            eprintln!("cannot begin a block: {error:?}");
-            return ExitCode::FAILURE;
+    let caller = match sender.as_deref() {
+        Some(text) if text.contains('.') => {
+            clarity::vm::types::QualifiedContractIdentifier::parse(text)
+                .map_or_else(|_| identifier.issuer.clone().into(), Into::into)
         }
-        vm.interpret_contract_calls(interpreted);
-        let caller = match sender.as_deref() {
-            Some(text) if text.contains('.') => {
-                clarity::vm::types::QualifiedContractIdentifier::parse(text)
-                    .map_or_else(|_| identifier.issuer.clone().into(), Into::into)
+        Some(text) => clarity::vm::types::PrincipalData::parse(text)
+            .unwrap_or_else(|_| identifier.issuer.clone().into()),
+        None => identifier.issuer.clone().into(),
+    };
+    match ask_both_engines(&mut vm, tip, &caller, &identifier, function, &encoded) {
+        Ok([compiler, interpreter]) => {
+            println!("compiler     {compiler}");
+            println!("interpreter  {interpreter}");
+            if compiler == interpreter {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
-            Some(text) => clarity::vm::types::PrincipalData::parse(text)
-                .unwrap_or_else(|_| identifier.issuer.clone().into()),
-            None => identifier.issuer.clone().into(),
-        };
-        let outcome = vm.execute_contract_call_outcome(
-            caller,
-            None,
-            identifier.clone(),
-            function,
-            &encoded,
-            &clarity::vm::costs::LimitedCostTracker::new_free(),
-        );
-        println!(
-            "{:<12} {}",
-            if interpreted { "interpreter" } else { "compiler" },
-            match &outcome {
-                Ok(
-                    nano_vm::ContractCallOutcome::Success(result)
-                    | nano_vm::ContractCallOutcome::AbortedByResponse(result),
-                ) => format!("{:?}", result.value),
-                Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
-                    format!("{error:?}")
-                }
-                Err(error) => format!("{error:?}"),
-            }
-        );
-        // Nothing is sealed, so the state is untouched either way.
-        drop(vm.abort_block());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
 }
 
 /// Ask both engines the same contract call and print what each answered.
@@ -2197,15 +2180,29 @@ fn ask_both_engines(
         );
         vm.begin_block(Some(tip), [0xca; 32])
             .map_err(|error| format!("cannot begin a block: {error:?}"))?;
-        vm.interpret_contract_calls(interpreted);
-        let outcome = vm.execute_contract_call_outcome(
-            sender.clone(),
-            None,
-            contract.clone(),
-            function,
-            encoded,
-            &clarity::vm::costs::LimitedCostTracker::new_free(),
-        );
+        let free = clarity::vm::costs::LimitedCostTracker::new_free();
+        let outcome = if interpreted {
+            nano_oracle::interpret_contract_call(
+                vm,
+                nano_oracle::ContractCall {
+                    sender: sender.clone(),
+                    sponsor: None,
+                    contract: contract.clone(),
+                    function,
+                    arguments: encoded,
+                },
+                free,
+            )
+        } else {
+            vm.execute_contract_call_outcome(
+                sender.clone(),
+                None,
+                contract.clone(),
+                function,
+                encoded,
+                &free,
+            )
+        };
         *slot = match &outcome {
             Ok(
                 nano_vm::ContractCallOutcome::Success(result)
@@ -2218,7 +2215,6 @@ fn ask_both_engines(
         };
         drop(vm.abort_block());
     }
-    vm.interpret_contract_calls(false);
     Ok(answers)
 }
 
@@ -2375,11 +2371,11 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let stubbed = vm.uninterpretable_contracts();
+    let stubbed = nano_oracle::uninterpretable_contracts(vm.state_and_context().0);
     println!("{} contracts the interpreter cannot run", stubbed.len());
     let mut healed = 0;
     for contract in &stubbed {
-        match vm.heal_contract(contract) {
+        match nano_oracle::heal_contract(&mut vm, contract) {
             Ok(()) => healed += 1,
             Err(error) => eprintln!("{contract}: {error}"),
         }

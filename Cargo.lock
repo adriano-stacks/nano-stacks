@@ -2596,6 +2596,7 @@ dependencies = [
  "nano-marf",
  "nano-mempool",
  "nano-node",
+ "nano-oracle",
  "nano-primitives",
  "nano-rpc",
  "nano-signer",
@@ -2701,6 +2702,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "nano-oracle"
+version = "0.1.0"
+dependencies = [
+ "clarity",
+ "hex",
+ "nano-primitives",
+ "nano-vm",
 ]
 
 [[package]]
@@ -5656,6 +5667,7 @@ dependencies = [
  "nano-crypto",
  "nano-marf",
  "nano-node",
+ "nano-oracle",
  "nano-primitives",
  "nano-sync",
  "nano-vm",

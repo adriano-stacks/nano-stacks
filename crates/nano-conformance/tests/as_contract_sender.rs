@@ -93,7 +93,7 @@ fn answers_with(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
     let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
     store.begin(None, [0x32; 32]).expect("begin");
     for (contract, source) in [(inner(), INNER), (other(), INNER), (outer(), OUTER)] {
-        nano_vm::deploy_contract(
+        nano_oracle::deploy_contract(
             &mut store,
             contract,
             ClarityVersion::Clarity3,
@@ -122,7 +122,7 @@ fn answers_with(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
         arguments,
         &LimitedCostTracker::new_free(),
     ));
-    let interpreted = describe(nano_vm::execute_contract_call_outcome(
+    let interpreted = describe(nano_oracle::execute_contract_call_outcome(
         &mut store,
         outer().issuer.into(),
         None,
