@@ -6,11 +6,11 @@
 
 use std::{error::Error, fs, future::Future, path::Path, sync::Arc, time::Duration};
 
-use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource};
+use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource};
 use nano_crypto::StacksPublicKey;
 use nano_chainstate::{
     MINER_REWARD_MATURITY, Signer, SignerSet,
-    BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting, TenureAccountingError,
+    BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting,
 };
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
@@ -36,7 +36,11 @@ const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
 pub(crate) const NODE_CHAINSTATE: &str = "chainstate";
 /// The state directory the signer validates proposals in.
 const SIGNER_CHAINSTATE: &str = "signer-chainstate";
-/// The accounting a role owes, rewritten as it executes.
+/// The accounting a role used to rewrite as it executed.
+///
+/// Read only, now: the ledger is committed with the seal, which is what makes it
+/// as of the tip rather than as of the last catch-up round. This is still read so
+/// that a state directory written before that keeps opening.
 const ACCOUNTING_FILE: &str = "accounting.json";
 
 /// The shared executed chain the node follows along and answers reads from.
@@ -405,7 +409,6 @@ async fn follow(
                         backfill_missing_header(&mut executor, &peer, &error.to_string()).await;
                     }
                 }
-                persist_accounting(&directory, &mut executor)?;
                 executed_height = executor.tip().header.chain_length;
                 sealed_tip(executor.tip(), executor.bitcoin_height())
             };
@@ -460,9 +463,12 @@ pub async fn open_chainstate(
         source,
         config.checkpoint.state_root()?,
     )?;
-    *chainstate.accounting_mut() = accounting(config, directory)?;
 
     let Some(tip) = chainstate.tip().filter(|tip| *tip != source) else {
+        // Nothing has been sealed here, so there is no ledger to recover: the
+        // first tenures a node executes pay out rewards earned before it
+        // existed, and only the checkpoint knows them.
+        *chainstate.accounting_mut() = accounting(config, directory)?;
         let anchor = NakamotoBlock::decode(&fs::read(&config.checkpoint.anchor_block)?)?;
         let mut context = bitcoin_context(config, pox);
         context.height = config.checkpoint.anchor_bitcoin_height;
@@ -495,7 +501,63 @@ pub async fn open_chainstate(
         tip.block_id(),
         tip.header.chain_length
     );
+    recover_ledger(&mut chainstate, config, directory, &tip)?;
     Ok((chainstate, tip, None))
+}
+
+/// Stand on the state the run that sealed this block kept beside the MARF.
+///
+/// Recovered for the block this node is *resuming at*, which is not always the
+/// deepest one it sealed: a tip that lost a fork race while the node was down is
+/// abandoned for an ancestor, and the ledger has to be that ancestor's.
+fn recover_ledger(
+    chainstate: &mut ChainState,
+    config: &Config,
+    directory: &Path,
+    tip: &NakamotoBlock,
+) -> Result<(), Box<dyn Error>> {
+    if chainstate.recover_ledger_at(*tip.block_id().as_bytes())? {
+        // Named field by field, because each one is a thing this node can do that
+        // a run without it silently could not: walk a reorganization back, answer
+        // `get-tenure-info?` for the tenure in flight, check the seed the next
+        // tenure commits.
+        let tenure = chainstate
+            .recorded_header(*tip.block_id().as_bytes())
+            .map(|header| header.tenure_height);
+        println!(
+            "recovered the ledger committed with block {}: {} executed blocks to walk back \
+             over, tenure {} starting at height {}, parent tenure proof {}",
+            tip.block_id(),
+            chainstate.executed_blocks().len(),
+            tenure.map_or_else(|| "unknown".to_owned(), |height| height.to_string()),
+            tenure
+                .and_then(|height| chainstate.tenure_start_height(height))
+                .map_or_else(|| "unknown".to_owned(), |height| height.to_string()),
+            if chainstate.parent_tenure_proof().is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        return Ok(());
+    }
+    // A state directory written before the ledger was committed with the seal
+    // has none, and the three things beside the accounting were never written
+    // anywhere at all. So say exactly what this run cannot do: it owes what the
+    // last catch-up *round* wrote rather than what its tip owes, it cannot walk
+    // a reorganization back past this restart, it will report the first block of
+    // the tenure in flight as that tenure's start height, and it cannot check
+    // the seed the next tenure commits. The first block this run seals writes a
+    // ledger, so the restart after it is whole.
+    eprintln!(
+        "no ledger was committed with block {}, so this run resumes from \
+         {ACCOUNTING_FILE} — which is written per catch-up round and may be behind the \
+         tip — with no reorganization reach, no tenure start heights and no parent \
+         tenure proof. The next block sealed writes one.",
+        tip.block_id()
+    );
+    *chainstate.accounting_mut() = accounting(config, directory)?;
+    Ok(())
 }
 
 /// Find the block a resumed state can carry on from.
@@ -849,23 +911,6 @@ fn check_maturity_window(accounting: &TenureAccounting) -> Result<(), Box<dyn Er
         .into());
     }
     Ok(())
-}
-
-/// Write out what the chain owes, so that a restart owes the same.
-pub fn persist_accounting<S>(
-    directory: &Path,
-    executor: &mut CheckpointExecutor<S>,
-) -> Result<(), String>
-where
-    S: BitcoinSource,
-    S::Error: std::fmt::Display,
-{
-    let encoded = executor
-        .chainstate_mut()
-        .accounting_mut()
-        .to_json()
-        .map_err(|error: TenureAccountingError| error.to_string())?;
-    fs::write(directory.join(ACCOUNTING_FILE), encoded).map_err(|error| error.to_string())
 }
 
 /// The execution context this network fixes, before a height is chosen.
