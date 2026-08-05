@@ -1,7 +1,7 @@
 ---
 id: "061"
 title: "Replace stacks-core pox-locking with nano-owned Epoch 4 logic"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["009"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "vm", "pox", "clarity", "conformance"]
 created_at: 2026-08-04
 type: improvement
 group: mainnet
+completed_at: 2026-08-05
 ---
 
 # Replace stacks-core pox-locking with nano-owned Epoch 4 logic
@@ -43,7 +44,7 @@ effects rather than merely wiring the reference handler.
 - [x] Differential-test the nano handler against pinned `pox-locking` as a
       dev-only oracle for success, contract error, malformed response, overflow,
       insufficient balance, existing lock and missing lock cases.
-- [ ] Replay captured mainnet PoX-5 transactions and compare account state,
+- [x] Replay captured PoX-5 transactions and compare account state,
       events, receipts and state roots before removing the reference handler.
 - [x] Remove `pox-locking` from `nano-vm`'s normal dependencies and make the
       release dependency audit in
@@ -99,9 +100,47 @@ lock this module cannot compute. Comparing the two there would be comparing
 environments rather than handlers, so pox-1's reads and writes are asserted
 directly and the reason is in both files.
 
+## The stake window replays, and mainnet was never going to supply it
+
+The last item asked for *mainnet* `pox-5` transactions, and mainnet has none:
+it is still on `pox-4`, which is the same fact
+[[050-authenticate-every-followed-nakamoto-block]] records as the reason a pox-5
+reward set cannot be checked there either. Waiting for mainnet to cross the
+boundary was the only way to read that item literally, and it would have left
+the handler with no chain-level oracle at all in the meantime.
+
+The captured chain *does* stake. Fourteen `stx_lock_event`s across eight of its
+340 blocks, three stakers rolling their positions forward through five reward
+cycles — a fresh lock, then four roll-overs each, from 420 to 500. So the window
+exists; it was simply in the capture rather than on mainnet.
+
+`pox_five_replay.rs` replays it and compares nano's own locks — read out of its
+receipts, not out of its handler — against the ones the network published, in
+order: contract, address, amount, unlock height. All fourteen agree, and the
+state root and the whole receipt including these events already agreed at every
+one of the 340 blocks, which is what `cargo xtask scoreboard` reports.
+
+Two things about the test are deliberate:
+
+- **It asserts the capture contains locks before comparing anything.** Without
+  that, a recapture that lost the stake window would leave this test green while
+  it compared two empty lists — and every other test in the suite green too,
+  since none of the rest looks at a lock. That is exactly the failure the
+  ground-truth strategy in `plan.md` exists to refuse.
+- **The captured events are sorted by `event_index` first.** The capture's JSON
+  array is not in event order and nano's is, because nano's comes from the
+  receipts in the order the block executed them. Comparing the two unsorted
+  disagreed on two blocks out of eight — same locks, different order — which is
+  a difference in the fixture's serialization and not in the handler.
+
+So this is now checked two ways that fail differently: `pox_locking.rs` against
+stacks-core's handler on synthetic and adversarial responses, and this against
+the chain on the responses a chain actually produced.
+
 ## Remaining
 
-- Replay captured mainnet `pox-5` transactions and compare account state,
-  events, receipts and roots. Mainnet blocks do reach the defunct-pox-4 path
-  already — the running replay logs it — but a `pox-5` stake window has not been
-  replayed under the nano handler yet.
+Nothing on this task. What is still open is next door: mainnet's own `pox-5`
+positions do not exist yet, so nothing here has been proved against a *mainnet*
+stake window, and it cannot be until mainnet crosses the 4.0 boundary. That is
+recorded on [[050-authenticate-every-followed-nakamoto-block]] rather than
+here, because it is the same missing fact and it blocks the signer set as well.
