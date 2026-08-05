@@ -7,7 +7,7 @@ use clarity::vm::contexts::AssetMap;
 use clarity::vm::costs::{constants as cost_constants, CostTracker};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{
-    RuntimeCheckErrorKind, RuntimeError, StaticCheckErrorKind, VmExecutionError, VmInternalError,
+    RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError,
 };
 #[cfg(any())]
 use clarity::vm::functions::crypto::{pubkey_to_address_v1, pubkey_to_address_v2};
@@ -1907,24 +1907,16 @@ fn link_with_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     }
                 };
 
-                if token_name != "*" {
-                    let asset_name = ClarityName::try_from(token_name.clone())?;
-                    let contract = caller
-                        .data_mut()
-                        .global_context
-                        .database
-                        .get_contract(contract_id)?;
-                    contract
-                        .meta_ft
-                        .contains_key(&asset_name)
-                        .then_some(())
-                        .ok_or_else(|| {
-                            WasmError::Expect(
-                                StaticCheckErrorKind::NoSuchFT(token_name.clone()).to_string(),
-                            )
-                        })?;
-                }
-
+                // No check that the token exists, for the same reason `with_nft`
+                // makes none: the reference builds this allowance out of its
+                // three arguments and never reads a contract
+                // (`check_allowance_with_ft` type-checks a principal, a string
+                // and a `uint`, and that is all). An allowance naming a token
+                // that is not there allows nothing, which is a perfectly
+                // ordinary thing for a router to write; refusing it fails the
+                // whole block, as mainnet 8,671,301 did for the NFT spelling of
+                // this. Nothing needed the lookup either — unlike `with-nft`
+                // there is no list whose element type has to be recovered.
                 AllowanceContext::push(
                     &allowance_ref,
                     Allowance::Ft(FtAllowance {
