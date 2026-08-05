@@ -134,10 +134,13 @@ impl TrieStorage {
     /// searches that log and throughput decays. A mainnet import fell from
     /// 60 MB/s to under 3.
     ///
-    /// Journalling buys nothing here: an import that does not finish leaves a
-    /// state directory with no provenance, which is discarded and done again.
-    /// So it is turned off for the duration and the state is durable from the
-    /// first block executed on top of it.
+    /// Journalling is therefore off for the duration, and the state is durable
+    /// from the first block executed on top of it — the import's connection is
+    /// dropped and the store reopened under WAL before anything executes.
+    ///
+    /// Which means an import that does not finish cannot roll back: the pages it
+    /// wrote stay in the file and read as state. That is what
+    /// `UnfinishedImport` is for; nothing may write here outside its mark.
     pub(crate) fn open_for_import(path: &Path) -> Result<Self, MarfError> {
         Self::open_with_journal(path, false)
     }

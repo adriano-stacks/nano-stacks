@@ -475,12 +475,10 @@ impl State {
             block.transactions.len(),
             hex::encode(applied.execution.state_root.0)
         );
-        self.dispatcher
-            .dispatch(
-                EventKind::MinedNakamotoBlock,
-                &mined_nakamoto_block_payload(&block, &applied, sortition.bitcoin_height),
-            )
-            .await;
+        self.dispatcher.dispatch(
+            EventKind::MinedNakamotoBlock,
+            &mined_nakamoto_block_payload(&block, &applied, sortition.bitcoin_height),
+        );
         let block = self.submit(block, sortition.bitcoin_height).await?;
         // A confirmed transaction leaves now rather than when the peer's
         // account nonces catch up, so the next block does not offer it again.
@@ -529,12 +527,10 @@ impl State {
             block.header.chain_length,
             hex::encode(applied.execution.state_root.0)
         );
-        self.dispatcher
-            .dispatch(
-                EventKind::MinedNakamotoBlock,
-                &mined_nakamoto_block_payload(&block, &applied, won.bitcoin_height),
-            )
-            .await;
+        self.dispatcher.dispatch(
+            EventKind::MinedNakamotoBlock,
+            &mined_nakamoto_block_payload(&block, &applied, won.bitcoin_height),
+        );
         self.submit(block, won.bitcoin_height).await
     }
 

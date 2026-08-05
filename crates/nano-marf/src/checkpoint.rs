@@ -45,6 +45,11 @@ pub enum CheckpointError {
         recorded: Box<CheckpointManifest>,
         configured: Box<CheckpointManifest>,
     },
+    UnfinishedImport {
+        directory: PathBuf,
+        marker: PathBuf,
+        state: String,
+    },
     UnsupportedPatch,
 }
 
@@ -86,6 +91,21 @@ impl std::fmt::Display for CheckpointError {
                 configured.state_index_root,
                 configured.stacks_height
             ),
+            Self::UnfinishedImport {
+                directory,
+                marker,
+                state,
+            } => write!(
+                formatter,
+                "the checkpoint import into {} did not finish: {} records an import of state {state} that never completed. \
+                 Journalling is off during an import, so what it left cannot be rolled back and cannot be told apart \
+                 from a complete state by reading it — the trie is missing nodes, and every state root computed on it \
+                 would be wrong. Remove {} and start again; an import is not resumed, and a mainnet checkpoint takes \
+                 about four and a half hours.",
+                directory.display(),
+                marker.display(),
+                directory.display(),
+            ),
             Self::UnsupportedPatch => {
                 formatter.write_str("checkpoint contains unsupported trie patch")
             }
@@ -105,6 +125,7 @@ impl std::error::Error for CheckpointError {
             | Self::RootMismatch { .. }
             | Self::DeclaredRootMismatch { .. }
             | Self::ProvenanceMismatch { .. }
+            | Self::UnfinishedImport { .. }
             | Self::UnsupportedPatch => None,
         }
     }

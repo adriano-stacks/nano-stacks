@@ -25,8 +25,8 @@ use clarity::vm::types::{
 };
 use clarity::vm::{ClarityVersion, Value};
 use nano_marf::{
-    CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, VersionedMarf,
-    import_checkpoint, import_checkpoint_into,
+    CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, UnfinishedImport,
+    VersionedMarf, import_checkpoint, import_checkpoint_into,
 };
 use nano_primitives::{Network, TrieHash};
 use rusqlite::{OptionalExtension, params};
@@ -1430,6 +1430,10 @@ impl MarfStore {
     pub fn open(network: Network, directory: impl AsRef<Path>) -> Result<Self, MarfStoreError> {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory).map_err(MarfStoreError::Io)?;
+        // Checked here as well as on the import path, because resuming is the
+        // route that would otherwise say nothing: the state a killed import left
+        // opens, reads and answers, and is short of nodes it will never mention.
+        UnfinishedImport::refuse(directory)?;
         let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
         let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
         let tip = marf.tip();
@@ -1466,21 +1470,18 @@ impl MarfStore {
     ) -> Result<Self, MarfStoreError> {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory).map_err(MarfStoreError::Io)?;
-        let marf_path = directory.join(MARF_FILE);
-        let clarity_path = directory.join(CLARITY_FILE);
-        if VersionedMarf::open(&marf_path)?.tip().is_some() {
-            return Self::open(network, directory);
+        // Before the tip is consulted: a tip is exactly what a killed import can
+        // leave behind, so "there is state here" is not the question. The
+        // question is whether the import that put it there ran to the end.
+        UnfinishedImport::refuse(directory)?;
+        if VersionedMarf::open(directory.join(MARF_FILE))?.tip().is_none() {
+            import(directory, checkpoint.as_ref(), source, expected_root)?;
         }
-        let marf = import_checkpoint_into(&marf_path, checkpoint.as_ref(), source, expected_root)?;
-        {
-            // Journalling off only while the import runs; the store is then
-            // reopened normally, so everything executed on top of it is
-            // durable.
-            let importing = open_side_store_for_import(&clarity_path)?;
-            import_side_store(&importing, checkpoint.as_ref(), Some(&marf_path))?;
-        }
-        let side_store = open_side_store(&clarity_path)?;
-        Ok(Self::assemble(network, marf, side_store, Some(source)))
+        // Reopened rather than continued on the import's own connections. Those
+        // have journalling off, and a block executed over one of them could not
+        // be rolled back either — a kill during the first tenure a node executes
+        // would tear the MARF with the import mark already cleared.
+        Self::open(network, directory)
     }
 
     const fn assemble(
@@ -2032,6 +2033,37 @@ fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open_in_memory()?;
     connection.execute_batch(SIDE_STORE_SCHEMA)?;
     Ok(connection)
+}
+
+/// Import a checkpoint into an empty state directory, marked while it runs.
+///
+/// Everything the import writes happens between `begin` and `finish`, so a
+/// directory holding the mark holds a state that stopped somewhere in the middle
+/// of this function and is refused rather than resumed.
+fn import(
+    directory: &Path,
+    checkpoint: &Path,
+    source: [u8; 32],
+    expected_root: TrieHash,
+) -> Result<(), MarfStoreError> {
+    let marf_path = directory.join(MARF_FILE);
+    let clarity_path = directory.join(CLARITY_FILE);
+    let unfinished = UnfinishedImport::begin(directory, source)?;
+    drop(import_checkpoint_into(
+        &marf_path,
+        checkpoint,
+        source,
+        expected_root,
+    )?);
+    {
+        // Journalling is off for both halves of the import. The mark spans both,
+        // because the side store is copied out of the trie that was just
+        // imported: a kill here leaves a complete MARF beside a value store
+        // missing values its leaves name, which reads as a finished import.
+        let importing = open_side_store_for_import(&clarity_path)?;
+        import_side_store(&importing, checkpoint, Some(&marf_path))?;
+    }
+    Ok(unfinished.finish(&[marf_path, clarity_path])?)
 }
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
@@ -3656,6 +3688,43 @@ mod tests {
 
 
 
+
+    /// A state directory whose import did not finish opens no way at all.
+    ///
+    /// Both doors, because they fail differently if only one is guarded: the
+    /// import door would start a second import on top of the first one's pages,
+    /// and the resume door would hand out a trie missing nodes. The checkpoint
+    /// path given here does not exist, which is how the test says the refusal
+    /// comes before anything is read — the error is the mark, not the missing
+    /// file.
+    #[test]
+    fn neither_door_opens_a_state_directory_an_import_did_not_finish() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let unfinished = nano_marf::UnfinishedImport::begin(directory.path(), [9; 32])
+            .expect("mark an import as under way");
+
+        let resumed = Vm::open(Network::MAINNET, directory.path());
+        let imported = Vm::open_from_checkpoint(
+            Network::MAINNET,
+            directory.path(),
+            directory.path().join("no-such-checkpoint.sqlite"),
+            [9; 32],
+            TrieHash::from_bytes([0; 32]),
+        );
+        for refusal in [resumed.err(), imported.err()] {
+            let message = refusal.expect("the mark is refused").to_string();
+            assert!(
+                message.contains("did not finish") && message.contains("Remove"),
+                "the refusal says what is wrong and what to do about it: {message}"
+            );
+        }
+
+        // And once the import that left the mark is finished, the same directory
+        // opens: absence of the mark is what lets a state imported before any of
+        // this existed carry on being opened.
+        unfinished.finish(&[]).expect("clear the mark");
+        Vm::open(Network::MAINNET, directory.path()).expect("open the finished state");
+    }
 
     /// A header a node recorded is still there after it restarts.
     ///

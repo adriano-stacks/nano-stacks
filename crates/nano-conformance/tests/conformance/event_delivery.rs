@@ -47,11 +47,13 @@ async fn an_observer_receives_what_the_node_dispatches() {
         "block_height": 8_665_780,
         "transactions": [],
     });
-    // `dispatch` answers with the observers it could *not* reach.
-    let unreachable = dispatcher.dispatch(EventKind::NewBlock, &payload).await;
+    // `dispatch` queues and returns; `settle` is how a test waits for the
+    // observer's own drain task, which is what a node never does.
+    dispatcher.dispatch(EventKind::NewBlock, &payload);
     assert!(
-        unreachable.is_empty(),
-        "the observer was reached: {unreachable:?}"
+        dispatcher.settle(std::time::Duration::from_secs(10)).await,
+        "the event was delivered: {:?}",
+        dispatcher.status()
     );
 
     // The listener answers before the body is parsed, so give it a moment.

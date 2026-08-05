@@ -2,11 +2,32 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use lru::LruCache;
+
+/// Requests this process has sent to a peer, and how long they took.
+///
+/// A follower's speed is either its own execution or what it waits for, and one
+/// counter says which: an HTTP round trip to a hosted API costs hundreds of
+/// milliseconds, so a per-block request is visible here before it is visible
+/// anywhere else.
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+static REQUEST_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// How many requests have been sent, and the seconds spent waiting for them.
+#[must_use]
+pub fn request_stats() -> (u64, f64) {
+    (
+        REQUESTS.load(Ordering::Relaxed),
+        Duration::from_nanos(REQUEST_NANOS.load(Ordering::Relaxed)).as_secs_f64(),
+    )
+}
 
 use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
 use nano_chainstate::{
@@ -931,6 +952,17 @@ impl SyncClient {
     /// catching up asks constantly. Treating that as a failure drops the whole
     /// round and starts it again, which asks even more.
     async fn send(&self, url: reqwest::Url) -> Result<reqwest::Response, SyncError> {
+        let started = std::time::Instant::now();
+        let sent = self.send_inner(url).await;
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        REQUEST_NANOS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        sent
+    }
+
+    async fn send_inner(&self, url: reqwest::Url) -> Result<reqwest::Response, SyncError> {
         let mut wait = RATE_LIMIT_WAIT;
         for _ in 0..RATE_LIMIT_RETRIES {
             let response = self.client.get(url.clone()).send().await?;

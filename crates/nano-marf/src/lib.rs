@@ -7,7 +7,9 @@ mod provenance;
 mod storage;
 
 pub use checkpoint::{CheckpointError, import_checkpoint, import_checkpoint_into, import_pcs};
-pub use provenance::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
+pub use provenance::{
+    CheckpointAttestation, CheckpointManifest, CheckpointProvenance, UnfinishedImport,
+};
 use storage::{BlockRecord, TrieStorage};
 
 /// The 40-byte value stored in a MARF leaf.

@@ -6,7 +6,11 @@
 //! sets out what trusting those bytes means; these types carry the claims that
 //! document reasons about.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use nano_primitives::TrieHash;
 use serde::{Deserialize, Serialize};
@@ -17,6 +21,8 @@ use crate::{CheckpointError, MarfBlockId, checkpoint::parse_hex};
 const MANIFEST_FILE: &str = "checkpoint.toml";
 /// The record a node keeps in its own state directory.
 const PROVENANCE_FILE: &str = "checkpoint-provenance.toml";
+/// The record that an import into a state directory is under way.
+const UNFINISHED_FILE: &str = "checkpoint-import-unfinished.toml";
 
 /// What a checkpoint publishes about itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +135,106 @@ impl CheckpointProvenance {
         fs::write(directory.join(PROVENANCE_FILE), contents)?;
         Ok(())
     }
+}
+
+/// The mark an import leaves in a state directory while it runs.
+///
+/// Journalling is off while a checkpoint is imported (see
+/// `TrieStorage::open_for_import`), so an import that is killed cannot roll
+/// back: pages its transaction had already written stay in the file, and the
+/// value side store is copied afterwards out of the trie that was imported. So
+/// neither "the MARF has a tip" nor "the value store has rows" tells a finished
+/// import apart from one that stopped in the middle — and a node that resumes on
+/// that difference executes blocks against a trie missing nodes, computing a
+/// wrong state root for every one of them and reporting nothing, because the
+/// blocks it is given are the ones the network accepted and their roots are the
+/// ones it cannot reproduce.
+///
+/// This is what tells the two apart: written before the first row, removed after
+/// the last. Absence therefore means finished, which is also what lets a state
+/// directory imported before this existed open unchanged.
+#[derive(Debug)]
+pub struct UnfinishedImport {
+    directory: PathBuf,
+}
+
+impl UnfinishedImport {
+    /// Where the mark lives, for an operator to look at and a test to watch.
+    #[must_use]
+    pub fn marker(directory: impl AsRef<Path>) -> PathBuf {
+        directory.as_ref().join(UNFINISHED_FILE)
+    }
+
+    /// Refuse a state directory whose last import did not finish.
+    pub fn refuse(directory: impl AsRef<Path>) -> Result<(), CheckpointError> {
+        let marker = Self::marker(directory.as_ref());
+        if !marker.exists() {
+            return Ok(());
+        }
+        let state = fs::read_to_string(&marker)
+            .ok()
+            .and_then(|contents| toml::from_str::<UnfinishedWire>(&contents).ok())
+            .map_or_else(|| "an unnamed state".to_owned(), |wire| wire.source_state_id);
+        Err(CheckpointError::UnfinishedImport {
+            directory: directory.as_ref().to_path_buf(),
+            marker,
+            state,
+        })
+    }
+
+    /// Mark an import of `source` into `directory` as under way.
+    pub fn begin(
+        directory: impl AsRef<Path>,
+        source: MarfBlockId,
+    ) -> Result<Self, CheckpointError> {
+        let directory = directory.as_ref();
+        Self::refuse(directory)?;
+        let contents = toml::to_string(&UnfinishedWire {
+            source_state_id: hex::encode(source),
+            started_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        })
+        .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
+        let marker = Self::marker(directory);
+        fs::write(&marker, contents)?;
+        // Durable before the import writes anything, so a machine that loses
+        // power mid-import comes back with the mark rather than with the state
+        // the import had reached and no way to know it is short.
+        sync(&marker)?;
+        sync(directory)?;
+        Ok(Self {
+            directory: directory.to_path_buf(),
+        })
+    }
+
+    /// Flush what was imported and clear the mark.
+    ///
+    /// The files are synced first: with `synchronous = OFF` a committed import
+    /// is a promise the operating system has not kept yet, and clearing the mark
+    /// before it does would leave a directory that says it is complete and is
+    /// not.
+    pub fn finish(self, files: &[PathBuf]) -> Result<(), CheckpointError> {
+        for file in files {
+            if file.exists() {
+                sync(file)?;
+            }
+        }
+        fs::remove_file(Self::marker(&self.directory))?;
+        sync(&self.directory)?;
+        Ok(())
+    }
+}
+
+/// Force a file — or a directory's entries — out to the disk.
+fn sync(path: &Path) -> Result<(), CheckpointError> {
+    Ok(fs::File::open(path)?.sync_all()?)
+}
+
+#[derive(Deserialize, Serialize)]
+struct UnfinishedWire {
+    source_state_id: String,
+    started_unix_seconds: u64,
 }
 
 #[derive(Deserialize, Serialize)]

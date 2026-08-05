@@ -5,7 +5,7 @@ pub mod signer;
 pub mod sortition;
 pub mod staging;
 
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, time::Duration};
 
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
@@ -85,6 +85,50 @@ struct LocalSortition {
     /// The winning commitment's leader-key VRF public key, when this node can
     /// name the winner without leaning on the burn distribution.
     winner_vrf_public_key: Option<[u8; 32]>,
+}
+
+/// Where a round of execution spent its time.
+///
+/// A follower is either executing or waiting, and a guess at which is worth
+/// nothing: this counts both, per phase, and the round says so when asked.
+#[derive(Default)]
+struct ExecutionTiming {
+    /// Distinct burn views the round's blocks stood on, which bounds how many
+    /// sortition requests caching could ever save.
+    views: usize,
+    sortition: Duration,
+    local: Duration,
+    headers: Duration,
+    coinbase: Duration,
+    execution: Duration,
+    /// Building each event payload and handing it to the observers' drain task.
+    dispatch: Duration,
+    staging: Duration,
+}
+
+/// How often a timed round says where its seconds went.
+const TIMING_INTERVAL: usize = 25;
+
+impl ExecutionTiming {
+    fn report(&self, executed: usize) {
+        if executed == 0 || std::env::var_os("NANO_TIMING").is_none() {
+            return;
+        }
+        let (requests, waited) = nano_sync::request_stats();
+        println!(
+            "timing over {executed} blocks on {} views: sortition {:.2}s, local {:.2}s, \
+             headers {:.2}s, coinbase {:.2}s, execution {:.2}s, \
+             dispatch {:.2}s, staging {:.2}s; {requests} peer requests so far, {waited:.1}s waited",
+            self.views,
+            self.sortition.as_secs_f64(),
+            self.local.as_secs_f64(),
+            self.headers.as_secs_f64(),
+            self.coinbase.as_secs_f64(),
+            self.execution.as_secs_f64(),
+            self.dispatch.as_secs_f64(),
+            self.staging.as_secs_f64(),
+        );
+    }
 }
 
 /// The `PoX` payout calendar a node's own constants imply.
@@ -827,20 +871,21 @@ where
         Ok(fetched)
     }
 
-    /// Derive sortitions locally from here on, alongside the peer's answers.
     /// Tell the observers what this node just executed.
     ///
     /// Only the fields a follower can answer from what it holds are filled in;
     /// the rest are left at their defaults rather than invented, since an
     /// observer comparing nano with stacks-core is better served by a field that
     /// is plainly absent than by one that is confidently wrong.
-    fn block_event(
+    fn announce_block(
         &self,
         block: &NakamotoBlock,
         applied: &AppliedBlock,
         context: BitcoinBlockContext,
-    ) -> Option<(nano_rpc::EventDispatcher, serde_json::Value)> {
-        let observers = self.observers.as_ref()?;
+    ) {
+        let Some(observers) = self.observers.as_ref() else {
+            return;
+        };
         let event = nano_rpc::BlockEventContext {
             parent_block_hash: nano_primitives::BlockHeaderHash::from_bytes(
                 *block.header.parent_block_id.as_bytes(),
@@ -856,10 +901,13 @@ where
             pox_5_activation_height: context.pox_5_activation_height,
             ..Default::default()
         };
-        Some((
-            observers.clone(),
-            nano_rpc::new_block_payload(block, applied, &event),
-        ))
+        // Queued rather than posted: `dispatch` hands the payload to the
+        // observer's own drain task, so an observer that is slow or gone costs
+        // this loop the serialization and nothing else.
+        observers.dispatch(
+            nano_rpc::EventKind::NewBlock,
+            &nano_rpc::new_block_payload(block, applied, &event),
+        );
     }
 
     /// Announce every block this node executes to these observers.
@@ -953,23 +1001,26 @@ where
                 peer.bitcoin_height
             );
         }
-        match tracker.catch_up(
+        let derived = match tracker.catch_up(
             |height| bitcoin.block_at(height),
             peer.bitcoin_height,
             payouts,
             crate::sortition::CATCH_UP_LIMIT,
         ) {
-            Ok(advanced) if advanced > 0 => println!(
-                "derived {advanced} sortitions locally, now standing on burn {}",
-                tracker.tip().bitcoin_height
-            ),
-            Ok(_) => {}
+            Ok(advanced) if advanced > 0 => {
+                println!(
+                    "derived {advanced} sortitions locally, now standing on burn {}",
+                    tracker.tip().bitcoin_height
+                );
+                advanced
+            }
+            Ok(advanced) => advanced,
             Err(error) => {
                 eprintln!("deriving the sortition locally failed: {error}");
                 self.sortition = None;
                 return None;
             }
-        }
+        };
         let tip = tracker.tip();
         if tip.bitcoin_height != peer.bitcoin_height {
             // Said once per gap rather than per block: a validation that never
@@ -1029,9 +1080,14 @@ where
             return None;
         }
         // Written down as it advances rather than at shutdown, because a node
-        // that is killed is exactly the one that must not start over.
-        if let (Some(tracker), Some(state)) =
-            (self.sortition.as_ref(), self.sortition_state.as_ref())
+        // that is killed is exactly the one that must not start over — and only
+        // as it advances: many Stacks blocks stand on one burn block, and
+        // writing the whole derived history again for each of them cost a third
+        // of a second per block on mainnet, where the history is 12 MB of JSON
+        // that has not changed.
+        if derived > 0
+            && let (Some(tracker), Some(state)) =
+                (self.sortition.as_ref(), self.sortition_state.as_ref())
             && let Err(error) = tracker.save(state)
         {
             eprintln!("the derived sortition chain could not be written down: {error}");
@@ -1131,6 +1187,8 @@ where
     }
 
     /// Execute staged blocks forward from this node's tip, up to `budget`.
+    ///
+    /// `NANO_TIMING=1` makes each round say where its seconds went.
     async fn execute_staged(
         &mut self,
         node: &SyncClient,
@@ -1139,6 +1197,8 @@ where
         budget: usize,
     ) -> Result<usize, NodeExecutionError> {
         let mut executed = 0;
+        let mut timing = ExecutionTiming::default();
+        let mut previous_view = None;
         while executed < budget {
             let Some(block) = staging.child_of(self.tip.block_id())? else {
                 break;
@@ -1157,8 +1217,15 @@ where
                 self.bitcoin_view = Self::bitcoin_view_of(node, &block).await?;
             }
             let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
+            if previous_view.replace(view) != Some(view) {
+                timing.views += 1;
+            }
+            let phase = std::time::Instant::now();
             let sortition = self.sortition_for(node, view).await?;
+            timing.sortition += phase.elapsed();
+            let phase = std::time::Instant::now();
             let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
+            timing.local += phase.elapsed();
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             // Clarity reads this back through `get-burn-block-info?`, and sBTC
@@ -1177,7 +1244,10 @@ where
                 bitcoin_context.sortition_hash = local.sortition_hash;
                 bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
             }
+            let phase = std::time::Instant::now();
             self.seed_burn_headers(sortition.bitcoin_height);
+            timing.headers += phase.elapsed();
+            let phase = std::time::Instant::now();
             let bitcoin_context = node
                 .tenure_coinbase_context(
                     &block,
@@ -1185,6 +1255,7 @@ where
                     bitcoin_context,
                 )
                 .await?;
+            timing.coinbase += phase.elapsed();
             // A burn block is news exactly once: when the tenure it elected
             // begins. `bitcoin_spent` is a running total, so the difference
             // between consecutive headers is what this burn block burned —
@@ -1193,8 +1264,11 @@ where
             let previous_spent = self.tip.header.bitcoin_spent;
             let announce_burn = self.tip.header.consensus_hash != block.header.consensus_hash;
             let burned = block.header.bitcoin_spent.saturating_sub(previous_spent);
+            let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
-            if announce_burn && let Some(observers) = self.observers.clone() {
+            timing.execution += phase.elapsed();
+            let phase = std::time::Instant::now();
+            if announce_burn && let Some(observers) = self.observers.as_ref() {
                 let payload = nano_rpc::new_burn_block_payload(
                     sortition.bitcoin_block_hash,
                     sortition.bitcoin_height,
@@ -1206,18 +1280,20 @@ where
                     ),
                     burned,
                 );
-                observers
-                    .dispatch(nano_rpc::EventKind::NewBurnBlock, &payload)
-                    .await;
+                observers.dispatch(nano_rpc::EventKind::NewBurnBlock, &payload);
             }
-            // Built before the await so the future does not hold the chainstate.
-            if let Some((observers, payload)) = self.block_event(&block, &applied, bitcoin_context) {
-                observers
-                    .dispatch(nano_rpc::EventKind::NewBlock, &payload)
-                    .await;
-            }
+            self.announce_block(&block, &applied, bitcoin_context);
+            timing.dispatch += phase.elapsed();
+            let phase = std::time::Instant::now();
             staging.remove(block.block_id())?;
+            timing.staging += phase.elapsed();
             executed += 1;
+            if executed % TIMING_INTERVAL == 0 {
+                timing.report(executed);
+            }
+        }
+        if executed % TIMING_INTERVAL != 0 {
+            timing.report(executed);
         }
         Ok(executed)
     }

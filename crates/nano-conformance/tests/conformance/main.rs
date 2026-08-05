@@ -29,6 +29,7 @@ mod event_delivery;
 mod event_observer;
 mod fork_retraction;
 mod hacknet_replacement;
+mod kill_during_import;
 mod mainnet_accounting;
 mod mainnet_checkpoint;
 mod mainnet_codec;

@@ -5,7 +5,13 @@
 //! by field name. `new_block` is also nano's own receipt oracle: the captured
 //! fixtures are exactly what this module has to reproduce.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use clarity::vm::costs::ExecutionCost;
 use nano_chainstate::{AppliedBlock, NakamotoBlock, TransactionReceipt, TransactionStatus};
@@ -15,6 +21,7 @@ use nano_primitives::{
 use nano_stackerdb::Chunk;
 use reqwest::Url;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 /// A block whose transactions were all skipped still says nothing about
 /// microblocks, which epoch 4.0 does not have.
@@ -323,36 +330,128 @@ fn cost_payload(cost: &ExecutionCost) -> Value {
     })
 }
 
-/// The observers a node publishes its events to.
-///
-/// stacks-core retries an observer forever; nano gives up after a bounded
-/// number of attempts so that one dead observer cannot stall block processing.
-#[derive(Clone, Debug)]
-pub struct EventDispatcher {
-    client: reqwest::Client,
-    observers: Vec<Url>,
-    attempts: u32,
-}
-
 /// How many times one observer is retried before an event is dropped.
 pub const DEFAULT_DISPATCH_ATTEMPTS: u32 = 5;
 
-impl EventDispatcher {
-    /// Publish to the supplied observer base URLs.
-    #[must_use]
-    pub fn new(observers: Vec<Url>) -> Self {
+/// How many bytes of undelivered events one observer may hold.
+///
+/// The queue is what stops a slow observer slowing the node down; its bound is
+/// what stops a dead one being a memory leak. Bounded in bytes rather than in
+/// events because payload sizes span three orders of magnitude — an empty
+/// `stackerdb_chunks` is a couple of hundred bytes and a full mainnet
+/// `new_block` is hundreds of kilobytes — so any event count either wastes the
+/// budget or blows through it. At mainnet's ~50 KB average this is several
+/// hundred blocks of slack, so an observer that restarts or pauses for a GC
+/// catches up with no gap at all.
+pub const DEFAULT_DISPATCH_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+
+/// How often a node repeats itself about an observer whose events it is
+/// dropping. Per event it would be one line per block for as long as the
+/// observer stays down, which buries every other line in the log.
+const COMPLAINT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The sequence number of this event in the node's stream to this observer.
+///
+/// Counts every event *offered*, delivered or not, so an observer that records
+/// it sees a gap exactly where the node dropped something. The payload body is
+/// stacks-core's byte for byte; this is a header, so an observer that does not
+/// read it is unaffected.
+const SEQUENCE_HEADER: &str = "x-nano-event-seq";
+
+/// How many events this node has dropped for this observer, in total.
+const DROPPED_HEADER: &str = "x-nano-events-dropped";
+
+/// How hard one observer is tried, and how far behind it may fall.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchLimits {
+    pub attempts: u32,
+    pub queue_bytes: usize,
+}
+
+impl Default for DispatchLimits {
+    fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
-            observers,
             attempts: DEFAULT_DISPATCH_ATTEMPTS,
+            queue_bytes: DEFAULT_DISPATCH_QUEUE_BYTES,
         }
     }
+}
 
-    /// Retry each observer this many times before dropping an event.
+/// What one observer has been sent, and what it has missed.
+#[derive(Clone, Debug)]
+pub struct ObserverStatus {
+    pub url: Url,
+    pub delivered: u64,
+    pub dropped: u64,
+    /// Events queued for it that have not been attempted yet.
+    pub undelivered: usize,
+    /// Whether its last attempted event was accepted.
+    pub reachable: bool,
+}
+
+/// One event on its way to one observer.
+struct Event {
+    kind: EventKind,
+    sequence: u64,
+    /// Serialized once per dispatch and shared by every observer.
+    body: Arc<Vec<u8>>,
+}
+
+/// The observers a node publishes its events to.
+///
+/// Dispatch does not block the caller. stacks-core POSTs to its observers from
+/// the thread that processed the block and retries forever; nano hands the event
+/// to a per-observer queue drained by its own task, because a node's block
+/// execution must not be gated on an HTTP request to a third party. Awaited
+/// inline, five attempts with backoff against an observer that does not answer
+/// cost about a second per block — which is what most of a mainnet replay's
+/// 28–34 blocks/min turned out to be.
+///
+/// One queue and one task **per observer**, so per-observer delivery order is
+/// exactly dispatch order: an indexer applying `new_block` needs the parent
+/// before the child, and a `stacks-signer` reads them as a sequence of state
+/// transitions. Observers do not wait on each other.
+#[derive(Clone, Debug)]
+pub struct EventDispatcher {
+    observers: Vec<Arc<Observer>>,
+}
+
+impl EventDispatcher {
+    /// Publish to the supplied observer base URLs.
+    ///
+    /// Spawns one drain task per observer, so this must be called from inside a
+    /// tokio runtime.
     #[must_use]
-    pub fn with_attempts(mut self, attempts: u32) -> Self {
-        self.attempts = attempts.max(1);
-        self
+    pub fn new(observers: Vec<Url>) -> Self {
+        Self::with_limits(observers, DispatchLimits::default())
+    }
+
+    /// Publish to the supplied observers under limits of your own.
+    #[must_use]
+    pub fn with_limits(observers: Vec<Url>, limits: DispatchLimits) -> Self {
+        let client = reqwest::Client::new();
+        let observers = observers
+            .into_iter()
+            .map(|url| {
+                let (events, queue) = mpsc::unbounded_channel();
+                let observer = Arc::new(Observer {
+                    url,
+                    events,
+                    attempts: limits.attempts.max(1),
+                    queue_bytes: limits.queue_bytes,
+                    queued: AtomicUsize::new(0),
+                    pending: AtomicUsize::new(0),
+                    offered: AtomicU64::new(0),
+                    delivered: AtomicU64::new(0),
+                    dropped: AtomicU64::new(0),
+                    reachable: AtomicBool::new(true),
+                    complained: Mutex::new(None),
+                });
+                tokio::spawn(drain(Arc::clone(&observer), queue, client.clone()));
+                observer
+            })
+            .collect();
+        Self { observers }
     }
 
     #[must_use]
@@ -360,66 +459,289 @@ impl EventDispatcher {
         self.observers.is_empty()
     }
 
-    /// POST one event to every observer, reporting the ones that never accepted it.
-    pub async fn dispatch(&self, kind: EventKind, payload: &Value) -> Vec<Url> {
-        let mut failed = Vec::new();
-        for observer in &self.observers {
-            if !self.post(observer, kind, payload).await {
-                failed.push(observer.clone());
-            }
+    /// Queue one event for every observer and return.
+    ///
+    /// Serializes the payload once and shares the bytes, so a second observer
+    /// costs a pointer rather than a copy of a mainnet block's receipts.
+    pub fn dispatch(&self, kind: EventKind, payload: &Value) {
+        if self.observers.is_empty() {
+            return;
         }
-        failed
+        let body = match serde_json::to_vec(payload) {
+            Ok(body) => Arc::new(body),
+            // A payload that will not serialize is a bug here, not an observer's
+            // problem, and saying so beats every observer reporting a gap.
+            Err(error) => {
+                eprintln!("the {} event could not be serialized: {error}", kind.path());
+                return;
+            }
+        };
+        for observer in &self.observers {
+            observer.offer(kind, &body);
+        }
     }
 
-    async fn post(&self, observer: &Url, kind: EventKind, payload: &Value) -> bool {
-        let Ok(url) = observer.join(kind.path()) else {
-            return false;
-        };
-        for attempt in 0..self.attempts {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
-            }
+    /// What every observer has been sent, and what it has missed.
+    #[must_use]
+    pub fn status(&self) -> Vec<ObserverStatus> {
+        self.observers
+            .iter()
+            .map(|observer| ObserverStatus {
+                url: observer.url.clone(),
+                delivered: observer.delivered.load(Ordering::Relaxed),
+                dropped: observer.dropped.load(Ordering::Relaxed),
+                undelivered: observer.pending.load(Ordering::Relaxed),
+                reachable: observer.reachable.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    /// Wait until every queued event has been attempted, or `timeout` elapses.
+    ///
+    /// Answers whether the queues emptied. Bounded on purpose: waiting on an
+    /// observer without a limit is the stall this whole queue exists to remove,
+    /// so a shutdown gives the drain a moment and then says what it abandoned.
+    pub async fn settle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
             if self
-                .client
-                .post(url.clone())
-                .json(payload)
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
+                .observers
+                .iter()
+                .all(|observer| observer.pending.load(Ordering::Relaxed) == 0)
             {
                 return true;
             }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        false
+    }
+}
+
+/// One observer's queue and its delivery record.
+#[derive(Debug)]
+struct Observer {
+    url: Url,
+    events: mpsc::UnboundedSender<Event>,
+    attempts: u32,
+    queue_bytes: usize,
+    /// Bytes of queued-but-unattempted payloads, held against `queue_bytes`.
+    /// This is the bound; the channel itself is unbounded because a count of
+    /// events says nothing about the memory they occupy.
+    queued: AtomicUsize,
+    /// Events queued and not yet attempted, which is what `settle` waits on.
+    pending: AtomicUsize,
+    offered: AtomicU64,
+    delivered: AtomicU64,
+    dropped: AtomicU64,
+    reachable: AtomicBool,
+    /// When this observer was last complained about.
+    complained: Mutex<Option<Instant>>,
+}
+
+impl Observer {
+    /// Queue one event, or drop it and say so.
+    fn offer(&self, kind: EventKind, body: &Arc<Vec<u8>>) {
+        // Numbered before it is admitted, so that a dropped event consumes a
+        // sequence number and the observer sees where it went.
+        let sequence = self.offered.fetch_add(1, Ordering::Relaxed);
+        let size = body.len();
+        let admitted = self
+            .queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                (queued + size <= self.queue_bytes).then_some(queued + size)
+            });
+        if admitted.is_err() {
+            self.drop_event(kind, sequence, "its queue of undelivered events is full");
+            return;
+        }
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self
+            .events
+            .send(Event {
+                kind,
+                sequence,
+                body: Arc::clone(body),
+            })
+            .is_err()
+        {
+            // The drain task is gone, which happens only as the process exits.
+            self.queued.fetch_sub(size, Ordering::Relaxed);
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            self.drop_event(kind, sequence, "its delivery task has stopped");
+        }
+    }
+
+    /// POST one event, retrying a live observer and giving up on a dead one.
+    async fn deliver(&self, client: &reqwest::Client, event: &Event) {
+        let Ok(url) = self.url.join(event.kind.path()) else {
+            self.drop_event(event.kind, event.sequence, "its URL admits no event path");
+            return;
+        };
+        // An observer already known to be down is tried once rather than five
+        // times. The backoff exists to give a transient failure a second chance;
+        // spending it on every event of a dead observer only makes its queue
+        // fill faster, and it is what made the inline path cost a second a block.
+        let attempts = if self.reachable.load(Ordering::Relaxed) {
+            self.attempts
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+            }
+            let answer = client
+                .post(url.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(SEQUENCE_HEADER, event.sequence)
+                .header(DROPPED_HEADER, self.dropped.load(Ordering::Relaxed))
+                .body(Vec::clone(&event.body))
+                .send()
+                .await;
+            match answer {
+                Ok(response) if response.status().is_success() => {
+                    self.delivered.fetch_add(1, Ordering::Relaxed);
+                    if !self.reachable.swap(true, Ordering::Relaxed) {
+                        // Worth an unconditional line: it names how much of the
+                        // chain this observer's view is missing, and nothing will
+                        // resend it.
+                        eprintln!(
+                            "event observer {} is accepting events again, {} dropped in the meantime and not resent",
+                            self.url,
+                            self.dropped.load(Ordering::Relaxed)
+                        );
+                    }
+                    return;
+                }
+                // An observer that answered has judged this event, and asking
+                // again cannot change its mind: a 404 says it serves no such
+                // endpoint, a 4xx that it will not have this payload. Only a
+                // request that never arrived, or one the observer failed to
+                // handle, is worth repeating.
+                Ok(response) if !retryable(response.status()) => break,
+                _ => {}
+            }
+        }
+        self.reachable.store(false, Ordering::Relaxed);
+        self.drop_event(
+            event.kind,
+            event.sequence,
+            "it did not accept the event after every attempt",
+        );
+    }
+
+    /// Count an event this observer will never see, and say so at most every
+    /// [`COMPLAINT_INTERVAL`].
+    fn drop_event(&self, kind: EventKind, sequence: u64, because: &str) {
+        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.due_to_complain() {
+            return;
+        }
+        eprintln!(
+            "event observer {}: dropped {} event {sequence} because {because}; \
+             {dropped} of {} events dropped so far, visible to it as gaps in its \
+             {SEQUENCE_HEADER} headers",
+            self.url,
+            kind.path(),
+            self.offered.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Whether enough time has passed to say it again. Taken and released here
+    /// so that nothing prints while holding the clock.
+    fn due_to_complain(&self) -> bool {
+        let mut complained = self.complained.lock().expect("the complaint clock");
+        if complained.is_some_and(|at| at.elapsed() < COMPLAINT_INTERVAL) {
+            return false;
+        }
+        *complained = Some(Instant::now());
+        true
+    }
+}
+
+/// Whether asking this observer again could get a different answer.
+fn retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Deliver one observer's events, in the order they were dispatched.
+async fn drain(
+    observer: Arc<Observer>,
+    mut queue: mpsc::UnboundedReceiver<Event>,
+    client: reqwest::Client,
+) {
+    while let Some(event) = queue.recv().await {
+        let size = event.body.len();
+        observer.deliver(&client, &event).await;
+        drop(event);
+        observer.queued.fetch_sub(size, Ordering::Relaxed);
+        observer.pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     use axum::{
         Router,
         extract::{Path, State},
+        http::HeaderMap,
         routing::post,
     };
     use serde_json::json;
 
-    use super::{EventDispatcher, EventKind, Url, Value};
+    use super::{
+        DEFAULT_DISPATCH_ATTEMPTS, DROPPED_HEADER, DispatchLimits, EventDispatcher, EventKind,
+        SEQUENCE_HEADER, Url, Value,
+    };
 
-    /// What an observer received, and the path each payload arrived on.
-    type Received = Arc<Mutex<Vec<(String, Value)>>>;
+    /// One POST an observer received.
+    #[derive(Clone, Debug)]
+    struct Post {
+        path: String,
+        payload: Value,
+        /// The event's place in the node's stream to this observer.
+        sequence: u64,
+        /// How many events the node had dropped for it when this one was sent.
+        dropped: u64,
+    }
 
-    async fn observer() -> (Url, Received) {
+    type Received = Arc<Mutex<Vec<Post>>>;
+
+    /// How long a test waits for the queues to drain before calling it a stall.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// An observer that records what it is sent, after `delay` per request.
+    async fn observer(delay: Duration) -> (Url, Received) {
         let received: Received = Arc::default();
         let app = Router::new()
             .route(
                 "/{event}",
                 post(
-                    |State(received): State<Received>,
-                     Path(event): Path<String>,
-                     axum::Json(payload): axum::Json<Value>| async move {
-                        received.lock().expect("record").push((event, payload));
+                    move |State(received): State<Received>,
+                          Path(event): Path<String>,
+                          headers: HeaderMap,
+                          body: String| async move {
+                        tokio::time::sleep(delay).await;
+                        let number = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or_else(|| panic!("every POST carries {name}"))
+                        };
+                        received.lock().expect("record").push(Post {
+                            path: event,
+                            payload: serde_json::from_str(&body).expect("a JSON payload"),
+                            sequence: number(SEQUENCE_HEADER),
+                            dropped: number(DROPPED_HEADER),
+                        });
                     },
                 ),
             )
@@ -437,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_event_reaches_the_observer_on_its_own_path() {
-        let (url, received) = observer().await;
+        let (url, received) = observer(Duration::ZERO).await;
         let dispatcher = EventDispatcher::new(vec![url]);
 
         for kind in [
@@ -447,19 +769,15 @@ mod tests {
             EventKind::ProposalResponse,
             EventKind::MinedNakamotoBlock,
         ] {
-            assert!(
-                dispatcher
-                    .dispatch(kind, &json!({ "kind": kind.path() }))
-                    .await
-                    .is_empty()
-            );
+            dispatcher.dispatch(kind, &json!({ "kind": kind.path() }));
         }
+        assert!(dispatcher.settle(PATIENCE).await, "the queue drained");
 
         let received = received.lock().expect("record").clone();
         assert_eq!(
             received
                 .iter()
-                .map(|(path, _)| path.as_str())
+                .map(|post| post.path.as_str())
                 .collect::<Vec<_>>(),
             [
                 "new_block",
@@ -469,17 +787,132 @@ mod tests {
                 "mined_nakamoto_block",
             ]
         );
-        assert_eq!(received[0].1, json!({ "kind": "new_block" }));
+        assert_eq!(received[0].payload, json!({ "kind": "new_block" }));
+        // One stream per observer, numbered without gaps while nothing is dropped.
+        assert_eq!(
+            received.iter().map(|post| post.sequence).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        assert!(received.iter().all(|post| post.dropped == 0));
+        let [status] = dispatcher.status().try_into().expect("one observer");
+        assert_eq!((status.delivered, status.dropped), (5, 0));
     }
 
+    /// The whole point of the queue: an observer that refuses connections costs
+    /// the caller no more than the enqueue, five attempts with backoff or not.
     #[tokio::test]
-    async fn an_observer_that_never_answers_is_reported_rather_than_waited_on() {
-        let unreachable = Url::parse("http://127.0.0.1:1/").expect("URL");
-        let dispatcher = EventDispatcher::new(vec![unreachable.clone()]).with_attempts(1);
+    async fn dispatching_to_a_dead_observer_does_not_wait_for_it() {
+        // Port 1 is not listening, so every attempt fails on connect.
+        let dead = Url::parse("http://127.0.0.1:1/").expect("URL");
+        let dispatcher = EventDispatcher::new(vec![dead]);
 
-        assert_eq!(
-            dispatcher.dispatch(EventKind::NewBlock, &json!({})).await,
-            vec![unreachable]
+        let started = Instant::now();
+        for height in 0..50 {
+            dispatcher.dispatch(EventKind::NewBlock, &json!({ "height": height }));
+        }
+        let dispatching = started.elapsed();
+
+        assert!(
+            dispatching < Duration::from_millis(100),
+            "dispatch waited on the observer: {dispatching:?}"
         );
+        // Inline, this would have been 50 blocks x 4 backoff sleeps = 50 s.
+        assert!(
+            u32::try_from(dispatching.as_millis()).unwrap_or(u32::MAX)
+                < 100 * DEFAULT_DISPATCH_ATTEMPTS,
+            "dispatch paid the retry backoff: {dispatching:?}"
+        );
+    }
+
+    /// An observer that refuses an event is asked once, not `attempts` times.
+    ///
+    /// The retries are backed off, so five attempts at a URL that answers 404 —
+    /// which is what an event observer pointed at something serving no such
+    /// endpoint does — cost a whole second per event, for an answer that was
+    /// never going to change. Off the executor's thread now, but the drain task
+    /// still falls a second per block behind for nothing.
+    #[tokio::test]
+    async fn an_observer_that_refuses_an_event_is_not_asked_again() {
+        let asked = Arc::new(Mutex::new(0_usize));
+        let counter = Arc::clone(&asked);
+        let app = Router::new().route(
+            "/{event}",
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    *counter.lock().expect("count") += 1;
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observer");
+        let address = listener.local_addr().expect("observer address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = Url::parse(&format!("http://{address}/")).expect("observer URL");
+        let dispatcher = EventDispatcher::new(vec![url]);
+
+        dispatcher.dispatch(EventKind::NewBlock, &json!({}));
+        assert!(dispatcher.settle(PATIENCE).await, "the queue drained");
+
+        assert_eq!(*asked.lock().expect("count"), 1);
+        let [status] = dispatcher.status().try_into().expect("one observer");
+        assert_eq!((status.delivered, status.dropped), (0, 1));
+    }
+
+    /// A slow observer falls behind rather than holding the node back, and the
+    /// events it misses are the ones over its byte budget — countable, and
+    /// visible to it as a gap in the sequence numbers it does receive.
+    #[tokio::test]
+    async fn an_observer_that_falls_behind_is_dropped_from_and_told_so() {
+        let (url, received) = observer(Duration::from_millis(50)).await;
+        let dispatcher = EventDispatcher::with_limits(
+            vec![url],
+            DispatchLimits {
+                attempts: 1,
+                // Room for two of the payloads below and no more.
+                queue_bytes: 64,
+            },
+        );
+
+        let started = Instant::now();
+        for height in 0..20 {
+            dispatcher.dispatch(EventKind::NewBlock, &json!({ "height": height }));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a slow observer stalled the dispatcher"
+        );
+        assert!(dispatcher.settle(PATIENCE).await, "the queue drained");
+
+        let [status] = dispatcher.status().try_into().expect("one observer");
+        assert!(status.dropped > 0, "the full queue dropped events");
+        assert_eq!(status.delivered + status.dropped, 20);
+
+        // The observer has caught up, so the next event reaches it -- and it is
+        // the *next* event that carries the evidence: its sequence number has
+        // skipped everything the full queue refused.
+        dispatcher.dispatch(EventKind::NewBlock, &json!({ "height": 20 }));
+        assert!(dispatcher.settle(PATIENCE).await, "the queue drained");
+
+        let received = received.lock().expect("record").clone();
+        // What arrived, arrived in dispatch order.
+        let sequences: Vec<u64> = received.iter().map(|post| post.sequence).collect();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        let last = received.last().expect("the observer caught up").clone();
+        assert_eq!(last.payload, json!({ "height": 20 }));
+        assert_eq!(last.sequence, 20);
+        assert!(
+            sequences.len() < 21,
+            "the burst was meant to overflow the queue"
+        );
+        // Two independent ways for the observer to notice, both in the headers
+        // of an event it did receive: a jump in the sequence, and the count.
+        assert!(
+            last.sequence >= u64::try_from(sequences.len()).expect("a small count"),
+            "a gap in {sequences:?} is what tells the observer it missed events"
+        );
+        assert_eq!(last.dropped, status.dropped);
     }
 }
