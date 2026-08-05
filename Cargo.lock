@@ -2599,6 +2599,7 @@ dependencies = [
  "nano-mempool",
  "nano-node",
  "nano-oracle",
+ "nano-p2p",
  "nano-primitives",
  "nano-rpc",
  "nano-signer",
@@ -2715,6 +2716,19 @@ dependencies = [
  "hex",
  "nano-primitives",
  "nano-vm",
+]
+
+[[package]]
+name = "nano-p2p"
+version = "0.1.0"
+dependencies = [
+ "nano-chainstate",
+ "nano-codec",
+ "nano-crypto",
+ "nano-primitives",
+ "rusqlite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,20 @@
+[package]
+name = "nano-p2p"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nano-chainstate = { path = "../nano-chainstate" }
+nano-codec = { path = "../nano-codec" }
+nano-crypto = { path = "../nano-crypto" }
+nano-primitives = { path = "../nano-primitives" }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
