@@ -254,8 +254,15 @@ pub struct TenureAccounting {
 impl TenureAccounting {
     /// Decode portable checkpoint accounting from JSON.
     pub fn from_json(bytes: &[u8]) -> Result<Self, TenureAccountingError> {
-        let checkpoint: TenureAccountingCheckpoint = serde_json::from_slice(bytes)
-            .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))?;
+        Self::from_checkpoint(
+            serde_json::from_slice(bytes)
+                .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))?,
+        )
+    }
+
+    fn from_checkpoint(
+        checkpoint: TenureAccountingCheckpoint,
+    ) -> Result<Self, TenureAccountingError> {
         let mut accounting = Self {
             schedule: checkpoint
                 .coinbase_schedule
@@ -305,10 +312,15 @@ impl TenureAccounting {
 
     /// Encode this accounting in the same JSON a checkpoint carries.
     ///
-    /// A node writes it back out on every block so that a restart resumes owing
-    /// exactly what it owed, rather than what its checkpoint owed.
+    /// A node commits it with every block it seals, so that a restart resumes
+    /// owing exactly what it owed rather than what its checkpoint owed.
     pub fn to_json(&self) -> Result<Vec<u8>, TenureAccountingError> {
-        let checkpoint = TenureAccountingCheckpoint {
+        serde_json::to_vec(&self.to_checkpoint())
+            .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))
+    }
+
+    fn to_checkpoint(&self) -> TenureAccountingCheckpoint {
+        TenureAccountingCheckpoint {
             matured_effects: self
                 .matured_effects
                 .iter()
@@ -343,9 +355,7 @@ impl TenureAccounting {
                 }
             }),
             started: self.started,
-        };
-        serde_json::to_vec(&checkpoint)
-            .map_err(|error| TenureAccountingError::InvalidCheckpoint(error.to_string()))
+        }
     }
 
     /// Record the effects that mature when the given coinbase height is reached.
@@ -628,6 +638,14 @@ struct BlockExecution<'a> {
 /// and the one time it was not, mainnet block 8,665,780 added its 458,250 uSTX
 /// of fees to its tenure on all 1,417 of its retries — 649,365,101 uSTX of
 /// earnings that no MARF root disagreed with, because none of this is in a root.
+///
+/// It is also written down as one value, in the transaction that commits the
+/// seal, for the same reason: these four fields are only ever meaningful
+/// together and as of one block. Split across rows they would be four ways to be
+/// a block apart from each other, which is the failure being fixed — three of
+/// them used to reach no store at all, and the fourth reached a JSON file once
+/// per catch-up *round*, so a crash lost every block of a round's fee accrual
+/// against a MARF sealed at the last of them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ChainLedger {
     accounting: TenureAccounting,
@@ -653,6 +671,87 @@ struct ChainLedger {
 /// grows with uptime rather than with anything it is used for — and it is now
 /// serialized on every block, so its length is a cost paid per block.
 const REORG_REACH: usize = 256;
+
+impl ChainLedger {
+    /// Encode the ledger for the row that is committed with the seal.
+    fn encode(&self) -> Result<Vec<u8>, ChainStateError> {
+        let record = ChainLedgerRecord {
+            accounting: self.accounting.to_checkpoint(),
+            tenure_start_heights: self
+                .tenure_start_heights
+                .iter()
+                .map(|(tenure, height)| (*tenure, *height))
+                .collect(),
+            executed: self
+                .executed
+                .iter()
+                .map(|block| ExecutedBlockRecord {
+                    block_id: hex::encode(block.block_id),
+                    consensus_hash: hex::encode(block.consensus_hash.as_bytes()),
+                    tenure_height: block.tenure_height,
+                })
+                .collect(),
+            parent_tenure_proof: self.parent_tenure_proof.map(hex::encode),
+        };
+        serde_json::to_vec(&record).map_err(|error| ChainStateError::Ledger(error.to_string()))
+    }
+
+    /// Read back a ledger an earlier run committed.
+    fn decode(bytes: &[u8]) -> Result<Self, ChainStateError> {
+        let record: ChainLedgerRecord = serde_json::from_slice(bytes)
+            .map_err(|error| ChainStateError::Ledger(error.to_string()))?;
+        let bad = |what: &str| ChainStateError::Ledger(format!("{what} is not what it claims"));
+        let executed = record
+            .executed
+            .into_iter()
+            .map(|block| {
+                Ok(ExecutedBlock {
+                    block_id: decode_hex(&block.block_id).ok_or_else(|| bad("an executed block"))?,
+                    consensus_hash: ConsensusHash::from_bytes(
+                        decode_hex(&block.consensus_hash)
+                            .ok_or_else(|| bad("an executed block's tenure"))?,
+                    ),
+                    tenure_height: block.tenure_height,
+                })
+            })
+            .collect::<Result<Vec<_>, ChainStateError>>()?;
+        let parent_tenure_proof = record
+            .parent_tenure_proof
+            .map(|proof| decode_hex(&proof).ok_or_else(|| bad("the parent tenure's VRF proof")))
+            .transpose()?;
+        Ok(Self {
+            accounting: TenureAccounting::from_checkpoint(record.accounting)
+                .map_err(|error| ChainStateError::Ledger(error.to_string()))?,
+            tenure_start_heights: record.tenure_start_heights.into_iter().collect(),
+            executed,
+            parent_tenure_proof,
+        })
+    }
+}
+
+/// A fixed-width hexadecimal field, refused rather than padded: a short block
+/// identifier would otherwise become some *other* block.
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    <[u8; N]>::try_from(hex::decode(value).ok()?.as_slice()).ok()
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChainLedgerRecord {
+    accounting: TenureAccountingCheckpoint,
+    /// Tenure height paired with the Stacks height its start block sits at.
+    tenure_start_heights: Vec<(u32, u32)>,
+    executed: Vec<ExecutedBlockRecord>,
+    parent_tenure_proof: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutedBlockRecord {
+    block_id: String,
+    consensus_hash: String,
+    tenure_height: u32,
+}
 
 /// A chainstate execution context backed by versioned VM state.
 ///
@@ -746,6 +845,8 @@ pub enum ChainStateError {
         expected: TrieHash,
         actual: TrieHash,
     },
+    /// The state kept beside the MARF could not be written or read back.
+    Ledger(String),
 }
 
 impl std::fmt::Display for ChainStateError {
@@ -767,6 +868,9 @@ impl std::fmt::Display for ChainStateError {
                 formatter,
                 "state root mismatch: expected {expected}, got {actual}"
             ),
+            Self::Ledger(error) => {
+                write!(formatter, "the ledger kept beside the MARF: {error}")
+            }
         }
     }
 }
@@ -781,6 +885,7 @@ impl std::error::Error for ChainStateError {
             | Self::TransactionFailure { .. }
             | Self::UnsupportedPayload
             | Self::NoSignerSet(_)
+            | Self::Ledger(_)
             | Self::StateRootMismatch { .. } => None,
         }
     }
@@ -882,6 +987,48 @@ impl ChainState {
     /// Access the portable accounting ledger associated with this chainstate.
     pub const fn accounting_mut(&mut self) -> &mut TenureAccounting {
         &mut self.ledger.accounting
+    }
+
+    /// Stand on the ledger the run that sealed `block` committed with it.
+    ///
+    /// Answers whether one was found, and changes nothing when none was: a state
+    /// directory written before the ledger was committed with the seal has none,
+    /// and its caller still has `accounting.json` to fall back to.
+    ///
+    /// The block is named by the caller rather than taken from the tip, because a
+    /// restart whose tip lost a fork race stands on an ancestor instead — and the
+    /// ledger it must stand on is that ancestor's, not the abandoned tip's.
+    pub fn recover_ledger_at(&mut self, block: [u8; 32]) -> Result<bool, ChainStateError> {
+        let Some(encoded) = self.vm.recorded_ledger(block) else {
+            return Ok(false);
+        };
+        let ledger = ChainLedger::decode(&encoded)?;
+        // The VM answers `get-tenure-info?` from a map of its own, which is
+        // memory: without this a restart mid-tenure reports the first block it
+        // executes as that tenure's start height, for every block after it.
+        self.vm.restore_tenure_starts(
+            ledger
+                .tenure_start_heights
+                .iter()
+                .map(|(tenure, height)| (*tenure, *height)),
+        );
+        self.adopt(ledger);
+        Ok(true)
+    }
+
+    /// The Stacks height a tenure's first block sits at, as this chain has it.
+    #[must_use]
+    pub fn tenure_start_height(&self, tenure_height: u32) -> Option<u32> {
+        self.ledger.tenure_start_heights.get(&tenure_height).copied()
+    }
+
+    /// The coinbase VRF proof of the last tenure this chain accepted.
+    ///
+    /// The next tenure's committed seed has to hash to it, so a node without one
+    /// cannot run half of the tenure VRF check and says so.
+    #[must_use]
+    pub const fn parent_tenure_proof(&self) -> Option<[u8; 80]> {
+        self.ledger.parent_tenure_proof
     }
 
     /// Return the committed MARF leaves for a block state.
@@ -1287,10 +1434,11 @@ impl ChainState {
     /// Either input can be unavailable, and the two cases are different from
     /// each other and from a failure:
     ///
-    /// - the leader key is unknown when its registration predates the burnchain
-    ///   window this node holds, which is ordinary just after a checkpoint;
-    /// - the parent proof is unknown only for the first tenure after a
-    ///   checkpoint, because every later one is retained here.
+    /// - the leader key is unknown when this node cannot name which of the burn
+    ///   block's commitments won, which needs the burn distribution;
+    /// - the parent proof is unknown for the first tenure after a checkpoint, and
+    ///   for the first after a restart of a state written before the ledger was
+    ///   committed with the seal. Every later one is read back from that ledger.
     ///
     /// Neither is a reason to accept quietly. An unavailable input is reported
     /// and named; a rule that *can* be checked and fails rejects the block.
@@ -1304,8 +1452,8 @@ impl ChainState {
         } else {
             eprintln!(
                 "tenure at burn {} carries a coinbase proof this node cannot check: \
-                 the winning commitment's leader key was registered before the \
-                 burnchain window it holds",
+                 it could not name which commitment won the sortition, so it has no \
+                 leader key to check the proof against",
                 context.height
             );
         }
@@ -1314,8 +1462,9 @@ impl ChainState {
         } else {
             eprintln!(
                 "tenure at burn {} commits a seed this node cannot check: it has no \
-                 coinbase proof for the parent tenure, which is expected only for \
-                 the first tenure after a checkpoint",
+                 coinbase proof for the parent tenure, which is expected for the first \
+                 tenure after a checkpoint and for the first after resuming a state \
+                 written before the ledger was committed with the seal",
                 context.height
             );
         }
@@ -1461,27 +1610,26 @@ impl ChainState {
             if let Some(proof) = coinbase_vrf_proof(block) {
                 ledger.parent_tenure_proof = Some(proof);
             }
-            let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
-            Ok((
-                AppliedBlock {
-                    bitcoin_height: bitcoin_context.height,
-                    execution: ExecutionResult { state_root },
-                    execution_cost,
-                    receipts,
+            // The ledger is complete before the seal, which is what lets the two
+            // be one commit: it is written with the header and the block's
+            // metadata in one side-store transaction, and the MARF commit that
+            // follows is the single moment the block becomes real.
+            let state_root = self.vm.commit_block(
+                *block.block_id().as_bytes(),
+                &nano_vm::BlockCommit {
+                    header,
+                    ledger: ledger.encode()?,
                 },
-                header,
-            ))
+            )?;
+            Ok(AppliedBlock {
+                bitcoin_height: bitcoin_context.height,
+                execution: ExecutionResult { state_root },
+                execution_cost,
+                receipts,
+            })
         })();
         match result {
-            Ok((applied, header)) => {
-                // Written down after the seal, because nothing undoes it: the
-                // header goes into the side store and into the VM's burn-header
-                // and tenure-start maps, and the tenure-start entry is
-                // first-write-wins, so a rejected block that got this far would
-                // fix a tenure's start height for every later block. The seal is
-                // what makes a block real, so it goes first.
-                self.vm
-                    .record_block_header(*block.block_id().as_bytes(), header)?;
+            Ok(applied) => {
                 self.adopt(ledger);
                 Ok(applied)
             }
@@ -2993,7 +3141,7 @@ const fn clarity_version_to_vm(version: ClarityVersion) -> VmClarityVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoinbaseSchedule, TenureEarnings};
+    use super::{CoinbaseSchedule, ExecutedBlock, TenureEarnings};
     use clarity::vm::contexts::AssetMap;
     use clarity::vm::costs::ExecutionCost;
     use clarity::vm::types::PrincipalData;
@@ -3287,15 +3435,17 @@ mod tests {
         );
     }
 
-    /// An accepted block's state and the header a later block reads it through
-    /// must both survive a restart.
+    /// An accepted block's state, the header a later block reads it through, and
+    /// the ledger it owes must all survive a restart, together.
     ///
     /// A sealed root whose header is missing is not a recoverable state: nothing
     /// re-derives it, and the first contract to ask `get-block-info?` about that
-    /// block gets zeroes for a block the chain has real answers for. The header
-    /// is written after the seal for that reason, so this asserts the pair
-    /// arrives — the rejection test above asserts neither half arrives when the
-    /// block fails.
+    /// block gets zeroes for a block the chain has real answers for. The ledger is
+    /// the same: three of its four fields used to reach no store at all, so every
+    /// restart resumed unable to walk a reorganization back, unable to check the
+    /// next tenure's committed seed, and reporting the wrong tenure start height
+    /// for the rest of the tenure in flight. All of it is committed with the seal
+    /// — the rejection test above asserts none of it arrives when the block fails.
     #[test]
     fn an_accepted_block_is_durable_with_its_header_and_parent_link() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -3312,9 +3462,30 @@ mod tests {
         let header = chainstate
             .recorded_header(id)
             .expect("a header was written");
+        let ledger = chainstate.ledger.clone();
+        assert!(
+            !ledger.executed.is_empty(),
+            "the block is on the executed chain, which is what a retraction walks back"
+        );
         drop(chainstate);
 
-        let (chainstate, _, _) = open_captured(directory.path());
+        let (mut reopened, _, _) = open_captured(directory.path());
+        assert!(
+            reopened
+                .recover_ledger_at(id)
+                .expect("the ledger reads back"),
+            "a ledger was committed with the seal"
+        );
+        assert_eq!(
+            reopened.ledger, ledger,
+            "and it is the one the run that sealed the block held"
+        );
+        assert_eq!(
+            reopened.tenure_start_height(header.tenure_height),
+            Some(header.tenure_start_height),
+            "so the rest of the tenure reports the start height the chain has"
+        );
+        let chainstate = reopened;
         assert_eq!(
             chainstate.tip(),
             Some(id),
@@ -3351,6 +3522,45 @@ mod tests {
         assert!(tenure_start_heights.is_empty());
         assert!(executed.is_empty());
         assert!(parent_tenure_proof.is_none());
+    }
+
+    /// Every field of the ledger survives the row it is committed in.
+    ///
+    /// A field that encodes and does not decode is worse than one that is not
+    /// persisted at all: the node would resume believing it had recovered.
+    #[test]
+    fn a_ledger_reads_back_exactly_as_it_was_committed() {
+        let mut ledger = ChainLedger {
+            accounting: accounting_counting_fees(),
+            tenure_start_heights: [(251_321, 8_665_600), (251_322, 8_665_612)].into(),
+            executed: vec![ExecutedBlock {
+                block_id: [0x3a; 32],
+                consensus_hash: nano_primitives::ConsensusHash::from_bytes([0x7c; 20]),
+                tenure_height: 251_322,
+            }],
+            parent_tenure_proof: Some([0x5e; 80]),
+        };
+        let encoded = ledger.encode().expect("the ledger encodes");
+        assert_eq!(
+            ChainLedger::decode(&encoded).expect("the ledger decodes"),
+            ledger
+        );
+
+        // An empty one too: the first block after a checkpoint has no parent
+        // tenure proof and nothing executed, and `None` must not read back as a
+        // proof of zeroes.
+        ledger.parent_tenure_proof = None;
+        ledger.executed.clear();
+        let encoded = ledger.encode().expect("the ledger encodes");
+        assert_eq!(
+            ChainLedger::decode(&encoded).expect("the ledger decodes"),
+            ledger
+        );
+
+        assert!(matches!(
+            ChainLedger::decode(b"{}"),
+            Err(ChainStateError::Ledger(_))
+        ));
     }
 
     #[test]

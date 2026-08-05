@@ -167,6 +167,22 @@ pub struct BlockHeader {
     pub tenure_start_height: u32,
 }
 
+/// Everything an accepted block makes durable outside the MARF.
+///
+/// The two travel together because they land in one side-store transaction, and
+/// that transaction runs *before* the MARF commit. The MARF's own commit is
+/// therefore the only decision point: a block is in the MARF only if everything
+/// describing it is already on disk. A crash between the two leaves rows for a
+/// block the MARF never got, and nothing can read them, because the only way to
+/// reach them is to stand on that block.
+#[derive(Clone, Debug)]
+pub struct BlockCommit {
+    /// What Clarity may read about the block.
+    pub header: BlockHeader,
+    /// The state its caller keeps beside the MARF, opaque here.
+    pub ledger: Vec<u8>,
+}
+
 /// Everything outside the MARF that Clarity may read.
 ///
 /// The burn state and the block headers travel together because Clarity reads
@@ -862,6 +878,44 @@ impl Vm {
         self.context.headers.insert(block, header);
     }
 
+    /// Seal a block together with everything that describes it.
+    ///
+    /// One call because there is one commit: the header, the caller's ledger and
+    /// the block's Clarity metadata are written in a single side-store
+    /// transaction and the MARF commit follows, so no sealed root can be missing
+    /// any of them. Before this they were four writes in four transactions, and
+    /// a crash between any two left a state nothing could reconcile.
+    pub fn commit_block(
+        &mut self,
+        block: [u8; 32],
+        commit: &BlockCommit,
+    ) -> Result<StateRoot, MarfStoreError> {
+        let root = self.store.commit_to(block, commit)?;
+        self.remember_block_header(block, commit.header);
+        Ok(root)
+    }
+
+    /// The state the run that sealed this block kept beside the MARF.
+    #[must_use]
+    pub fn recorded_ledger(&self, block: [u8; 32]) -> Option<Vec<u8>> {
+        self.store.ledger_at(block)
+    }
+
+    /// Put back the tenure-start answers an earlier run recorded.
+    ///
+    /// `get-tenure-info?` reads these, and they live in memory, so a restart
+    /// without them reports the first block it executes as its tenure's start.
+    /// First-write-wins as everywhere else, so this cannot overwrite an answer
+    /// the current run has already given.
+    pub fn restore_tenure_starts(&mut self, starts: impl IntoIterator<Item = (u32, u32)>) {
+        for (tenure_height, stacks_height) in starts {
+            self.context
+                .tenure_starts
+                .entry(tenure_height)
+                .or_insert(stacks_height);
+        }
+    }
+
     /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.
     pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
         self.store.set_checkpoint_height(block, height);
@@ -1522,6 +1576,34 @@ impl MarfStore {
         Ok(())
     }
 
+    /// Keep the state its caller holds beside the MARF, as of this block.
+    fn write_ledger(&self, block: [u8; 32], ledger: &[u8]) -> Result<(), MarfStoreError> {
+        self.side_store
+            .prepare_cached(
+                "INSERT OR REPLACE INTO chain_ledger (block_id, sequence, data) \
+                 VALUES (?1, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM chain_ledger), ?2)",
+            )?
+            .execute(params![block.as_slice(), ledger])?;
+        self.side_store
+            .prepare_cached(
+                "DELETE FROM chain_ledger \
+                 WHERE sequence <= (SELECT MAX(sequence) FROM chain_ledger) - ?1",
+            )?
+            .execute(params![LEDGER_HISTORY])?;
+        Ok(())
+    }
+
+    /// The state the run that sealed this block kept beside the MARF.
+    #[must_use]
+    pub fn ledger_at(&self, block: [u8; 32]) -> Option<Vec<u8>> {
+        self.side_store
+            .prepare_cached("SELECT data FROM chain_ledger WHERE block_id = ?1")
+            .ok()?
+            .query_row(params![block.as_slice()], |row| row.get(0))
+            .optional()
+            .ok()?
+    }
+
     /// Where this store keeps what is not in the trie, when it is on disk.
     fn side_store_path(&self) -> Option<std::path::PathBuf> {
         self.side_store.path().map(std::path::PathBuf::from)
@@ -1652,11 +1734,73 @@ impl MarfStore {
         Ok(StateRoot(*root.as_bytes()))
     }
 
+    /// Seal the active state under `block`, with everything that describes it.
+    ///
+    /// Two durability boundaries, in this order and no other: one side-store
+    /// transaction carrying the block's Clarity metadata, its header and its
+    /// caller's ledger, and then the MARF's own commit. The MARF commit is last
+    /// and atomic, so it *is* the decision: the block exists exactly when
+    /// everything beside it is already durable. A crash in between leaves rows
+    /// for a block the MARF never got, which nothing can reach, because reaching
+    /// them means standing on that block.
+    pub fn commit_to(
+        &mut self,
+        block: [u8; 32],
+        commit: &BlockCommit,
+    ) -> Result<StateRoot, MarfStoreError> {
+        if self.transaction.is_some() {
+            return Err(MarfStoreError::TransactionInProgress);
+        }
+        if self.active.is_none() {
+            return Err(MarfStoreError::NoActiveState);
+        }
+        self.prepare_commit(block, commit)?;
+        // A failure here must leave the active state intact so the caller can
+        // still abort it.
+        let root = self.marf.seal_to(block)?;
+        self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.metadata.clear();
+        self.read_block = Some(block);
+        Ok(StateRoot(*root.as_bytes()))
+    }
+
+    /// Write everything the block owns outside the MARF, in one transaction.
+    ///
+    /// Committed with `synchronous = FULL`, for this one transaction only. The
+    /// ordering between the two stores is only an ordering on disk if this half
+    /// reaches it first: at the store's usual `NORMAL` a power cut could keep the
+    /// MARF commit and lose the ledger row, which is exactly the sealed root with
+    /// a ledger a block behind that committing them in this order prevents. One
+    /// fsync per block buys it — left switched on, every Clarity value write, each
+    /// its own autocommit and thousands to a block, would fsync too.
+    fn prepare_commit(&self, block: [u8; 32], commit: &BlockCommit) -> Result<(), MarfStoreError> {
+        let prepared = (|| -> Result<(), MarfStoreError> {
+            self.side_store.execute_batch("PRAGMA synchronous = FULL")?;
+            let transaction = self.side_store.unchecked_transaction()?;
+            self.write_metadata(block)?;
+            self.write_block_header(block, &commit.header)?;
+            self.write_ledger(block, &commit.ledger)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let restored = self.side_store.execute_batch("PRAGMA synchronous = NORMAL");
+        prepared?;
+        restored?;
+        Ok(())
+    }
+
     /// Move the block's Clarity metadata into the side store, keyed by the
     /// block that defined it, which is how a later block finds it again.
     fn flush_metadata(&mut self, block: [u8; 32]) -> Result<(), MarfStoreError> {
-        let blockhash = block_hex(block);
         let transaction = self.side_store.unchecked_transaction()?;
+        self.write_metadata(block)?;
+        transaction.commit()?;
+        self.metadata.clear();
+        Ok(())
+    }
+
+    fn write_metadata(&self, block: [u8; 32]) -> Result<(), MarfStoreError> {
+        let blockhash = block_hex(block);
         for ((contract, key), value) in &self.metadata {
             self.side_store
                 .prepare_cached(
@@ -1669,8 +1813,6 @@ impl MarfStore {
                     value
                 ])?;
         }
-        transaction.commit()?;
-        self.metadata.clear();
         Ok(())
     }
 
@@ -1812,7 +1954,27 @@ CREATE TABLE IF NOT EXISTS block_header (
     block_id BLOB PRIMARY KEY,
     data BLOB NOT NULL
 ) WITHOUT ROWID;
+-- The state a node keeps beside the MARF, as of the block that sealed it:
+-- tenure accounting, tenure start heights, the executed suffix a reorganization
+-- walks back over, the previous tenure's VRF proof. Written in the same
+-- transaction as that block's header and metadata, and before the MARF commit.
+--
+-- A history rather than one row, because a restart may find its tip is no longer
+-- on the chain and walk back to an ancestor the network still has: the ledger it
+-- then stands on has to be the one that ancestor sealed.
+CREATE TABLE IF NOT EXISTS chain_ledger (
+    block_id BLOB PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    data BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS chain_ledger_sequence ON chain_ledger(sequence);
 ";
+
+/// How many blocks of ledger history the side store keeps.
+///
+/// `nano-node` looks this far back for a tip the network still has, so a walk
+/// that goes further has nothing to stand on anyway.
+const LEDGER_HISTORY: u32 = 256;
 
 fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open_in_memory()?;
@@ -3279,7 +3441,7 @@ mod tests {
     use clarity::vm::{ClarityVersion, Value};
     use nano_primitives::{Network, TrieHash};
 
-    use super::BlockHeader;
+    use super::{BlockCommit, BlockHeader};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -3458,6 +3620,92 @@ mod tests {
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
         assert_eq!(vm.recorded_header([7; 32]), Some(header));
+    }
+
+    /// A block is sealed with its header and its caller's ledger, or with none of
+    /// them.
+    #[test]
+    fn a_committed_block_carries_its_header_and_ledger_across_a_restart() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let header = BlockHeader {
+            burn_block_height: 960_240,
+            tenure_height: 251_400,
+            tenure_start_height: 8_665_700,
+            ..BlockHeader::default()
+        };
+        {
+            let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("open");
+            vm.begin_block(None, [1; 32]).expect("begin");
+            vm.commit_block(
+                [1; 32],
+                &BlockCommit {
+                    header,
+                    ledger: b"owed as of block one".to_vec(),
+                },
+            )
+            .expect("commit");
+        }
+
+        let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(vm.tip(), Some([1; 32]));
+        assert_eq!(vm.recorded_header([1; 32]), Some(header));
+        assert_eq!(
+            vm.recorded_ledger([1; 32]).as_deref(),
+            Some(b"owed as of block one".as_slice())
+        );
+    }
+
+    /// A crash between the two durability boundaries leaves the parent, whole.
+    ///
+    /// `prepare_commit` is everything a block writes outside the MARF; the MARF
+    /// commit follows and is what makes the block real. Stopping in between is the
+    /// one window a crash can land in, and this is that window: the prepared rows
+    /// are on disk and the block is not. A reopened store must stand on the
+    /// parent, with the parent's ledger — not on a block that never sealed, and
+    /// not on a tip whose ledger is a block behind.
+    #[test]
+    fn a_crash_between_the_two_boundaries_leaves_the_parent_and_its_ledger() {
+        let directory = tempfile::tempdir().expect("a directory");
+        {
+            let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("open");
+            store.begin(None, [1; 32]).expect("begin the parent");
+            store
+                .commit_to(
+                    [1; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the parent".to_vec(),
+                    },
+                )
+                .expect("commit the parent");
+
+            // The child, prepared and then abandoned where a SIGKILL would land.
+            store.begin(Some([1; 32]), [2; 32]).expect("begin the child");
+            store
+                .prepare_commit(
+                    [2; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the child".to_vec(),
+                    },
+                )
+                .expect("prepare the child");
+        }
+
+        let store = MarfStore::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(
+            store.tip(),
+            Some([1; 32]),
+            "the child never committed, so the parent is the tip"
+        );
+        assert_eq!(
+            store.ledger_at([1; 32]).as_deref(),
+            Some(b"as of the parent".as_slice()),
+            "and the ledger the reopened store stands on is the parent's"
+        );
+        // The child's rows are on disk and unreachable: nothing addresses them
+        // but the child, and the child is not in the MARF.
+        assert!(store.ledger_at([2; 32]).is_some());
     }
 
     /// The size at which a contract of trait calls stops compiling.
