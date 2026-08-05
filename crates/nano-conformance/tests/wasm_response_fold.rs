@@ -378,6 +378,146 @@ fn boolean(value: bool) -> Vec<u8> {
     serialized(&Value::Bool(value))
 }
 
+fn principal(text: &str) -> Vec<u8> {
+    serialized(
+        &Value::Principal(
+            clarity::vm::types::PrincipalData::parse(text).expect("a principal literal"),
+        ),
+    )
+}
+
+/// The shape mainnet block 8,667,509 stops on: a `default-to` whose default
+/// names fewer fields than the optional carries.
+///
+/// `SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.blacklist-susdh-v1` is on the chain
+/// and mainnet ran it, and clarity-wasm emitted a module wasmtime refuses:
+///
+/// ```text
+/// type mismatch: values remaining on stack at end of block (at offset 0x2955)
+/// ```
+///
+/// which is *not* the placeholder signature of the four before it — nothing is
+/// read as the wrong width; a slot is pushed that nothing pops. `default-to`
+/// types as `least_supertype(default, inner)`, which walks the **default's**
+/// fields and silently drops the rest, so `(default-to { soft: false } (map-get?
+/// blacklist k))` over a `{ soft: bool, full: bool }` map analyses as the
+/// one-field tuple. `map-get?` reads the map's own value type and pushes two
+/// slots; only one was accounted for, and the other stayed on the stack to the
+/// end of the function.
+const NARROWING_DEFAULT: &str = "
+(define-map blacklist { address: principal } { soft: bool, full: bool })
+
+;; `get-soft-blacklist` and `get-full-blacklist`, verbatim in shape: each default
+;; names one of the two fields, so each narrows differently.
+(define-read-only (soft-of (address principal))
+  (get soft (default-to { soft: false } (map-get? blacklist { address: address }))))
+(define-read-only (full-of (address principal))
+  (get full (default-to { full: false } (map-get? blacklist { address: address }))))
+
+;; Both branches of the same `default-to`: present for `address`, absent for the
+;; principal beside it. A `none` converts a placeholder payload, which must not
+;; be read.
+(define-public (record (address principal) (full bool))
+  (begin
+    (map-set blacklist { address: address } { soft: true, full: full })
+    (ok {
+      present-soft: (soft-of address),
+      present-full: (full-of address),
+      absent: (soft-of 'ST000000000000000000002AMW42H)
+    })))
+
+;; A list in the surviving field makes the conversion need call-stack workspace
+;; rather than locals alone, and `(list)` as the default makes the *default* the
+;; placeholder for once.
+(define-map holdings { address: principal } { amounts: (list 3 uint), note: uint })
+(define-public (hold (address principal))
+  (begin
+    (map-set holdings { address: address } { amounts: (list u1 u2 u3), note: u9 })
+    (ok {
+      present: (get amounts (default-to { amounts: (list) }
+                 (map-get? holdings { address: address }))),
+      absent: (get amounts (default-to { amounts: (list) }
+                 (map-get? holdings { address: 'ST000000000000000000002AMW42H })))
+    })))
+
+;; The optional as a plain binding rather than a map read, which is the same
+;; narrowing reached through `visit_atom` instead of through `map-get?`.
+(define-read-only (soft-of-bound (entry (optional { soft: bool, full: bool })))
+  (get soft (default-to { soft: false } entry)))
+
+;; `default-to` with nothing to narrow, which the fix must leave alone: the
+;; payload's type is the expression's, and either side can be the placeholder.
+(define-read-only (or-seven (n (optional uint))) (default-to u7 n))
+(define-read-only (or-nothing (n (optional (optional uint)))) (default-to none n))
+";
+
+#[test]
+fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
+    let alice = "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7";
+    for function in ["soft-of", "full-of"] {
+        for who in [alice, "ST000000000000000000002AMW42H"] {
+            let (compiled, interpreted) =
+                both_in(NARROWING_DEFAULT, function, &[principal(who)]);
+            assert_eq!(compiled, interpreted, "{function} of {who}");
+        }
+    }
+    for full in [true, false] {
+        let (compiled, interpreted) =
+            both_in(NARROWING_DEFAULT, "record", &[principal(alice), boolean(full)]);
+        assert!(
+            !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
+            "record with full={full} answered nothing: {compiled}"
+        );
+        assert_eq!(compiled, interpreted, "record with full={full}");
+    }
+    let (compiled, interpreted) = both_in(NARROWING_DEFAULT, "hold", &[principal(alice)]);
+    assert!(
+        !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
+        "hold answered nothing: {compiled}"
+    );
+    assert_eq!(compiled, interpreted, "hold");
+
+    for entry in [
+        Value::none(),
+        Value::some(Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (
+                    clarity::vm::ClarityName::from_literal("soft"),
+                    Value::Bool(true),
+                ),
+                (
+                    clarity::vm::ClarityName::from_literal("full"),
+                    Value::Bool(false),
+                ),
+            ])
+            .expect("a tuple"),
+        ))
+        .expect("an optional"),
+    ] {
+        let (compiled, interpreted) =
+            both_in(NARROWING_DEFAULT, "soft-of-bound", &[serialized(&entry)]);
+        assert_eq!(compiled, interpreted, "soft-of-bound of {entry}");
+    }
+}
+
+#[test]
+fn a_default_to_with_nothing_to_narrow_is_unchanged() {
+    let some_eleven = Value::some(Value::UInt(11)).expect("an optional");
+    for (function, argument) in [
+        ("or-seven", &some_eleven),
+        ("or-seven", &Value::none()),
+        (
+            "or-nothing",
+            &Value::some(some_eleven.clone()).expect("an optional"),
+        ),
+        ("or-nothing", &Value::none()),
+    ] {
+        let (compiled, interpreted) =
+            both_in(NARROWING_DEFAULT, function, &[serialized(argument)]);
+        assert_eq!(compiled, interpreted, "{function} of {argument}");
+    }
+}
+
 #[test]
 fn narrowing_a_tuple_keeps_the_fields_it_kept() {
     for function in [
