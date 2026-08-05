@@ -412,7 +412,7 @@ async fn swarm_against(address: SocketAddr) -> (nano_p2p::Round, nano_p2p::Known
         .seed(&address.to_string())
         .await
         .expect("record the seed");
-    let round = swarm.maintain(view(900_001)).await;
+    let round = swarm.maintain(view(900_001), None).await;
     let known = swarm
         .peer_table()
         .get(nano_p2p::PeerAddress::from_ip(address.ip()), address.port())
@@ -556,7 +556,7 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     }
     let discovered = swarm.discovered();
 
-    let round = swarm.maintain(view(900_001)).await;
+    let round = swarm.maintain(view(900_001), Some(KNOWN_CYCLE)).await;
     assert_eq!(round.dialled, 3);
     assert_eq!(round.connected, 3);
     assert_eq!(round.isolated, 0);
@@ -571,10 +571,16 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     );
     // Three dialled peers plus the three addresses one of them gossiped.
     assert_eq!(discovered.known(), 6);
+    // All three answered the inventory; the two with an HTTP endpoint are the ones
+    // worth fetching from, because the third has nothing at the other end to ask.
+    assert_eq!(round.claiming, 2);
+    let mut claiming = discovered.claiming();
+    claiming.sort();
+    assert_eq!(claiming, endpoints);
 
     // Every peer answers the same inventory question, because one peer's inventory
     // is one peer's claim.
-    let claims = swarm.tenure_claims(KNOWN_CYCLE).await;
+    let claims = swarm.tenure_claims(KNOWN_CYCLE, &mut nano_p2p::Round::default()).await;
     assert_eq!(claims.len(), 3);
     assert!(claims.iter().all(|claim| claim.tenures.get(0) == Some(true)));
     assert_eq!(
@@ -582,15 +588,29 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
         2
     );
     // A nack is an answer and not a fault, so nobody is dropped for it.
-    assert!(swarm.tenure_claims(UNKNOWN_CYCLE).await.is_empty());
+    assert!(
+        swarm
+            .tenure_claims(UNKNOWN_CYCLE, &mut nano_p2p::Round::default())
+            .await
+            .is_empty()
+    );
     assert_eq!(swarm.discovered().connected(), 3);
 
     // One peer goes away. It is dropped, not isolated: not answering is a restart,
     // and a peer punished for restarting is a peer a small network cannot afford.
     first_task.abort();
-    let round = swarm.maintain(view(900_002)).await;
+    let round = swarm.maintain(view(900_002), Some(KNOWN_CYCLE)).await;
     assert_eq!(round.connected, 2);
     assert_eq!(round.isolated, 0);
+    // The one that went away is reported, which is not free: `retire` used to
+    // penalise into a `Round` it threw away, so a peer lost during an inventory
+    // exchange left the round claiming it still had it.
+    assert_eq!(round.dropped, 1);
+    // And the two that stayed still answer, which is what the inbound idle budget
+    // buys: the round above spent five seconds waiting on the peer that had gone, and
+    // a conversation closed at its read deadline would have taken the other two with
+    // it.
+    assert_eq!(round.claiming, 1);
     assert_eq!(discovered.connected(), 2);
     assert!(!discovered.endpoints().contains(&"http://127.0.0.1:20443".to_owned()));
     // And it is still known, with a failure against it rather than forgotten.

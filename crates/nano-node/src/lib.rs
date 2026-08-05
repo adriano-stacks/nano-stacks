@@ -14,7 +14,7 @@ use nano_chainstate::{
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
 use nano_primitives::{Network, StacksBlockId, TrieHash};
-use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError};
+use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError, TenureSource};
 
 use crate::staging::{Staging, StagingError};
 
@@ -655,6 +655,36 @@ where
             .map_or(0, |header| u64::from(header.burn_block_height))
     }
 
+    /// The consensus hash that names the reward cycle this node's burn view sits in.
+    ///
+    /// This is how a `GetNakamotoInv` names a cycle — by the consensus hash of its
+    /// *first sortition* — and it comes from this node's own derived sortition chain
+    /// rather than from a peer, because a cycle identifier taken from a peer would
+    /// make that peer's view of the burnchain the thing nano's inventory requests are
+    /// keyed on.
+    ///
+    /// The boundary is found with the **cycle-keyed** rule and not the tip-keyed one.
+    /// `starts_reward_cycle` is waterfall-aware: a cycle opens at offset 0 once the
+    /// waterfall is on and at offset 1 before it, so a node that decided from where
+    /// its tip happens to sit would move the boundary part-way through a prepare
+    /// phase and name a cycle no peer recognises.
+    #[must_use]
+    pub fn cycle_start_consensus_hash(&self, pox: &PoxInfo) -> Option<nano_primitives::ConsensusHash> {
+        let tracker = self.sortition.as_ref()?;
+        let payouts = payout_schedule(pox)?;
+        let mut height = self.bitcoin_height().min(tracker.tip().bitcoin_height);
+        // The cycle is at most one length back, so the walk is bounded by the cycle
+        // and cannot run away on a schedule that never says yes.
+        let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+        for _ in 0..=length {
+            if payouts.starts_reward_cycle(height) {
+                return tracker.consensus_hash_at(height);
+            }
+            height = height.checked_sub(1)?;
+        }
+        None
+    }
+
     /// Ask a peer for something, waiting out the limits it answers with.
     ///
     /// A node writing down the headers it is missing cannot execute anything
@@ -758,6 +788,7 @@ where
     pub async fn catch_up(
         &mut self,
         node: &SyncClient,
+        history: &mut TenureSource,
         pox: &PoxInfo,
         staging: &Staging,
         budget: CatchUpBudget,
@@ -774,7 +805,7 @@ where
         // from.
         staging.remove_to(executed_height)?;
         let mut fetched = Self::descend(
-            node,
+            history,
             staging,
             peer_tip,
             Stop {
@@ -789,7 +820,7 @@ where
         // is what makes a rate-limited round cost nothing but time.
         if let Some(resume) = staging.descent_resumes_at()? {
             fetched += Self::descend(
-                node,
+                history,
                 staging,
                 resume,
                 Stop {
@@ -823,7 +854,7 @@ where
     /// Walk back from `from`, staging each block, until this node's tip or a
     /// block already staged is reached, or the budget runs out.
     async fn descend(
-        node: &SyncClient,
+        history: &mut TenureSource,
         staging: &Staging,
         from: StacksBlockId,
         until: Stop,
@@ -839,11 +870,17 @@ where
             // A whole tenure per request rather than a block per request: over
             // a gap of tens of thousands of blocks that is the difference
             // between catching up and being rate limited forever.
-            let blocks = match node.blocks_of_tenure(cursor).await {
+            // Spread over every peer discovery found, not sent down one client.
+            // Twenty thousand blocks through one hosted API is a rate limit deciding
+            // how fast nano can catch up, which is the thing joining the peer network
+            // was for.
+            let blocks = match history.blocks_of_tenure(cursor).await {
                 Ok(blocks) => blocks,
                 // A peer that is rate limiting has not failed, and neither has
-                // the round: everything staged so far still stands.
-                Err(error) if error.is_rate_limited() => {
+                // the round: everything staged so far still stands. Reported only
+                // when there is nobody left to ask, because with peers still willing
+                // the right response is to ask one of them rather than to wait.
+                Err(error) if error.is_rate_limited() && history.exhausted() => {
                     round.rate_limited = true;
                     break;
                 }

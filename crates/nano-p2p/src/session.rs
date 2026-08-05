@@ -436,10 +436,16 @@ impl Framed {
         }
     }
 
-    /// Read one message with this session's ordinary deadline.
-    pub(crate) async fn read(&mut self) -> Result<Message, SessionError> {
-        self.read_until(tokio::time::Instant::now() + self.timeout)
-            .await
+    /// Wait up to `idle` for the peer's next message.
+    ///
+    /// A separate budget from [`Framed::timeout`], because the two answer different
+    /// questions. The timeout says how long one read may take once bytes are coming;
+    /// `idle` says how long a conversation may be *silent*, and on this protocol that
+    /// is a long time — stacks-core's advertised heartbeat is 3600 seconds. Closing an
+    /// inbound conversation at the read timeout meant nano hung up on every stock node
+    /// that was merely quiet, roughly twice a minute.
+    pub(crate) async fn read_idle(&mut self, idle: Duration) -> Result<Message, SessionError> {
+        self.read_until(tokio::time::Instant::now() + idle).await
     }
 
     /// Collect everything the peer has already sent, without waiting for more.

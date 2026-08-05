@@ -107,15 +107,19 @@ async fn nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api() {
     // ever talk to its seed list would still have four services as a dependency.
     let mut learned_beyond_the_seeds = false;
     for round in 1..=2 {
-        let outcome = swarm.maintain(fresh_node_view()).await;
+        // No cycle to ask inventories about: a fresh table has no locally derived
+        // sortitions, so there is no consensus hash this node could name a cycle by
+        // without quoting a peer for it.
+        let outcome = swarm.maintain(fresh_node_view(), None).await;
         println!(
             "round {round}: {} connected, {} dialled, {} isolated, {} addresses learned, \
-             {} known",
+             {} known, {} unprompted messages",
             outcome.connected,
             outcome.dialled,
             outcome.isolated,
             outcome.learned,
             discovered.known(),
+            outcome.collected,
         );
         learned_beyond_the_seeds |= outcome.learned > 0;
     }

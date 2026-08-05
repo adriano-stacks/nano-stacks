@@ -350,6 +350,8 @@ pub enum SyncError {
     Fork,
     InvalidMempool,
     InvalidAccount,
+    /// Every peer in the pool has been asked and none could answer.
+    NoPeer,
 }
 
 impl SyncError {
@@ -366,6 +368,7 @@ impl fmt::Display for SyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
+            Self::NoPeer => formatter.write_str("no peer left to ask"),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
             Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
             Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
@@ -414,7 +417,8 @@ impl std::error::Error for SyncError {
             | Self::UnstableTip
             | Self::Fork
             | Self::InvalidMempool
-            | Self::InvalidAccount => None,
+            | Self::InvalidAccount
+            | Self::NoPeer => None,
         }
     }
 }
@@ -996,6 +1000,122 @@ impl SyncClient {
     }
 }
 
+/// Where bulk history comes from: several peers, asked in turn.
+///
+/// Rebuilding tens of thousands of blocks from a checkpoint used to run every
+/// request through the one client the follow loop had chosen. That makes one
+/// service's rate limit the speed of catching up, which is precisely what joining
+/// the peer network is meant to remove — `nano-p2p` hands back six mainnet
+/// endpoints found by asking the network, and a tenure can come from any of them.
+///
+/// Three properties, and they are the same three that make a peer set worth having
+/// at all:
+///
+/// * **Consecutive tenures go to different peers.** A descent of two thousand
+///   tenures is two thousand requests, and sending them all to whichever peer
+///   sorted first is a pool in name only.
+/// * **A throttle moves the work, it does not stop it.** A peer that rate-limits is
+///   doing its job; it is set aside for the rest of the round and the tenure is
+///   asked of somebody else. Only when *every* peer has throttled does the round
+///   report itself rate limited, which is the signal that means "wait", and by then
+///   waiting is genuinely the only option.
+/// * **A peer that cannot serve a tenure is not a failed round.** The next peer is
+///   asked before an error is raised, so one peer missing one tenure — a fork it
+///   never saw, history it has pruned — costs a request rather than the descent.
+///
+/// What it deliberately does *not* do is decide anything. Every block it returns
+/// still goes through staging and the same authenticated execution path, so which
+/// peer a block came from cannot change whether it is accepted.
+#[derive(Debug)]
+pub struct TenureSource {
+    peers: Vec<SyncClient>,
+    /// Which peer the next tenure goes to.
+    next: usize,
+    /// Peers that have rate-limited since the round began.
+    throttled: BTreeSet<usize>,
+}
+
+impl TenureSource {
+    /// Fetch bulk history from these peers, in this order to begin with.
+    #[must_use]
+    pub const fn new(peers: Vec<SyncClient>) -> Self {
+        Self {
+            peers,
+            next: 0,
+            throttled: BTreeSet::new(),
+        }
+    }
+
+    /// One peer, which is what a node with a single configured peer still has.
+    #[must_use]
+    pub fn only(peer: SyncClient) -> Self {
+        Self::new(vec![peer])
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Whether every peer has rate-limited, so there is nobody left to ask.
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.peers.is_empty() || self.throttled.len() >= self.peers.len()
+    }
+
+    /// Put a peer at the front of the queue, if it is in the pool.
+    ///
+    /// Used to honour what an inventory said: a peer that claims the cycle being
+    /// walked is a better first guess than one that does not, and the inventory
+    /// exists to avoid the round trip that finds out the hard way.
+    pub fn prefer(&mut self, endpoints: &[String]) {
+        // Stable, so peers the inventory said nothing about keep their order rather
+        // than being shuffled by whichever claim arrived first.
+        let preferred: BTreeSet<&String> = endpoints.iter().collect();
+        self.peers.sort_by_key(|peer| {
+            u8::from(!preferred.contains(&peer.base_url().to_string()))
+        });
+        self.next = 0;
+        self.throttled.clear();
+    }
+
+    /// Fetch one tenure, from whichever peer is next and willing.
+    pub async fn blocks_of_tenure(
+        &mut self,
+        tip: StacksBlockId,
+    ) -> Result<Vec<NakamotoBlock>, SyncError> {
+        let mut last = None;
+        for offset in 0..self.peers.len() {
+            let index = (self.next + offset) % self.peers.len();
+            if self.throttled.contains(&index) {
+                continue;
+            }
+            let Some(peer) = self.peers.get(index) else {
+                continue;
+            };
+            match peer.blocks_of_tenure(tip).await {
+                Ok(blocks) => {
+                    // Start the next tenure at the peer *after* this one, so the work
+                    // walks around the pool instead of settling on one member.
+                    self.next = index + 1;
+                    return Ok(blocks);
+                }
+                Err(error) if error.is_rate_limited() => {
+                    self.throttled.insert(index);
+                    last = Some(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(SyncError::NoPeer))
+    }
+}
+
 /// Several peers, and which of them have proved unreliable.
 ///
 /// A node with one peer follows whatever that peer says: the peer decides both
@@ -1158,6 +1278,13 @@ impl PeerPool {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The clients themselves, for a caller that wants to spread work over them
+    /// rather than pick one — [`TenureSource`] is what does that.
+    #[must_use]
+    pub fn into_clients(self) -> Vec<SyncClient> {
+        self.peers
     }
 
     /// Which peer to catch up from this round.

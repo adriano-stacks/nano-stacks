@@ -113,6 +113,17 @@ pub(crate) fn answer_request<S: Service + ?Sized>(
 pub struct InboundLimits {
     /// How long to wait on any single read or write.
     pub timeout: Duration,
+    /// How long a conversation may be silent before it is closed.
+    ///
+    /// Distinct from `timeout`, and the distinction was a real bug: closing at the
+    /// read deadline meant nano hung up on any stock node that had nothing to say for
+    /// thirty seconds, which is *most of the time* — stacks-core advertises a 3600
+    /// second heartbeat and pings on it. A node that drops its inbound peers twice a
+    /// minute is not a peer anyone keeps.
+    ///
+    /// Bounded all the same, because a silently dead socket would otherwise hold one
+    /// of `MAX_INBOUND_PEERS` slots forever.
+    pub idle: Duration,
     /// How many messages one conversation may carry before it is closed. A peer
     /// that wants to keep talking reconnects, which costs it a handshake.
     pub max_messages: u64,
@@ -122,6 +133,7 @@ impl Default for InboundLimits {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            idle: Duration::from_mins(15),
             max_messages: 4096,
         }
     }
@@ -188,7 +200,7 @@ pub async fn serve_peer<S: Service + ?Sized>(
     let mut served = Served::default();
     let ours = local.private_key.public_key();
     for _ in 0..limits.max_messages {
-        let message = match framed.read().await {
+        let message = match framed.read_idle(limits.idle).await {
             Ok(message) => message,
             // A peer that closes cleanly is not a peer that did anything wrong,
             // and treating a hang-up as a fault is how an honest neighbour ends up

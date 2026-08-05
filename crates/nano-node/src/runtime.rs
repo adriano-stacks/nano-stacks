@@ -15,7 +15,7 @@ use nano_chainstate::{
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_p2p::Discovered;
-use nano_sync::{Node, PeerPool, PoxInfo, SyncClient, SyncError};
+use nano_sync::{Node, PeerPool, PoxInfo, SyncClient, SyncError, TenureSource};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
 use crate::{
@@ -142,6 +142,9 @@ impl Drop for Phase {
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&config.node.working_dir)?;
     let mut roles: JoinSet<(Job, Role)> = JoinSet::new();
+    // Written by the follow loop once there is a chain to describe, and read by the
+    // discovery loop that starts before there is one.
+    let advertised = Advertised::default();
     // The p2p transport comes up first, because its whole point is to be a way in
     // that does not depend on a configured HTTP peer. It needs the chain identifier
     // up front — on this protocol the network id *is* the chain id and it is the
@@ -149,7 +152,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // to be discovered gets no transport, and falls back to what it always did.
     let phase = Phase::start("joining the peer network");
     let discovered = match config.network() {
-        Some(network) => start_transport(&config, network, None, &mut roles).await,
+        Some(network) => start_transport(&config, network, &advertised, &mut roles).await,
         None => None,
     };
     drop(phase);
@@ -240,6 +243,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             network,
             peer,
             discovered,
+            advertised,
             pox,
             source,
             state,
@@ -353,6 +357,74 @@ fn report_round(from: u64, round: CatchUpRound, tip: &NakamotoBlock) {
     }
 }
 
+/// Write down the ancestor headers this state is missing, once, at startup.
+///
+/// A state built before headers were kept has none, so the first block it executes
+/// cannot read the one it stands on.
+async fn backfill_ancestors(
+    executor: &SharedExecutor,
+    peer: &SyncClient,
+    pox: &PoxInfo,
+    source: [u8; 32],
+) {
+    let _phase = Phase::start("backfilling ancestor headers");
+    let mut executor = executor.lock().await;
+    match executor.backfill_headers(peer, pox, source).await {
+        Ok(0) => {}
+        Ok(recorded) => println!("wrote down {recorded} headers this state was missing"),
+        Err(error) => eprintln!("writing down the missing headers failed: {error}"),
+    }
+}
+
+/// What one round of execution left behind for the loop around it.
+struct ExecutedRound {
+    sealed: nano_rpc::SealedTip,
+    executed_height: u64,
+    peer_failed: bool,
+}
+
+/// Run one catch-up round, and publish what it makes this node able to say.
+///
+/// Extracted from the follow loop because it is the only part that holds the
+/// executor lock, and holding a lock is worth being able to see the boundary of.
+async fn execute_round(
+    executor: &SharedExecutor,
+    peer: &SyncClient,
+    history: &mut TenureSource,
+    pox: &PoxInfo,
+    staging: &Staging,
+    budget: CatchUpBudget,
+    advertised: &Advertised,
+) -> ExecutedRound {
+    let mut executor = executor.lock().await;
+    let mut peer_failed = false;
+    let from = executor.tip().header.chain_length;
+    match executor.catch_up(peer, history, pox, staging, budget).await {
+        Ok(round) => report_round(from, round, executor.tip()),
+        // A round that stops partway has still sealed everything up to where it
+        // stopped, and that is what has to be recorded: reporting only successful
+        // rounds left a node that had executed eighty-three blocks claiming
+        // twenty-two, and left its accounting behind its own chain.
+        Err(error) => {
+            eprintln!("executing the peer's chain failed: {error}");
+            backfill_missing_header(&mut executor, peer, &error.to_string()).await;
+            peer_failed = true;
+        }
+    }
+    // What this node tells its peers about itself, now that there is a chain to
+    // describe: the discovery loop starts before there is one and advertises a
+    // deliberately old view until this runs.
+    advertised.publish(LocalAnnouncement {
+        bitcoin_height: executor.bitcoin_height(),
+        cycle_start: executor.cycle_start_consensus_hash(pox),
+    });
+    ExecutedRound {
+        sealed: sealed_tip(executor.tip(), executor.bitcoin_height()),
+        executed_height: executor.tip().header.chain_length,
+        peer_failed,
+    }
+}
+
 /// Everything the following role runs on, as one value for the same reason the
 /// miner's is: the loop needs the peer, the chain, the served state and the
 /// blocks the API admitted, and a list of eight arguments hides which is which.
@@ -363,6 +435,10 @@ struct Follower {
     /// The peers p2p discovery found, which this loop re-weighs alongside the
     /// configured ones. `None` when the transport is off.
     discovered: Option<Discovered>,
+    /// Where to publish what this node tells its peers about itself. The discovery
+    /// loop starts before there is a chain to describe, so this is how it eventually
+    /// gets one.
+    advertised: Advertised,
     pox: PoxInfo,
     source: [u8; 32],
     state: Option<RpcState>,
@@ -378,6 +454,7 @@ async fn follow(follower: Follower) -> Role {
         network,
         peer,
         discovered,
+        advertised,
         pox,
         source,
         state,
@@ -408,16 +485,8 @@ async fn follow(follower: Follower) -> Role {
         drop(phase);
     }
 
-    // A state built before headers were kept has none, so the first block it
-    // executes cannot read the one it stands on. Written down once, at startup.
     if let Some(executor) = executor.as_ref() {
-        let _phase = Phase::start("backfilling ancestor headers");
-        let mut executor = executor.lock().await;
-        match executor.backfill_headers(&peer, &pox, source).await {
-            Ok(0) => {}
-            Ok(recorded) => println!("wrote down {recorded} headers this state was missing"),
-            Err(error) => eprintln!("writing down the missing headers failed: {error}"),
-        }
+        backfill_ancestors(executor, &peer, &pox, source).await;
     }
     let mut peer_height = u64::MAX;
     let mut executed_height = 0;
@@ -431,7 +500,12 @@ async fn follow(follower: Follower) -> Role {
     let mut node = Node::new(peer.clone());
     let mut rounds_on_this_peer = 0_u32;
     let mut peer_failed = false;
+    // Bulk history comes from every peer known, which is not the same question as
+    // which peer this round *follows*: following is a fork choice and has to land on
+    // one answer, while fetching history is work to be spread.
+    let mut history = BulkHistory::new(peer.clone());
     loop {
+        history.refresh(&config, discovered.as_ref());
         // Re-weigh on a timer, or immediately after the current peer let a round
         // down. Every round would be two requests per peer per second for an answer
         // that moves on the order of a tenure; never would be the single-peer node
@@ -464,25 +538,19 @@ async fn follow(follower: Follower) -> Role {
         )
         .await;
         if let Some(executor) = executor.as_ref() {
-            let sealed = {
-                let mut executor = executor.lock().await;
-                let from = executor.tip().header.chain_length;
-                match executor.catch_up(&peer, &pox, &staging, budget).await {
-                    Ok(round) => report_round(from, round, executor.tip()),
-                    // A round that stops partway has still sealed everything up
-                    // to where it stopped, and that is what has to be recorded:
-                    // reporting only successful rounds left a node that had
-                    // executed eighty-three blocks claiming twenty-two, and
-                    // left its accounting behind its own chain.
-                    Err(error) => {
-                        eprintln!("executing the peer's chain failed: {error}");
-                        backfill_missing_header(&mut executor, &peer, &error.to_string()).await;
-                        peer_failed = true;
-                    }
-                }
-                executed_height = executor.tip().header.chain_length;
-                sealed_tip(executor.tip(), executor.bitcoin_height())
-            };
+            let round = execute_round(
+                executor,
+                &peer,
+                &mut history.source,
+                &pox,
+                &staging,
+                budget,
+                &advertised,
+            )
+            .await;
+            executed_height = round.executed_height;
+            peer_failed |= round.peer_failed;
+            let sealed = round.sealed;
             if let Some(state) = state.as_ref() {
                 state.publish_executed(sealed).await;
                 publish_reward_cycle(
@@ -1363,13 +1431,74 @@ async fn reachable_peer(
 /// ones after, de-duplicated, because the same node can be both. A pool of one is
 /// still a pool — it just cannot protect against that one.
 fn follow_pool(config: &Config, discovered: Option<&Discovered>) -> PeerPool {
+    PeerPool::from_endpoints(&follow_endpoints(config, discovered))
+}
+
+fn follow_endpoints(config: &Config, discovered: Option<&Discovered>) -> Vec<String> {
     let mut endpoints = config.node.peers.clone();
     for endpoint in discovered.map(Discovered::endpoints).unwrap_or_default() {
         if !endpoints.contains(&endpoint) {
             endpoints.push(endpoint);
         }
     }
-    PeerPool::from_endpoints(&endpoints)
+    endpoints
+}
+
+/// Where this round fetches bulk history from.
+///
+/// The work list, rather than one client: `catch_up`'s descent asks for a tenure at
+/// a time, and on mainnet from the checkpoint that is tens of thousands of blocks.
+/// Sent down one connection to a hosted API, the rate limit *is* the catch-up speed
+/// — which is the thing joining the peer network was for, and which stayed true for
+/// two slices after the transport landed because nothing changed who the descent
+/// asked.
+///
+/// Rebuilt when the endpoint list changes rather than every round, so a peer set that
+/// has not moved keeps the position it had walked to and the throttles it had learned.
+struct BulkHistory {
+    source: TenureSource,
+    endpoints: Vec<String>,
+    claiming: Vec<String>,
+}
+
+impl BulkHistory {
+    fn new(peer: SyncClient) -> Self {
+        Self {
+            source: TenureSource::only(peer),
+            endpoints: Vec::new(),
+            claiming: Vec::new(),
+        }
+    }
+
+    /// Take account of what discovery has learned since the last round.
+    ///
+    /// Both halves are guarded on the thing having *changed*, because rebuilding the
+    /// source or reordering it discards the position the round-robin had walked to and
+    /// the throttles it had learned — so doing it every round would leave the descent
+    /// asking the same first peer forever.
+    fn refresh(&mut self, config: &Config, discovered: Option<&Discovered>) {
+        let endpoints = follow_endpoints(config, discovered);
+        let rebuilt = PeerPool::from_endpoints(&endpoints);
+        if endpoints != self.endpoints && !rebuilt.is_empty() {
+            println!(
+                "fetching history from {} peers: {}",
+                rebuilt.len(),
+                rebuilt.endpoints().join(", ")
+            );
+            self.source = TenureSource::new(rebuilt.into_clients());
+            self.endpoints = endpoints;
+            // A fresh source has no order to preserve, so the shortlist applies again.
+            self.claiming.clear();
+        }
+        // Ask the peers the inventory says hold this cycle first. A peer that claims
+        // none of it has nothing to serve, and finding that out by asking it for a
+        // tenure is the round trip an inventory exists to avoid.
+        let claiming = discovered.map(Discovered::claiming).unwrap_or_default();
+        if !claiming.is_empty() && claiming != self.claiming {
+            self.source.prefer(&claiming);
+            self.claiming = claiming;
+        }
+    }
 }
 
 /// Re-weigh the peers and hand back a better one, if there is one.
@@ -1459,9 +1588,9 @@ async fn track_peer(
 /// contradicted, and stacks-core reads not-contradictable as merely stale. A node
 /// with no executed chain yet advertises exactly that and gets in, which is what
 /// lets discovery run before there is a chain to describe.
-async fn advertised_view(
+fn advertised_view(
     bitcoin: &BurnchainSource,
-    executor: Option<&SharedExecutor>,
+    published: Option<LocalAnnouncement>,
 ) -> nano_p2p::ChainView {
     let stale = || {
         nano_p2p::ChainView::new(
@@ -1471,10 +1600,9 @@ async fn advertised_view(
         )
         .expect("a height above the confirmation window")
     };
-    let Some(executor) = executor else {
+    let Some(height) = published.map(|announced| announced.bitcoin_height) else {
         return stale();
     };
-    let height = executor.lock().await.bitcoin_height();
     let Some(settled) = height.checked_sub(nano_p2p::STABLE_CONFIRMATIONS) else {
         return stale();
     };
@@ -1490,6 +1618,46 @@ async fn advertised_view(
         nano_primitives::BitcoinHeaderHash::from_bytes(stable_hash),
     )
     .unwrap_or_else(stale)
+}
+
+/// What this node tells its peers about itself, written by the loop that knows it.
+///
+/// The transport comes up *before* there is a chainstate — that is its whole point,
+/// since it is the way in that does not depend on a configured HTTP peer — so the
+/// discovery loop cannot read an executor that is built after it. This is the handle
+/// the follow loop writes each round and discovery reads: how far this node's own
+/// burnchain view has got, and which reward cycle to ask peers' inventories about.
+///
+/// Both are *this node's* answers. A preamble view is a gossip hint, but repeating a
+/// peer's claim back at the network is how a hint becomes a consensus input, and a
+/// cycle identifier taken from a peer would make its view of the burnchain the thing
+/// nano's own requests are keyed on.
+#[derive(Clone, Default)]
+pub struct Advertised {
+    inner: Arc<std::sync::Mutex<Option<LocalAnnouncement>>>,
+}
+
+/// What the follow loop knows and the discovery loop needs.
+#[derive(Clone, Copy, Debug)]
+struct LocalAnnouncement {
+    /// The Bitcoin height the sealed tip was executed under.
+    bitcoin_height: u64,
+    /// The consensus hash naming the reward cycle being walked, when derivable.
+    cycle_start: Option<nano_primitives::ConsensusHash>,
+}
+
+impl Advertised {
+    fn publish(&self, announcement: LocalAnnouncement) {
+        if let Ok(mut held) = self.inner.lock() {
+            *held = Some(announcement);
+        }
+    }
+
+    fn read(&self) -> Option<LocalAnnouncement> {
+        // A poisoned lock means a panic while publishing a height, which is not a
+        // reason to stop talking to peers: the stale view below is a correct answer.
+        self.inner.lock().ok().and_then(|held| *held)
+    }
 }
 
 /// This node's p2p identity, which has to survive a restart.
@@ -1535,7 +1703,7 @@ fn p2p_identity(working_dir: &Path) -> Result<nano_crypto::StacksPrivateKey, Box
 async fn start_transport(
     config: &Config,
     network: Network,
-    executor: Option<&SharedExecutor>,
+    advertised: &Advertised,
     roles: &mut JoinSet<(Job, Role)>,
 ) -> Option<Discovered> {
     let seeds = config.node.bootstrap_seeds();
@@ -1595,7 +1763,7 @@ async fn start_transport(
         }
     };
     let round = swarm
-        .maintain(advertised_view(&bitcoin, executor).await)
+        .maintain(advertised_view(&bitcoin, advertised.read()), None)
         .await;
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
@@ -1605,9 +1773,12 @@ async fn start_transport(
     );
 
     let interval = Duration::from_secs(config.node.poll_interval_secs.max(1) * 10);
-    let held = executor.cloned();
+    let advertised = advertised.clone();
     roles.spawn(async move {
-        (Job::Peers, peer_discovery(swarm, bitcoin, held, interval).await)
+        (
+            Job::Peers,
+            peer_discovery(swarm, bitcoin, advertised, interval).await,
+        )
     });
 
     if let Some(bind) = bind {
@@ -1620,17 +1791,27 @@ async fn start_transport(
 async fn peer_discovery(
     mut swarm: nano_p2p::Swarm,
     bitcoin: BurnchainSource,
-    executor: Option<SharedExecutor>,
+    advertised: Advertised,
     interval: Duration,
 ) -> Role {
     loop {
         sleep(interval).await;
-        let view = advertised_view(&bitcoin, executor.as_ref()).await;
-        let round = swarm.maintain(view).await;
+        let published = advertised.read();
+        let view = advertised_view(&bitcoin, published);
+        // `None` before there is a chain to name a cycle, and a peer is then not
+        // asked at all rather than asked about a guess.
+        let cycle_start = published.and_then(|announced| announced.cycle_start);
+        let round = swarm.maintain(view, cycle_start).await;
         if round.dialled > 0 || round.dropped > 0 || round.isolated > 0 {
             println!(
-                "p2p: {} connected ({} new, {} lost, {} isolated), {} addresses learned",
-                round.connected, round.dialled, round.dropped, round.isolated, round.learned
+                "p2p: {} connected ({} new, {} lost, {} isolated), {} addresses learned, \
+                 {} claiming this cycle",
+                round.connected,
+                round.dialled,
+                round.dropped,
+                round.isolated,
+                round.learned,
+                round.claiming,
             );
         }
         // Everything peers said unprompted. The count used to be reported as

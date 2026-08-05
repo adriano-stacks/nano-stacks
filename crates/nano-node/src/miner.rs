@@ -21,6 +21,7 @@ use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use std::sync::Arc;
 
 use nano_mempool::Mempool;
+use nano_sync::TenureSource;
 use tokio::sync::Mutex;
 use nano_miner::{
     BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError, RegisteredLeaderKey,
@@ -130,10 +131,13 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         fetch: runtime::ROUND_FETCH,
         execute: state.config.node.max_sync_blocks,
     };
+    // A miner follows the peer it was configured with: it is close to the tip by
+    // definition, so bulk history over a pool buys it nothing.
+    let mut history = TenureSource::only(state.peer.clone());
     loop {
         let mut executor = executor.lock().await;
         if let Err(error) = executor
-            .catch_up(&state.peer, &state.pox, &staging, budget)
+            .catch_up(&state.peer, &mut history, &state.pox, &staging, budget)
             .await
         {
             eprintln!("following the peer failed: {error}");
