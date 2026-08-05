@@ -24,6 +24,7 @@ mod as_contract_sender;
 mod block_authentication;
 mod block_height_keyword;
 mod coinbase_schedule;
+mod engine_failure;
 mod engine_state_roots;
 mod event_delivery;
 mod event_observer;
