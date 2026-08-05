@@ -167,6 +167,22 @@ pub struct BlockHeader {
     pub tenure_start_height: u32,
 }
 
+/// Everything an accepted block makes durable outside the MARF.
+///
+/// The two travel together because they land in one side-store transaction, and
+/// that transaction runs *before* the MARF commit. The MARF's own commit is
+/// therefore the only decision point: a block is in the MARF only if everything
+/// describing it is already on disk. A crash between the two leaves rows for a
+/// block the MARF never got, and nothing can read them, because the only way to
+/// reach them is to stand on that block.
+#[derive(Clone, Debug)]
+pub struct BlockCommit {
+    /// What Clarity may read about the block.
+    pub header: BlockHeader,
+    /// The state its caller keeps beside the MARF, opaque here.
+    pub ledger: Vec<u8>,
+}
+
 /// Everything outside the MARF that Clarity may read.
 ///
 /// The burn state and the block headers travel together because Clarity reads
@@ -411,6 +427,30 @@ impl BitcoinContext {
         decode_block_header(&bytes?)
     }
 
+    /// The Bitcoin block at a burn height, from memory or from the store.
+    ///
+    /// The store is consulted because this map is memory: a restart that
+    /// answered only from what it had re-seeded would answer `none` where the
+    /// run before it answered a hash, and an sBTC withdrawal naming a burn block
+    /// deeper than the re-seeded window would be rejected on a chain that
+    /// accepted it.
+    fn burn_header(&self, height: u32) -> Option<[u8; 32]> {
+        if let Some(hash) = self.burn_headers.get(&height) {
+            return Some(*hash);
+        }
+        let hash: Option<Vec<u8>> = {
+            let guard = self.headers_db.as_ref()?.lock().ok()?;
+            guard
+                .query_row(
+                    "SELECT hash FROM burn_header WHERE height = ?1",
+                    params![height],
+                    |row| row.get(0),
+                )
+                .ok()
+        };
+        <[u8; 32]>::try_from(hash?.as_slice()).ok()
+    }
+
     /// Blocks a contract asked about whose headers this node does not hold.
     pub(crate) fn take_missing_headers(&self) -> Vec<[u8; 32]> {
         self.missing_headers
@@ -593,7 +633,7 @@ impl BurnStateDB for BitcoinContext {
         // A burn block Clarity cannot be told about is a withdrawal this node
         // rejects and the network accepted, so it is worth being able to see
         // what every lookup answered.
-        let found = self.burn_headers.get(&height).copied();
+        let found = self.burn_header(height);
         if std::env::var_os("NANO_TRACE_BURN_HEADERS").is_some() {
             println!(
                 "burn header {height} -> {}",
@@ -830,7 +870,28 @@ impl Vm {
         self.context.header(&StacksBlockId(*block))
     }
 
-    pub fn record_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
+    /// Write a header down for a block this node is not sealing.
+    ///
+    /// The failure is returned rather than printed: a header a later block reads
+    /// through is not optional, and a caller that cannot write one has to stop
+    /// rather than carry on answering `none` where the chain has an answer.
+    pub fn record_block_header(
+        &mut self,
+        block: [u8; 32],
+        header: BlockHeader,
+    ) -> Result<(), MarfStoreError> {
+        self.store.write_block_header(block, &header)?;
+        self.remember_block_header(block, header);
+        Ok(())
+    }
+
+    /// Keep in memory what a written-down header answers.
+    ///
+    /// `tenure_starts` is first-write-wins, which is why this is separate: for a
+    /// block being sealed it must not run until the MARF has committed, or a
+    /// block that failed to seal would fix its tenure's start height for every
+    /// later block.
+    fn remember_block_header(&mut self, block: [u8; 32], header: BlockHeader) {
         self.context
             .tenure_starts
             .entry(header.tenure_height)
@@ -838,12 +899,45 @@ impl Vm {
         self.context
             .burn_headers
             .insert(header.burn_block_height, header.burn_header_hash);
-        // Written down as well as remembered: a contract may ask about any
-        // ancestor, and a restart has to answer what the run before it did.
-        if let Err(error) = self.store.write_block_header(block, &header) {
-            eprintln!("recording the header of {} failed: {error}", hex::encode(block));
-        }
         self.context.headers.insert(block, header);
+    }
+
+    /// Seal a block together with everything that describes it.
+    ///
+    /// One call because there is one commit: the header, the caller's ledger and
+    /// the block's Clarity metadata are written in a single side-store
+    /// transaction and the MARF commit follows, so no sealed root can be missing
+    /// any of them. Before this they were four writes in four transactions, and
+    /// a crash between any two left a state nothing could reconcile.
+    pub fn commit_block(
+        &mut self,
+        block: [u8; 32],
+        commit: &BlockCommit,
+    ) -> Result<StateRoot, MarfStoreError> {
+        let root = self.store.commit_to(block, commit)?;
+        self.remember_block_header(block, commit.header);
+        Ok(root)
+    }
+
+    /// The state the run that sealed this block kept beside the MARF.
+    #[must_use]
+    pub fn recorded_ledger(&self, block: [u8; 32]) -> Option<Vec<u8>> {
+        self.store.ledger_at(block)
+    }
+
+    /// Put back the tenure-start answers an earlier run recorded.
+    ///
+    /// `get-tenure-info?` reads these, and they live in memory, so a restart
+    /// without them reports the first block it executes as its tenure's start.
+    /// First-write-wins as everywhere else, so this cannot overwrite an answer
+    /// the current run has already given.
+    pub fn restore_tenure_starts(&mut self, starts: impl IntoIterator<Item = (u32, u32)>) {
+        for (tenure_height, stacks_height) in starts {
+            self.context
+                .tenure_starts
+                .entry(tenure_height)
+                .or_insert(stacks_height);
+        }
     }
 
     /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.
@@ -1006,16 +1100,28 @@ impl Vm {
     /// has executed under, and a node that started at a checkpoint has none from
     /// before it. sBTC's withdrawal path checks a sweep's Bitcoin block that
     /// way, so an unanswered height rejects a withdrawal the network accepted.
-    pub fn record_burn_header(&mut self, height: u64, hash: [u8; 32]) {
+    /// Make a burn block's header hash readable from Clarity, now and after a
+    /// restart.
+    ///
+    /// Written outside any block's commit because it is a fact about Bitcoin
+    /// rather than about a Stacks block: it is true before the block that reads
+    /// it exists, and re-reading it costs a Bitcoin block download.
+    pub fn record_burn_header(
+        &mut self,
+        height: u64,
+        hash: [u8; 32],
+    ) -> Result<(), MarfStoreError> {
         if let Ok(height) = u32::try_from(height) {
             self.context.burn_headers.insert(height, hash);
+            self.store.write_burn_header(height, hash)?;
         }
+        Ok(())
     }
 
     /// Whether Clarity can already answer for this burn block.
     #[must_use]
     pub fn knows_burn_header(&self, height: u64) -> bool {
-        u32::try_from(height).is_ok_and(|height| self.context.burn_headers.contains_key(&height))
+        u32::try_from(height).is_ok_and(|height| self.context.burn_header(height).is_some())
     }
 
     pub fn execute_contract_call_outcome(
@@ -1506,6 +1612,44 @@ impl MarfStore {
         Ok(())
     }
 
+    /// Keep the Bitcoin block at a burn height.
+    fn write_burn_header(&self, height: u32, hash: [u8; 32]) -> Result<(), MarfStoreError> {
+        // Replaced rather than ignored: a Bitcoin reorganization gives a height
+        // a different block, and the memory this mirrors overwrites too.
+        self.side_store
+            .prepare_cached("INSERT OR REPLACE INTO burn_header (height, hash) VALUES (?1, ?2)")?
+            .execute(params![height, hash.as_slice()])?;
+        Ok(())
+    }
+
+    /// Keep the state its caller holds beside the MARF, as of this block.
+    fn write_ledger(&self, block: [u8; 32], ledger: &[u8]) -> Result<(), MarfStoreError> {
+        self.side_store
+            .prepare_cached(
+                "INSERT OR REPLACE INTO chain_ledger (block_id, sequence, data) \
+                 VALUES (?1, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM chain_ledger), ?2)",
+            )?
+            .execute(params![block.as_slice(), ledger])?;
+        self.side_store
+            .prepare_cached(
+                "DELETE FROM chain_ledger \
+                 WHERE sequence <= (SELECT MAX(sequence) FROM chain_ledger) - ?1",
+            )?
+            .execute(params![LEDGER_HISTORY])?;
+        Ok(())
+    }
+
+    /// The state the run that sealed this block kept beside the MARF.
+    #[must_use]
+    pub fn ledger_at(&self, block: [u8; 32]) -> Option<Vec<u8>> {
+        self.side_store
+            .prepare_cached("SELECT data FROM chain_ledger WHERE block_id = ?1")
+            .ok()?
+            .query_row(params![block.as_slice()], |row| row.get(0))
+            .optional()
+            .ok()?
+    }
+
     /// Where this store keeps what is not in the trie, when it is on disk.
     fn side_store_path(&self) -> Option<std::path::PathBuf> {
         self.side_store.path().map(std::path::PathBuf::from)
@@ -1636,11 +1780,73 @@ impl MarfStore {
         Ok(StateRoot(*root.as_bytes()))
     }
 
+    /// Seal the active state under `block`, with everything that describes it.
+    ///
+    /// Two durability boundaries, in this order and no other: one side-store
+    /// transaction carrying the block's Clarity metadata, its header and its
+    /// caller's ledger, and then the MARF's own commit. The MARF commit is last
+    /// and atomic, so it *is* the decision: the block exists exactly when
+    /// everything beside it is already durable. A crash in between leaves rows
+    /// for a block the MARF never got, which nothing can reach, because reaching
+    /// them means standing on that block.
+    pub fn commit_to(
+        &mut self,
+        block: [u8; 32],
+        commit: &BlockCommit,
+    ) -> Result<StateRoot, MarfStoreError> {
+        if self.transaction.is_some() {
+            return Err(MarfStoreError::TransactionInProgress);
+        }
+        if self.active.is_none() {
+            return Err(MarfStoreError::NoActiveState);
+        }
+        self.prepare_commit(block, commit)?;
+        // A failure here must leave the active state intact so the caller can
+        // still abort it.
+        let root = self.marf.seal_to(block)?;
+        self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.metadata.clear();
+        self.read_block = Some(block);
+        Ok(StateRoot(*root.as_bytes()))
+    }
+
+    /// Write everything the block owns outside the MARF, in one transaction.
+    ///
+    /// Committed with `synchronous = FULL`, for this one transaction only. The
+    /// ordering between the two stores is only an ordering on disk if this half
+    /// reaches it first: at the store's usual `NORMAL` a power cut could keep the
+    /// MARF commit and lose the ledger row, which is exactly the sealed root with
+    /// a ledger a block behind that committing them in this order prevents. One
+    /// fsync per block buys it — left switched on, every Clarity value write, each
+    /// its own autocommit and thousands to a block, would fsync too.
+    fn prepare_commit(&self, block: [u8; 32], commit: &BlockCommit) -> Result<(), MarfStoreError> {
+        let prepared = (|| -> Result<(), MarfStoreError> {
+            self.side_store.execute_batch("PRAGMA synchronous = FULL")?;
+            let transaction = self.side_store.unchecked_transaction()?;
+            self.write_metadata(block)?;
+            self.write_block_header(block, &commit.header)?;
+            self.write_ledger(block, &commit.ledger)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let restored = self.side_store.execute_batch("PRAGMA synchronous = NORMAL");
+        prepared?;
+        restored?;
+        Ok(())
+    }
+
     /// Move the block's Clarity metadata into the side store, keyed by the
     /// block that defined it, which is how a later block finds it again.
     fn flush_metadata(&mut self, block: [u8; 32]) -> Result<(), MarfStoreError> {
-        let blockhash = block_hex(block);
         let transaction = self.side_store.unchecked_transaction()?;
+        self.write_metadata(block)?;
+        transaction.commit()?;
+        self.metadata.clear();
+        Ok(())
+    }
+
+    fn write_metadata(&self, block: [u8; 32]) -> Result<(), MarfStoreError> {
+        let blockhash = block_hex(block);
         for ((contract, key), value) in &self.metadata {
             self.side_store
                 .prepare_cached(
@@ -1653,8 +1859,6 @@ impl MarfStore {
                     value
                 ])?;
         }
-        transaction.commit()?;
-        self.metadata.clear();
         Ok(())
     }
 
@@ -1796,7 +2000,33 @@ CREATE TABLE IF NOT EXISTS block_header (
     block_id BLOB PRIMARY KEY,
     data BLOB NOT NULL
 ) WITHOUT ROWID;
+-- The state a node keeps beside the MARF, as of the block that sealed it:
+-- tenure accounting, tenure start heights, the executed suffix a reorganization
+-- walks back over, the previous tenure's VRF proof. Written in the same
+-- transaction as that block's header and metadata, and before the MARF commit.
+--
+-- A history rather than one row, because a restart may find its tip is no longer
+-- on the chain and walk back to an ancestor the network still has: the ledger it
+-- then stands on has to be the one that ancestor sealed.
+CREATE TABLE IF NOT EXISTS chain_ledger (
+    block_id BLOB PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    data BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS chain_ledger_sequence ON chain_ledger(sequence);
+-- The Bitcoin block at each burn height. A fact about Bitcoin, not about any
+-- Stacks block, so it is written as it is learned rather than with a seal.
+CREATE TABLE IF NOT EXISTS burn_header (
+    height INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL
+) WITHOUT ROWID;
 ";
+
+/// How many blocks of ledger history the side store keeps.
+///
+/// `nano-node` looks this far back for a tip the network still has, so a walk
+/// that goes further has nothing to stand on anyway.
+const LEDGER_HISTORY: u32 = 256;
 
 fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open_in_memory()?;
@@ -3281,7 +3511,7 @@ mod tests {
     use clarity::vm::{ClarityVersion, Value};
     use nano_primitives::{Network, TrieHash};
 
-    use super::BlockHeader;
+    use super::{BlockCommit, BlockHeader};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -3363,11 +3593,13 @@ mod tests {
             PrincipalData::parse("ST000000000000000000002AMW42H").expect("valid principal");
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [1; 32]).expect("begin checkpoint");
-        vm.record_block_header([1; 32], BlockHeader::default());
+        vm.record_block_header([1; 32], BlockHeader::default())
+            .expect("record a header");
         vm.seal_block().expect("seal checkpoint");
         vm.begin_block(Some([1; 32]), [2; 32])
             .expect("begin successor");
-        vm.record_block_header([2; 32], BlockHeader::default());
+        vm.record_block_header([2; 32], BlockHeader::default())
+            .expect("record a header");
         vm.credit_stx(&principal, 42).expect("credit STX");
 
         let value = read_through_a_contract(
@@ -3452,7 +3684,8 @@ mod tests {
 
         {
             let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("open");
-            vm.record_block_header([7; 32], header);
+            vm.record_block_header([7; 32], header)
+                .expect("record a header");
         }
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
@@ -3517,6 +3750,92 @@ mod tests {
         assert_eq!(compiled, cached);
         assert_eq!(compiled, recompiled);
         assert!(count() > 0, "a deleted cache is written again");
+    }
+
+    /// A block is sealed with its header and its caller's ledger, or with none of
+    /// them.
+    #[test]
+    fn a_committed_block_carries_its_header_and_ledger_across_a_restart() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let header = BlockHeader {
+            burn_block_height: 960_240,
+            tenure_height: 251_400,
+            tenure_start_height: 8_665_700,
+            ..BlockHeader::default()
+        };
+        {
+            let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("open");
+            vm.begin_block(None, [1; 32]).expect("begin");
+            vm.commit_block(
+                [1; 32],
+                &BlockCommit {
+                    header,
+                    ledger: b"owed as of block one".to_vec(),
+                },
+            )
+            .expect("commit");
+        }
+
+        let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(vm.tip(), Some([1; 32]));
+        assert_eq!(vm.recorded_header([1; 32]), Some(header));
+        assert_eq!(
+            vm.recorded_ledger([1; 32]).as_deref(),
+            Some(b"owed as of block one".as_slice())
+        );
+    }
+
+    /// A crash between the two durability boundaries leaves the parent, whole.
+    ///
+    /// `prepare_commit` is everything a block writes outside the MARF; the MARF
+    /// commit follows and is what makes the block real. Stopping in between is the
+    /// one window a crash can land in, and this is that window: the prepared rows
+    /// are on disk and the block is not. A reopened store must stand on the
+    /// parent, with the parent's ledger — not on a block that never sealed, and
+    /// not on a tip whose ledger is a block behind.
+    #[test]
+    fn a_crash_between_the_two_boundaries_leaves_the_parent_and_its_ledger() {
+        let directory = tempfile::tempdir().expect("a directory");
+        {
+            let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("open");
+            store.begin(None, [1; 32]).expect("begin the parent");
+            store
+                .commit_to(
+                    [1; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the parent".to_vec(),
+                    },
+                )
+                .expect("commit the parent");
+
+            // The child, prepared and then abandoned where a SIGKILL would land.
+            store.begin(Some([1; 32]), [2; 32]).expect("begin the child");
+            store
+                .prepare_commit(
+                    [2; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the child".to_vec(),
+                    },
+                )
+                .expect("prepare the child");
+        }
+
+        let store = MarfStore::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(
+            store.tip(),
+            Some([1; 32]),
+            "the child never committed, so the parent is the tip"
+        );
+        assert_eq!(
+            store.ledger_at([1; 32]).as_deref(),
+            Some(b"as of the parent".as_slice()),
+            "and the ledger the reopened store stands on is the parent's"
+        );
+        // The child's rows are on disk and unreachable: nothing addresses them
+        // but the child, and the child is not in the MARF.
+        assert!(store.ledger_at([2; 32]).is_some());
     }
 
     /// The size at which a contract of trait calls stops compiling.
@@ -3707,7 +4026,8 @@ mod tests {
                 burn_block_height: 960_231,
                 ..BlockHeader::default()
             },
-        );
+        )
+        .expect("record a header");
         vm.begin_block(None, parent).expect("begin parent");
         vm.seal_block().expect("seal parent");
 
@@ -3718,7 +4038,8 @@ mod tests {
                 burn_block_height: 960_232,
                 ..BlockHeader::default()
             },
-        );
+        )
+        .expect("record a header");
         let mut context = super::BitcoinBlockContext::at_height(960_232);
         context.burn_header_hash = hash;
         vm.begin_block_with_bitcoin_context(Some(parent), [9; 32], context)

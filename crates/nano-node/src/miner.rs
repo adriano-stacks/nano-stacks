@@ -154,10 +154,6 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             eprintln!("advancing the tenure failed: {error}");
             state.tenure = None;
         }
-        runtime::persist_accounting(
-            &state.config.chainstate_dir(runtime::NODE_CHAINSTATE),
-            &mut executor,
-        )?;
         drop(executor);
         sleep(interval).await;
     }

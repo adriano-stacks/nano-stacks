@@ -1115,7 +1115,14 @@ where
                 continue;
             }
             match self.bitcoin.block_hash_at(height) {
-                Ok(hash) => self.chainstate.record_burn_header(height, hash),
+                Ok(hash) => {
+                    // Reported, not fatal: the header is in memory for this run
+                    // whether or not it reached disk, and a run that comes after
+                    // one that could not write it fetches it again.
+                    if let Err(error) = self.chainstate.record_burn_header(height, hash) {
+                        eprintln!("writing down the Bitcoin header at {height} failed: {error}");
+                    }
+                }
                 // Worth saying: a burn block Clarity cannot be told about is a
                 // withdrawal this node will reject and the network accepted.
                 Err(_) => eprintln!("no Bitcoin header for burn block {height}"),

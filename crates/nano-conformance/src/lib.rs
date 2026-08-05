@@ -669,6 +669,60 @@ pub fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static
     Ok((chainstate, source))
 }
 
+/// A durable chainstate over the captured checkpoint, resuming what `directory`
+/// already holds.
+///
+/// The same door `nano-node` opens: a directory with a tip of its own recovers
+/// the ledger committed with that tip, and only one with nothing sealed takes the
+/// checkpoint's accounting. Tests that carried the accounting across a restart by
+/// hand could not have caught the three fields nobody carried.
+pub fn durable_replay_chainstate(
+    root: &Path,
+    directory: &Path,
+) -> Result<(ChainState, [u8; 32]), String> {
+    let (source, state_root) =
+        checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
+    let mut chainstate = ChainState::open_from_checkpoint(
+        captured_network(root),
+        directory,
+        root.join("chainstate/checkpoint-H/marf.sqlite"),
+        source,
+        state_root,
+    )
+    .map_err(|error| format!("the checkpoint cannot be opened: {error}"))?;
+    let recovered = match chainstate.tip().filter(|tip| *tip != source) {
+        Some(tip) => chainstate
+            .recover_ledger_at(tip)
+            .map_err(|error| format!("the ledger cannot be read back: {error}"))?,
+        None => false,
+    };
+    if !recovered {
+        let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
+            .ok()
+            .and_then(|contents| TenureAccounting::from_json(&contents).ok())
+            .ok_or("native accounting fixture cannot be loaded")?;
+        *chainstate.accounting_mut() = accounting;
+    }
+    Ok((chainstate, source))
+}
+
+/// How many captured blocks a state directory has already sealed.
+///
+/// Counted from the fixtures rather than passed in, because a process that is
+/// killed cannot report where it got to.
+#[must_use]
+pub fn captured_blocks_sealed(root: &Path, chainstate: &ChainState) -> usize {
+    captured_block_paths(root)
+        .iter()
+        .take_while(|path| {
+            fs::read(path)
+                .ok()
+                .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
+                .is_some_and(|block| chainstate.has_block_state(*block.block_id().as_bytes()))
+        })
+        .count()
+}
+
 fn replay_fixture_failure(manifest: FixtureManifest, message: &str) -> ReplayDepth {
     ReplayDepth {
         completed: 0,
