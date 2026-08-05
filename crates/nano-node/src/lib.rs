@@ -51,6 +51,18 @@ pub struct CheckpointExecutor<S> {
     /// The burn view the current tenure is standing on, which a tenure change
     /// states and the blocks after it inherit.
     bitcoin_view: Option<nano_primitives::ConsensusHash>,
+    /// The sortition last fetched, and the burn view it describes.
+    ///
+    /// A sortition belongs to a *burn* block, and many Stacks blocks share one
+    /// burn view — so asking a peer once per Stacks block reissues an identical
+    /// request for an identical answer. At 0.44 s of round trip to a hosted API
+    /// that was the whole cost of a replay: the process sat at 16% of one core
+    /// waiting on the network while 40,000 already-staged blocks queued behind it.
+    ///
+    /// One entry rather than a map, because a replay walks burn views in order and
+    /// never looks back. Keeping the earlier ones would be a leak dressed as a
+    /// cache — a catch-up crosses thousands of them.
+    sortition_view: Option<(nano_primitives::ConsensusHash, nano_sync::SortitionInfo)>,
     /// Where to announce the blocks this node executes.
     ///
     /// An observer's whole purpose is to see what a node *executed*, so this
@@ -451,6 +463,7 @@ where
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
+            sortition_view: None,
             observers: None,
             bitcoin,
         })
@@ -473,6 +486,7 @@ where
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
+            sortition_view: None,
             observers: None,
             bitcoin,
         }
@@ -891,6 +905,22 @@ where
     /// a burn total that disagrees with a signed header means every consensus hash
     /// from here on is derived from a wrong number, so deriving stops rather than
     /// reporting the same wrongness at every block after it.
+    /// The sortition for a burn view, asked of a peer at most once.
+    async fn sortition_for(
+        &mut self,
+        node: &SyncClient,
+        view: nano_primitives::ConsensusHash,
+    ) -> Result<nano_sync::SortitionInfo, NodeExecutionError> {
+        if let Some((known, sortition)) = self.sortition_view.as_ref()
+            && *known == view
+        {
+            return Ok(sortition.clone());
+        }
+        let sortition = node.sortition(view).await?;
+        self.sortition_view = Some((view, sortition.clone()));
+        Ok(sortition)
+    }
+
     fn local_sortition(
         &mut self,
         pox: &PoxInfo,
@@ -1120,7 +1150,7 @@ where
                 self.bitcoin_view = Self::bitcoin_view_of(node, &block).await?;
             }
             let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
-            let sortition = node.sortition(view).await?;
+            let sortition = self.sortition_for(node, view).await?;
             let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
