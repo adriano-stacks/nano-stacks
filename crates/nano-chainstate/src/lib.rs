@@ -1817,8 +1817,13 @@ impl ChainState {
     }
 
     /// Make a burn block's header hash readable from Clarity.
-    pub fn record_burn_header(&mut self, height: u64, hash: [u8; 32]) {
-        self.vm.record_burn_header(height, hash);
+    pub fn record_burn_header(
+        &mut self,
+        height: u64,
+        hash: [u8; 32],
+    ) -> Result<(), ChainStateError> {
+        self.vm.record_burn_header(height, hash)?;
+        Ok(())
     }
 
     /// Blocks a contract asked about whose headers this node does not hold.

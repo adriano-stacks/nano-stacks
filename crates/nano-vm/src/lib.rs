@@ -427,6 +427,30 @@ impl BitcoinContext {
         decode_block_header(&bytes?)
     }
 
+    /// The Bitcoin block at a burn height, from memory or from the store.
+    ///
+    /// The store is consulted because this map is memory: a restart that
+    /// answered only from what it had re-seeded would answer `none` where the
+    /// run before it answered a hash, and an sBTC withdrawal naming a burn block
+    /// deeper than the re-seeded window would be rejected on a chain that
+    /// accepted it.
+    fn burn_header(&self, height: u32) -> Option<[u8; 32]> {
+        if let Some(hash) = self.burn_headers.get(&height) {
+            return Some(*hash);
+        }
+        let hash: Option<Vec<u8>> = {
+            let guard = self.headers_db.as_ref()?.lock().ok()?;
+            guard
+                .query_row(
+                    "SELECT hash FROM burn_header WHERE height = ?1",
+                    params![height],
+                    |row| row.get(0),
+                )
+                .ok()
+        };
+        <[u8; 32]>::try_from(hash?.as_slice()).ok()
+    }
+
     /// Blocks a contract asked about whose headers this node does not hold.
     pub(crate) fn take_missing_headers(&self) -> Vec<[u8; 32]> {
         self.missing_headers
@@ -609,7 +633,7 @@ impl BurnStateDB for BitcoinContext {
         // A burn block Clarity cannot be told about is a withdrawal this node
         // rejects and the network accepted, so it is worth being able to see
         // what every lookup answered.
-        let found = self.burn_headers.get(&height).copied();
+        let found = self.burn_header(height);
         if std::env::var_os("NANO_TRACE_BURN_HEADERS").is_some() {
             println!(
                 "burn header {height} -> {}",
@@ -1076,16 +1100,28 @@ impl Vm {
     /// has executed under, and a node that started at a checkpoint has none from
     /// before it. sBTC's withdrawal path checks a sweep's Bitcoin block that
     /// way, so an unanswered height rejects a withdrawal the network accepted.
-    pub fn record_burn_header(&mut self, height: u64, hash: [u8; 32]) {
+    /// Make a burn block's header hash readable from Clarity, now and after a
+    /// restart.
+    ///
+    /// Written outside any block's commit because it is a fact about Bitcoin
+    /// rather than about a Stacks block: it is true before the block that reads
+    /// it exists, and re-reading it costs a Bitcoin block download.
+    pub fn record_burn_header(
+        &mut self,
+        height: u64,
+        hash: [u8; 32],
+    ) -> Result<(), MarfStoreError> {
         if let Ok(height) = u32::try_from(height) {
             self.context.burn_headers.insert(height, hash);
+            self.store.write_burn_header(height, hash)?;
         }
+        Ok(())
     }
 
     /// Whether Clarity can already answer for this burn block.
     #[must_use]
     pub fn knows_burn_header(&self, height: u64) -> bool {
-        u32::try_from(height).is_ok_and(|height| self.context.burn_headers.contains_key(&height))
+        u32::try_from(height).is_ok_and(|height| self.context.burn_header(height).is_some())
     }
 
     pub fn execute_contract_call_outcome(
@@ -1576,6 +1612,16 @@ impl MarfStore {
         Ok(())
     }
 
+    /// Keep the Bitcoin block at a burn height.
+    fn write_burn_header(&self, height: u32, hash: [u8; 32]) -> Result<(), MarfStoreError> {
+        // Replaced rather than ignored: a Bitcoin reorganization gives a height
+        // a different block, and the memory this mirrors overwrites too.
+        self.side_store
+            .prepare_cached("INSERT OR REPLACE INTO burn_header (height, hash) VALUES (?1, ?2)")?
+            .execute(params![height, hash.as_slice()])?;
+        Ok(())
+    }
+
     /// Keep the state its caller holds beside the MARF, as of this block.
     fn write_ledger(&self, block: [u8; 32], ledger: &[u8]) -> Result<(), MarfStoreError> {
         self.side_store
@@ -1968,6 +2014,12 @@ CREATE TABLE IF NOT EXISTS chain_ledger (
     data BLOB NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS chain_ledger_sequence ON chain_ledger(sequence);
+-- The Bitcoin block at each burn height. A fact about Bitcoin, not about any
+-- Stacks block, so it is written as it is learned rather than with a seal.
+CREATE TABLE IF NOT EXISTS burn_header (
+    height INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL
+) WITHOUT ROWID;
 ";
 
 /// How many blocks of ledger history the side store keeps.
