@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use clar2wasm::{CompiledContract, ModuleCache};
@@ -721,13 +721,13 @@ impl Vm {
             .and_then(|path| rusqlite::Connection::open(path).ok())
             .map(Mutex::new);
         Self {
+            modules: native_module_cache(store.side_store_path().as_deref()),
             store,
             context: BitcoinContext {
                 mainnet,
                 headers_db,
                 ..BitcoinContext::default()
             },
-            modules: ModuleCache::default(),
         }
     }
 
@@ -2752,6 +2752,20 @@ const fn contract_argument(value: &Value) -> Option<&QualifiedContractIdentifier
     }
 }
 
+/// The module cache a store on disk keeps its native code in.
+///
+/// Cranelift's output goes beside the databases, so a restart does not compile
+/// every contract it touches all over again. An in-memory store — a test, a
+/// checkpoint being read — has nowhere to put it and does without.
+fn native_module_cache(side_store: Option<&Path>) -> ModuleCache {
+    side_store
+        .and_then(Path::parent)
+        .and_then(|directory| nano_wasm_cache::NativeModuleCache::open(directory).ok())
+        .map_or_else(ModuleCache::default, |cache| {
+            ModuleCache::persisting_in(Arc::new(cache))
+        })
+}
+
 fn ensure_wasm_module(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
@@ -3443,6 +3457,66 @@ mod tests {
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
         assert_eq!(vm.recorded_header([7; 32]), Some(header));
+    }
+
+    /// A contract answers the same whether its native code was compiled now or
+    /// read back from the state directory.
+    ///
+    /// That equality is the whole safety claim of the persistent module cache:
+    /// the middle call runs code the previous process compiled, and the last one
+    /// runs code compiled from scratch after the cache was deleted underneath
+    /// it. A cache that ever answered differently would be a consensus bug.
+    #[test]
+    fn a_cached_module_answers_what_a_compiled_one_does() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let entries = directory.path().join("native-modules").join("1");
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
+                .expect("a contract identifier");
+        let sender: PrincipalData = contract.issuer.clone().into();
+        let ask = |vm: &mut Vm| {
+            vm.call_contract_values(&sender, &contract, "answer", &[])
+                .expect("call the contract")
+        };
+        let count = || {
+            std::fs::read_dir(&entries)
+                .expect("the cache directory")
+                .count()
+        };
+
+        let compiled = {
+            let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("open");
+            vm.begin_block(None, [21; 32]).expect("begin a block");
+            vm.deploy_contract(
+                contract.clone(),
+                ClarityVersion::Clarity6,
+                "(define-read-only (answer) (+ u1 u41))",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("deploy the contract");
+            let answer = ask(&mut vm);
+            vm.seal_block().expect("seal the block");
+            answer
+        };
+        assert_eq!(compiled, Value::UInt(42));
+        assert!(count() > 0, "the deploy left native code behind");
+
+        let cached = {
+            let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen");
+            vm.begin_block(Some([21; 32]), [22; 32]).expect("begin a block");
+            ask(&mut vm)
+        };
+
+        std::fs::remove_dir_all(&entries).expect("delete the cache");
+        let recompiled = {
+            let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen");
+            vm.begin_block(Some([21; 32]), [23; 32]).expect("begin a block");
+            ask(&mut vm)
+        };
+
+        assert_eq!(compiled, cached);
+        assert_eq!(compiled, recompiled);
+        assert!(count() > 0, "a deleted cache is written again");
     }
 
     /// The size at which a contract of trait calls stops compiling.

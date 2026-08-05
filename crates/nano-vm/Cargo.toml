@@ -11,6 +11,7 @@ clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "ef
 hex = "0.4.3"
 nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
+nano-wasm-cache = { path = "../nano-wasm-cache" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 
