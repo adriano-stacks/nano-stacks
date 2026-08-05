@@ -506,3 +506,67 @@ staging directory to be walked back with it, which is the round's business
 (`runtime.rs`, `execute_staged`) and not a sortition's; and the depth guard is
 still a constant rather than a function of the history held, which is the
 unresolved half recorded above.
+
+## A resumed chain named the wrong winner where nobody had been elected
+
+Making the coinbase proof checkable ([[024]]) surfaced this immediately, and it had
+been there since resuming was added. The sampling of a sortition mixes the **most
+recent winner's** VRF seed — not the tip's, because a burn block that elects nobody
+mixes nothing, and mainnet leaves four such blocks in every fifteen. A chain
+seeded at one of them holds no snapshot with a seed at all, and
+`unanimous_winner_seed` recovered one from the seed block's own commitments, which
+carry the seed of the tenure they were *bidding* for. A different value of the
+right shape.
+
+Nothing downstream disagrees. Every candidate in a Nakamoto burn block carries the
+same `new_seed`, so a wrongly named winner still produces the right sortition hash,
+the right consensus hash and the right running burn total — the whole of what this
+task checks against the capture and against a signed header. The only thing it
+changes is *which leader key* the tenure's proof is checked against, so for as long
+as that key was `None` the bug was unobservable.
+
+It became observable the moment the registry landed. A live node restarted onto
+burn 960,487 — `was_sortition: false` — and refused the tenure at 960,488 with
+*"coinbase VRF proof was not produced by the winning leader key"*, retrying a block
+the network had accepted, forever.
+
+The fix is to write the seed down rather than recover it:
+`SnapshotChain::effective_winner_seed` names the rule, `save` records it beside the
+tip, and `seed_snapshot` refuses a snapshot that carries neither it nor whether its
+block elected anybody — a chain saved by an older binary is re-derived from the
+checkpoint instead, saying so while it walks, because guessing costs a wrongly named
+winner one restart in three.
+
+Two things are worth keeping from how this was found:
+
+- **The `snapshots` table's own `sortition` column is the discriminator**, and the
+  capture already carried it. The saved form now carries it too, so a seed either
+  states the winning seed, or states that its block had a winner and lets `prime`
+  recover it from that block's commitments, or is refused. There is no fourth case
+  and no default.
+- **A wrong answer that agrees with every oracle is what a checkpoint-resumed chain
+  produces by default.** Four fields derived exactly and the fifth was wrong for
+  three months. What caught it was making a *sixth* thing depend on it.
+
+`a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner` pins it
+offline on mainnet data — the capture's burn 960,222 is exactly this shape — by
+running one chain through and stopping another at the sortition-less block, saving
+it, reading it back the way a restart does, and requiring the same winner. It fails
+if the saved field is taken away. Live, after the fix: resumed at burn 960,491,
+which elected nobody, and the proof of every tenure from 960,492 to 960,496
+verified.
+
+## The numbers, from the re-derivation this caused
+
+Re-deriving 269 burn blocks from the checkpoint's anchor is the largest sortition
+workload a mainnet node ever runs, and it prints its own split:
+
+```
+derived 144 sortitions locally, now standing on burn 960363 (205.94s reading 150 burn blocks, 6 of them priming the mining window, 0.006s deriving)
+derived 125 sortitions locally, now standing on burn 960488 (104.42s reading 125 burn blocks, 0.008s deriving)
+```
+
+**40 microseconds of arithmetic per sortition, against 0.8–1.4 s of Bitcoin block.**
+Four orders of magnitude, and the slow side is a hosted Esplora rather than
+anything this crate does. There is nothing to optimise here that is not a caching
+decision about the burnchain.
