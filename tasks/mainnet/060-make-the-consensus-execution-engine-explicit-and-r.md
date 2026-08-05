@@ -501,7 +501,26 @@ it. Whatever the interpreter does with a value whose shape depends on the branch
 taken is what clarity-wasm has to reproduce, and that is the thing to establish
 next: run `min1` through the interpreter and see what type and value come back.
 
-That is the honest state. Two named defects, one reduced test, and no fix yet.
+**What the interpreter does, measured.** `xtask eval` on the minimised `if`:
+
+```
+Some(Tuple(TupleData { type_signature: { "a": uint, "b": uint }, … }))
+```
+
+It returns the **taken branch's own tuple, with that branch's own type**. There is
+no widening at runtime: the value's shape depends on which arm ran.
+
+That is the model mismatch. clar2wasm fixes a value's wasm representation from its
+*static* type, and `If` gives both arms one static type — so whichever arm does not
+match that type is laid out wrongly, and no conversion fixes it because the two
+arms genuinely carry different numbers of fields. Either `If` must stop rewriting
+its arms' types and pass the result through memory instead of the value stack, or
+the arms must be ducked to whichever type the analysis actually chose for the `if`
+— and which one that is has not been established. Printing the `if`'s analysed type
+is the next measurement, and it is a one-line addition to `If::traverse`.
+
+That is the honest state. Two named defects, one measured interpreter answer, one
+reduced test, and no fix yet.
 
 ## Two tools this needed, and now has
 
