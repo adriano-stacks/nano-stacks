@@ -312,3 +312,31 @@ block hash that no longer exists. No edit of somebody else's block can be made
 valid, because that is exactly what these rules refuse — so the fork is *mined*
 now, with a tenure change naming the miner that signs it. A synthetic block that
 could not exist is not a test of a rule about real ones.
+
+## Live evidence: the enforced validator accepts mainnet
+
+The complete validator, signer weight included and *rejecting*, is what the
+pristine mainnet replay now runs. Over the first few hundred blocks past
+8,676,182 it has raised **zero** signer rejections and zero "cannot check the
+signer set" reports — so the set nano reads out of `.signers` is the set that
+signed those blocks, on a chain nobody staged for it.
+
+That closes the doubt this task carried for a long time in the other direction.
+The note above said mainnet could not prove the signer path because cycle 140 was
+stacked in pox-4 and pox-5 has no positions for it. True of the *derivation* and
+false of the check: the cycle's `.signers` entries came across with the imported
+state, written by stacks-core under a state root the network agreed with, so they
+are available exactly where the derivation is not. `NANO_CHECK_SIGNERS` is gone;
+there is no switch.
+
+**What is still reported rather than rejected, and why**, from the same live run:
+the coinbase VRF proof, ~400 times, always as *"could not name which commitment
+won the sortition, so it has no leader key to check the proof against"*. The
+winner derives now — [[049-derive-canonical-sortitions-from-the-local-burncha]]
+got that to 14 of 14 — but the *leader key registration* it names sits below the
+burnchain window a node standing on a checkpoint holds, so there is no public key
+to check the proof against. That is a burnchain-history question rather than a
+sortition one, and it is the same shape as
+[[055-answer-block-info-for-blocks-before-the-checkpoint]]: a checkpoint has to
+carry it, or the node has to fetch it. Mainnet has 2,477 leader keys in total, so
+carrying them is small.
