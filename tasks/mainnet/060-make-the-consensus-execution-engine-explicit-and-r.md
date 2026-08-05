@@ -849,3 +849,119 @@ too early. This one is different again — **a host function reading state to
 recover something the compiler already knew**, and reading the wrong state. Worth
 naming as a class, because `with_ft` and `with_stacking` are next door and the
 same question applies to them.
+
+## The eighth is not a compiler bug at all: a tenure's fees, one tenure late (8,673,846)
+
+```
+state root mismatch at height 8673846:
+  expected 85ea9fa6ab48a0cea0c6a9ae51210cc8d70e3a0f8a85309170f5881e4d37a163
+  got      9fc9a9ff92602b13d5f67dd90c29349720daaa4f675e782caf9efa1f0e5ed87b
+```
+
+The block starts tenure 251,421 and holds two transactions, a `tenure_change`
+and a `coinbase`, both succeeding at zero cost on chain and in nano. Nothing the
+VM does is in question.
+
+**What it was.** A tenure's fee total is not recorded in its own payment
+schedule. stacks-core cannot total it until the next tenure change proves the
+tenure over, so it writes it into the *following* tenure's schedule as
+`MinerPaymentTxFees::Nakamoto { parent_fees }` and pays it out, a maturity later,
+to the recipient of that schedule's parent. So two tenures pay out at every
+tenure start, one tenure apart:
+
+- the maturing tenure's **coinbase**, to its own recipient;
+- the **previous** tenure's **fees**, to *its* own recipient.
+
+nano paid the previous tenure's recipient the *maturing* tenure's fees. At
+8,673,846 that is 22,539,119 uSTX — tenure 251,321's fee total — where mainnet
+pays 15,114, tenure 251,320's. Same recipient, wrong tenure's money.
+
+The reason it survived 8,128 blocks is the whole lesson. `xtask
+capture-fixtures` copied `payments.tx_fees_anchored` into the checkpoint's
+`fees` field verbatim, so every tenure the checkpoint carried held its
+*predecessor's* total under its own name. Against data shifted like that,
+"the maturing tenure's fees to the previous tenure's recipient" and "the
+previous tenure's fees to its own recipient" are the same arithmetic. The two
+readings first differ at the earliest tenure nano totalled for itself — 251,321,
+which starts at 8,665,610, nine blocks past the checkpoint anchor — and that
+tenure matures exactly 100 tenures later, at 8,673,846. The bug was scheduled.
+
+The fix names one convention and holds it everywhere: `TenureEarnings::fees` is
+the total *this* tenure's own transactions paid. `effects_for_tenure` takes both
+halves of the second credit from one entry, `earnings[matured - 1]`, so the
+recipient and the amount can no longer come apart. `capture-fixtures` reads
+`fees` from the following tenure's schedule, which is where stacks-core keeps it
+and what `hacknet/signer-checkpoint.sh` already did.
+
+### What was ruled out, and by which single measurement
+
+The write trace (`NANO_TRACE_WRITES=1`) is twelve writes over eight distinct
+keys, and `cargo xtask probe-root` reproduced nano's root from exactly those —
+so the trie, the ordering and the journal were all in agreement and the fault
+was in a key or a value. `probe-root` also showed no single omitted write and no
+permutation reaching the expected root.
+
+- **Five burn operations that wrote nothing.** The strongest-looking lead, and
+  dead in one query: `regex 6a4c50 5832` over the raw block from
+  `mempool.space/api/block/<hash>/raw` finds exactly five `6a 4c 50` OP_RETURNs
+  whose op byte is `5b`, `[`, `LeaderBlockCommit`. Five commits and no
+  stack/transfer/delegate/vote op, which the archive corroborates: every burn
+  block near 960,341 carries exactly five, and `leader_keys`, `stack_stx`,
+  `transfer_stx` and `delegate_stx` are all empty or centuries behind. Five ops
+  writing nothing is the *correct* number of writes.
+- **`check_and_handle_reward_start`, which nano does not implement at all.**
+  Also dead by reading: in 2.5 and later `handle_pox_cycle_start_pox_4` and
+  `_pox_5` are `Ok(vec![])` and do not even call `mark_pox_cycle_handled`.
+  Missed-slot auto-unlocks ended in Epoch 2.5; the handler writes nothing in
+  4.0, at a cycle boundary or anywhere else.
+- **`process_stx_unlocks` and the prepare phase.** Burn 960,381 is at offset 331
+  of cycle 140, no boundary; nano's unlock write is present and increments the
+  liquid supply by zero, which is what the network does too.
+- **Every value nano wrote.** `Sha512_256` of the candidate value string against
+  the traced `MARFValue` settles a value in one command, because the MARF leaf
+  *is* that hash: `printf '%s' 1785491070 | openssl dgst -sha512-256` is
+  `67b3ced7…`, the traced `block_time`. Seven of the eight matched what the chain
+  implies — `block_time`, `tenure_height` (`0003d61d`), both miner nonces, the
+  miner's unchanged balance, the coinbase credit, the SIP-031 mint and the liquid
+  supply. The eighth, `SP70B98…`'s balance, did not, and `sqlite3 clarity.sqlite
+  'select value from data_table where key like "66635b19…%"'` gave the number
+  nano actually wrote: 2,025,225,302 against the chain's 2,002,701,297.
+
+### The cheapest measurement that would have found it first
+
+Hash the value, not the balance. The chain's `/extended/v1/address/…/stx` says
+what an account holds; it does not say what nano wrote. Six amounts were
+"confirmed against the chain" here and one of them was confirmed against nano's
+*intent* — a log line — rather than its trie leaf. `Sha512_256(value_string)`
+compared with the traced `MARFValue` is a single-command check that admits no
+such gap, and it is available for every write in the trace, not just the ones
+an explorer indexes.
+
+Second, and more general: the accounting cross-check the fix ships as a tool.
+`cargo xtask repair-ledger <state> <index.sqlite>` now restates every tenure's
+fee total from stacks-core's own `payments` rows. Run against the parked state it
+moved 110 of 201 entries and left 91 untouched — the 110 being everything the
+checkpoint handed over or `repair-ledger` had filled, and the 91 being every
+tenure nano totalled itself, agreeing with the archive to the microSTX. A
+disagreement in either direction is a bug, and one command finds it a hundred
+tenures before the payout does.
+
+### Not the same family as the first seven
+
+The seven before this were all inside clarity-wasm. This one is nano's own
+chainstate arithmetic, and it is the first divergence that was *invisible by
+construction* rather than merely undiscovered: a checkpoint that carried a field
+one tenure out of phase and a reader that read it one tenure out of phase agreed
+with each other, and with the chain, for as long as the checkpoint lasted. Any
+consensus quantity that arrives both from a checkpoint and from execution needs
+its convention asserted at the seam, not inferred at each end.
+
+### Gates
+
+`cargo test --release -p nano-chainstate -p nano-vm`, the conformance suite with
+`NANO_MAINNET_CAPTURE` (121 passed), and `cargo clippy --release --workspace
+--all-targets` are green. The regression is
+`crates/nano-conformance/tests/conformance/tenure_fee_maturity.rs`, a hardcoded
+mainnet vector: at 251,421, `SP2N4YMH4…` takes 1,000,000,000 and `SP70B98…`
+takes 15,114, and 22,539,119 appears in neither credit until the next tenure
+start.
