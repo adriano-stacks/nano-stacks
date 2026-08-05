@@ -417,6 +417,7 @@ async fn execute_round(
     advertised.publish(LocalAnnouncement {
         bitcoin_height: executor.bitcoin_height(),
         cycle_start: executor.cycle_start_consensus_hash(pox),
+        inventory: executor.tenure_inventory(pox),
     });
     ExecutedRound {
         sealed: sealed_tip(executor.tip(), executor.bitcoin_height()),
@@ -1590,7 +1591,7 @@ async fn track_peer(
 /// lets discovery run before there is a chain to describe.
 fn advertised_view(
     bitcoin: &BurnchainSource,
-    published: Option<LocalAnnouncement>,
+    published: Option<&LocalAnnouncement>,
 ) -> nano_p2p::ChainView {
     let stale = || {
         nano_p2p::ChainView::new(
@@ -1637,13 +1638,15 @@ pub struct Advertised {
     inner: Arc<std::sync::Mutex<Option<LocalAnnouncement>>>,
 }
 
-/// What the follow loop knows and the discovery loop needs.
-#[derive(Clone, Copy, Debug)]
+/// What the follow loop knows and the peer-facing loops need.
+#[derive(Clone, Debug)]
 struct LocalAnnouncement {
     /// The Bitcoin height the sealed tip was executed under.
     bitcoin_height: u64,
     /// The consensus hash naming the reward cycle being walked, when derivable.
     cycle_start: Option<nano_primitives::ConsensusHash>,
+    /// Which tenures of that cycle this node has executed, and so will serve.
+    inventory: Option<(nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)>,
 }
 
 impl Advertised {
@@ -1656,7 +1659,17 @@ impl Advertised {
     fn read(&self) -> Option<LocalAnnouncement> {
         // A poisoned lock means a panic while publishing a height, which is not a
         // reason to stop talking to peers: the stale view below is a correct answer.
-        self.inner.lock().ok().and_then(|held| *held)
+        self.inner.lock().ok().and_then(|held| held.clone())
+    }
+
+    /// Answer a peer's inventory request, or `None` for a cycle this node cannot
+    /// speak to — which becomes a `Nack`, and is the honest answer.
+    fn tenure_inventory(
+        &self,
+        cycle_start: nano_primitives::ConsensusHash,
+    ) -> Option<nano_primitives::BitVec<2100>> {
+        let (known, tenures) = self.read()?.inventory?;
+        (known == cycle_start).then_some(tenures)
     }
 }
 
@@ -1745,7 +1758,24 @@ async fn start_transport(
             return None;
         }
     };
-    let mut swarm = nano_p2p::Swarm::new(peers, local, protocol, nano_p2p::SwarmLimits::default());
+    // One service, answering both directions. The listener needs it so a stock node
+    // can sync *from* nano; the swarm needs it because a peer nano dialled asks nano
+    // the same questions on that same socket, and a node that only answered inbound
+    // connections is invisible to every peer behind a NAT.
+    let service = match nano_p2p::PeerDb::open(&config.node.working_dir.join("peers.sqlite")) {
+        // A second connection rather than a shared one: sqlite's `Connection` is not
+        // `Sync`, so sharing would mean a lock held across every inbound reply.
+        Ok(table) => Arc::new(PeerService {
+            peers: std::sync::Mutex::new(table),
+            advertised: advertised.clone(),
+        }),
+        Err(error) => {
+            eprintln!("cannot open the peer table for serving: {error}");
+            return None;
+        }
+    };
+    let mut swarm = nano_p2p::Swarm::new(peers, local, protocol, nano_p2p::SwarmLimits::default())
+        .serving(service.clone());
     for seed in &seeds {
         if let Err(error) = swarm.seed(seed).await {
             eprintln!("cannot record the bootstrap peer {seed}: {error}");
@@ -1763,7 +1793,7 @@ async fn start_transport(
         }
     };
     let round = swarm
-        .maintain(advertised_view(&bitcoin, advertised.read()), None)
+        .maintain(advertised_view(&bitcoin, advertised.read().as_ref()), None)
         .await;
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
@@ -1782,7 +1812,7 @@ async fn start_transport(
     });
 
     if let Some(bind) = bind {
-        start_listener(config, network, bind, roles);
+        start_listener(config, network, bind, service, roles);
     }
     Some(discovered)
 }
@@ -1797,7 +1827,7 @@ async fn peer_discovery(
     loop {
         sleep(interval).await;
         let published = advertised.read();
-        let view = advertised_view(&bitcoin, published);
+        let view = advertised_view(&bitcoin, published.as_ref());
         // `None` before there is a chain to name a cycle, and a peer is then not
         // asked at all rather than asked about a guess.
         let cycle_start = published.and_then(|announced| announced.cycle_start);
@@ -1843,6 +1873,7 @@ fn start_listener(
     config: &Config,
     network: Network,
     bind: std::net::SocketAddr,
+    service: Arc<PeerService>,
     roles: &mut JoinSet<(Job, Role)>,
 ) {
     let Ok(identity) = p2p_identity(&config.node.working_dir) else {
@@ -1860,31 +1891,26 @@ fn start_listener(
         local.data_url = format!("http://{rpc}");
         local.services |= nano_p2p::wire::services::RPC;
     }
-    let peers_path = config.node.working_dir.join("peers.sqlite");
-    roles.spawn(async move { (Job::Peers, answer_peers(bind, peers_path, local, protocol).await) });
+    roles.spawn(async move {
+        (
+            Job::Peers,
+            answer_peers(bind, local, protocol, service).await,
+        )
+    });
 }
 
 /// Answer inbound peers until the socket fails.
 async fn answer_peers(
     bind: std::net::SocketAddr,
-    peers_path: std::path::PathBuf,
     local: nano_p2p::LocalPeer,
     protocol: nano_p2p::Protocol,
+    service: Arc<PeerService>,
 ) -> Role {
     {
         let listener = nano_p2p::Listener::bind(bind)
             .await
             .map_err(|error| format!("cannot listen for peers on {bind}: {error}"))?;
         println!("p2p: listening for peers on {bind}");
-        // The listener answers from its own connection to the peer table: sqlite's
-        // `Connection` is not `Sync`, and sharing one with the swarm would mean a
-        // lock held across every inbound reply.
-        let service = Arc::new(PeerService {
-            peers: std::sync::Mutex::new(
-                nano_p2p::PeerDb::open(&peers_path)
-                    .map_err(|error| format!("cannot open the peer table: {error}"))?,
-            ),
-        });
         let mut conversations: JoinSet<()> = JoinSet::new();
         loop {
             let (stream, from) = match listener.accept().await {
@@ -1928,20 +1954,39 @@ const MAX_INBOUND_PEERS: usize = 64;
 /// What this node tells a peer that dialled it.
 struct PeerService {
     peers: std::sync::Mutex<nano_p2p::PeerDb>,
+    /// What the follow loop last published about this node's own chain.
+    advertised: Advertised,
 }
 
 impl nano_p2p::Service for PeerService {
     fn chain_view(&self) -> nano_p2p::ChainView {
-        // The view the swarm last advertised would be the honest answer, and it
-        // lives behind an async lock this trait deliberately cannot take. The stale
-        // view is the safe one: uncontradictable rather than wrong, which is what a
-        // peer checks it for.
+        // The stale view is what a node with no executed chain says, and it is safe
+        // rather than a placeholder: a peer keeps only about 288 blocks below its
+        // stable height, so a claim older than that is uncontradictable rather than
+        // wrong. Once there is a chain, the height is this node's own.
+        //
+        // Deliberately not derived from a Bitcoin fetch: this trait is synchronous
+        // because an inbound reply that can block on I/O is one that can stall the
+        // listener, so the honest tip *hash* is not reachable from here and the height
+        // alone would be a view a peer could contradict. That is why the whole thing
+        // stays the stale one for now, and why the swarm — which can await — is where
+        // the real view is advertised.
         nano_p2p::ChainView::new(
             100_000,
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
         )
         .expect("a height above the confirmation window")
+    }
+
+    fn tenure_inventory(
+        &self,
+        cycle_start: nano_primitives::ConsensusHash,
+    ) -> Option<nano_primitives::BitVec<2100>> {
+        // Answered from the snapshot the follow loop published, never by asking the
+        // executor: a reply that took the executor's lock would let one inbound peer
+        // stall the loop that executes blocks.
+        self.advertised.tenure_inventory(cycle_start)
     }
 
     fn neighbors(&self) -> Vec<nano_p2p::NeighborAddress> {

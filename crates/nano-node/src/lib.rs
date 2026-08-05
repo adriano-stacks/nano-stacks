@@ -670,19 +670,67 @@ where
     /// phase and name a cycle no peer recognises.
     #[must_use]
     pub fn cycle_start_consensus_hash(&self, pox: &PoxInfo) -> Option<nano_primitives::ConsensusHash> {
-        let tracker = self.sortition.as_ref()?;
+        self.sortition
+            .as_ref()?
+            .consensus_hash_at(self.cycle_start_height(pox)?)
+    }
+
+    /// The Bitcoin height the reward cycle this node's burn view sits in opens at.
+    fn cycle_start_height(&self, pox: &PoxInfo) -> Option<u64> {
         let payouts = payout_schedule(pox)?;
-        let mut height = self.bitcoin_height().min(tracker.tip().bitcoin_height);
+        let mut height = self
+            .bitcoin_height()
+            .min(self.sortition.as_ref()?.tip().bitcoin_height);
         // The cycle is at most one length back, so the walk is bounded by the cycle
         // and cannot run away on a schedule that never says yes.
         let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
         for _ in 0..=length {
             if payouts.starts_reward_cycle(height) {
-                return tracker.consensus_hash_at(height);
+                return Some(height);
             }
             height = height.checked_sub(1)?;
         }
         None
+    }
+
+    /// Which tenures of the cycle being walked this node has executed, for a peer
+    /// that asks.
+    ///
+    /// A bit is set only where this node executed the tenure that began at that
+    /// sortition and can therefore serve its blocks, so the vector says less than the
+    /// node knows rather than more: an unset bit means "do not ask me", which costs a
+    /// peer nothing, while a set bit it could not honour would cost that peer a failed
+    /// fetch. It is the conservative direction on purpose.
+    ///
+    /// It says *much* less than the node knows, and the reason is worth recording:
+    /// the executed ledger reaches `REORG_REACH` blocks back, so the honest answer
+    /// covers the recent end of the cycle and nothing older. Answering fully needs a
+    /// durable consensus-hash-to-tenure index, which is a chainstate change and not
+    /// this one — but answering *partially and truthfully* is already strictly better
+    /// than the `Nack` that came before it, because a nack tells a peer to give up on
+    /// nano for the whole cycle.
+    #[must_use]
+    pub fn tenure_inventory(
+        &self,
+        pox: &PoxInfo,
+    ) -> Option<(nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)> {
+        let tracker = self.sortition.as_ref()?;
+        let start = self.cycle_start_height(pox)?;
+        let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+        let executed: std::collections::HashSet<nano_primitives::ConsensusHash> =
+            self.chainstate.executed_tenures().into_iter().collect();
+        let mut tenures = nano_primitives::BitVec::<2100>::zeros(u16::try_from(length).ok()?).ok()?;
+        // Walked by offset rather than by searching the history for each executed
+        // tenure: the history is a quarter of a million hashes long, and the cycle is
+        // two thousand.
+        for offset in 0..length {
+            if let Some(hash) = tracker.consensus_hash_at(start + offset)
+                && executed.contains(&hash)
+            {
+                tenures.set(u16::try_from(offset).ok()?, true).ok()?;
+            }
+        }
+        Some((tracker.consensus_hash_at(start)?, tenures))
     }
 
     /// Ask a peer for something, waiting out the limits it answers with.
