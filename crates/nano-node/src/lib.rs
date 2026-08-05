@@ -149,7 +149,17 @@ fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> {
     });
     let cycles =
         nano_sortition::RewardCycleSchedule::new(pox.first_bitcoin_height, length, waterfall).ok()?;
-    nano_sortition::PayoutSchedule::new(cycles, u64::from(pox.prepare_phase_length)).ok()
+    let schedule =
+        nano_sortition::PayoutSchedule::new(cycles, u64::from(pox.prepare_phase_length)).ok()?;
+    // Where epoch 4.0 begins collapses the mining window for the six blocks after
+    // it — a block weighed over a window that reaches into the previous epoch is
+    // weighed over that block alone, and mainnet's burn 960,230 and 960,233 name
+    // different winners under the two rules. `validate_epochs` makes pox-5's
+    // activation the epoch 4.0 start, so this is the same field the waterfall
+    // above already reads and nothing new is configured.
+    Some(pox.pox_5_activation_height.map_or(schedule, |activation| {
+        schedule.activating_epoch_four_at(u64::from(activation))
+    }))
 }
 
 /// Say where a locally derived sortition and the peer's answer part company.
@@ -1041,17 +1051,16 @@ where
         }
         self.sortition_gap = None;
         report_disagreements(tip, peer);
-        // The winner's identity comes out of the burn distribution once a block
-        // holds more than one eligible commitment, and that distribution derives
-        // 12 of the 14 sortitions in the captured mainnet window — so the key is
-        // published only where the block leaves no choice to get wrong. Publishing
-        // it otherwise would reject roughly one valid tenure in seven.
+        // The winner's identity is published as derived. It used to be withheld
+        // wherever more than one commitment competed, because the distribution
+        // named 12 of the captured window's 14 — and the cause turned out not to
+        // be the distribution at all but the *window*, which collapses to one
+        // block across the epoch 4.0 boundary. All fourteen derive now, so
+        // `candidates` is a report rather than a gate.
         let candidates = tracker.candidates();
         let local = LocalSortition {
             sortition_hash: *tip.sortition_hash.as_bytes(),
-            winner_vrf_public_key: (candidates == 1)
-                .then_some(tip.winner_vrf_public_key)
-                .flatten(),
+            winner_vrf_public_key: tip.winner_vrf_public_key,
         };
         if local.winner_vrf_public_key.is_none()
             && tip.winner_txid.is_some()
@@ -1060,9 +1069,10 @@ where
             self.sortition_winner = Some(peer.bitcoin_height);
             eprintln!(
                 "the tenure at burn {} carries a coinbase proof this node checks the \
-                 sortition hash of but not the key: {candidates} commitments competed for \
-                 this sortition and naming the winner among them needs the burn \
-                 distribution, which derives 12 of the captured window's 14",
+                 sortition hash of but not the key: it named a winner among \
+                 {candidates} commitments but holds no leader-key registration for it, \
+                 which happens when the key was registered before the burnchain \
+                 window this node holds",
                 peer.bitcoin_height
             );
         }
