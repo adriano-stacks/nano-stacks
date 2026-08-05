@@ -133,6 +133,28 @@ descends from a checkpoint whose root a signed header endorsed at 2,708 weight
 against a 2,599 threshold, and the report reads that back off disk rather than
 being told it.
 
+### An `inputs` section, and a rule about filling it in
+
+Most mainnet gates take their fixtures from the environment, so a report printing
+only its command line would describe a different run from the one it made. Every
+`NANO_*` variable the run was given is printed, and `run_gate` inherits them —
+which is how an operator hands the suite more fixtures without the report knowing
+their names.
+
+Filling that in has a rule, learned by breaking it. Handing the suite everything
+this machine has took the run from *15 could not run, 0 failed* to *8 could not
+run, **4 failed***, and none of the four was a defect: `NANO_NODE_MARF` pointed at
+a state directory at 8,666,584 while `NANO_MAINNET_BLOCK` named the checkpoint's
+state id at 8,665,600, so `every_checkpointed_contract_is_reachable_in_the_imported_trie`
+reported one of twenty-one contracts unreachable and
+`stacks_core_finds_the_contract_nano_cannot` — a *diagnostic*, not a gate — failed
+reading a blob.
+
+**A gate handed the wrong fixture is worse than one handed none**: it reports a
+failure that means nothing, which is the same dishonesty as a skipped gate
+reporting green, pointing the other way. So the report is run with the four inputs
+whose pairing is unambiguous, and the rest are left absent and reported absent.
+
 ## The artifact, not the dependency graph
 
 `wasm_is_the_engine` asks the sources and `cargo tree` whether an interpreter path
@@ -258,6 +280,51 @@ What this does not cover is the same thing happening to a running node across a
 Bitcoin reorganization, which is the "exercise a Bitcoin reorganization" item and
 needs the live run.
 
+### The run
+
+```
+$ export NANO_MAINNET_CAPTURE=/home/aldur/mainnet-capture
+$ export NANO_MAINNET_CHECKPOINT=$NANO_MAINNET_CAPTURE/chainstate/checkpoint-H
+$ export NANO_MAINNET_BLOCKS=/tmp/nano-mainnet-blocks.bin      # cat capture/nakamoto/blocks/*.bin
+$ export NANO_MAINNET_ARCHIVE=/home/aldur/mainnet-chainstate/mainnet/chainstate/vm/index.sqlite
+$ cargo xtask release-report --state /home/aldur/mainnet-wasm/state
+```
+
+```
+gates
+  Each command below also inherits every variable under `inputs`.
+
+  cargo test --release -p nano-rpc -p nano-node
+    pass   ok. 17 passed; 0 failed …; ok. 23 passed; 0 failed; 1 ignored …
+
+  NANO_REQUIRE_MAINNET=1 NANO_MAINNET_CAPTURE=… cargo test --release -p nano-conformance --test conformance
+    FAIL   FAILED. 164 passed; 12 failed; 2 ignored; finished in 64.46s
+           12 gate(s) could not run, so the run is not evidence for them:
+             1 × NANO_MAINNET_MARF and NANO_MAINNET_BLOCK are needed
+             2 × NANO_MAINNET_STATE and NANO_MAINNET_CAPTURE name a state directory and a capture
+             1 × NANO_NODE_MARF, NANO_NODE_CLARITY and NANO_MAINNET_BLOCK are needed
+             1 × NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY are needed
+             1 × NANO_P2P_MAINNET must be set to dial mainnet
+             1 × NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES are needed
+             5 × the capture has no leader key for the winning commitment
+
+  cargo clippy --release --workspace --all-targets
+    pass   Finished `release` profile [optimized] target(s) in 22.24s
+```
+
+**164 passed, 12 failed, and every one of the twelve is a gate that could not run
+— none ran and failed.** That is the whole point of the exercise: the run is
+evidence for 164 assertions and explicitly not evidence for twelve, and the twelve
+say why. The exit status is non-zero, which is correct: a release cannot be cut on
+a run with twelve unrun gates.
+
+Five of the twelve are not an environment variable at all but the capture's own
+content — `/home/aldur/mainnet-capture` holds no leader-key registration for the
+commitment that won its tenure, because the key was registered before the
+burnchain window the capture covers. `p2p_discovery` and `trie_diff` are live and
+diagnostic respectively. The remaining five want a state directory paired with the
+block identifier it stands on, which this machine has separately and not together.
+
 ## What is proved, what is staged, and what needs wall-clock
 
 The distinction this task exists to make, applied to itself.
@@ -287,8 +354,31 @@ The distinction this task exists to make, applied to itself.
   — `restart.rs` and `kill_during_replay.rs` prove the invariants at the library
   level, including twenty `SIGKILL`s a run, and `kill_during_import.rs` proves the
   same across an import. What the gate asks for and they do not give is the
-  *assembled binary* rather than the library. Nothing blocks that but a harness
-  that starts and kills the process.
+  *assembled binary* rather than the library.
+
+  Attempted this session and abandoned for a reason worth writing down. The
+  obvious cheap route is a `cp --reflink=always` of the pristine run's 45 GB state
+  directory and a second node started on the copy. **That copy is not a
+  snapshot.** A reflink copy is per-file atomic and says nothing across files, and
+  a running node's `marf.sqlite`, `clarity.sqlite`, `staging.sqlite` and
+  `accounting.json` are four files it writes in sequence — so the copy caught a
+  ledger that had reached 8,679,483 and a trie that had not:
+
+  ```
+  thread 'main' panicked at crates/nano-marf/src/lib.rs:1155:
+  trie storage: Storage("trie storage is missing block 8679483")
+  ```
+
+  That is the copy's fault, not the node's, and it is the *right* thing to notice
+  — but it **panics** where it should name the inconsistency and refuse, which is
+  a difference between a node that can be diagnosed and one that cannot. A hard
+  kill of the node's own process leaves a consistent directory, which is what
+  `kill_during_replay` proves; a torn copy of somebody else's is a separate case
+  and nothing handles it deliberately. Recorded for whoever owns `nano-marf`.
+
+  So the binary-level restart needs either a state directory nothing is writing —
+  a fresh import, which is hours — or a node stopped cleanly first, which the
+  pristine run must not be. Neither is a code problem; both are wall-clock.
 - **A Bitcoin reorganization and a Stacks fork switch** — [[026]] and
   `fork_retraction.rs` cover the retraction; the live event has not happened
   under a nano node.

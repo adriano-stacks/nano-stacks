@@ -4036,6 +4036,27 @@ fn report_scoreboard() {
     }
 }
 
+/// Every `NANO_*` variable this run was given.
+///
+/// Part of "the exact commands": most of the mainnet gates take their inputs from
+/// the environment, so a report that printed only the command line would be
+/// describing a different run from the one it made. `run_gate` inherits this
+/// environment, which is what lets an operator hand the suite more fixtures
+/// without the report knowing their names.
+fn report_inputs() {
+    println!("\ninputs");
+    let mut names: Vec<(String, String)> = env::vars()
+        .filter(|(name, _)| name.starts_with("NANO_"))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        println!("  none, so every gate that needs one will report that it could not run");
+    }
+    for (name, value) in names {
+        println!("  {name:<24} {value}");
+    }
+}
+
 fn report_conditional_gates() {
     println!("\nconditional gates");
     let conditional = conditional_gates();
@@ -4055,6 +4076,7 @@ fn report_conditional_gates() {
 /// Run the three gates tasks/053 names and report what each said.
 fn report_gates(capture: Option<&str>) -> bool {
     println!("\ngates");
+    println!("  Each command below also inherits every variable under `inputs`.");
     let mut environment: Vec<(&str, &str)> = vec![("NANO_REQUIRE_MAINNET", "1")];
     match capture {
         Some(path) => environment.push(("NANO_MAINNET_CAPTURE", path)),
@@ -4123,6 +4145,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     report_artifact();
     report_checkpoint(state.as_deref());
     report_scoreboard();
+    report_inputs();
     report_conditional_gates();
 
     let passed = if run_gates {

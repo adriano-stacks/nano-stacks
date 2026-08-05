@@ -411,3 +411,28 @@ called, which is what the whole task was about.
   executed chain.
 - `new_block`'s matured rewards, reward set and miner txid are still defaults, as
   they were before this task.
+
+## The last item, split into its three halves
+
+"Exercise a stock `stacks-signer`, transaction submitter and event observer
+against the binary" is three claims, and they are not in the same state.
+
+- **Event observer: done.** The live run above received `new_block` ×160,
+  `new_burn_block` ×2 and `proposal_response` ×4 at a real listener, and
+  `event_delivery.rs` is the offline half. `event_observer.rs` checks the payload
+  shapes against stacks-core's *own readers*, which is what caught the two
+  reward-set defects.
+- **Transaction submitter: the route is live, a real submitter has not driven
+  it.** `/v2/transactions` decodes, refuses garbage with `400 failed to decode
+  transaction`, and admits into the same `Mempool` the miner takes the lock on.
+  What has not happened is a wallet or `stacks-cli` posting a *valid* mainnet
+  transaction and it appearing in a mined block, which needs a chain nano can
+  mine on.
+- **Stock signer: blocked on the chain, not on nano.** Unchanged from above: a
+  signer must be in the reward set nano derives, nano derives waterfall sets from
+  pox-5, and mainnet is on pox-4. Provable against hacknet on 4.0 (W13) or
+  `api.testnet-pox5.hiro.so`; not against a mainnet replay from a 3.x checkpoint.
+
+[[053-pass-the-mainnet-node-release-gate]] carries the same split for the release
+gate as a whole, under "what is proved, what is staged, and what needs
+wall-clock".
