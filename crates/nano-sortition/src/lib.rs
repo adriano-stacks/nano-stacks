@@ -13,6 +13,17 @@ const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23, 0, 0, 0];
 /// The Bitcoin blocks a sortition weighs mining commitments over.
 pub const MINING_COMMITMENT_WINDOW: usize = 6;
 
+/// Blocks of commitment history a [`SortitionEngine`] keeps.
+///
+/// More than the window, because a Bitcoin reorganization takes the top of that
+/// history with it and the replacement branch has to be weighed over a full
+/// window from its first block. Keeping only the window meant a reorganization
+/// two blocks deep left five, and the replayed sortition was weighed over five
+/// blocks where the network used six — the same failure as a short window
+/// anywhere else, which is a different answer rather than a rougher one. Twice
+/// the window covers every retraction [`SortitionEngine::retract_above`] admits.
+const RETAINED_COMMITMENT_BLOCKS: usize = MINING_COMMITMENT_WINDOW * 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpsHash([u8; 32]);
 
@@ -1173,7 +1184,7 @@ impl SortitionEngine {
     /// Feed the blocks oldest first, ending with the snapshot's own burn block.
     pub fn prime(&mut self, commitments: CommitmentWindowBlock) {
         self.commitment_window.push(commitments);
-        if self.commitment_window.len() > MINING_COMMITMENT_WINDOW {
+        if self.commitment_window.len() > RETAINED_COMMITMENT_BLOCKS {
             self.commitment_window.remove(0);
         }
     }
@@ -1256,7 +1267,7 @@ impl SortitionEngine {
     ) -> Result<&SortitionSnapshot, SortitionError> {
         let mut retained = self.commitment_window.clone();
         retained.push(commitments);
-        if retained.len() > MINING_COMMITMENT_WINDOW {
+        if retained.len() > RETAINED_COMMITMENT_BLOCKS {
             retained.remove(0);
         }
         let window = &retained[retained.len().saturating_sub(window_len.max(1))..];
@@ -1585,6 +1596,30 @@ mod tests {
         append(&mut replayed, 3, 0x33);
         append(&mut replayed, 4, 0x44);
         assert_eq!(engine.snapshots(), replayed.snapshots());
+    }
+
+    /// A reorganization must not leave the replacement branch weighed short.
+    ///
+    /// The commitment history is what refills the window, and retracting the top of
+    /// it is the one moment the window can go short without any block being
+    /// missing — which is a different sortition, not a rougher one. Keeping only
+    /// the window itself meant the deepest admitted retraction emptied it.
+    #[test]
+    fn the_retained_history_refills_the_window_after_the_deepest_retraction() {
+        let heights: Vec<u8> = (1..=20).collect();
+        let mut engine = engine_over(&heights);
+        assert_eq!(
+            engine.commitment_window().len(),
+            super::RETAINED_COMMITMENT_BLOCKS
+        );
+
+        let depth = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64");
+        let reorg = engine.retract_above(20 - depth).expect("retract the branch");
+        assert_eq!(reorg.depth(), MINING_COMMITMENT_WINDOW);
+        assert!(
+            engine.commitment_window().len() + 1 >= MINING_COMMITMENT_WINDOW,
+            "one replayed block refills the window, so it is weighed over all six"
+        );
     }
 
     #[test]

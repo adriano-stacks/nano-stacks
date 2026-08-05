@@ -38,7 +38,9 @@ never validation inputs.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
 - [ ] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
-      path and replay the affected Stacks tenures.
+      path and replay the affected Stacks tenures. Nothing calls `find_fork`,
+      `SortitionEngine::retract_above` or `ChainState::retract` outside tests;
+      one bug the reading found is fixed below.
 
 ## Acceptance Criteria
 
@@ -369,6 +371,36 @@ Two one-line changes in `crates/nano-node/src/lib.rs`, which another agent owns:
 - The `(candidates == 1)` hedge around `winner_vrf_public_key` can go: the winner
   derives whether or not the burn block left a choice. `SortitionTracker::candidates`
   is a report now, not a gate.
+
+## A reorganization must not leave the replacement branch weighed short
+
+Nothing in `nano-node` calls `find_fork`, `SortitionEngine::retract_above` or
+`ChainState::retract(reorg)` — the Bitcoin-reorganization path exists and is
+tested in the library and is unwired in production, which is the remaining item
+above. Wiring it needs the node's own round (`crates/nano-node/src/lib.rs`,
+`runtime.rs`) to ask Bitcoin whether the heights it snapshotted still hold,
+invalidate the `PreStx` window, and hand the `SortitionReorg` to the chainstate.
+
+Reading it turned up one real bug, in the engine rather than the wiring, and it is
+the same failure the mining-window work above is about. `SortitionEngine` kept
+exactly `MINING_COMMITMENT_WINDOW` blocks of commitment history, and a retraction
+drops one entry per retracted snapshot — so a reorganization two blocks deep left
+five, and the first replayed sortition was weighed over five blocks where the
+network used six. The blocks that would have refilled it sit below the fork point
+and are never read again. It kept `RETAINED_COMMITMENT_BLOCKS = 2 *
+MINING_COMMITMENT_WINDOW` now, which covers every depth `retract_above` admits,
+and `the_retained_history_refills_the_window_after_the_deepest_retraction` fails
+if that slack is taken away.
+
+What is *not* closed: the depth guard is still a constant rather than a function of
+the history actually held. A chain freshly seeded from a checkpoint has only
+`MINING_COMMITMENT_WINDOW` blocks behind it — `SortitionTracker::prime` reads that
+many and the capture carries no more — so until it has run a window past its seed,
+a reorganization it accepts can still be weighed short. Making the guard refuse on
+the retained length instead would also refuse the legitimately short window of a
+chain younger than six blocks, which stacks-core allows ("Mining commitment window
+shortened because block height is less than window size"), so telling those two
+apart is part of the item above rather than a one-line change.
 
 ## It keeps pace on mainnet
 
