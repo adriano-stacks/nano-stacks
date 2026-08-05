@@ -179,6 +179,9 @@ re-codegen. The single largest structural contributor is nano-conformance's 28 s
 `nano-*` + `clarity` + `wasmtime` generic surface into its own ~30 MB executable, at a mean
 of 5.0 s and a max of 10.9 s apiece, for a combined 4.6 minutes of CPU per rebuild.
 
+**That first row is history: those 28 targets are one target now.** See "The 28 conformance
+targets are one" at the end of this document for the before/after measurement.
+
 Inside a single unit (`stacks-node` bin, `rustc -Ztime-passes`, 12.1 s total):
 
 | pass | time | share |
@@ -209,10 +212,13 @@ What is **not** the problem:
 Ordered by (saving ÷ risk). Items 6 and the noted parts of 2 and 7 **change generated code
 or runtime behaviour** and are called out explicitly.
 
-### 1. Collapse nano-conformance's 28 integration test targets into one
+### 1. Collapse nano-conformance's 28 integration test targets into one — **done**
 
 Replace `crates/nano-conformance/tests/*.rs` (28 separate targets) with a single
 `tests/conformance/main.rs` that does `mod marf_lockstep; mod mainnet_codec; …`.
+
+Landed; measured results at the end of this document. The estimate below was roughly right
+about the build and wrong about the test run.
 
 - **Saving: ~124 s of 353 s CPU per rebuild (35 %), ~10–15 s of the 43 s wall.** 28
   codegen+link units become 1. Also cuts test execution: 28 process launches and 28 libtest
@@ -383,8 +389,74 @@ rather than putting `incremental = true` into `[profile.release]`, because that
 changes codegen-unit partitioning and this node's replay throughput is worth
 measuring before trading. Costs one cold build, which has not been paid yet.
 
-**Not done, and it is the biggest one left.** Merging `nano-conformance`'s 28
-integration test targets into one: ~124 s of the 353 s CPU per rebuild, 39 % of
-it. Left alone because the tests would lose per-process isolation and at least one
-of them (`oom_checker`) looks like it depends on that, and auditing 28 files for
-process-global state is not a thing to do in the same pass as a consensus fix.
+## The 28 conformance targets are one
+
+Done, later the same day. All 28 files moved to `crates/nano-conformance/tests/conformance/`
+and are declared as modules of one `tests/conformance/main.rs`, so the workspace links once
+instead of 28 times. A test's name is now `<module>::<fn>`, and
+`cargo test -p nano-conformance <module>` runs what `--test <module>` used to.
+
+**Nothing had to stay a separate target.** `oom_checker`, the test the note above worried
+about, is a clar2wasm test (`vendor/clarity-wasm/clar2wasm/tests/oom-checker/`) and was never
+one of these 28. The audit of all 28 for process-global state found nothing that has to have
+a process to itself: no `set_var`/`remove_var`, no `static`/`OnceLock` mutable state, no
+working-directory change, no fixed port (the one test that serves HTTP binds `127.0.0.1:0`),
+no global hook or panic handler. One fixed temp path, in `release_dependencies`, became a
+`tempfile::tempdir()` first, in its own commit. The two tests that shell out to `cargo` still
+do; nested cargo takes the target-directory lock, which it already did when they ran
+concurrently inside their own binary.
+
+### Measured, same box, same session
+
+The machine was **not** quiet — other agents were building throughout, `loadavg` 15–52 — so
+wall time is mostly noise and CPU time (user + sys, children included) is the number to
+trust. It has a 3 % spread across runs where wall has 60 %.
+
+`touch crates/nano-vm/src/lib.rs && cargo build --release --tests -p nano-conformance`,
+median of 6 runs each side:
+
+| | CPU | wall | link+write (`sys`) |
+|---|---|---|---|
+| before, 28 targets | **303 s** | 43 s | 19 s |
+| after, 1 target | **202 s** | 27 s | 5 s |
+
+**−101 s CPU, −33 %.** The `sys` drop is 27 fewer 36 MB executables written per rebuild.
+
+`touch crates/nano-vm/src/lib.rs && cargo build --release --workspace --all-targets`,
+median of 3 each side:
+
+| | CPU | wall (at loadavg) |
+|---|---|---|
+| before | **596 s** | 92 s (41–52) |
+| after | **480 s** | 51 s (26–34) |
+
+**−116 s CPU, −19 %** of the whole test graph. These absolute numbers are much larger than
+the 352.8 s in the table above because that measurement predates `nano-mempool`,
+`nano-bitcoin` and `nano-oracle`; only the before/after pair is comparable.
+
+### Test execution did not improve
+
+Recommendation 1 predicted the merge would also cut the test run, on the theory that 28
+process launches and 28 libtest pools cost something. They do not.
+`cargo test --release -p nano-conformance`, build warm, three runs each side:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| before | 34 s | 73 s | 79 s |
+| after | 32 s | 76 s | 80 s |
+
+Identical within noise, and the same shape on both sides — the first run after a build is
+fast and later ones are not, because `release_dependencies` shells out to
+`cargo check --release --tests` over the 16 production crates and that dominates whatever
+else is running. Process launch was never the cost. If the test run is the thing to fix, it
+is that test (recommendation 4), not the target count.
+
+### Evidence that nothing was dropped
+
+`cargo test --release -p nano-conformance -- --list` before and after, compared as
+`<file-stem>::<fn>` so the new module prefix does not read as a difference: **163 tests both
+times, diff empty.** Per-test verdicts also diff-empty, both ungated (162 ok, 1 ignored) and
+with `NANO_REQUIRE_MAINNET=1` and the mainnet capture present (156 ok, 6 failed, 1 ignored —
+the same six gates failing on the same `skip_gate` panic for the same missing environment
+variable). `skip_gate` still panics rather than reporting green, which is the whole reason it
+exists.

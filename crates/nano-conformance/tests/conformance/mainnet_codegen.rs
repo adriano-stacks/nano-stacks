@@ -31,7 +31,7 @@ use clarity::vm::{ClarityVersion, Value};
 use stacks_common::codec::StacksMessageCodec;
 
 /// The contract as mainnet holds it.
-const FLEA: &str = include_str!("../fixtures/contracts/flea.clar");
+const FLEA: &str = include_str!("../../fixtures/contracts/flea.clar");
 
 #[test]
 fn a_mainnet_contract_compiles_to_a_module_that_loads() {

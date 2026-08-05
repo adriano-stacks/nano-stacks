@@ -180,13 +180,14 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
         }),
     };
     // Written through the real `record`, so the keys compared are the ones a node
-    // puts on disk rather than the ones a test thought it would.
-    let directory = std::env::temp_dir().join("nano-checkpoint-procedure");
-    let _ = std::fs::remove_dir_all(&directory);
-    written.record(&directory).expect("record provenance");
-    let toml = std::fs::read_to_string(directory.join("checkpoint-provenance.toml"))
+    // puts on disk rather than the ones a test thought it would. In a fresh
+    // directory each time: this used to be one fixed path under the temp
+    // directory, which two runs of the suite at once would delete under each
+    // other.
+    let directory = tempfile::tempdir().expect("a directory");
+    written.record(directory.path()).expect("record provenance");
+    let toml = std::fs::read_to_string(directory.path().join("checkpoint-provenance.toml"))
         .expect("read the recorded provenance");
-    let _ = std::fs::remove_dir_all(&directory);
     let mut checked = 0_usize;
     for line in toml.lines() {
         let Some((key, _)) = line.split_once(" = ") else {
