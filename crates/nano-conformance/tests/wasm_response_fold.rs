@@ -306,11 +306,11 @@ fn hashing_the_parsed_proof_agrees() {
 /// analysis ("Tuples fields should be typed"), so it is `print` accepting two
 /// unrelated tuple types that lets codegen reach a layout it cannot honour.
 ///
-/// Ignored rather than deleted or left failing: it is a real, reduced,
-/// reproducible compiler bug with nothing yet fixed behind it, and a red suite
-/// teaches people to ignore red suites. Remove the attribute with the fix.
+/// Fixed in three places: `need_ducktyping` compared tuples field-set-wise
+/// instead of zipping them positionally, `print` ducks the value it hands back
+/// from its argument's type to its own expression's type, and `duck_type_stack`
+/// maps tuple fields by name and drops the ones the target does not have.
 #[test]
-#[ignore = "clarity-wasm lays out an i32 where it reads an i64: mainnet 8,666,585"]
 fn two_tuple_shapes_under_one_if_compile_to_a_loadable_module() {
     const SHAPES: &str = "
 (define-data-var v uint u0)
@@ -330,4 +330,57 @@ fn two_tuple_shapes_under_one_if_compile_to_a_loadable_module() {
         LimitedCostTracker::new_free(),
     )
     .expect("mainnet accepted this contract, so the compiler has to build it");
+}
+
+/// The narrowing the fix has to get right, not merely survive.
+///
+/// `least_supertype` walks the *true* arm's fields and looks each one up in the
+/// false arm's, so the `if` takes the true arm's — narrower — type and the false
+/// arm's value has to shed fields. Shedding the wrong one still loads: it just
+/// answers with a neighbour's value, so each case reads the survivors back and
+/// compares them against the interpreter.
+const NARROWING: &str = "
+;; The dropped field is in the middle of the name order, and is two i32 slots
+;; wide where its neighbours are one i32 and two i64.
+(define-read-only (drop-middle (narrow bool))
+  (let ((t (if narrow
+             (print { a: u10, c: true })
+             (print { a: u10, b: 0x11223344, c: true }))))
+    { a: (get a t), c: (get c t) }))
+
+;; Narrowing inside a field: `inner` sorts before `outer`, and `y` sorts between
+;; the two fields that survive it.
+(define-read-only (drop-nested (narrow bool))
+  (let ((t (if narrow
+             (print { inner: { x: u20, z: u40 }, outer: u50 })
+             (print { inner: { x: u20, y: u30, z: u40 }, outer: u50 }))))
+    { x: (get x (get inner t)), z: (get z (get inner t)), outer: (get outer t) }))
+
+;; A list field makes the target need duck-typing workspace, which is the branch
+;; where `print` has to allocate call-stack bytes rather than pass `none`.
+(define-read-only (drop-beside-a-list (narrow bool))
+  (let ((t (if narrow
+             (print { a: (list u1 u2 u3), c: u60 })
+             (print { a: (list u1 u2 u3), b: u70, c: u60 }))))
+    { a: (get a t), c: (get c t) }))
+";
+
+fn boolean(value: bool) -> Vec<u8> {
+    serialized(&Value::Bool(value))
+}
+
+#[test]
+fn narrowing_a_tuple_keeps_the_fields_it_kept() {
+    for function in ["drop-middle", "drop-nested", "drop-beside-a-list"] {
+        for narrow in [true, false] {
+            let (compiled, interpreted) = both_in(NARROWING, function, &[boolean(narrow)]);
+            // Two engines agreeing on a failure would prove nothing about which
+            // fields survived.
+            assert!(
+                !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
+                "{function} with narrow={narrow} answered nothing: {compiled}"
+            );
+            assert_eq!(compiled, interpreted, "{function} with narrow={narrow}");
+        }
+    }
 }

@@ -142,19 +142,29 @@ impl WasmGenerator {
                 builder.local_set(*variant_local);
             }
             (TypeSignature::TupleType(og_tup_ty), TypeSignature::TupleType(target_tup_ty)) => {
-                let og_ty_iter = og_tup_ty.get_type_map().values().rev();
-                let target_ty_iter = target_tup_ty.get_type_map().values().rev();
-
+                // A tuple's slots are its fields' slots concatenated in ascending
+                // field-name order, so the last field is on top of the stack and owns
+                // the tail of `locals`: both are consumed from the end. Walking the
+                // *source* fields in descending name order therefore visits the shared
+                // names in the same descending order the target locals come off in.
+                // A source field the target does not have is dropped, not converted.
+                let target_map = target_tup_ty.get_type_map();
                 let mut remaining_locals = locals;
-                for (og_subty, target_subty) in og_ty_iter.zip(target_ty_iter) {
-                    let current_locals;
-                    (remaining_locals, current_locals) = remaining_locals
-                        .split_at_checked(remaining_locals.len() - clar2wasm_ty(target_subty).len())
+                for (name, og_subty) in og_tup_ty.get_type_map().iter().rev() {
+                    let Some(target_subty) = target_map.get(name) else {
+                        drop_value(builder, og_subty);
+                        continue;
+                    };
+                    let split = remaining_locals
+                        .len()
+                        .checked_sub(clar2wasm_ty(target_subty).len())
                         .ok_or_else(|| {
                             GeneratorError::InternalError(
                                 "Not enough locals for duck-typing a tuple".to_owned(),
                             )
                         })?;
+                    let current_locals;
+                    (remaining_locals, current_locals) = remaining_locals.split_at(split);
                     self.duck_type_stack(
                         builder,
                         og_subty,
@@ -162,6 +172,11 @@ impl WasmGenerator {
                         current_locals,
                         allocated_mem_offset,
                     )?;
+                }
+                if !remaining_locals.is_empty() {
+                    return Err(GeneratorError::TypeError(format!(
+                        "Duck typing cannot invent tuple fields:\n\t{og_ty:?}\n\t{target_ty:?}"
+                    )));
                 }
             }
             (
@@ -316,11 +331,17 @@ pub fn need_ducktyping(og_ty: &TypeSignature, tg_ty: &TypeSignature) -> bool {
         }
         TypeSignature::TupleType(og_tup_ty) => {
             if let TypeSignature::TupleType(tg_tup_ty) = tg_ty {
-                og_tup_ty
-                    .get_type_map()
-                    .values()
-                    .zip(tg_tup_ty.get_type_map().values())
-                    .any(|(og_elem_ty, tg_tup_ty)| need_ducktyping(og_elem_ty, tg_tup_ty))
+                // Compare the field *sets*: zipping the two type maps positionally
+                // would pair `c` with `b` for `{a,b,c}` against `{a,b}` and answer
+                // "no conversion needed" for layouts that differ by a slot.
+                let og_map = og_tup_ty.get_type_map();
+                let tg_map = tg_tup_ty.get_type_map();
+                og_map.len() != tg_map.len()
+                    || og_map.iter().any(|(name, og_elem_ty)| {
+                        tg_map
+                            .get(name)
+                            .is_none_or(|tg_elem_ty| need_ducktyping(og_elem_ty, tg_elem_ty))
+                    })
             } else {
                 false
             }

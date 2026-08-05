@@ -154,6 +154,53 @@ fn the_conformance_suite_still_takes_the_reference_implementation() {
     }
 }
 
+/// The operator procedure describes the file the node actually writes.
+///
+/// `docs/checkpoint-trust.md` is how somebody adopts a mainnet checkpoint, and
+/// its worked example of `checkpoint-provenance.toml` is the part they will
+/// compare their own file against. A renamed field would make the document
+/// quietly wrong in the one place an operator checks by eye, so every key the
+/// document shows has to be a key the node still writes.
+#[test]
+fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
+    let doc = std::fs::read_to_string(workspace().join("docs/checkpoint-trust.md"))
+        .expect("read the checkpoint procedure");
+    let written = nano_marf::CheckpointProvenance {
+        checkpoint: nano_marf::CheckpointManifest {
+            format: "stacks-core-marf-sqlite-v2".to_owned(),
+            stacks_height: 400,
+            source_state_id: [0x59; 32],
+            state_index_root: nano_primitives::TrieHash::from_bytes([0x34; 32]),
+            first_bitcoin_height: 277,
+        },
+        attestation: Some(nano_node::CheckpointAttestation {
+            attesting_block_id: [0x59; 32],
+            signer_weight: 12,
+            approval_threshold: 9,
+        }),
+    };
+    // Written through the real `record`, so the keys compared are the ones a node
+    // puts on disk rather than the ones a test thought it would.
+    let directory = std::env::temp_dir().join("nano-checkpoint-procedure");
+    let _ = std::fs::remove_dir_all(&directory);
+    written.record(&directory).expect("record provenance");
+    let toml = std::fs::read_to_string(directory.join("checkpoint-provenance.toml"))
+        .expect("read the recorded provenance");
+    let _ = std::fs::remove_dir_all(&directory);
+    let mut checked = 0_usize;
+    for line in toml.lines() {
+        let Some((key, _)) = line.split_once(" = ") else {
+            continue;
+        };
+        assert!(
+            doc.contains(&format!("{key} = ")),
+            "the node writes `{key}` and docs/checkpoint-trust.md does not show it"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} provenance keys were checked");
+}
+
 /// `developer-mode` stays on, deliberately.
 ///
 /// It is in `stacks-common`'s default features, so a stock mainnet node runs

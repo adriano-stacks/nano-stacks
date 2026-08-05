@@ -1,7 +1,7 @@
 ---
 id: "051"
 title: "Enforce checkpoint attestation during startup"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: bug
@@ -30,7 +30,7 @@ Make the documented trust procedure the only production import path.
 - [x] Refuse missing, unsigned, wrong-height, wrong-state or wrong-root inputs.
 - [x] Record provenance in the role's state directory and verify it on restart.
 - [x] Refuse to reuse a directory descended from a different checkpoint.
-- [ ] Keep `docs/checkpoint-trust.md` executable as an operator procedure.
+- [x] Keep `docs/checkpoint-trust.md` executable as an operator procedure.
 
 ## Acceptance Criteria
 
@@ -75,3 +75,13 @@ The `StateId` case is the one worth having. It is what an operator gets wrong by
 copying a configuration, and it is the one that fails silently: the trie imports,
 the root matches, and every block after it is computed against somebody else's
 ancestry.
+
+## The procedure cannot drift from the node any more
+
+`docs/checkpoint-trust.md`'s worked example of `checkpoint-provenance.toml` is the
+part an operator compares their own file against by eye, so a renamed field would
+make the document quietly wrong in exactly the place it is trusted.
+`the_checkpoint_procedure_names_the_fields_the_node_writes` records a provenance
+file through the real `CheckpointProvenance::record`, reads it back, and asserts
+every key it contains appears in the document. Verified non-vacuous by misspelling
+one key in the document and watching it fail.

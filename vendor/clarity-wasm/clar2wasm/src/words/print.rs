@@ -4,6 +4,7 @@ use clarity::vm::{ClarityName, SymbolicExpression};
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
+use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
 use crate::wasm_utils::{signature_from_string, ArgumentCountCheck};
 
@@ -21,7 +22,7 @@ impl ComplexWord for Print {
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
+        expr: &SymbolicExpression,
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
@@ -89,6 +90,24 @@ impl ComplexWord for Print {
         // the locals.
         for val_local in val_locals {
             builder.local_get(val_local);
+        }
+
+        // `if` overwrites both its arms' types with its own, so the value handed
+        // back can be laid out more widely than the callers of this expression
+        // will read it. The event above keeps the argument's own value, which is
+        // what the interpreter prints; only the value left on the stack converts.
+        let expr_ty = generator
+            .get_expr_type(expr)
+            .ok_or_else(|| {
+                GeneratorError::TypeError("print expression must be typed".to_owned())
+            })?
+            .clone();
+        if need_ducktyping(&ty, &expr_ty) {
+            let workspace = match dt_needed_workspace(&expr_ty) {
+                0 => None,
+                size => Some(generator.create_call_stack_bytes(builder, size as i32).0),
+            };
+            generator.duck_type(builder, &ty, &expr_ty, workspace)?;
         }
 
         Ok(())
