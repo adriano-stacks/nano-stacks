@@ -467,6 +467,42 @@ Pinned as `two_tuple_shapes_under_one_if_compile_to_a_loadable_module` in
 `wasm_response_fold`, `#[ignore]`d with the reason, because a red suite teaches
 people to ignore red suites. `cargo test -- --ignored` runs it in 0.01 s.
 
+### Two findings, and why the obvious fix is not the fix
+
+**`If` overwrites both branches' types with its own.** `conditionals.rs` does
+`set_expr_type(true_branch, expr_ty)` and the same for the false branch, so inside
+`Print::traverse` the `print` *expression*'s type is the `if`'s supertype while its
+*argument*'s type is the narrow tuple. `Print` reads only the argument's type, for
+the locals and for the value it pushes back — so it leaves an arm laid out one slot
+short of what the `if` reads. Ducking `print`'s result to the expression's type
+looked like the fix, was tried, and did not work; the change is reverted rather
+than left in on a hunch.
+
+**`need_ducktyping` compares tuples by position and stops at the shorter one.**
+
+```rust
+og_tup_ty.get_type_map().values()
+    .zip(tg_tup_ty.get_type_map().values())
+    .any(|(og, tg)| need_ducktyping(og, tg))
+```
+
+`{ a: uint, b: uint }` against `{ a: uint, b: uint, c: bool }` zips two pairs, finds
+them identical, and answers "no conversion needed" — for two types whose layouts
+differ by a slot. That is a real latent bug worth fixing on its own, and it is
+plainly involved here.
+
+**But widening a tuple is not a representation change.** An arm that produced
+`{ a, b }` has no third field to convert; no layout conversion can invent one. So
+the question underneath is what the `if`'s type *should* be, and whether
+clarity-wasm should be emitting a module here at all. Note that the same `if`
+without `print` is refused by analysis with "Tuples fields should be typed" — and
+that mainnet **accepted this deployment**, so stacks-core's analysis does not refuse
+it. Whatever the interpreter does with a value whose shape depends on the branch
+taken is what clarity-wasm has to reproduce, and that is the thing to establish
+next: run `min1` through the interpreter and see what type and value come back.
+
+That is the honest state. Two named defects, one reduced test, and no fix yet.
+
 ## Two tools this needed, and now has
 
 `xtask decode-blocks` with `NANO_DUMP_DEPLOYS=<dir>` writes out the source of every
