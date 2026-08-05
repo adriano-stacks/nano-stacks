@@ -407,3 +407,49 @@ which is what pointed at the decoder rather than at the oracle or the market.
   `wasm_trait_fold` hold the three found so far.
 - Pin roots, receipts, costs and events for a bounded mainnet regression slice.
 - Record the clarity-wasm and compiler revisions in checkpoint provenance.
+
+## Replay depth 8,666,584, and a fourth bug of the same family
+
+The fee fix carried the replay 863 blocks past 8,665,719. It now stops at
+**8,666,585**, and the cause is localised:
+
+```
+receipt 487356b6…  RuntimeFailure(… "contract analysis failed:
+  SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.rewards-stx-v1 compiles to a module
+  that will not load: type mismatch: expected i64, found i32 (at offset 0x30f8)")
+```
+
+**"expected i64, found i32" is the placeholder-layout signature** — the same
+error 8,667,467's `let`-bound `none` produced, and the same family as the
+fold-over-a-buffer fixed above. A fourth instance, in a contract this block
+*deploys*: mainnet accepted the deployment, clarity-wasm emits a module wasmtime
+refuses to load, so nano turns it into a failed transaction and the block's state
+root differs while every balance in it is right.
+
+Everything else about the block was checked and is correct, which is what makes
+this unambiguous:
+
+- all four account balances match the chain at that height, read from
+  `/extended/v1/address/…/stx?until_block=8666585`;
+- the block's one contract call answers `(ok true)` under both engines and both
+  engines write the **same five keys with the same five values** — so
+  `call-both-tx` with a write trace now compares write *sets*, not just answers;
+- `probe-root` reproduces nano's root from its 16-write journal exactly, and no
+  omission and no reordering reaches the chain's, so it is a value or a missing
+  write rather than a trie or ordering fault.
+
+## The next step, exactly
+
+`rewards-stx-v1` is not in the state — the transaction that deploys it is the one
+that failed — so `check-module` cannot read its source from there. It is in the
+block: extract the `VersionedSmartContract` payload from transaction
+`487356b6823569e5392ef0dbe22aa78b1467cf7c41038324c5b64f84e4fc5aff` of block
+8,666,585 and run `check-module <state> <id> <version> <source-file>`, which
+reproduces the load failure in seconds without executing anything.
+
+The offset `0x30f8` is in the emitted module, and `NANO_DUMP_REFUSED_WASM` writes
+a disassembly beside it, so the failing instruction can be read directly rather
+than inferred. The two fixes already made both narrowed to a *read* that wanted a
+value in a form the binding was not laid out for; this is very likely a third
+position of the same mistake, and `duck_type` is the machinery it should be using
+— see the note above about `visit_atom`.
