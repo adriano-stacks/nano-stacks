@@ -27,6 +27,7 @@ mod coinbase_schedule;
 mod engine_state_roots;
 mod event_delivery;
 mod event_observer;
+mod event_queue;
 mod fork_retraction;
 mod hacknet_replacement;
 mod kill_during_import;

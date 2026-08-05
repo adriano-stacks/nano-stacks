@@ -1,5 +1,5 @@
 mod nakamoto;
-mod signers;
+pub mod signers;
 
 pub use nakamoto::{
     NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, Signer, SignerSet, SignerSetError,
@@ -1361,7 +1361,7 @@ impl ChainState {
             return;
         }
         match signers::active_signer_set(&mut self.vm, context) {
-            Ok(set) => {
+            Ok((set, _)) => {
                 if let Err(error) = set.verify(&block.header) {
                     eprintln!(
                         "block {} at height {} does not carry threshold signer weight: {error:?}",

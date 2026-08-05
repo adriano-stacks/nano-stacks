@@ -33,6 +33,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+axum = "0.8.9"
 proptest = "1.11.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 tempfile = "3.27.0"

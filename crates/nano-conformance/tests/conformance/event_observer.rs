@@ -238,3 +238,129 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
     assert!(transactions > 0, "no receipts were compared");
     assert!(events > 0, "no Clarity events were compared");
 }
+
+/// nano's `proposal_response` payloads against stacks-core's own type.
+///
+/// A signer branches on this payload — it decides whether to sign — and it
+/// decides by deserializing it into `BlockValidateResponse`. So the check is not
+/// that the fields look right but that stacks-core's own reader accepts them and
+/// reads back what nano meant: the tag, the hash, the cost, and the reject code
+/// out of the thirteen it has names for.
+///
+/// The cheapest oracle in the ladder, and the one that matters most here: the
+/// shape is hand-written on nano's side, and a `result` tag or a `reason_code`
+/// spelling that stacks-core cannot parse is a signer that ignores the answer.
+#[test]
+fn a_proposal_verdict_is_read_back_by_stacks_cores_own_reader() {
+    use blockstack_lib::net::api::postblock_proposal::{BlockValidateResponse, ValidateRejectCode};
+
+    let hash = Sha256Sum::from_bytes([7; 32]);
+    let accepted = nano_rpc::proposal_response_payload(
+        hash,
+        &nano_rpc::ProposalOutcome::Accepted {
+            cost: clarity::vm::costs::ExecutionCost {
+                write_length: 1,
+                write_count: 2,
+                read_length: 3,
+                read_count: 4,
+                runtime: 5,
+            },
+            size: 4_096,
+            validation_time_ms: 12,
+        },
+    );
+    match serde_json::from_value(accepted).expect("stacks-core reads nano's acceptance") {
+        BlockValidateResponse::Ok(ok) => {
+            assert_eq!(ok.signer_signature_hash.to_hex(), hash.to_string());
+            assert_eq!(ok.size, 4_096);
+            assert_eq!(ok.validation_time_ms, 12);
+            assert_eq!(ok.cost.runtime, 5);
+            assert_eq!(ok.cost.read_count, 4);
+            assert!(!ok.replay_tx_exhausted);
+            assert_eq!(ok.replay_tx_hash, None);
+        }
+        BlockValidateResponse::Reject(reject) => panic!("read as a rejection: {reject:?}"),
+    }
+
+    // Every code nano can answer with, against the names stacks-core knows. A
+    // code it cannot parse would make the whole verdict unreadable, so this
+    // walks all of them rather than the one the routes happen to use today.
+    for (code, expected) in [
+        (nano_rpc::ProposalRejectCode::BadBlockHash, ValidateRejectCode::BadBlockHash),
+        (nano_rpc::ProposalRejectCode::BadTransaction, ValidateRejectCode::BadTransaction),
+        (nano_rpc::ProposalRejectCode::InvalidBlock, ValidateRejectCode::InvalidBlock),
+        (nano_rpc::ProposalRejectCode::ChainstateError, ValidateRejectCode::ChainstateError),
+        (nano_rpc::ProposalRejectCode::UnknownParent, ValidateRejectCode::UnknownParent),
+        (
+            nano_rpc::ProposalRejectCode::NonCanonicalTenure,
+            ValidateRejectCode::NonCanonicalTenure,
+        ),
+        (nano_rpc::ProposalRejectCode::NoSuchTenure, ValidateRejectCode::NoSuchTenure),
+        (
+            nano_rpc::ProposalRejectCode::InvalidTransactionReplay,
+            ValidateRejectCode::InvalidTransactionReplay,
+        ),
+        (
+            nano_rpc::ProposalRejectCode::InvalidParentBlock,
+            ValidateRejectCode::InvalidParentBlock,
+        ),
+        (nano_rpc::ProposalRejectCode::InvalidTimestamp, ValidateRejectCode::InvalidTimestamp),
+        (
+            nano_rpc::ProposalRejectCode::NetworkChainMismatch,
+            ValidateRejectCode::NetworkChainMismatch,
+        ),
+        (nano_rpc::ProposalRejectCode::NotFoundError, ValidateRejectCode::NotFoundError),
+        (
+            nano_rpc::ProposalRejectCode::ProblematicTransaction,
+            ValidateRejectCode::ProblematicTransaction,
+        ),
+    ] {
+        let payload = nano_rpc::proposal_response_payload(
+            hash,
+            &nano_rpc::ProposalOutcome::Rejected {
+                reason: "because".to_owned(),
+                code,
+            },
+        );
+        match serde_json::from_value(payload).expect("stacks-core reads nano's rejection") {
+            BlockValidateResponse::Reject(reject) => {
+                assert_eq!(reject.reason_code, expected, "{}", code.name());
+                assert_eq!(reject.reason, "because");
+                assert_eq!(reject.signer_signature_hash.to_hex(), hash.to_string());
+                assert_eq!(reject.failed_txid, None);
+            }
+            BlockValidateResponse::Ok(ok) => panic!("read as an acceptance: {ok:?}"),
+        }
+    }
+}
+
+/// The reward set nano serves against the one stacks-core's signer reads.
+///
+/// `/v3/stacker_set` is how a signer learns its own weight and how a node learns
+/// whose signatures to count, and the document is hand-written here too. So the
+/// check is that stacks-core's own `RewardSet` reader takes it.
+#[test]
+fn a_served_reward_set_is_read_back_by_stacks_cores_own_reader() {
+    use blockstack_lib::chainstate::stacks::boot::RewardSet;
+
+    let signers: Vec<RewardSetSigner> = (1..=3_u8)
+        .map(|seed| RewardSetSigner {
+            signing_key: nano_crypto::StacksPrivateKey::from_seed(&[seed])
+                .public_key()
+                .to_bytes_compressed(),
+            stacked_amount: u128::from(seed) * 1_000_000_000,
+            weight: u32::from(seed),
+        })
+        .collect();
+    let document = nano_rpc::stacker_set_payload(&signers, 50_000_000_000);
+
+    let read: RewardSet = serde_json::from_value(document).expect("stacks-core reads the set");
+    let entries = read.signers().expect("the set names its signers").clone();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(read.pox_ustx_threshold(), Some(50_000_000_000));
+    for (entry, signer) in entries.iter().zip(&signers) {
+        assert_eq!(entry.signing_key, signer.signing_key);
+        assert_eq!(entry.weight, signer.weight);
+        assert_eq!(entry.stacked_amt, signer.stacked_amount);
+    }
+}

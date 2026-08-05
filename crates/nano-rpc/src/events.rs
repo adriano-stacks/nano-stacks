@@ -210,6 +210,152 @@ pub fn stackerdb_chunks_payload(contract_id: &str, chunks: &[Chunk]) -> Value {
     })
 }
 
+/// Why a node refused a block proposal (`net/api/postblock_proposal.rs:87`).
+///
+/// A signer branches on this, so the names are stacks-core's: `define_u8_enum!`
+/// derives `Serialize`, which writes the variant name as a bare string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalRejectCode {
+    BadBlockHash,
+    BadTransaction,
+    InvalidBlock,
+    ChainstateError,
+    UnknownParent,
+    NonCanonicalTenure,
+    NoSuchTenure,
+    InvalidTransactionReplay,
+    InvalidParentBlock,
+    InvalidTimestamp,
+    NetworkChainMismatch,
+    NotFoundError,
+    ProblematicTransaction,
+}
+
+impl ProposalRejectCode {
+    /// The name a signer reads this code by.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BadBlockHash => "BadBlockHash",
+            Self::BadTransaction => "BadTransaction",
+            Self::InvalidBlock => "InvalidBlock",
+            Self::ChainstateError => "ChainstateError",
+            Self::UnknownParent => "UnknownParent",
+            Self::NonCanonicalTenure => "NonCanonicalTenure",
+            Self::NoSuchTenure => "NoSuchTenure",
+            Self::InvalidTransactionReplay => "InvalidTransactionReplay",
+            Self::InvalidParentBlock => "InvalidParentBlock",
+            Self::InvalidTimestamp => "InvalidTimestamp",
+            Self::NetworkChainMismatch => "NetworkChainMismatch",
+            Self::NotFoundError => "NotFoundError",
+            Self::ProblematicTransaction => "ProblematicTransaction",
+        }
+    }
+}
+
+/// What a node answers a block proposal with, once it has judged it.
+///
+/// The wire shape is `BlockValidateResponse`, an internally tagged enum on
+/// `result`, so both arms carry `signer_signature_hash` beside a `result` of
+/// `Ok` or `Reject`. The hash is a *bare* hex string here, unlike `new_block`'s
+/// `0x`-prefixed one, because stacks-core serializes the hash type directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalOutcome {
+    /// The node holds this block and stands behind the state it computed.
+    ///
+    /// `cost` zero is not a placeholder: a stock signer reads it as "nothing was
+    /// executed to answer this", because the node already had the block, and
+    /// records a validation time of zero accordingly
+    /// (`stacks-signer/src/v0/signer.rs:1569`).
+    Accepted {
+        cost: ExecutionCost,
+        size: u64,
+        validation_time_ms: u64,
+    },
+    Rejected {
+        reason: String,
+        code: ProposalRejectCode,
+    },
+}
+
+/// Build the `proposal_response` payload a signer waits for after proposing.
+#[must_use]
+pub fn proposal_response_payload(
+    signer_signature_hash: Sha256Sum,
+    outcome: &ProposalOutcome,
+) -> Value {
+    match outcome {
+        ProposalOutcome::Accepted {
+            cost,
+            size,
+            validation_time_ms,
+        } => json!({
+            "result": "Ok",
+            "signer_signature_hash": signer_signature_hash.to_string(),
+            "cost": cost_payload(cost),
+            "size": size,
+            "validation_time_ms": validation_time_ms,
+            "replay_tx_hash": Value::Null,
+            "replay_tx_exhausted": false,
+        }),
+        ProposalOutcome::Rejected { reason, code } => json!({
+            "result": "Reject",
+            "signer_signature_hash": signer_signature_hash.to_string(),
+            "reason": reason,
+            "reason_code": code.name(),
+            "failed_txid": Value::Null,
+        }),
+    }
+}
+
+/// Build the `/v3/stacker_set` document for a reward cycle this node derived.
+///
+/// Shared with the event payload's `reward_set` rather than shaped twice: they
+/// are the same set of signers, and nano's own `SyncClient` parses this document
+/// back, which is what makes a served reward set usable as another node's
+/// checkpoint attestation.
+///
+/// The amounts are JSON numbers, as stacks-core writes them and as nano's own
+/// `SyncClient` reads them back.
+///
+/// The shape is `RewardSetV0`'s, which is the one a document with no
+/// `reward_set_version` is read as. The 4.0 `Waterfall` shape requires
+/// `sbtc_address`, and nano does not derive it: it comes from the sBTC registry's
+/// aggregate public key through the taproot derivation, which nothing reads yet.
+/// A version 1 document without it would not deserialize at all, so this serves
+/// the version every reader accepts rather than claiming a version it cannot
+/// fill.
+#[must_use]
+pub fn stacker_set_payload(signers: &[RewardSetSigner], pox_ustx_threshold: u128) -> Value {
+    json!({
+        "signers": signers
+            .iter()
+            .map(|signer| json!({
+                // Bare hex, no `0x`: stacks-core writes the key type straight
+                // out, and its own reader is not prefix-tolerant.
+                "signing_key": hex::encode(signer.signing_key),
+                "stacked_amt": microstx(signer.stacked_amount),
+                "weight": signer.weight,
+            }))
+            .collect::<Vec<_>>(),
+        "pox_ustx_threshold": microstx(pox_ustx_threshold),
+        // Empty under waterfall, which pays one sBTC output rather than a set of
+        // reward addresses, and so misses no slots either.
+        "rewarded_addresses": Vec::<Value>::new(),
+        "start_cycle_state": { "missed_reward_slots": Vec::<Value>::new() },
+    })
+}
+
+/// A microSTX quantity as a JSON number.
+///
+/// Clarity counts in `u128` and JSON numbers stop at `u64`, which is four orders
+/// of magnitude above the whole STX supply — so this only ever matters for a
+/// quantity that is already impossible, and such a one is reported as absent
+/// rather than truncated into a plausible smaller number or panicked on.
+fn microstx(amount: u128) -> Value {
+    serde_json::Number::from_u128(amount).map_or(Value::Null, Value::Number)
+}
+
 /// Build the `mined_nakamoto_block` payload for a block this node assembled.
 #[must_use]
 pub fn mined_nakamoto_block_payload(

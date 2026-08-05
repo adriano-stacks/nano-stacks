@@ -2585,6 +2585,7 @@ dependencies = [
 name = "nano-conformance"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clarity",
  "hex",
  "libsigner",
