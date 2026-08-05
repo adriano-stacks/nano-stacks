@@ -25,4 +25,4 @@ curl -sS --max-time 120 "$peer/v3/tenures/$tenure" -o "$capture" \
     -w 'captured %{size_download} bytes, status %{http_code}\n'
 
 cargo run -q -p xtask -- decode-blocks "$capture" | tail -3 || true
-NANO_MAINNET_BLOCKS="$capture" cargo test -q -p nano-conformance --test mainnet_codec 2>&1 | tail -20
+NANO_MAINNET_BLOCKS="$capture" cargo test -q -p nano-conformance --test conformance mainnet_codec 2>&1 | tail -20
