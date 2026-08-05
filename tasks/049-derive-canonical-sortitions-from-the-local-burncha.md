@@ -36,7 +36,7 @@ never validation inputs.
       (`vrf_seed`, `burn_block_time`, the burn header hash) still come from the
       peer, because they move state roots.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
-- [ ] Name the winner when several commitments compete: 12 of the captured 14.
+- [x] Name the winner when several commitments compete: all fourteen.
 - [ ] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
       path and replay the affected Stacks tenures.
 
@@ -74,7 +74,7 @@ an operation in the block that follows —
 `(burn_parent_modulus % 5 + 1) % 5 == block_height % 5`. One that arrives late
 is a *missed* commitment: still a transaction, still able to chain its UTXO so
 the mining window survives a gap, but not part of the sortition and not part of
-the hash. `nano_sortition::commit_lands_in_block` is that rule.
+the hash. `nano_sortition::commitment_miss_distance` is that rule.
 
 Two things were ruled out on the way, each by evidence rather than reasoning:
 it is not the waterfall rule, which starts at 962,150 — the cycle *after* pox-5
@@ -255,26 +255,120 @@ step costs a full Bitcoin block download, which is what made the unbounded versi
 of this walk (commit 2ee576b8) so expensive. Bounded per round, so a round that
 runs out keeps what it derived.
 
-## What the winner still needs
+## The winner derives for all fourteen: the mining window is not always six
 
-The winner's identity derives for **12 of the captured 14**, and the two it misses
-— burn 960,230 and 960,233 — both name a different commitment carrying the *same*
-`new_seed`. So the sortition hash still derives; what does not is which miner's
-leader key authorised the tenure, and that is the input
-[[024-verify-the-vrf-seed-a-block-commits-to]] needs.
+The winner's identity used to derive for 12 of the captured 14, and the two it
+missed — burn 960,230 and 960,233 — both named a different commitment carrying the
+*same* `new_seed`, so the sortition hash still derived and only the leader key
+[[024-verify-the-vrf-seed-a-block-commits-to]] needs was wrong. It derives for all
+fourteen now, and `tests/mainnet_sortition.rs` asserts the winner per block rather
+than counting how many it got: `WINNERS_FLOOR` is gone.
 
-The difference is in `make_burn_sample`'s min-median weighting of window slots a
-candidate has no commitment in, which nano fills with 1. A variant that takes the
-median over only the slots a candidate *does* have fixes 960,230 and 960,233 and
-breaks 960,228 — 13 of 14 either way — so neither rule is the network's, and it was
-tried and reverted rather than shipped on a coin flip. That is the next thing to
-close, and `WINNERS_FLOOR` in `tests/mainnet_sortition.rs` is the number that has
-to go up.
+The suspected cause was wrong, and finding that out was the whole of the work.
+The note here said the difference was in `make_burn_sample`'s min-median
+weighting of window slots a candidate has no commitment in — that nano fills with
+1 and that a median over only the occupied slots fixed two blocks and broke a
+third. It is not that. **nano fills empty slots with 1 exactly as stacks-core
+does** (`distribution.rs`: "use 1 as the linked commit min. this gives a miner a
+_small_ chance of winning a block even if they haven't performed chained utxos
+yet"), and the earlier 13-of-14 variant was a coincidence, not a rule.
 
-Until it does, the node publishes the winner's leader key only where the burn
-block leaves no choice — one eligible commitment — and says, per burn block, how
-many competed. Publishing a 12-in-14 answer into a check that *rejects* would
-reject one valid tenure in seven.
+### The oracle that settled it
+
+The distribution is a *pure function of a commitment window*, so stacks-core's own
+`BurnSamplePoint::make_min_median_distribution` can be **called** rather than
+inferred from fourteen recorded winners — the cheapest rung of the oracle ladder,
+and it should have been the first thing built here.
+`mainnet_sortition::the_burn_distribution_matches_stacks_core` converts each
+window and compares candidate order, `burns`, `median_burn`, `frequency` and both
+sortition-range endpoints, per candidate, per block. It reported **exact agreement
+on all fourteen windows** — which is what proved the weighting was never the
+problem and moved the search to what the distribution is computed *over*.
+
+### The rule: an epoch boundary inside the window collapses it to one block
+
+`Burnchain::from_block_ops` windows a sortition over `MINING_COMMITMENT_WINDOW`
+blocks only when three things hold:
+
+```rust
+if !burnchain.is_in_prepare_phase(parent_snapshot.block_height + 1)
+    && !is_after_pox_sunset_end(parent_snapshot.block_height + 1, epoch_id)
+    && (epoch_id < StacksEpochId::Epoch30 || window_start_epoch_id == epoch_id)
+```
+
+where `window_start_epoch_id` is the epoch at `parent_snapshot.block_height -
+MINING_COMMITMENT_WINDOW`, i.e. **seven blocks back**. Otherwise the block is
+weighed alone.
+
+`BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT = 960_230`. Epoch 3.4 ends there and 4.0
+begins there, so for burn 960,230 through 960,236 the epoch seven blocks back is
+3.4 while the epoch at the block is 4.0, and mainnet weighed each of those seven
+sortitions **on its own block alone**. nano weighed them over six. Burn 960,230
+and 960,233 are the two of those seven where a one-block window and a six-block
+window disagree about the winner; 960,231, 960,232 and the three sortition-less
+blocks agreed by luck, which is exactly why a 12-of-14 count named the wrong
+suspect.
+
+A one-block window is not a rougher answer than a six-block one. It changes three
+things at once: each candidate's weight becomes what it actually paid, the
+windowed median becomes the block's own total so the assumed-total-commit
+carryover is always 1 and the null miner can never win, and the minimum mining
+frequency drops to 1.
+
+`nano_sortition::PayoutSchedule::mining_window_at` is that rule, and it needs no
+new configuration: pox-5's activation height *is* epoch 4.0's start
+(`validate_epochs` requires it), so `/v2/pox` already states it. One boundary is
+enough, because a 4.0-only node starting at or after that boundary can never have
+another transition in its window — mainnet's previous one, epoch 3.4 at burn
+943,333, is seventeen thousand blocks back.
+
+### Two more differences the same reading found
+
+**The prepare-phase predicate was off by one.** stacks-core's classic predicate
+(`PoxConstants::static_is_in_prepare_phase`, and it is the classic one both the
+commitment parser and the distribution use) is `reward_index == 0 || reward_index
+> reward_cycle_length - prepare_length`. nano had `offset >= length - prepare`:
+the same window shifted down by one at both ends, so it called the last
+reward-paying block of a cycle a prepare block and the next cycle's "mod 0" block
+a reward block. Invisible in every capture — they all sit deep in a reward phase,
+mainnet's window at offsets 169–183 of 2100 — and wrong twice per cycle forever.
+It decides both how many of a commitment's outputs are payouts and whether the
+window collapses, so it is not cosmetic. `PayoutSchedule::is_in_prepare_phase` is
+now the classic form, with the mod-0 block included on purpose.
+
+**A missed commitment belongs to the sortition it aimed at, not the one it
+arrived in.** stacks-core stores it under `intended_sortition` and reads it back
+with `get_missed_commits_by_intended`, so a window slot holds the misses of the
+block *above* it; nano filed each miss in the block it landed in, one slot too
+high, which lets a chain reach one block further back than the network's does. And
+a miss of more than one block is refused outright
+(`check_intended_sortition` → `BlockCommitMissDistanceTooBig`, because a miner
+able to file arbitrarily late could bunch a whole window into one Bitcoin block
+and skip the six-block warm-up), so its UTXO chains nothing at all —
+`commitment_window_block` now drops it.
+
+The captured window **cannot falsify either half of this**: it holds exactly one
+missed commitment, at burn 960,230, and nothing chains to it, so both placements
+give the same distribution there. That is why
+`a_chain_reaching_through_a_missed_commitment_matches_stacks_core` builds the
+window that does tell them apart — a candidate spending a miss that spends an
+older commitment — and checks it against stacks-core rather than against an
+expectation written down by hand. Under the filing rule the chain is two long;
+under the arrived-in placement it would be three, with a different median.
+
+### What still has to be wired outside this task's files
+
+Two one-line changes in `crates/nano-node/src/lib.rs`, which another agent owns:
+
+- `payout_schedule` must chain `.activating_epoch_four_at(pox.pox_5_activation_height)`
+  — it already reads that field to derive the waterfall height. Without it the node
+  weighs the seven blocks from the 4.0 boundary over six blocks instead of one. It
+  costs nothing today, because the mainnet node stands past burn 960,236, and the
+  prepare-phase collapse (the one that recurs every cycle) needs no new input and
+  is live.
+- The `(candidates == 1)` hedge around `winner_vrf_public_key` can go: the winner
+  derives whether or not the burn block left a choice. `SortitionTracker::candidates`
+  is a report now, not a gate.
 
 ## It keeps pace on mainnet
 

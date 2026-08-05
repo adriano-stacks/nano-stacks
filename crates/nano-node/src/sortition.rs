@@ -138,9 +138,8 @@ impl SortitionTracker {
 
     /// Commitments the burn block at the tip put up for its sortition.
     ///
-    /// One means the block left no choice and its winner follows from the block
-    /// alone; more means the winner came out of the burn distribution. See
-    /// [`SortitionEngine::candidates`].
+    /// Reporting, not a gate: the winner derives whether or not the block left a
+    /// choice. See [`SortitionEngine::candidates`].
     #[must_use]
     pub fn candidates(&self) -> usize {
         self.engine.candidates()
@@ -177,9 +176,13 @@ impl SortitionTracker {
         let commitments =
             commitment_window_block(block, payouts.outputs_at(block.height), &self.keys);
         let txids = accepted_operation_txids(block);
-        Ok(self
-            .engine
-            .append(block, &txids, commitments, self.pox_id.clone())?)
+        Ok(self.engine.append(
+            block,
+            &txids,
+            commitments,
+            self.pox_id.clone(),
+            payouts.mining_window_at(block.height),
+        )?)
     }
 
     /// Walk the burnchain until the chain stands on `target`, or the bound runs
