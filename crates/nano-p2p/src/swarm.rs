@@ -102,11 +102,62 @@ impl Connected {
     fn endpoint(&self) -> Option<String> {
         let handshake = self.session.handshake();
         // An empty `data_url` is what a node with no routable HTTP endpoint sends,
-        // and the RPC service bit is what says it will answer if dialled. Trying
-        // one without either is a guaranteed wasted connection.
-        (!handshake.data_url.is_empty()
-            && handshake.services & crate::wire::services::RPC != 0)
-            .then(|| handshake.data_url.clone())
+        // and the RPC service bit is what says it will answer if dialled. Trying one
+        // without either is a guaranteed wasted connection.
+        if handshake.data_url.is_empty()
+            || handshake.services & crate::wire::services::RPC == 0
+            || !endpoint_is_reachable(&handshake.data_url, self.address)
+        {
+            return None;
+        }
+        Some(handshake.data_url.clone())
+    }
+}
+
+/// Whether an endpoint a peer advertised is one *this* node could plausibly reach.
+///
+/// Mainnet returns `http://10.0.1.37:20443` — a load-balanced node advertising the
+/// address it sees itself at behind its own NAT. Dialling that from here reaches
+/// whatever happens to be at 10.0.1.37 on this machine's network, which is a wasted
+/// connection at best and somebody else's service at worst.
+///
+/// The rule is a comparison rather than a blanket ban, because a private address is
+/// exactly right on a private network: an endpoint may be private if the peer that
+/// advertised it is *also* private, since then this node is on the same network as
+/// it. A public peer advertising a private endpoint is describing something only it
+/// can reach. That keeps Hacknet working without a configuration switch —
+/// stacks-core's equivalent, `connection_opts.private_neighbors`, is a switch, and a
+/// switch is a thing to get wrong.
+fn endpoint_is_reachable(endpoint: &str, peer: PeerAddress) -> bool {
+    // Only an address literal can be judged; a DNS name resolves to whatever it
+    // resolves to, and guessing would reject legitimate hosts.
+    let Some(host) = endpoint
+        .split("//")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .map(|authority| authority.rsplit_once(':').map_or(authority, |(host, _)| host))
+    else {
+        return true;
+    };
+    let Ok(address) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    is_private(address) == is_private(peer.to_ip())
+}
+
+/// Whether an address is one only somebody on the same network can reach.
+///
+/// `IpAddr::is_global` is still unstable, so this is the same set stacks-core's
+/// `PeerAddress::is_in_private_range` checks, plus the unspecified and link-local
+/// addresses that are never a peer's real endpoint either.
+const fn is_private(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.octets()[0] & 0xfe == 0xfc
+        }
     }
 }
 
@@ -420,12 +471,20 @@ impl Swarm {
     }
 
     fn publish(&self) {
+        // De-duplicated, because several peers behind one load balancer advertise
+        // the same endpoint: mainnet returned two copies of one address out of eight
+        // peers. Left in, a pool of "eight" would have had six distinct places to
+        // fetch from, and "no single peer is load bearing" would have been counting
+        // the same peer twice.
+        let mut endpoints: Vec<String> = self
+            .connected
+            .iter()
+            .filter_map(Connected::endpoint)
+            .collect();
+        endpoints.sort_unstable();
+        endpoints.dedup();
         self.discovered.publish(Snapshot {
-            endpoints: self
-                .connected
-                .iter()
-                .filter_map(Connected::endpoint)
-                .collect(),
+            endpoints,
             connected: self.connected.len(),
             known: self.peers.count().unwrap_or(0),
         });
@@ -522,6 +581,38 @@ mod tests {
             peer: Hash160::from_bytes([peer; 20]),
             endpoint: endpoint.map(str::to_owned),
             tenures,
+        }
+    }
+
+    /// A private endpoint is reachable from a private peer and not from a public one.
+    ///
+    /// Mainnet really does advertise `http://10.0.1.37:20443` — a load-balanced node
+    /// naming the address it sees itself at — and a node that fetched from it would
+    /// be dialling its own network.
+    #[test]
+    fn only_a_private_peer_may_advertise_a_private_endpoint() {
+        for (peer, endpoint, reachable) in [
+            ("34.150.184.50", "http://34.150.184.50:20443", true),
+            ("34.150.184.50", "http://10.0.1.37:20443", false),
+            ("34.150.184.50", "http://127.0.0.1:20443", false),
+            ("34.150.184.50", "http://0.0.0.0:20443", false),
+            // On a private network, a private endpoint is the only kind there is.
+            ("10.0.1.5", "http://10.0.1.37:20443", true),
+            ("10.0.1.5", "http://34.150.184.50:20443", false),
+            // A name resolves to whatever it resolves to; guessing would reject
+            // legitimate hosts.
+            ("34.150.184.50", "https://node.example.com/", true),
+            ("34.150.184.50", "http://node.example.com:20443/v2/info", true),
+            ("34.150.184.50", "http://[2001:db8::1]:20443", true),
+            ("34.150.184.50", "http://[::1]:20443", false),
+            ("34.150.184.50", "http://[fc00::1]:20443", false),
+        ] {
+            let address = PeerAddress::from_ip(peer.parse().expect("an address"));
+            assert_eq!(
+                endpoint_is_reachable(endpoint, address),
+                reachable,
+                "{peer} advertising {endpoint}"
+            );
         }
     }
 
