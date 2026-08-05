@@ -414,6 +414,21 @@ pub trait ChainContext: BurnStateDB + HeadersDB {}
 
 impl<T: BurnStateDB + HeadersDB> ChainContext for T {}
 
+/// How many executed headers stay in memory before the store answers instead.
+///
+/// The store is authoritative; this only saves a query for a block the run just
+/// sealed, and a replay asks about its own recent ancestry. Generous enough to
+/// cover a whole tenure and everything a `get-stacks-block-info?` in it is likely
+/// to reach back for.
+const HEADERS_CACHED: usize = 1024;
+
+/// The same, for the burn block at a height.
+///
+/// `BURN_HEADER_WINDOW` re-seeds 32 behind the tip and an sBTC withdrawal may
+/// name a deeper one; both are covered by the fall-through, so this is a size
+/// rather than a horizon.
+const BURN_HEADERS_CACHED: usize = 512;
+
 /// Bitcoin state and executed headers available while evaluating.
 #[derive(Debug, Default)]
 struct BitcoinContext {
@@ -430,7 +445,15 @@ struct BitcoinContext {
     pox_5_activation_height: u32,
     /// Headers this node has executed, which a query consults before the
     /// store — a block being executed is asked about before it is written.
+    ///
+    /// A cache, bounded, and safe to bound because every reader falls through to
+    /// the store on a miss. Unbounded it grew one entry per block for as long as
+    /// the node ran.
     headers: BTreeMap<[u8; 32], RecordedHeader>,
+    /// The order `headers` was filled in, so the oldest entry can be dropped.
+    /// A block identifier is a hash, so the map's own ordering says nothing
+    /// about which entry is stalest.
+    header_order: std::collections::VecDeque<[u8; 32]>,
     /// Every block this node knows about, including the checkpoint's ancestry.
     headers_db: Option<Mutex<rusqlite::Connection>>,
     /// The block index, to tell a block this node never carried a header for
@@ -615,6 +638,7 @@ static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     index_db: None,
     tenure_starts: BTreeMap::new(),
     burn_headers: BTreeMap::new(),
+    header_order: std::collections::VecDeque::new(),
 };
 
 impl BitcoinContext {
@@ -1382,7 +1406,21 @@ impl Vm {
                 .burn_headers
                 .insert(header.burn_block_height, header.burn_header_hash);
         }
-        self.context.headers.insert(block, recorded);
+        if self.context.headers.insert(block, recorded).is_none() {
+            self.context.header_order.push_back(block);
+        }
+        while self.context.header_order.len() > HEADERS_CACHED {
+            if let Some(stalest) = self.context.header_order.pop_front() {
+                self.context.headers.remove(&stalest);
+            }
+        }
+        // Keyed by height, so the map's own order *is* staleness here.
+        while self.context.burn_headers.len() > BURN_HEADERS_CACHED {
+            let Some(oldest) = self.context.burn_headers.keys().next().copied() else {
+                break;
+            };
+            self.context.burn_headers.remove(&oldest);
+        }
     }
 
     /// Seal a block together with everything that describes it.

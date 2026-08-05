@@ -39,7 +39,7 @@ hundreds of failed attempts.
       [[057-commit-and-recover-accepted-block-state-atomically]].
 - [x] Resume after an orderly process stop without refetching or re-executing
       sealed blocks.
-- [ ] Bound caches, response bodies and in-memory ancestry independently of
+- [x] Bound caches, response bodies and in-memory ancestry independently of
       distance from tip or peer-controlled response size.
 - [ ] Test gaps spanning long tenures and multiple tenures with deterministic
       429s, short pages, tip movement and a restart after every chunk boundary.
@@ -175,3 +175,36 @@ The two items still open are the memory bounds — `TenureAccounting::earnings` 
 `BitcoinContext::headers` both grow with the chain — and a deterministic harness
 for rate limits and short pages, which the live mainnet run exercises and no test
 pins.
+
+## The three things that grew with the chain
+
+All three were in-memory structures with no relationship to distance from the
+tip, and one of them was also a **per-block cost**, which is what makes this a
+throughput item and not only a leak.
+
+**`TenureAccounting::earnings`** is serialized into the chain ledger with every
+block, so letting it grow meant a write that got slower forever — about 130 bytes
+a tenure, and mainnet adds a tenure every ten minutes. Bounded at 201, which is
+the deepest read (`matured - 1`, 101 below the tip) plus a full maturity window of
+margin, and the same 201 a checkpoint has to carry. Not a coincidence: both
+numbers are "what a node can still be asked to pay". Pruning the bottom is safe
+because every reader counts down from the top, and a tenure's `block_reward`
+outlives the map in the header store, which records it when the block is sealed.
+
+**`BitcoinContext::headers`** and **`burn_headers`** are caches in front of the
+side store, consulted because a block being executed is asked about before it is
+written. Both fall through to the store on a miss, which is what makes bounding
+them safe rather than merely smaller. `headers` is keyed by block identifier — a
+hash — so the map's own ordering says nothing about staleness and the insertion
+order is kept beside it; `burn_headers` is keyed by height, where it does.
+
+**The test asserts both halves, deliberately.** A bound that let the map grow
+would pass a loosely written length assertion, and a bound that pruned what
+`effects_for_tenure` reaches would pass a tightly written one — so
+`earnings_are_bounded_and_a_payout_still_resolves` walks a thousand tenures past
+the cap and *then* asks for the payout at the top, which reads 101 down, and
+checks the span a startup validation reads is still long enough to judge.
+
+Writing it caught something worth recording: the expectation was drafted on the
+pre-8,673,846 fee rule and the test refused it. The second credit's amount and
+recipient both come from `earnings[matured - 1]`, and the tree is right.
