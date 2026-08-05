@@ -163,3 +163,24 @@ Found while making a rejected block's rollback structural
 fix belongs: persist the whole ledger with the seal rather than beside it. Until
 then a restarting node reports that it cannot check the seed, which is at least
 audible — but the window is far wider than this task claimed.
+
+## Fixed: the parent proof is committed with the block that produced it
+
+`ChainLedger` is now written down in the same transaction that commits the seal
+([[057]]), so `parent_tenure_proof` comes back with the tip and the committed-seed
+half of the check runs from the first tenure after a restart. The window is again
+what this task originally claimed — the first tenure after a *checkpoint* — plus
+one more, honestly named: the first tenure after resuming a state directory
+written before ledgers were committed, which has none to read. Both messages now
+say so.
+
+The other message was wrong too and is corrected. It said an absent leader key
+meant the registration predated the burnchain window this node holds; the real
+reason, since [[049]], is that the node could not name which of the burn block's
+commitments won, which needs the burn distribution's min-median weighting. That
+remains the last thing this task needs, and it is 049's work rather than this
+one's.
+
+Still true and untouched: `nano-miner`'s
+`hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
+block header hash where it should match on the txid.

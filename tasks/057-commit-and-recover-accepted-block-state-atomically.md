@@ -32,15 +32,15 @@ accounting into the second half. It does not establish crash consistency.
 
 - [x] Enumerate and document the durability boundary for every store changed by
       an accepted block.
-- [ ] Add the smallest commit journal or equivalent recovery protocol that can
+- [x] Add the smallest commit journal or equivalent recovery protocol that can
       distinguish prepared, accepted and fully durable blocks.
-- [ ] Propagate header, metadata and accounting write failures to the block
+- [x] Propagate header, metadata and accounting write failures to the block
       commit instead of logging and continuing.
-- [ ] Make startup complete or roll back an interrupted commit idempotently
+- [x] Make startup complete or roll back an interrupted commit idempotently
       before exposing an executed tip.
-- [ ] Inject a failure after every commit boundary and reopen the state for each
+- [x] Inject a failure after every commit boundary and reopen the state for each
       case.
-- [ ] Exercise hard process termination during catch-up, tenure transition and
+- [x] Exercise hard process termination during catch-up, tenure transition and
       restart, not only an orderly drop/reopen.
 
 ## Acceptance Criteria
@@ -103,21 +103,86 @@ root, the parent link and the header all survived together. The rejection test i
 [[056]] asserts the other side: neither the header nor the block state is there
 for a block that failed.
 
-## What remains, and where it has to go
+## The protocol that landed: prepare, then decide
 
-None of this can be finished inside `nano-chainstate`; the stores are not its.
+Two boundaries, not five, and the second one *is* the decision. `Vm::commit_block`
+takes the header and the encoded ledger and does exactly this:
 
-- **One transaction for rows 1–3, and 5 with them.** The natural shape is to
-  persist the whole `ChainLedger` as a row in the side store, written inside
-  `flush_metadata`'s transaction, so "the ledger is as of the tip" is an
-  invariant rather than a hope, and to retire `accounting.json`. That needs a
-  `nano-vm` API for a caller-supplied blob committed with the seal, a
-  `Serialize`/`Deserialize` ledger here, and `nano-node` to stop writing the file.
-  It also fixes row 6 for free.
-- **Returning write failures.** `Vm::record_block_header` returns `()` and prints
-  on failure; `flush_metadata`'s error is returned but only from inside `seal_to`,
-  after the MARF has already committed. Both are `nano-vm`.
-- **Completing or rolling back an interrupted commit at startup.** Depends on the
-  journal above; belongs with whoever owns the open path in `nano-node`.
-- **Kill tests.** Hard termination at each boundary is a `nano-node` or
-  `nano-conformance` harness, not a unit test: it needs a process to kill.
+1. one side-store transaction carrying the block's Clarity metadata, its
+   `block_header` row and its `chain_ledger` row, committed with
+   `synchronous = FULL` for that transaction only;
+2. `marf.seal_to`, which is one SQLite transaction of its own.
+
+The MARF commit is last and atomic, so a block is in the MARF **only if**
+everything describing it is already on disk. There is no journal because there is
+nothing to reconcile: a crash in the window leaves rows keyed by a block the MARF
+never got, and the only way to read them is to stand on that block. Startup
+therefore neither completes nor rolls anything back — it reads the ledger for the
+block it resumes at and that ledger is the one that block sealed.
+
+The whole ledger is one row rather than four because these four fields are only
+ever meaningful together and as of one block; separate rows would be four ways to
+be a block apart from each other, which is the bug. The one field Clarity queries
+*by key* during execution — the tenure-start map — is not a second row either: it
+is restored from the same blob into the map the VM already answers from, so there
+is one writer and one reader.
+
+`synchronous = FULL` for the prepare is what makes the ordering an ordering on
+disk. At the store's usual `NORMAL` a power cut could keep the MARF commit and
+lose the ledger row — precisely the sealed root with a ledger a block behind that
+the ordering exists to prevent. It costs one fsync per block, and it is switched
+back afterwards because every Clarity value write is its own autocommit and there
+are thousands to a block.
+
+Also landed:
+
+- `Vm::record_block_header` returns its error instead of printing it, and so do
+  `ChainState::backfill_ancestor_header` and `record_burn_header`. A header a
+  later block reads through is not optional.
+- Burn headers are persisted (`burn_header` table). They were memory-only, so a
+  restart answered `none` for any burn block outside the 32-block window it
+  re-seeded, where the run before it answered a hash — an sBTC withdrawal naming
+  a deeper one is rejected on a chain that accepted it.
+- `accounting.json` is no longer written. It is still read, once, for a state
+  directory that predates this: the message says exactly what such a run cannot
+  do, and the first block it seals writes a ledger.
+- `ChainLedger::executed` is bounded at `REORG_REACH` (256), matching
+  `nano-node`'s `RESUME_ANCESTORS`. It used to grow with uptime, and it is now
+  serialized on every block.
+
+### Verification
+
+- `nano-vm`: `a_crash_between_the_two_boundaries_leaves_the_parent_and_its_ledger`
+  prepares a child and stops exactly where a SIGKILL would land, then reopens: the
+  tip is the parent and the ledger is the parent's.
+- `nano-conformance`: `kill_during_replay` spawns `replay-blocks`, waits for it to
+  seal its first block, sleeps a scattered 0–80 ms and sends **SIGKILL**, then
+  reopens and compares all four ledger fields and the sealed content root against
+  an uninterrupted run at the same block — 20 kills a run. The first version killed
+  on a wall-clock delay alone and was wrong: as the state grew, reopening it took
+  longer than the delay, so the later kills all landed during the open and sealed
+  nothing. Waiting for the first sealed block is what makes every kill land inside
+  the replay.
+- `nano-conformance`: `restart.rs` no longer carries the accounting across by hand.
+  A test that hands the state over cannot catch the fields nobody thought to hand
+  over.
+
+### Still open
+
+- **A killed checkpoint import is still unrecoverable.** The import runs with
+  journalling off, and `open_from_checkpoint` decides it has already imported when
+  `marf_block` holds any row — so a process killed mid-import resumes on a partial
+  trie, and the provenance file was written before the import even started. The
+  kill test lets its first run finish for that reason. This is import atomicity
+  rather than block commit atomicity, and it belongs with [[051]].
+- **`xtask rebuild-accounting` repairs `accounting.json`, which the node now only
+  reads during migration.** After a state has sealed one block under this change,
+  the tool's correction is ignored. Either it has to write the ledger row or the
+  repair path has to be "remove the ledger rows, then run it".
+- **`TenureAccounting::earnings` is still unbounded**, so the ledger blob grows by
+  about 130 bytes a tenure (13 KB on the real mainnet state today) and is now
+  written per block. Nothing older than the maturity window is read, so it could be
+  pruned; that changes payout derivation, so it wants its own change and its own
+  test.
+- **`BitcoinContext::headers` keeps every header this process recorded in memory as
+  well as on disk.** Bounded by uptime rather than by anything that reads it.
