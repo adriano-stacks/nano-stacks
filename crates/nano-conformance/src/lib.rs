@@ -1633,6 +1633,40 @@ mod tests {
             "a checkpoint root the signed header does not carry was accepted"
         );
 
+        // A checkpoint claiming a height the signed header is not at. The root
+        // and the state id would still agree, so nothing but this check stands
+        // between an operator and a state imported at the wrong height.
+        let wrong_height = nano_marf::CheckpointManifest {
+            stacks_height: manifest.stacks_height + 1,
+            ..manifest.clone()
+        };
+        assert!(
+            matches!(
+                attest_checkpoint(&wrong_height, &block.header, &signers),
+                Err(CheckpointTrustError::Height { .. })
+            ),
+            "a checkpoint at a height the signed header is not at was accepted"
+        );
+
+        // A checkpoint naming a state the signed header does not identify. This
+        // is the one an operator is most likely to get wrong by copying a
+        // configuration, and the one that silently builds on someone else's
+        // chain: the trie would import, the root would match, and every block
+        // after it would be computed against the wrong ancestry.
+        let mut wrong_state = manifest.source_state_id;
+        wrong_state[0] ^= 0x01;
+        let wrong_state = nano_marf::CheckpointManifest {
+            source_state_id: wrong_state,
+            ..manifest.clone()
+        };
+        assert!(
+            matches!(
+                attest_checkpoint(&wrong_state, &block.header, &signers),
+                Err(CheckpointTrustError::StateId { .. })
+            ),
+            "a checkpoint naming a state the signed header does not identify was accepted"
+        );
+
         let mut header = block.header;
         header.signer_signatures.clear();
         assert!(

@@ -27,7 +27,7 @@ Make the documented trust procedure the only production import path.
 - [x] Add configuration for the checkpoint manifest, attesting header and a
       reward set obtained independently of the checkpoint.
 - [x] Call `adopt_checkpoint` before any imported state is opened or copied.
-- [ ] Refuse missing, unsigned, wrong-height, wrong-state or wrong-root inputs.
+- [x] Refuse missing, unsigned, wrong-height, wrong-state or wrong-root inputs.
 - [x] Record provenance in the role's state directory and verify it on restart.
 - [x] Refuse to reuse a directory descended from a different checkpoint.
 - [ ] Keep `docs/checkpoint-trust.md` executable as an operator procedure.
@@ -56,3 +56,22 @@ behind it, which is what makes one trustworthy. A directory that already carries
 provenance is not re-adopted, and refuses to be reused for a different
 checkpoint — its trie stands on the first one's state, and nothing later would
 notice.
+
+## All five refusals now have a test
+
+`attest_checkpoint` refused all five already; three of them had nothing proving
+it. `a_signed_header_attests_the_checkpoint_it_sealed` now tampers each input in
+turn and asserts the specific error:
+
+| tampered | refused with |
+|---|---|
+| `state_index_root` | `StateRoot` |
+| `stacks_height` | `Height` |
+| `source_state_id` | `StateId` |
+| the header's signatures | `Signers` |
+| the attesting block or reward set absent | `runtime::adopt` returns before anything is opened |
+
+The `StateId` case is the one worth having. It is what an operator gets wrong by
+copying a configuration, and it is the one that fails silently: the trie imports,
+the root matches, and every block after it is computed against somebody else's
+ancestry.
