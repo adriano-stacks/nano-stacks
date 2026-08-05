@@ -29,7 +29,7 @@ strands it.
 
 - [x] Implement a `PeerPool` that can gather candidate tips, rank them
       deterministically and distrust a peer that serves invalid data.
-- [ ] Wire the production runtime and `catch_up` to poll that pool instead of
+- [x] Wire the production runtime and `catch_up` to poll that pool instead of
       selecting the first reachable HTTP peer and constructing one
       `SyncClient`.
 - [ ] Choose between candidates using enforced signer authentication and the
@@ -148,3 +148,27 @@ acceptance criteria pass end to end. [[054-join-and-synchronize-over-the-stacks-
 will replace hosted HTTP transport, but it must feed this same locally
 authenticated selection boundary rather than becoming another single source of
 truth.
+
+## The runtime polls the pool now
+
+`reachable_peer` no longer takes the first configured HTTP peer that answers.
+`follow_pool` builds a `PeerPool` from the configured endpoints *and* the ones
+[[054-join-and-synchronize-over-the-stacks-p2p-network]] discovers over p2p, and
+`better_peer` re-weighs it whenever a round is let down — through
+`PeerPool::choose_source`, which compares a tip on signer weight and length from
+headers this node fetched rather than on a peer's claim about its own height.
+
+`node.peers` may now be empty: mainnet falls back to stacks-core's public
+bootstrap nodes, so the peers a node follows are found rather than configured, and
+no one of them is anybody's product. That is the part of this task that was about
+liveness and censorship rather than about forks.
+
+**What that does not yet close.** The two remaining items are the ones that need
+the *validated* boundary rather than the transport: choosing between candidates on
+enforced signer authentication (which waits on
+[[050-authenticate-every-followed-nakamoto-block]], and on mainnet reaching
+epoch 4.0 before a pox-5 reward set exists to enforce against), and a test that
+runs two simultaneous peers through the production runtime with one of them
+stale, withholding or lying. `nano-p2p`'s `loopback.rs` isolates a peer that
+signs with the wrong key and one on the wrong network; a peer that serves a
+plausible but wrong *chain* through the follow path is the case still missing.
