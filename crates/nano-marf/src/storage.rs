@@ -43,8 +43,19 @@ CREATE TABLE IF NOT EXISTS marf_node_staging (
 ";
 
 /// How many trie nodes and block records stay resident per cache generation.
-const NODE_CACHE: usize = 20_000;
-const BLOCK_CACHE: usize = 4_096;
+///
+/// Measured rather than chosen. A mainnet replay reads about 225,000 database
+/// pages *per block* — 900 MB of `rchar` against a 30 GB `marf.sqlite` and a 2 GB
+/// page cache — because a MARF lookup walks back-pointers into ancestor states and
+/// a checkpointed node has 8.6 million ancestors. At 20,000 per generation the
+/// cache held under a fifth of one block's working set and thrashed on every
+/// block, so the same nodes were decoded again for each of them.
+///
+/// Nodes are small — a leaf or a Node4 is a couple of hundred bytes, and only a
+/// Node256 approaches 1.5 KB — so 250,000 per generation is a few hundred
+/// megabytes at worst for a structure the whole replay reads out of.
+const NODE_CACHE: usize = 250_000;
+const BLOCK_CACHE: usize = 65_536;
 
 const LEAF_RECORD: u8 = 0;
 const INTERNAL_RECORD: u8 = 1;
@@ -109,6 +120,8 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
 pub struct TrieStorage {
     connection: Connection,
     nodes: RefCell<Cache<(u32, u32), Arc<TrieNode>>>,
+    /// Node hashes, which are read with the fanout of the trie while sealing.
+    node_hashes: RefCell<Cache<(u32, u32), TrieHash>>,
     blocks: RefCell<Cache<MarfBlockId, BlockRecord>>,
     hashes: RefCell<Cache<u32, MarfBlockId>>,
     /// Whether nodes are being staged for a checkpoint import.
@@ -171,6 +184,7 @@ impl TrieStorage {
         Ok(Self {
             connection,
             nodes: RefCell::new(Cache::new(NODE_CACHE)),
+            node_hashes: RefCell::new(Cache::new(NODE_CACHE)),
             blocks: RefCell::new(Cache::new(BLOCK_CACHE)),
             hashes: RefCell::new(Cache::new(BLOCK_CACHE)),
             staging: std::cell::Cell::new(false),
@@ -267,14 +281,27 @@ impl TrieStorage {
         Ok(node)
     }
 
+    /// A node's hash, cached for the same reason the node is.
+    ///
+    /// Sealing a block hashes every node on every path it touched, and each of
+    /// those preimages needs *every sibling's* hash — so this is read with the
+    /// fanout of the trie, thousands of times a block, and it was the one read on
+    /// the path with no cache at all. A hash is immutable per `(block, index)`
+    /// exactly as the node is: a state is addressed by the block that sealed it,
+    /// so nothing ever rewrites one.
     pub(crate) fn node_hash(&self, block: u32, index: u32) -> Result<TrieHash, MarfError> {
+        if let Some(hash) = self.node_hashes.borrow_mut().get(&(block, index)) {
+            return Ok(hash);
+        }
         let hash: Option<Vec<u8>> = self
             .connection
             .prepare_cached("SELECT hash FROM marf_node WHERE block = ?1 AND idx = ?2")?
             .query_row(params![block, index], |row| row.get(0))
             .optional()?;
         let hash = hash.ok_or_else(|| missing(&format!("trie node {block}/{index}")))?;
-        Ok(TrieHash::from_bytes(block_id(&hash)?))
+        let hash = TrieHash::from_bytes(block_id(&hash)?);
+        self.node_hashes.borrow_mut().insert((block, index), hash);
+        Ok(hash)
     }
 
     /// Reserve a state's row before its nodes are written, so the nodes can
@@ -383,6 +410,10 @@ impl TrieStorage {
     /// addressing rows the database no longer holds.
     pub(crate) fn forget(&self) {
         *self.nodes.borrow_mut() = Cache::new(NODE_CACHE);
+        // Not optional: a rolled-back write leaves this addressing rows the
+        // database no longer holds, and a stale *hash* is worse than a stale node
+        // because it goes straight into a parent's preimage and moves a root.
+        *self.node_hashes.borrow_mut() = Cache::new(NODE_CACHE);
         *self.blocks.borrow_mut() = Cache::new(BLOCK_CACHE);
         *self.hashes.borrow_mut() = Cache::new(BLOCK_CACHE);
     }

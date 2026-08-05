@@ -76,6 +76,14 @@ pub struct NativeStxCredit {
 /// Number of sortition-created tenures before a miner reward matures.
 pub const MINER_REWARD_MATURITY: u64 = 100;
 
+/// How many tenures' earnings are kept.
+///
+/// The deepest read is `matured - 1`, 101 below the tip, so this is that plus a
+/// full maturity window of margin — and it is the same 201 a checkpoint has to
+/// carry, which is not a coincidence: both numbers are "what a node can still be
+/// asked to pay".
+const EARNINGS_KEPT: u64 = 2 * MINER_REWARD_MATURITY + 1;
+
 /// What a tenure earned for the recipient it pays once it matures.
 ///
 /// Both halves go to the same recipient — this tenure's — but not in the same
@@ -402,6 +410,7 @@ impl TenureAccounting {
     /// are only knowable from the node that produced the checkpoint.
     pub fn seed_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
         self.earnings.insert(coinbase_height, earnings);
+        self.forget_earnings_nothing_can_read();
     }
 
     /// Record a tenure whose start block was executed here.
@@ -469,6 +478,36 @@ impl TenureAccounting {
     pub fn record_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
         self.earnings.insert(coinbase_height, earnings);
         self.started = Some(coinbase_height);
+        self.forget_earnings_nothing_can_read();
+    }
+
+    /// Drop tenures no payout, no check and no header can still ask for.
+    ///
+    /// This map is serialized into the chain ledger with **every** block, so
+    /// letting it grow with the chain is not only a leak — it is a per-block cost
+    /// that rises forever. About 130 bytes a tenure, and mainnet adds one every
+    /// ten minutes.
+    ///
+    /// [`EARNINGS_KEPT`] is what the deepest reader needs plus a full maturity
+    /// window of margin. `effects_for_tenure` reaches `matured - 1`, which is 101
+    /// below the tip, so 102 would be correct and 201 leaves
+    /// `known_earnings_span` a window it can still judge — the whole point of
+    /// that span is to refuse a state that cannot pay, and a span pruned to the
+    /// bone would report "exactly enough" for a state that is one tenure from
+    /// failing.
+    ///
+    /// Pruning the *bottom* is safe because every reader counts down from the
+    /// top: a payout from `coinbase_height`, the contiguous span, `add_fees` and
+    /// `reward_for_tenure` on the tenure being executed. A tenure's
+    /// `block_reward` outlives this map in the header store, which records it
+    /// when the block is sealed.
+    fn forget_earnings_nothing_can_read(&mut self) {
+        while self.earnings.len() as u64 > EARNINGS_KEPT {
+            let Some(oldest) = self.earnings.keys().next().copied() else {
+                break;
+            };
+            self.earnings.remove(&oldest);
+        }
     }
 
     /// Add the fees a block paid to the tenure that mined it, which only counts
@@ -3535,6 +3574,64 @@ mod tests {
     /// captured chain on its own is a weak witness for the fee bug: nothing
     /// moves either way. Recording earnings for tenure 120 is what a tenure-start
     /// block does, and it is what makes the fees below actually land.
+    /// The earnings map stays bounded, and the bound does not break a payout.
+    ///
+    /// Both halves matter. A bound that let the map grow would pass a length
+    /// assertion written loosely, and a bound that pruned what
+    /// `effects_for_tenure` reaches would pass a length assertion written
+    /// tightly — so this walks a thousand tenures past the cap and then asks for
+    /// the payout at the top, which reads 101 tenures down.
+    #[test]
+    fn earnings_are_bounded_and_a_payout_still_resolves() {
+        let who = |n: u64| {
+            PrincipalData::parse(if n.is_multiple_of(2) {
+                "ST000000000000000000002AMW42H"
+            } else {
+                "ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"
+            })
+            .expect("a principal")
+        };
+        let mut accounting = TenureAccounting::default();
+        for height in 1..=1_200 {
+            accounting.record_earnings(
+                height,
+                TenureEarnings {
+                    recipient: who(height),
+                    coinbase: 1_000,
+                    fees: height.into(),
+                },
+            );
+            assert!(
+                accounting.earnings.len() as u64 <= crate::EARNINGS_KEPT,
+                "the map grew past its bound at tenure {height}"
+            );
+        }
+
+        // The deepest read: 1,200 matures 1,100, whose coinbase goes to its own
+        // recipient — and tenure 1,099's *own* fees go to 1,099's recipient,
+        // which is the phase the mainnet divergence at 8,673,846 was about. Both
+        // halves of that credit come from the same entry, 101 below the tip, so
+        // this is what the bound has to keep reachable.
+        let effects = accounting
+            .effects_for_tenure(Network::MAINNET, 1_200)
+            .expect("the payout at the top still resolves");
+        assert_eq!(effects.credits.len(), 2);
+        assert_eq!(effects.credits[0].amount, 1_000);
+        assert_eq!(effects.credits[0].recipient, who(1_100));
+        assert_eq!(effects.credits[1].amount, 1_099);
+        assert_eq!(effects.credits[1].recipient, who(1_099));
+
+        // And the span a startup check reads is still long enough to judge.
+        let (first, last) = accounting
+            .known_earnings_span()
+            .expect("the span is still there");
+        assert_eq!(last, 1_200);
+        assert!(
+            last - first >= crate::MINER_REWARD_MATURITY,
+            "the bound left a window too short to check: {first}..{last}"
+        );
+    }
+
     fn accounting_counting_fees() -> TenureAccounting {
         let mut accounting = TenureAccounting::default();
         accounting.record_earnings(

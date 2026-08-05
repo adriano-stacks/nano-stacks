@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
@@ -16,6 +18,7 @@ fn main() -> ExitCode {
     let command = env::args().nth(1);
     match command.as_deref() {
         Some("scoreboard") => print_scoreboard(),
+        Some("release-report") => release_report(&env::args().skip(2).collect::<Vec<_>>()),
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
@@ -45,7 +48,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -3809,4 +3812,494 @@ fn archived_payment(
     let coinbase = parse_u128("archived coinbase", fields.next())?;
     let anchored = parse_u128("archived anchored fees", fields.next())?;
     Ok(Some((recipient, coinbase, anchored)))
+}
+
+// ─── the release report ────────────────────────────────────────────────────────
+//
+// Everything below serves `cargo xtask release-report`, which is the last item of
+// tasks/053: "publish the exact commands, versions, checkpoint provenance and
+// resulting conformance report".
+//
+// Written as a command rather than a document, because a document is a claim and
+// a command is a measurement. The distinction the report exists to make is the
+// one tasks/053 puts at its centre: **a suite where every mainnet test skipped
+// looks identical to one where every mainnet test passed**. So the report does
+// not parse skip lines and guess. It runs the conformance suite with
+// `NANO_REQUIRE_MAINNET` set, which turns every `skip_gate` into a panic, and a
+// green run under that variable is by construction a run in which every gate
+// executed.
+
+/// Where the workspace root is, from xtask's manifest.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask sits in the workspace root")
+        .to_path_buf()
+}
+
+/// Run a command in the workspace and give back its trimmed stdout.
+fn captured(program: &str, arguments: &[&str]) -> String {
+    let Ok(output) = Command::new(program)
+        .args(arguments)
+        .current_dir(workspace_root())
+        .output()
+    else {
+        return "unknown".to_owned();
+    };
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    } else {
+        "unknown".to_owned()
+    }
+}
+
+/// One row of the report's gate table.
+struct GateResult {
+    command: String,
+    passed: bool,
+    detail: String,
+}
+
+/// Run one gate and summarize what it said.
+///
+/// The summary is taken from libtest's own `test result:` line where there is
+/// one and from the last line of output otherwise, so a gate that failed to
+/// *build* cannot be reported as a gate that passed.
+fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> GateResult {
+    let mut printed = String::new();
+    for (name, value) in environment {
+        let _ = write!(printed, "{name}={value} ");
+    }
+    let _ = write!(printed, "{command} {}", arguments.join(" "));
+
+    let mut process = Command::new(command);
+    process.args(arguments).current_dir(workspace_root());
+    for (name, value) in environment {
+        process.env(name, value);
+    }
+    let Ok(output) = process.output() else {
+        return GateResult {
+            command: printed,
+            passed: false,
+            detail: format!("{command} could not be started"),
+        };
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Every `test result:` line, because one cargo invocation over several
+    // packages prints one per test binary.
+    let results: Vec<&str> = combined
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("test result: "))
+        .collect();
+    let mut detail = if results.is_empty() {
+        combined
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("no output")
+            .trim()
+            .to_owned()
+    } else {
+        results.join("; ")
+    };
+    if !output.status.success() {
+        let (unrunnable, broken) = classify_failures(&combined);
+        if !unrunnable.is_empty() {
+            let total: usize = unrunnable.values().map(Vec::len).sum();
+            let _ = write!(
+                detail,
+                "\n           {total} gate(s) could not run, so the run is not \
+                 evidence for them:"
+            );
+            for (reason, tests) in &unrunnable {
+                let _ = write!(detail, "\n             {} × {reason}", tests.len());
+                for test in tests {
+                    let _ = write!(detail, "\n                 {test}");
+                }
+            }
+        }
+        if !broken.is_empty() {
+            let _ = write!(
+                detail,
+                "\n           {} gate(s) ran and FAILED: {}",
+                broken.len(),
+                broken.join(", ")
+            );
+        }
+    }
+    GateResult {
+        command: printed,
+        passed: output.status.success(),
+        detail,
+    }
+}
+
+/// Split a failing test run into gates that could not run and gates that broke.
+///
+/// The whole point of `NANO_REQUIRE_MAINNET` is that a gate whose fixture is
+/// absent must not report itself green — so under it, an absent fixture arrives
+/// as a *failure*, and a report that stopped there would say the same thing about
+/// a missing environment variable as about a wrong state root. `skip_gate`'s
+/// panic message is distinctive, so the two are separable: unrunnable gates are
+/// grouped by the reason they gave, and everything else is a real failure.
+///
+/// Returns (reason → test names, other failing test names).
+fn classify_failures(output: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
+    const CANNOT_RUN: &str = "this gate cannot run and NANO_REQUIRE_MAINNET is set: ";
+    let mut unrunnable: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut broken = Vec::new();
+    // libtest prints one `---- <name> stdout ----` block per failure, and the
+    // panic message is inside it.
+    let mut blocks = output.split("---- ");
+    blocks.next();
+    for block in blocks {
+        let Some((header, body)) = block.split_once('\n') else {
+            continue;
+        };
+        let Some(name) = header.strip_suffix(" stdout ----") else {
+            continue;
+        };
+        // The trailing summary repeats each name on its own line; only the
+        // blocks carry a body worth reading.
+        match body.split(CANNOT_RUN).nth(1) {
+            Some(rest) => {
+                let reason = rest.lines().next().unwrap_or("unstated").trim();
+                unrunnable
+                    .entry(reason.to_owned())
+                    .or_default()
+                    .push(name.to_owned());
+            }
+            None => broken.push(name.to_owned()),
+        }
+    }
+    (unrunnable, broken)
+}
+
+/// How many `skip_gate` call sites each conformance file has.
+///
+/// Reported because it is the size of the conditional surface: these are the
+/// assertions a working tree is allowed to skip and a release is not, and a
+/// reader should be able to see how much of the suite that is without taking
+/// anybody's word for it.
+fn conditional_gates() -> Vec<(String, usize)> {
+    let directory = workspace_root().join("crates/nano-conformance/tests/conformance");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect();
+    paths.sort();
+    let mut found = Vec::new();
+    for path in paths {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        // The call, not the import and not a mention in prose.
+        let count = text.matches("skip_gate(").count();
+        if count > 0 {
+            found.push((
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                count,
+            ));
+        }
+    }
+    found
+}
+
+/// The version the lock file pins for a crate, if it pins exactly one.
+fn locked_version(crate_name: &str) -> String {
+    let Ok(lock) = fs::read_to_string(workspace_root().join("Cargo.lock")) else {
+        return "no lock file".to_owned();
+    };
+    for package in lock.split("\n[[package]]").skip(1) {
+        let field = |key: &str| {
+            package.lines().find_map(|line| {
+                line.strip_prefix(&format!("{key} = \""))
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+        };
+        if field("name") != Some(crate_name) {
+            continue;
+        }
+        let version = field("version").unwrap_or("?");
+        // A git source's revision is what identifies it; a registry version
+        // identifies itself.
+        return field("source")
+            .and_then(|source| source.split("rev=").nth(1))
+            // A locked git source spells the revision twice, as `?rev=X#X`.
+            .map(|revision| revision.split('#').next().unwrap_or(revision))
+            .map_or_else(
+                || version.to_owned(),
+                |revision| format!("{version} (stacks-core {revision})"),
+            );
+    }
+    "not in the lock file".to_owned()
+}
+
+fn report_revision() {
+    println!("\nrevision");
+    println!("  nano-stacks          {}", captured("git", &["rev-parse", "HEAD"]));
+    let dirty = !captured("git", &["status", "--porcelain"]).is_empty();
+    println!(
+        "  branch               {} ({})",
+        captured("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
+        if dirty { "UNCOMMITTED CHANGES" } else { "clean" }
+    );
+    println!("  rustc                {}", captured("rustc", &["--version"]));
+    println!("  cargo                {}", captured("cargo", &["--version"]));
+}
+
+/// The engine, named by content.
+///
+/// tasks/060 asks for the clarity-wasm and compiler revisions by name. The
+/// compiler is vendored in-tree rather than pinned as a git dependency, so its
+/// revision is the *tree hash* of `vendor/clarity-wasm` — a content hash of
+/// exactly the source that was compiled, which a commit id of the whole
+/// repository is not.
+fn report_engines() {
+    println!("\nengines");
+    println!(
+        "  clarity-wasm         tree {}",
+        captured("git", &["rev-parse", "HEAD:vendor/clarity-wasm"])
+    );
+    println!(
+        "  clarity-wasm change  {}",
+        captured("git", &["log", "-1", "--format=%h %s", "--", "vendor/clarity-wasm"])
+    );
+    for crate_name in ["wasmtime", "clarity", "stackslib"] {
+        println!("  {crate_name:<20} {}", locked_version(crate_name));
+    }
+    println!("  interpreter          not linked into the artifact; see the gates below");
+}
+
+fn report_artifact() {
+    println!("\nartifact");
+    let binary = workspace_root().join("target/release/stacks-node");
+    match fs::read(&binary) {
+        Ok(bytes) => {
+            println!("  path                 {}", binary.display());
+            println!("  bytes                {}", bytes.len());
+            println!(
+                "  sha256               {}",
+                hex::encode(nano_primitives::sha256(&bytes).as_bytes())
+            );
+        }
+        Err(error) => println!("  path                 {} ({error})", binary.display()),
+    }
+}
+
+fn report_checkpoint(state: Option<&Path>) {
+    println!("\ncheckpoint provenance");
+    let Some(directory) = state else {
+        println!(
+            "  no --state directory given, so no provenance is claimed. \
+             docs/checkpoint-trust.md is the procedure."
+        );
+        return;
+    };
+    // A node records its provenance beside the MARF it imported, which is
+    // `<state>/chainstate`, and an operator naturally names the state directory.
+    // Both are accepted rather than making the caller know which.
+    let found = [directory.to_path_buf(), directory.join("chainstate")]
+        .into_iter()
+        .find_map(|candidate| match nano_marf::CheckpointProvenance::load(&candidate) {
+            Ok(Some(provenance)) => Some((candidate, Ok(Some(provenance)))),
+            Ok(None) => None,
+            Err(error) => Some((candidate, Err(error))),
+        });
+    let (directory, loaded) =
+        found.unwrap_or_else(|| (directory.to_path_buf(), Ok(None)));
+    match loaded {
+        Ok(Some(provenance)) => {
+            let checkpoint = &provenance.checkpoint;
+            println!("  state directory      {}", directory.display());
+            println!("  format               {}", checkpoint.format);
+            println!("  stacks_height        {}", checkpoint.stacks_height);
+            println!(
+                "  source_state_id      {}",
+                hex::encode(checkpoint.source_state_id)
+            );
+            println!(
+                "  state_index_root     {}",
+                hex::encode(checkpoint.state_index_root.as_bytes())
+            );
+            println!("  first_bitcoin_height {}", checkpoint.first_bitcoin_height);
+            match &provenance.attestation {
+                Some(attestation) => {
+                    println!(
+                        "  attesting_block_id   {}",
+                        hex::encode(attestation.attesting_block_id)
+                    );
+                    println!(
+                        "  signer_weight        {} against a threshold of {}",
+                        attestation.signer_weight, attestation.approval_threshold
+                    );
+                }
+                None => println!(
+                    "  attestation          NONE — the root was taken on trust rather \
+                     than from a signed header"
+                ),
+            }
+        }
+        Ok(None) => println!(
+            "  {} carries no checkpoint-provenance.toml, so what it descends from is \
+             unrecorded",
+            directory.display()
+        ),
+        Err(error) => println!("  {} is unreadable: {error}", directory.display()),
+    }
+}
+
+fn report_scoreboard() {
+    println!("\nscoreboard");
+    let manifest_path = fixture_root().join("manifest.toml");
+    match FixtureManifest::load(&manifest_path) {
+        Ok(manifest) => {
+            for line in scoreboard_at(&fixture_root(), manifest).lines() {
+                println!("  {line}");
+            }
+        }
+        Err(error) => println!("  no fixture manifest at {}: {error}", manifest_path.display()),
+    }
+}
+
+/// Every `NANO_*` variable this run was given.
+///
+/// Part of "the exact commands": most of the mainnet gates take their inputs from
+/// the environment, so a report that printed only the command line would be
+/// describing a different run from the one it made. `run_gate` inherits this
+/// environment, which is what lets an operator hand the suite more fixtures
+/// without the report knowing their names.
+fn report_inputs() {
+    println!("\ninputs");
+    let mut names: Vec<(String, String)> = env::vars()
+        .filter(|(name, _)| name.starts_with("NANO_"))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        println!("  none, so every gate that needs one will report that it could not run");
+    }
+    for (name, value) in names {
+        println!("  {name:<24} {value}");
+    }
+}
+
+fn report_conditional_gates() {
+    println!("\nconditional gates");
+    let conditional = conditional_gates();
+    let total: usize = conditional.iter().map(|(_, count)| count).sum();
+    println!(
+        "  {total} assertions across {} files skip themselves when their capture or \
+         tool is absent,",
+        conditional.len()
+    );
+    println!("  and panic instead when NANO_REQUIRE_MAINNET is set. That variable is what");
+    println!("  makes the conformance run below evidence rather than a count of green dots.");
+    for (name, count) in &conditional {
+        println!("    {name:<34} {count}");
+    }
+}
+
+/// Run the three gates tasks/053 names and report what each said.
+fn report_gates(capture: Option<&str>) -> bool {
+    println!("\ngates");
+    println!("  Each command below also inherits every variable under `inputs`.");
+    let mut environment: Vec<(&str, &str)> = vec![("NANO_REQUIRE_MAINNET", "1")];
+    match capture {
+        Some(path) => environment.push(("NANO_MAINNET_CAPTURE", path)),
+        None => println!(
+            "  no --capture and no NANO_MAINNET_CAPTURE, so the mainnet gates cannot run \
+             and the\n  conformance gate below is expected to FAIL under \
+             NANO_REQUIRE_MAINNET. That failure is\n  the honest report."
+        ),
+    }
+    let gates = [
+        run_gate(
+            "cargo",
+            &["test", "--release", "-p", "nano-rpc", "-p", "nano-node"],
+            &[],
+        ),
+        run_gate(
+            "cargo",
+            &["test", "--release", "-p", "nano-conformance", "--test", "conformance"],
+            &environment,
+        ),
+        run_gate(
+            "cargo",
+            &["clippy", "--release", "--workspace", "--all-targets"],
+            &[],
+        ),
+    ];
+    let mut all_passed = true;
+    for gate in &gates {
+        all_passed &= gate.passed;
+        println!("\n  {}", gate.command);
+        println!("    {:<6} {}", if gate.passed { "pass" } else { "FAIL" }, gate.detail);
+    }
+    all_passed
+}
+
+fn release_report(arguments: &[String]) -> ExitCode {
+    let mut capture = env::var("NANO_MAINNET_CAPTURE").ok();
+    let mut state: Option<PathBuf> = None;
+    let mut run_gates = true;
+    let mut rest = arguments.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--capture" => capture = rest.next().cloned(),
+            "--state" => state = rest.next().map(PathBuf::from),
+            "--no-gates" => run_gates = false,
+            other => {
+                eprintln!(
+                    "usage: cargo xtask release-report [--capture <dir>] [--state <dir>] \
+                     [--no-gates]\nunexpected argument: {other}"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    println!("nano-stacks release report");
+    println!(
+        "  generated            {} (unix {})",
+        captured("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs())
+    );
+    report_revision();
+    report_engines();
+    report_artifact();
+    report_checkpoint(state.as_deref());
+    report_scoreboard();
+    report_inputs();
+    report_conditional_gates();
+
+    let passed = if run_gates {
+        report_gates(capture.as_deref())
+    } else {
+        println!("\ngates");
+        println!("  --no-gates: nothing was run, so nothing is claimed.");
+        true
+    };
+
+    println!("\nwhat this report does not say");
+    println!("  Nothing here is evidence for holding mainnet tip for 24 hours, for a live");
+    println!("  Bitcoin reorganization, or for a stock stacks-signer run against the binary.");
+    println!("  Those need wall-clock and a pox-5 chain. tasks/053 says which is which.");
+
+    if passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

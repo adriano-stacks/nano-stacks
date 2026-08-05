@@ -39,7 +39,7 @@ hundreds of failed attempts.
       [[057-commit-and-recover-accepted-block-state-atomically]].
 - [x] Resume after an orderly process stop without refetching or re-executing
       sealed blocks.
-- [ ] Bound caches, response bodies and in-memory ancestry independently of
+- [x] Bound caches, response bodies and in-memory ancestry independently of
       distance from tip or peer-controlled response size.
 - [ ] Test gaps spanning long tenures and multiple tenures with deterministic
       429s, short pages, tip movement and a restart after every chunk boundary.
@@ -175,3 +175,74 @@ The two items still open are the memory bounds — `TenureAccounting::earnings` 
 `BitcoinContext::headers` both grow with the chain — and a deterministic harness
 for rate limits and short pages, which the live mainnet run exercises and no test
 pins.
+
+## The three things that grew with the chain
+
+All three were in-memory structures with no relationship to distance from the
+tip, and one of them was also a **per-block cost**, which is what makes this a
+throughput item and not only a leak.
+
+**`TenureAccounting::earnings`** is serialized into the chain ledger with every
+block, so letting it grow meant a write that got slower forever — about 130 bytes
+a tenure, and mainnet adds a tenure every ten minutes. Bounded at 201, which is
+the deepest read (`matured - 1`, 101 below the tip) plus a full maturity window of
+margin, and the same 201 a checkpoint has to carry. Not a coincidence: both
+numbers are "what a node can still be asked to pay". Pruning the bottom is safe
+because every reader counts down from the top, and a tenure's `block_reward`
+outlives the map in the header store, which records it when the block is sealed.
+
+**`BitcoinContext::headers`** and **`burn_headers`** are caches in front of the
+side store, consulted because a block being executed is asked about before it is
+written. Both fall through to the store on a miss, which is what makes bounding
+them safe rather than merely smaller. `headers` is keyed by block identifier — a
+hash — so the map's own ordering says nothing about staleness and the insertion
+order is kept beside it; `burn_headers` is keyed by height, where it does.
+
+**The test asserts both halves, deliberately.** A bound that let the map grow
+would pass a loosely written length assertion, and a bound that pruned what
+`effects_for_tenure` reaches would pass a tightly written one — so
+`earnings_are_bounded_and_a_payout_still_resolves` walks a thousand tenures past
+the cap and *then* asks for the payout at the top, which reads 101 down, and
+checks the span a startup validation reads is still long enough to judge.
+
+Writing it caught something worth recording: the expectation was drafted on the
+pre-8,673,846 fee rule and the test refused it. The second credit's amount and
+recipient both come from `earnings[matured - 1]`, and the tree is right.
+
+## The MARF node cache was a fifth of one block's working set
+
+The replay was reading **900 MB per block** — 145 MB/s of `rchar` against a 30 GB
+`marf.sqlite` — and running at about 40 blocks a minute. Not a missing index: the
+node table is `WITHOUT ROWID` on `(block, idx)` and the plan is a primary-key
+search. It was the cache.
+
+A MARF lookup walks back-pointers into ancestor states, and a node standing on a
+checkpoint has 8.6 million ancestors, so one block's working set is on the order of
+200,000 nodes. `NODE_CACHE` was 20,000 per generation — under a fifth of that — so
+the cache thrashed on every block and the same nodes were decoded again for the
+next one. And `node_hash` had **no cache at all**, on a path that is read with the
+fanout of the trie: sealing a block hashes every node it touched, and each preimage
+needs every sibling's hash.
+
+Both are immutable per `(block, index)` — a state is addressed by the block that
+sealed it, so nothing rewrites one — which is what makes caching them safe rather
+than merely faster.
+
+| | before | after |
+|---|---|---|
+| replay throughput | ~40 blocks/min | **140 blocks/min** |
+| read volume | ~900 MB/block | ~250 MB/block |
+| execution, per block | 1.1 s | 0.30 s |
+| resident memory | ~2.5 GB | 3.3 GB |
+
+Three and a half hours to mainnet tip instead of twelve.
+
+**One thing that had to go in with it**, and is the reason a cache like this is not
+free: `forget()` drops every cache after a rolled-back write, because the cache
+would otherwise address rows the database no longer holds. A stale *hash* is worse
+than a stale node — it goes straight into a parent's preimage and moves a root — so
+the new cache is cleared there too. `marf_lockstep` and the whole conformance suite
+are what say it did not change an answer.
+
+`local` is still 0.06 s a block, halved but not gone; that is
+[[049-derive-canonical-sortitions-from-the-local-burncha]]'s.
