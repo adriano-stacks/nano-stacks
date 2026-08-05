@@ -449,6 +449,11 @@ const NARROWING_DEFAULT: &str = "
 ;; payload's type is the expression's, and either side can be the placeholder.
 (define-read-only (or-seven (n (optional uint))) (default-to u7 n))
 (define-read-only (or-nothing (n (optional (optional uint)))) (default-to none n))
+
+;; The narrowed tuple handed back whole instead of read through `get`, which is
+;; the one shape the two engines still answer differently.
+(define-read-only (whole (entry (optional { soft: bool, full: bool })))
+  (default-to { soft: false } entry))
 ";
 
 #[test]
@@ -498,6 +503,47 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
             both_in(NARROWING_DEFAULT, "soft-of-bound", &[serialized(&entry)]);
         assert_eq!(compiled, interpreted, "soft-of-bound of {entry}");
     }
+}
+
+/// The supertype asymmetry, now reachable through `default-to`.
+///
+/// `least_supertype` walks the default's fields and drops the rest, so
+/// `(default-to { soft: false } entry)` analyses as `{ soft: bool }`. clar2wasm
+/// lays every value out for its static type and so answers with the narrowed
+/// tuple; the interpreter carries the taken value and answers with the wide one.
+/// Nothing sanitizes a contract-call return, so the two receipts differ:
+///
+/// ```text
+/// compiled     { "soft": bool }               { soft: true }
+/// interpreted  { "full": bool, "soft": bool } { full: true, soft: true }
+/// ```
+///
+/// The same asymmetry the `if` narrowing left open, and `default-to` is a far
+/// more common way to reach it than a `print` under an `if`.
+/// `blacklist-susdh-v1` reads every one of its `default-to`s through `get`, so
+/// mainnet block 8,667,509 does not depend on which value comes back, and no
+/// shape found on the chain so far does. Ignored rather than deleted: it needs a
+/// decision at the analysis layer, and a red suite teaches people to ignore red
+/// suites.
+#[test]
+#[ignore = "narrowing a tuple by its static type answers differently from the interpreter, which keeps the taken value's own type"]
+fn a_narrowed_default_handed_back_whole_agrees() {
+    let entry = Value::some(Value::Tuple(
+        clarity::vm::types::TupleData::from_data(vec![
+            (
+                clarity::vm::ClarityName::from_literal("soft"),
+                Value::Bool(true),
+            ),
+            (
+                clarity::vm::ClarityName::from_literal("full"),
+                Value::Bool(true),
+            ),
+        ])
+        .expect("a tuple"),
+    ))
+    .expect("an optional");
+    let (compiled, interpreted) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&entry)]);
+    assert_eq!(compiled, interpreted);
 }
 
 #[test]
