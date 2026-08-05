@@ -34,6 +34,9 @@ pub struct CheckpointExecutor<S> {
     sortition: Option<crate::sortition::SortitionTracker>,
     /// Where the derived chain is written down, so a restart resumes it.
     sortition_state: Option<std::path::PathBuf>,
+    /// The burn height a reported sortition gap was last complained about, so
+    /// the complaint is made once rather than for every block behind it.
+    sortition_gap: Option<u64>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -378,6 +381,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            sortition_gap: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
@@ -398,6 +402,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            sortition_gap: None,
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
@@ -800,9 +805,32 @@ where
         let Some(tracker) = self.sortition.as_mut() else {
             return;
         };
-        if peer.bitcoin_height != tracker.tip().bitcoin_height.saturating_add(1) {
+        // The chain can only be extended one burn block at a time, and each one
+        // needs its cumulative `total_burn` — which the node has only from a
+        // tenure header's `bitcoin_spent`. So a tracker that has fallen behind
+        // cannot simply skip forward, and on mainnet it starts behind: the
+        // checkpoint's sortition seed is older than the first block executed.
+        //
+        // The effect is that this check silently does nothing there, which is the
+        // failure mode worth being loud about — a validation that never runs looks
+        // exactly like one that always passes. Said once per gap rather than per
+        // block, so it names the condition without burying the log.
+        let expected = tracker.tip().bitcoin_height.saturating_add(1);
+        if peer.bitcoin_height != expected {
+            if self.sortition_gap != Some(peer.bitcoin_height) {
+                self.sortition_gap = Some(peer.bitcoin_height);
+                eprintln!(
+                    "not deriving sortitions: the local chain ends at burn {} and this block \
+                     is at {}, and closing that gap needs each intervening block's total burn, \
+                     which only a tenure header carries. Every sortition this node executes \
+                     under until then is the peer's, unchecked.",
+                    expected.saturating_sub(1),
+                    peer.bitcoin_height
+                );
+            }
             return;
         }
+        self.sortition_gap = None;
         let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
             return;
         };
