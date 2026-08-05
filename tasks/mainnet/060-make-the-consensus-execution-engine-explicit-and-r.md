@@ -65,8 +65,12 @@ node may invoke.
 - [ ] Pin roots, receipts, costs, events and consensus-visible writes for a
       bounded mainnet compiler regression slice; a missing fixture must fail the
       release gate.
-- [ ] Record the clarity-wasm and compiler revisions in checkpoint provenance
-      and in the report produced by [[053-pass-the-mainnet-node-release-gate]].
+- [x] Record the clarity-wasm and compiler revisions in the report produced by
+      [[053-pass-the-mainnet-node-release-gate]]. Still open for checkpoint
+      provenance itself.
+- [ ] Tell a compile refusal at a *call* apart from one at a deploy. The first
+      can only ever be a compiler gap; the second is a transaction the network
+      also failed. Conflating them makes a gap invisible in the state root.
 
 ## Acceptance Criteria
 
@@ -406,7 +410,44 @@ which is what pointed at the decoder rather than at the oracle or the market.
   minimized fixtures for every disagreement. `wasm_response_fold` and
   `wasm_trait_fold` hold the three found so far.
 - Pin roots, receipts, costs and events for a bounded mainnet regression slice.
-- Record the clarity-wasm and compiler revisions in checkpoint provenance.
+- Record the clarity-wasm and compiler revisions in checkpoint provenance. The
+  *report* half is done: `cargo xtask release-report` prints the tree hash of
+  `vendor/clarity-wasm` — a content hash of exactly the source that was compiled,
+  which the repository's commit id is not — along with the wasmtime version and
+  the pinned stacks-core revision. What a state directory carries is unchanged.
+
+## Three forced refusals, and a hole the state root cannot see
+
+`crates/nano-conformance/tests/conformance/engine_failure.rs` forces all three
+refusal classes through `nano_vm::Vm`, none of them needing an open compiler bug:
+a source naming an unresolved function (compile), a `let` with 60,000 bindings
+(module load — every binding is a wasm local and wasmtime's validator accepts
+50,000), and `(- u0 u1)` after a write (runtime trap). Twenty retries each, on
+both the deploy path and a *planted* contract that is already in state, which is
+the 8,668,161 shape. The positive control is the 60,000-binding contract: the
+interpreter deploys and runs it happily, so one engine answers and the other
+refuses, and nano's answer is no.
+
+Two facts worth keeping from writing it:
+
+- A function's parameters are capped at **256 by Clarity's analyzer**, so wasm's
+  1,000-parameter limit is unreachable from Clarity source, and contract metadata
+  is write-once, so a bad module cannot be planted as bytes. Locals are the only
+  reachable wasmtime limit.
+- **A compile refusal at a call is invisible in the sealed root.** It is reported
+  as a failed transaction — deliberately, because a deployment naming a function
+  that does not exist is an ordinary failed mainnet transaction and has to stay
+  one — and a failed transaction writes nothing, so it seals the root an untouched
+  block seals, and the root a legitimate `ArithmeticUnderflow` seals. A
+  root-matching replay can therefore hide a compiler gap whose *receipt* is wrong.
+  Receipts catch it; roots do not. That is the new item above: a refusal at a call
+  can only ever be a gap, because the network accepted the contract once, and it
+  should reject the candidate rather than become a receipt.
+
+Also gone: the stale comment in `deploy_contract_with_wasm_in_context` about
+`loadable` keeping an analysis out of the way of "the interpreter fallback below",
+which no longer exists. Not changed here — `nano-vm` is another agent's file — but
+worth someone's `sed`.
 
 ## Replay depth 8,666,584, and a fourth bug of the same family
 
