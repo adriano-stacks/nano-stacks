@@ -1026,6 +1026,18 @@ impl Vm {
             .map(|_| ())
     }
 
+    /// The source and Clarity version this state holds for a contract.
+    ///
+    /// A contract the compiler refuses is one already on the chain, so the only
+    /// source worth compiling is the state's own — reading it from anywhere else
+    /// is a chance to bisect the wrong text.
+    pub fn contract_source(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+    ) -> Result<(String, ClarityVersion), VmExecutionError> {
+        contract_source(&mut self.store, &self.context, contract)
+    }
+
     /// Record what a burn block's header hash is, for Clarity to read back.
     ///
     /// `get-burn-block-info? header-hash` answers from the burn blocks this node

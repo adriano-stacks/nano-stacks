@@ -156,32 +156,42 @@ impl ComplexWord for Fold {
 
         // We need to find the correct types expected by the function `func` and the result type of the fold expression
         // to make sure everything will be coherent in the end.
-        // This is only needed if we are folding a list and the function is user-defined.
+        // This is only needed if the function is user-defined.
         struct FoldFuncTy {
-            elem_ty: TypeSignature,
+            /// Only for a list: `get_sequence_element_type` reports `(buff 1)`
+            /// for a buffer *and* for a string, so ducking a string's element to
+            /// the parameter's `(string-ascii n)` is refused as incompatible.
+            elem_ty: Option<TypeSignature>,
             acc_ty: TypeSignature,
             return_ty: TypeSignature,
         }
+        // The accumulator's own type is not enough to lay it out: an initial
+        // value written as `(list)`, `none` or `(ok true)` analyses with a
+        // placeholder where the folded function has a real type, and every
+        // allocation and copy below is sized from it. The function's parameter
+        // is the type the fold actually carries, whatever kind of sequence it
+        // walks — a buffer and a string reach the same accumulator a list does.
         let fold_func_ty = {
-            match generator.get_expr_type(sequence).ok_or_else(|| {
+            let sequence_ty = generator.get_expr_type(sequence).ok_or_else(|| {
                 GeneratorError::TypeError("Folded sequence should be typed".to_owned())
-            })? {
-                TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
-                    match generator.get_function_type(func) {
-                        Some(FunctionType::Fixed(FixedFunction { args, returns }))
-                            if args.len() == 2 =>
-                        {
-                            let fold_func_ty = FoldFuncTy {
-                                elem_ty: args[0].signature.clone(),
-                                acc_ty: args[1].signature.clone(),
-                                return_ty: returns.clone(),
-                            };
-                            // set the accumulator type
-                            generator.set_expr_type(initial, fold_func_ty.acc_ty.clone())?;
-                            Some(fold_func_ty)
-                        }
-                        _ => None,
-                    }
+            })?;
+            let list = matches!(
+                sequence_ty,
+                TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+            );
+            match (sequence_ty, generator.get_function_type(func)) {
+                (
+                    TypeSignature::SequenceType(_),
+                    Some(FunctionType::Fixed(FixedFunction { args, returns })),
+                ) if args.len() == 2 => {
+                    let fold_func_ty = FoldFuncTy {
+                        elem_ty: list.then(|| args[0].signature.clone()),
+                        acc_ty: args[1].signature.clone(),
+                        return_ty: returns.clone(),
+                    };
+                    // set the accumulator type
+                    generator.set_expr_type(initial, fold_func_ty.acc_ty.clone())?;
+                    Some(fold_func_ty)
                 }
                 _ => None,
             }
@@ -271,7 +281,7 @@ impl ComplexWord for Fold {
         // Load the element from the sequence and duck-type it to the expected type
         elem_ty.load(generator, &mut loop_, offset)?;
         if let Some(FoldFuncTy {
-            elem_ty: expected_elem_ty,
+            elem_ty: Some(expected_elem_ty),
             ..
         }) = &fold_func_ty
         {

@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("call-both-tx") => call_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("eval") => eval_in_state(&env::args().skip(2).collect::<Vec<_>>()),
@@ -35,7 +36,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|heal-contracts>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|call-both-tx|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -1593,37 +1594,29 @@ fn io_error(context: &'static str) -> impl FnOnce(std::io::Error) -> String {
 /// borrows its state rather than rebuilding a fixture of it, which also makes
 /// bisecting an edited source a matter of seconds instead of a replay.
 fn check_module(arguments: &[String]) -> ExitCode {
-    let [state, contract, version, source] = arguments else {
-        eprintln!(
-            "usage: cargo xtask check-module <state-dir> <contract-id> <clarity-version> <source-file>\n\
-             the node must not be running: it holds the state open"
-        );
-        return ExitCode::FAILURE;
+    let ([state, contract], rest) = match arguments {
+        [state, contract, rest @ ..] if rest.len() <= 2 => ([state, contract], rest),
+        _ => {
+            eprintln!(
+                "usage: cargo xtask check-module <state-dir> <contract-id> [clarity-version] [source-file]\n\
+                 without either the state's own version and source are used\n\
+                 the node must not be running: it holds the state open"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let asked_version = match rest.first().map(|text| clarity_version(text)) {
+        Some(Some(version)) => Some(version),
+        Some(None) => {
+            eprintln!("{} is not a Clarity version", rest[0]);
+            return ExitCode::FAILURE;
+        }
+        None => None,
     };
     let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
         eprintln!("{contract} is not a contract identifier");
         return ExitCode::FAILURE;
     };
-    let version = match version.as_str() {
-        "1" => clarity::vm::ClarityVersion::Clarity1,
-        "2" => clarity::vm::ClarityVersion::Clarity2,
-        "3" => clarity::vm::ClarityVersion::Clarity3,
-        "4" => clarity::vm::ClarityVersion::Clarity4,
-        "5" => clarity::vm::ClarityVersion::Clarity5,
-        "6" => clarity::vm::ClarityVersion::Clarity6,
-        other => {
-            eprintln!("{other} is not a Clarity version");
-            return ExitCode::FAILURE;
-        }
-    };
-    let source = match fs::read_to_string(source) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("cannot read the source: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
@@ -1639,6 +1632,35 @@ fn check_module(arguments: &[String]) -> ExitCode {
         eprintln!("cannot begin a block on the tip: {error:?}");
         return ExitCode::FAILURE;
     }
+    // The state's own source and version, unless told otherwise: a contract the
+    // compiler refuses is one already on the chain, and bisecting the wrong text
+    // or the wrong version answers a question nobody asked.
+    let (stored_source, stored_version) = match vm.contract_source(&identifier) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("the state has no source for {contract}: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let version = asked_version.unwrap_or(stored_version);
+    if version != stored_version {
+        println!("the state holds {contract} as {stored_version:?}, not {version:?}");
+    }
+    let source = match rest.get(1) {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("cannot read the source: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => stored_source,
+    };
+    if let Some(path) = env::var_os("NANO_DUMP_SOURCE")
+        && let Err(error) = fs::write(&path, &source)
+    {
+        eprintln!("cannot write the source: {error}");
+    }
 
     match vm.check_module(
         &identifier,
@@ -1652,24 +1674,40 @@ fn check_module(arguments: &[String]) -> ExitCode {
         }
         Err(error) => {
             println!("{contract}: {error:?}");
-            // The bytes are only readable disassembled, and a refused module is
-            // exactly when someone wants to read them.
-            if let Some(path) = env::var_os("NANO_DUMP_REFUSED_WASM") {
-                match fs::read(&path).map(wasmprinter::print_bytes) {
-                    Ok(Ok(text)) => {
-                        let text_path = Path::new(&path).with_extension("wat");
-                        if let Err(error) = fs::write(&text_path, text) {
-                            eprintln!("cannot write the disassembly: {error}");
-                        } else {
-                            println!("disassembled to {}", text_path.display());
-                        }
-                    }
-                    Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
-                    Err(error) => eprintln!("cannot read the module: {error}"),
-                }
-            }
+            dump_refused_wasm();
             ExitCode::FAILURE
         }
+    }
+}
+
+const fn clarity_version(text: &str) -> Option<clarity::vm::ClarityVersion> {
+    match text.as_bytes() {
+        b"1" => Some(clarity::vm::ClarityVersion::Clarity1),
+        b"2" => Some(clarity::vm::ClarityVersion::Clarity2),
+        b"3" => Some(clarity::vm::ClarityVersion::Clarity3),
+        b"4" => Some(clarity::vm::ClarityVersion::Clarity4),
+        b"5" => Some(clarity::vm::ClarityVersion::Clarity5),
+        b"6" => Some(clarity::vm::ClarityVersion::Clarity6),
+        _ => None,
+    }
+}
+
+/// Disassemble a module the runtime refused, which is the only readable form.
+fn dump_refused_wasm() {
+    let Some(path) = env::var_os("NANO_DUMP_REFUSED_WASM") else {
+        return;
+    };
+    match fs::read(&path).map(wasmprinter::print_bytes) {
+        Ok(Ok(text)) => {
+            let text_path = Path::new(&path).with_extension("wat");
+            if let Err(error) = fs::write(&text_path, text) {
+                eprintln!("cannot write the disassembly: {error}");
+            } else {
+                println!("disassembled to {}", text_path.display());
+            }
+        }
+        Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
+        Err(error) => eprintln!("cannot read the module: {error}"),
     }
 }
 
@@ -2134,6 +2172,176 @@ fn call_both(arguments: &[String]) -> ExitCode {
         drop(vm.abort_block());
     }
     ExitCode::SUCCESS
+}
+
+/// Ask both engines the same contract call and print what each answered.
+///
+/// Every run opens its own block on `tip` and aborts it, so neither engine sees
+/// the other's writes and the state is untouched.
+fn ask_both_engines(
+    vm: &mut nano_vm::Vm,
+    tip: [u8; 32],
+    sender: &clarity::vm::types::PrincipalData,
+    contract: &clarity::vm::types::QualifiedContractIdentifier,
+    function: &str,
+    encoded: &[Vec<u8>],
+) -> Result<[String; 2], String> {
+    let mut answers = [String::new(), String::new()];
+    for (slot, interpreted) in answers.iter_mut().zip([false, true]) {
+        // A write trace is only readable if it says which engine wrote it, and
+        // the first write the two make differently names the contract they
+        // diverge in — which the returned value alone never does.
+        println!(
+            "--- {} {contract}::{function}",
+            if interpreted { "interpreter" } else { "compiler" }
+        );
+        vm.begin_block(Some(tip), [0xca; 32])
+            .map_err(|error| format!("cannot begin a block: {error:?}"))?;
+        vm.interpret_contract_calls(interpreted);
+        let outcome = vm.execute_contract_call_outcome(
+            sender.clone(),
+            None,
+            contract.clone(),
+            function,
+            encoded,
+            &clarity::vm::costs::LimitedCostTracker::new_free(),
+        );
+        *slot = match &outcome {
+            Ok(
+                nano_vm::ContractCallOutcome::Success(result)
+                | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+            ) => format!("{:?}", result.value),
+            Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+                format!("failed: {error:?}")
+            }
+            Err(error) => format!("error: {error:?}"),
+        };
+        drop(vm.abort_block());
+    }
+    vm.interpret_contract_calls(false);
+    Ok(answers)
+}
+
+/// Replay the staged child of a state's tip through both engines, call by call.
+///
+/// This is the tool the two compiler bugs were found without: a divergence stops
+/// the node on a *transaction*, whose arguments are already in the block, and
+/// hand-serializing them back into `call-both` is where the hours went. Here the
+/// block is read from staging, so the call is exactly the one that diverged.
+///
+/// Rolled back, and read-only by construction — nothing is ever sealed.
+fn call_both_tx(arguments: &[String]) -> ExitCode {
+    let (only, arguments) = match arguments {
+        [flag, txid, rest @ ..] if flag == "--txid" => (Some(txid.to_lowercase()), rest),
+        _ => (None, arguments),
+    };
+    let [state] = arguments else {
+        eprintln!(
+            "usage: cargo xtask call-both-tx [--txid <txid>] <state-dir>\n\
+             replays the staged block above the tip; the node must not be running"
+        );
+        return ExitCode::FAILURE;
+    };
+    let chainstate = Path::new(state).join("chainstate");
+    let mut vm = match nano_vm::Vm::open(Network::MAINNET, &chainstate) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block");
+        return ExitCode::FAILURE;
+    };
+    let staging = match nano_node::staging::Staging::open(&chainstate.join("staging.sqlite")) {
+        Ok(staging) => staging,
+        Err(error) => {
+            eprintln!("cannot open the staged blocks: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let block = match staging.child_of(nano_primitives::StacksBlockId::from_bytes(tip)) {
+        Ok(Some(block)) => block,
+        Ok(None) => {
+            eprintln!("nothing is staged above the tip");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the staged block: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "block {} at height {}, {} transactions",
+        hex::encode(block.header.block_hash().as_bytes()),
+        block.header.chain_length,
+        block.transactions.len()
+    );
+
+    let mut disagreements = 0;
+    for transaction in &block.transactions {
+        let txid = hex::encode(transaction.txid().as_bytes());
+        if only.as_ref().is_some_and(|wanted| wanted != &txid) {
+            continue;
+        }
+        match ask_both_engines_about(&mut vm, tip, transaction) {
+            Ok(Some([compiler, interpreter])) => {
+                println!("  compiler     {compiler}");
+                println!("  interpreter  {interpreter}");
+                if compiler != interpreter {
+                    disagreements += 1;
+                    println!("  DISAGREE");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("{txid}: {error}"),
+        }
+    }
+    println!("{disagreements} calls the engines answer differently");
+    if disagreements == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Ask both engines one transaction's contract call, if that is what it is.
+///
+/// Only a contract call has two engines to disagree about; a transfer, a
+/// deployment or a tenure change is answered the same way either way.
+fn ask_both_engines_about(
+    vm: &mut nano_vm::Vm,
+    tip: [u8; 32],
+    transaction: &nano_codec::Transaction,
+) -> Result<Option<[String; 2]>, String> {
+    let nano_codec::TransactionPayloadData::ContractCall {
+        address,
+        contract_name,
+        function_name,
+        arguments,
+    } = transaction.payload().data()
+    else {
+        return Ok(None);
+    };
+    let origin = transaction
+        .origin_address()
+        .ok_or_else(|| "no recognized network".to_owned())?;
+    let sender = clarity::vm::types::PrincipalData::parse(&origin.to_string())
+        .map_err(|error| error.to_string())?;
+    let contract = format!("{address}.{contract_name}");
+    let identifier = clarity::vm::types::QualifiedContractIdentifier::parse(&contract)
+        .map_err(|_| format!("{contract} is not a contract identifier"))?;
+    let encoded = arguments
+        .iter()
+        .map(|argument| argument.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    println!(
+        "{} {contract}::{function_name} ({} arguments)",
+        hex::encode(transaction.txid().as_bytes()),
+        encoded.len()
+    );
+    ask_both_engines(vm, tip, &sender, &identifier, function_name, &encoded).map(Some)
 }
 
 /// Make every contract in a state runnable by the interpreter.
