@@ -694,3 +694,30 @@ the whole process group with it. Launched with `setsid` it runs continuously and
 depth climbs without help. Recorded because the wrong version of this was
 published, and because "the node stops on its own" would have sent someone into
 `supervise` looking for a bug that is not there.
+
+## The sixth divergence: a legal name refused
+
+Replay parks at **8,668,096**:
+
+```
+SP1E0XBN9T4B10E9QMR7XMFJPMA19D77WY3KP2QKC.auto-alex-v3-endpoint-v2-02::rebase
+  compiler     analysis failed: Internal error: Name already used ClarityName("err")
+  interpreter  (ok u390)
+```
+
+Mainnet executed this contract. `words/maps.rs`'s `DefineMap::traverse` calls
+`generator.is_reserved_name`, which is `lookup_reserved_functions(name, &version)
+.is_some() || variables::is_reserved_name(…)` — and `err` is a native function in
+every Clarity version, so `(define-map err …)` is refused. The reference analysis
+has already run and passed, so clar2wasm is stricter than the reference and
+second-guessing a judgement already made.
+
+Unverified: the reference's `check_define_map` may guard only against names used
+*in this contract*. Read the reference rather than inferring, and check whether
+`define-data-var`, `define-fungible-token` and `define-trait` copied the same
+check. Do not simply delete the guard — find the test that wanted it first, and
+note that being wrong in the permissive direction means accepting a contract the
+network rejects, which is worse.
+
+`xtask call-both-tx` answered this in one command, which is what the diagnostic
+ladder was built for: the first of these cost hours.

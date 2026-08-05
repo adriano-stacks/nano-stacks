@@ -85,3 +85,24 @@ make the document quietly wrong in exactly the place it is trusted.
 file through the real `CheckpointProvenance::record`, reads it back, and asserts
 every key it contains appears in the document. Verified non-vacuous by misspelling
 one key in the document and watching it fail.
+
+## A killed import resumes on a partial trie, and nothing notices
+
+`Vm::open_from_checkpoint` treats **any** `marf_block` row as "already imported":
+
+```rust
+if VersionedMarf::open(&marf_path)?.tip().is_some() {
+    return Self::open(network, directory);
+}
+```
+
+Journalling is deliberately off during import — a mainnet import fell from
+60 MB/s to under 3 with a WAL that could never checkpoint — so a killed import
+leaves a partial trie with rows in it, the next start calls it done, and every
+root after that is wrong for a reason nothing reports.
+
+Worse than any of the six consensus divergences found on 2026-08-05, because
+those *stopped* the node and this one does not. A partial import must fail loudly
+and by default, and recovery must not be "silently start over on the wreckage" —
+a 33 GB import costs about 4.5 hours, so refusing with a message that names the
+remedy beats an automatic redo nobody asked for.

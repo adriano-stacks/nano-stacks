@@ -104,3 +104,48 @@ divergence, which this one is.
 
 Persisting the chain is still right, and is done. Attributing minutes to it was
 not.
+
+## Measured feedback-loop costs, and the standing lesson
+
+Numbers from 2026-08-05, kept here rather than in a separate document because the
+task list is where this project records things.
+
+| | before | after |
+|---|---|---|
+| node startup silence on a mainnet state | 6+ min | 20 s |
+| state snapshot, making an experiment reversible | 4.5 h re-import | 3 s, no extra disk |
+| release-dependency audit | 243 s | 16 s |
+| rebuild after a one-line change to a hot crate | 303 s CPU | 202 s CPU |
+| free disk | 494 GB (76% full) | 962 GB (53%) |
+
+The startup cost was `open_chainstate` walking `parent_of` to the root of the
+MARF — a checkpoint import brings the whole ancestry, so 8.6 million SQLite
+lookups against a 23 GB database, building a 277 MB list, to use the first entry
+unless a peer had lost our tip. Bounded to 256.
+
+`target/debug` was 452 GB against 8.8 GB of release, in a workspace that never
+builds debug on purpose; half of why it grew was a conformance test using
+`cargo check --all-targets`. `vendor/clarity-wasm/target` was a second 15 GB build
+of the same graph — `cargo test -p clar2wasm` works from the workspace root, so it
+never needed to exist.
+
+The 28 conformance test targets became one: 303 s → 202 s CPU per rebuild, with an
+empty test-name diff either side. Nothing in the suite needed its own process; the
+reason previously given for not doing it (`oom_checker`) turned out to be a
+clar2wasm test under `vendor/`, never one of the 28.
+
+`[profile.loop]` exists — `inherits = "release"` with `incremental = true` — and is
+deliberately **not** adopted, because that flag changes codegen-unit partitioning
+and this node's replay throughput is worth measuring before trading. Iterate with
+`--profile loop`; leave `release` as the profile whose numbers mean something.
+
+**The standing lesson, which cost most of a day.** Four attributions of a
+performance problem were wrong, each fixed only by sampling the live process:
+restart cost blamed on sortition re-derivation (the tracker could not advance
+there at all); "the follower exits after each round" (that message is the SIGTERM
+handler — a harness timeout was killing the process group); "all cores saturated"
+(the process was at 16% of one core waiting on the network); and a dead
+`event_observers` entry pointing at the node's own RPC port, costing five retries
+per block, which corrupted every throughput number until it was found. Sample
+`/proc/<pid>/stat` and `/proc/<pid>/io` before believing any story about where
+time goes.

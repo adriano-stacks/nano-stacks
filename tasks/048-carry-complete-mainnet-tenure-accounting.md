@@ -144,3 +144,8 @@ reimplementation of its arithmetic.
 
 Attempting to reverse the precedence anyway broke three tests that assert it, which
 was the right signal for the wrong reason — there was nothing to fix.
+
+## `TenureAccounting::earnings` is unbounded
+
+About 130 bytes per tenure, and since the ledger landed it is written per block
+rather than per catch-up round. It grows with the chain.
