@@ -115,36 +115,32 @@ Do not resume against the old file or close this task on the formula unit test.
 The acceptance event is a clean reconstruction followed by a matching root at
 8,673,864 and a restart that preserves the same accounting.
 
-## The mainnet capture's one checkpointed payout encodes the old fee rule
+## The checkpointed payouts agree with the corrected rule — a false alarm, corrected
 
-`effects_for_tenure` takes `matured_effects` first and derives only when there is
-no entry. The mainnet capture holds exactly one entry, for coinbase height 251,321:
+An earlier version of this note claimed the mainnet capture's one `matured_effects`
+entry encoded the pre-8,665,722 fee rule and so silently overrode the corrected
+derivation. **That was wrong**, from an arithmetic slip, and reading the capture
+tool settles it.
 
-```json
-credits: [ { SP70B98…, 500000000 }, { SP70B98…, 27865898 } ]
+`capture-fixtures` builds each entry from `scheduled_payment(coinbase_height -
+MINER_REWARD_MATURITY)` — the *maturing* tenure — and splits it:
+
+```rust
+let (own, parent) = if earned.nakamoto { (earned.coinbase, earned.anchored) } else { … };
+let previous = scheduled_payment(coinbase_height - MINER_REWARD_MATURITY - 1) … recipient;
 ```
 
-27,865,898 is tenure **251,221**'s own fee total — the maturing tenure's. That is
-the rule this project corrected at 8,665,722, where the chain proved the amount
-comes from the maturing tenure and the *recipient* from the one before it. So the
-capture's entry was derived by the capture tool under the older rule rather than
-read from the chain, and it takes precedence over the corrected derivation.
+so the parent's **amount** is the maturing tenure's anchored fees and the parent's
+**recipient** is the tenure before it. That is exactly the rule the chain proved at
+8,665,722 and exactly what `effects_for_tenure` now derives. For coinbase height
+251,321 both give 27,865,898, tenure 251,221's own fee total. The slip was reading
+`earned.fees` in the derivation as the *previous* tenure's rather than the maturing
+one's.
 
-Harmless today: that entry is for a height at or below the checkpoint anchor, so it
-is never applied. It is a live hazard for any future capture whose window overlaps
-executed heights.
+So the two sources agree and the precedence between them does not matter. The
+entries are also not merely convenient: `scheduled_payment` reads the archive's
+own scheduled-payment rows, so they come from stacks-core rather than from a
+reimplementation of its arithmetic.
 
-**Preferring the derivation was tried and reverted.** Deriving whenever the tenures
-are known, and using a checkpointed payout only when they are not, breaks three
-tests that deliberately assert the opposite precedence
-(`tenure_accounting_applies_effects_at_the_recorded_height`,
-`loads_portable_tenure_accounting`, `tenure_accounting_survives_a_round_trip_through_json`).
-Whether a checkpointed payout is authoritative — read from the chain — or merely
-convenient — derived by the capture tool — decides which way this goes, and that is
-not established. The capture at hand says derived; the tests say authoritative. It
-is a consensus precedence and not a thing to change on a guess.
-
-Settling it needs the capture tool read: if it computes `matured_effects` itself,
-the entries should be dropped from the format and the derivation trusted; if it
-reads them from a node's `new_block` events, they are authoritative and the
-derivation is the fallback.
+Attempting to reverse the precedence anyway broke three tests that assert it, which
+was the right signal for the wrong reason — there was nothing to fix.
