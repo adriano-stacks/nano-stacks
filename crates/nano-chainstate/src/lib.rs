@@ -2224,11 +2224,17 @@ fn note_executed_block(
     let stacks_height = u32::try_from(block.header.chain_length).map_err(|_| {
         ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
     })?;
-    if block_starts_new_tenure(block) {
-        ledger
-            .tenure_start_heights
-            .insert(tenure_height, stacks_height);
-    }
+    // Not only for a block that starts a tenure. A node that began mid-tenure —
+    // at a checkpoint, or at a restart — never sees that tenure's start block,
+    // and the answer it gave for it is the height of the first block of it that
+    // it *did* execute. The VM's own map already worked that way, so recording
+    // the same here is what makes the ledger the single thing to write down:
+    // otherwise the map recovered on restart is missing exactly the tenure in
+    // flight, which is the one being asked about.
+    let tenure_start_height = *ledger
+        .tenure_start_heights
+        .entry(tenure_height)
+        .or_insert(stacks_height);
     ledger.executed.push(ExecutedBlock {
         block_id: *block.block_id().as_bytes(),
         consensus_hash: block.header.consensus_hash,
@@ -2259,11 +2265,7 @@ fn note_executed_block(
             .accounting
             .reward_for_tenure(u64::from(tenure_height)),
         tenure_height,
-        tenure_start_height: ledger
-            .tenure_start_heights
-            .get(&tenure_height)
-            .copied()
-            .unwrap_or(stacks_height),
+        tenure_start_height,
     })
 }
 
