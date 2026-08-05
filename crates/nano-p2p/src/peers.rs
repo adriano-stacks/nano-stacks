@@ -38,6 +38,13 @@ const BASE_BACKOFF: Duration = Duration::from_secs(30);
 /// an hour is still worth one attempt an hour: mainnet peers restart.
 const MAX_BACKOFF: Duration = Duration::from_hours(1);
 
+/// The failure count [`PeerDb::isolate`] records, chosen to saturate the backoff.
+///
+/// Written as a count rather than as a flag so that a peer which then answers is
+/// forgiven by the same code path as any other — `record_handshake` clears it, and
+/// there is no second kind of forgiveness to get wrong.
+const ISOLATION_FAILURES: u32 = 16;
+
 /// A peer this node knows of, and how well that has gone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownPeer {
@@ -212,6 +219,28 @@ impl PeerDb {
                 handshake.services,
                 &handshake.data_url,
                 now_stored(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Set a peer aside for breaking the protocol.
+    ///
+    /// This is the longest penalty the table can express — the backoff ceiling,
+    /// one attempt an hour — and deliberately not a permanent ban. A malformed
+    /// message is far more often a version skew or somebody's bug than malice, and
+    /// a node that bans permanently on protocol errors bans the network one
+    /// deployment at a time. What it does buy is that a peer serving garbage stops
+    /// occupying one of a handful of session slots.
+    pub fn isolate(&self, address: PeerAddress, port: u16) -> Result<(), PeerDbError> {
+        self.connection.execute(
+            "UPDATE peers SET last_failed = ?3, consecutive_failures = ?4
+              WHERE address = ?1 AND port = ?2",
+            params![
+                &address.as_bytes()[..],
+                port,
+                now_stored(),
+                ISOLATION_FAILURES
             ],
         )?;
         Ok(())

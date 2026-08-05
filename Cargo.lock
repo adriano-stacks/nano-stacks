@@ -2693,6 +2693,7 @@ dependencies = [
  "nano-marf",
  "nano-mempool",
  "nano-miner",
+ "nano-p2p",
  "nano-primitives",
  "nano-rpc",
  "nano-signer",

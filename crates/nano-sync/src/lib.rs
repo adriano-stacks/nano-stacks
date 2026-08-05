@@ -1121,6 +1121,81 @@ impl PeerPool {
         }
         candidates
     }
+
+    /// Build a pool from endpoint URLs, keeping the ones that parse.
+    ///
+    /// This is how peer discovery reaches the chain view: `nano-p2p`'s swarm hands
+    /// back the `data_url` of every peer that completed a handshake, and each one
+    /// becomes a client here. A URL that does not parse is dropped rather than
+    /// raised — it came from a peer's handshake, so a bad one is that peer's
+    /// problem and not a reason to have no pool.
+    #[must_use]
+    pub fn from_endpoints(endpoints: &[String]) -> Self {
+        Self::new(
+            endpoints
+                .iter()
+                .filter_map(|endpoint| Url::parse(endpoint).ok())
+                .filter_map(|url| SyncClient::new(url).ok())
+                .collect(),
+        )
+    }
+
+    /// The endpoints this pool holds, so a caller can tell whether discovery has
+    /// found anything new without rebuilding it.
+    #[must_use]
+    pub fn endpoints(&self) -> Vec<String> {
+        self.peers
+            .iter()
+            .map(|peer| peer.base_url().to_string())
+            .collect()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Which peer to catch up from this round.
+    ///
+    /// With a reward set this is [`choose_canonical_tip`]: threshold signer weight
+    /// first, then chain length, then the lower block identifier, so that every
+    /// node looking at the same peers lands on the same block rather than on
+    /// whichever answered first.
+    ///
+    /// Without one it falls back to the longest chain, and that is a *liveness*
+    /// choice rather than a security one — said plainly because the difference
+    /// matters. A reward set is not derivable until the checkpoint's cycle has been
+    /// reconstructed, and a node with no reward set that refused to sync would
+    /// never acquire one. What makes the fallback safe is that selection is not the
+    /// only check: every block this node executes still has to pass
+    /// `SignerSet::verify` at execution, so a peer offering an unsigned chain wins
+    /// the round and then fails to have a single block accepted, which distrusts it
+    /// by the ordinary path.
+    ///
+    /// Either way the answer is derived from headers this node fetched and weighed
+    /// itself, never from a peer's claim about its own height.
+    pub async fn choose_source(
+        &self,
+        signers: Option<&SignerSet>,
+    ) -> Option<(usize, SyncClient)> {
+        let candidates = self.candidate_tips().await;
+        let chosen = match signers {
+            Some(signers) => choose_canonical_tip(&candidates, signers)?,
+            None => candidates.iter().max_by(|left, right| {
+                left.header
+                    .chain_length
+                    .cmp(&right.header.chain_length)
+                    .then_with(|| right.header.block_id().cmp(&left.header.block_id()))
+            })?,
+        };
+        let peer = chosen.peer;
+        self.peer(peer).map(|client| (peer, client.clone()))
+    }
 }
 
 impl TenureFollower {

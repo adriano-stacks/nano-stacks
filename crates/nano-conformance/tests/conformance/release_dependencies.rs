@@ -16,7 +16,7 @@
 use std::process::Command;
 
 /// The crates the shipped `stacks-node` is built from.
-const PRODUCTION: [&str; 16] = [
+const PRODUCTION: [&str; 17] = [
     "nano-primitives",
     "nano-crypto",
     "nano-address",
@@ -27,6 +27,7 @@ const PRODUCTION: [&str; 16] = [
     "nano-mempool",
     "nano-vm",
     "nano-chainstate",
+    "nano-p2p",
     "nano-sync",
     "nano-stackerdb",
     "nano-signer",

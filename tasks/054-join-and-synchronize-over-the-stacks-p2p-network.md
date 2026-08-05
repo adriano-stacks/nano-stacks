@@ -34,7 +34,7 @@ steady-state operation may require a hosted Stacks API.
       nano.
 - [x] Implement the mainnet handshake, framing, network and chain checks,
       liveness messages, neighbor discovery and persistent peer database.
-- [ ] Maintain bounded outbound and inbound peer sets with connection limits,
+- [x] Maintain bounded outbound and inbound peer sets with connection limits,
       retry backoff, scoring and isolation of malformed or dishonest peers.
 - [ ] Exchange inventories and acquire Nakamoto blocks, tenures and required
       sortition data from multiple peers without making any one peer a
@@ -49,7 +49,7 @@ steady-state operation may require a hosted Stacks API.
       StackerDB messages required by the enabled node roles.
 - [ ] Feed all received data through the local burnchain, signer, miner, VRF,
       transaction and state-root checks before fork choice or relay.
-- [ ] Make peer disconnects, slow peers, duplicate inventory, invalid messages,
+- [x] Make peer disconnects, slow peers, duplicate inventory, invalid messages,
       ordinary forks and bounded network queues non-fatal and observable.
 - [ ] Interoperate with stock `stacks-node` peers in deterministic integration
       tests, including restart, reorganization and one malicious peer.
@@ -235,3 +235,201 @@ in the release closure.
 - **The first `is_due` doubled once too early**, so a peer's *first* failure cost
   it 60 s instead of 30. Caught by its own test, which is the only reason it is not
   still there.
+
+## The second slice: nano is a peer, and a node with no hosted API
+
+The first slice could handshake. This one holds a peer set, answers peers that dial
+it, discovers endpoints to fetch from, and is wired into the running node — so
+`node.peers` is now optional and a mainnet node's way in is four public p2p
+bootstrap addresses rather than somebody's API.
+
+`crates/nano-p2p` is four modules: `wire` the codec, `session` one conversation,
+`swarm` a bounded set of them with scoring and neighbour discovery, `inbound` the
+reply side, `peers` the durable table.
+
+### Blocks come over HTTP, and that is not a shortcut
+
+Worth stating plainly because it shaped everything after it. In Nakamoto,
+stacks-core downloads blocks and tenures over **HTTP** to each peer's own RPC
+endpoint (`net/download/nakamoto/tenure_downloader.rs` builds
+`StacksHttpRequest::new_get_nakamoto_tenure` against a `PeerHost`); there is *no
+p2p message for requesting a block*. p2p carries the handshake, neighbours,
+inventories, and pushed blocks and transactions.
+
+So the product of discovery is [`Discovered::endpoints`] — the `data_url` of every
+peer that handshook and advertises RPC. `https://api.mainnet.hiro.so` and
+`http://54.91.222.127:20443` speak the same protocol; the difference that matters
+is that the second was found by asking the network, is one of six, and is not a
+service whose rate limit is nano's liveness. Building a p2p block-request message
+nano's peers do not implement would have been inventing a protocol, not joining
+one.
+
+### What a stock node can now do with nano
+
+Both directions, and each is gated by a test that has the reference implementation
+on the other end.
+
+**Nano → stacks-core.** `nano-p2p/tests/live_peer.rs`: all four stacks-core
+mainnet seeds complete the handshake, answer the ping and hand over their
+neighbour lists.
+
+**stacks-core → nano.** `nano-conformance/tests/conformance/p2p_inbound.rs` puts
+`stackslib` on the *dialling* end over a real socket: every message is built,
+signed and serialised by the reference implementation, and every reply is
+deserialised and authenticated by it. A handshake whose announced key
+`verify_secp256k1` accepts, a ping, a neighbour walk, and an inventory exchange in
+both directions — including a `Nack(NoSuchBurnchainBlock)` for a cycle nano does
+not know, which a stock node reads as "ask somebody else" rather than "it has
+nothing". What stands between that and a live stock node is the stock node's own
+scheduler.
+
+`nano-p2p/tests/loopback.rs` runs nano against nano for the conversation itself,
+including two hostile peers: one announcing key A and signing with B, one answering
+on another network. Both are isolated. A peer that merely hangs up is not, and
+proving *that* took a test fix — aborting a listener left its already-accepted
+conversations answering pings, so the peer the test had "removed" was still in the
+swarm.
+
+### Catch-up with the hosted API removed
+
+`p2p_discovery.rs`, gated on `NANO_P2P_MAINNET`, is the acceptance criterion taken
+literally. Against mainnet, from the four seeds and nothing else:
+
+```
+round 1: 4 connected, 4 dialled, 0 isolated, 52 addresses learned, 56 known
+round 2: 8 connected, 4 dialled, 0 isolated,  2 addresses learned, 58 known
+6 endpoints to fetch from: 3.122.176.89, 3.14.226.111, 3.231.161.121,
+                           34.150.184.50, 52.77.118.154, 54.91.222.127  (all :20443)
+chose peer 5 at http://54.91.222.127:20443/: stacks height 8708612, bitcoin height 961206
+5 of 6 discovered peers answer HTTP
+```
+
+The gate asserts what the numbers are for: at least two sessions, a table that grew
+past its seed list, no `hiro.so`, no private address, no duplicate, and a chosen tip
+on mainnet weighed by the same `PeerPool` the production loop weighs. What is *not*
+yet demonstrated is a full replay from the checkpoint driven only by these
+endpoints; the transport and the selection are proven, the multi-thousand-block
+catch-up over them is not, and that is the first thing to measure next.
+
+### Two things only real peers could teach
+
+**Mainnet advertises `http://10.0.1.37:20443`.** A load-balanced node naming the
+address it sees itself at behind its own NAT — the same 10.0.1.37 that came back in
+a nat-punch reply. Fetching from it means dialling this machine's own network. The
+rule is a comparison rather than a ban: a private endpoint is accepted from a
+private peer, because then we are on that network, and refused from a public one.
+Hacknet keeps working with no configuration switch, which matters because
+stacks-core's equivalent (`connection_opts.private_neighbors`) is a switch, and a
+switch is a thing to get wrong.
+
+**Two of eight peers advertised the same endpoint.** Left in, a pool of "eight" had
+six distinct places to fetch from, and "no single peer is load bearing" would have
+been counting one peer twice.
+
+### Scoring: away versus wrong
+
+The whole policy is one distinction. A peer that times out or hangs up has almost
+certainly restarted, so its session is dropped and the table gives it a growing
+backoff — 30 s doubling to an hour — and keeps it. A peer that sends a malformed
+message, signs with a key other than the one it announced, contradicts itself about
+its own Bitcoin view, floods instead of answering, or answers on another network is
+*isolated*: the longest penalty the table can express.
+
+Deliberately not a permanent ban. A malformed message is more often a version skew
+than malice, and a node that bans permanently on protocol errors bans the network
+one deployment at a time. What isolation buys is that a peer serving garbage stops
+occupying one of eight session slots. `SessionError::is_protocol_fault` is where the
+line lives, and no variant of `SessionError` stops the node.
+
+### The node wiring
+
+`node.peers` may be empty when `node.p2p_seeds` gives a way in; on mainnet the seeds
+default to stacks-core's own published bootstrap nodes, because they are public and
+a mainnet node with no way in does nothing. `p2p_seeds = []` is how a configuration
+says "HTTP only" out loud. A configuration with neither is still refused.
+
+`start_transport` opens the peer table under the working directory, seeds it, and
+runs one round *synchronously* so a node with no configured peer has somewhere to
+fetch from by the time it looks. It needs the chain identifier up front — on this
+protocol the network id **is** the chain id, in the second field of the first
+message — so a configuration that leaves the chain to be discovered from its peers
+gets no transport and behaves exactly as before.
+
+The identity is persisted as a seed under `p2p-seed`. Peers remember a node by its
+key hash, and one that re-keyed every start would be a new stranger to the whole
+network each time — including to the tables that had it on a backoff, which is the
+half that would make restarting a way to launder a reputation.
+
+The advertised Bitcoin view is derived from this node's own executed height and its
+own Bitcoin source, never from what a peer said: a preamble view is a gossip hint
+rather than a consensus input, but repeating a peer's claim back at the network is
+how a hint becomes one. Before there is a chain to describe it advertises a
+deliberately old view, which all four mainnet seeds accept — a peer keeps only ~288
+blocks below its stable height, so an older claim is *uncontradictable* rather than
+wrong, and stacks-core reads not-contradictable as merely stale.
+
+`Job::Peers` is not fatal. Losing discovery leaves whatever the operator configured;
+losing the listener only costs this node its place in other nodes' tables.
+
+### Task 027's open half, closed
+
+`choose_canonical_tip` existed and nothing called it. The follow loop now re-weighs
+through `PeerPool::choose_source` over the configured and discovered endpoints
+together — on a timer, and immediately after the current peer lets a round down.
+
+Where no reward set is derivable yet it falls back to length, and that is a
+*liveness* choice rather than a security one, said plainly in the doc comment
+because the difference matters: a node with no reward set that refused to sync would
+never acquire one. What keeps it safe is that selection is not the only check —
+every block still has to pass `SignerSet::verify` at execution, so a peer offering
+an unsigned chain wins one round and then fails to have a single block accepted.
+
+### What is left
+
+1. **Driving the fetches from the inventory.** `assign_tenures` is done and unit
+   tested — only claiming peers are asked, work is spread round-robin, and the order
+   is sorted by peer key hash so it does not depend on who replied first — and
+   `Swarm::tenure_claims` collects the claims. Nothing calls them yet: `catch_up`
+   walks backwards from one peer's tip rather than taking a tenure work list, and
+   turning it into a per-tenure parallel fetch is the next real change.
+2. **Relay.** `encode_frame` takes a relayer list for it (appending ourselves changes
+   the frame, so a relayed message is re-encoded and re-signed rather than forwarded
+   verbatim), and pushed blocks and transactions are already offered to the caller by
+   both the swarm and the listener. Both are counted and dropped in `nano-node`,
+   because acting on one means putting it through staging and the authenticated
+   selection boundary.
+3. **Serving inventories and blocks.** The listener answers `GetNakamotoInv` from a
+   `Service` implementation that currently returns `None`, so nano nacks every cycle.
+   Wiring it to the executed chain is what makes nano useful to *other* nodes, and it
+   is also the "persist enough authenticated block data to answer peer requests"
+   item.
+4. **Bulk history through a local source.** Untouched. Header backfill and accounting
+   reconstruction still go through one client, and now that the pool has six peers
+   the fix is to spread them.
+5. **Deterministic integration against a stock node**, including restart and reorg.
+   `p2p_inbound.rs` is the closest thing so far, and it is the reference codec rather
+   than a reference node.
+
+### Not affected by the pox-4/pox-5 cycle-keying finding
+
+Checked, because it was worth checking: nothing in this slice reads a PoX contract or
+a reward cycle. `ChainView` is Bitcoin heights and header hashes only, and
+`GetNakamotoInv`/`assign_tenures` take a cycle's *first sortition consensus hash*
+from the caller and never compute which cycle that is. When the inventory driver
+lands it will have to derive that hash, and that is where the cycle-keyed rule will
+matter.
+
+### Tried and reverted
+
+- **`&Swarm` across an await.** `PeerDb` holds a `rusqlite::Connection`, which is
+  `Send` but not `Sync`, so a shared borrow made every future non-`Send` and
+  unspawnable. Everything that awaits takes `&mut self`, which is also the honest
+  signature: each of those calls changes what this node knows.
+- **A `dial` helper on `&mut self`** that clippy correctly said never mutated
+  through the reference. Inlined into the dialling loop, which removed the awkward
+  borrow rather than annotating it.
+- **A reachability test that re-parsed the URL itself** instead of calling the
+  function under test. It passed and proved nothing; the function is free-standing
+  now and the test calls it.
+- **`is_due` doubling once too early**, so a peer's *first* failure cost it 60 s
+  instead of 30. Caught by its own test.

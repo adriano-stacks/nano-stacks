@@ -37,8 +37,35 @@ pub struct NodeConfig {
     /// Overrides the chain identifier of a non-mainnet network, which Hacknet
     /// and the private testnets set to something of their own.
     pub chain_id: Option<u32>,
-    /// The peers this node follows, tried in order until one answers.
+    /// The HTTP peers this node follows, tried in order until one answers.
+    ///
+    /// May be empty when `p2p_seeds` gives a way into the binary network instead:
+    /// what a node needs is *a* way in, and an operator who wants no hosted API in
+    /// the picture should be able to say so by leaving this out.
+    #[serde(default)]
     pub peers: Vec<String>,
+    /// Bootstrap peers for the binary p2p network, as `<key>@<host>:<port>` or
+    /// plain `<host>:<port>`.
+    ///
+    /// Omitted on mainnet, stacks-core's own published bootstrap nodes are used —
+    /// they are public, and a mainnet node with no way into the network does
+    /// nothing. An explicit empty list turns the transport off, which is how a node
+    /// says "HTTP only" out loud. The key, if given, is a label: a session learns
+    /// the peer's key from its handshake and authenticates against that.
+    pub p2p_seeds: Option<Vec<String>>,
+    /// Where to listen for inbound peers, or nothing to stay outbound-only.
+    ///
+    /// A node that does not listen can still sync; what it cannot do is get into
+    /// other nodes' peer tables, which is what makes it useful to the network
+    /// rather than only to itself.
+    pub p2p_bind: Option<SocketAddr>,
+    /// The address to tell peers to dial back on, when it is not the bind address.
+    ///
+    /// Behind NAT the bound address is not reachable, and a peer that records the
+    /// wrong one wastes its slots on it. Left out, the bind address is advertised,
+    /// and an unroutable one is advertised as the any-net address — which peers read
+    /// as "I do not know my own address" rather than as a lie.
+    pub p2p_address: Option<SocketAddr>,
     /// Where to serve the public RPC, or nothing to serve none of it.
     pub rpc_bind: Option<SocketAddr>,
     /// Where to POST the events an observer subscribes to.
@@ -221,9 +248,13 @@ impl Config {
     /// Parse and validate a configuration document.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
-        if config.node.peers.is_empty() {
+        // A node needs *a* way into the network, and now there are two of them.
+        // Requiring an HTTP peer specifically is what made a hosted API
+        // load-bearing in the first place.
+        if config.node.peers.is_empty() && config.node.bootstrap_seeds().is_empty() {
             return Err(ConfigError::Invalid(
-                "node.peers must name at least one peer to follow".to_owned(),
+                "node.peers or node.p2p_seeds must name at least one way into the network"
+                    .to_owned(),
             ));
         }
         config.burnchain.magic()?;
@@ -273,6 +304,26 @@ impl NodeConfig {
     /// The peers to follow, in the order they are tried.
     pub fn peers(&self) -> Result<Vec<Url>, ConfigError> {
         urls("node.peers", &self.peers)
+    }
+
+    /// The p2p bootstrap peers, defaulting to stacks-core's own on mainnet.
+    ///
+    /// Only when `network = "mainnet"` is written down: a configuration that leaves
+    /// the chain to be discovered from its peers cannot have its network id
+    /// defaulted, because on this protocol the network id *is* the chain id and it
+    /// goes in the first byte of the first message.
+    #[must_use]
+    pub fn bootstrap_seeds(&self) -> Vec<String> {
+        match &self.p2p_seeds {
+            Some(seeds) => seeds.clone(),
+            None if matches!(self.network, Some(NetworkName::Mainnet)) => {
+                nano_p2p::MAINNET_SEEDS
+                    .iter()
+                    .map(|seed| (*seed).to_owned())
+                    .collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// The observers every event is posted to.
@@ -409,6 +460,57 @@ mod tests {
         anchor_block = "/tmp/checkpoint/anchor-block.bin"
         anchor_bitcoin_height = 285
     "#;
+
+    /// A mainnet node needs no configured HTTP peer at all.
+    ///
+    /// This is the whole point of task 054: requiring `node.peers` is what made a
+    /// hosted API load-bearing. Mainnet's own published bootstrap nodes are the
+    /// default way in, and they are p2p seeds rather than an RPC service.
+    #[test]
+    fn a_mainnet_node_needs_no_configured_http_peer() {
+        let mainnet = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 2147483648\n", "")
+            .replace("peers = [\"http://127.0.0.1:20443/\"]", "peers = []");
+        let config = Config::parse(&mainnet).expect("valid configuration");
+        assert!(config.node.peers.is_empty());
+        assert_eq!(config.node.bootstrap_seeds().len(), 4);
+        assert!(
+            config.node.bootstrap_seeds()[0].contains("seed.mainnet.hiro.so"),
+            "the default seeds are stacks-core's own"
+        );
+    }
+
+    /// An explicit empty seed list is how a node says "HTTP only" out loud.
+    #[test]
+    fn an_empty_seed_list_turns_the_transport_off() {
+        let http_only = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 2147483648", "p2p_seeds = []");
+        let config = Config::parse(&http_only).expect("valid configuration");
+        assert!(config.node.bootstrap_seeds().is_empty());
+        assert_eq!(config.node.peers.len(), 1);
+    }
+
+    /// A configuration with no way into the network at all is refused.
+    #[test]
+    fn a_node_with_no_way_in_is_refused() {
+        // Testnet, so the mainnet seed default does not apply and there is nothing
+        // left to reach the network through.
+        let nowhere = MINIMAL.replace("peers = [\"http://127.0.0.1:20443/\"]", "peers = []");
+        let error = Config::parse(&nowhere).expect_err("a node with no peers is refused");
+        assert!(
+            error.to_string().contains("p2p_seeds"),
+            "the error should name both ways in: {error}"
+        );
+    }
+
+    /// A non-mainnet chain gets no default seeds, because nano does not know them.
+    #[test]
+    fn a_private_chain_gets_no_default_seeds() {
+        let config = Config::parse(MINIMAL).expect("valid configuration");
+        assert!(config.node.bootstrap_seeds().is_empty());
+    }
 
     #[test]
     fn a_node_needs_only_a_chain_a_burnchain_and_a_checkpoint() {

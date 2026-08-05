@@ -162,7 +162,7 @@ impl LocalPeer {
         }
     }
 
-    fn announce(&self) -> Handshake {
+    pub(crate) fn announce(&self) -> Handshake {
         Handshake {
             address: self.address,
             port: self.port,
@@ -244,6 +244,34 @@ impl std::error::Error for SessionError {
     }
 }
 
+impl SessionError {
+    /// Whether the peer broke the protocol, as opposed to merely going away.
+    ///
+    /// The distinction is the whole of the swarm's scoring policy. Not answering is
+    /// nearly always a restart, and a node that punished it would drop honest
+    /// neighbours every time the network deployed. Sending a malformed message,
+    /// signing with a key other than the one announced, contradicting itself about
+    /// its own Bitcoin view, or flooding instead of answering are all things a
+    /// working node does not do — so they are worth remembering across the session,
+    /// and across a restart.
+    ///
+    /// A `Nack` is neither: it is an answer, and refusing a request is something an
+    /// honest peer does constantly.
+    #[must_use]
+    pub const fn is_protocol_fault(&self) -> bool {
+        match self {
+            Self::Wire(_)
+            | Self::Unauthenticated
+            | Self::InconsistentView
+            | Self::WrongNetwork { .. }
+            | Self::StaleEpoch(_)
+            | Self::TooChatty
+            | Self::UnexpectedReply(_) => true,
+            Self::Io(_) | Self::Timeout | Self::HandshakeRejected | Self::Nack(_) => false,
+        }
+    }
+}
+
 impl From<std::io::Error> for SessionError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -270,26 +298,49 @@ const MAX_UNSOLICITED_PER_REQUEST: usize = 32;
 /// exchange that happens before the peer's key is known, and a `Session` that
 /// could not name its peer would put an `Option` on every accessor for the sake
 /// of one message.
-struct Framed {
+pub(crate) struct Framed {
     stream: TcpStream,
     protocol: Protocol,
     private_key: StacksPrivateKey,
-    view: ChainView,
+    pub(crate) view: ChainView,
     timeout: Duration,
     seq: u32,
     /// The peer's key, once its handshake has announced it. Until then messages
     /// are read but not authenticated, which is why the handshake reply is
     /// re-verified against the key it carries.
-    peer_key: Option<StacksPublicKey>,
+    pub(crate) peer_key: Option<StacksPublicKey>,
     remote_view: Option<ChainView>,
     pushed: Vec<Message>,
     unhandled: u64,
 }
 
 impl Framed {
-    /// Send a message and read until the reply to it arrives.
-    async fn request(&mut self, payload: Payload) -> Result<Message, SessionError> {
-        let seq = self.next_seq();
+    pub(crate) fn new(
+        stream: TcpStream,
+        local: &LocalPeer,
+        protocol: Protocol,
+        view: ChainView,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            stream,
+            protocol,
+            private_key: local.private_key.clone(),
+            view,
+            timeout,
+            seq: initial_seq(),
+            peer_key: None,
+            remote_view: None,
+            pushed: Vec::new(),
+            unhandled: 0,
+        }
+    }
+
+    /// Sign one message and put it on the wire, without waiting for anything.
+    ///
+    /// The sequence number is the caller's, because a reply has to carry the
+    /// sequence number of the request it answers rather than one of its own.
+    pub(crate) async fn send(&mut self, seq: u32, payload: Payload) -> Result<(), SessionError> {
         let message = Message::sign(
             self.protocol.peer_version,
             self.protocol.network_id,
@@ -299,6 +350,13 @@ impl Framed {
             &self.private_key,
         )?;
         deadline(self.timeout, self.stream.write_all(&message.encode())).await??;
+        Ok(())
+    }
+
+    /// Send a message and read until the reply to it arrives.
+    async fn request(&mut self, payload: Payload) -> Result<Message, SessionError> {
+        let seq = self.next_seq();
+        self.send(seq, payload).await?;
         for _ in 0..=MAX_UNSOLICITED_PER_REQUEST {
             let message = self.read().await?;
             if message.preamble.seq == seq {
@@ -313,7 +371,7 @@ impl Framed {
     }
 
     /// Read one message: a fixed preamble, then the frame it announces.
-    async fn read(&mut self) -> Result<Message, SessionError> {
+    pub(crate) async fn read(&mut self) -> Result<Message, SessionError> {
         let mut header = [0; PREAMBLE_LEN];
         deadline(self.timeout, self.stream.read_exact(&mut header)).await??;
         let preamble = Preamble::decode(&header)?;
@@ -363,7 +421,7 @@ impl Framed {
         Ok(())
     }
 
-    const fn next_seq(&mut self) -> u32 {
+    pub(crate) const fn next_seq(&mut self) -> u32 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
     }
@@ -407,18 +465,7 @@ impl Session {
         view: ChainView,
         timeout: Duration,
     ) -> Result<Self, SessionError> {
-        let mut framed = Framed {
-            stream,
-            protocol,
-            private_key: local.private_key.clone(),
-            view,
-            timeout,
-            seq: initial_seq(),
-            peer_key: None,
-            remote_view: None,
-            pushed: Vec::new(),
-            unhandled: 0,
-        };
+        let mut framed = Framed::new(stream, local, protocol, view, timeout);
         let reply = framed.request(Payload::Handshake(local.announce())).await?;
         // Cloned rather than moved out, because the reply itself is still needed
         // below to check that the key it announces is the key that signed it.
@@ -562,7 +609,7 @@ fn initial_seq() -> u32 {
         .map_or(0, |since| since.subsec_nanos())
 }
 
-async fn deadline<F: Future>(timeout: Duration, future: F) -> Result<F::Output, SessionError> {
+pub(crate) async fn deadline<F: Future>(timeout: Duration, future: F) -> Result<F::Output, SessionError> {
     tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| SessionError::Timeout)
