@@ -388,3 +388,29 @@ The distinction this task exists to make, applied to itself.
   slot. Same blocker as [[050]]'s signer-weight check. See [[052]].
 - **Recording every executed height and verified root during catch-up** — the run
   logs a root every 500 blocks, not every block.
+
+## The panic on a torn state directory: what the obvious fix is not
+
+The release-gate run found that a reflink copy of a *running* node's state
+directory is not a snapshot — reflink is atomic per file, not across a directory —
+and that opening one makes `nano-marf` **panic** inside the trie walk rather than
+naming the inconsistency. An operator holding a torn copy deserves the sentence.
+
+The obvious fix was tried and is wrong. A check at open — "refuse a state whose
+side store names a block the trie never sealed" — was written, and
+`a_crash_between_the_two_boundaries_leaves_the_parent_and_its_ledger` and
+`a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent` both
+failed against it immediately. That is the point: **a crash between the ledger
+write and the MARF seal leaves exactly the same shape**, and it is the shape
+recovery exists for. The torn copy and the legitimately half-committed state are
+indistinguishable by that comparison, so refusing one refuses the other, and
+refusing the other is refusing to recover from a kill.
+
+Reverted rather than left in, and this is why. The real fix is at the other end:
+`nano-marf` has seventeen `expect("trie storage")` sites on the read path, and a
+lookup for a node the trie does not hold has to return an error naming the block
+and the node rather than unwinding. That is an API change across `nano-vm` and
+`nano-chainstate` and belongs on its own, not smuggled into a release gate.
+
+Recorded here rather than fixed because the wrong fix is cheap to reach for and
+the tests that refute it are not obvious ones to run.
