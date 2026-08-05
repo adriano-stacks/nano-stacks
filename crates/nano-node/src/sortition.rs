@@ -274,11 +274,24 @@ impl SortitionTracker {
             // saved states the seed exactly, and the recovery below is a
             // capture's fallback that holds only because a capture whose seed
             // elected nobody is refused when it is loaded.
-            if height == tip
-                && self.tip().winner_vrf_seed.is_none()
-                && let Some(seed) = unanimous_winner_seed(&block)
-            {
-                self.engine.adopt_root_winner_seed(seed);
+            if height == tip && self.tip().winner_vrf_seed.is_none() {
+                match unanimous_winner_seed(&block) {
+                    Some(seed) => {
+                        self.engine.adopt_root_winner_seed(seed);
+                    }
+                    // The seed said this block elected somebody, so its
+                    // commitments should have agreed on the seed that winner
+                    // carried. When they do not there is no telling which of them
+                    // won, and every sortition after this one is sampled against a
+                    // zero seed — which names miners that did not win, and only
+                    // shows up as their tenures' proofs being refused.
+                    None => eprintln!(
+                        "the sortition seed at burn {height} says its block elected somebody, \
+                         but its commitments do not agree on the seed that winner carried, so \
+                         this node cannot recover the seed the next sortition mixes and will \
+                         sample against zero"
+                    ),
+                }
             }
             let commitments =
                 commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
