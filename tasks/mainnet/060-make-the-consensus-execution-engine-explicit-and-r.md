@@ -590,6 +590,90 @@ fold over a buffer not widening its accumulator (8,665,719), and a tuple narrowe
 by position rather than by name (8,666,585). All four were the same underlying
 mistake in different positions: a value laid out for one type and read as another.
 
+## 8,667,509: the fifth bug is not the same family
+
+Replay stops at **8,667,509**, and it is *not* a placeholder laid out for the
+wrong width. The four before it all said `expected i64, found i32`; this one says
+
+```
+SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.blacklist-susdh-v1
+  type mismatch: values remaining on stack at end of block (at offset 0x2955)
+```
+
+An unbalanced path, not a mis-sized one — a slot is pushed that nothing pops.
+
+The contract is on the chain (this block *calls* it, it does not deploy it), so
+`check-module` reads its source from the state. `NANO_DUMP_SOURCE` writes that
+source out, which is how a 161-line contract became a two-line reproducer:
+
+```clarity
+(define-read-only (g (o (optional { soft: bool, full: bool })))
+  (default-to { soft: false } o))
+```
+
+**What the disassembly showed.** `wasm-objdump -d` on the module
+`NANO_DUMP_REFUSED_WASM` wrote puts offset `0x2955` at the closing `end` of
+`get-soft-blacklist`'s outermost body block, just before the function postlude:
+
+```
+002929: local.set 24    ;; save the payload -- one i32, per the analysed type
+00292b: if type[10]     ;; (param i32) (result i32): the default, one i32
+00292d:   drop          ;;   the default
+00292e:   local.get 24  ;;   the payload
+002930: else
+002931: end
+...
+002951: local.set 25
+002953: local.get 25
+002955: end             ;; two i32 left where the block declares one
+```
+
+`map-get?` had pushed **two** i32s — `soft` and `full` — and only one was saved.
+The other sat underneath the `if` all the way to the end of the function.
+
+**The cause.** `default-to`'s type is `least_supertype(default, inner)`, and
+`least_supertype` for tuples walks the **first** argument's fields and looks each
+up in the second, dropping the rest (`clarity-types/src/types/signatures.rs`). So
+`(default-to { soft: false } (map-get? blacklist k))` over a
+`{ soft: bool, full: bool }` map analyses as the one-field tuple. `default_to.rs`
+carried a WORKAROUND that set *both* arguments' expression types to that — but
+`map-get?` reads the map's own declared value type and ignores what it was asked
+for, so the request was a lie about what was on the stack. `visit_atom` behaves
+the same way here: `widen_actions` refuses two tuples with different field counts
+and falls through to a plain `local_get` of the wide binding.
+
+**The fix.** Only the *default* is told to be the expression's type — it has to
+be, so a `none` literal knows how many slots to fill. The optional is taken as
+analysed and its payload converted afterwards with `duck_type`, in the position
+where it already sits on top of the stack with the indicator underneath. Same
+machinery as the `print` narrowing, one word over.
+
+It also fixed a second symptom of the same override: `(default-to { soft: false }
+(some { soft: true, full: true }))` used to fail codegen with "Tuples fields
+should be typed", because the narrowed request propagated into the tuple
+literal's fields. Both engines now agree on it.
+
+Gates: the new `a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named`
+and `a_default_to_with_nothing_to_narrow_is_unchanged` pass, `cargo test --release
+-p clar2wasm` is 1376/1376, the workspace is green, clippy is clean with no
+`#[allow]`, and `check-module` on the real `blacklist-susdh-v1` against the live
+mainnet state now says it loads.
+
+**Nothing was tried and reverted this time.** The first hypothesis — that
+`asserts!` inside `(ok …)` was branching out with a value still pushed, which
+this contract does four times — was dropped before any code changed, because
+bisecting the two-line `default-to` reproducer out of the contract took under a
+minute with `check-module` and a source file.
+
+**One thing narrowing does not fix**, measured rather than assumed: handing the
+narrowed tuple back *whole* instead of reading it through `get` gives
+`{ soft: true }` under the compiler and `{ full: true, soft: true }` under the
+interpreter. That is the supertype asymmetry recorded below, now reachable
+through `default-to`, which is far more common than a `print` under an `if`.
+Pinned as `a_narrowed_default_handed_back_whole_agrees`, `#[ignore]`d with the
+reason. `blacklist-susdh-v1` reads all three of its `default-to`s through `get`,
+so 8,667,509 does not depend on it.
+
 ## Two things this leaves open
 
 **A supertype asymmetry that no conversion reconciles.** `least_supertype` walks
