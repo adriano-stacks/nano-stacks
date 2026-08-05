@@ -314,3 +314,32 @@ already fixed today would have hidden: buffer slicing and placeholder layout.
 Next: call `verify-and-update-price-feeds` with that payload under both engines.
 It is a `contract-call?` with one buffer argument, so `xtask call-both` can ask
 it directly — minutes, not hours.
+
+### Exact resume point for 8,665,719
+
+The Pyth payload is extracted and ready. From the failing transaction's
+`price-feeds` argument — `(optional (list 1 (buff 8192)))`, prefix
+`0a 0b 00000001 02` — the single feed is **2,007 bytes**, written as a
+consensus-serialized `(buff 2007)` argument.
+
+```
+cargo xtask call-both --sender SPRSMJ5QYQM8T0YRJGAFZXRFXN3K6PCDRDYE6B2T \
+  <state-dir> SP1CGXWEAMG6P6FT04W66NVGJ7PQWMDAC19R7PJ0Y.pyth-oracle-v4 \
+  verify-and-update-price-feeds <feed-buff-hex> <config-tuple-hex>
+```
+
+Run with the feed alone both engines answer
+`RuntimeCheck(IncorrectArgumentCount(2, 1))` — agreeing, which is right:
+`verify-and-update-price-feeds` takes the feed *and* an execution-context tuple.
+`write-feed` in `v0-4-market` builds it:
+
+```clarity
+(contract-call? 'SP1CGXWEAMG6P6FT04W66NVGJ7PQWMDAC19R7PJ0Y.pyth-oracle-v4
+  verify-and-update-price-feeds feed
+  { pyth-storage-contract: 'SP1CGXWEAMG6P6FT04W66NVGJ7P… , … })
+```
+
+So the one remaining step is to serialize that tuple from `write-feed`'s literal
+and pass it as the second argument. If the engines then disagree, it is the third
+compiler bug; if they agree, the divergence is in `borrow`'s later bindings and
+`eval` can walk them one at a time.
