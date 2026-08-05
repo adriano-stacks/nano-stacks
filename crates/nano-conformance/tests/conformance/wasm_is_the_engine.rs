@@ -127,11 +127,21 @@ fn the_historical_interpreter_switches_are_absent() {
         "NANO_CROSSCHECK",
         "NANO_CROSSCHECK_TRANSACTIONS",
     ];
-    let this_file = Path::new(file!()).file_name().expect("this test has a name");
+    // Two files name them in order to forbid them: this one, at the source, and
+    // `one_engine_in_the_artifact`, which looks for the same strings in the
+    // shipped binary's data. Spelled out rather than derived from `file!()`,
+    // because the second one is the release-gate half of the same question and a
+    // reader should see both named here.
+    const FORBIDDING: [&str; 2] = [
+        "wasm_is_the_engine.rs",
+        "one_engine_in_the_artifact.rs",
+    ];
     for directory in [workspace().join("crates"), workspace().join("xtask")] {
         for entry in walk(&directory) {
-            // This file names them in order to forbid them.
-            if entry.file_name() == Some(this_file) {
+            if entry
+                .file_name()
+                .is_some_and(|name| FORBIDDING.iter().any(|allowed| name == *allowed))
+            {
                 continue;
             }
             let text = fs::read_to_string(&entry).expect("read a source file");

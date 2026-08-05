@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     fmt::Write as _,
@@ -3758,12 +3759,6 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
         .lines()
         .filter_map(|line| line.trim().strip_prefix("test result: "))
         .collect();
-    let failures: Vec<&str> = combined
-        .lines()
-        .filter(|line| line.starts_with("    ") && !line.trim().contains(' '))
-        .map(str::trim)
-        .filter(|name| name.contains("::"))
-        .collect();
     let mut detail = if results.is_empty() {
         combined
             .lines()
@@ -3775,14 +3770,77 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
     } else {
         results.join("; ")
     };
-    if !output.status.success() && !failures.is_empty() {
-        let _ = write!(detail, "\n           failing: {}", failures.join(", "));
+    if !output.status.success() {
+        let (unrunnable, broken) = classify_failures(&combined);
+        if !unrunnable.is_empty() {
+            let total: usize = unrunnable.values().len();
+            let _ = write!(
+                detail,
+                "\n           {total} gate(s) could not run, so the run is not \
+                 evidence for them:"
+            );
+            for (reason, tests) in &unrunnable {
+                let _ = write!(detail, "\n             {} × {reason}", tests.len());
+                for test in tests {
+                    let _ = write!(detail, "\n                 {test}");
+                }
+            }
+        }
+        if !broken.is_empty() {
+            let _ = write!(
+                detail,
+                "\n           {} gate(s) ran and FAILED: {}",
+                broken.len(),
+                broken.join(", ")
+            );
+        }
     }
     GateResult {
         command: printed,
         passed: output.status.success(),
         detail,
     }
+}
+
+/// Split a failing test run into gates that could not run and gates that broke.
+///
+/// The whole point of `NANO_REQUIRE_MAINNET` is that a gate whose fixture is
+/// absent must not report itself green — so under it, an absent fixture arrives
+/// as a *failure*, and a report that stopped there would say the same thing about
+/// a missing environment variable as about a wrong state root. `skip_gate`'s
+/// panic message is distinctive, so the two are separable: unrunnable gates are
+/// grouped by the reason they gave, and everything else is a real failure.
+///
+/// Returns (reason → test names, other failing test names).
+fn classify_failures(output: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
+    const CANNOT_RUN: &str = "this gate cannot run and NANO_REQUIRE_MAINNET is set: ";
+    let mut unrunnable: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut broken = Vec::new();
+    // libtest prints one `---- <name> stdout ----` block per failure, and the
+    // panic message is inside it.
+    let mut blocks = output.split("---- ");
+    blocks.next();
+    for block in blocks {
+        let Some((header, body)) = block.split_once('\n') else {
+            continue;
+        };
+        let Some(name) = header.strip_suffix(" stdout ----") else {
+            continue;
+        };
+        // The trailing summary repeats each name on its own line; only the
+        // blocks carry a body worth reading.
+        match body.split(CANNOT_RUN).nth(1) {
+            Some(rest) => {
+                let reason = rest.lines().next().unwrap_or("unstated").trim();
+                unrunnable
+                    .entry(reason.to_owned())
+                    .or_default()
+                    .push(name.to_owned());
+            }
+            None => broken.push(name.to_owned()),
+        }
+    }
+    (unrunnable, broken)
 }
 
 /// How many `skip_gate` call sites each conformance file has.
