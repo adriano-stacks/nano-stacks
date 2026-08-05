@@ -121,3 +121,18 @@ local `SortitionTracker` instead, the check runs with `None` on both inputs on a
 live follow and only the conformance test exercises it for real. Taking them from
 the peer would mean trusting the peer for a validation input, which is the thing
 this task exists to avoid.
+
+## Correction: the parent proof is lost on every restart, not only at a checkpoint
+
+The note above says the parent tenure's proof "is unknown only for the very first
+tenure after a checkpoint, because every later one is retained here". That is
+wrong. `parent_tenure_proof` lives only in memory — like `tenure_start_heights`
+and the executed-block list, it is never written to disk. So **every restart**
+loses it, and the committed-seed half of the check silently cannot run for the
+first tenure after each one, not merely after an import.
+
+Found while making a rejected block's rollback structural
+([[057-commit-and-recover-accepted-block-state-atomically]]), which is where the
+fix belongs: persist the whole ledger with the seal rather than beside it. Until
+then a restarting node reports that it cannot check the seed, which is at least
+audible — but the window is far wider than this task claimed.
