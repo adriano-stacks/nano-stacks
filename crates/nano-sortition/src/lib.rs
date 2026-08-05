@@ -75,12 +75,24 @@ pub struct MiningCommitment {
     pub spent_output: u32,
     pub burn_sats: u64,
     pub vrf_seed: [u8; 32],
+    /// The leader-key VRF public key this commitment named, when the burn block
+    /// that registered it is one this node has seen.
+    pub vrf_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SortitionWinner {
     pub txid: [u8; 32],
     pub vrf_seed: [u8; 32],
+    /// The VRF public key of the leader-key registration this commitment named,
+    /// when the registering burn block is one this node has seen.
+    ///
+    /// `None` is not "no key" — every winning commitment names one. It means the
+    /// registration predates the burnchain window this node holds, which is the
+    /// ordinary case for the first tenures after a checkpoint. A validator that
+    /// treated it as "no check needed" would be accepting an unverified proof;
+    /// it has to say so instead.
+    pub vrf_public_key: Option<[u8; 32]>,
 }
 
 /// Bitcoin blocks a miner may name when it says which block it built on.
@@ -534,6 +546,9 @@ pub struct SortitionSnapshot {
     pub sortition_hash: SortitionHash,
     pub winner_txid: Option<[u8; 32]>,
     pub winner_vrf_seed: Option<[u8; 32]>,
+    /// The winning commitment's leader-key VRF public key, if this node saw the
+    /// burn block that registered it. See `SortitionWinner::vrf_public_key`.
+    pub winner_vrf_public_key: Option<[u8; 32]>,
     pub pox_id: PoxId,
 }
 
@@ -551,6 +566,7 @@ impl SortitionSnapshot {
             sortition_hash: SortitionHash::initial(),
             winner_txid: None,
             winner_vrf_seed: None,
+            winner_vrf_public_key: None,
             pox_id: PoxId::initial(),
         }
     }
@@ -791,6 +807,7 @@ impl SnapshotChain {
             }),
             winner_txid: winner.map(|winner| winner.txid),
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
+            winner_vrf_public_key: winner.and_then(|winner| winner.vrf_public_key),
             pox_id,
         };
         self.consensus_hashes.push(snapshot.consensus_hash);
@@ -925,6 +942,7 @@ impl SortitionEngine {
                         SortitionWinner {
                             txid: distribution[index].candidate.txid,
                             vrf_seed: distribution[index].candidate.vrf_seed,
+                            vrf_public_key: distribution[index].candidate.vrf_public_key,
                         },
                     )
                 })
@@ -1306,6 +1324,7 @@ mod tests {
             spent_output: 3,
             burn_sats: 10,
             vrf_seed: [hash; 32],
+            vrf_public_key: None,
         };
         engine
             .append(
@@ -1333,6 +1352,7 @@ mod tests {
 
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
         MiningCommitment {
+            vrf_public_key: None,
             txid: [txid; 32],
             spent_txid: [spent_txid; 32],
             spent_output: 3,

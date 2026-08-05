@@ -637,7 +637,24 @@ pub fn replay_into(
     }
 }
 
-fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static str> {
+/// Every captured block, in height order.
+#[must_use]
+pub fn captured_block_paths(fixture: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+/// A chainstate opened on the captured checkpoint, and the state it starts from.
+///
+/// Public because a test that asks what the follow path *does* has to go through
+/// the same door the replay does.
+pub fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static str> {
     let (source, state_root) =
         checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
     let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
@@ -1117,7 +1134,8 @@ fn captured_magic(root: &Path) -> [u8; 2] {
         .unwrap_or(*b"T3")
 }
 
-fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlockContext>> {
+#[must_use]
+pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlockContext>> {
     let snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
     // A block's reward cycle position decides whether it sets up a signer set,
@@ -1183,7 +1201,8 @@ fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, BitcoinBlo
         .collect()
 }
 
-fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<BitcoinOperation>>> {
+#[must_use]
+pub fn captured_bitcoin_operations(root: &Path) -> Option<BTreeMap<String, Vec<BitcoinOperation>>> {
     let mut snapshots: Vec<CapturedBitcoinSnapshot> =
         serde_json::from_slice(&fs::read(root.join("sortition/snapshots.json")).ok()?).ok()?;
     snapshots.sort_by_key(|snapshot| snapshot.block_height);
@@ -1209,7 +1228,8 @@ fn checkpoint_manifest(root: &Path) -> Option<nano_marf::CheckpointManifest> {
     nano_marf::CheckpointManifest::load(root.join("chainstate/checkpoint-H")).ok()
 }
 
-fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
+#[must_use]
+pub fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
     let manifest = checkpoint_manifest(root)?;
     Some((manifest.source_state_id, manifest.state_index_root))
 }
@@ -1481,14 +1501,7 @@ mod tests {
 
     /// The captured corpus is recaptured wholesale, so tests address its blocks
     /// by position rather than by the name of any one capture.
-    fn captured_block_paths(fixture: &Path) -> Vec<PathBuf> {
-        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
-            .expect("read captured blocks")
-            .map(|entry| entry.expect("captured block entry").path())
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths
-    }
+    use super::captured_block_paths;
 
     /// Every contract a checkpoint carries has to be findable in the trie it
     /// imported, by the key Clarity looks it up with.
@@ -3925,6 +3938,7 @@ mod tests {
             };
             let winner_vrf_seed = (height % 3 == 0).then_some(hash);
             let winner = winner_vrf_seed.map(|vrf_seed| nano_sortition::SortitionWinner {
+                vrf_public_key: None,
                 txid: hash,
                 vrf_seed,
             });
@@ -4113,6 +4127,7 @@ mod tests {
                         nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
                             new_seed, ..
                         } => Some(nano_sortition::SortitionWinner {
+                            vrf_public_key: None,
                             txid: winning_txid,
                             vrf_seed: new_seed,
                         }),

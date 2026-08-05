@@ -626,6 +626,13 @@ pub struct ChainState {
     tenure_start_heights: BTreeMap<u32, u32>,
     /// The blocks executed since the checkpoint, oldest first.
     executed: Vec<ExecutedBlock>,
+    /// The coinbase VRF proof of the last tenure this chain accepted.
+    ///
+    /// A tenure's committed seed has to be the hash of the *parent* tenure's
+    /// proof, so checking it means keeping the parent's. A node starting at a
+    /// checkpoint has none for the tenure before its first, which is why this is
+    /// an `Option` and why an absent one is reported rather than passed.
+    parent_tenure_proof: Option<[u8; 80]>,
 }
 
 /// The header version epoch 4.0 blocks carry, below the shadow flag.
@@ -774,6 +781,7 @@ impl ChainState {
             accounting: TenureAccounting::default(),
             tenure_start_heights: BTreeMap::new(),
             executed: Vec::new(),
+            parent_tenure_proof: None,
         })
     }
 
@@ -789,6 +797,7 @@ impl ChainState {
             accounting: TenureAccounting::default(),
             tenure_start_heights: BTreeMap::new(),
             executed: Vec::new(),
+            parent_tenure_proof: None,
         })
     }
 
@@ -809,6 +818,7 @@ impl ChainState {
             accounting: TenureAccounting::default(),
             tenure_start_heights: BTreeMap::new(),
             executed: Vec::new(),
+            parent_tenure_proof: None,
         })
     }
 
@@ -1195,6 +1205,98 @@ impl ChainState {
         }
     }
 
+    /// Everything a block has to satisfy before any of it runs.
+    ///
+    /// A state root only says a block computes what its header commits to. None
+    /// of these checks would be caught by one: a block that fails them computes a
+    /// perfectly self-consistent state for a chain nobody else is on.
+    fn check_before_executing(
+        &mut self,
+        block: &NakamotoBlock,
+        parent: Option<[u8; 32]>,
+        context: BitcoinBlockContext,
+    ) -> Result<(), ChainStateError> {
+        if let Some(parent) = parent {
+            let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "Nakamoto block cannot extend the genesis height".to_owned(),
+                )
+            })?;
+            self.vm.set_checkpoint_height(
+                parent,
+                u32::try_from(parent_height).map_err(|_| {
+                    ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
+                })?,
+            );
+        }
+        self.authenticate_block(block)
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        self.check_signer_signatures(block, context);
+        self.check_tenure_vrf_if_starting(block, context)
+    }
+
+    /// A tenure-start block claims a tenure it says it won, and the VRF rules are
+    /// what make that claim checkable. They run before anything executes: a block
+    /// that fails them is not this chain's, whatever state it computes.
+    fn check_tenure_vrf_if_starting(
+        &self,
+        block: &NakamotoBlock,
+        context: BitcoinBlockContext,
+    ) -> Result<(), ChainStateError> {
+        if !block_starts_new_tenure(block) {
+            return Ok(());
+        }
+        self.check_tenure_vrf(block, context)
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
+    }
+
+    /// Check the VRF rules a tenure-start block has to satisfy.
+    ///
+    /// Two rules, and they are separate. The coinbase proof must have been
+    /// produced by the winning miner's registered VRF key over this tenure's
+    /// sortition hash — otherwise anyone could claim a tenure they did not win.
+    /// And the seed that miner committed on Bitcoin must be the hash of the
+    /// *parent* tenure's proof — otherwise a miner could commit any seed and
+    /// steer the sortition that follows.
+    ///
+    /// Either input can be unavailable, and the two cases are different from
+    /// each other and from a failure:
+    ///
+    /// - the leader key is unknown when its registration predates the burnchain
+    ///   window this node holds, which is ordinary just after a checkpoint;
+    /// - the parent proof is unknown only for the first tenure after a
+    ///   checkpoint, because every later one is retained here.
+    ///
+    /// Neither is a reason to accept quietly. An unavailable input is reported
+    /// and named; a rule that *can* be checked and fails rejects the block.
+    fn check_tenure_vrf(
+        &self,
+        block: &NakamotoBlock,
+        context: BitcoinBlockContext,
+    ) -> Result<(), TenureVrfError> {
+        if let Some(key) = context.winner_vrf_public_key {
+            verify_coinbase_vrf_proof(block, &key, &context.sortition_hash)?;
+        } else {
+            eprintln!(
+                "tenure at burn {} carries a coinbase proof this node cannot check: \
+                 the winning commitment's leader key was registered before the \
+                 burnchain window it holds",
+                context.height
+            );
+        }
+        if let Some(parent_proof) = self.parent_tenure_proof {
+            verify_committed_vrf_seed(&context.vrf_seed, &parent_proof)?;
+        } else {
+            eprintln!(
+                "tenure at burn {} commits a seed this node cannot check: it has no \
+                 coinbase proof for the parent tenure, which is expected only for \
+                 the first tenure after a checkpoint",
+                context.height
+            );
+        }
+        Ok(())
+    }
+
     /// Check what a block claims about itself before any of it is executed.
     ///
     /// A state root only says the block computes what its header commits to; it
@@ -1249,23 +1351,7 @@ impl ChainState {
             effects,
             candidates,
         } = execution;
-        if let Some(parent) = parent {
-            let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
-                ChainStateError::InvalidTransaction(
-                    "Nakamoto block cannot extend the genesis height".to_owned(),
-                )
-            })?;
-            self.vm.set_checkpoint_height(
-                parent,
-                u32::try_from(parent_height).map_err(|_| {
-                    ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
-                })?,
-            );
-        }
-        // What the block claims about itself, before any of it runs.
-        self.authenticate_block(block)
-            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
-        self.check_signer_signatures(block, bitcoin_context);
+        self.check_before_executing(block, parent, bitcoin_context)?;
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // Everything this node keeps outside the MARF, as it stood before the
@@ -1279,6 +1365,7 @@ impl ChainState {
             self.accounting.clone(),
             self.tenure_start_heights.clone(),
             self.executed.clone(),
+            self.parent_tenure_proof,
         );
         let mut effects = effects;
         let result = (|| {
@@ -1346,6 +1433,12 @@ impl ChainState {
             };
             self.settle_state_root(block, root, &receipts, executed)?;
             self.record_block_header(block, bitcoin_context)?;
+            // Keep this tenure's proof: it is what the *next* tenure's committed
+            // seed has to hash to. Retained only once the block is accepted, and
+            // rolled back with everything else if it is not.
+            if let Some(proof) = coinbase_vrf_proof(block) {
+                self.parent_tenure_proof = Some(proof);
+            }
             let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
             Ok(AppliedBlock {
                 bitcoin_height: bitcoin_context.height,
@@ -1357,7 +1450,12 @@ impl ChainState {
         if result.is_err() {
             // Report why execution failed, not why the rollback did.
             drop(self.vm.abort_block());
-            (self.accounting, self.tenure_start_heights, self.executed) = unwind;
+            (
+                self.accounting,
+                self.tenure_start_heights,
+                self.executed,
+                self.parent_tenure_proof,
+            ) = unwind;
         }
         result
     }

@@ -102,6 +102,15 @@ pub struct BitcoinBlockContext {
     /// Bitcoin every miner spent on this sortition, and the winner's share.
     pub burn_spend_total: u128,
     pub burn_spend_winner: u128,
+    /// The tenure's sortition hash, which a coinbase VRF proof is over.
+    ///
+    /// Validation only: no Clarity word reads it, so it moves no state root.
+    pub sortition_hash: [u8; 32],
+    /// The winning commitment's leader-key VRF public key, when this node saw
+    /// the burn block that registered it.
+    ///
+    /// Validation only, and `None` means "not known here", not "no key".
+    pub winner_vrf_public_key: Option<[u8; 32]>,
 }
 
 impl BitcoinBlockContext {
@@ -124,6 +133,8 @@ impl BitcoinBlockContext {
             vrf_seed: [0; 32],
             burn_spend_total: 0,
             burn_spend_winner: 0,
+            sortition_hash: [0; 32],
+            winner_vrf_public_key: None,
         }
     }
 }

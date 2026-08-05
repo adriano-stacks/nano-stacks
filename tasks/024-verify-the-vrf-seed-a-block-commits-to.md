@@ -29,7 +29,7 @@ or it will follow a chain the network will not.
       started.
 - [x] Verify the coinbase proof against that key and the parent's seed.
 - [x] Check the seed the commitment carries is the one the proof derives.
-- [ ] Reject a tenure-start block that fails either check.
+- [x] Reject a tenure-start block that fails either check.
 
 ## Acceptance Criteria
 
@@ -85,3 +85,39 @@ Also still true from the note above: `nano-miner`'s
 `hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
 block header hash, and several miners commit the same hash in one Bitcoin block,
 so it should match on the txid.
+
+## The check is on the follow path now
+
+`ChainState::check_tenure_vrf` runs before anything executes, on every block that
+starts a tenure, and a failure rejects the block rather than warning about it.
+`tenure_vrf_enforcement` goes through
+`append_nakamoto_block_with_bitcoin_operations` and asks what the chainstate
+*does*: the tenure the network accepted is accepted with its own leader key, a
+proof from another miner's key is rejected, a key that is not a curve point is
+rejected, and an unknown key accepts the block while saying on stderr that it
+could not be checked.
+
+The two inputs are carried as validation-only fields — `sortition_hash` and
+`winner_vrf_public_key` on `BitcoinBlockContext` — so no Clarity word reads them
+and neither moves a state root. `SortitionTracker` now keeps a `LeaderKeys` and
+registers every `LeaderKeyRegistration` it walks past, registrations before
+commitments so a commitment naming a key from its own burn block resolves. The
+accepted tenure's coinbase proof is retained in `ChainState` and rolled back with
+everything else if the block is not accepted.
+
+**Two inputs can be absent, and they are reported rather than skipped.** A leader
+key registered before the burnchain window this node holds is unresolvable, which
+is ordinary for the first tenures after a checkpoint; and the parent tenure's
+proof is unknown for the very first tenure. Both print what they could not check
+and why. That is the honest state, not a closed hole: a node in that window is
+accepting proofs it has not verified, and it says so.
+
+**What is left is plumbing, and it belongs to
+[[049-derive-canonical-sortitions-from-the-local-burncha]].** The fields are on
+the context but the follow path still fills the per-block context from the
+peer-supplied `/v3/sortitions` response (`nano-node/src/lib.rs`, three sites),
+which carries neither a sortition hash nor a leader key. Until those read from the
+local `SortitionTracker` instead, the check runs with `None` on both inputs on a
+live follow and only the conformance test exercises it for real. Taking them from
+the peer would mean trusting the peer for a validation input, which is the thing
+this task exists to avoid.

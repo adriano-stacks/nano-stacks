@@ -197,6 +197,7 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         ),
         winner_txid: None,
         winner_vrf_seed: None,
+        winner_vrf_public_key: None,
         pox_id: mainnet_pox_id(),
     }
 }
@@ -275,6 +276,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
                             new_seed,
                             ..
                         }) => Some(SortitionWinner {
+                            vrf_public_key: None,
                             txid: operation.txid,
                             vrf_seed: *new_seed,
                         }),

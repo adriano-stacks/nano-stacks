@@ -16,7 +16,7 @@ use std::{fs, path::Path};
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
 use nano_primitives::ConsensusHash;
 use nano_sortition::{
-    PoxId, SnapshotChain, SortitionError, SortitionSnapshot, SortitionWinner,
+    LeaderKeys, PoxId, SnapshotChain, SortitionError, SortitionSnapshot, SortitionWinner,
     commit_lands_in_block,
 };
 use serde::Deserialize;
@@ -56,6 +56,14 @@ struct History {
 pub struct SortitionTracker {
     chain: SnapshotChain,
     pox_id: PoxId,
+    /// Leader keys registered by the burn blocks this tracker has walked.
+    ///
+    /// A winning commitment names the registration that authorises its VRF
+    /// proof, and the proof is what a tenure-start block is checked against. A
+    /// node that started at a checkpoint has not seen the older registrations,
+    /// so a lookup can miss — which is reported rather than treated as "no check
+    /// needed".
+    keys: LeaderKeys,
 }
 
 impl SortitionTracker {
@@ -68,7 +76,11 @@ impl SortitionTracker {
         let chain = SnapshotChain::with_history(seed, history).ok_or_else(|| {
             TrackerError::Seed("the history does not end at the snapshot it seeds".to_owned())
         })?;
-        Ok(Self { chain, pox_id })
+        Ok(Self {
+            chain,
+            pox_id,
+            keys: LeaderKeys::new(),
+        })
     }
 
     /// Read the consensus hashes a capture carries, oldest first.
@@ -107,8 +119,18 @@ impl SortitionTracker {
         block: &BitcoinBlock,
         total_burn: u64,
     ) -> Result<&SortitionSnapshot, TrackerError> {
+        // Registrations first: a commitment in this very block may name a key
+        // this block registers, and a lookup that ran first would miss it.
+        for operation in &block.operations {
+            if let BitcoinOperationKind::LeaderKeyRegistration { vrf_public_key, .. } =
+                &operation.kind
+            {
+                self.keys
+                    .register(block.height, operation.transaction_index, *vrf_public_key);
+            }
+        }
         let txids = operation_txids(block);
-        let winner = winner_of(block);
+        let winner = winner_of(block, &self.keys);
         Ok(self.chain.append_with_operations(
             block,
             &txids,
@@ -145,15 +167,25 @@ fn operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
 /// Choosing between several is the burn distribution's business; a block with
 /// one eligible commitment has no choice to make, which is the common case and
 /// the one this answers.
-fn winner_of(block: &BitcoinBlock) -> Option<SortitionWinner> {
+fn winner_of(block: &BitcoinBlock, keys: &LeaderKeys) -> Option<SortitionWinner> {
     let mut eligible = block.operations.iter().filter_map(|operation| {
         match (&operation.kind, commit_lands_in_block_of(operation, block)) {
-            (BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }, true) => {
-                Some(SortitionWinner {
-                    txid: operation.txid,
-                    vrf_seed: *new_seed,
-                })
-            }
+            (
+                BitcoinOperationKind::LeaderBlockCommit {
+                    new_seed,
+                    key_block_height,
+                    key_transaction_index,
+                    ..
+                },
+                true,
+            ) => Some(SortitionWinner {
+                txid: operation.txid,
+                vrf_seed: *new_seed,
+                vrf_public_key: keys.usable(
+                    u64::from(*key_block_height),
+                    u32::from(*key_transaction_index),
+                ),
+            }),
             _ => None,
         }
     });
@@ -248,6 +280,7 @@ fn seed_snapshot(seed: &CapturedSnapshot, pox_id: PoxId) -> Result<SortitionSnap
         )?),
         winner_txid: None,
         winner_vrf_seed: None,
+        winner_vrf_public_key: None,
         pox_id,
     })
 }
