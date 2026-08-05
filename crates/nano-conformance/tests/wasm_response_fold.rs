@@ -348,6 +348,15 @@ const NARROWING: &str = "
              (print { a: u10, b: 0x11223344, c: true }))))
     { a: (get a t), c: (get c t) }))
 
+;; The same drop with every field the same width, so a mispairing of source
+;; field to target locals loads cleanly and answers wrong instead of refusing
+;; to load, which is the failure mode a load check cannot see.
+(define-read-only (drop-middle-uniform (narrow bool))
+  (let ((t (if narrow
+             (print { a: u10, c: u30 })
+             (print { a: u10, b: u20, c: u30 }))))
+    { a: (get a t), c: (get c t) }))
+
 ;; Narrowing inside a field: `inner` sorts before `outer`, and `y` sorts between
 ;; the two fields that survive it.
 (define-read-only (drop-nested (narrow bool))
@@ -371,7 +380,12 @@ fn boolean(value: bool) -> Vec<u8> {
 
 #[test]
 fn narrowing_a_tuple_keeps_the_fields_it_kept() {
-    for function in ["drop-middle", "drop-nested", "drop-beside-a-list"] {
+    for function in [
+        "drop-middle",
+        "drop-middle-uniform",
+        "drop-nested",
+        "drop-beside-a-list",
+    ] {
         for narrow in [true, false] {
             let (compiled, interpreted) = both_in(NARROWING, function, &[boolean(narrow)]);
             // Two engines agreeing on a failure would prove nothing about which
