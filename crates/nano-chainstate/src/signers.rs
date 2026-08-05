@@ -51,24 +51,26 @@ pub const fn reward_cycle_at(context: BitcoinBlockContext) -> Option<u64> {
     Some((context.height - context.first_height) / length)
 }
 
-/// The signer set that attests to blocks in `context`'s reward cycle.
+/// The signer set that attests to blocks in `context`'s reward cycle, and the
+/// per-slot stacking threshold it was apportioned against.
 ///
 /// Derived from this node's own executed state — the pox-5 linked list the
 /// network derives it from — so a block's signatures can be checked against
-/// something no peer supplied.
+/// something no peer supplied. The threshold comes back because it is
+/// `pox_ustx_threshold` in the reward set a node publishes, and nothing else can
+/// recompute it from the weights.
 pub fn active_signer_set(
     vm: &mut Vm,
     context: BitcoinBlockContext,
-) -> Result<SignerSet, ChainStateError> {
+) -> Result<(SignerSet, u128), ChainStateError> {
     let cycle = reward_cycle_at(context).ok_or(ChainStateError::NoSignerSet(0))?;
     let reward_slots = context.reward_phase_length * OUTPUTS_PER_COMMIT;
     let stakers = stake_entries(vm, cycle)?;
     if stakers.is_empty() {
         return Err(ChainStateError::NoSignerSet(cycle));
     }
-    let (set, _) = SignerSet::from_reward_slots(stakers, reward_slots)
-        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
-    Ok(set)
+    SignerSet::from_reward_slots(stakers, reward_slots)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }
 
 /// Compute and store the next cycle's signer set, if this block starts a prepare phase.

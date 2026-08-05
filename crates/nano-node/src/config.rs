@@ -44,6 +44,13 @@ pub struct NodeConfig {
     /// Where to POST the events an observer subscribes to.
     #[serde(default)]
     pub event_observers: Vec<String>,
+    /// The `authorization` header `/v3/block_proposal` demands, or nothing to
+    /// serve no proposals at all.
+    ///
+    /// Unauthenticated, that route lets anyone make a node execute a block of
+    /// their choosing, so there is no default: a node that was not given a token
+    /// answers `503` rather than inventing one.
+    pub block_proposal_token: Option<String>,
     #[serde(default = "one")]
     pub poll_interval_secs: u64,
     /// Blocks this node will download to reach the peer's tip before it

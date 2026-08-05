@@ -4,7 +4,7 @@ mod stackerdb;
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -27,8 +27,8 @@ use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
-use nano_sync::NodeView;
 use nano_primitives::{ConsensusHash, Network, StacksBlockId, TrieHash};
+use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -37,24 +37,64 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
 pub use events::{
     BlockEventContext, DEFAULT_DISPATCH_ATTEMPTS, EventDispatcher, EventKind, MaturedReward,
-    RewardSetEvent, RewardSetSigner, mined_nakamoto_block_payload, new_block_payload,
-    new_burn_block_payload, stackerdb_chunks_payload,
+    ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner,
+    mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
+    proposal_response_payload, stackerdb_chunks_payload, stacker_set_payload,
 };
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
+
+/// The one boundary an unsolicited block passes before a node will hold it.
+///
+/// A block uploaded or proposed over HTTP arrives from anyone, so it has to
+/// satisfy what a followed block satisfies: a node that admits over its own API
+/// what it would refuse from a peer is forkable through its own API. This is
+/// deliberately not a second validator — the node's implementation routes
+/// straight to `ChainState::authenticate_block`, the boundary
+/// [[050-authenticate-every-followed-nakamoto-block]] put before execution.
+pub trait BlockAdmission: Send {
+    /// Why this block is not one this chain would accept, if it is not.
+    fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String>;
+}
+
+/// One coherent view of what this node executed.
+///
+/// Published as a whole so that two routes cannot answer from two different
+/// rounds: the tip, the chain that leads to it, and the cycle constants are read
+/// together or not at all.
+#[derive(Clone, Debug)]
+struct Executed {
+    tip: SealedTip,
+    /// The followed tenures, bounded at the tip: what this node has executed,
+    /// and nothing above it.
+    chain: Vec<FollowedTenure>,
+    /// The `PoX` constants, which are configuration rather than chain state, so
+    /// they survive a tip the peer's view no longer reaches.
+    pox: Option<PoxInfo>,
+}
 
 /// The validated node state exposed by the public HTTP API.
 #[derive(Clone)]
 pub struct RpcState {
-    view: Arc<RwLock<Option<NodeView>>>,
-    /// The tip this node has actually executed and sealed.
+    /// What the peer said, kept so that catching up is measurable and read by
+    /// nothing else. Serving the peer's height as this node's own is how a node
+    /// that had executed nothing at all reported itself within three blocks of
+    /// mainnet for eighty minutes.
+    followed: Arc<RwLock<Option<NodeView>>>,
+    /// How far ahead the peer said it is.
     ///
-    /// Separate from `view`, which is what the peer said. Serving the peer's
-    /// height as this node's own is how a node that had executed nothing at all
-    /// reported itself within three blocks of mainnet for eighty minutes.
-    executed: Arc<RwLock<Option<SealedTip>>>,
+    /// Kept apart from `followed` because a node that is far behind never walks
+    /// the peer's tenure — that walk fails every round from there — so it has a
+    /// height and no view, and the height is the whole of what "how far behind
+    /// am I" needs.
+    followed_height: Arc<RwLock<Option<u64>>>,
+    /// What this node executed and sealed, which every Stacks-compatible route
+    /// answers from.
+    executed: Arc<RwLock<Option<Executed>>>,
     events: broadcast::Sender<NodeEvent>,
     /// The executed Clarity state, when the node runs one.
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
+    /// The validator an uploaded block or a proposal has to pass.
+    admission: Option<Arc<Mutex<dyn BlockAdmission>>>,
     mempool: Option<Arc<Mutex<Mempool>>>,
     /// The chain this node is on, which no peer needs to be asked about.
     network: Network,
@@ -66,6 +106,8 @@ pub struct RpcState {
     blocks: Option<mpsc::UnboundedSender<NakamotoBlock>>,
     /// The `authorization` header `/v3/block_proposal` demands.
     proposal_token: Option<String>,
+    /// Where the events a route produces are published.
+    observers: Option<EventDispatcher>,
 }
 
 impl std::fmt::Debug for RpcState {
@@ -92,16 +134,19 @@ impl RpcState {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
-            view: Arc::new(RwLock::new(None)),
+            followed: Arc::new(RwLock::new(None)),
+            followed_height: Arc::new(RwLock::new(None)),
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
+            admission: None,
             mempool: None,
             network: Network::MAINNET,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
             stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
             blocks: None,
             proposal_token: None,
+            observers: None,
         }
     }
 
@@ -123,6 +168,20 @@ impl RpcState {
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<Mutex<dyn ChainAccess>>) -> Self {
         self.chain = Some(chain);
+        self
+    }
+
+    /// Admit uploaded blocks and proposals only through this validator.
+    #[must_use]
+    pub fn with_block_admission(mut self, admission: Arc<Mutex<dyn BlockAdmission>>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// Publish the events a route produces to these observers.
+    #[must_use]
+    pub fn with_observers(mut self, observers: EventDispatcher) -> Self {
+        self.observers = Some(observers);
         self
     }
 
@@ -152,26 +211,81 @@ impl RpcState {
         self.stacker_sets.write().await.insert(cycle, stacker_set);
     }
 
-    /// Publish the tip this node has executed and sealed.
+    /// Publish the tip this node has executed and sealed, and the chain that
+    /// leads to it.
+    ///
+    /// The snapshot is built here, from the latest followed view bounded at this
+    /// tip, and written once — so a caller reading a block and a caller reading
+    /// the tip are told about the same state.
     pub async fn publish_executed(&self, tip: SealedTip) {
-        *self.executed.write().await = Some(tip);
+        let followed = self.followed.read().await.clone();
+        let pox = followed.as_ref().map(|view| view.pox_info.clone());
+        let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
+        *self.executed.write().await = Some(Executed { tip, chain, pox });
+    }
+
+    /// Say how far ahead the peer is, which is all a node this far behind knows.
+    ///
+    /// Catching up, the follower asks the peer only for its height: the tenure
+    /// walk a full view needs fails every round from thousands of blocks back.
+    /// Without this, `/nano/sync_status` answered `blocks_behind: null` for
+    /// exactly the node the number exists for.
+    pub async fn publish_followed_height(&self, height: u64) {
+        *self.followed_height.write().await = Some(height);
     }
 
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
     pub async fn publish(&self, view: NodeView) {
+        *self.followed_height.write().await = Some(view.node_info.stacks_height);
         let event = NodeEvent::from_view(&view);
         let changed = self
-            .view
+            .followed
             .read()
             .await
             .as_ref()
             .and_then(NodeEvent::from_view)
             != event;
-        *self.view.write().await = Some(view);
+        *self.followed.write().await = Some(view);
         if changed && let Some(event) = event {
             let _ = self.events.send(event);
         }
     }
+}
+
+/// The part of a followed view this node has actually executed.
+///
+/// The peer is ahead by construction, so its view names blocks this node has not
+/// executed and may never execute; serving them is exactly the confusion
+/// [[046-distinguish-followed-and-executed-chain-tips]] was about. So the chain
+/// is walked back from the executed tip through parent links, and nothing off
+/// that walk survives — a tip the view does not reach at all leaves nothing,
+/// which is the honest answer for a node still catching up.
+fn executed_chain(tenures: Vec<FollowedTenure>, tip: &SealedTip) -> Vec<FollowedTenure> {
+    let parents: HashMap<StacksBlockId, StacksBlockId> = tenures
+        .iter()
+        .flat_map(|tenure| &tenure.blocks)
+        .map(|block| (block.block_id(), block.header.parent_block_id))
+        .collect();
+    let mut executed = HashSet::new();
+    let mut walk = Some(tip.stacks_tip);
+    while let Some(block) = walk.filter(|block| !executed.contains(block)) {
+        executed.insert(block);
+        walk = parents.get(&block).copied();
+    }
+    tenures
+        .into_iter()
+        .filter_map(|mut tenure| {
+            tenure
+                .blocks
+                .retain(|block| executed.contains(&block.block_id()));
+            let last = tenure.blocks.last()?;
+            // The tenure's own tip moves down with it: a tenure whose newest
+            // blocks were dropped must not keep advertising them.
+            tenure.info.tip_block_id = last.block_id();
+            tenure.info.tip_height = last.header.chain_length;
+            Some(tenure)
+        })
+        .collect()
 }
 
 impl Default for RpcState {
@@ -273,14 +387,44 @@ impl RpcState {
         self.chain.clone().ok_or(RpcError::Unavailable)
     }
 
-    /// Whether the latest validated view already carries this block.
+    /// Whether this node has already executed this block.
     async fn holds_block(&self, block: &NakamotoBlock) -> bool {
-        self.view.read().await.as_ref().is_some_and(|view| {
-            view.tenures
+        self.executed.read().await.as_ref().is_some_and(|executed| {
+            executed
+                .chain
                 .iter()
                 .flat_map(|tenure| &tenure.blocks)
                 .any(|known| known.block_id() == block.block_id())
         })
+    }
+
+    /// Whether this node stands on the block this one names as its parent.
+    ///
+    /// A block whose parent this node has not executed cannot be validated
+    /// against anything: its state root is over a state this node does not hold.
+    async fn holds_parent_of(&self, block: &NakamotoBlock) -> bool {
+        let parent = block.header.parent_block_id;
+        self.executed.read().await.as_ref().is_some_and(|executed| {
+            executed.tip.stacks_tip == parent
+                || executed
+                    .chain
+                    .iter()
+                    .flat_map(|tenure| &tenure.blocks)
+                    .any(|known| known.block_id() == parent)
+        })
+    }
+
+    /// Put a block through the validator a followed block passes.
+    ///
+    /// Routed to, never reimplemented: the whole point is that the RPC cannot
+    /// admit something the follow path would refuse.
+    async fn authenticate(&self, block: &NakamotoBlock) -> Result<(), String> {
+        match self.admission.as_ref() {
+            Some(admission) => admission.lock().await.authenticate(block),
+            // A node with no chain to authenticate against holds no blocks
+            // either, so there is nothing for it to be talked onto.
+            None => Err("this node runs no chain to authenticate a block against".to_owned()),
+        }
     }
 
     fn offer_block(&self, block: NakamotoBlock) -> Result<(), RpcError> {
@@ -290,10 +434,22 @@ impl RpcState {
             .send(block)
             .map_err(|_| RpcError::Unavailable)
     }
+
+    fn dispatch(&self, kind: EventKind, payload: &Value) {
+        if let Some(observers) = self.observers.as_ref() {
+            observers.dispatch(kind, payload);
+        }
+    }
 }
 
-async fn view(state: &RpcState) -> Result<NodeView, RpcError> {
-    state.view.read().await.clone().ok_or(RpcError::Unavailable)
+/// The one executed snapshot a request answers from.
+async fn executed(state: &RpcState) -> Result<Executed, RpcError> {
+    state
+        .executed
+        .read()
+        .await
+        .clone()
+        .ok_or(RpcError::Unavailable)
 }
 
 /// The Stacks-compatible fields describe the chain this node executed, never
@@ -305,17 +461,12 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
     // had been heard from, even with a perfectly good executed tip to report —
     // which is the opposite of what this route is for.
     let network_id = state.network.chain_id();
-    let executed = state
-        .executed
-        .read()
-        .await
-        .clone()
-        .ok_or(RpcError::Unavailable)?;
+    let tip = executed(&state).await?.tip;
     Ok(axum::Json(NodeInfoWire {
-        burn_block_height: executed.bitcoin_height,
-        stacks_tip_height: executed.stacks_height,
-        stacks_tip: executed.stacks_tip.to_string(),
-        stacks_tip_consensus_hash: executed.consensus_hash.to_string(),
+        burn_block_height: tip.bitcoin_height,
+        stacks_tip_height: tip.stacks_height,
+        stacks_tip: tip.stacks_tip.to_string(),
+        stacks_tip_consensus_hash: tip.consensus_hash.to_string(),
         network_id,
     }))
 }
@@ -326,26 +477,34 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
 /// node that cannot execute looks identical to one at tip. This route is
 /// nano's own, and exists so that catching up is measurable.
 async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncStatusWire>, RpcError> {
-    let followed = view(&state).await.ok().map(|view| view.node_info.stacks_height);
-    let executed = state.executed.read().await.clone();
+    let followed = *state.followed_height.read().await;
+    let tip = state
+        .executed
+        .read()
+        .await
+        .as_ref()
+        .map(|executed| executed.tip.clone());
     Ok(axum::Json(SyncStatusWire {
         followed_stacks_height: followed,
-        executed_stacks_height: executed.as_ref().map(|tip| tip.stacks_height),
-        executed_stacks_tip: executed.as_ref().map(|tip| tip.stacks_tip.to_string()),
-        executed_state_index_root: executed.as_ref().map(|tip| tip.state_index_root.to_string()),
+        executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
+        executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
+        executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
         blocks_behind: followed
-            .zip(executed.as_ref().map(|tip| tip.stacks_height))
+            .zip(tip.as_ref().map(|tip| tip.stacks_height))
             .map(|(followed, executed)| followed.saturating_sub(executed)),
     }))
 }
 
+/// The cycle constants are this node's own, and the height is the one it
+/// executed: a caller told a burn height it can then ask no account about is
+/// being told about the peer.
 async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
-    let view = view(&state).await?;
-    let network = Network::from_chain_id(view.node_info.network_id);
-    let pox = view.pox_info;
+    let executed = executed(&state).await?;
+    let network = state.network;
+    let pox = executed.pox.ok_or(RpcError::Unavailable)?;
     Ok(axum::Json(PoxInfoWire {
         first_burnchain_block_height: pox.first_bitcoin_height,
-        current_burnchain_block_height: pox.bitcoin_height,
+        current_burnchain_block_height: executed.tip.bitcoin_height,
         prepare_phase_block_length: pox.prepare_phase_length,
         reward_phase_block_length: pox.reward_phase_length,
         reward_slots: pox.reward_slots,
@@ -365,9 +524,9 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWir
 async fn tenure_info(
     State(state): State<RpcState>,
 ) -> Result<axum::Json<TenureInfoWire>, RpcError> {
-    let latest = view(&state)
+    let latest = executed(&state)
         .await?
-        .tenures
+        .chain
         .last()
         .ok_or(RpcError::Unavailable)?
         .info
@@ -379,9 +538,9 @@ async fn sortition(
     State(state): State<RpcState>,
     Path(consensus_hash): Path<String>,
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
-    let sortition = view(&state)
+    let sortition = executed(&state)
         .await?
-        .tenures
+        .chain
         .into_iter()
         .map(|tenure| tenure.sortition)
         .find(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
@@ -609,9 +768,20 @@ async fn stackerdb_chunk_upload(
     };
     let metadata = SlotMetadataWire::from(&chunk.metadata());
     let contract_id = format!("{address}.{contract}");
+    let announce = chunk.clone();
     let accepted = state.stackerdb.write().await.put(&contract_id, chunk);
     Ok(axum::Json(match accepted {
-        Ok(()) => json!({ "accepted": true, "metadata": metadata }),
+        Ok(()) => {
+            // A chunk becomes news exactly when a slot takes it, which is here:
+            // this route is the only way a chunk enters a nano node, so it is
+            // the transition an observer — a signer watching its own reward
+            // cycle's contracts — is waiting on.
+            state.dispatch(
+                EventKind::StackerDbChunks,
+                &stackerdb_chunks_payload(&contract_id, std::slice::from_ref(&announce)),
+            );
+            json!({ "accepted": true, "metadata": metadata })
+        }
         Err(refusal) => json!({
             "accepted": false,
             "reason": refusal.reason(),
@@ -620,26 +790,57 @@ async fn stackerdb_chunk_upload(
     }))
 }
 
+/// Take a block off the network the way a peer's would be taken.
+///
+/// An uploaded block is somebody else's claim about the chain, so it passes the
+/// authentication a followed block passes before this node will hold it at all,
+/// and is then handed to the executor — which checks its state root as it would
+/// any other. Answering `accepted` for a block that never reached the validator
+/// is how a node becomes forkable through its own API.
 async fn upload_block(
     State(state): State<RpcState>,
     body: Bytes,
 ) -> Result<axum::Json<BlockUploadWire>, RpcError> {
     let block = NakamotoBlock::decode(&body)
         .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
-    let response = BlockUploadWire {
-        stacks_block_id: format!("0x{}", block.block_id()),
-        // A node that already holds the block does not re-accept it.
-        accepted: !state.holds_block(&block).await,
-    };
-    state.offer_block(block)?;
-    Ok(axum::Json(response))
+    state
+        .authenticate(&block)
+        .await
+        .map_err(|error| RpcError::BadRequest(format!("block refused: {error}")))?;
+    let stacks_block_id = format!("0x{}", block.block_id());
+    // A node that already holds the block does not re-accept it, and does not
+    // offer it again either: the executor would only walk past it.
+    let held = state.holds_block(&block).await;
+    if !held {
+        state.offer_block(block)?;
+    }
+    Ok(axum::Json(BlockUploadWire {
+        stacks_block_id,
+        accepted: !held,
+    }))
 }
 
+/// Judge a proposed block and say so through the event observer.
+///
+/// The shape is stacks-core's: the request is answered `202 Accepted` as soon as
+/// it parses, and the verdict travels as a `proposal_response` event, because a
+/// stock signer reads it from there rather than from this response body. A node
+/// with no observer registered answers `400`, as stacks-core does — a proposal
+/// whose result cannot be reported is a request nobody can act on.
+///
+/// What nano can and cannot say is the important part. Everything a followed
+/// block is authenticated for is checked here and rejected with the code a signer
+/// branches on. But a block that passes is only *admitted*: nano validates a
+/// state root by executing the block, and it cannot execute a candidate off its
+/// tip without leaving that candidate's state behind
+/// ([[056-make-rejected-block-execution-leave-no-state]]). So a block this node
+/// has not already executed is answered `Reject`, naming that as the reason,
+/// rather than `Ok` — a signer must not sign on a validation that did not happen.
 async fn block_proposal(
     State(state): State<RpcState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, RpcError> {
+) -> Result<(StatusCode, axum::Json<Value>), RpcError> {
     let token = state
         .proposal_token
         .as_deref()
@@ -651,6 +852,12 @@ async fn block_proposal(
     {
         return Err(RpcError::Unauthorized);
     }
+    if state.observers.is_none() {
+        return Err(RpcError::Rejected(json!({
+            "result": "Error",
+            "message": "No `observer` registered for receiving proposal callbacks",
+        })));
+    }
     let proposal: BlockProposalWire = serde_json::from_slice(&body)
         .map_err(|error| RpcError::BadRequest(format!("failed to decode proposal: {error}")))?;
     let block = NakamotoBlock::decode(
@@ -658,8 +865,87 @@ async fn block_proposal(
             .map_err(|error| RpcError::BadRequest(format!("invalid block hex: {error}")))?,
     )
     .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
-    state.offer_block(block)?;
-    Ok(StatusCode::ACCEPTED)
+
+    let outcome = judge_proposal(&state, &proposal, &block).await;
+    state.dispatch(
+        EventKind::ProposalResponse,
+        &proposal_response_payload(block.header.signer_signature_hash(), &outcome),
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(json!({
+            "result": "Accepted",
+            "message": "Block proposal is processing, result will be returned via the event observer",
+        })),
+    ))
+}
+
+async fn judge_proposal(
+    state: &RpcState,
+    proposal: &BlockProposalWire,
+    block: &NakamotoBlock,
+) -> ProposalOutcome {
+    let rejected = |reason: String, code| ProposalOutcome::Rejected { reason, code };
+    // The chain identifier is in the request rather than in the block, and a
+    // proposal for another chain is not a proposal at all.
+    if let Some(chain_id) = proposal.chain_id
+        && chain_id != state.network.chain_id()
+    {
+        return rejected(
+            format!(
+                "proposal names chain {chain_id:#010x}, this node is on {:#010x}",
+                state.network.chain_id()
+            ),
+            ProposalRejectCode::NetworkChainMismatch,
+        );
+    }
+    if proposal
+        .replay_txs
+        .as_ref()
+        .is_some_and(|replay| !replay.is_empty())
+    {
+        return rejected(
+            "this node does not validate against a transaction replay set".to_owned(),
+            ProposalRejectCode::InvalidTransactionReplay,
+        );
+    }
+    if let Err(error) = state.authenticate(block).await {
+        return rejected(error, ProposalRejectCode::InvalidBlock);
+    }
+    if state.holds_block(block).await {
+        // Already executed, so the state root was already checked. Zero cost is
+        // the value stacks-core itself reports for a block it did not have to
+        // execute, and a signer reads it that way.
+        return ProposalOutcome::Accepted {
+            cost: clarity::vm::costs::ExecutionCost::ZERO,
+            size: block.encode().len() as u64,
+            validation_time_ms: 0,
+        };
+    }
+    if !state.holds_parent_of(block).await {
+        return rejected(
+            format!(
+                "this node has not executed the parent {} this block builds on",
+                block.header.parent_block_id
+            ),
+            ProposalRejectCode::UnknownParent,
+        );
+    }
+    // Admitted for execution but not vouched for: the offer is what gets the
+    // block executed and its root checked, and the refusal is what stops a
+    // signer treating "we will look at it" as "we agree with it".
+    if let Err(error) = state.offer_block(block.clone()) {
+        return rejected(
+            format!("this node cannot take the block: {error:?}"),
+            ProposalRejectCode::ChainstateError,
+        );
+    }
+    rejected(
+        "this node validates a proposal by executing it, and has not executed \
+         this block yet; it has been admitted and its state root will be checked then"
+            .to_owned(),
+        ProposalRejectCode::ChainstateError,
+    )
 }
 
 fn now_seconds() -> u64 {
@@ -678,9 +964,9 @@ async fn tenure(
     Path(start_block_id): Path<String>,
     Query(query): Query<TenureQuery>,
 ) -> Result<RawBlockStream, RpcError> {
-    let tenure = view(&state)
+    let tenure = executed(&state)
         .await?
-        .tenures
+        .chain
         .into_iter()
         .find(|tenure| tenure.info.tenure_start_block_id.to_string() == start_block_id)
         .ok_or(RpcError::NotFound)?;
@@ -702,9 +988,9 @@ async fn block(
     State(state): State<RpcState>,
     Path(block_id): Path<String>,
 ) -> Result<RawBlockStream, RpcError> {
-    let block = view(&state)
+    let block = executed(&state)
         .await?
-        .tenures
+        .chain
         .into_iter()
         .flat_map(|tenure| tenure.blocks)
         .find(|block| block.block_id().to_string() == block_id)
@@ -789,9 +1075,18 @@ struct BlockUploadWire {
     accepted: bool,
 }
 
+/// A proposal as a stock signer sends it (`NakamotoBlockProposal`).
+///
+/// `chain_id` and `replay_txs` are optional here where stacks-core requires
+/// them, so that a hand-rolled proposal — which is how nano's own tests and
+/// hacknet tooling send one — is not refused for a field it had no reason to set.
 #[derive(Deserialize)]
 struct BlockProposalWire {
     block: String,
+    #[serde(default)]
+    chain_id: Option<u32>,
+    #[serde(default)]
+    replay_txs: Option<Vec<Value>>,
 }
 
 /// The tip a node has executed and sealed, as opposed to the one it has seen.
@@ -933,9 +1228,16 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall, Router, RpcState, SealedTip,
-        router,
+        AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, ReadOnlyCall,
+        Router, RpcState, SealedTip, mpsc, router,
     };
+
+    /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
+    /// JSON's for every payload.
+    use serde_json::Value as Json;
+
+    /// The events an observer has been sent, by path and payload.
+    type Received = Arc<std::sync::Mutex<Vec<(String, Json)>>>;
 
     const NETWORK: Network = Network::TESTNET;
 
@@ -1384,6 +1686,580 @@ mod tests {
 
         state.publish(captured_view()).await;
         assert!(events.try_recv().is_err());
+    }
+
+    /// A chain of blocks that agree with each other, for the routes that serve
+    /// them: `executed_chain` walks parent links, so the links have to be real.
+    fn synthetic_block(
+        height: u64,
+        parent: StacksBlockId,
+        consensus_hash: ConsensusHash,
+    ) -> NakamotoBlock {
+        NakamotoBlock {
+            header: nano_chainstate::NakamotoBlockHeader {
+                version: 1,
+                chain_length: height,
+                bitcoin_spent: height * 10,
+                consensus_hash,
+                parent_block_id: parent,
+                transaction_merkle_root: nano_primitives::Sha256Sum::default(),
+                state_index_root: TrieHash::from_bytes([u8::try_from(height % 256).unwrap_or(0); 32]),
+                timestamp: 1_700_000_000 + height,
+                miner_signature: nano_crypto::MessageSignature::from_bytes([0; 65]),
+                signer_signatures: Vec::new(),
+                pox_treatment: nano_primitives::BitVec::zeros(1).expect("a bit vector"),
+                problematic_transactions: Vec::new(),
+            },
+            transactions: Vec::new(),
+        }
+    }
+
+    /// A view whose one tenure carries three linked blocks, of which this node
+    /// is meant to have executed only the first `executed`.
+    fn view_with_blocks(count: u64) -> (NodeView, Vec<NakamotoBlock>) {
+        let consensus_hash = ConsensusHash::from_bytes([2; 20]);
+        let mut blocks = Vec::new();
+        let mut parent = StacksBlockId::from_bytes([0; 32]);
+        for height in 1..=count {
+            let block = synthetic_block(height, parent, consensus_hash);
+            parent = block.block_id();
+            blocks.push(block);
+        }
+        let mut view = captured_view();
+        view.tenures[0].info.tenure_start_block_id = blocks[0].block_id();
+        view.tenures[0].blocks = blocks.clone();
+        (view, blocks)
+    }
+
+    fn sealed_at(block: &NakamotoBlock) -> SealedTip {
+        SealedTip {
+            stacks_height: block.header.chain_length,
+            stacks_tip: block.block_id(),
+            consensus_hash: block.header.consensus_hash,
+            bitcoin_height: 11,
+            state_index_root: block.header.state_index_root,
+        }
+    }
+
+    /// Every route answers from what this node executed, so a block the peer has
+    /// and this node has not is not served, and the tenure it belongs to reports
+    /// the height this node actually reached.
+    ///
+    /// A peer's view is ahead by construction. Serving it is how a node reported
+    /// itself at mainnet's tip with an empty MARF; the fix is not to bound one
+    /// route but to publish one snapshot every route reads.
+    #[tokio::test]
+    async fn no_route_serves_a_block_the_node_has_not_executed() {
+        let (view, blocks) = view_with_blocks(3);
+        let state = RpcState::new();
+        state.publish(view).await;
+        state.publish_executed(sealed_at(&blocks[1])).await;
+        let app = router(state);
+        let get = |uri: String, app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        };
+
+        for (block, expected) in [
+            (&blocks[0], StatusCode::OK),
+            (&blocks[1], StatusCode::OK),
+            (&blocks[2], StatusCode::NOT_FOUND),
+        ] {
+            let response = get(format!("/v3/blocks/{}", block.block_id()), app.clone()).await;
+            assert_eq!(
+                response.status(),
+                expected,
+                "block {} at height {}",
+                block.block_id(),
+                block.header.chain_length
+            );
+        }
+
+        // The tenure's own tip comes down with it, rather than advertising a
+        // block the same node will not serve.
+        let tenure = body_json(get("/v3/tenures/info".to_owned(), app.clone()).await).await;
+        assert_eq!(tenure["tip_height"], json!(2));
+        assert_eq!(
+            tenure["tip_block_id"],
+            json!(blocks[1].block_id().to_string())
+        );
+
+        // And the tenure stream stops there too.
+        let stream = get(
+            format!("/v3/tenures/{}", blocks[0].block_id()),
+            app.clone(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
+            .await
+            .expect("read tenure");
+        let expected: Vec<u8> = blocks[..2].iter().flat_map(NakamotoBlock::encode).collect();
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+
+        // `/v2/pox` keeps the cycle constants, which are configuration, and
+        // reports the burn height this node executed under.
+        let pox = body_json(get("/v2/pox".to_owned(), app).await).await;
+        assert_eq!(pox["prepare_phase_block_length"], json!(5));
+        assert_eq!(pox["current_burnchain_block_height"], json!(11));
+    }
+
+    /// A tip the peer's view does not reach leaves nothing to serve, which is the
+    /// honest answer for a node that is catching up: it holds the blocks, but it
+    /// cannot prove from a peer's view that they are the ones it executed.
+    #[tokio::test]
+    async fn a_tip_outside_the_followed_view_serves_no_blocks() {
+        let (view, blocks) = view_with_blocks(3);
+        let state = RpcState::new();
+        state.publish(view).await;
+        state
+            .publish_executed(sealed_at(&synthetic_block(
+                9,
+                StacksBlockId::from_bytes([9; 32]),
+                ConsensusHash::from_bytes([9; 20]),
+            )))
+            .await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v3/blocks/{}", blocks[0].block_id()))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let tenure = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v3/tenures/info")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(tenure.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A validator that records what it was asked about and answers as told, so
+    /// the routes can be checked to *reach* it rather than to duplicate it.
+    #[derive(Clone, Default)]
+    struct RecordingAdmission {
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+        refusal: Option<String>,
+    }
+
+    impl super::BlockAdmission for RecordingAdmission {
+        fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String> {
+            self.asked
+                .lock()
+                .expect("record")
+                .push(block.block_id().to_string());
+            self.refusal.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    /// An observer that keeps every body it is sent, at a real address, so the
+    /// dispatch a route makes can be read back out of it.
+    async fn recording_observer() -> (reqwest::Url, Received) {
+        let received: Received = Arc::default();
+        let state = received.clone();
+        let app = Router::new()
+            .route(
+                "/{event}",
+                axum::routing::post(
+                    |axum::extract::State(state): axum::extract::State<Received>,
+                     axum::extract::Path(event): axum::extract::Path<String>,
+                     body: String| async move {
+                        let payload = serde_json::from_str(&body).expect("a JSON payload");
+                        state.lock().expect("record").push((event, payload));
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observer");
+        let address = listener.local_addr().expect("observer address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (
+            reqwest::Url::parse(&format!("http://{address}/")).expect("observer URL"),
+            received,
+        )
+    }
+
+    /// An uploaded block goes through the validator a followed block goes
+    /// through, and a node that refuses it does not hold it.
+    ///
+    /// The point is not that the check exists but that this route reaches the
+    /// one check: a node that admits over its own API what it would refuse from
+    /// a peer is forkable through its own API.
+    #[tokio::test]
+    async fn an_uploaded_block_is_refused_by_the_validator_that_refuses_a_followed_one() {
+        let (view, blocks) = view_with_blocks(3);
+        let refusing = RecordingAdmission {
+            asked: Arc::default(),
+            refusal: Some("unsupported Nakamoto block version 3".to_owned()),
+        };
+        let (blocks_out, mut offered) = mpsc::unbounded_channel();
+        let state = RpcState::new()
+            .with_block_admission(Arc::new(Mutex::new(refusing.clone())))
+            .with_block_sink(blocks_out);
+        state.publish(view.clone()).await;
+        state.publish_executed(sealed_at(&blocks[1])).await;
+        let upload = |block: &NakamotoBlock, app: Router| {
+            let body = block.encode();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v3/blocks/upload")
+                        .body(Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+            }
+        };
+
+        let refused = upload(&blocks[2], router(state.clone())).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusing.asked.lock().expect("record").len(), 1);
+        assert!(
+            offered.try_recv().is_err(),
+            "a refused block was handed to the node anyway"
+        );
+
+        // The same block, from a node whose validator accepts it, is taken once
+        // — and a block already executed is neither accepted again nor offered.
+        let accepting = RecordingAdmission::default();
+        let (blocks_out, mut offered) = mpsc::unbounded_channel();
+        let state = RpcState::new()
+            .with_block_admission(Arc::new(Mutex::new(accepting)))
+            .with_block_sink(blocks_out);
+        state.publish(view).await;
+        state.publish_executed(sealed_at(&blocks[1])).await;
+
+        let taken = body_json(upload(&blocks[2], router(state.clone())).await).await;
+        assert_eq!(taken["accepted"], json!(true));
+        assert_eq!(
+            offered.try_recv().expect("the node was offered the block"),
+            blocks[2]
+        );
+
+        let held = body_json(upload(&blocks[1], router(state)).await).await;
+        assert_eq!(held["accepted"], json!(false));
+        assert!(
+            offered.try_recv().is_err(),
+            "a block already executed was offered again"
+        );
+    }
+
+    /// A node whose proposal route is fully wired: a validator that accepts, a
+    /// real observer, a token, and an executed chain two of three blocks deep.
+    struct ProposalNode {
+        app: Router,
+        blocks: Vec<NakamotoBlock>,
+        received: Received,
+        offered: mpsc::UnboundedReceiver<NakamotoBlock>,
+    }
+
+    async fn proposal_node() -> ProposalNode {
+        let (view, blocks) = view_with_blocks(3);
+        let (url, received) = recording_observer().await;
+        let (blocks_out, offered) = mpsc::unbounded_channel();
+        let state = RpcState::new()
+            .on(NETWORK)
+            .with_block_admission(Arc::new(Mutex::new(RecordingAdmission::default())))
+            .with_block_sink(blocks_out)
+            .with_observers(EventDispatcher::new(vec![url]))
+            .with_proposal_token("t0ken".to_owned());
+        state.publish(view).await;
+        state.publish_executed(sealed_at(&blocks[1])).await;
+        ProposalNode {
+            app: router(state),
+            blocks,
+            received,
+            offered,
+        }
+    }
+
+    impl ProposalNode {
+        async fn propose(&self, body: Json, token: Option<&str>) -> axum::response::Response {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v3/block_proposal")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", token);
+            }
+            self.app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).expect("request"))
+                .await
+                .expect("response")
+        }
+
+        /// The one verdict this node reached, once its observer has it.
+        async fn verdict(&self) -> Json {
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let posts = self.received.lock().expect("record");
+                if let Some((_, payload)) = posts
+                    .iter()
+                    .find(|(event, _)| event == "proposal_response")
+                {
+                    let payload = payload.clone();
+                    drop(posts);
+                    self.received.lock().expect("record").clear();
+                    return payload;
+                }
+            }
+            panic!("no verdict reached the observer");
+        }
+    }
+
+    /// A proposal this node will not have is rejected by name, through the event
+    /// observer, because that is where a stock signer reads the verdict from.
+    #[tokio::test]
+    async fn a_proposal_this_node_refuses_is_rejected_by_name() {
+        let mut node = proposal_node().await;
+
+        // No token, no proposal: unauthenticated, this route lets anyone make a
+        // node execute a block of their choosing.
+        let unauthorized = node
+            .propose(json!({ "block": hex::encode(node.blocks[2].encode()) }), None)
+            .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        // A proposal for another chain is not a proposal at all.
+        let response = node
+            .propose(
+                json!({
+                    "block": hex::encode(node.blocks[2].encode()),
+                    "chain_id": 0x1234_5678,
+                }),
+                Some("t0ken"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let verdict = node.verdict().await;
+        assert_eq!(verdict["result"], json!("Reject"));
+        assert_eq!(verdict["reason_code"], json!("NetworkChainMismatch"));
+        assert_eq!(
+            verdict["signer_signature_hash"],
+            json!(node.blocks[2].header.signer_signature_hash().to_string())
+        );
+
+        // A replay set is refused rather than ignored: ignoring it would validate
+        // a different block than the one asked about.
+        node.propose(
+            json!({
+                "block": hex::encode(node.blocks[2].encode()),
+                "replay_txs": ["00"],
+            }),
+            Some("t0ken"),
+        )
+        .await;
+        assert_eq!(
+            node.verdict().await["reason_code"],
+            json!("InvalidTransactionReplay")
+        );
+
+        // And a block whose parent this node has not executed cannot be judged
+        // against anything: its state root is over a state this node has not got.
+        let orphan = synthetic_block(
+            30,
+            StacksBlockId::from_bytes([30; 32]),
+            ConsensusHash::from_bytes([2; 20]),
+        );
+        node.propose(
+            json!({ "block": hex::encode(orphan.encode()) }),
+            Some("t0ken"),
+        )
+        .await;
+        assert_eq!(node.verdict().await["reason_code"], json!("UnknownParent"));
+
+        assert!(
+            node.offered.try_recv().is_err(),
+            "a refused proposal was admitted anyway"
+        );
+    }
+
+    /// The two verdicts a well-formed proposal can get: `Ok` for a block this node
+    /// already executed, and a refusal for one it has only admitted.
+    #[tokio::test]
+    async fn a_proposal_is_vouched_for_only_once_this_node_has_executed_it() {
+        let mut node = proposal_node().await;
+
+        // Already executed, so its state root was already checked. Zero cost is
+        // how stacks-core itself reports having executed nothing to answer.
+        node.propose(
+            json!({ "block": hex::encode(node.blocks[1].encode()) }),
+            Some("t0ken"),
+        )
+        .await;
+        let verdict = node.verdict().await;
+        assert_eq!(verdict["result"], json!("Ok"));
+        assert_eq!(verdict["cost"]["runtime"], json!(0));
+        assert_eq!(verdict["size"], json!(node.blocks[1].encode().len()));
+
+        // The extension of the tip is admitted for execution and *refused* rather
+        // than vouched for: nano validates a state root by executing the block,
+        // and it has not executed this one. A signer must not sign on a
+        // validation that did not happen.
+        node.propose(
+            json!({ "block": hex::encode(node.blocks[2].encode()) }),
+            Some("t0ken"),
+        )
+        .await;
+        let verdict = node.verdict().await;
+        assert_eq!(verdict["result"], json!("Reject"));
+        assert_eq!(verdict["reason_code"], json!("ChainstateError"));
+        assert_eq!(
+            node.offered.try_recv().expect("the block was admitted"),
+            node.blocks[2]
+        );
+    }
+
+    /// A proposal nobody could be told the result of is a request nobody can act
+    /// on, which is the one thing stacks-core refuses outright.
+    #[tokio::test]
+    async fn a_proposal_is_refused_when_no_observer_can_be_told_the_result() {
+        let state = RpcState::new()
+            .on(NETWORK)
+            .with_proposal_token("t0ken".to_owned());
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v3/block_proposal")
+                    .header("authorization", "t0ken")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "block": "00" }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["result"], json!("Error"));
+    }
+
+    /// A chunk becomes news when a slot takes it, and only then.
+    #[tokio::test]
+    async fn an_accepted_chunk_is_announced_and_a_refused_one_is_not() {
+        let writer = key(b"signer");
+        let (url, received) = recording_observer().await;
+        let state = RpcState::new().with_observers(EventDispatcher::new(vec![url]));
+        state.stackerdb().write().await.configure(
+            "ST000000000000000000002AMW42H.signers-0-1",
+            vec![nano_primitives::hash160(
+                &writer.public_key().to_bytes_compressed(),
+            )],
+        );
+        let app = router(state);
+        let put = |chunk: nano_stackerdb::Chunk, app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "slot_id": chunk.slot_id,
+                            "slot_version": chunk.slot_version,
+                            "sig": hex::encode(chunk.signature.as_bytes()),
+                            "data": hex::encode(&chunk.data),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        };
+
+        let mut accepted = nano_stackerdb::Chunk::new(0, 1, b"a response".to_vec());
+        accepted.sign(&writer).expect("sign chunk");
+        assert_eq!(
+            body_json(put(accepted.clone(), app.clone()).await).await["accepted"],
+            json!(true)
+        );
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if !received.lock().expect("record").is_empty() {
+                break;
+            }
+        }
+        let announced = received.lock().expect("record").clone();
+        let [(event, payload)] = announced.as_slice() else {
+            panic!("exactly one chunk was announced, got {announced:?}");
+        };
+        assert_eq!(event, "stackerdb_chunks");
+        assert_eq!(
+            payload["contract_id"],
+            json!("ST000000000000000000002AMW42H.signers-0-1")
+        );
+        assert_eq!(
+            payload["modified_slots"][0]["data"],
+            json!(hex::encode(b"a response"))
+        );
+
+        // A chunk a slot refuses changed nothing, so there is nothing to say.
+        let stranger = key(b"stranger");
+        let mut forged = nano_stackerdb::Chunk::new(0, 2, b"forged".to_vec());
+        forged.sign(&stranger).expect("sign chunk");
+        assert_eq!(
+            body_json(put(forged, app).await).await["accepted"],
+            json!(false)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(received.lock().expect("record").len(), 1);
+    }
+
+    /// The reward set this node derives and serves is one it can read back, which
+    /// is what makes a nano node able to attest another nano node's checkpoint.
+    #[tokio::test]
+    async fn a_served_reward_set_parses_back_through_this_node_s_own_client() {
+        let signers: Vec<super::RewardSetSigner> = [b"one".as_slice(), b"two".as_slice()]
+            .iter()
+            .map(|seed| super::RewardSetSigner {
+                signing_key: key(seed).public_key().to_bytes_compressed(),
+                stacked_amount: 0,
+                weight: 4,
+            })
+            .collect();
+        let state = RpcState::new();
+        state
+            .publish_stacker_set(
+                140,
+                super::stacker_set_payload(&signers, 50_000_000_000),
+            )
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the RPC");
+        let address = listener.local_addr().expect("an address");
+        tokio::spawn(async move { super::serve(listener, state).await });
+
+        let client = SyncClient::new(
+            Url::parse(&format!("http://{address}/")).expect("a URL"),
+        )
+        .expect("a client");
+        let served = client.stacker_set(140).await.expect("the served reward set");
+        assert_eq!(served.pox_ustx_threshold, 50_000_000_000);
+        assert_eq!(served.signer_set.signers().len(), 2);
+        assert_eq!(served.signer_set.weights(), vec![4, 4]);
+        assert!(client.stacker_set(141).await.is_err());
     }
 
     #[tokio::test]

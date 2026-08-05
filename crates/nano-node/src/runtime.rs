@@ -53,6 +53,11 @@ pub type Role = Result<(), String>;
 /// before the state is declared to have left the chain.
 const RESUME_ATTEMPTS: u32 = 30;
 
+/// The `StackerDB` message contracts a reward cycle's signers write to:
+/// block responses, state machine updates and pre-commits, in that order
+/// (`MessageSlotID`). A cycle's signer set owns one slot in each.
+const SIGNER_MESSAGE_IDS: [u32; 3] = [1, 2, 3];
+
 /// A job the node runs, and what its stopping means for the rest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Job {
@@ -168,6 +173,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // miner cannot see accepts them and never mines them, which is worse than
     // refusing them.
     let mempool = Arc::new(Mutex::new(nano_mempool::Mempool::new(network)));
+    // Where a block admitted over the public API is handed to the executor. One
+    // channel, drained by the follow loop into the same staging store the peer's
+    // blocks land in, so an upload and a followed block are the same thing from
+    // the moment they are authenticated.
+    let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
 
     let mut roles = JoinSet::new();
     let state = start_rpc(
@@ -175,6 +185,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         network,
         executor.clone(),
         mempool.clone(),
+        &dispatcher,
+        blocks,
         &mut roles,
     )
     .await?;
@@ -196,35 +208,22 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         };
         roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
     }
-    if let Some(signer) = config.signer.clone() {
-        let validator = signer::open(
-            &config,
-            network,
-            &pox,
-            &peer,
-            &config.chainstate_dir(SIGNER_CHAINSTATE),
-        )
-        .await?;
-        let (running, peer) = (config.clone(), peer.clone());
-        roles.spawn(async move {
-            (
-                Job::Signer,
-                signer::run(running, signer, network, peer, validator).await,
-            )
-        });
-    }
+    start_signer(&config, network, &pox, &peer, &mut roles).await?;
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
     if state.is_some() || executor.is_some() {
-        roles.spawn(
-            async move {
-                (
-                    Job::Follower,
-                    follow(config, peer, pox, source, state, executor).await,
-                )
-            },
-        );
+        let follower = Follower {
+            config,
+            network,
+            peer,
+            pox,
+            source,
+            state,
+            executor,
+            offered,
+        };
+        roles.spawn(async move { (Job::Follower, follow(follower).await) });
     }
     if roles.is_empty() {
         return Err("this configuration switches on no roles".into());
@@ -281,6 +280,21 @@ async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedEx
     }
 }
 
+/// A block offered over the public API passes the boundary a followed block
+/// passes, and it is the same call: `ChainState::authenticate_block`, which
+/// [[050-authenticate-every-followed-nakamoto-block]] put in front of execution.
+///
+/// Nothing is reimplemented here on purpose. A node that admits over its own API
+/// what it would refuse from a peer is forkable through its own API, and the only
+/// way to be sure the two agree is for there to be one of them.
+impl<S: Send> nano_rpc::BlockAdmission for CheckpointExecutor<S> {
+    fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String> {
+        self.chainstate
+            .authenticate_block(block)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// What this node has sealed, for the RPC to answer from.
 fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     SealedTip {
@@ -316,15 +330,33 @@ fn report_round(from: u64, round: CatchUpRound, tip: &NakamotoBlock) {
     }
 }
 
-/// Follow the peer, publishing what it validated and executing along it.
-async fn follow(
+/// Everything the following role runs on, as one value for the same reason the
+/// miner's is: the loop needs the peer, the chain, the served state and the
+/// blocks the API admitted, and a list of eight arguments hides which is which.
+struct Follower {
     config: Config,
+    network: Network,
     peer: SyncClient,
     pox: PoxInfo,
     source: [u8; 32],
     state: Option<RpcState>,
     executor: Option<SharedExecutor>,
-) -> Role {
+    /// Blocks the public API authenticated, waiting to be staged.
+    offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+}
+
+/// Follow the peer, publishing what it validated and executing along it.
+async fn follow(follower: Follower) -> Role {
+    let Follower {
+        config,
+        network,
+        peer,
+        pox,
+        source,
+        state,
+        executor,
+        mut offered,
+    } = follower;
     let directory = config.chainstate_dir(NODE_CHAINSTATE);
     let interval = Duration::from_secs(config.node.poll_interval_secs);
     let staging = match Staging::open(&directory.join("staging.sqlite")) {
@@ -363,7 +395,12 @@ async fn follow(
     }
     let mut peer_height = u64::MAX;
     let mut executed_height = 0;
+    let mut published = RewardCyclePublication::default();
     loop {
+        // Blocks the public API admitted go into the same store the peer's do,
+        // before the round that executes it: nothing about them is special from
+        // here on, which is the point.
+        stage_admitted_blocks(&mut offered, &staging);
         // Following the peer's current tenure is pointless while this node is
         // far from it — the tenure descends from blocks it has not executed, so
         // the walk fails every round — and the requests it spends are the ones
@@ -376,7 +413,15 @@ async fn follow(
         // executor down with it.
         if catching_up {
             match peer.node_info().await {
-                Ok(info) => peer_height = info.stacks_height,
+                Ok(info) => {
+                    peer_height = info.stacks_height;
+                    // Said out loud, because this is the branch a node that
+                    // cannot catch up sits in: without it `/nano/sync_status`
+                    // reported no distance at all for the one node that has one.
+                    if let Some(state) = state.as_ref() {
+                        state.publish_followed_height(peer_height).await;
+                    }
+                }
                 Err(error) => eprintln!("asking the peer how far ahead it is failed: {error}"),
             }
         } else {
@@ -414,10 +459,215 @@ async fn follow(
             };
             if let Some(state) = state.as_ref() {
                 state.publish_executed(sealed).await;
+                publish_reward_cycle(
+                    state,
+                    executor,
+                    &config,
+                    network,
+                    &pox,
+                    &last_sortition_winners(node.view().as_ref()),
+                    &mut published,
+                )
+                .await;
             }
         }
         sleep(interval).await;
     }
+}
+
+/// Take the blocks the public API admitted and stage them.
+///
+/// Nothing is validated here on purpose: the route already put each one through
+/// `ChainState::authenticate_block`, and the executor checks its state root when
+/// it runs it. Draining the channel rather than awaiting it keeps this on the
+/// round's own clock — an upload is visible within one poll interval, and a burst
+/// of them cannot starve the peer.
+fn stage_admitted_blocks(
+    offered: &mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    staging: &Staging,
+) {
+    while let Ok(block) = offered.try_recv() {
+        match staging.put(&block) {
+            Ok(()) => println!(
+                "admitted block {} at height {} over the public API",
+                block.block_id(),
+                block.header.chain_length
+            ),
+            Err(error) => eprintln!(
+                "staging the admitted block {} failed: {error}",
+                block.block_id()
+            ),
+        }
+    }
+}
+
+/// Which reward cycle this node has already answered for, so a walk of the
+/// pox-5 signer list happens once per cycle instead of once per round.
+#[derive(Default)]
+struct RewardCyclePublication {
+    served: Option<u64>,
+    /// The cycle whose derivation failure has been reported, so a chain with no
+    /// pox-5 stackers says so once rather than every second.
+    complained: Option<u64>,
+    /// The cycle whose miner slots could not be assigned, for the same reason.
+    ambiguous_miners: Option<u64>,
+    /// The key `.miners` is currently replicated for. Reconfiguring a contract
+    /// clears every chunk in it, so this is only done when the writer changes —
+    /// doing it per round would drop the proposal a signer is reading.
+    miner_writer: Option<nano_primitives::Hash160>,
+}
+
+/// Publish the reward set the executed state derives, and configure the
+/// `StackerDB` contracts that cycle's signers write to.
+///
+/// Derived from this node's own pox-5 state rather than read from the peer, which
+/// is the whole difference between serving a reward set and relaying one. The
+/// document nano writes here is the one `SyncClient` parses, so a node's own
+/// `/v3/stacker_set` can attest another node's checkpoint.
+async fn publish_reward_cycle(
+    state: &RpcState,
+    executor: &SharedExecutor,
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    winners: &[nano_primitives::Hash160],
+    published: &mut RewardCyclePublication,
+) {
+    let mut context = bitcoin_context(config, pox);
+    context.height = executor.lock().await.bitcoin_height();
+    let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
+        return;
+    };
+    configure_miner_slots(state, network, cycle, winners, published).await;
+    if published.served == Some(cycle) {
+        return;
+    }
+    // The lock is held only for the walk: it is the same lock every account read
+    // takes, and the walk is one contract call per signer.
+    let derived = nano_chainstate::signers::active_signer_set(
+        executor.lock().await.chainstate_mut().vm_mut(),
+        context,
+    );
+    let (signers, threshold) = match derived {
+        Ok(derived) => derived,
+        Err(error) => {
+            if published.complained != Some(cycle) {
+                published.complained = Some(cycle);
+                eprintln!(
+                    "this node cannot derive the reward set for cycle {cycle} from its own \
+                     state, so /v3/stacker_set will not answer for it and its signers' \
+                     StackerDB contracts stay unconfigured: {error}"
+                );
+            }
+            return;
+        }
+    };
+    let entries: Vec<nano_rpc::RewardSetSigner> = signers
+        .signers()
+        .iter()
+        .map(|signer| nano_rpc::RewardSetSigner {
+            signing_key: signer.public_key.to_bytes_compressed(),
+            // Not carried by `SignerSet`, which keeps only the weight it
+            // apportioned from the amount. A signer's own weight is what decides
+            // whether a block is attested, so it is served; the amount behind it
+            // is reported as zero rather than reconstructed from the weight,
+            // which would be the threshold back again and not the amount.
+            stacked_amount: 0,
+            weight: signer.weight,
+        })
+        .collect();
+    state
+        .publish_stacker_set(cycle, nano_rpc::stacker_set_payload(&entries, threshold))
+        .await;
+    let writers: Vec<nano_primitives::Hash160> = entries
+        .iter()
+        .map(|entry| nano_primitives::hash160(&entry.signing_key))
+        .collect();
+    let store = state.stackerdb();
+    let mut store = store.write().await;
+    for message in SIGNER_MESSAGE_IDS {
+        let contract = crate::config::cycle_contract(network, cycle, message);
+        store.configure(
+            &format!("{}.{}", contract.address, contract.name),
+            writers.clone(),
+        );
+    }
+    drop(store);
+    published.served = Some(cycle);
+    println!(
+        "derived the reward set for cycle {cycle} from this node's own state: {} signers, \
+         {} of weight, replicating their StackerDB contracts",
+        entries.len(),
+        entries.iter().map(|entry| u64::from(entry.weight)).sum::<u64>()
+    );
+}
+
+/// The block-signing keys that won the last two sortitions, newest first.
+///
+/// Whose commitment won a burn block needs the burn distribution, which nano
+/// cannot derive ([[049-derive-sortitions-locally]]), so this is the peer's
+/// answer — and it is used for nothing but naming who may write a `StackerDB`
+/// slot, which is replication rather than consensus.
+fn last_sortition_winners(view: Option<&nano_sync::NodeView>) -> Vec<nano_primitives::Hash160> {
+    let mut winners = Vec::new();
+    let Some(view) = view else {
+        return winners;
+    };
+    for tenure in view.tenures.iter().rev() {
+        if !tenure.sortition.was_sortition {
+            continue;
+        }
+        if let Some(hash) = tenure.sortition.miner_public_key_hash {
+            winners.push(hash);
+        }
+        if winners.len() == 2 {
+            break;
+        }
+    }
+    winners
+}
+
+/// Replicate `.miners`, so a signer hosted here can read what a miner proposed.
+///
+/// The two slots belong to the last two sortition winners, and which winner gets
+/// which is `num_sortitions % 2` in stacks-core — a count over the whole
+/// burnchain that a checkpointed node has never made and no snapshot nano holds
+/// carries. So the slots are configured only where the answer cannot be got
+/// wrong: when the last two winners are the same key, which is every chain with
+/// one miner. Otherwise it says so and replicates nothing, because a `.miners`
+/// replica with the two slots swapped refuses the very chunks it exists for.
+async fn configure_miner_slots(
+    state: &RpcState,
+    network: Network,
+    cycle: u64,
+    winners: &[nano_primitives::Hash160],
+    published: &mut RewardCyclePublication,
+) {
+    let Some(&latest) = winners.first() else {
+        return;
+    };
+    let previous = winners.get(1).copied().unwrap_or(latest);
+    if previous != latest {
+        if published.ambiguous_miners != Some(cycle) {
+            published.ambiguous_miners = Some(cycle);
+            eprintln!(
+                "the last two sortitions were won by different miners ({latest} and \
+                 {previous}), and this node cannot say which of the two .miners slots each \
+                 owns without a sortition count, so it replicates neither"
+            );
+        }
+        return;
+    }
+    if published.miner_writer == Some(latest) {
+        return;
+    }
+    published.miner_writer = Some(latest);
+    let contract = crate::config::miner_contract(network);
+    state.stackerdb().write().await.configure(
+        &format!("{}.{}", contract.address, contract.name),
+        vec![latest, latest],
+    );
+    println!("replicating .miners for the miner {latest} that won the last two sortitions");
 }
 
 /// Open the chain this node executes, resuming whatever is already on disk.
@@ -622,14 +872,33 @@ async fn start_rpc(
     network: Network,
     executor: Option<SharedExecutor>,
     mempool: Arc<Mutex<nano_mempool::Mempool>>,
+    dispatcher: &EventDispatcher,
+    blocks: tokio::sync::mpsc::UnboundedSender<NakamotoBlock>,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
 ) -> Result<Option<RpcState>, Box<dyn Error>> {
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
-    let mut state = RpcState::new().on(network).with_mempool(mempool);
+    let mut state = RpcState::new()
+        .on(network)
+        .with_mempool(mempool)
+        .with_block_sink(blocks);
     if let Some(executor) = executor {
-        state = state.with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
+        // The same mutex behind two trait objects, so an account read and a block
+        // admission are serialized against each other and against execution: the
+        // one thing the RPC must never do is authenticate against a chainstate
+        // that a round is halfway through moving.
+        state = state
+            .with_block_admission(executor.clone() as Arc<Mutex<dyn nano_rpc::BlockAdmission>>)
+            .with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
+    }
+    // Only when there is somewhere for them to go: `/v3/block_proposal` refuses a
+    // proposal it could not report the verdict on, as stacks-core does.
+    if !dispatcher.is_empty() {
+        state = state.with_observers(dispatcher.clone());
+    }
+    if let Some(token) = config.node.block_proposal_token.clone() {
+        state = state.with_proposal_token(token);
     }
     let listener = TcpListener::bind(address).await?;
     println!("serving the public RPC on {address}");
@@ -643,6 +912,38 @@ async fn start_rpc(
         )
     });
     Ok(Some(state))
+}
+
+/// Validate proposals for the active reward cycle, if this node signs.
+///
+/// The signer's chain state is opened here rather than in the task, so a state it
+/// cannot open stops the node at startup instead of a second later.
+async fn start_signer(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peer: &SyncClient,
+    roles: &mut JoinSet<(Job, Role)>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(signer) = config.signer.clone() else {
+        return Ok(());
+    };
+    let validator = signer::open(
+        config,
+        network,
+        pox,
+        peer,
+        &config.chainstate_dir(SIGNER_CHAINSTATE),
+    )
+    .await?;
+    let (running, peer) = (config.clone(), peer.clone());
+    roles.spawn(async move {
+        (
+            Job::Signer,
+            signer::run(running, signer, network, peer, validator).await,
+        )
+    });
+    Ok(())
 }
 
 /// Send the blocks this node executes to the configured observers.
