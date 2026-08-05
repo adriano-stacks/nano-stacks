@@ -206,3 +206,89 @@ fn a_tenure_change_confirming_a_tenure_this_chain_never_executed_is_rejected() {
         "the rejection names the tenure: {error}"
     );
 }
+
+/// Mainnet's own tenure changes, against the arithmetic this rule uses.
+///
+/// The tests above put the rule against the captured chain, through the code that
+/// enforces it. This puts the *arithmetic* against a hundred consecutive mainnet
+/// blocks, which is the sample that matters for a live replay: nano's answer for a
+/// tenure's length is the run of blocks sharing a consensus hash, and if that is
+/// ever not what the network counted, the follow path would refuse an honest
+/// block.
+///
+/// It works off the captured blocks rather than off executed state because the
+/// capture's blocks are already sealed in any state a node has replayed them into,
+/// so there is no way to execute them again offline. The claim is the same one:
+/// the parent's height in its own tenure.
+///
+/// **The capture cannot falsify the count.** Its hundred blocks hold two tenures —
+/// nine blocks then ninety-one — so there is one boundary in the sample and the
+/// tenure before it began below the span. The identity half is checkable and is
+/// checked; the count half needs a capture holding two consecutive complete
+/// tenures, and this says so rather than passing on an empty comparison.
+#[test]
+fn mainnet_tenure_changes_agree_with_the_count_over_a_tenures_blocks() {
+    let Some(capture) = std::env::var_os("NANO_MAINNET_CAPTURE").map(PathBuf::from) else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let mut paths = fs::read_dir(capture.join("nakamoto/blocks"))
+        .expect("the captured blocks")
+        .map(|entry| entry.expect("a block entry").path())
+        .collect::<Vec<_>>();
+    // Named by height, so lexical order is chain order.
+    paths.sort();
+    let mut run: Option<(nano_primitives::ConsensusHash, u32)> = None;
+    // The capture starts mid-tenure, so the first run's beginning is not in the
+    // sample and its length cannot be completed — the same condition the rule
+    // itself passes over rather than guessing at.
+    let mut complete = false;
+    let (mut tenures, mut counts) = (0, 0);
+    for path in paths {
+        let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
+            .expect("a captured mainnet block decodes");
+        let change =
+            block
+                .transactions
+                .iter()
+                .find_map(|transaction| match transaction.payload().data() {
+                    TransactionPayloadData::TenureChange(payload) => Some(payload.clone()),
+                    _ => None,
+                });
+        if let (Some(payload), Some((tenure, blocks))) = (change, run) {
+            assert_eq!(
+                payload.previous_tenure_consensus_hash, tenure,
+                "block {} confirms the tenure its parent belongs to",
+                block.header.chain_length
+            );
+            tenures += 1;
+            if complete {
+                assert_eq!(
+                    payload.previous_tenure_blocks, blocks,
+                    "block {} reports the blocks its parent's tenure ran",
+                    block.header.chain_length
+                );
+                counts += 1;
+            }
+        }
+        run = match run {
+            Some((tenure, blocks)) if tenure == block.header.consensus_hash => {
+                Some((tenure, blocks + 1))
+            }
+            _ => {
+                // A new run begins, and this time its beginning is in the sample.
+                complete = run.is_some();
+                Some((block.header.consensus_hash, 1))
+            }
+        };
+    }
+    assert!(
+        tenures > 0,
+        "the capture holds no tenure change whose previous tenure it also holds"
+    );
+    println!(
+        "{tenures} mainnet tenure changes name the tenure before them; {counts} of them \
+         end a tenure the capture holds whole, so only {counts} could have their block \
+         count checked"
+    );
+}

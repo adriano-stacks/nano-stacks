@@ -1453,15 +1453,8 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
-        root: RootPolicy<'_>,
+        assembled: bool,
     ) -> Result<(), ChainStateError> {
-        // A block this node is assembling is not one it is following, and the
-        // difference is signatures: the miner signs the header at seal time,
-        // after this runs, and the signers only see it afterwards. Every rule
-        // below that reads a signature would be asking a candidate for something
-        // it cannot have yet — and the miner's own answer to each of them is the
-        // code that builds the block.
-        let assembled = matches!(root, RootPolicy::Mine(_));
         if let Some(parent) = parent {
             let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
                 ChainStateError::InvalidTransaction(
@@ -1485,7 +1478,6 @@ impl ChainState {
         self.check_tenure_continuity(block, parent)
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
         if !assembled {
-            self.check_signer_signatures(block, context)?;
             Self::check_miner_won_the_sortition(block, context, operations)
                 .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
         }
@@ -1694,7 +1686,13 @@ impl ChainState {
             effects,
             candidates,
         } = execution;
-        self.check_before_executing(block, parent, bitcoin_context, operations, root)?;
+        // A block this node is assembling is not one it is following, and the
+        // difference is signatures: the miner signs the header at seal time and
+        // the signers only see it afterwards, so every rule that reads one is
+        // asked of a followed block and not of a candidate. The miner's own
+        // answer to each of them is the code that builds the block.
+        let assembled = matches!(root, RootPolicy::Mine(_));
+        self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // The block runs against a copy of everything kept outside the MARF, and
@@ -1707,6 +1705,16 @@ impl ChainState {
         let mut ledger = self.ledger.clone();
         let mut effects = effects;
         let result = (|| {
+            // Inside the block, and first: the reward set is read out of state, so
+            // it has to be read from the state *this block* stands on. Before the
+            // block is opened, reads go to whatever was sealed last, which after a
+            // fork switch is the branch this node has left. Nothing has run at
+            // this point and nothing has been written — the MARF version opened
+            // above is empty and is aborted with everything else if this fails —
+            // so the block is still refused before any of it executes.
+            if !assembled {
+                self.check_signer_signatures(block, bitcoin_context)?;
+            }
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
                 let matured = self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;

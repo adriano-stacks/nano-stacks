@@ -189,6 +189,22 @@ the window would otherwise say so on every block of it.
 `previous_tenure_blocks` the network counted for a tenure is the number of blocks
 nano executed in it, so the two mutations beside it reject something real.
 
+**The mainnet capture cannot falsify the count, and that is a capture shape.** Its
+hundred blocks hold two tenures — nine blocks and then ninety-one — so there is
+one boundary in the sample and the tenure before it began below the span. The
+identity half is checkable there and checked; the count half needs a capture
+holding two consecutive whole tenures, which at mainnet's tenure lengths means a
+few hundred blocks. `mainnet_tenure_changes_agree_with_the_count_over_a_tenures_blocks`
+prints how many of each it could check rather than passing on an empty comparison.
+
+So the count is the one rule this task enforces with no mainnet oracle behind it,
+and it is worth knowing what it would look like if it were wrong: a rejection
+naming both numbers — "the tenure change reports N blocks in the tenure it ends,
+where this chain executed M" — on a tenure-start block, on a chain that had been
+following fine. The arithmetic cannot drift for the reasons a chain diverges
+(nano executes every block of a branch in order, and a retraction splits the list
+rather than trimming it), but the sample that would prove it is a longer capture.
+
 The half that is **not** at this boundary: the header's `consensus_hash` against
 the local sortition's, and the tenure change's `burn_view_consensus_hash`.
 `BitcoinBlockContext` carries the burn header hash but not the consensus hash, so
