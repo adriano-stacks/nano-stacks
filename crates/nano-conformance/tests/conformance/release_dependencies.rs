@@ -204,16 +204,60 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
 
 /// `developer-mode` stays on, deliberately.
 ///
-/// It is in `stacks-common`'s default features, so a stock mainnet node runs
-/// with it, and all it does is keep source spans on AST nodes. Turning it off to
-/// tidy the feature list would make nano's parser produce different diagnostics
-/// from the network's for no benefit — the opposite of the point of this file.
-/// Asserted rather than merely allowed, so switching it off is a decision
-/// somebody has to make on purpose.
+/// All it does is keep source spans on AST nodes, and a stock mainnet node has
+/// it — so turning it off to tidy the feature list would make nano's parser
+/// produce different diagnostics from the network's for no benefit, the opposite
+/// of the point of this file. It is now asked for by name rather than inherited
+/// from `stacks-common`'s default (see the two `Cargo.toml` lines that spell the
+/// feature list out), which is why this is asserted: switching it off is a
+/// decision somebody has to make on purpose.
 #[test]
 fn the_node_keeps_developer_mode_because_the_network_does() {
     assert!(
         tree("features").contains("stacks-common feature \"developer-mode\""),
-        "developer-mode is a stacks-common default and mainnet runs with it"
+        "developer-mode is what keeps source spans, and mainnet runs with it"
+    );
+}
+
+/// The reference crates' features are the ones nano chose, and no others.
+///
+/// `clarity` asks for `stacks_common` with `default-features = false`, so
+/// everything `stacks-common`'s own default carries reached nano through nano's
+/// *own* two direct dependencies on it — `nano-vm`'s and vendored `clar2wasm`'s.
+/// That put `ctrlc-handler` in the release graph: two extra crates and a SIGINT
+/// handler nano never installs, next to the SIGTERM handling it does have. Both
+/// lines now spell the list out, so a future `stacks-common` release cannot add
+/// to nano's closure by adding to its own default.
+///
+/// Asserted as an exact set rather than a deny-list. A deny-list only refuses
+/// what somebody already thought of, and the whole failure mode here is a
+/// feature arriving that nobody chose.
+#[test]
+fn the_node_enables_only_the_reference_features_it_asked_for() {
+    let tree = tree("features");
+    let enabled: std::collections::BTreeSet<&str> = tree
+        .lines()
+        .filter_map(|line| {
+            let feature = line
+                .trim_start_matches(['│', '├', '└', '─', ' '])
+                .strip_prefix("stacks-common feature \"")
+                .or_else(|| {
+                    line.trim_start_matches(['│', '├', '└', '─', ' '])
+                        .strip_prefix("stacks_common feature \"")
+                })?;
+            feature.strip_suffix('"')
+        })
+        .collect();
+
+    // `developer-mode` for the parser's source spans, `rand` because the
+    // reference's own crypto helpers need it, `rusqlite` because the Clarity
+    // database ABI is SQLite-backed. Nothing else is required to compile the VM
+    // boundary, which is all nano takes from these crates. `default` is
+    // *absent*, which is the change: the set is now chosen rather than inherited.
+    let wanted = ["developer-mode", "rand", "rusqlite"];
+    assert_eq!(
+        enabled,
+        wanted.into_iter().collect(),
+        "the release graph's stacks-common features are not the ones nano asked for"
     );
 }
