@@ -15,7 +15,7 @@ use nano_chainstate::{
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
 use nano_p2p::Discovered;
-use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
+use nano_sync::{Node, PeerPool, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
 use crate::{
@@ -29,6 +29,9 @@ pub(crate) const ROUND_FETCH: usize = 4_000;
 /// How close a node has to be before it is worth following the peer's tenure
 /// rather than spending every request catching up.
 const FOLLOW_WHEN_WITHIN: u64 = 1_000;
+
+/// How many rounds to stay with one peer before asking whether a better one exists.
+const RESELECT_ROUNDS: u32 = 60;
 
 /// How long a startup step waits out a rate-limited peer before giving up.
 const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
@@ -236,6 +239,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             config,
             network,
             peer,
+            discovered,
             pox,
             source,
             state,
@@ -356,6 +360,9 @@ struct Follower {
     config: Config,
     network: Network,
     peer: SyncClient,
+    /// The peers p2p discovery found, which this loop re-weighs alongside the
+    /// configured ones. `None` when the transport is off.
+    discovered: Option<Discovered>,
     pox: PoxInfo,
     source: [u8; 32],
     state: Option<RpcState>,
@@ -370,6 +377,7 @@ async fn follow(follower: Follower) -> Role {
         config,
         network,
         peer,
+        discovered,
         pox,
         source,
         state,
@@ -389,7 +397,6 @@ async fn follow(follower: Follower) -> Role {
         fetch: ROUND_FETCH,
         execute: config.node.max_sync_blocks,
     };
-    let mut node = Node::new(peer.clone());
     let mut pox = pox;
     // Derive sortitions alongside the peer's answers, when the checkpoint
     // carries the history that makes it possible.
@@ -415,7 +422,29 @@ async fn follow(follower: Follower) -> Role {
     let mut peer_height = u64::MAX;
     let mut executed_height = 0;
     let mut published = RewardCyclePublication::default();
+    // Which peer this round follows. Re-chosen from everything this node knows of —
+    // the endpoints the operator configured and the ones p2p discovery found — so
+    // that a peer which stalls, falls behind or starts refusing costs one round
+    // rather than the node's liveness. That was the open half of task 027: the
+    // choosing already existed, and nothing called it.
+    let mut peer = peer;
+    let mut node = Node::new(peer.clone());
+    let mut rounds_on_this_peer = 0_u32;
+    let mut peer_failed = false;
     loop {
+        // Re-weigh on a timer, or immediately after the current peer let a round
+        // down. Every round would be two requests per peer per second for an answer
+        // that moves on the order of a tenure; never would be the single-peer node
+        // this task set out to remove.
+        rounds_on_this_peer = rounds_on_this_peer.saturating_add(1);
+        if peer_failed || rounds_on_this_peer >= RESELECT_ROUNDS {
+            rounds_on_this_peer = 0;
+            peer_failed = false;
+            if let Some(chosen) = better_peer(&peer, &config, discovered.as_ref()).await {
+                peer = chosen;
+                node = Node::new(peer.clone());
+            }
+        }
         // Blocks the public API admitted go into the same store the peer's do,
         // before the round that executes it: nothing about them is special from
         // here on, which is the point.
@@ -425,38 +454,15 @@ async fn follow(follower: Follower) -> Role {
         // the walk fails every round — and the requests it spends are the ones
         // catching up needs. A node this far back has nothing to serve anyway.
         let catching_up = peer_height.saturating_sub(executed_height) > FOLLOW_WHEN_WITHIN;
-        // The served view and the executed chain are independent jobs on one
-        // peer. Gating execution on a successful poll is how a node twenty
-        // thousand blocks behind executed nothing at all: that far back the
-        // follower's own tenure walk fails every round, and it took the
-        // executor down with it.
-        if catching_up {
-            match peer.node_info().await {
-                Ok(info) => {
-                    peer_height = info.stacks_height;
-                    // Said out loud, because this is the branch a node that
-                    // cannot catch up sits in: without it `/nano/sync_status`
-                    // reported no distance at all for the one node that has one.
-                    if let Some(state) = state.as_ref() {
-                        state.publish_followed_height(peer_height).await;
-                    }
-                }
-                Err(error) => eprintln!("asking the peer how far ahead it is failed: {error}"),
-            }
-        } else {
-            match node.poll().await {
-                Ok(_) => {
-                    if let Some(view) = node.view() {
-                        peer_height = view.node_info.stacks_height;
-                        pox = view.pox_info.clone();
-                        if let Some(state) = state.as_ref() {
-                            state.publish(view).await;
-                        }
-                    }
-                }
-                Err(error) => eprintln!("following the peer failed: {error}"),
-            }
-        }
+        peer_failed |= track_peer(
+            &mut node,
+            &peer,
+            state.as_ref(),
+            &mut pox,
+            &mut peer_height,
+            catching_up,
+        )
+        .await;
         if let Some(executor) = executor.as_ref() {
             let sealed = {
                 let mut executor = executor.lock().await;
@@ -471,6 +477,7 @@ async fn follow(follower: Follower) -> Role {
                     Err(error) => {
                         eprintln!("executing the peer's chain failed: {error}");
                         backfill_missing_header(&mut executor, &peer, &error.to_string()).await;
+                        peer_failed = true;
                     }
                 }
                 executed_height = executor.tip().header.chain_length;
@@ -1341,6 +1348,95 @@ async fn reachable_peer(
         || Box::<dyn Error>::from("no peer to follow"),
         |error| Box::new(error) as Box<dyn Error>,
     ))
+}
+
+/// Every peer this node could follow: the ones configured, and the ones p2p found.
+///
+/// Configured first, so an operator naming a peer still gets it weighed; discovered
+/// ones after, de-duplicated, because the same node can be both. A pool of one is
+/// still a pool — it just cannot protect against that one.
+fn follow_pool(config: &Config, discovered: Option<&Discovered>) -> PeerPool {
+    let mut endpoints = config.node.peers.clone();
+    for endpoint in discovered.map(Discovered::endpoints).unwrap_or_default() {
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    PeerPool::from_endpoints(&endpoints)
+}
+
+/// Re-weigh the peers and hand back a better one, if there is one.
+///
+/// The weighing is `PeerPool::choose_source`, which is the boundary that has to
+/// stay in one place: a tip is compared on signer weight and length from headers
+/// this node fetched, never on a peer's claim about its own height.
+async fn better_peer(
+    current: &SyncClient,
+    config: &Config,
+    discovered: Option<&Discovered>,
+) -> Option<SyncClient> {
+    let pool = follow_pool(config, discovered);
+    let (_, chosen) = pool.choose_source(None).await?;
+    (chosen.base_url() != current.base_url()).then(|| {
+        println!(
+            "following {} now, of {} peers known",
+            chosen.base_url(),
+            pool.len()
+        );
+        chosen
+    })
+}
+
+/// Learn how far ahead the peer is, and refresh what the RPC serves.
+///
+/// Two independent jobs on one peer, and they are separated because gating
+/// execution on a successful poll is how a node twenty thousand blocks behind
+/// executed nothing at all: that far back the follower's own tenure walk fails
+/// every round, and it took the executor down with it. Returns whether the peer let
+/// this round down, which is what makes the next one choose again.
+async fn track_peer(
+    node: &mut Node,
+    peer: &SyncClient,
+    state: Option<&RpcState>,
+    pox: &mut PoxInfo,
+    peer_height: &mut u64,
+    catching_up: bool,
+) -> bool {
+    if catching_up {
+        match peer.node_info().await {
+            Ok(info) => {
+                *peer_height = info.stacks_height;
+                // Said out loud, because this is the branch a node that cannot catch
+                // up sits in: without it `/nano/sync_status` reported no distance at
+                // all for the one node that has one.
+                if let Some(state) = state {
+                    state.publish_followed_height(*peer_height).await;
+                }
+                false
+            }
+            Err(error) => {
+                eprintln!("asking the peer how far ahead it is failed: {error}");
+                true
+            }
+        }
+    } else {
+        match node.poll().await {
+            Ok(_) => {
+                if let Some(view) = node.view() {
+                    *peer_height = view.node_info.stacks_height;
+                    *pox = view.pox_info.clone();
+                    if let Some(state) = state {
+                        state.publish(view).await;
+                    }
+                }
+                false
+            }
+            Err(error) => {
+                eprintln!("following the peer failed: {error}");
+                true
+            }
+        }
+    }
 }
 
 /// The Bitcoin view this node advertises to its peers.

@@ -461,6 +461,57 @@ mod tests {
         anchor_bitcoin_height = 285
     "#;
 
+    /// A mainnet node needs no configured HTTP peer at all.
+    ///
+    /// This is the whole point of task 054: requiring `node.peers` is what made a
+    /// hosted API load-bearing. Mainnet's own published bootstrap nodes are the
+    /// default way in, and they are p2p seeds rather than an RPC service.
+    #[test]
+    fn a_mainnet_node_needs_no_configured_http_peer() {
+        let mainnet = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 2147483648\n", "")
+            .replace("peers = [\"http://127.0.0.1:20443/\"]", "peers = []");
+        let config = Config::parse(&mainnet).expect("valid configuration");
+        assert!(config.node.peers.is_empty());
+        assert_eq!(config.node.bootstrap_seeds().len(), 4);
+        assert!(
+            config.node.bootstrap_seeds()[0].contains("seed.mainnet.hiro.so"),
+            "the default seeds are stacks-core's own"
+        );
+    }
+
+    /// An explicit empty seed list is how a node says "HTTP only" out loud.
+    #[test]
+    fn an_empty_seed_list_turns_the_transport_off() {
+        let http_only = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 2147483648", "p2p_seeds = []");
+        let config = Config::parse(&http_only).expect("valid configuration");
+        assert!(config.node.bootstrap_seeds().is_empty());
+        assert_eq!(config.node.peers.len(), 1);
+    }
+
+    /// A configuration with no way into the network at all is refused.
+    #[test]
+    fn a_node_with_no_way_in_is_refused() {
+        // Testnet, so the mainnet seed default does not apply and there is nothing
+        // left to reach the network through.
+        let nowhere = MINIMAL.replace("peers = [\"http://127.0.0.1:20443/\"]", "peers = []");
+        let error = Config::parse(&nowhere).expect_err("a node with no peers is refused");
+        assert!(
+            error.to_string().contains("p2p_seeds"),
+            "the error should name both ways in: {error}"
+        );
+    }
+
+    /// A non-mainnet chain gets no default seeds, because nano does not know them.
+    #[test]
+    fn a_private_chain_gets_no_default_seeds() {
+        let config = Config::parse(MINIMAL).expect("valid configuration");
+        assert!(config.node.bootstrap_seeds().is_empty());
+    }
+
     #[test]
     fn a_node_needs_only_a_chain_a_burnchain_and_a_checkpoint() {
         let config = Config::parse(MINIMAL).expect("valid configuration");
