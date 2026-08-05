@@ -102,6 +102,11 @@ fn compare_headers(rebuilt: &nano_vm::BlockHeader, recorded: &nano_vm::BlockHead
 ///
 /// The fastest question to ask a divergence: what does this node actually
 /// answer, right where it stopped. Read-only and rolled back.
+///
+/// Answers that come from the *state* are real — `tenure-height`,
+/// `stacks-block-time`, every `get-stacks-block-info?`, any contract call. The
+/// burn context is not: this opens a block with no Bitcoin context, so
+/// `burn-block-height` reads 0 here and means nothing.
 fn eval_in_state(arguments: &[String]) -> ExitCode {
     let [state, source] = arguments else {
         eprintln!(

@@ -14,18 +14,23 @@ created_at: 2026-08-04
 
 ## Objective
 
-Make clarity-wasm the only production consensus execution path and close every
-known difference from stacks-core's Clarity semantics. Mainnet replay currently
-advances only with `NANO_INTERPRETER_ONLY=1`; the clarity-wasm path has produced
-different principal routing and transaction results on accepted mainnet blocks.
-That is a compiler conformance bug, not permission to substitute another engine.
+Make clarity-wasm the only production execution path and close every known
+difference from stacks-core's Clarity semantics. This is an unconditional
+product boundary, not a mainnet configuration choice: a shipped `stacks-node`
+must have no path that can execute a transaction, deployment, contract call or
+read-only query with the interpreter on any network, in any build profile or
+under any failure mode. A clarity-wasm compile, load or runtime failure rejects
+the candidate and is fixed in clarity-wasm; it is never retried under another
+engine.
 
-The interpreter remains a differential oracle: run the same transaction against
-both engines in a rolled-back diagnostic bracket to localize a disagreement.
-It must not answer a production transaction after clarity-wasm refuses or
-returns a different result. [[059-heal-the-contracts-the-interpreter-cannot-run]]
-is useful for investigating an old compiler-created state, but healing or an
-engine switch is not mainnet conformance evidence.
+The interpreter remains a differential oracle only in separately built test or
+diagnostic tooling. That tooling may run the same transaction against both
+engines in a rolled-back bracket to localize a disagreement, but it must not be
+reachable from the node binary or share its mutable runtime. It must never
+answer a production request after clarity-wasm refuses or returns a different
+result. [[059-heal-the-contracts-the-interpreter-cannot-run]] is diagnostic
+tooling for investigating old compiler-created state, not functionality the
+node may invoke.
 
 ## Tasks
 
@@ -33,14 +38,23 @@ engine switch is not mainnet conformance evidence.
       including the trait-reference/wrong-principal failure at 8,668,161.
 - [x] Fix the two known compiler/runtime boundary disagreements without routing
       their transaction or deployment through the interpreter.
-- [x] Reject `NANO_INTERPRETER_ONLY` on mainnet.
-- [ ] Remove or reject `NANO_INTERPRETER_FALLBACK`, `NANO_CROSSCHECK` and
-      `NANO_CROSSCHECK_TRANSACTIONS` in the production mainnet node; every path
-      that toggles `Vm::interpret_contract_calls` must enforce the same network
-      policy.
-- [ ] Keep the interpreter differential oracle and contract healing in explicit
-      test or `xtask` tooling whose writes are always rolled back and which the
-      release runtime cannot invoke.
+- [x] Reject `NANO_INTERPRETER_ONLY` on mainnet as an immediate containment
+      measure; this guard is not the final boundary.
+- [ ] Delete `NANO_INTERPRETER_ONLY`, `NANO_INTERPRETER_FALLBACK`,
+      `NANO_CROSSCHECK` and `NANO_CROSSCHECK_TRANSACTIONS` handling from the
+      production node and VM call path. The shipped node must not recognize an
+      environment variable, configuration field or command-line option that can
+      select, compare, retry or fall through to the interpreter.
+- [ ] Remove `Vm::interpret_contract_calls` and every equivalent engine selector
+      from the production API. Do not replace them with a mainnet guard, hidden
+      feature, emergency mode or unsafe escape hatch; there is no production
+      condition under which interpreter execution is allowed.
+- [ ] Move the interpreter differential oracle, crosscheck and contract healing
+      into separately built test or `xtask` tooling whose writes are always
+      rolled back and which the `stacks-node` binary cannot call or enable.
+- [ ] Make every clarity-wasm compile, validation, instantiation, trap and host
+      failure reject the candidate without sealing or committing any state, and
+      add a regression proving that none is retried with the interpreter.
 - [ ] Answer `/v2/accounts` without evaluating `(stx-account ...)` through the
       reference interpreter; use direct state access or clarity-wasm.
 - [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
@@ -56,9 +70,13 @@ engine switch is not mainnet conformance evidence.
 
 ## Acceptance Criteria
 
-- A normal mainnet start executes every deployment and call through
-  clarity-wasm; no interpreter environment variable, fallback or healing step
-  is required or permitted by the release configuration.
+- Every production node execution, on every network and under every role or
+  build profile, uses clarity-wasm. The node contains no interpreter engine
+  selector, fallback, crosscheck, healing path or failure recovery route.
+- Setting any historical interpreter environment variable cannot change node
+  behavior because the production binary does not read or recognize it.
+- A forced clarity-wasm compile, load or runtime failure rejects the candidate,
+  commits no state and invokes no second execution engine.
 - The known principal-routing and compiler-refusal cases match stacks-core's
   results, costs, events and state roots under clarity-wasm.
 - Restarting preserves the same clarity-wasm state and root without migration.
@@ -67,11 +85,25 @@ engine switch is not mainnet conformance evidence.
 - Deliberately forcing a clarity-wasm/interpreter disagreement in a regression
   test stops the conformance run before sealing rather than accepting the
   interpreter's answer.
-- Starting mainnet with any interpreter or crosscheck environment switch fails
-  before opening mutable chainstate, and no public Rust or RPC path can enable
-  interpreter execution afterwards.
+- No public or private production Rust API, RPC route, environment variable,
+  configuration field, CLI option or Cargo feature can enable interpreter
+  execution before or after mutable chainstate opens.
 - Account and read-only RPCs execute no Clarity expression in the reference
   interpreter.
+
+## Non-negotiable production boundary
+
+"Fallback disabled" is not sufficient. A dormant branch, a testnet-only branch,
+an environment-gated branch, an emergency switch and a crosscheck that happens
+to discard its result are all production interpreter paths and all violate this
+task. The node must have one execution engine: clarity-wasm.
+
+The reference interpreter may remain in the dependency closure because
+clarity-wasm consumes stacks-core's frontend and ABI types. Dependency presence
+does not permit a callable node path. Production crates must not reference
+`eval_all`, an interpreter contract-call helper or an engine-selection API;
+those references belong only to conformance tests and separately built
+diagnostic commands.
 
 ## Where the 8,668,161 divergence is, and two shapes that are not it
 

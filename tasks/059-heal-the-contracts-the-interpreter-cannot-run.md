@@ -26,6 +26,12 @@ fallback as tracked by
 contracts or switches to the interpreter can locate a compiler bug, but cannot
 close the release gate.
 
+This tooling must never be callable from a production node. There is no
+mainnet, testnet, emergency, recovery or operator-controlled condition under
+which healing or interpreter execution is an acceptable node fallback. The
+production response to a clarity-wasm failure is rejection with no committed
+state, followed by fixing clarity-wasm.
+
 
 ## All 27 contracts heal, and the compiler stopped being able to stop the chain
 
@@ -115,13 +121,16 @@ receipts against the chain rather than only reading them is what told the
 difference**; a root mismatch with all-successful receipts reads as MARF, and
 this was not.
 
-### `NANO_INTERPRETER_ONLY=1` replays mainnet where the compiler cannot
+### Historical experiment: `NANO_INTERPRETER_ONLY=1`
 
-plan.md's highest-value tripwire, invoked: *"clarity-wasm not compiling … point
-`nano-vm` at the clarity interpreter instead."* The switch already existed. With
-it set the node cleared 8,668,161 and kept going:
+The plan then called this its highest-value tripwire: *"clarity-wasm not
+compiling … point `nano-vm` at the clarity interpreter instead."* That policy
+has been removed. The old experiment cleared 8,668,161 and kept going:
 
 **8,668,160 → 8,669,750, zero state root mismatches.**
+
+This is diagnostic history only. Task [[060]] forbids retaining or reviving the
+switch in any production node.
 
 That is the answer to the write-ordering worry recorded beside the fallback: the
 two engines were only *evidenced* to seal the same roots by `engine_state_roots`,

@@ -109,7 +109,7 @@ Pre-agreed, so nobody has to argue about sunk cost mid-flight.
 | If… | Then |
 |---|---|
 | Conformance harness not compiling / fixtures not captured early | Stop. Do not start components — nothing downstream is verifiable without it. |
-| clarity-wasm not compiling against develop+Epoch40 by ~¼ of budget | Point `nano-vm` at the **clarity interpreter** instead (same dependency closure, already Clarity-6-correct, costs-4/5 correct). M10 and the interop goal survive intact; only the clarity-wasm requirement slips, and it swaps back in later behind the same trait. **This is the highest-value fallback in the plan.** |
+| clarity-wasm not compiling against develop+Epoch40 by ~¼ of budget | Stop the production milestone and use the interpreter only in separate, rolled-back diagnostic tooling to localize the compiler gap. The node never substitutes the interpreter: clarity-wasm conformance is a release prerequisite. |
 | MARF lockstep red by ~¼ of budget | Bisect with node byte vectors before lockstep scripts. The cause is nearly always one of the four named traps: Node48 `indexes` in the preimage, omitted empty slots, insertion-order packing, or the ancestor skip-list. |
 | hacknet 4.0 not producing blocks | Capture fixtures from the live internal pox-5 testnet instead; no infra to stand up. |
 | Cost dimensions red but everything else green | Ship it — costs only diverge near block limits. Log it, keep replay running, fix after M10. |
@@ -363,7 +363,7 @@ Do **not** register nano wallets with the `bitcoin-miner` service: its on-demand
 
 | Risk | Mitigation |
 |---|---|
-| clarity-wasm rebase across two epochs on a 400 KB divergent file | Longest lead time — start at M0 in parallel. Its own crosscheck suite is the gate (M8a), and the interpreter is in the tree as a fallback execution path. |
+| clarity-wasm rebase across two epochs on a 400 KB divergent file | Longest lead time — start at M0 in parallel. Its own crosscheck suite is the gate (M8a); the interpreter is a test oracle only and is never a node execution path. |
 | Cost parity (no costs-4/5 today) — divergence invisible until a block nears a limit | M8c asserts per-snippet dimension equality against the interpreter, not just block acceptance. |
 | MARF bit-exactness | M7a lockstep against stacks-core's own MARF, before anything depends on it. |
 | Clarity error identity is consensus-visible and hand-mapped in clarity-wasm | M10 asserts receipts (status, cost, events), not just state roots. |
@@ -371,4 +371,3 @@ Do **not** register nano wallets with the `bitcoin-miner` service: its on-demand
 | hacknet 4.0 on the critical path for fixtures | Parallel from M0. Fallback: capture fixtures from the live internal pox-5 testnet instead — no infra to stand up. |
 | PCS correctness is not verifiable in-protocol | M7b checks the root at H against the published value; M10 then replays forward and matches stacks-core block-for-block. |
 | Empty signer set is fatal; hacknet's stacker no-ops under pox-5 | W13; assert non-empty reward set at startup. |
-

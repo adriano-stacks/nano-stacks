@@ -42,6 +42,11 @@ or broad reference-node crates by accident.
       [[061-replace-stacks-core-pox-locking-with-nano-owned-ep]] and every
       test-only interpreter/healing entry point out of the release node's
       normal dependency graph and callable runtime surface.
+- [ ] Assert that production crates contain no reference to `eval_all`,
+      interpreter contract-call execution, engine-selection APIs or the former
+      interpreter environment switches. The Clarity interpreter may exist
+      transitively for the frontend ABI, but the node must have no callable
+      path to it under any feature or build profile.
 - [ ] Add a CI dependency/feature assertion for the release package so a future
       workspace or dev dependency cannot silently re-enable a forbidden crate
       or feature through unification.
@@ -60,6 +65,9 @@ or broad reference-node crates by accident.
   `libsigner`, `libstackerdb` or `pox-locking`.
 - A release build cannot select test emission or coinbase schedules, mutate a
   global test override, or call a reference test faucet.
+- A release or development build of the production node cannot select, invoke,
+  crosscheck or fall back to the interpreter on any network or after any
+  clarity-wasm failure.
 - Conformance tests still use the pinned reference implementation without
   changing the release graph.
 - The dependency assertion, release build, `clippy --all-targets --all-features`

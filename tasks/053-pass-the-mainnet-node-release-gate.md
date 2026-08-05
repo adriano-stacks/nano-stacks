@@ -22,8 +22,12 @@ and steady state, with evidence tied to the durable executed chain.
 ## Tasks
 
 - [ ] Bootstrap a clean state directory from an attested mainnet checkpoint.
-- [ ] Start with clarity-wasm as the production execution engine, with
-      interpreter fallback and healing disabled for the whole run.
+- [ ] Build and inspect the production node artifact to prove clarity-wasm is
+      its only execution path. Interpreter fallback, crosscheck, healing and
+      engine-selection code must be absent, not merely disabled for the run.
+- [ ] Force clarity-wasm compilation, module-load and runtime failures through
+      the production boundary and prove each rejects without committing state
+      or invoking the interpreter.
 - [ ] Catch up using a local Bitcoin source and multiple Stacks peers while
       recording every executed height and verified root.
 - [ ] Restart during catch-up and at tip, then prove the same durable tip, root
@@ -55,8 +59,10 @@ and steady state, with evidence tied to the durable executed chain.
 - RPC responses and events describe the same durable executed state.
 - Synchronization, propagation and consensus inputs do not require Hiro or any
   other hosted Stacks HTTP API.
-- The release configuration executes consensus through clarity-wasm and cannot
-  hide a compiler divergence by retrying under the interpreter.
+- The release node executes all Clarity work through clarity-wasm and has no
+  interpreter path under any network, configuration, environment, role, build
+  profile or failure condition. A compiler divergence cannot be hidden by a
+  retry, crosscheck, fallback, healing step or emergency switch.
 
 ## A skipped gate can no longer report itself green
 

@@ -13,6 +13,14 @@ created_at: 2026-08-02
 
 # Answer block info for blocks before the checkpoint
 
+## Production execution rule
+
+The historical investigation below used interpreter-only and fallback modes to
+diagnose old replay failures. Those modes are now forbidden by [[060]] and must
+not be retained or restored in the node. The interpreter may be used only by
+separate, rolled-back diagnostic tooling; a production clarity-wasm failure
+rejects the candidate and invokes no fallback engine.
+
 ## Objective
 
 `HeadersDB` answers every `get-stacks-block-info?`, `get-tenure-info?` and
@@ -108,10 +116,10 @@ present the **interpreter succeeds with `(ok true)` — exactly mainnet's answer
 while clarity-wasm still fails.** So the remaining fault is a compiler bug, not
 state and not the arguments.
 
-This plan names the interpreter as the execution path to fall back to, so it can
-now answer a call the compiler refuses, behind `NANO_INTERPRETER_FALLBACK`. With
-that on, the block executed and **its state root matched**, which is the
-strongest evidence available that the interpreter's answer is the consensus one.
+At the time, the plan named the interpreter as an execution fallback, so the
+experiment used `NANO_INTERPRETER_FALLBACK` to answer the refused call. That
+historical run matched the root and localized the compiler fault; it is not a
+permitted production mechanism and cannot be used to close a current gate.
 
 Replay then moved on and found two more things the checkpoint was not carrying:
 accounting written before the maturity window existed, which is now refused
@@ -126,7 +134,7 @@ beside them.
 The clarity-wasm bug itself is still to be found; every word that path stands on
 has been pinned and agrees, and the crosscheck is the oracle to bisect it with.
 
-## The one contract still needing the interpreter
+## Historical diagnostic: the one contract that needed the interpreter
 
 Knowing which epoch a Bitcoin height was in, and rebuilding a rejected contract
 newest-epoch-first rather than oldest, took the contracts needing the
@@ -688,12 +696,14 @@ it now is to trace the aggregator's *own* intermediate values rather than guess
 which word produced them. `NANO_TRACE_CALLS` reaches call boundaries; what is
 missing is inside one.
 
-## What stands between the plan's fallback and the node
+## Historical fallback experiment
 
-plan.md names pointing `nano-vm` at the Clarity interpreter as **the
-highest-value fallback in the plan**, and the crosscheck has now proved the
-interpreter right against mainnet receipts on exactly the transactions where
-clarity-wasm is wrong. So the obvious question is whether the fallback works.
+The plan then named pointing `nano-vm` at the Clarity interpreter as its
+highest-value fallback, and the crosscheck proved the interpreter right against
+mainnet receipts on transactions where clarity-wasm was wrong. The experiment
+therefore asked whether that fallback worked. That policy has since been
+removed: the results below are diagnostic history, not a node design that may
+be restored.
 
 Half the answer is yes: with `NANO_INTERPRETER_ONLY` set, the captured replay
 passes all forty blocks **with matching state roots**. The interpreter is not
@@ -1392,3 +1402,26 @@ The header work is still right for what it was actually needed for — the epoch
 lookup at 8,669,750 — and should stay. But **8,665,719 does not belong to this
 task**, and the next step is to find which unwrap in `borrow` fails, which
 `eval` now makes a matter of minutes.
+
+### Where 8,665,719 actually points
+
+`v0-4-market.borrow` binds, in order: `get-asset`, `write-feeds` (pyth price
+feeds), `get-position`, then `accrue-user-debts` / `accrue-user-collateral`,
+then `accrue-and-cache` — and that last one keys its cache on
+**`stacks-block-time`**:
+
+```clarity
+(define-private (accrue-and-cache (aid uint))
+  (let ((cache-key { timestamp: stacks-block-time, aid: aid })
+        (cached? (map-get? index-cache cache-key)))
+```
+
+At the tip where execution stops, `xtask eval` says `stacks-block-time` is
+`1785402333` and `tenure-height` is `251321` — both real, both from state. So
+the next question is which of `borrow`'s bindings is the failing `try!`/unwrap,
+and `eval` can ask each of them directly against the same state.
+
+**Caveat on the probe:** `eval` opens a block with no Bitcoin context, so
+`burn-block-height` reads `0` there and means nothing. State-derived answers are
+real; burn-context ones are not. Noted in the tool's own documentation so the
+zero is not chased.

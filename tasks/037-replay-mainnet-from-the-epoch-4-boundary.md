@@ -42,13 +42,17 @@ never from fetched, staged or peer-reported height.
 - [ ] Feed one identical journal through nano's MARF and the pinned stacks-core
       MARF, including rewrites, forks and the imported mainnet checkpoint, to
       separate execution differences from trie differences.
-- [ ] Compare compiler and interpreter journals before sealing; a fallback that
-      reaches the same values in a different order is diagnostic, not a
-      production conformance result.
+- [ ] In a separately built conformance harness, compare compiler and
+      interpreter journals before sealing. The production node must not perform
+      this crosscheck or contain a fallback path; matching diagnostic values are
+      not a production conformance result.
 - [ ] Replay from a pristine checkpoint entirely with clarity-wasm after
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
       production evidence.
+- [ ] Run the production replay with a node artifact that contains no
+      interpreter execution path. Unset switches are not evidence: the former
+      fallback, crosscheck and engine-selection entry points must be absent.
 - [ ] Keep a bounded slice of the capture in CI as a regression gate.
 - [ ] Make the mainnet gate explicitly skip or fail when its fixture is absent;
       an environment-variable early return must not appear as conformance.
