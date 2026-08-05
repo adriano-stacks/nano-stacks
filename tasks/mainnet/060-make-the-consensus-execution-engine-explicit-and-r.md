@@ -695,29 +695,87 @@ depth climbs without help. Recorded because the wrong version of this was
 published, and because "the node stops on its own" would have sent someone into
 `supervise` looking for a bug that is not there.
 
-## The sixth divergence: a legal name refused
+## The sixth: a `match` branch rejected before it could be taken (8,668,096)
 
-Replay parks at **8,668,096**:
+Not another layout bug, and not an unbalanced stack — the sixth divergence is a
+compile-time rejection of something the reference only rejects at run time.
 
+`SP1E0XBN9T4B10E9QMR7XMFJPMA19D77WY3KP2QKC.auto-alex-v3-endpoint-v2-02` contains
+
+```clarity
+ok-value (match claimed-response claimed (ok (+ ok-value …)) err (err err))
 ```
-SP1E0XBN9T4B10E9QMR7XMFJPMA19D77WY3KP2QKC.auto-alex-v3-endpoint-v2-02::rebase
-  compiler     analysis failed: Internal error: Name already used ClarityName("err")
-  interpreter  (ok u390)
-```
 
-Mainnet executed this contract. `words/maps.rs`'s `DefineMap::traverse` calls
-`generator.is_reserved_name`, which is `lookup_reserved_functions(name, &version)
-.is_some() || variables::is_reserved_name(…)` — and `err` is a native function in
-every Clarity version, so `(define-map err …)` is refused. The reference analysis
-has already run and passed, so clar2wasm is stricter than the reference and
-second-guessing a judgement already made.
+whose *error* branch binds the name `err`, which is also a native function.
+`clar2wasm`'s `Match` refused the whole contract for it, so every call into it
+failed regardless of which branch it would take. Block 8,668,096 calls `rebase`,
+which takes the ok branch: the chain says `(ok u390)` with 89 writes, nano said
+`(err none)` with none, and the 89 missing writes are the whole state-root gap.
 
-Unverified: the reference's `check_define_map` may guard only against names used
-*in this contract*. Read the reference rather than inferring, and check whether
-`define-data-var`, `define-fungible-token` and `define-trait` copied the same
-check. Do not simply delete the guard — find the test that wanted it first, and
-note that being wrong in the permissive direction means accepting a contract the
-network rejects, which is worse.
+The reference checks a binding name *where it binds it*
+(`eval_with_new_binding`, `clarity/src/vm/functions/options.rs`), so a branch
+that never runs never rejects. `check_special_match` in the analyzer checks only
+`contract_context.check_name_used` — contract-level definitions — which is why
+this contract passed analysis and deployed on mainnet in the first place.
 
-`xtask call-both-tx` answered this in one command, which is what the diagnostic
-ladder was built for: the first of these cost hours.
+The fix is `when`, not `whether`: a reserved binding name now compiles that
+branch to `NameAlreadyUsed` at run time — the same machinery a reused function
+argument name and a `let` shadowing a builtin already use
+(`generate_name_already_used_error`) — instead of failing the build. Take the
+branch and both engines still raise `RuntimeCheck(NameAlreadyUsed)`.
+
+The predicate is untouched, deliberately: only the *timing* moved. The other
+`is_reserved_name` sites are `define-map`, `define-data-var`, `define-constant`,
+`define-fungible-token`, `define-trait` and `define-read-only`, and for those a
+compile-time refusal is the right judgement — the reference's
+`check_legal_define` calls `ContractContext::is_name_used`, which *does* include
+`is_reserved`, so `(define-map err …)` fails the deploy on chain too. A contract
+that cannot deploy and a contract that cannot compile are the same outcome. Only
+`match` binds per-branch, and only `match` was wrong.
+
+### What ruled out the shapes that were suggested
+
+- **Not `define-map`/`define-data-var` copying a check the reference does not
+  make.** The reference makes it: `check_legal_define` → `is_name_used` →
+  `is_reserved`. Read, not inferred. And the contract has no `define-map` at
+  all — `grep '(define-map' ` on its source is empty.
+- **Not the wrong epoch or Clarity version.** `err` is in
+  `lookup_reserved_functions` for every version, so `ensure_wasm_module`'s
+  epoch-rebuild fallback had nothing to fall back to, and the version the state
+  records for the contract cannot change the answer.
+- **Not a layout or stack bug.** Nothing was read at the wrong width and
+  nothing was left on the stack; the module was never built.
+
+### The ladder
+
+Rung 0 answered it — the node's own log named the contract and the reason
+(`contract analysis failed: Internal error: Name already used
+ClarityName("err")`) beside a receipt with zero cost, and the Hiro API said the
+same transaction succeeded with `(ok u390)`. Rung 1 (`call-both-tx`) confirmed
+the disagreement independently. Neither `probe-root` nor `state-value` was
+needed: a receipt that spends nothing where the chain spends 6.6M runtime is not
+a write-ordering question.
+
+### Gates
+
+- `clar_match_builtin_name_binds_only_on_its_own_branch` and its optional twin
+  in `words/conditionals.rs` — the crosscheck reproducer, three lines of Clarity.
+- `wasm_match_binding_name` in the conformance suite — the same shape through
+  nano's own deploy and call path, both engines.
+- `xtask check-module` on the real contract against a mainnet state: was
+  `Name already used ClarityName("err")`, now `compiles to a module that loads`.
+- `cargo test --release -p clar2wasm`: 2,579 passed, 10 ignored, 0 failed.
+- `cargo test --release --workspace` clean; `cargo clippy --release
+  --all-targets` clean, workspace and `clar2wasm`, no `#[allow]`.
+
+### An adjacent divergence left alone, on purpose
+
+The reference's binding check is
+`is_reserved(name) || contract_context.lookup_function(name).is_some() ||
+inner_context.lookup_variable(name).is_some()`. clar2wasm's `match` checks only
+the first, so binding a name that shadows an *enclosing local* — `(let ((x 1))
+(match r x … e …))` — is accepted where the interpreter raises
+`NameAlreadyUsed`. Deliberately not changed here: no mainnet block needs it,
+and widening a rejection is the direction that risks refusing a contract the
+network accepted. Recorded so the next person finds it named rather than
+guesses.

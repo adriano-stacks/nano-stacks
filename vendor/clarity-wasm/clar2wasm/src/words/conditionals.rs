@@ -346,13 +346,6 @@ impl ComplexWord for Match {
 
         let match_on = args.get_expr(0)?;
         let success_binding = args.get_name(1)?;
-
-        if generator.is_reserved_name(success_binding) {
-            return Err(GeneratorError::InternalError(format!(
-                "Name already used {success_binding:?}"
-            )));
-        }
-
         let success_body = args.get_expr(2)?;
         // WORKAROND: type set on some/ok body
         generator.set_expr_type(success_body, expr_ty.clone())?;
@@ -378,7 +371,8 @@ impl ComplexWord for Match {
                     .bindings
                     .insert(success_binding.clone(), *inner_type, some_locals);
 
-                let some_block = generator.block_from_expr(builder, success_body)?;
+                let some_block =
+                    generator.block_from_bound_expr(builder, success_body, success_binding)?;
 
                 // we can restore early, since the none branch does not bind anything
                 generator.bindings = saved_bindings;
@@ -398,13 +392,6 @@ impl ComplexWord for Match {
                 let (ok_ty, err_ty) = &*inner_types;
 
                 let err_binding = args.get_name(3)?;
-
-                if generator.is_reserved_name(err_binding) {
-                    return Err(GeneratorError::InternalError(format!(
-                        "Name already used {err_binding:?}"
-                    )));
-                }
-
                 let err_body = args.get_expr(4)?;
                 // Workaround: set type on err body
                 generator.set_expr_type(err_body, expr_ty)?;
@@ -415,7 +402,8 @@ impl ComplexWord for Match {
                 generator
                     .bindings
                     .insert(success_binding.clone(), ok_ty.clone(), ok_locals);
-                let ok_block = generator.block_from_expr(builder, success_body)?;
+                let ok_block =
+                    generator.block_from_bound_expr(builder, success_body, success_binding)?;
 
                 // restore named locals
                 generator.bindings.clone_from(&saved_bindings);
@@ -425,7 +413,7 @@ impl ComplexWord for Match {
                     .bindings
                     .insert(err_binding.clone(), err_ty.clone(), err_locals);
 
-                let err_block = generator.block_from_expr(builder, err_body)?;
+                let err_block = generator.block_from_bound_expr(builder, err_body, err_binding)?;
 
                 // restore named locals again
                 generator.bindings = saved_bindings;
@@ -1317,6 +1305,38 @@ mod tests {
    err (+ err 107)))";
 
         crosscheck_expect_failure(&format!("{ERR} (test (err 18))"));
+    }
+
+    #[test]
+    fn clar_match_builtin_name_binds_only_on_its_own_branch() {
+        // The interpreter checks a `match` binding's name when it *binds* it,
+        // so a branch that never runs never rejects. Refusing the contract at
+        // compile time instead made every call into it fail: mainnet
+        // 8,668,096's `auto-alex-v3-endpoint-v2-02` binds `err` in an error
+        // branch `rebase` does not take, and the chain answers `(ok u390)`.
+        const ERR: &str = "
+(define-private (test (x (response int int)))
+ (match x
+   val (+ val 10)
+   err (+ err 107)))";
+
+        crosscheck(&format!("{ERR} (test (ok 115))"), Ok(Some(Value::Int(125))));
+        crosscheck_expect_failure(&format!("{ERR} (test (err 18))"));
+    }
+
+    #[test]
+    fn clar_match_optional_builtin_name_binds_only_on_its_own_branch() {
+        // Same rule for `match` on an optional: the `none` branch binds
+        // nothing, so a reserved name on the `some` side is only reached when
+        // there is a value.
+        const ERR: &str = "
+(define-private (test (x (optional int)))
+ (match x
+   err (+ err 10)
+   107))";
+
+        crosscheck(&format!("{ERR} (test none)"), Ok(Some(Value::Int(107))));
+        crosscheck_expect_failure(&format!("{ERR} (test (some 115))"));
     }
 
     #[test]

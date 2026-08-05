@@ -4,15 +4,16 @@ use clarity::vm::errors::{
     CommonCheckErrorKind, EarlyReturnError, RuntimeCheckErrorKind, RuntimeError, VmExecutionError,
 };
 use clarity::vm::types::ResponseData;
-use clarity::vm::{ClarityVersion, Value};
+use clarity::vm::{ClarityVersion, SymbolicExpression, Value};
 use clarity_types::types::{ASCIIData, CharType};
 use clarity_types::{ClarityName, ClarityTypeError};
 use std::sync::Mutex;
+use walrus::ir::{InstrSeqId, InstrSeqType};
 use walrus::InstrSeqBuilder;
 use wasmtime::{AsContextMut, Instance, Trap};
 
 use crate::error::WasmError;
-use crate::wasm_generator::{GeneratorError, WasmGenerator};
+use crate::wasm_generator::{clar2wasm_ty, GeneratorError, WasmGenerator};
 use crate::wasm_utils::{
     get_global, read_bytes_from_wasm, read_from_wasm_indirect, read_identifier_from_wasm,
     signature_from_string,
@@ -490,6 +491,39 @@ pub(crate) fn generate_name_already_used_error(
 }
 
 impl WasmGenerator {
+    /// A branch's block, or one that raises `NameAlreadyUsed` for the name the
+    /// branch binds.
+    ///
+    /// The interpreter checks a binding's name where it *binds* it, so a `match`
+    /// branch that is not taken never rejects its name. Refusing the whole
+    /// contract at compile time is not the same judgement: mainnet 8,668,096
+    /// called `auto-alex-v3-endpoint-v2-02::rebase`, which binds `err` in an
+    /// error branch it does not reach, and the chain answers `(ok u390)` — while
+    /// the compiler would not build the contract at all, so every call into it
+    /// failed.
+    pub(crate) fn block_from_bound_expr(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+        binding: &ClarityName,
+    ) -> Result<InstrSeqId, GeneratorError> {
+        if !self.is_reserved_name(binding) {
+            return self.block_from_expr(builder, expr);
+        }
+
+        let return_type = clar2wasm_ty(self.get_expr_type(expr).ok_or_else(|| {
+            GeneratorError::TypeError("Expression results must be typed".to_owned())
+        })?);
+        let mut block = builder.dangling_instr_seq(InstrSeqType::new(
+            &mut self.module.types,
+            &[],
+            &return_type,
+        ));
+        generate_name_already_used_error(self, &mut block, binding)?;
+
+        Ok(block.id())
+    }
+
     /// Returns `true` if `name` is already claimed by another contract-level definition.
     ///
     /// Mirrors the interpreter's `ContractContext::is_name_used` so the compiler can emit a

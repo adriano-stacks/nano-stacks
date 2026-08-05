@@ -45,5 +45,6 @@ mod tenure_vrf_enforcement;
 mod trie_diff;
 mod wasm_builds_a_let_bound_placeholder;
 mod wasm_is_the_engine;
+mod wasm_match_binding_name;
 mod wasm_response_fold;
 mod wasm_trait_fold;
