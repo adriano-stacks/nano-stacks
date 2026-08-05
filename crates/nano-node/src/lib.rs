@@ -37,10 +37,6 @@ pub struct CheckpointExecutor<S> {
     /// The burn height a reported sortition gap was last complained about, so
     /// the complaint is made once rather than for every block behind it.
     sortition_gap: Option<u64>,
-    /// The burn height whose winner could not be named was last said, for the
-    /// same reason: a tenure is many Stacks blocks and the sortition is one fact
-    /// about it, so saying it per block buries every other line in the log.
-    sortition_winner: Option<u64>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -513,7 +509,6 @@ where
             sortition: None,
             sortition_state: None,
             sortition_gap: None,
-            sortition_winner: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
@@ -536,7 +531,6 @@ where
             sortition: None,
             sortition_state: None,
             sortition_gap: None,
-            sortition_winner: None,
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
@@ -1017,14 +1011,30 @@ where
             payouts,
             crate::sortition::CATCH_UP_LIMIT,
         ) {
-            Ok(advanced) if advanced > 0 => {
+            Ok(walk) if walk.advanced > 0 => {
+                // The split, and not a total, because a total here was read as
+                // a per-Stacks-block cost once and it is not one: a sortition
+                // belongs to a burn block, and this line is printed once per
+                // burn block. Reading is the burnchain, deriving is the hashes,
+                // and priming is the six blocks behind a fresh seed that a
+                // start pays for once.
                 println!(
-                    "derived {advanced} sortitions locally, now standing on burn {}",
-                    tracker.tip().bitcoin_height
+                    "derived {} sortitions locally, now standing on burn {} \
+                     ({:.2}s reading {} burn blocks{}, {:.3}s deriving)",
+                    walk.advanced,
+                    tracker.tip().bitcoin_height,
+                    walk.reading.as_secs_f64(),
+                    walk.advanced + walk.primed,
+                    if walk.primed > 0 {
+                        format!(", {} of them priming the mining window", walk.primed)
+                    } else {
+                        String::new()
+                    },
+                    walk.deriving.as_secs_f64(),
                 );
-                advanced
+                walk.advanced
             }
-            Ok(advanced) => advanced,
+            Ok(walk) => walk.advanced,
             Err(error) => {
                 eprintln!("deriving the sortition locally failed: {error}");
                 self.sortition = None;
@@ -1057,25 +1067,19 @@ where
         // be the distribution at all but the *window*, which collapses to one
         // block across the epoch 4.0 boundary. All fourteen derive now, so
         // `candidates` is a report rather than a gate.
-        let candidates = tracker.candidates();
+        // An unresolvable leader key used to be reported here as well as in
+        // `check_tenure_vrf`, once a tenure each, in almost the same words — and
+        // with the wrong reason here, since the winner has derived for every
+        // captured sortition since the mining window's epoch-boundary rule
+        // landed. It is said once now, at the rule that could not run, which is
+        // also the only place that still holds for a chainstate driven without
+        // this node. Nothing belongs here in its place: a burn block that elects
+        // no winner while carrying commitments is ordinary — mainnet's 960,222
+        // is one — so the count is a report on the tracker and not a condition.
         let local = LocalSortition {
             sortition_hash: *tip.sortition_hash.as_bytes(),
             winner_vrf_public_key: tip.winner_vrf_public_key,
         };
-        if local.winner_vrf_public_key.is_none()
-            && tip.winner_txid.is_some()
-            && self.sortition_winner != Some(peer.bitcoin_height)
-        {
-            self.sortition_winner = Some(peer.bitcoin_height);
-            eprintln!(
-                "the tenure at burn {} carries a coinbase proof this node checks the \
-                 sortition hash of but not the key: it named a winner among \
-                 {candidates} commitments but holds no leader-key registration for it, \
-                 which happens when the key was registered before the burnchain \
-                 window this node holds",
-                peer.bitcoin_height
-            );
-        }
         if !tracker.agrees_with_header(bitcoin_spent) {
             eprintln!(
                 "the locally derived burn total at burn {} is {} where the header signed by \
@@ -1098,9 +1102,16 @@ where
         if derived > 0
             && let (Some(tracker), Some(state)) =
                 (self.sortition.as_ref(), self.sortition_state.as_ref())
-            && let Err(error) = tracker.save(state)
         {
-            eprintln!("the derived sortition chain could not be written down: {error}");
+            let written = std::time::Instant::now();
+            if let Err(error) = tracker.save(state) {
+                eprintln!("the derived sortition chain could not be written down: {error}");
+            } else {
+                println!(
+                    "the derived sortition chain is written down ({:.2}s)",
+                    written.elapsed().as_secs_f64()
+                );
+            }
         }
         Some(local)
     }

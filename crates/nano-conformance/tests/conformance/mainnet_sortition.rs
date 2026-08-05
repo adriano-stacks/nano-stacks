@@ -735,16 +735,25 @@ fn the_node_tracker_derives_the_same_window() {
     assert_eq!(winners, DERIVED_FLOOR, "the node named every winner");
 }
 
+/// What the tracker derived about one sortition, in what a validator reads.
+#[derive(Clone, Copy, Debug)]
+struct Derived {
+    bitcoin_height: u64,
+    sortition_hash: [u8; 32],
+    winner_vrf_public_key: Option<[u8; 32]>,
+}
+
+/// Every sortition a window derived, keyed by the consensus hash a Stacks block
+/// names its burn view with — which is how a block finds its own sortition.
+type DerivedWindow = BTreeMap<String, Derived>;
+
 /// Run the tracker over the window, with or without the carried registry.
-///
-/// Returns what it derived per burn height, keyed by the consensus hash a Stacks
-/// block names its burn view with — which is how a block finds its own sortition.
 fn derive_window(
     root: &std::path::Path,
     captured: &[Captured],
     blocks: &BTreeMap<u64, BitcoinBlock>,
     with_registry: bool,
-) -> (usize, BTreeMap<String, (u64, [u8; 32], Option<[u8; 32]>)>) {
+) -> (usize, DerivedWindow) {
     let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
         .expect("the capture carries the consensus hashes");
     let mut tracker = nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
@@ -779,11 +788,11 @@ fn derive_window(
         if snapshot.winner_txid.is_some() {
             derived.insert(
                 snapshot.consensus_hash.to_string(),
-                (
-                    snapshot.bitcoin_height,
-                    *snapshot.sortition_hash.as_bytes(),
-                    snapshot.winner_vrf_public_key,
-                ),
+                Derived {
+                    bitcoin_height: snapshot.bitcoin_height,
+                    sortition_hash: *snapshot.sortition_hash.as_bytes(),
+                    winner_vrf_public_key: snapshot.winner_vrf_public_key,
+                },
             );
         }
     }
@@ -825,11 +834,13 @@ fn the_carried_registry_names_the_key_that_proved_each_tenure() {
 
     let (_, without) = derive_window(&root, &captured, &blocks, false);
     assert!(
-        without.values().all(|(_, _, key)| key.is_none()),
+        without
+            .values()
+            .all(|derived| derived.winner_vrf_public_key.is_none()),
         "a window resolves no leader key on its own: {:?}",
         without
             .values()
-            .filter(|(_, _, key)| key.is_some())
+            .filter(|derived| derived.winner_vrf_public_key.is_some())
             .collect::<Vec<_>>()
     );
 
@@ -844,8 +855,8 @@ fn the_carried_registry_names_the_key_that_proved_each_tenure() {
     println!("{registry} leader-key registrations carried, {} sortitions", derived.len());
     let unresolved: Vec<u64> = derived
         .values()
-        .filter(|(_, _, key)| key.is_none())
-        .map(|(height, _, _)| *height)
+        .filter(|derived| derived.winner_vrf_public_key.is_none())
+        .map(|derived| derived.bitcoin_height)
         .collect();
     assert!(
         unresolved.is_empty(),
@@ -865,16 +876,19 @@ fn the_carried_registry_names_the_key_that_proved_each_tenure() {
         if !nano_chainstate::starts_new_tenure(&block) {
             continue;
         }
-        let Some((height, sortition_hash, Some(key))) =
-            derived.get(&block.header.consensus_hash.to_string()).copied()
+        let Some(Derived {
+            bitcoin_height,
+            sortition_hash,
+            winner_vrf_public_key: Some(key),
+        }) = derived.get(&block.header.consensus_hash.to_string()).copied()
         else {
             continue;
         };
         nano_chainstate::verify_coinbase_vrf_proof(&block, &key, &sortition_hash).unwrap_or_else(
             |error| {
                 panic!(
-                    "the key the registry resolves for burn {height} must prove the tenure \
-                     it elected: {error:?}"
+                    "the key the registry resolves for burn {bitcoin_height} must prove the \
+                     tenure it elected: {error:?}"
                 )
             },
         );

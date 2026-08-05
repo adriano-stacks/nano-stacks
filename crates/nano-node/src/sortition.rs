@@ -43,6 +43,33 @@ const POX_HISTORY_SEARCH_LIMIT: usize = 1024;
 /// what it derived and the next one carries on.
 pub const CATCH_UP_LIMIT: u64 = 144;
 
+/// What one round of catching up did, and where its time went.
+///
+/// It is worth counting because the cost of deriving a sortition was attributed
+/// wrongly once already. A round's `local` phase looked like 0.11 s per *Stacks*
+/// block on mainnet, which would have been a reason to make the arithmetic
+/// cheaper; the node's own timing lines show the phase does not grow between one
+/// Stacks block and the next at all — it grows only when the burn view moves,
+/// which is once a tenure. Sortition is a fact about a Bitcoin block, and many
+/// Stacks blocks stand on one, so per-block is the wrong denominator.
+///
+/// What is left after that division is `reading`: a full Bitcoin block fetched
+/// from whatever burnchain the node is configured with, which for a node reading
+/// a hosted Esplora is a megabyte or two over the internet. `deriving` is the
+/// hashes, and it is the part this node could make cheaper — the numbers say
+/// there is nothing there to win.
+#[derive(Debug, Default)]
+pub struct CatchUp {
+    /// Burn blocks snapshotted.
+    pub advanced: u64,
+    /// Burn blocks read to fill the mining window behind the seed, once a start.
+    pub primed: u64,
+    /// Waiting on the burnchain for those blocks.
+    pub reading: std::time::Duration,
+    /// The sortition arithmetic over them.
+    pub deriving: std::time::Duration,
+}
+
 /// Why a locally derived sortition chain could not be started or advanced.
 #[derive(Debug)]
 pub enum TrackerError {
@@ -186,33 +213,41 @@ impl SortitionTracker {
     }
 
     /// Walk the burnchain until the chain stands on `target`, or the bound runs
-    /// out. Returns how many burn blocks it advanced.
+    /// out.
     ///
     /// Nothing is skipped: every burn block between here and there is read and
     /// snapshotted, because a consensus hash mixes the ones behind it and a
     /// height left out changes every hash from there on.
+    ///
+    /// The two costs are counted apart because they are not the same kind of
+    /// thing and only one of them is this node's to make cheaper: reading a burn
+    /// block is a Bitcoin block download, and the arithmetic over it is hashes.
     pub fn catch_up<E: Display>(
         &mut self,
         mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
         target: u64,
         payouts: PayoutSchedule,
         limit: u64,
-    ) -> Result<u64, TrackerError> {
+    ) -> Result<CatchUp, TrackerError> {
+        let mut walk = CatchUp::default();
         if !self.primed {
-            self.prime(&mut block_at, payouts)?;
+            self.prime(&mut block_at, payouts, &mut walk)?;
         }
-        let mut advanced = 0;
-        while self.tip().bitcoin_height < target && advanced < limit {
+        while self.tip().bitcoin_height < target && walk.advanced < limit {
             let height = self
                 .tip()
                 .bitcoin_height
                 .checked_add(1)
                 .ok_or(SortitionError::HeightOverflow)?;
+            let read = std::time::Instant::now();
             let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            walk.reading += read.elapsed();
+            let derive = std::time::Instant::now();
             self.advance(&block, payouts)?;
-            advanced += 1;
+            walk.deriving += derive.elapsed();
+            walk.advanced += 1;
         }
-        Ok(advanced)
+        Ok(walk)
     }
 
     /// Read the mining window behind the seed, which the seed itself is not in.
@@ -225,11 +260,15 @@ impl SortitionTracker {
         &mut self,
         block_at: &mut impl FnMut(u64) -> Result<BitcoinBlock, E>,
         payouts: PayoutSchedule,
+        walk: &mut CatchUp,
     ) -> Result<(), TrackerError> {
         let tip = self.tip().bitcoin_height;
         let behind = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64") - 1;
         for height in tip.saturating_sub(behind)..=tip {
+            let read = std::time::Instant::now();
             let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            walk.reading += read.elapsed();
+            walk.primed += 1;
             self.register_keys(&block);
             if height == tip && let Some(seed) = unanimous_winner_seed(&block) {
                 self.engine.adopt_root_winner_seed(seed);
