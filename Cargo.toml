@@ -10,6 +10,7 @@ members = [
     "crates/nano-marf",
     "crates/nano-mempool",
     "crates/nano-vm",
+    "crates/nano-wasm-cache",
     "crates/nano-oracle",
     "crates/nano-chainstate",
     "crates/nano-sync",

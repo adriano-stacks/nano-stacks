@@ -2569,6 +2569,7 @@ dependencies = [
  "nano-vm",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2824,6 +2825,17 @@ dependencies = [
  "stacks-common",
  "tempfile",
  "wasmtime",
+]
+
+[[package]]
+name = "nano-wasm-cache"
+version = "0.1.0"
+dependencies = [
+ "clar2wasm",
+ "sha2 0.10.9",
+ "tempfile",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]

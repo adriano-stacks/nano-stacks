@@ -1,0 +1,31 @@
+[package]
+name = "nano-wasm-cache"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
+sha2 = "0.10.9"
+wasmtime = "15.0.0"
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1.0.74"
+
+# The workspace forbids unsafe code, and `wasmtime::Module::deserialize_file` --
+# the one call that makes this cache worth having -- is unsafe. `forbid` cannot
+# be relaxed from inside the crate it applies to, so the exception is a crate
+# boundary: this crate, and only this crate, denies rather than forbids, and
+# holds the single `unsafe` block in the workspace. Everything else is copied
+# from `[workspace.lints]` unchanged, so the same clippy bar applies here.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

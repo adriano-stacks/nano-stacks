@@ -106,6 +106,19 @@ impl CompileResult {
     }
 }
 
+/// Somewhere native code outlives the process that compiled it.
+///
+/// The node implements this over its state directory. A store never reports an
+/// error: a miss, a truncated entry, an entry another wasmtime wrote and an
+/// unreadable directory are all just "no module", and the caller compiles.
+pub trait NativeModuleStore: std::fmt::Debug + Send + Sync {
+    /// The native module previously stored for exactly these wasm bytes.
+    fn load(&self, engine: &wasmtime::Engine, wasm: &[u8]) -> Option<wasmtime::Module>;
+
+    /// Keep `module`, which was compiled from `wasm`, for a later process.
+    fn store(&self, wasm: &[u8], module: &wasmtime::Module);
+}
+
 /// The compiled contracts one execution context has to hand.
 ///
 /// Holds the `Engine` as well, because a `Module` may only be instantiated in a
@@ -114,6 +127,7 @@ impl CompileResult {
 #[derive(Clone, Default)]
 pub struct ModuleCache {
     engine: wasmtime::Engine,
+    persistent: Option<Arc<dyn NativeModuleStore>>,
     contracts: HashMap<QualifiedContractIdentifier, Arc<CompiledContract>>,
 }
 
@@ -122,11 +136,20 @@ impl std::fmt::Debug for ModuleCache {
         formatter
             .debug_struct("ModuleCache")
             .field("contracts", &self.contracts.len())
+            .field("persistent", &self.persistent)
             .finish()
     }
 }
 
 impl ModuleCache {
+    /// A cache that also reads and writes native code through `store`.
+    pub fn persisting_in(store: Arc<dyn NativeModuleStore>) -> Self {
+        Self {
+            persistent: Some(store),
+            ..Self::default()
+        }
+    }
+
     pub fn insert(&mut self, contract: QualifiedContractIdentifier, module: CompiledContract) {
         self.contracts.insert(contract, Arc::new(module));
     }
@@ -140,10 +163,21 @@ impl ModuleCache {
         &self.engine
     }
 
-    /// Native code for `wasm`, compiled by this cache's engine.
+    /// Native code for `wasm`, from the persistent store if it has it.
     pub fn native_module(&self, wasm: &[u8]) -> Result<wasmtime::Module, VmExecutionError> {
-        wasmtime::Module::from_binary(&self.engine, wasm)
-            .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))
+        if let Some(stored) = self
+            .persistent
+            .as_ref()
+            .and_then(|store| store.load(&self.engine, wasm))
+        {
+            return Ok(stored);
+        }
+        let module = wasmtime::Module::from_binary(&self.engine, wasm)
+            .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+        if let Some(store) = self.persistent.as_ref() {
+            store.store(wasm, &module);
+        }
+        Ok(module)
     }
 }
 
