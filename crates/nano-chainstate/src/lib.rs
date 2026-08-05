@@ -633,7 +633,8 @@ struct ChainLedger {
     accounting: TenureAccounting,
     /// Stacks height each tenure started at, which `get-tenure-info?` maps back.
     tenure_start_heights: BTreeMap<u32, u32>,
-    /// The blocks executed since the checkpoint, oldest first.
+    /// The blocks executed since the checkpoint, oldest first, bounded at
+    /// `REORG_REACH`.
     executed: Vec<ExecutedBlock>,
     /// The coinbase VRF proof of the last tenure this chain accepted.
     ///
@@ -643,6 +644,15 @@ struct ChainLedger {
     /// an `Option` and why an absent one is reported rather than passed.
     parent_tenure_proof: Option<[u8; 80]>,
 }
+
+/// How far back the executed chain is kept, and so how far a retraction reaches.
+///
+/// A Bitcoin reorganization or a Stacks fork parts a block or a few back;
+/// `nano-node` looks 256 ancestors back for a tip the network still has, so
+/// beyond that there is nothing left to walk back *to*. Unbounded, this list
+/// grows with uptime rather than with anything it is used for — and it is now
+/// serialized on every block, so its length is a cost paid per block.
+const REORG_REACH: usize = 256;
 
 /// A chainstate execution context backed by versioned VM state.
 ///
@@ -2240,6 +2250,9 @@ fn note_executed_block(
         consensus_hash: block.header.consensus_hash,
         tenure_height,
     });
+    if let Some(over) = ledger.executed.len().checked_sub(REORG_REACH) {
+        ledger.executed.drain(..over);
+    }
     let miner = ledger
         .accounting
         .earnings_at(u64::from(tenure_height))
