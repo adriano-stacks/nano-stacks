@@ -33,7 +33,7 @@ not explicitly seeded must fail with `UnknownTenure`.
       every state root.
 - [x] Pay the maturing tenure's parent its own tenure fees, not the child
       tenure's fees.
-- [ ] Rebuild the live accounting from accepted chain history and reject the
+- [x] Rebuild the live accounting from accepted chain history and reject the
       result unless all 201 required tenures are present and contiguous.
 - [ ] Re-execute mainnet block 8,673,864 from the reconstructed state and match
       its expected root before counting any later replay depth.
@@ -149,3 +149,79 @@ was the right signal for the wrong reason — there was nothing to fix.
 
 About 130 bytes per tenure, and since the ledger landed it is written per block
 rather than per catch-up round. It grows with the chain.
+
+## The hole, measured: eight tenures nano executed and never recorded
+
+The durable ledger held **193 tenures spanning 251,220 to 251,420 with exactly
+eight missing — 251,322 through 251,329**. Not the checkpoint's fault: the
+capture's `native-effects.json` carries 251,220–251,321 with no gaps. Those eight
+are the first tenures nano itself executed after the anchor, and nothing recorded
+them.
+
+`MINER_REWARD_MATURITY` is 100, so tenure 251,422 pays 251,322. The replay had
+reached tenure 251,420. It would have run for another two tenures and then failed
+with `UnknownTenure`, having sealed 8,000 blocks that all had to be thrown away —
+which is precisely the outcome `check_maturity_window` exists to prevent, and it
+was not being called.
+
+**The cause is not determinable from this state, and saying so is the honest
+answer.** `accounting.json` in the same directory has the *same* eight missing and
+stops at 251,351, so the hole predates the ledger and came in through the
+migration from that file. The blocks concerned are 8,665,60x–8,665,80x, which is
+the range `047` records a root mismatch at 8,665,780 being retried 1,417 times,
+and the log for that period is gone. What *is* determinable: the current code path
+records every tenure — 91 contiguous from 251,330 to 251,420 — so this is
+historical rather than live. `start_tenure` calls `record_earnings` on every
+tenure start where a coinbase schedule exists, and the schedule is present.
+
+## The resume path validated nothing at all
+
+That is the bug worth fixing, rather than the hole. `check_maturity_window` ran on
+the checkpoint and on `accounting.json` — and *not* on a recovered ledger, which is
+the path a running node actually takes. So the one artifact a node executes from was
+the one artifact nobody checked. `recover_ledger` now applies it, which is one
+comparison at startup against hours of execution.
+
+Note the interaction with `known_earnings_span` answering the **contiguous** run:
+the outer pair 251,220–251,420 says the window is 201 long and healthy. Only
+counting down from the top says it is 91, and the first unpayable tenure is 27
+away.
+
+## `repair-ledger`, and where its numbers come from
+
+`cargo xtask repair-ledger <state-dir> <stacks-core-index.sqlite>` fills the holes
+in every stored ledger row from **stacks-core's own `payments` rows**, for the same
+reason `capture-fixtures` reads them there: they are stacks-core's arithmetic
+rather than a reimplementation of it. `rebuild-accounting` walks a peer summing
+fees, which is a reimplementation, takes hours against a rate limit, and writes
+`accounting.json` — a file the node stopped reading once a block had sealed, so its
+repair went nowhere.
+
+It also settles the one field a fee-walk would have had to guess: tenure 251,329's
+coinbase is **2,000,000,000**, twice the emission, because the burn block before it
+produced no sortition and the coinbase accumulated. A reconstruction that assumed
+the schedule's amount would have been silently wrong there.
+
+**Verified before being trusted.** For every tenure the capture and the archive
+share, recipient, coinbase and fees agree exactly — including 251,321's oddly small
+15,114, which is the kind of value a plausible-looking reconstruction gets wrong.
+
+All 256 rows were repaired, each to 251,220–251,420 contiguous, and a second run
+says "every ledger row already owes a contiguous window".
+
+### Two mistakes made getting there, both worth recording
+
+**The first repair wrote TEXT into a BLOB column.** Every row passed validation and
+none could be read afterwards: rusqlite's byte reader refuses a text value, so the
+node started with "no ledger was committed with block …" and fell back to
+`accounting.json` — which still had the hole, so the new startup check fired, on the
+wrong artifact, for the right reason. The tool validated what it was *about to*
+write rather than what came back out. It now writes `x'…'` and re-reads the row,
+checking both the type and the bytes.
+
+**Then the `UPDATE` was too long for an argument list.** A repaired row is 67 KB of
+hexadecimal and `execve` refused it. `sqlite_script` feeds statements on standard
+input, where there is no limit to hit.
+
+Both are the same lesson in different clothes: verify through the path the reader
+uses, not the path the writer took.

@@ -33,12 +33,13 @@ fn main() -> ExitCode {
         Some("state-value") => state_value(&env::args().skip(2).collect::<Vec<_>>()),
         Some("snapshot-state") => snapshot_state(&env::args().skip(2).collect::<Vec<_>>()),
         Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("repair-ledger") => repair_ledger(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -1457,6 +1458,39 @@ fn sqlite(database: &Path, query: &str) -> Result<String, String> {
     )
 }
 
+/// Run a statement too long for an argument list.
+///
+/// A repaired ledger row is 67 KB of hexadecimal, and an `UPDATE` carrying it is
+/// past `E2BIG` — the first version of `repair-ledger` failed on its first row
+/// for exactly that. Fed on standard input there is no limit to hit.
+fn sqlite_script(database: &Path, script: &str) -> Result<String, String> {
+    use std::io::Write as _;
+
+    let mut child = Command::new("sqlite3")
+        .arg(database)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run sqlite3: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "sqlite3 has no standard input".to_owned())?
+        .write_all(script.as_bytes())
+        .map_err(|error| format!("cannot write the statement: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("sqlite3 did not finish: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sqlite3 refused the statement: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn sqlite_json(database: &Path, query: &str) -> Result<String, String> {
     command_output(
         Command::new("sqlite3")
@@ -2557,3 +2591,265 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+
+/// Fill one ledger row's holes, or say why it could not be.
+///
+/// Answers the tenures it filled, empty when the row already owed a contiguous
+/// window. Split out of `repair_ledger` because a per-row body and a per-state
+/// loop are two jobs.
+fn repair_ledger_row(
+    side_store: &Path,
+    archive: &Path,
+    block: &str,
+    data: &str,
+) -> Result<Vec<u64>, ()> {
+    let Some(bytes) = decode_hex(data.trim()) else {
+        eprintln!("the ledger committed with {block} is not hexadecimal");
+        return Err(())
+    };
+    let Ok(mut ledger) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        eprintln!("the ledger committed with {block} does not read as JSON");
+        return Err(())
+    };
+    let missing = match missing_tenures(&ledger) {
+        Ok(missing) => missing,
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(())
+        }
+    };
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    for height in &missing {
+        let entry = match archived_tenure(archive, *height) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                eprintln!("the archive has no scheduled payment for tenure {height}");
+                return Err(())
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                return Err(())
+            }
+        };
+        let Some(tenures) = ledger
+            .get_mut("accounting")
+            .and_then(|accounting| accounting.get_mut("tenures"))
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            eprintln!("the ledger names no tenures");
+            return Err(())
+        };
+        tenures.push(entry);
+        tenures.sort_by_key(|tenure| {
+            tenure
+                .get("coinbase_height")
+                .and_then(serde_json::Value::as_u64)
+        });
+    }
+    // Validated through the node's own reader before it is written back: a
+    // repair that produces something the node cannot parse, or that leaves a
+    // hole, has to fail here rather than at the next start.
+    let accounting = ledger.get("accounting").cloned().unwrap_or_default();
+    match nano_chainstate::TenureAccounting::from_json(
+        serde_json::to_string(&accounting).unwrap_or_default().as_bytes(),
+    ) {
+        Ok(accounting) => {
+            if !missing_tenures(&ledger).is_ok_and(|missing| missing.is_empty()) {
+                eprintln!("the repaired ledger for {block} still has a hole");
+                return Err(())
+            }
+            let Some((first, last)) = accounting.known_earnings_span() else {
+                eprintln!("the repaired ledger for {block} owes nothing");
+                return Err(())
+            };
+            println!("{block}: filled {} tenures, window {first}..{last}", missing.len());
+        }
+        Err(error) => {
+            eprintln!("the repaired accounting for {block} does not read back: {error}");
+            return Err(())
+        }
+    }
+    let encoded = serde_json::to_vec(&ledger).unwrap_or_default();
+    if let Err(error) = sqlite_script(
+        side_store,
+        &format!(
+            "UPDATE chain_ledger SET data = x'{}' WHERE hex(block_id) = '{block}';\n",
+            encode_hex(&encoded)
+        ),
+    ) {
+        eprintln!("cannot write the repaired ledger for {block}: {error}");
+        return Err(())
+    }
+    // Read back from the database, not from memory. The first attempt at
+    // this validated what it was about to write and wrote it as the wrong
+    // SQLite type, so every row passed and none could be read afterwards.
+    match sqlite(
+        side_store,
+        &format!("SELECT typeof(data), hex(data) FROM chain_ledger WHERE hex(block_id) = '{block}'"),
+    ) {
+        Ok(written) => {
+            let Some((kind, hex)) = written.trim().split_once('|') else {
+                eprintln!("the repaired row for {block} did not read back");
+                return Err(())
+            };
+            if kind != "blob" {
+                eprintln!("the repaired row for {block} is a {kind} where the node reads bytes");
+                return Err(())
+            }
+            if decode_hex(hex.trim()).as_deref() != Some(encoded.as_slice()) {
+                eprintln!("the repaired row for {block} did not come back as it went in");
+                return Err(())
+            }
+        }
+        Err(error) => {
+            eprintln!("cannot read back the repaired ledger for {block}: {error}");
+            return Err(())
+        }
+    }
+    Ok(missing)
+}
+
+/// Fill a hole in a state's tenure accounting from stacks-core's own archive.
+///
+/// A tenure's earnings are recorded when its start block executes, and a state
+/// that missed one runs perfectly until the payout a hundred tenures later that
+/// it cannot derive — hours in, having written state that has to be thrown away.
+/// The live mainnet state carried exactly that: eight tenures, 251,322 through
+/// 251,329, that nano executed and did not record, only reachable at tenure
+/// 251,422.
+///
+/// The numbers come from the archive's own `payments` rows rather than from a
+/// walk that re-derives them, for the same reason `capture-fixtures` reads them
+/// there: they are stacks-core's arithmetic, not a reimplementation of it. That
+/// also settles the one field a reconstruction would have had to guess — tenure
+/// 251,329's coinbase is 2,000,000,000, twice the emission, because the burn
+/// block before it produced no sortition and the coinbase accumulated.
+///
+/// Verified against the checkpoint before being trusted for anything it does not
+/// hold: for every tenure the capture and the archive share, recipient, coinbase
+/// and fees agree exactly, down to 251,321's oddly small 15,114.
+fn repair_ledger(arguments: &[String]) -> ExitCode {
+    let [state, archive] = arguments else {
+        eprintln!(
+            "usage: cargo xtask repair-ledger <state-dir> <stacks-core-index.sqlite>\n\
+             fills tenures missing from the chain ledger; the node must not be running"
+        );
+        return ExitCode::FAILURE;
+    };
+    let side_store = Path::new(state).join("chainstate").join("clarity.sqlite");
+    let archive = Path::new(archive);
+    if !side_store.exists() || !archive.exists() {
+        eprintln!("both the state's clarity.sqlite and the archive have to exist");
+        return ExitCode::FAILURE;
+    }
+
+    // Both columns as hexadecimal. `data` is a *blob*, and rusqlite's reader
+    // refuses a text value where it wants bytes — so a repair that writes the
+    // JSON back as text leaves rows the node can no longer read at all, which
+    // is exactly what the first attempt at this did. Hex in, hex out.
+    let rows = match sqlite(
+        &side_store,
+        "SELECT hex(block_id), hex(data) FROM chain_ledger ORDER BY sequence",
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("cannot read the chain ledger: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows: Vec<(String, String)> = rows
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .map(|(block, data)| (block.to_owned(), data.to_owned()))
+        .collect();
+    if rows.is_empty() {
+        eprintln!("the state has no chain ledger to repair");
+        return ExitCode::FAILURE;
+    }
+
+    let mut repaired = 0_usize;
+    let mut filled = std::collections::BTreeSet::new();
+    for (block, data) in &rows {
+        match repair_ledger_row(&side_store, archive, block, data) {
+            Ok(missing) if missing.is_empty() => {}
+            Ok(missing) => {
+                filled.extend(missing);
+                repaired += 1;
+            }
+            Err(()) => return ExitCode::FAILURE,
+        }
+    }
+
+    if repaired == 0 {
+        println!("every ledger row already owes a contiguous window");
+    } else {
+        println!(
+            "repaired {repaired} of {} ledger rows, filling tenures {:?}",
+            rows.len(),
+            filled
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// The coinbase heights absent from a ledger's tenure accounting.
+///
+/// Between the lowest and the highest it holds: a window that simply starts
+/// later is shorter, and this is looking for the holes that make a *longer*
+/// window unpayable.
+fn missing_tenures(ledger: &serde_json::Value) -> Result<Vec<u64>, String> {
+    let tenures = ledger
+        .get("accounting")
+        .and_then(|accounting| accounting.get("tenures"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "the ledger names no tenures".to_owned())?;
+    let heights: std::collections::BTreeSet<u64> = tenures
+        .iter()
+        .filter_map(|tenure| tenure.get("coinbase_height")?.as_u64())
+        .collect();
+    let (Some(first), Some(last)) = (heights.iter().next(), heights.iter().next_back()) else {
+        return Ok(Vec::new());
+    };
+    Ok((*first..=*last)
+        .filter(|height| !heights.contains(height))
+        .collect())
+}
+
+/// One tenure's earnings, as stacks-core's archive recorded them.
+fn archived_tenure(archive: &Path, coinbase_height: u64) -> Result<Option<serde_json::Value>, String> {
+    let tenure = sqlite(
+        archive,
+        &format!(
+            "SELECT block_id FROM nakamoto_tenure_events \
+             WHERE cause = 0 AND coinbase_height = {coinbase_height} LIMIT 1"
+        ),
+    )?;
+    let Some(block_id) = tenure.lines().next() else {
+        return Ok(None);
+    };
+    let payment = sqlite(
+        archive,
+        &format!(
+            "SELECT COALESCE(recipient, address), coinbase, tx_fees_anchored \
+             FROM payments WHERE index_block_hash = '{block_id}' AND miner = 1 \
+             ORDER BY rowid LIMIT 1"
+        ),
+    )?;
+    let Some(payment) = payment.lines().next() else {
+        return Ok(None);
+    };
+    let mut fields = payment.split('|');
+    let recipient = fields
+        .next()
+        .ok_or_else(|| format!("tenure {coinbase_height} has no recipient"))?;
+    let coinbase = parse_u128("archived coinbase", fields.next())?;
+    let fees = parse_u128("archived anchored fees", fields.next())?;
+    Ok(Some(json!({
+        "coinbase_height": coinbase_height,
+        "recipient": recipient,
+        "coinbase": coinbase,
+        "fees": fees,
+    })))
+}

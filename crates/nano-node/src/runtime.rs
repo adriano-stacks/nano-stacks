@@ -789,7 +789,14 @@ fn recover_ledger(
                 "absent"
             }
         );
-        return Ok(());
+        // The same check the checkpoint and `accounting.json` get. It was missing
+        // here, and a resumed node is the one that runs for hours: the live
+        // mainnet state carried a hole at 251,322–251,329 — eight tenures nano
+        // executed and did not record — through 8,000 blocks of replay, because
+        // the only path that validates a maturity window was the one this node
+        // had stopped taking. `known_earnings_span` answers the *contiguous* run,
+        // so a hole shortens it rather than hiding inside it.
+        return check_maturity_window(chainstate.accounting_mut());
     }
     // A state directory written before the ledger was committed with the seal
     // has none, and the three things beside the accounting were never written
