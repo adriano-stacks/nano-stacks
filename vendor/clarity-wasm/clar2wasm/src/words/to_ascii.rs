@@ -907,6 +907,39 @@ mod tests {
         check("ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE.foo")
     }
 
+    /// Every byte in the ASCII range, against Clarity's own validator.
+    ///
+    /// The table below picks the boundaries by hand, which is a sample of the
+    /// rule rather than the rule. This asks `string_ascii_from_bytes` itself
+    /// whether each byte is admissible and requires the compiled path to agree,
+    /// so it cannot drift from Clarity's answer even if that answer changes.
+    ///
+    /// Prompted by upstream `stx-labs/clarity-wasm#827`, which fixes the same
+    /// class of bug in `to-ascii?` on UTF-8 -- bytes under 128 that Clarity
+    /// still rejects. This node fixed that in task 045; what the PR is worth
+    /// here is the exhaustiveness, not the fix.
+    #[test]
+    fn to_ascii_utf8_agrees_with_clarity_on_every_ascii_byte() {
+        for byte in 0..=0x7f_u8 {
+            let admissible = clarity::vm::Value::string_ascii_from_bytes(vec![byte]).is_ok();
+            let expected = if admissible {
+                clarity::vm::Value::okay(
+                    clarity::vm::Value::string_ascii_from_bytes(vec![byte])
+                        .expect("just checked"),
+                )
+                .expect("a response")
+            } else {
+                clarity::vm::Value::err_uint(1)
+            };
+            // `\u{..}` rather than the character, so a quote, a backslash or a
+            // brace cannot end the literal early and test something else.
+            crosscheck(
+                &format!("(to-ascii? u\"\\u{{{byte:x}}}\")"),
+                Ok(Some(expected)),
+            );
+        }
+    }
+
     /// Clarity admits a byte that is alphanumeric, punctuation or whitespace.
     ///
     /// Being under 128 is not the same rule: NUL, a vertical tab and DEL are
