@@ -40,6 +40,7 @@ mod mainnet_envelope;
 mod mainnet_sortition;
 mod marf_lockstep;
 mod mempool;
+mod p2p_inbound;
 mod p2p_wire;
 mod pox_five_replay;
 mod pox_locking;

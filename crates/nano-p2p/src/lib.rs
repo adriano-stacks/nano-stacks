@@ -9,9 +9,20 @@
 //! ## What is and is not here
 //!
 //! [`wire`] is the message codec, [`session`] one authenticated conversation,
-//! [`peers`] the durable peer table. Missing, and named as the next slice in
-//! `tasks/054-join-and-synchronize-over-the-stacks-p2p-network.md`: the inventory
-//! and block-download driver, the inbound listener, and relay.
+//! [`swarm`] a bounded set of them with scoring and neighbour discovery,
+//! [`inbound`] the reply side that lets another node handshake *with* nano, and
+//! [`peers`] the durable peer table.
+//!
+//! ## Blocks come over HTTP, and that is not a shortcut
+//!
+//! In Nakamoto, stacks-core downloads blocks and tenures over HTTP to each peer's
+//! own RPC endpoint (`net/download/nakamoto/tenure_downloader.rs`); there is no
+//! p2p message for requesting a block. So what p2p is *for* is the handshake,
+//! neighbours, inventories, and pushed blocks and transactions — and the thing it
+//! produces for the rest of the node is [`Discovered::endpoints`], the `data_url`
+//! of every peer that handshook. Those endpoints replace a hosted API not by
+//! speaking a different protocol but by being many, found rather than configured,
+//! and nobody's product.
 //!
 //! ## Why nano's own codec
 //!
@@ -34,12 +45,16 @@
 //! this node's view. Authentication proves *who* said something, never that it is
 //! true.
 
+pub mod inbound;
 pub mod peers;
 pub mod session;
+pub mod swarm;
 pub mod wire;
 
+pub use inbound::{InboundLimits, Listener, Served, Service, serve_peer};
 pub use peers::{KnownPeer, MAX_KNOWN_PEERS, PeerDb, PeerDbError};
 pub use session::{LocalPeer, Protocol, Session, SessionError, nack_is_transient};
+pub use swarm::{Discovered, Round, Swarm, SwarmLimits, TenureClaim, assign_tenures};
 pub use wire::{
     ChainView, Handshake, Message, NeighborAddress, Payload, PeerAddress, Preamble,
     STABLE_CONFIRMATIONS, WireError,

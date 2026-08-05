@@ -37,8 +37,35 @@ pub struct NodeConfig {
     /// Overrides the chain identifier of a non-mainnet network, which Hacknet
     /// and the private testnets set to something of their own.
     pub chain_id: Option<u32>,
-    /// The peers this node follows, tried in order until one answers.
+    /// The HTTP peers this node follows, tried in order until one answers.
+    ///
+    /// May be empty when `p2p_seeds` gives a way into the binary network instead:
+    /// what a node needs is *a* way in, and an operator who wants no hosted API in
+    /// the picture should be able to say so by leaving this out.
+    #[serde(default)]
     pub peers: Vec<String>,
+    /// Bootstrap peers for the binary p2p network, as `<key>@<host>:<port>` or
+    /// plain `<host>:<port>`.
+    ///
+    /// Omitted on mainnet, stacks-core's own published bootstrap nodes are used —
+    /// they are public, and a mainnet node with no way into the network does
+    /// nothing. An explicit empty list turns the transport off, which is how a node
+    /// says "HTTP only" out loud. The key, if given, is a label: a session learns
+    /// the peer's key from its handshake and authenticates against that.
+    pub p2p_seeds: Option<Vec<String>>,
+    /// Where to listen for inbound peers, or nothing to stay outbound-only.
+    ///
+    /// A node that does not listen can still sync; what it cannot do is get into
+    /// other nodes' peer tables, which is what makes it useful to the network
+    /// rather than only to itself.
+    pub p2p_bind: Option<SocketAddr>,
+    /// The address to tell peers to dial back on, when it is not the bind address.
+    ///
+    /// Behind NAT the bound address is not reachable, and a peer that records the
+    /// wrong one wastes its slots on it. Left out, the bind address is advertised,
+    /// and an unroutable one is advertised as the any-net address — which peers read
+    /// as "I do not know my own address" rather than as a lie.
+    pub p2p_address: Option<SocketAddr>,
     /// Where to serve the public RPC, or nothing to serve none of it.
     pub rpc_bind: Option<SocketAddr>,
     /// Where to POST the events an observer subscribes to.
@@ -221,9 +248,13 @@ impl Config {
     /// Parse and validate a configuration document.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
-        if config.node.peers.is_empty() {
+        // A node needs *a* way into the network, and now there are two of them.
+        // Requiring an HTTP peer specifically is what made a hosted API
+        // load-bearing in the first place.
+        if config.node.peers.is_empty() && config.node.bootstrap_seeds().is_empty() {
             return Err(ConfigError::Invalid(
-                "node.peers must name at least one peer to follow".to_owned(),
+                "node.peers or node.p2p_seeds must name at least one way into the network"
+                    .to_owned(),
             ));
         }
         config.burnchain.magic()?;
@@ -273,6 +304,26 @@ impl NodeConfig {
     /// The peers to follow, in the order they are tried.
     pub fn peers(&self) -> Result<Vec<Url>, ConfigError> {
         urls("node.peers", &self.peers)
+    }
+
+    /// The p2p bootstrap peers, defaulting to stacks-core's own on mainnet.
+    ///
+    /// Only when `network = "mainnet"` is written down: a configuration that leaves
+    /// the chain to be discovered from its peers cannot have its network id
+    /// defaulted, because on this protocol the network id *is* the chain id and it
+    /// goes in the first byte of the first message.
+    #[must_use]
+    pub fn bootstrap_seeds(&self) -> Vec<String> {
+        match &self.p2p_seeds {
+            Some(seeds) => seeds.clone(),
+            None if matches!(self.network, Some(NetworkName::Mainnet)) => {
+                nano_p2p::MAINNET_SEEDS
+                    .iter()
+                    .map(|seed| (*seed).to_owned())
+                    .collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// The observers every event is posted to.

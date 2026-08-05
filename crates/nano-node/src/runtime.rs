@@ -14,6 +14,7 @@ use nano_chainstate::{
 };
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
+use nano_p2p::Discovered;
 use nano_sync::{Node, PoxInfo, SyncClient, SyncError};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
@@ -65,6 +66,8 @@ pub enum Job {
     Follower,
     Signer,
     Miner,
+    /// The p2p transport: peer discovery, and the listener that answers peers.
+    Peers,
 }
 
 impl Job {
@@ -78,7 +81,11 @@ impl Job {
     const fn is_fatal(self) -> bool {
         match self {
             Self::Signer | Self::Follower => true,
-            Self::Rpc | Self::Miner => false,
+            // Losing peer discovery leaves whatever HTTP peers the operator
+            // configured, and losing the listener only costs this node its place in
+            // other nodes' peer tables. Neither is worth stopping a node that is
+            // still executing the chain.
+            Self::Rpc | Self::Miner | Self::Peers => false,
         }
     }
 }
@@ -90,6 +97,7 @@ impl std::fmt::Display for Job {
             Self::Follower => "follower",
             Self::Signer => "signer",
             Self::Miner => "miner",
+            Self::Peers => "peer network",
         })
     }
 }
@@ -130,8 +138,20 @@ impl Drop for Phase {
 /// Run a node until it is asked to stop or a role gives up.
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&config.node.working_dir)?;
+    let mut roles: JoinSet<(Job, Role)> = JoinSet::new();
+    // The p2p transport comes up first, because its whole point is to be a way in
+    // that does not depend on a configured HTTP peer. It needs the chain identifier
+    // up front — on this protocol the network id *is* the chain id and it is the
+    // second field of the first message — so a configuration that leaves the chain
+    // to be discovered gets no transport, and falls back to what it always did.
+    let phase = Phase::start("joining the peer network");
+    let discovered = match config.network() {
+        Some(network) => start_transport(&config, network, None, &mut roles).await,
+        None => None,
+    };
+    drop(phase);
     let phase = Phase::start("reaching a peer");
-    let peer = reachable_peer(&config).await?;
+    let peer = reachable_peer(&config, discovered.as_ref()).await?;
     drop(phase);
     let network = match config.network() {
         Some(network) => network,
@@ -179,7 +199,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // the moment they are authenticated.
     let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
 
-    let mut roles = JoinSet::new();
     let state = start_rpc(
         &config,
         network,
@@ -1293,10 +1312,23 @@ where
     }
 }
 
-async fn reachable_peer(config: &Config) -> Result<SyncClient, Box<dyn Error>> {
+async fn reachable_peer(
+    config: &Config,
+    discovered: Option<&Discovered>,
+) -> Result<SyncClient, Box<dyn Error>> {
     let mut last = None;
-    for url in config.node.peers()? {
-        let client = SyncClient::new(url.clone())?;
+    // Configured peers first, because an operator naming one is expressing a
+    // preference; then whatever the p2p network turned out to hold, which is what
+    // makes an empty `node.peers` a workable configuration rather than a fatal one.
+    let configured = config.node.peers()?;
+    let found = discovered.map(Discovered::endpoints).unwrap_or_default();
+    let candidates = configured
+        .into_iter()
+        .chain(found.iter().filter_map(|endpoint| endpoint.parse().ok()));
+    for url in candidates {
+        let Ok(client) = SyncClient::new(url.clone()) else {
+            continue;
+        };
         match patiently(|| client.node_info()).await {
             Ok(_) => return Ok(client),
             Err(error) => {
@@ -1309,6 +1341,336 @@ async fn reachable_peer(config: &Config) -> Result<SyncClient, Box<dyn Error>> {
         || Box::<dyn Error>::from("no peer to follow"),
         |error| Box::new(error) as Box<dyn Error>,
     ))
+}
+
+/// The Bitcoin view this node advertises to its peers.
+///
+/// Derived from the node's own executed height and its own Bitcoin source, never
+/// from what a peer said: a preamble view is a gossip hint rather than a consensus
+/// input, but a node repeating a peer's claim back at the network would be laundering
+/// it into one.
+///
+/// The fallback matters as much as the derivation. A peer refuses a message whose
+/// *stable* header hash contradicts its own at that height, and it keeps roughly 288
+/// blocks below its own stable height — so a view older than that cannot be
+/// contradicted, and stacks-core reads not-contradictable as merely stale. A node
+/// with no executed chain yet advertises exactly that and gets in, which is what
+/// lets discovery run before there is a chain to describe.
+async fn advertised_view(
+    bitcoin: &BurnchainSource,
+    executor: Option<&SharedExecutor>,
+) -> nano_p2p::ChainView {
+    let stale = || {
+        nano_p2p::ChainView::new(
+            100_000,
+            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+        )
+        .expect("a height above the confirmation window")
+    };
+    let Some(executor) = executor else {
+        return stale();
+    };
+    let height = executor.lock().await.bitcoin_height();
+    let Some(settled) = height.checked_sub(nano_p2p::STABLE_CONFIRMATIONS) else {
+        return stale();
+    };
+    let (Ok(tip_hash), Ok(stable_hash)) = (
+        nano_bitcoin::BitcoinSource::block_hash_at(bitcoin, height),
+        nano_bitcoin::BitcoinSource::block_hash_at(bitcoin, settled),
+    ) else {
+        return stale();
+    };
+    nano_p2p::ChainView::new(
+        height,
+        nano_primitives::BitcoinHeaderHash::from_bytes(tip_hash),
+        nano_primitives::BitcoinHeaderHash::from_bytes(stable_hash),
+    )
+    .unwrap_or_else(stale)
+}
+
+/// This node's p2p identity, which has to survive a restart.
+///
+/// Peers remember a node by its key hash, and a node that re-keyed every start
+/// would be a new stranger to the whole network each time — including to the peer
+/// tables that had it on a backoff, which is the half that would make restarting a
+/// way to launder a bad reputation.
+fn p2p_identity(working_dir: &Path) -> Result<nano_crypto::StacksPrivateKey, Box<dyn Error>> {
+    // The file holds the *seed*, not the key: a seed is what `from_seed` derives an
+    // identity from, so storing it stores the thing that regenerates the identity
+    // rather than a second encoding of the same secret.
+    let path = working_dir.join("p2p-seed");
+    if let Ok(text) = fs::read_to_string(&path)
+        && let Ok(seed) = hex::decode(text.trim())
+        && !seed.is_empty()
+    {
+        return Ok(nano_crypto::StacksPrivateKey::from_seed(&seed));
+    }
+    // Drawn from the working directory and the clock: two nodes sharing a
+    // configuration but not a directory must not share an identity, because a peer
+    // that sees one key from two addresses treats the second as a connection cycle
+    // and drops it.
+    let mut seed = working_dir.as_os_str().as_encoded_bytes().to_vec();
+    seed.extend_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+            .to_be_bytes(),
+    );
+    fs::write(&path, hex::encode(&seed))?;
+    Ok(nano_crypto::StacksPrivateKey::from_seed(&seed))
+}
+
+/// Join the binary p2p network: seed the peer table, discover peers, and answer
+/// the ones that dial us.
+///
+/// Returns the handle the rest of the node reads endpoints from, or `None` when
+/// there is no way in — no seeds, or a configuration that leaves the chain
+/// identifier to be discovered, which cannot work here because on this protocol
+/// the network id *is* the chain id and it is in the first field of the first
+/// message.
+async fn start_transport(
+    config: &Config,
+    network: Network,
+    executor: Option<&SharedExecutor>,
+    roles: &mut JoinSet<(Job, Role)>,
+) -> Option<Discovered> {
+    let seeds = config.node.bootstrap_seeds();
+    if seeds.is_empty() && config.node.p2p_bind.is_none() {
+        return None;
+    }
+    let protocol = nano_p2p::Protocol::for_network(network);
+    let identity = match p2p_identity(&config.node.working_dir) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("cannot establish a p2p identity: {error}");
+            return None;
+        }
+    };
+    let bind = config.node.p2p_bind;
+    let advertise = config.node.p2p_address.or(bind);
+    let mut local = nano_p2p::LocalPeer::quiet(
+        identity,
+        advertise.map_or(20444, |address| address.port()),
+    );
+    if let Some(address) = advertise
+        && !address.ip().is_unspecified()
+    {
+        local.address = nano_p2p::PeerAddress::from_ip(address.ip());
+    }
+    // Only claim to serve what this node actually serves. A peer that records an
+    // RPC endpoint here and finds nothing listening has spent a connection slot on
+    // us, and will stop offering us to its own neighbours.
+    if let Some(rpc) = config.node.rpc_bind
+        && !rpc.ip().is_unspecified()
+    {
+        local.data_url = format!("http://{rpc}");
+        local.services |= nano_p2p::wire::services::RPC;
+    }
+    let peers = match nano_p2p::PeerDb::open(&config.node.working_dir.join("peers.sqlite")) {
+        Ok(peers) => peers,
+        Err(error) => {
+            eprintln!("cannot open the peer table: {error}");
+            return None;
+        }
+    };
+    let mut swarm = nano_p2p::Swarm::new(peers, local, protocol, nano_p2p::SwarmLimits::default());
+    for seed in &seeds {
+        if let Err(error) = swarm.seed(seed).await {
+            eprintln!("cannot record the bootstrap peer {seed}: {error}");
+        }
+    }
+    let discovered = swarm.discovered();
+
+    // One round before anything else runs, so that a node with no configured HTTP
+    // peer has somewhere to fetch from by the time it looks.
+    let bitcoin = match bitcoin_source(config) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("cannot reach the Bitcoin source to build a p2p view: {error}");
+            return None;
+        }
+    };
+    let round = swarm
+        .maintain(advertised_view(&bitcoin, executor).await)
+        .await;
+    println!(
+        "p2p: {} peers connected, {} known, {} endpoints to fetch from",
+        round.connected,
+        discovered.known(),
+        discovered.endpoints().len()
+    );
+
+    let interval = Duration::from_secs(config.node.poll_interval_secs.max(1) * 10);
+    let held = executor.cloned();
+    roles.spawn(async move {
+        (Job::Peers, peer_discovery(swarm, bitcoin, held, interval).await)
+    });
+
+    if let Some(bind) = bind {
+        start_listener(config, network, bind, roles);
+    }
+    Some(discovered)
+}
+
+/// Keep the peer set at strength for as long as the node runs.
+async fn peer_discovery(
+    mut swarm: nano_p2p::Swarm,
+    bitcoin: BurnchainSource,
+    executor: Option<SharedExecutor>,
+    interval: Duration,
+) -> Role {
+    loop {
+        sleep(interval).await;
+        let view = advertised_view(&bitcoin, executor.as_ref()).await;
+        let round = swarm.maintain(view).await;
+        if round.dialled > 0 || round.dropped > 0 || round.isolated > 0 {
+            println!(
+                "p2p: {} connected ({} new, {} lost, {} isolated), {} addresses learned",
+                round.connected, round.dialled, round.dropped, round.isolated, round.learned
+            );
+        }
+        // Everything peers pushed while we were asking them things. Counted and
+        // dropped, because acting on a pushed block means putting it through staging
+        // and the authenticated selection boundary, and doing it from here would be
+        // the one place in this crate that trusted a peer. Named as the next slice
+        // in task 054.
+        let pushed = swarm.take_pushed().len();
+        if pushed > 0 {
+            println!("p2p: {pushed} unsolicited messages dropped");
+        }
+    }
+}
+
+/// Answer peers that dial this node.
+///
+/// A node that does not listen can sync perfectly well; what it cannot do is get
+/// into anybody else's peer table, which is the difference between using the
+/// network and being part of it.
+fn start_listener(
+    config: &Config,
+    network: Network,
+    bind: std::net::SocketAddr,
+    roles: &mut JoinSet<(Job, Role)>,
+) {
+    let Ok(identity) = p2p_identity(&config.node.working_dir) else {
+        return;
+    };
+    let protocol = nano_p2p::Protocol::for_network(network);
+    let advertise = config.node.p2p_address.unwrap_or(bind);
+    let mut local = nano_p2p::LocalPeer::quiet(identity, advertise.port());
+    if !advertise.ip().is_unspecified() {
+        local.address = nano_p2p::PeerAddress::from_ip(advertise.ip());
+    }
+    if let Some(rpc) = config.node.rpc_bind
+        && !rpc.ip().is_unspecified()
+    {
+        local.data_url = format!("http://{rpc}");
+        local.services |= nano_p2p::wire::services::RPC;
+    }
+    let peers_path = config.node.working_dir.join("peers.sqlite");
+    roles.spawn(async move { (Job::Peers, answer_peers(bind, peers_path, local, protocol).await) });
+}
+
+/// Answer inbound peers until the socket fails.
+async fn answer_peers(
+    bind: std::net::SocketAddr,
+    peers_path: std::path::PathBuf,
+    local: nano_p2p::LocalPeer,
+    protocol: nano_p2p::Protocol,
+) -> Role {
+    {
+        let listener = nano_p2p::Listener::bind(bind)
+            .await
+            .map_err(|error| format!("cannot listen for peers on {bind}: {error}"))?;
+        println!("p2p: listening for peers on {bind}");
+        // The listener answers from its own connection to the peer table: sqlite's
+        // `Connection` is not `Sync`, and sharing one with the swarm would mean a
+        // lock held across every inbound reply.
+        let service = Arc::new(PeerService {
+            peers: std::sync::Mutex::new(
+                nano_p2p::PeerDb::open(&peers_path)
+                    .map_err(|error| format!("cannot open the peer table: {error}"))?,
+            ),
+        });
+        let mut conversations: JoinSet<()> = JoinSet::new();
+        loop {
+            let (stream, from) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    eprintln!("accepting a peer failed: {error}");
+                    continue;
+                }
+            };
+            // Bounded, so that a flood of connections cannot become a flood of
+            // tasks. Beyond the cap the oldest finished conversations are reaped
+            // first, and if none has, the connection waits its turn.
+            while conversations.len() >= MAX_INBOUND_PEERS {
+                let _ = conversations.join_next().await;
+            }
+            let service = service.clone();
+            let local = local.clone();
+            conversations.spawn(async move {
+                if let Err(error) = nano_p2p::serve_peer(
+                    stream,
+                    from,
+                    &local,
+                    protocol,
+                    service.as_ref(),
+                    nano_p2p::InboundLimits::default(),
+                )
+                .await
+                {
+                    // Per-peer and unremarkable: a peer that hangs up mid-sentence
+                    // is the common case, not an incident.
+                    eprintln!("inbound peer {from} ended: {error}");
+                }
+            });
+        }
+    }
+}
+
+/// How many inbound peers to hold conversations with at once.
+const MAX_INBOUND_PEERS: usize = 64;
+
+/// What this node tells a peer that dialled it.
+struct PeerService {
+    peers: std::sync::Mutex<nano_p2p::PeerDb>,
+}
+
+impl nano_p2p::Service for PeerService {
+    fn chain_view(&self) -> nano_p2p::ChainView {
+        // The view the swarm last advertised would be the honest answer, and it
+        // lives behind an async lock this trait deliberately cannot take. The stale
+        // view is the safe one: uncontradictable rather than wrong, which is what a
+        // peer checks it for.
+        nano_p2p::ChainView::new(
+            100_000,
+            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+        )
+        .expect("a height above the confirmation window")
+    }
+
+    fn neighbors(&self) -> Vec<nano_p2p::NeighborAddress> {
+        // Only peers a handshake proved a key for. Passing on an address this node
+        // merely heard about would make it a relay for somebody else's claims, and
+        // `MAX_NEIGHBORS_DATA_LEN` is 128.
+        self.peers
+            .lock()
+            .ok()
+            .and_then(|peers| peers.candidates(128).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|peer| {
+                Some(nano_p2p::NeighborAddress {
+                    address: peer.address,
+                    port: peer.port,
+                    public_key_hash: peer.public_key_hash.filter(|_| peer.last_seen.is_some())?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Resolve when the process is asked to stop.

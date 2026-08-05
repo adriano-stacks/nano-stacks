@@ -23,6 +23,7 @@ nano-rpc = { path = "../nano-rpc" }
 nano-signer = { path = "../nano-signer" }
 nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
+nano-p2p = { path = "../nano-p2p" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
