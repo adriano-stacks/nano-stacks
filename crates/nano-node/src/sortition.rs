@@ -249,13 +249,58 @@ impl SortitionTracker {
     /// miss it.
     fn register_keys(&mut self, block: &BitcoinBlock) {
         for operation in &block.operations {
-            if let BitcoinOperationKind::LeaderKeyRegistration { vrf_public_key, .. } =
-                &operation.kind
+            if let BitcoinOperationKind::LeaderKeyRegistration {
+                vrf_public_key,
+                block_signing_key_hash,
+                ..
+            } = &operation.kind
             {
-                self.keys
-                    .register(block.height, operation.transaction_index, *vrf_public_key);
+                self.keys.register(
+                    block.height,
+                    operation.transaction_index,
+                    nano_sortition::LeaderKeyRegistration {
+                        vrf_public_key: *vrf_public_key,
+                        signing_key_hash: *block_signing_key_hash,
+                    },
+                );
             }
         }
+    }
+
+    /// How many leader-key registrations this chain can resolve a winner through.
+    #[must_use]
+    pub fn leader_keys(&self) -> usize {
+        self.keys.available()
+    }
+
+    /// Take on the leader-key registry a checkpoint carries.
+    ///
+    /// A winning commitment names the registration that authorises its VRF proof
+    /// by burn position, and that position is tens of thousands of blocks below
+    /// any window a follower holds — so without this the proof of every tenure is
+    /// reported as uncheckable rather than checked. Answering it out of the
+    /// registry is what makes the checkpoint, rather than the peer that supplied
+    /// the block, the source of a validation input.
+    ///
+    /// An absent file is not an error here: it is a capture or a state directory
+    /// written before the registry existed, and the caller says so out loud
+    /// instead. A malformed one *is* — a registry that half-loaded would resolve
+    /// some winners and silently not others.
+    pub fn load_leader_keys(&mut self, directory: &Path) -> Result<usize, TrackerError> {
+        let path = directory.join(LEADER_KEY_FILE);
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(0);
+        };
+        let records: Vec<CapturedLeaderKey> =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                TrackerError::Seed(format!("{}: {error}", path.display()))
+            })?;
+        let loaded = records.len();
+        for record in records {
+            self.keys
+                .register(record.block_height, record.vtxindex, record.registration()?);
+        }
+        Ok(loaded)
     }
 
     /// Whether the derived burn total is the one a signed header states.
@@ -295,6 +340,54 @@ fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
     seeds.all(|seed| seed == first).then_some(first)
 }
 
+/// Where a checkpoint's leader-key registry is written down.
+///
+/// Beside the snapshots and the consensus hashes, because it answers the same
+/// kind of question they do: what the burnchain below this node's window said.
+pub const LEADER_KEY_FILE: &str = "leader-keys.json";
+
+/// One leader-key registration, as a checkpoint carries it.
+///
+/// The column names are stacks-core's own (`leader_keys`: `block_height`,
+/// `vtxindex`, `public_key`, `memo`), so an export is a copy of the archive's
+/// rows rather than a translation of them — and a translation is where a wrong
+/// field would hide.
+#[derive(Debug, Deserialize, Serialize)]
+struct CapturedLeaderKey {
+    block_height: u64,
+    vtxindex: u32,
+    public_key: String,
+    /// The 20-byte block-signing key hash, when the registration carries one.
+    ///
+    /// Empty for every registration from before Nakamoto, which is most of
+    /// mainnet's: they authorise a VRF key and nothing else.
+    #[serde(default)]
+    memo: String,
+}
+
+impl CapturedLeaderKey {
+    fn registration(&self) -> Result<nano_sortition::LeaderKeyRegistration, TrackerError> {
+        let bytes = hex::decode(&self.public_key)
+            .map_err(|_| TrackerError::Seed("a leader key is not hexadecimal".to_owned()))?;
+        let vrf_public_key = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| TrackerError::Seed("a leader key is not 32 bytes".to_owned()))?;
+        let signing_key_hash = if self.memo.is_empty() {
+            None
+        } else {
+            let bytes = hex::decode(&self.memo).map_err(|_| {
+                TrackerError::Seed("a block-signing key hash is not hexadecimal".to_owned())
+            })?;
+            Some(<[u8; 20]>::try_from(bytes.as_slice()).map_err(|_| {
+                TrackerError::Seed("a block-signing key hash is not 20 bytes".to_owned())
+            })?)
+        };
+        Ok(nano_sortition::LeaderKeyRegistration {
+            vrf_public_key,
+            signing_key_hash,
+        })
+    }
+}
+
 /// A snapshot a capture holds, in the fields a seed needs.
 #[derive(Debug, Deserialize, Serialize)]
 struct CapturedSnapshot {
@@ -324,15 +417,37 @@ impl SortitionTracker {
     /// The saved form is the capture's own, so this is the same loader either way
     /// and a saved chain cannot be read more loosely than a captured one.
     pub fn resume_or_capture(state: &Path, capture: &Path) -> Result<Self, TrackerError> {
-        match Self::from_capture(state) {
-            Ok(tracker) => Ok(tracker),
+        let mut tracker = match Self::from_capture(state) {
+            Ok(tracker) => tracker,
             Err(saved) => Self::from_capture(capture).map_err(|captured| {
                 TrackerError::Seed(format!(
                     "neither the saved sortitions ({saved}) nor the capture ({captured}) \
                      can seed a chain"
                 ))
-            }),
+            })?,
+        };
+        // A registry is checkpoint data, not derived data, so a state directory
+        // written before it existed takes it from the capture rather than being
+        // re-imported. The saved copy wins when there is one, because it holds
+        // the registrations this chain walked past above the checkpoint as well.
+        if tracker.leader_keys() == 0 {
+            tracker.load_leader_keys(capture)?;
         }
+        if tracker.leader_keys() == 0 {
+            eprintln!(
+                "this checkpoint carries no leader-key registry ({}), so no tenure's \
+                 coinbase proof and no miner signature can be checked: the registration a \
+                 winning commitment names sits tens of thousands of burn blocks below any \
+                 window this node holds. `cargo xtask export-leader-keys` writes one.",
+                capture.join(LEADER_KEY_FILE).display()
+            );
+        } else {
+            println!(
+                "{} leader-key registrations carried with the checkpoint",
+                tracker.leader_keys()
+            );
+        }
+        Ok(tracker)
     }
 
     /// Write the chain down, so the next start resumes instead of re-deriving.
@@ -369,9 +484,27 @@ impl SortitionTracker {
                 .map(ToString::to_string)
                 .collect(),
         };
+        // The registry goes with them, and it has to: a key registered in the
+        // burn blocks this chain has already walked past would otherwise be lost
+        // on the next start, because a resumed chain reads the blocks *after* its
+        // saved tip and never those before it.
+        let keys: Vec<CapturedLeaderKey> = self
+            .keys
+            .entries()
+            .map(|(block_height, vtxindex, registration)| CapturedLeaderKey {
+                block_height,
+                vtxindex,
+                public_key: hex::encode(registration.vrf_public_key),
+                memo: registration.signing_key_hash.map(hex::encode).unwrap_or_default(),
+            })
+            .collect();
         write(
             "consensus-hashes.json",
             serde_json::to_vec(&history).map_err(|error| TrackerError::Seed(error.to_string()))?,
+        )?;
+        write(
+            LEADER_KEY_FILE,
+            serde_json::to_vec(&keys).map_err(|error| TrackerError::Seed(error.to_string()))?,
         )?;
         write(
             "snapshots.json",
@@ -400,7 +533,9 @@ impl SortitionTracker {
                     "no snapshot for the hash the history ends at: {anchor}"
                 ))
             })?;
-        Self::new(seed_snapshot(seed)?, history)
+        let mut tracker = Self::new(seed_snapshot(seed)?, history)?;
+        tracker.load_leader_keys(directory)?;
+        Ok(tracker)
     }
 }
 

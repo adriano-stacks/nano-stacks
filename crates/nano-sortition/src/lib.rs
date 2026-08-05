@@ -1835,10 +1835,36 @@ mod tests {
 /// that does not. A node that keeps every commitment it can decode hashes a
 /// different operation set and derives a different consensus hash — which is
 /// how nano and mainnet parted at burn 960,230, on one commitment out of five.
+///
+/// The registry is also the *only* place a node standing on a checkpoint can
+/// learn these from. A leader key is registered once on Bitcoin and named by
+/// tens of thousands of commitments afterwards — the five keys mainnet's miners
+/// used across the epoch 4.0 boundary were registered at burn 867,772 through
+/// 939,759, twenty to ninety thousand blocks below it — so no burnchain window a
+/// follower holds contains them. Carrying them is small: mainnet has 2,477 in
+/// total.
 #[derive(Clone, Debug, Default)]
 pub struct LeaderKeys {
-    registered: BTreeMap<(u64, u32), [u8; 32]>,
+    registered: BTreeMap<(u64, u32), LeaderKeyRegistration>,
     spent: BTreeSet<(u64, u32)>,
+}
+
+/// What one leader-key registration binds, in the two fields consensus reads.
+///
+/// A registration authorises two different things and both are checked against
+/// it: the VRF key that may produce the tenure's coinbase proof, and the
+/// block-signing key hash that may sign the tenure's blocks. They come out of
+/// the same Bitcoin transaction, so a node that can resolve one can resolve the
+/// other, and a registry that carried only the first would have to be exported
+/// again to check the second.
+///
+/// The signing hash is optional because the registrations from before Nakamoto
+/// have no memo at all: of mainnet's 2,477 keys, 101 carry one — and every key
+/// its 4.0 miners actually use is among them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeaderKeyRegistration {
+    pub vrf_public_key: [u8; 32],
+    pub signing_key_hash: Option<[u8; 20]>,
 }
 
 impl LeaderKeys {
@@ -1847,20 +1873,43 @@ impl LeaderKeys {
         Self::default()
     }
 
-    /// Record a key a burn block registered.
-    pub fn register(&mut self, block_height: u64, transaction_index: u32, vrf_public_key: [u8; 32]) {
+    /// Record a registration a burn block made.
+    pub fn register(
+        &mut self,
+        block_height: u64,
+        transaction_index: u32,
+        registration: LeaderKeyRegistration,
+    ) {
         self.registered
-            .insert((block_height, transaction_index), vrf_public_key);
+            .insert((block_height, transaction_index), registration);
     }
 
     /// The VRF public key a commitment names, if it may still be used.
     #[must_use]
     pub fn usable(&self, block_height: u64, transaction_index: u32) -> Option<[u8; 32]> {
+        self.registration(block_height, transaction_index)
+            .map(|registration| registration.vrf_public_key)
+    }
+
+    /// The whole registration a commitment names, if it may still be used.
+    #[must_use]
+    pub fn registration(
+        &self,
+        block_height: u64,
+        transaction_index: u32,
+    ) -> Option<LeaderKeyRegistration> {
         let at = (block_height, transaction_index);
         if self.spent.contains(&at) {
             return None;
         }
         self.registered.get(&at).copied()
+    }
+
+    /// Every registration held, in burn order — which is how one is written down.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32, LeaderKeyRegistration)> + '_ {
+        self.registered
+            .iter()
+            .map(|(&(height, index), registration)| (height, index, *registration))
     }
 
     /// Consume a key, so a later commitment naming it is not an operation.
@@ -1880,7 +1929,7 @@ impl LeaderKeys {
 
 #[cfg(test)]
 mod leader_key_tests {
-    use super::LeaderKeys;
+    use super::{LeaderKeyRegistration, LeaderKeys};
 
     /// A commitment may only name a key that was registered and not yet spent.
     ///
@@ -1892,15 +1941,48 @@ mod leader_key_tests {
         let mut keys = LeaderKeys::new();
         assert_eq!(keys.usable(100, 7), None, "an unregistered key is unusable");
 
-        keys.register(100, 7, [0xab; 32]);
+        keys.register(
+            100,
+            7,
+            LeaderKeyRegistration {
+                vrf_public_key: [0xab; 32],
+                signing_key_hash: Some([0xcd; 20]),
+            },
+        );
         assert_eq!(keys.usable(100, 7), Some([0xab; 32]));
         assert_eq!(keys.available(), 1);
         // A different position is a different key, not the same one.
         assert_eq!(keys.usable(100, 8), None);
+        // Both halves of the registration come back, because both are checked
+        // against it: the VRF key produces the coinbase proof and the signing
+        // hash signs the tenure's blocks.
+        assert_eq!(
+            keys.registration(100, 7).and_then(|key| key.signing_key_hash),
+            Some([0xcd; 20])
+        );
 
         keys.spend(100, 7);
         assert_eq!(keys.usable(100, 7), None, "a spent key is not usable again");
         assert_eq!(keys.available(), 0);
+    }
+
+    /// A registry is written down and read back whole, both halves.
+    #[test]
+    fn the_registry_is_walked_in_burn_order() {
+        let mut keys = LeaderKeys::new();
+        let registration = |byte: u8| LeaderKeyRegistration {
+            vrf_public_key: [byte; 32],
+            signing_key_hash: (byte != 0).then_some([byte; 20]),
+        };
+        keys.register(900, 4, registration(2));
+        keys.register(100, 7, registration(1));
+        keys.register(100, 2, registration(0));
+        assert_eq!(
+            keys.entries()
+                .map(|(height, index, key)| (height, index, key.signing_key_hash.is_some()))
+                .collect::<Vec<_>>(),
+            vec![(100, 2, false), (100, 7, true), (900, 4, true)]
+        );
     }
 }
 
