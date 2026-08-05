@@ -161,6 +161,9 @@ pub struct BlockHeader {
 /// The burn state and the block headers travel together because Clarity reads
 /// them through one database, and keeping them in one value spares every
 /// evaluation path a second parameter.
+/// The native side of a `PoX` contract call: locks, unlocks and lock events.
+pub mod pox;
+
 pub trait ChainContext: BurnStateDB + HeadersDB {}
 
 impl<T: BurnStateDB + HeadersDB> ChainContext for T {}
@@ -1905,7 +1908,7 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_cc_special_cases_handler(&self) -> Option<SpecialCaseHandler> {
-        Some(&pox_locking::handle_contract_call_special_cases)
+        Some(&pox::handle_contract_call)
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
@@ -3711,7 +3714,7 @@ mod tests {
     }
 
     /// `unwrap!` in a `let` binding must return from the whole function, not
-    /// just abandon the binding. PoX-5 guards its entry points this way.
+    /// just abandon the binding. `PoX`-5 guards its entry points this way.
     #[test]
     fn unwrap_in_a_let_binding_returns_from_the_function() {
         let block = [11; 32];

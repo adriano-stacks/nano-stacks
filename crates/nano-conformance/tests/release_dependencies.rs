@@ -64,7 +64,13 @@ fn the_node_enables_no_reference_test_feature() {
 #[test]
 fn the_node_links_no_reference_node_crate() {
     let tree = tree("normal");
-    for crate_name in ["stackslib", "stacks-codec", "libsigner", "libstackerdb"] {
+    for crate_name in [
+        "stackslib",
+        "stacks-codec",
+        "libsigner",
+        "libstackerdb",
+        "pox-locking",
+    ] {
         assert!(
             !tree.contains(&format!("{crate_name} v")),
             "nano-node links {crate_name}, which is a reference implementation of \
