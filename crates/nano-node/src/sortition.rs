@@ -43,6 +43,33 @@ const POX_HISTORY_SEARCH_LIMIT: usize = 1024;
 /// what it derived and the next one carries on.
 pub const CATCH_UP_LIMIT: u64 = 144;
 
+/// What one round of catching up did, and where its time went.
+///
+/// It is worth counting because the cost of deriving a sortition was attributed
+/// wrongly once already. A round's `local` phase looked like 0.11 s per *Stacks*
+/// block on mainnet, which would have been a reason to make the arithmetic
+/// cheaper; the node's own timing lines show the phase does not grow between one
+/// Stacks block and the next at all — it grows only when the burn view moves,
+/// which is once a tenure. Sortition is a fact about a Bitcoin block, and many
+/// Stacks blocks stand on one, so per-block is the wrong denominator.
+///
+/// What is left after that division is `reading`: a full Bitcoin block fetched
+/// from whatever burnchain the node is configured with, which for a node reading
+/// a hosted Esplora is a megabyte or two over the internet. `deriving` is the
+/// hashes, and it is the part this node could make cheaper — the numbers say
+/// there is nothing there to win.
+#[derive(Debug, Default)]
+pub struct CatchUp {
+    /// Burn blocks snapshotted.
+    pub advanced: u64,
+    /// Burn blocks read to fill the mining window behind the seed, once a start.
+    pub primed: u64,
+    /// Waiting on the burnchain for those blocks.
+    pub reading: std::time::Duration,
+    /// The sortition arithmetic over them.
+    pub deriving: std::time::Duration,
+}
+
 /// Why a locally derived sortition chain could not be started or advanced.
 #[derive(Debug)]
 pub enum TrackerError {
@@ -200,33 +227,41 @@ impl SortitionTracker {
     }
 
     /// Walk the burnchain until the chain stands on `target`, or the bound runs
-    /// out. Returns how many burn blocks it advanced.
+    /// out.
     ///
     /// Nothing is skipped: every burn block between here and there is read and
     /// snapshotted, because a consensus hash mixes the ones behind it and a
     /// height left out changes every hash from there on.
+    ///
+    /// The two costs are counted apart because they are not the same kind of
+    /// thing and only one of them is this node's to make cheaper: reading a burn
+    /// block is a Bitcoin block download, and the arithmetic over it is hashes.
     pub fn catch_up<E: Display>(
         &mut self,
         mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
         target: u64,
         payouts: PayoutSchedule,
         limit: u64,
-    ) -> Result<u64, TrackerError> {
+    ) -> Result<CatchUp, TrackerError> {
+        let mut walk = CatchUp::default();
         if !self.primed {
-            self.prime(&mut block_at, payouts)?;
+            self.prime(&mut block_at, payouts, &mut walk)?;
         }
-        let mut advanced = 0;
-        while self.tip().bitcoin_height < target && advanced < limit {
+        while self.tip().bitcoin_height < target && walk.advanced < limit {
             let height = self
                 .tip()
                 .bitcoin_height
                 .checked_add(1)
                 .ok_or(SortitionError::HeightOverflow)?;
+            let read = std::time::Instant::now();
             let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            walk.reading += read.elapsed();
+            let derive = std::time::Instant::now();
             self.advance(&block, payouts)?;
-            advanced += 1;
+            walk.deriving += derive.elapsed();
+            walk.advanced += 1;
         }
-        Ok(advanced)
+        Ok(walk)
     }
 
     /// Read the mining window behind the seed, which the seed itself is not in.
@@ -239,14 +274,38 @@ impl SortitionTracker {
         &mut self,
         block_at: &mut impl FnMut(u64) -> Result<BitcoinBlock, E>,
         payouts: PayoutSchedule,
+        walk: &mut CatchUp,
     ) -> Result<(), TrackerError> {
         let tip = self.tip().bitcoin_height;
         let behind = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64") - 1;
         for height in tip.saturating_sub(behind)..=tip {
+            let read = std::time::Instant::now();
             let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            walk.reading += read.elapsed();
+            walk.primed += 1;
             self.register_keys(&block);
-            if height == tip && let Some(seed) = unanimous_winner_seed(&block) {
-                self.engine.adopt_root_winner_seed(seed);
+            // Only where the seed does not already carry one: a chain this node
+            // saved states the seed exactly, and the recovery below is a
+            // capture's fallback that holds only because a capture whose seed
+            // elected nobody is refused when it is loaded.
+            if height == tip && self.tip().winner_vrf_seed.is_none() {
+                match unanimous_winner_seed(&block) {
+                    Some(seed) => {
+                        self.engine.adopt_root_winner_seed(seed);
+                    }
+                    // The seed said this block elected somebody, so its
+                    // commitments should have agreed on the seed that winner
+                    // carried. When they do not there is no telling which of them
+                    // won, and every sortition after this one is sampled against a
+                    // zero seed — which names miners that did not win, and only
+                    // shows up as their tenures' proofs being refused.
+                    None => eprintln!(
+                        "the sortition seed at burn {height} says its block elected somebody, \
+                         but its commitments do not agree on the seed that winner carried, so \
+                         this node cannot recover the seed the next sortition mixes and will \
+                         sample against zero"
+                    ),
+                }
             }
             let commitments =
                 commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
@@ -263,13 +322,58 @@ impl SortitionTracker {
     /// miss it.
     fn register_keys(&mut self, block: &BitcoinBlock) {
         for operation in &block.operations {
-            if let BitcoinOperationKind::LeaderKeyRegistration { vrf_public_key, .. } =
-                &operation.kind
+            if let BitcoinOperationKind::LeaderKeyRegistration {
+                vrf_public_key,
+                block_signing_key_hash,
+                ..
+            } = &operation.kind
             {
-                self.keys
-                    .register(block.height, operation.transaction_index, *vrf_public_key);
+                self.keys.register(
+                    block.height,
+                    operation.transaction_index,
+                    nano_sortition::LeaderKeyRegistration {
+                        vrf_public_key: *vrf_public_key,
+                        signing_key_hash: *block_signing_key_hash,
+                    },
+                );
             }
         }
+    }
+
+    /// How many leader-key registrations this chain can resolve a winner through.
+    #[must_use]
+    pub fn leader_keys(&self) -> usize {
+        self.keys.available()
+    }
+
+    /// Take on the leader-key registry a checkpoint carries.
+    ///
+    /// A winning commitment names the registration that authorises its VRF proof
+    /// by burn position, and that position is tens of thousands of blocks below
+    /// any window a follower holds — so without this the proof of every tenure is
+    /// reported as uncheckable rather than checked. Answering it out of the
+    /// registry is what makes the checkpoint, rather than the peer that supplied
+    /// the block, the source of a validation input.
+    ///
+    /// An absent file is not an error here: it is a capture or a state directory
+    /// written before the registry existed, and the caller says so out loud
+    /// instead. A malformed one *is* — a registry that half-loaded would resolve
+    /// some winners and silently not others.
+    pub fn load_leader_keys(&mut self, directory: &Path) -> Result<usize, TrackerError> {
+        let path = directory.join(LEADER_KEY_FILE);
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(0);
+        };
+        let records: Vec<CapturedLeaderKey> =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                TrackerError::Seed(format!("{}: {error}", path.display()))
+            })?;
+        let loaded = records.len();
+        for record in records {
+            self.keys
+                .register(record.block_height, record.vtxindex, record.registration()?);
+        }
+        Ok(loaded)
     }
 
     /// Whether the derived burn total is the one a signed header states.
@@ -309,6 +413,54 @@ fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
     seeds.all(|seed| seed == first).then_some(first)
 }
 
+/// Where a checkpoint's leader-key registry is written down.
+///
+/// Beside the snapshots and the consensus hashes, because it answers the same
+/// kind of question they do: what the burnchain below this node's window said.
+pub const LEADER_KEY_FILE: &str = "leader-keys.json";
+
+/// One leader-key registration, as a checkpoint carries it.
+///
+/// The column names are stacks-core's own (`leader_keys`: `block_height`,
+/// `vtxindex`, `public_key`, `memo`), so an export is a copy of the archive's
+/// rows rather than a translation of them — and a translation is where a wrong
+/// field would hide.
+#[derive(Debug, Deserialize, Serialize)]
+struct CapturedLeaderKey {
+    block_height: u64,
+    vtxindex: u32,
+    public_key: String,
+    /// The 20-byte block-signing key hash, when the registration carries one.
+    ///
+    /// Empty for every registration from before Nakamoto, which is most of
+    /// mainnet's: they authorise a VRF key and nothing else.
+    #[serde(default)]
+    memo: String,
+}
+
+impl CapturedLeaderKey {
+    fn registration(&self) -> Result<nano_sortition::LeaderKeyRegistration, TrackerError> {
+        let bytes = hex::decode(&self.public_key)
+            .map_err(|_| TrackerError::Seed("a leader key is not hexadecimal".to_owned()))?;
+        let vrf_public_key = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| TrackerError::Seed("a leader key is not 32 bytes".to_owned()))?;
+        let signing_key_hash = if self.memo.is_empty() {
+            None
+        } else {
+            let bytes = hex::decode(&self.memo).map_err(|_| {
+                TrackerError::Seed("a block-signing key hash is not hexadecimal".to_owned())
+            })?;
+            Some(<[u8; 20]>::try_from(bytes.as_slice()).map_err(|_| {
+                TrackerError::Seed("a block-signing key hash is not 20 bytes".to_owned())
+            })?)
+        };
+        Ok(nano_sortition::LeaderKeyRegistration {
+            vrf_public_key,
+            signing_key_hash,
+        })
+    }
+}
+
 /// A snapshot a capture holds, in the fields a seed needs.
 #[derive(Debug, Deserialize, Serialize)]
 struct CapturedSnapshot {
@@ -318,6 +470,19 @@ struct CapturedSnapshot {
     consensus_hash: String,
     sortition_hash: String,
     total_burn: String,
+    /// Whether this burn block elected anybody, as stacks-core's own column
+    /// spells it. Absent in a chain saved before this field existed.
+    #[serde(default)]
+    sortition: Option<i64>,
+    /// The winning VRF seed the next sampling has to mix — the most recent
+    /// winner's, not necessarily this block's.
+    ///
+    /// A chain saved at a burn block that elected nobody cannot recover it: the
+    /// commitments of such a block carry the seed of the tenure they were bidding
+    /// for, and adopting that samples the next sortition against a seed nobody
+    /// won. See [`nano_sortition::SnapshotChain::effective_winner_seed`].
+    #[serde(default)]
+    winner_vrf_seed: Option<String>,
 }
 
 impl SortitionTracker {
@@ -338,15 +503,47 @@ impl SortitionTracker {
     /// The saved form is the capture's own, so this is the same loader either way
     /// and a saved chain cannot be read more loosely than a captured one.
     pub fn resume_or_capture(state: &Path, capture: &Path) -> Result<Self, TrackerError> {
-        match Self::from_capture(state) {
-            Ok(tracker) => Ok(tracker),
-            Err(saved) => Self::from_capture(capture).map_err(|captured| {
-                TrackerError::Seed(format!(
-                    "neither the saved sortitions ({saved}) nor the capture ({captured}) \
-                     can seed a chain"
-                ))
-            }),
+        let mut tracker = match Self::from_capture(state) {
+            Ok(tracker) => tracker,
+            Err(saved) => {
+                // Said out loud, because the fallback is not free: re-deriving
+                // from the checkpoint's own anchor is one Bitcoin block download
+                // per burn block, minutes of them on mainnet, and a node that
+                // prints nothing while doing it looks stopped.
+                eprintln!(
+                    "the saved sortitions cannot seed a chain, so it is re-derived from the \
+                     checkpoint: {saved}"
+                );
+                Self::from_capture(capture).map_err(|captured| {
+                    TrackerError::Seed(format!(
+                        "neither the saved sortitions ({saved}) nor the capture ({captured}) \
+                         can seed a chain"
+                    ))
+                })?
+            }
+        };
+        // A registry is checkpoint data, not derived data, so a state directory
+        // written before it existed takes it from the capture rather than being
+        // re-imported. The saved copy wins when there is one, because it holds
+        // the registrations this chain walked past above the checkpoint as well.
+        if tracker.leader_keys() == 0 {
+            tracker.load_leader_keys(capture)?;
         }
+        if tracker.leader_keys() == 0 {
+            eprintln!(
+                "this checkpoint carries no leader-key registry ({}), so no tenure's \
+                 coinbase proof and no miner signature can be checked: the registration a \
+                 winning commitment names sits tens of thousands of burn blocks below any \
+                 window this node holds. `cargo xtask export-leader-keys` writes one.",
+                capture.join(LEADER_KEY_FILE).display()
+            );
+        } else {
+            println!(
+                "{} leader-key registrations carried with the checkpoint",
+                tracker.leader_keys()
+            );
+        }
+        Ok(tracker)
     }
 
     /// Write the chain down, so the next start resumes instead of re-deriving.
@@ -373,6 +570,13 @@ impl SortitionTracker {
             consensus_hash: tip.consensus_hash.to_string(),
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
+            sortition: Some(i64::from(tip.winner_txid.is_some())),
+            // The one field a resumed chain cannot derive and must not guess.
+            winner_vrf_seed: self
+                .engine
+                .snapshots()
+                .effective_winner_seed()
+                .map(hex::encode),
         }];
         let history = History {
             hashes: self
@@ -383,9 +587,27 @@ impl SortitionTracker {
                 .map(ToString::to_string)
                 .collect(),
         };
+        // The registry goes with them, and it has to: a key registered in the
+        // burn blocks this chain has already walked past would otherwise be lost
+        // on the next start, because a resumed chain reads the blocks *after* its
+        // saved tip and never those before it.
+        let keys: Vec<CapturedLeaderKey> = self
+            .keys
+            .entries()
+            .map(|(block_height, vtxindex, registration)| CapturedLeaderKey {
+                block_height,
+                vtxindex,
+                public_key: hex::encode(registration.vrf_public_key),
+                memo: registration.signing_key_hash.map(hex::encode).unwrap_or_default(),
+            })
+            .collect();
         write(
             "consensus-hashes.json",
             serde_json::to_vec(&history).map_err(|error| TrackerError::Seed(error.to_string()))?,
+        )?;
+        write(
+            LEADER_KEY_FILE,
+            serde_json::to_vec(&keys).map_err(|error| TrackerError::Seed(error.to_string()))?,
         )?;
         write(
             "snapshots.json",
@@ -414,11 +636,46 @@ impl SortitionTracker {
                     "no snapshot for the hash the history ends at: {anchor}"
                 ))
             })?;
-        Self::new(seed_snapshot(seed)?, history)
+        let mut tracker = Self::new(seed_snapshot(seed)?, history)?;
+        tracker.load_leader_keys(directory)?;
+        Ok(tracker)
     }
 }
 
 fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerError> {
+    // The sampling of the block after the seed mixes the most recent winner's VRF
+    // seed, and where that seed is not the seed block's own it cannot be found in
+    // the seed block. Refusing here is what stops the alternative: adopting the
+    // seed the block's commitments were *bidding* with, which names a different
+    // winner and so a different leader key — a wrong answer that no consensus
+    // hash, sortition hash or burn total disagrees with, and that surfaces only
+    // as a valid tenure's coinbase proof being rejected. Mainnet does this once
+    // every three or four burn blocks.
+    match (seed.winner_vrf_seed.is_some(), seed.sortition) {
+        // Stated by the chain that derived it: nothing to recover.
+        (true, _) => {}
+        // A capture whose seed elected somebody: `prime` recovers the seed from
+        // that block's own commitments, which all carry it.
+        (false, Some(sortition)) if sortition != 0 => {}
+        (false, Some(_)) => {
+            return Err(TrackerError::Seed(format!(
+                "burn {} elected nobody, so the winning seed the next sortition mixes is an \
+                 older block's and this snapshot does not carry it — seed the chain at a \
+                 burn block that had a sortition, or resume from a chain that saved the seed",
+                seed.block_height
+            )));
+        }
+        (false, None) => {
+            return Err(TrackerError::Seed(format!(
+                "the snapshot at burn {} says neither whether that block elected anybody nor \
+                 what winning seed the next sortition mixes, which is how a chain saved \
+                 before those were written down looks. Guessing costs a wrongly named \
+                 winner one restart in three, and the only thing that names is the leader \
+                 key a coinbase proof is checked against — so this is re-derived instead.",
+                seed.block_height
+            )));
+        }
+    }
     let bytes = |value: &str, name: &str| -> Result<Vec<u8>, TrackerError> {
         hex::decode(value).map_err(|_| TrackerError::Seed(format!("{name} is not hexadecimal")))
     };
@@ -466,11 +723,17 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             "sortition hash",
         )?),
         winner_txid: None,
-        // The seed's own winner is unknown, and only the *next* block's sampling
-        // reads it — so the first sortition after a checkpoint is derived from a
-        // zero previous seed and its winner is not this node's to trust. It is
-        // reported for that reason rather than published.
-        winner_vrf_seed: None,
+        // The seed the sampling of the block after this one mixes. A chain this
+        // node saved states it, exactly, because it derived it. A capture does
+        // not, and then it is recovered from the seed's own burn block by
+        // `prime` — which is only sound where the seed block *elected* somebody,
+        // so a capture that says otherwise is refused above rather than seeded
+        // against a seed nobody won.
+        winner_vrf_seed: seed
+            .winner_vrf_seed
+            .as_deref()
+            .map(|value| thirty_two(value, "winning VRF seed"))
+            .transpose()?,
         winner_vrf_public_key: None,
         pox_id,
     })

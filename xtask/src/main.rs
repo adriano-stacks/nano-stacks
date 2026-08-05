@@ -39,13 +39,16 @@ fn main() -> ExitCode {
         Some("repair-ledger") => repair_ledger(&env::args().skip(2).collect::<Vec<_>>()),
         Some("export-headers") => export_headers(&env::args().skip(2).collect::<Vec<_>>()),
         Some("import-headers") => import_headers(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("export-leader-keys") => {
+            export_leader_keys(&env::args().skip(2).collect::<Vec<_>>())
+        }
         Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -466,6 +469,124 @@ fn import_headers(arguments: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Export the leader-key registry a checkpoint has to carry.
+///
+/// A winning block commitment names the registration that authorises its VRF
+/// proof by burn position, and a leader key is registered *once* and named by
+/// commitments for years afterwards: the five keys mainnet's miners used across
+/// the epoch 4.0 boundary were registered between burn 867,772 and 939,759, up
+/// to ninety thousand blocks below it. No burnchain window a follower holds
+/// reaches them, so a node that does not carry them cannot check a single
+/// tenure's coinbase proof — it can only report that it could not.
+///
+/// Fetching them from the peer that supplied the block is exactly the dependency
+/// this group of tasks exists to remove, and carrying them is small: mainnet's
+/// whole history is 2,477 registrations, a quarter of a megabyte of JSON.
+fn export_leader_keys(arguments: &[String]) -> ExitCode {
+    let [sortition, out, height] = arguments else {
+        eprintln!(
+            "usage: cargo xtask export-leader-keys <stacks-core burnchain/sortition/marf.sqlite> \
+             <out.json> <to-burn-height>\n\
+             the height is the checkpoint's burn anchor: a registration above it belongs to \
+             burn blocks the node walks for itself"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(to_height) = height.parse::<u64>() else {
+        eprintln!("{height} is not a burn height");
+        return ExitCode::FAILURE;
+    };
+    match read_leader_keys(Path::new(sortition), to_height)
+        .and_then(|keys| write_leader_keys(Path::new(out), &keys))
+    {
+        Ok(exported) => {
+            println!(
+                "exported {} leader-key registrations at or below burn {to_height}, {} of them \
+                 carrying a block-signing key hash",
+                exported.0, exported.1
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("exporting the leader keys failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// One row of stacks-core's `leader_keys`, in its own column names.
+///
+/// Kept as the archive spells it — `public_key` and `memo` rather than anything
+/// friendlier — so the export is a copy of the rows and not a translation of
+/// them, which is where a wrong field would hide. `memo` is the 20-byte
+/// block-signing key hash for a Nakamoto-era registration and empty for the
+/// registrations from before it, which is most of mainnet's.
+struct ExportedLeaderKey {
+    block_height: u64,
+    vtxindex: u32,
+    public_key: String,
+    memo: String,
+}
+
+/// Read the registry out of a stacks-core sortition database.
+///
+/// Only the canonical rows are wanted, and `leader_keys` is keyed by
+/// `(txid, sortition_id)`, so a registration seen on two sortitions of a
+/// Bitcoin fork appears twice. Grouping by burn position collapses them, which
+/// is sound because the position is what a commitment names: mainnet's 2,477
+/// rows occupy 2,477 distinct positions and no position carries two different
+/// keys, so this drops nothing.
+fn read_leader_keys(sortition: &Path, to_height: u64) -> Result<Vec<ExportedLeaderKey>, String> {
+    let archive = open_archive(sortition)?;
+    let mut statement = archive
+        .prepare(
+            "SELECT block_height, vtxindex, public_key, COALESCE(memo, '') FROM leader_keys \
+             WHERE block_height <= ?1 GROUP BY block_height, vtxindex \
+             ORDER BY block_height, vtxindex",
+        )
+        .map_err(|error| format!("reading leader_keys: {error}"))?;
+    let keys = statement
+        .query_map([to_height], |row| {
+            Ok(ExportedLeaderKey {
+                block_height: row.get(0)?,
+                vtxindex: row.get(1)?,
+                public_key: row.get(2)?,
+                memo: row.get(3)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if keys.is_empty() {
+        return Err(format!(
+            "{} holds no leader keys at or below burn {to_height}",
+            sortition.display()
+        ));
+    }
+    Ok(keys)
+}
+
+/// Write a registry where a checkpoint's sortition directory expects it.
+fn write_leader_keys(out: &Path, keys: &[ExportedLeaderKey]) -> Result<(usize, usize), String> {
+    let signing = keys.iter().filter(|key| !key.memo.is_empty()).count();
+    let rows: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|key| {
+            json!({
+                "block_height": key.block_height,
+                "vtxindex": key.vtxindex,
+                "public_key": key.public_key,
+                "memo": key.memo,
+            })
+        })
+        .collect();
+    write_file(
+        out,
+        &serde_json::to_vec(&rows).map_err(|error| error.to_string())?,
+    )?;
+    Ok((keys.len(), signing))
 }
 
 /// A tenure's start block, which is where five of a header's fields live.
@@ -1591,6 +1712,21 @@ impl CaptureConfig {
             &staging.join("sortition/snapshots.json"),
             snapshots.as_bytes(),
         )?;
+
+        // The leader-key registry, without which no tenure's coinbase proof can
+        // be checked at all: the registration a winning commitment names is
+        // registered once and reused for years, so it sits far below the burn
+        // span this capture holds. It is the cheapest thing in the capture — a
+        // quarter of a megabyte for mainnet's entire history — and the
+        // alternative is asking the peer that supplied the block for the input
+        // that decides whether to believe it.
+        let (keys, signing) = read_leader_keys(sortition_db, last_burn).and_then(|keys| {
+            write_leader_keys(&staging.join("sortition").join(nano_node::sortition::LEADER_KEY_FILE), &keys)
+        })?;
+        println!(
+            "captured {keys} leader-key registrations up to burn {last_burn}, {signing} with a \
+             block-signing key hash"
+        );
 
         self.write_stacker_sets(staging, &snapshots, blocks)?;
 

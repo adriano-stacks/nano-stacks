@@ -340,3 +340,35 @@ sortition one, and it is the same shape as
 [[055-answer-block-info-for-blocks-before-the-checkpoint]]: a checkpoint has to
 carry it, or the node has to fetch it. Mainnet has 2,477 leader keys in total, so
 carrying them is small.
+
+## The coinbase proof is checked now; the signature is one lookup away
+
+The four hundred reports of *"could not name which commitment won the sortition"*
+are gone, and so is the reason the note above gave for them. The winner had been
+deriving since the mining window's epoch-boundary rule landed; what was missing was
+the **leader-key registration** it names, which is registered once and reused for
+years — mainnet's five active keys sit at burn 867,772 through 939,759, twenty to
+ninety thousand blocks below the 4.0 boundary. No window reaches that, so the
+checkpoint carries the registry: 2,477 registrations, 323 KB, exported from
+stacks-core's own `leader_keys` rows by `xtask export-leader-keys` and written by
+`capture-fixtures`. [[024]] has the detail.
+
+Live on a copy of the mainnet replay's state, from burn 960,473: the coinbase-proof
+complaint appears **zero** times over the tenures at 960,474 through 960,479, where
+the previous binary printed it once a tenure.
+
+The miner signature is the one that still reports, and the message now names its
+own fix: *"it knows which leader key won the sortition but not the block-signing key
+that key was registered with"*. The registry holds that hash — 101 of the 2,477
+registrations carry one, and every key mainnet's 4.0 miners use is among them, since
+both halves come out of the same Bitcoin transaction. What is wrong is where
+`check_miner_won_the_sortition` looks for it:
+`registered_signing_key_hash(operations, key)` searches the operations of the
+tenure's *own* burn block, which is the one place a reused registration cannot be.
+
+It wants the registry's answer to travel the way `winner_vrf_public_key` does —
+`LeaderKeys::registration` returns it already — which is one 20-byte field on
+`SortitionSnapshot`, one on `BitcoinBlockContext`, one line in `local_sortition`,
+and one substitution in `check_miner_won_the_sortition`. That last function is in
+the half of `nano-chainstate` this change was not allowed to touch, which is the
+only reason it is still open.

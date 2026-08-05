@@ -423,3 +423,150 @@ the seed's real ancestors. `xtask capture` should reach
 `MINING_COMMITMENT_WINDOW - 1` blocks below the span, and until it does the
 tracker test skips with that as its reason rather than quietly asserting less.
 
+
+## The two one-line changes outside this task's files have landed
+
+Both items the section above listed as unwired are wired, and were already wired
+when this was read again: `payout_schedule` chains
+`.activating_epoch_four_at(pox.pox_5_activation_height)`, so the seven blocks from
+the 4.0 boundary are weighed on their own block; and the `(candidates == 1)` hedge
+around `winner_vrf_public_key` is gone, so the winner is published as derived and
+`SortitionTracker::candidates` is a report. Nothing in the node gates on it now.
+
+## What a sortition costs per block: nothing, and the number that said otherwise
+
+`local` read as 0.11 s per Stacks block on mainnet against the 0.014 s of the peer
+requests it replaced — 24.99 s over 225 blocks — which looks like a reason to make
+the arithmetic cheaper. It is the fifth wrong attribution of a performance problem
+in this project ([[047]] records the first four), and the node's own timing lines
+falsify it without any new instrumentation:
+
+```
+timing over 275 blocks on 7 views: ... local 26.09s
+timing over 300 blocks on 7 views: ... local 26.09s
+timing over 325 blocks on 7 views: ... local 26.09s
+timing over 350 blocks on 7 views: ... local 26.09s
+```
+
+The phase does not move between one Stacks block and the next. It moves when the
+**burn view** does. A sortition is a fact about a Bitcoin block and many Stacks
+blocks stand on one, so per-Stacks-block is the wrong denominator: seventy-five
+blocks of that round cost zero, and the 26 s was one restart's catch-up plus six
+burn views. There is nothing per-block to remove because there is nothing
+per-block — `catch_up` returns immediately once the chain stands where the block
+does.
+
+`CatchUp` now counts what is left apart, because the two halves are not the same
+kind of thing, and a live mainnet run says:
+
+```
+derived 1 sortitions locally, now standing on burn 960475 (0.73s reading 1 burn blocks, 0.000s deriving)
+the derived sortition chain is written down (0.20s)
+```
+
+Per burn view: **0.7–1.3 s waiting on the burnchain, 0.2–0.3 s writing the chain
+down, and 1 ms of hashes.** The arithmetic is not the cost and could not become
+one; the cost is a mainnet Bitcoin block fetched from a hosted Esplora, which is
+the price of not asking a peer, and it is paid once a tenure.
+
+Two things worth knowing that came out of the same measurement:
+
+- **Priming costs about seven seconds on every start** — the six burn blocks
+  behind the seed that `MINING_COMMITMENT_WINDOW` is weighed over — and it used to
+  print nothing at all, because no sortition comes out of it. It says so now.
+  Removing it means writing the commitment window down beside the snapshot, which
+  is a new serialised format for a once-per-start cost, so it is measured and left
+  alone rather than built.
+- **The 12 MB consensus-hash history is rewritten whole per burn view**, for one
+  hash appended. At 0.2 s a tenure that is not worth an append-only format, but it
+  is the only part of this phase that grows with the length of the chain.
+
+## Wiring the Bitcoin reorganization: what the measurement above changes about it
+
+Still open, and reading it against the timing above moved where it has to go.
+
+Detection is already free and already reaches the node: `BitcoinRestSource::block_at`
+verifies on every read that the block it read last is still at that height
+(`check_last_read`) and returns `Reorganized { height }`, which arrives in
+`local_sortition` as a `TrackerError::Bitcoin`. What that does today is exactly
+wrong — it disables the local derivation and goes back to the peer's sortitions,
+which is to say a Bitcoin reorganization hands the node's consensus hashes back to
+the peer.
+
+What must not happen is the obvious fix. `SnapshotChain::find_fork` walks the
+snapshots comparing each against Bitcoin, so calling it from `local_sortition`
+would cost one burnchain round trip **per Stacks block** — 0.2 s each, reinstating
+precisely the per-block cost the section above establishes does not exist. The
+check has to be gated on the burn view moving, the way `catch_up` already is.
+
+The rest is in files this change did not own, and it is three things rather than
+one: `BitcoinSource` has no `invalidate_from`, so the `PreStx` window cannot be
+invalidated through the trait; `ChainState::retract` needs the executed tip and the
+staging directory to be walked back with it, which is the round's business
+(`runtime.rs`, `execute_staged`) and not a sortition's; and the depth guard is
+still a constant rather than a function of the history held, which is the
+unresolved half recorded above.
+
+## A resumed chain named the wrong winner where nobody had been elected
+
+Making the coinbase proof checkable ([[024]]) surfaced this immediately, and it had
+been there since resuming was added. The sampling of a sortition mixes the **most
+recent winner's** VRF seed — not the tip's, because a burn block that elects nobody
+mixes nothing, and mainnet leaves four such blocks in every fifteen. A chain
+seeded at one of them holds no snapshot with a seed at all, and
+`unanimous_winner_seed` recovered one from the seed block's own commitments, which
+carry the seed of the tenure they were *bidding* for. A different value of the
+right shape.
+
+Nothing downstream disagrees. Every candidate in a Nakamoto burn block carries the
+same `new_seed`, so a wrongly named winner still produces the right sortition hash,
+the right consensus hash and the right running burn total — the whole of what this
+task checks against the capture and against a signed header. The only thing it
+changes is *which leader key* the tenure's proof is checked against, so for as long
+as that key was `None` the bug was unobservable.
+
+It became observable the moment the registry landed. A live node restarted onto
+burn 960,487 — `was_sortition: false` — and refused the tenure at 960,488 with
+*"coinbase VRF proof was not produced by the winning leader key"*, retrying a block
+the network had accepted, forever.
+
+The fix is to write the seed down rather than recover it:
+`SnapshotChain::effective_winner_seed` names the rule, `save` records it beside the
+tip, and `seed_snapshot` refuses a snapshot that carries neither it nor whether its
+block elected anybody — a chain saved by an older binary is re-derived from the
+checkpoint instead, saying so while it walks, because guessing costs a wrongly named
+winner one restart in three.
+
+Two things are worth keeping from how this was found:
+
+- **The `snapshots` table's own `sortition` column is the discriminator**, and the
+  capture already carried it. The saved form now carries it too, so a seed either
+  states the winning seed, or states that its block had a winner and lets `prime`
+  recover it from that block's commitments, or is refused. There is no fourth case
+  and no default.
+- **A wrong answer that agrees with every oracle is what a checkpoint-resumed chain
+  produces by default.** Four fields derived exactly and the fifth was wrong for
+  three months. What caught it was making a *sixth* thing depend on it.
+
+`a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner` pins it
+offline on mainnet data — the capture's burn 960,222 is exactly this shape — by
+running one chain through and stopping another at the sortition-less block, saving
+it, reading it back the way a restart does, and requiring the same winner. It fails
+if the saved field is taken away. Live, after the fix: resumed at burn 960,491,
+which elected nobody, and the proof of every tenure from 960,492 to 960,496
+verified.
+
+## The numbers, from the re-derivation this caused
+
+Re-deriving 269 burn blocks from the checkpoint's anchor is the largest sortition
+workload a mainnet node ever runs, and it prints its own split:
+
+```
+derived 144 sortitions locally, now standing on burn 960363 (205.94s reading 150 burn blocks, 6 of them priming the mining window, 0.006s deriving)
+derived 125 sortitions locally, now standing on burn 960488 (104.42s reading 125 burn blocks, 0.008s deriving)
+```
+
+**40 microseconds of arithmetic per sortition, against 0.8–1.4 s of Bitcoin block.**
+Four orders of magnitude, and the slow side is a hosted Esplora rather than
+anything this crate does. There is nothing to optimise here that is not a caching
+decision about the burnchain.

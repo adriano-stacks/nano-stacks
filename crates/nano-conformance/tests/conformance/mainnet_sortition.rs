@@ -144,10 +144,18 @@ fn keys_registered_in(blocks: &BTreeMap<u64, BitcoinBlock>) -> LeaderKeys {
         for operation in &block.operations {
             if let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
                 vrf_public_key,
+                block_signing_key_hash,
                 ..
             } = &operation.kind
             {
-                keys.register(block.height, operation.transaction_index, *vrf_public_key);
+                keys.register(
+                    block.height,
+                    operation.transaction_index,
+                    nano_sortition::LeaderKeyRegistration {
+                        vrf_public_key: *vrf_public_key,
+                        signing_key_hash: *block_signing_key_hash,
+                    },
+                );
             }
         }
     }
@@ -725,4 +733,280 @@ fn the_node_tracker_derives_the_same_window() {
     // identity was the field that did not derive; it derives for all fourteen now,
     // so a floor would only hide a regression.
     assert_eq!(winners, DERIVED_FLOOR, "the node named every winner");
+}
+
+/// A chain resumed from what it saved names the same winners as one that ran on.
+///
+/// The interesting seed is a burn block that elected **nobody**, and mainnet has
+/// four of them in this window of fifteen. The sampling of the block after a
+/// sortition mixes the most recent *winner's* VRF seed, so at such a block that
+/// seed belongs to an earlier block and is nowhere in the one being seeded at —
+/// while the commitments sitting in it carry the seed of the tenure they were
+/// bidding for, which is a different value and a plausible-looking one.
+///
+/// Adopting that names a different commitment as the winner. Nothing disagrees:
+/// every candidate in a Nakamoto burn block carries the same `new_seed`, so the
+/// sortition hash, the consensus hash and the burn total all still derive, and the
+/// only visible consequence is that the winner's leader key is the wrong one — so
+/// the coinbase proof of a tenure the network accepted fails to verify. That is
+/// what a live mainnet node did at burn 960,488, whose parent 960,487 had no
+/// sortition, once the leader-key registry made the proof checkable at all.
+///
+/// So the seed the next sampling mixes is saved with the chain, and this is the
+/// test that says the two chains agree. It fails if the saved field is dropped.
+#[test]
+fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
+    let Some(root) = capture() else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    let Some(blocks) = window_blocks(&root, &captured) else {
+        nano_conformance::skip_gate("the capture holds no Bitcoin blocks below its seed");
+        return;
+    };
+    let Some(position) = captured
+        .iter()
+        .position(|snapshot| snapshot.sortition == 0 && snapshot.block_height > captured[0].block_height)
+        .filter(|position| position + 1 < captured.len())
+    else {
+        nano_conformance::skip_gate("the captured window holds no sortition-less burn block");
+        return;
+    };
+    let pause = captured[position].block_height;
+    let next = captured[position + 1].block_height;
+    let read = |height: u64| {
+        blocks
+            .get(&height)
+            .cloned()
+            .ok_or_else(|| format!("no Bitcoin block at {height}"))
+    };
+    let payouts = mainnet_payouts();
+    let window = u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("fits u64");
+
+    // One chain that never stops, which is the answer both have to agree with:
+    // it is the one whose winners the capture itself confirms elsewhere.
+    let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
+        .expect("the capture carries the consensus hashes");
+    let mut running =
+        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history.clone())
+            .expect("the tracker starts");
+    running
+        .catch_up(read, captured[0].block_height, payouts, window)
+        .expect("the mining window fills");
+    let mut expected = None;
+    for snapshot in captured.iter().skip(1) {
+        let derived = running
+            .advance(&read(snapshot.block_height).expect("a block"), payouts)
+            .expect("the chain extends");
+        if snapshot.block_height == next {
+            expected = derived.winner_txid;
+        }
+    }
+    let expected = expected.expect("the block after the pause has a winner");
+
+    // The same chain, stopped at the sortition-less block, written down, and read
+    // back the way a restarting node reads it.
+    let mut stopping =
+        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
+            .expect("the tracker starts");
+    stopping
+        .catch_up(read, pause, payouts, window + 32)
+        .expect("the chain walks to the pause");
+    assert_eq!(stopping.tip().bitcoin_height, pause);
+    let saved = tempfile::tempdir().expect("a directory to save into");
+    stopping.save(saved.path()).expect("the chain is written down");
+
+    let mut resumed = nano_node::sortition::SortitionTracker::from_capture(saved.path())
+        .expect("the saved chain seeds a new one");
+    resumed
+        .catch_up(read, next, payouts, window + 1)
+        .expect("the resumed chain advances");
+    assert_eq!(
+        resumed.tip().winner_txid.map(hex::encode),
+        Some(hex::encode(expected)),
+        "a chain resumed at burn {pause}, which elected nobody, must name the same winner \
+         at burn {next} as one that never stopped"
+    );
+    println!(
+        "resumed at burn {pause} with no sortition and named the same winner at burn {next}"
+    );
+}
+
+/// What the tracker derived about one sortition, in what a validator reads.
+#[derive(Clone, Copy, Debug)]
+struct Derived {
+    bitcoin_height: u64,
+    sortition_hash: [u8; 32],
+    winner_vrf_public_key: Option<[u8; 32]>,
+}
+
+/// Every sortition a window derived, keyed by the consensus hash a Stacks block
+/// names its burn view with — which is how a block finds its own sortition.
+type DerivedWindow = BTreeMap<String, Derived>;
+
+/// Run the tracker over the window, with or without the carried registry.
+fn derive_window(
+    root: &std::path::Path,
+    captured: &[Captured],
+    blocks: &BTreeMap<u64, BitcoinBlock>,
+    with_registry: bool,
+) -> (usize, DerivedWindow) {
+    let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
+        .expect("the capture carries the consensus hashes");
+    let mut tracker = nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
+        .expect("the tracker starts");
+    let registry = if with_registry {
+        tracker
+            .load_leader_keys(&root.join("sortition"))
+            .expect("the carried registry parses")
+    } else {
+        0
+    };
+    let payouts = mainnet_payouts();
+    tracker
+        .catch_up(
+            |height| {
+                blocks
+                    .get(&height)
+                    .cloned()
+                    .ok_or_else(|| format!("no Bitcoin block at {height}"))
+            },
+            captured[0].block_height,
+            payouts,
+            u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("window fits u64"),
+        )
+        .expect("the mining window fills from behind the seed");
+    let mut derived = BTreeMap::new();
+    for snapshot in captured.iter().skip(1) {
+        let block = blocks
+            .get(&snapshot.block_height)
+            .expect("every captured snapshot has its Bitcoin block");
+        let snapshot = tracker.advance(block, payouts).expect("the tracker advances");
+        if snapshot.winner_txid.is_some() {
+            derived.insert(
+                snapshot.consensus_hash.to_string(),
+                Derived {
+                    bitcoin_height: snapshot.bitcoin_height,
+                    sortition_hash: *snapshot.sortition_hash.as_bytes(),
+                    winner_vrf_public_key: snapshot.winner_vrf_public_key,
+                },
+            );
+        }
+    }
+    (registry, derived)
+}
+
+/// The registry a checkpoint carries is what makes the coinbase proof checkable.
+///
+/// This is the whole of the claim, in the order it has to be made:
+///
+/// 1. Without the registry the winner's leader key is unresolvable for **every**
+///    sortition in the window, because a leader key is registered once and named
+///    for years afterwards — mainnet's five active keys sit at burn 867,772
+///    through 939,759, twenty to ninety thousand blocks below it. That is the
+///    state the node was in, reporting once a tenure that it could not check.
+/// 2. With it, every winner resolves.
+/// 3. And the key it resolves is the right one, which a fixture cannot assert by
+///    equality because the capture records the winning *transaction* and not its
+///    key. The chain states it instead: the resolved key and the locally derived
+///    sortition hash verify the VRF proof in the coinbase of the tenure that
+///    sortition elected. Three independent things — a Bitcoin registration from
+///    ninety thousand blocks back, a sortition hash chained from raw Bitcoin
+///    blocks, and a proof out of a Stacks block — and nothing is asked of a peer.
+/// 4. Any other key fails, so this is a check and not a formality.
+#[test]
+fn the_carried_registry_names_the_key_that_proved_each_tenure() {
+    let Some(root) = capture() else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    let Some(blocks) = window_blocks(&root, &captured) else {
+        nano_conformance::skip_gate("the capture holds no Bitcoin blocks below its seed");
+        return;
+    };
+
+    let (_, without) = derive_window(&root, &captured, &blocks, false);
+    assert!(
+        without
+            .values()
+            .all(|derived| derived.winner_vrf_public_key.is_none()),
+        "a window resolves no leader key on its own: {:?}",
+        without
+            .values()
+            .filter(|derived| derived.winner_vrf_public_key.is_some())
+            .collect::<Vec<_>>()
+    );
+
+    let (registry, derived) = derive_window(&root, &captured, &blocks, true);
+    if registry == 0 {
+        nano_conformance::skip_gate(
+            "the capture carries no sortition/leader-keys.json -- `cargo xtask \
+             export-leader-keys` writes one from a stacks-core sortition database",
+        );
+        return;
+    }
+    println!("{registry} leader-key registrations carried, {} sortitions", derived.len());
+    let unresolved: Vec<u64> = derived
+        .values()
+        .filter(|derived| derived.winner_vrf_public_key.is_none())
+        .map(|derived| derived.bitcoin_height)
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "the registry resolves the winner's leader key at every sortition; \
+         these are still unresolved: {unresolved:?}"
+    );
+
+    // The blocks the capture holds, so a tenure-start block can be found for the
+    // burn views derived above. A capture whose blocks sit above the window
+    // proves nothing here and says so rather than passing vacuously.
+    let mut proved = 0;
+    for path in nano_conformance::captured_block_paths(&root) {
+        let Ok(block) = nano_chainstate::NakamotoBlock::decode(&fs::read(&path).expect("read"))
+        else {
+            continue;
+        };
+        if !nano_chainstate::starts_new_tenure(&block) {
+            continue;
+        }
+        let Some(Derived {
+            bitcoin_height,
+            sortition_hash,
+            winner_vrf_public_key: Some(key),
+        }) = derived.get(&block.header.consensus_hash.to_string()).copied()
+        else {
+            continue;
+        };
+        nano_chainstate::verify_coinbase_vrf_proof(&block, &key, &sortition_hash).unwrap_or_else(
+            |error| {
+                panic!(
+                    "the key the registry resolves for burn {bitcoin_height} must prove the \
+                     tenure it elected: {error:?}"
+                )
+            },
+        );
+        nano_chainstate::verify_coinbase_vrf_proof(
+            &block,
+            &nano_crypto::VrfPrivateKey::from_bytes([3; 32])
+                .public_key()
+                .to_bytes(),
+            &sortition_hash,
+        )
+        .expect_err("another miner's key must not prove this tenure");
+        proved += 1;
+    }
+    assert!(
+        proved > 0,
+        "the capture holds no tenure-start block inside the derived burn window, so \
+         nothing checked the resolved key against a real coinbase proof"
+    );
+    println!("{proved} captured tenures proved by the key the carried registry resolved");
 }

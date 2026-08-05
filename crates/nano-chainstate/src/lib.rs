@@ -1682,9 +1682,11 @@ impl ChainState {
             verify_coinbase_vrf_proof(block, &key, &context.sortition_hash)?;
         } else {
             eprintln!(
-                "tenure at burn {} carries a coinbase proof this node cannot check: \
-                 it could not name which commitment won the sortition, so it has no \
-                 leader key to check the proof against",
+                "tenure at burn {} carries a coinbase proof this node cannot check: it has \
+                 no leader-key registration for the commitment that won the sortition. A \
+                 leader key is registered once and named for years afterwards, so the \
+                 registration is far below any burnchain window this node holds and has to \
+                 come with the checkpoint -- see `xtask export-leader-keys`.",
                 context.height
             );
         }
