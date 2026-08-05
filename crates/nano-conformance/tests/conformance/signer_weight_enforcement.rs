@@ -367,27 +367,69 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
         .recorded_signer_set(mainnet_context(&capture))
         .expect("the mainnet state records a signer set for the cycle it stands in");
     let threshold = set.approval_threshold().expect("a threshold");
-    let blocks = fixtures().join("mainnet/blocks");
+    // Both samples: the five blocks in the tree, and every block the capture
+    // holds. They are the same cycle, and the capture is the larger sample.
     let mut checked = 0;
-    for entry in fs::read_dir(&blocks).expect("the captured mainnet blocks") {
+    for directory in [
+        fixtures().join("mainnet/blocks"),
+        capture.join("nakamoto/blocks"),
+    ] {
+        for entry in fs::read_dir(&directory).expect("the captured mainnet blocks") {
+            let path = entry.expect("a block entry").path();
+            let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
+                .expect("a captured mainnet block decodes");
+            let weight = set.verify(&block.header).unwrap_or_else(|error| {
+                panic!(
+                    "mainnet block {} at height {} was accepted by mainnet: {error}",
+                    path.display(),
+                    block.header.chain_length
+                )
+            });
+            assert!(
+                weight >= threshold,
+                "block {} carries {weight} of the {threshold} its cycle requires",
+                block.header.chain_length
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 5, "the capture holds no mainnet blocks to check");
+}
+
+/// Every block the mainnet capture holds passes the complete validator.
+///
+/// The acceptance criterion of the task, for the half that needs no state: the
+/// header version, the transactions' network, chain and anchoring, the tenure and
+/// coinbase shape, the tenure change's miner and the problematic-transaction
+/// markers, over a hundred consecutive blocks mainnet accepted. The rules that
+/// read executed state — the signer weight above, the tenure counts, the VRF —
+/// are checked where they are checkable.
+#[test]
+fn every_captured_mainnet_block_authenticates() {
+    let Some(capture) = std::env::var_os("NANO_MAINNET_CAPTURE").map(PathBuf::from) else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    // An empty chainstate is enough: authentication reads the chain's identity and
+    // the block, and nothing else.
+    let chainstate =
+        ChainState::new(nano_primitives::Network::MAINNET).expect("an empty mainnet chainstate");
+    let mut checked = 0;
+    for entry in fs::read_dir(capture.join("nakamoto/blocks")).expect("the captured blocks") {
         let path = entry.expect("a block entry").path();
         let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
             .expect("a captured mainnet block decodes");
-        let weight = set.verify(&block.header).unwrap_or_else(|error| {
-            panic!(
-                "mainnet block {} at height {} was accepted by mainnet: {error}",
-                path.display(),
-                block.header.chain_length
-            )
-        });
-        assert!(
-            weight >= threshold,
-            "block {} carries {weight} of the {threshold} its cycle requires",
-            block.header.chain_length
-        );
+        chainstate
+            .authenticate_block(&block)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "mainnet block {} was accepted by mainnet: {error}",
+                    block.header.chain_length
+                )
+            });
         checked += 1;
     }
-    assert!(checked > 0, "the capture holds no mainnet blocks to check");
+    assert!(checked > 0, "the capture holds no blocks to authenticate");
 }
 
 /// The stacking calendar and burn height a mainnet capture records.
