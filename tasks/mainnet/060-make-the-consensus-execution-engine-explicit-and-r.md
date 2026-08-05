@@ -40,22 +40,22 @@ node may invoke.
       their transaction or deployment through the interpreter.
 - [x] Reject `NANO_INTERPRETER_ONLY` on mainnet as an immediate containment
       measure; this guard is not the final boundary.
-- [ ] Delete `NANO_INTERPRETER_ONLY`, `NANO_INTERPRETER_FALLBACK`,
+- [x] Delete `NANO_INTERPRETER_ONLY`, `NANO_INTERPRETER_FALLBACK`,
       `NANO_CROSSCHECK` and `NANO_CROSSCHECK_TRANSACTIONS` handling from the
       production node and VM call path. The shipped node must not recognize an
       environment variable, configuration field or command-line option that can
       select, compare, retry or fall through to the interpreter.
-- [ ] Remove `Vm::interpret_contract_calls` and every equivalent engine selector
+- [x] Remove `Vm::interpret_contract_calls` and every equivalent engine selector
       from the production API. Do not replace them with a mainnet guard, hidden
       feature, emergency mode or unsafe escape hatch; there is no production
       condition under which interpreter execution is allowed.
-- [ ] Move the interpreter differential oracle, crosscheck and contract healing
+- [x] Move the interpreter differential oracle, crosscheck and contract healing
       into separately built test or `xtask` tooling whose writes are always
       rolled back and which the `stacks-node` binary cannot call or enable.
-- [ ] Make every clarity-wasm compile, validation, instantiation, trap and host
+- [x] Make every clarity-wasm compile, validation, instantiation, trap and host
       failure reject the candidate without sealing or committing any state, and
       add a regression proving that none is retried with the interpreter.
-- [ ] Answer `/v2/accounts` without evaluating `(stx-account ...)` through the
+- [x] Answer `/v2/accounts` without evaluating `(stx-account ...)` through the
       reference interpreter; use direct state access or clarity-wasm.
 - [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
       compiler-hostile deployments and calls, with no healing or engine switch.
@@ -343,3 +343,67 @@ So the one remaining step is to serialize that tuple from `write-feed`'s literal
 and pass it as the second argument. If the engines then disagree, it is the third
 compiler bug; if they agree, the divergence is in `borrow`'s later bindings and
 `eval` can walk them one at a time.
+
+## The boundary is structural now
+
+The interpreter lives in `nano-oracle`, a crate `nano-node` does not depend on.
+There is no environment variable, configuration field, Cargo feature or failure
+mode that can make a shipped node execute a transaction that way, because the
+engine is not linked in. `NANO_INTERPRETER_ONLY`, `NANO_INTERPRETER_FALLBACK`,
+`NANO_CROSSCHECK`, `NANO_CROSSCHECK_TRANSACTIONS`, `Vm::interpret_contract_calls`
+and `Vm::execute` are all gone, and so are `heal_contract` and
+`uninterpretable_contracts` — the last two moved to the oracle, where the healing
+task always belonged.
+
+`wasm_is_the_engine` checks that rather than a flag: `nano-oracle` absent from
+`cargo tree -p nano-node`, no production crate naming `eval_all`,
+`initialize_versioned_contract` or `environment.execute_transaction(`, and the
+four retired switches appearing nowhere in the tree. It also asserts the oracle
+*does* name those three, so it cannot pass because a symbol was renamed.
+
+`/v2/accounts` reads `get_stx_balance_snapshot` and the three unlock heights
+directly — the same reads `special_stx_account` makes, in the same order — so no
+engine starts to answer an RPC. The two remaining Clarity reads in tests and in
+the conformance suite go through a deployed contract, which is the only way a
+contract on the chain can read anything.
+
+Found while moving it: the compiled call path passed `None` as the sponsor into
+clar2wasm, so `tx-sponsor?` answered `none` in every sponsored contract call.
+Consensus-visible, and now threaded through.
+
+## The third compiler bug: a fold over a buffer
+
+`fold` computed the type its accumulator actually carries — the folded function's
+second parameter — only when the sequence was a *list*. An initial value written
+`(list)`, `none` or `(ok true)` analyses with a placeholder in it, so folding a
+buffer sized every allocation and copy from the placeholder and read the
+accumulator short.
+
+That is mainnet 8,665,719. `pyth-pnau-decoder-v3::parse-proof` folds over a
+`(buff 8192)` with `{ result: (list), ... }`, so each 20-byte merkle hash came
+back empty; `check-proof` then `unwrap-panic`s a `slice?` of one and the whole
+`v0-4-market::borrow` aborted with `UnwrapFailure` where the chain says
+`(ok true)`. Both engines now answer `(ok true)`, and so does the chain.
+
+Element duck-typing stays list-only, and now says why:
+`get_sequence_element_type` reports `(buff 1)` for a string as well as a buffer.
+
+## What made it findable in minutes instead of hours
+
+`xtask call-both-tx` replays the staged block above a state's tip through both
+engines using the transaction's own arguments. Hand-serializing those arguments
+back into `call-both` is where the previous two bugs cost hours each.
+`check-module` now reads the contract's source and version from the state rather
+than a file, so a bisection cannot start from the wrong text, and
+`NANO_TRACE_CALLS` names the deepest cross-contract call before a failure —
+which is what pointed at the decoder rather than at the oracle or the market.
+
+## Remaining
+
+- Replay from a pristine checkpoint entirely through clarity-wasm: in progress,
+  and past 8,665,988 with no divergence since the fee fix.
+- Compare the engines before sealing in the conformance harness, and keep
+  minimized fixtures for every disagreement. `wasm_response_fold` and
+  `wasm_trait_fold` hold the three found so far.
+- Pin roots, receipts, costs and events for a bounded mainnet regression slice.
+- Record the clarity-wasm and compiler revisions in checkpoint provenance.

@@ -2131,16 +2131,20 @@ pub fn referenced_contracts(
     source: &str,
     version: ClarityVersion,
 ) -> Vec<QualifiedContractIdentifier> {
-    let Ok(expressions) = clarity::vm::ast::parse(
+    // `build_ast` rather than `ast::parse`: the latter is a testing-gated
+    // wrapper around exactly this call, and the `testing` feature it needs would
+    // reach the whole build graph.
+    let Ok(parsed) = build_ast(
         contract,
         source,
+        &mut LimitedCostTracker::new_free(),
         version,
         epoch_for_version(version),
     ) else {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_contracts(&expressions, contract, &mut found);
+    collect_contracts(&parsed.expressions, contract, &mut found);
     found
 }
 

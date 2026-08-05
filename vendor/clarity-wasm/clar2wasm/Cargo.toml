@@ -14,7 +14,12 @@ sha2 = { version = "0.10.7" }
 chrono = { version = "0.4.20" }
 rusqlite = { version = "0.31.0" }
 
-clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
+# No `testing` feature here: Cargo unifies features across a build graph, so
+# enabling it on a normal dependency enables it for `clarity`, `clarity-types`
+# and `stacks-common` inside every binary built from this crate -- including a
+# release node, which must observe the real schedules and no test override. The
+# crosscheck harness needs it and asks for it as a dev-dependency below.
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 clarity-types = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 
@@ -36,6 +41,7 @@ developer-mode = []
 
 [dev-dependencies]
 clar2wasm = {path = ".", features = ["developer-mode"]}
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
 criterion = "0.5"
 proptest = "1.2.0"
 num-integer = { version = "0.1.45", default-features = false }

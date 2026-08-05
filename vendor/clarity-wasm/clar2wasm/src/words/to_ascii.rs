@@ -9,6 +9,19 @@ use crate::wasm_generator::GeneratorError;
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::{ComplexWord, Word};
 
+/// A `(string-ascii n)` type, built without the testing-only constructor.
+///
+/// `TypeSignature::new_ascii_type_checked` is gated on `clarity/testing`, and
+/// Cargo unifies features across a build graph — so asking for it on a normal
+/// dependency puts the reference crates' test behaviour into every binary built
+/// from this one, a release node included. `new_ascii_type` is the same
+/// construction with an invalid length reported rather than panicked on.
+fn ascii_type(length: u32) -> Result<TypeSignature, GeneratorError> {
+    TypeSignature::new_ascii_type(i128::from(length)).map_err(|error| {
+        GeneratorError::TypeError(format!("invalid ASCII string length {length}: {error}"))
+    })
+}
+
 #[derive(Debug)]
 pub struct ToAscii;
 
@@ -66,7 +79,7 @@ fn to_ascii_bool(
     // however, we will use 8 bytes so that we can write u64 values directly to memory.
     let (offset, _len) = generator.create_call_stack_local(
         builder,
-        &TypeSignature::new_ascii_type_checked(8),
+        &ascii_type(8)?,
         false,
         true,
     );
@@ -120,7 +133,7 @@ fn to_ascii_uint(
     // We also need a space for the character 'u'
     let (offset, _len) = generator.create_call_stack_local(
         builder,
-        &TypeSignature::new_ascii_type_checked(40),
+        &ascii_type(40)?,
         false,
         true,
     );
@@ -181,7 +194,7 @@ fn to_ascii_int(
     // the biggest int we could write will have the length of i128::MIN: 40 characters, including the '-'.
     let (offset, _len) = generator.create_call_stack_local(
         builder,
-        &TypeSignature::new_ascii_type_checked(40),
+        &ascii_type(40)?,
         false,
         true,
     );
@@ -414,7 +427,7 @@ fn to_ascii_buffer(
     };
     let (result_offset, _len) = generator.create_call_stack_local(
         builder,
-        &TypeSignature::new_ascii_type_checked(2 * arg_size + 2),
+        &ascii_type(2 * arg_size + 2)?,
         false,
         true,
     );
@@ -572,7 +585,7 @@ fn to_ascii_string_utf8(
     };
     let (result_offset, _len) = generator.create_call_stack_local(
         builder,
-        &TypeSignature::new_ascii_type_checked(arg_size),
+        &ascii_type(arg_size)?,
         false,
         true,
     );
@@ -710,7 +723,7 @@ fn to_ascii_principal(
     let (result_offset, length) = generator.create_call_stack_local(
         builder,
         // size is 41 for the max size of a standard contract + the dot + the max len of a contract name
-        &TypeSignature::new_ascii_type_checked(41 + 1 + MAX_STRING_LEN as u32),
+        &ascii_type(41 + 1 + MAX_STRING_LEN as u32)?,
         false,
         true,
     );
