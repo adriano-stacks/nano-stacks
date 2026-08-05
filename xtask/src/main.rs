@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("eval") => eval_in_state(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("state-value") => state_value(&env::args().skip(2).collect::<Vec<_>>()),
         Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
@@ -1708,6 +1709,74 @@ fn dump_refused_wasm() {
         }
         Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
         Err(error) => eprintln!("cannot read the module: {error}"),
+    }
+}
+
+/// Read what a state holds for one Clarity key at one block.
+///
+/// A root divergence whose receipts all match is a wrong *value* somewhere, and
+/// the write trace only shows the 40-byte MARF value. This resolves the value
+/// itself, and at the parent as well as at the tip, which is what turns "these
+/// two roots differ" into "this balance is wrong by this much".
+fn state_value(arguments: &[String]) -> ExitCode {
+    let [state, block, key] = arguments else {
+        eprintln!(
+            "usage: cargo xtask state-value <state-dir> <block-id|tip> <clarity-key>\n\
+             the node must not be running: it holds the state open"
+        );
+        return ExitCode::FAILURE;
+    };
+    let store = match nano_vm::MarfStore::open(Network::MAINNET, Path::new(state).join("chainstate"))
+    {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let resolved = if block == "tip" {
+        store.tip()
+    } else {
+        hex::decode(block)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+    };
+    let Some(block) = resolved else {
+        eprintln!("the block must be 32 hexadecimal bytes, or `tip` on a sealed state");
+        return ExitCode::FAILURE;
+    };
+    let Some(value) = store.get(block, key) else {
+        println!("no value for {key} at {}", hex::encode(block));
+        return ExitCode::FAILURE;
+    };
+    println!("{value}");
+    describe_stored_value(&value);
+    ExitCode::SUCCESS
+}
+
+/// Say what a stored value means, for the two shapes a divergence lands in.
+///
+/// `STXBalance` is 16 bytes unlocked, 16 locked and 8 unlock height; a Clarity
+/// `uint` is a `0x01` tag and 16 big-endian bytes. Everything else is left as
+/// the hex it is.
+fn describe_stored_value(value: &str) {
+    let Ok(bytes) = hex::decode(value) else {
+        return;
+    };
+    let be = |slice: &[u8]| -> u128 {
+        slice
+            .iter()
+            .fold(0_u128, |total, byte| (total << 8) | u128::from(*byte))
+    };
+    match bytes.len() {
+        40 => println!(
+            "  balance: unlocked {} locked {} unlock height {}",
+            be(&bytes[0..16]),
+            be(&bytes[16..32]),
+            be(&bytes[32..40])
+        ),
+        17 if bytes[0] == 1 => println!("  uint: {}", be(&bytes[1..17])),
+        _ => {}
     }
 }
 

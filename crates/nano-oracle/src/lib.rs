@@ -51,6 +51,7 @@ pub struct Evaluation {
 /// contract has to be present — which is the difference between this and
 /// rebuilding by deploying into a throwaway store: a contract that names a
 /// contract cannot be deployed beside nothing, and can still be *parsed*.
+#[must_use]
 pub fn defined_functions(
     contract: &QualifiedContractIdentifier,
     version: ClarityVersion,
