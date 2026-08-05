@@ -13,6 +13,17 @@ const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23, 0, 0, 0];
 /// The Bitcoin blocks a sortition weighs mining commitments over.
 pub const MINING_COMMITMENT_WINDOW: usize = 6;
 
+/// Blocks of commitment history a [`SortitionEngine`] keeps.
+///
+/// More than the window, because a Bitcoin reorganization takes the top of that
+/// history with it and the replacement branch has to be weighed over a full
+/// window from its first block. Keeping only the window meant a reorganization
+/// two blocks deep left five, and the replayed sortition was weighed over five
+/// blocks where the network used six — the same failure as a short window
+/// anywhere else, which is a different answer rather than a rougher one. Twice
+/// the window covers every retraction [`SortitionEngine::retract_above`] admits.
+const RETAINED_COMMITMENT_BLOCKS: usize = MINING_COMMITMENT_WINDOW * 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpsHash([u8; 32]);
 
@@ -101,19 +112,33 @@ pub struct SortitionWinner {
 /// (`burn/operations/leader_block_commit.rs`, `BURN_BLOCK_MINED_AT_MODULUS`).
 pub const BURN_BLOCK_MINED_AT_MODULUS: u64 = 5;
 
-/// Whether a commitment landed in the Bitcoin block it aimed at.
+/// How many Bitcoin blocks late a commitment arrived; zero if it was on time.
 ///
-/// A miner names the block it built on by its height modulo five, so the block
-/// it means to land in is the one after that. A commitment that arrives
-/// anywhere else missed: stacks-core keeps it only so its UTXO can chain
-/// through the mining window, and it is neither a candidate for the sortition
-/// nor one of the operations the block's `ops_hash` covers
-/// (`leader_block_commit.rs`, `check`).
+/// A miner names the block it built on by its height modulo five, so the block it
+/// means to land in is the one after that (`leader_block_commit.rs`, `check`).
+/// Because the modulus wraps at five, "how late" is only knowable modulo five,
+/// which is why stacks-core refuses a distance above one outright — see
+/// [`commitment_window_block`].
 #[must_use]
-pub const fn commitment_is_on_time(parent_modulus: u8, bitcoin_height: u64) -> bool {
+pub const fn commitment_miss_distance(parent_modulus: u8, bitcoin_height: u64) -> u64 {
     let intended =
         (parent_modulus as u64 % BURN_BLOCK_MINED_AT_MODULUS + 1) % BURN_BLOCK_MINED_AT_MODULUS;
-    bitcoin_height % BURN_BLOCK_MINED_AT_MODULUS == intended
+    let actual = bitcoin_height % BURN_BLOCK_MINED_AT_MODULUS;
+    if actual >= intended {
+        actual - intended
+    } else {
+        BURN_BLOCK_MINED_AT_MODULUS + actual - intended
+    }
+}
+
+/// Whether a commitment landed in the Bitcoin block it aimed at.
+///
+/// A commitment that arrives anywhere else missed: stacks-core keeps it only so
+/// its UTXO can chain through the mining window, and it is neither a candidate
+/// for the sortition nor one of the operations the block's `ops_hash` covers.
+#[must_use]
+pub const fn commitment_is_on_time(parent_modulus: u8, bitcoin_height: u64) -> bool {
+    commitment_miss_distance(parent_modulus, bitcoin_height) == 0
 }
 
 /// The operations a Bitcoin block contributes to its own consensus hash.
@@ -154,10 +179,23 @@ pub struct MissedCommitment {
 /// A reward phase pays two recipients; a prepare phase burns to one address; the
 /// waterfall pays the one sBTC address. Mainnet's totals derive exactly under
 /// this rule across the captured window, which spans a reward phase.
+///
+/// It also answers how many blocks the burn distribution is weighed over, which
+/// is not always six — see [`PayoutSchedule::mining_window_at`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PayoutSchedule {
     cycles: RewardCycleSchedule,
     prepare_phase_length: u64,
+    /// The Bitcoin height epoch 4.0 activates at, when the node knows it.
+    ///
+    /// This is pox-5's activation height: `validate_epochs` requires the two to be
+    /// equal, so `/v2/pox` states it and nothing new has to be configured.
+    ///
+    /// One boundary is enough because nano is a 4.0-only node that starts at or
+    /// after that boundary, so it is the only epoch transition its mining window
+    /// can ever contain. On mainnet the one below it, epoch 3.4 at burn 943,333, is
+    /// seventeen thousand blocks back.
+    epoch_four_activation: Option<u64>,
 }
 
 /// Recipients a commitment pays in a reward phase (`OUTPUTS_PER_COMMIT`).
@@ -174,7 +212,38 @@ impl PayoutSchedule {
         Ok(Self {
             cycles,
             prepare_phase_length,
+            epoch_four_activation: None,
         })
+    }
+
+    /// Say where epoch 4.0 begins, which shortens the mining window around it.
+    ///
+    /// Additive rather than a constructor argument so a caller that does not know
+    /// the boundary keeps the behaviour it had. See
+    /// [`PayoutSchedule::mining_window_at`] for what knowing it buys.
+    #[must_use]
+    pub const fn activating_epoch_four_at(mut self, bitcoin_height: u64) -> Self {
+        self.epoch_four_activation = Some(bitcoin_height);
+        self
+    }
+
+    /// Whether this Bitcoin block is in a prepare phase.
+    ///
+    /// stacks-core's *classic* predicate (`PoxConstants::static_is_in_prepare_phase`),
+    /// which is the one both the commitment parser and the burn distribution use:
+    /// the first block of a cycle is at offset 1, so offset 0 is the last block of
+    /// the previous cycle's prepare phase and counts as prepare, while the block at
+    /// offset `length - prepare` does *not*. nano had `offset >= length - prepare`,
+    /// which is that window shifted down by one — invisible in every capture,
+    /// because they all sit deep in a reward phase, and wrong at both ends of every
+    /// prepare phase mainnet has.
+    #[must_use]
+    pub const fn is_in_prepare_phase(&self, bitcoin_height: u64) -> bool {
+        if bitcoin_height <= self.cycles.first_bitcoin_height {
+            return false;
+        }
+        let offset = self.cycles.offset_in_cycle(bitcoin_height);
+        offset == 0 || offset > self.cycles.reward_cycle_length - self.prepare_phase_length
     }
 
     /// How many payout outputs a commitment in this Bitcoin block carries.
@@ -183,13 +252,44 @@ impl PayoutSchedule {
         if self.cycles.is_waterfall_at(bitcoin_height) {
             return 1;
         }
-        if self.cycles.offset_in_cycle(bitcoin_height)
-            >= self.cycles.reward_cycle_length - self.prepare_phase_length
-        {
+        if self.is_in_prepare_phase(bitcoin_height) {
             1
         } else {
             OUTPUTS_PER_COMMIT
         }
+    }
+
+    /// How many Bitcoin blocks the burn distribution for this block is weighed over.
+    ///
+    /// Six is the ordinary answer and not the only one. stacks-core windows a
+    /// sortition over `MINING_COMMITMENT_WINDOW` blocks *only* when the block is in
+    /// a reward phase and the epoch at the bottom of the window is the epoch at the
+    /// top (`Burnchain::from_block_ops`); otherwise it weighs the block alone.
+    ///
+    /// Both exceptions are real on mainnet. A prepare phase runs for a hundred
+    /// blocks of every twenty-one hundred, and a one-block window changes more than
+    /// a candidate's weight: the windowed median becomes the block's own total, so
+    /// the assumed-total-commit carryover is always 1 and the null miner can never
+    /// win. And epoch 4.0 activates at burn 960,230 — the mainnet checkpoint's own
+    /// neighbourhood — so the seven blocks from there have the epoch 3.4 boundary
+    /// inside their window and are weighed alone. That is why nano named a
+    /// different winner at burn 960,230 and 960,233 while agreeing on every other
+    /// field: its window was six blocks where the network's was one.
+    #[must_use]
+    pub const fn mining_window_at(&self, bitcoin_height: u64) -> usize {
+        if self.is_in_prepare_phase(bitcoin_height) {
+            return 1;
+        }
+        // The epoch at the bottom of the window is read at `bitcoin_height - 1 -
+        // MINING_COMMITMENT_WINDOW`, so a boundary is "inside the window" for the
+        // window's length plus one blocks after it.
+        if let Some(activation) = self.epoch_four_activation
+            && bitcoin_height >= activation
+            && bitcoin_height - activation <= MINING_COMMITMENT_WINDOW as u64
+        {
+            return 1;
+        }
+        MINING_COMMITMENT_WINDOW
     }
 
     /// Whether this Bitcoin block opens a reward cycle, and so adds a bit to the
@@ -202,9 +302,16 @@ impl PayoutSchedule {
 
 /// The commitments a Bitcoin block contributes to the mining window.
 ///
-/// A commitment that missed the block it aimed at is kept apart: it is not a
-/// candidate and not part of the operations hash, but its UTXO still chains, so
+/// A commitment that missed the block it aimed at by one is kept apart: it is not
+/// a candidate and not part of the operations hash, but its UTXO still chains, so
 /// dropping it entirely would break the window of every miner behind it.
+///
+/// A commitment that missed by *more* than one is dropped outright, and its UTXO
+/// chains nothing. stacks-core refuses it with `BlockCommitMissDistanceTooBig`
+/// (`check_intended_sortition`) and says why: a miner who could file late by any
+/// amount could bunch a whole window's commitments into one Bitcoin block and mine
+/// when it suited them, skipping the six-block warm-up the window exists to
+/// impose. It is also what makes the filing rule below unambiguous.
 #[must_use]
 pub fn commitment_window_block(
     block: &BitcoinBlock,
@@ -230,7 +337,11 @@ pub fn commitment_window_block(
             .inputs
             .first()
             .map_or(([0; 32], 0), |input| (input.txid, input.output_index));
-        if commitment_is_on_time(*parent_modulus, block.height) {
+        let miss_distance = commitment_miss_distance(*parent_modulus, block.height);
+        if miss_distance > 1 {
+            continue;
+        }
+        if miss_distance == 0 {
             commitments.push(MiningCommitment {
                 txid: operation.txid,
                 spent_txid,
@@ -343,7 +454,7 @@ pub fn commitment_distribution(
         .map(|commitment| vec![Some(Link::Commitment(commitment))])
         .collect::<Vec<_>>();
 
-    for block in earlier.iter().rev() {
+    for (slot, block) in earlier.iter().enumerate().rev() {
         let expected_output = if block.requires_single_commit { 2 } else { 3 };
         let mut commitments = block
             .commitments
@@ -351,10 +462,16 @@ pub fn commitment_distribution(
             .cloned()
             .map(|commitment| (commitment.txid, commitment))
             .collect::<HashMap<_, _>>();
-        let mut missed = block
-            .missed_commitments
-            .iter()
-            .cloned()
+        // A missed commitment belongs to the sortition it *intended* to land in,
+        // not the one it arrived in: stacks-core files it under
+        // `intended_sortition`, which is one block back, and refuses any larger
+        // distance. So the misses a chain can link to in this slot are the ones
+        // that arrived in the block above it — and the oldest slot's own misses
+        // belong below the window and are never read.
+        let mut missed = window
+            .get(slot + 1)
+            .into_iter()
+            .flat_map(|above| above.missed_commitments.iter().cloned())
             .map(|commitment| (commitment.txid, commitment))
             .collect::<HashMap<_, _>>();
         for chain in &mut linked {
@@ -1067,7 +1184,7 @@ impl SortitionEngine {
     /// Feed the blocks oldest first, ending with the snapshot's own burn block.
     pub fn prime(&mut self, commitments: CommitmentWindowBlock) {
         self.commitment_window.push(commitments);
-        if self.commitment_window.len() > MINING_COMMITMENT_WINDOW {
+        if self.commitment_window.len() > RETAINED_COMMITMENT_BLOCKS {
             self.commitment_window.remove(0);
         }
     }
@@ -1079,11 +1196,13 @@ impl SortitionEngine {
 
     /// Commitments the most recent burn block put up for its sortition.
     ///
-    /// One means the block left no choice to make, and the winner follows from
-    /// the block alone. More than one means the winner came out of the burn
-    /// distribution, which is weighed over six blocks and is not yet exact —
-    /// see `docs`/task 049 — so a caller that would *reject* a block on the
-    /// strength of the winner's identity has to know which case it is in.
+    /// A diagnostic now rather than a gate. It existed because the winner among
+    /// several competing commitments did not derive exactly, so a caller that
+    /// would *reject* a block on the strength of the winner's identity had to
+    /// know whether the block left it a choice. The winner derives for every
+    /// block of the captured mainnet window, and the distribution itself is
+    /// checked against stacks-core's own `make_min_median_distribution`, so the
+    /// count is only worth reporting.
     #[must_use]
     pub fn candidates(&self) -> usize {
         self.commitment_window
@@ -1131,20 +1250,29 @@ impl SortitionEngine {
         Ok(reorg)
     }
 
+    /// Extend the chain with a Bitcoin block, sampling over `window_len` blocks.
+    ///
+    /// `window_len` is [`PayoutSchedule::mining_window_at`] for this block's
+    /// height, and it is not always [`MINING_COMMITMENT_WINDOW`]: a prepare phase
+    /// and the blocks just after an epoch boundary weigh the block alone. The
+    /// engine keeps the full six regardless, because the block after a one-block
+    /// window needs them again.
     pub fn append(
         &mut self,
         block: &BitcoinBlock,
         accepted_operation_txids: &[[u8; 32]],
         commitments: CommitmentWindowBlock,
         pox_id: PoxId,
+        window_len: usize,
     ) -> Result<&SortitionSnapshot, SortitionError> {
-        let mut window = self.commitment_window.clone();
-        window.push(commitments);
-        if window.len() > MINING_COMMITMENT_WINDOW {
-            window.remove(0);
+        let mut retained = self.commitment_window.clone();
+        retained.push(commitments);
+        if retained.len() > RETAINED_COMMITMENT_BLOCKS {
+            retained.remove(0);
         }
-        let statistics = commitment_burn_statistics(&window)?;
-        let distribution = commitment_distribution(&window)?;
+        let window = &retained[retained.len().saturating_sub(window_len.max(1))..];
+        let statistics = commitment_burn_statistics(window)?;
+        let distribution = commitment_distribution(window)?;
         let next_sortition_hash = self
             .snapshots
             .tip()
@@ -1189,7 +1317,7 @@ impl SortitionEngine {
             || (self.snapshots.tip().total_burn, None),
             |(total_burn, winner)| (total_burn, Some(winner)),
         );
-        self.commitment_window = window;
+        self.commitment_window = retained;
         self.snapshots.append_with_operations(
             block,
             accepted_operation_txids,
@@ -1286,9 +1414,9 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitmentWindowBlock, MiningCommitment, PoxIdTracker, RewardCycleSchedule,
-        SortitionEngine, SortitionHash, SortitionSnapshot, commitment_burn_statistics,
-        commitment_distribution, select_epoch4_winner, select_winner,
+        CommitmentWindowBlock, MINING_COMMITMENT_WINDOW, MiningCommitment, PoxIdTracker,
+        RewardCycleSchedule, SortitionEngine, SortitionHash, SortitionSnapshot,
+        commitment_burn_statistics, commitment_distribution, select_epoch4_winner, select_winner,
     };
 
     #[test]
@@ -1382,6 +1510,7 @@ mod tests {
                     requires_single_commit: false,
                 },
                 super::PoxId::initial(),
+                MINING_COMMITMENT_WINDOW,
             )
             .expect("first sortition snapshot");
         assert_eq!(snapshot.total_burn, 10);
@@ -1403,6 +1532,7 @@ mod tests {
                     requires_single_commit: false,
                 },
                 super::PoxId::initial(),
+                MINING_COMMITMENT_WINDOW,
             )
             .expect("second sortition snapshot");
         assert_eq!(snapshot.total_burn, 20);
@@ -1466,6 +1596,30 @@ mod tests {
         append(&mut replayed, 3, 0x33);
         append(&mut replayed, 4, 0x44);
         assert_eq!(engine.snapshots(), replayed.snapshots());
+    }
+
+    /// A reorganization must not leave the replacement branch weighed short.
+    ///
+    /// The commitment history is what refills the window, and retracting the top of
+    /// it is the one moment the window can go short without any block being
+    /// missing — which is a different sortition, not a rougher one. Keeping only
+    /// the window itself meant the deepest admitted retraction emptied it.
+    #[test]
+    fn the_retained_history_refills_the_window_after_the_deepest_retraction() {
+        let heights: Vec<u8> = (1..=20).collect();
+        let mut engine = engine_over(&heights);
+        assert_eq!(
+            engine.commitment_window().len(),
+            super::RETAINED_COMMITMENT_BLOCKS
+        );
+
+        let depth = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64");
+        let reorg = engine.retract_above(20 - depth).expect("retract the branch");
+        assert_eq!(reorg.depth(), MINING_COMMITMENT_WINDOW);
+        assert!(
+            engine.commitment_window().len() + 1 >= MINING_COMMITMENT_WINDOW,
+            "one replayed block refills the window, so it is weighed over all six"
+        );
     }
 
     #[test]
@@ -1536,22 +1690,57 @@ mod tests {
     #[test]
     fn payout_outputs_follow_the_reward_cycle_and_the_waterfall() {
         // Mainnet: cycle 140 runs 960,050..962,149, its prepare phase the last
-        // hundred of those. The exact block the prepare phase opens on is one
-        // nano has no capture for — every captured block sits deep in a reward
-        // phase — and mainnet leaves the question behind at 962,150, where the
-        // waterfall decides it instead.
+        // hundred of those. The first block of a cycle sits at offset 1, so the
+        // prepare phase is offsets 2001..2099 plus the *next* cycle's offset 0 —
+        // the "mod 0" block, which stacks-core's classic predicate counts as
+        // prepare and which nano's earlier `offset >= 2000` rule got wrong at
+        // both ends.
         let cycles =
             RewardCycleSchedule::new(666_050, 2100, Some(962_150)).expect("valid cycle schedule");
         let schedule = super::PayoutSchedule::new(cycles, 100).expect("valid schedule");
         assert_eq!(schedule.outputs_at(960_230), super::OUTPUTS_PER_COMMIT);
-        assert_eq!(schedule.outputs_at(962_049), super::OUTPUTS_PER_COMMIT);
-        assert_eq!(schedule.outputs_at(962_050), 1, "the prepare phase burns");
+        assert_eq!(
+            schedule.outputs_at(962_050),
+            super::OUTPUTS_PER_COMMIT,
+            "offset 2000 is the last reward-paying block, not the first prepare one"
+        );
+        assert_eq!(schedule.outputs_at(962_051), 1, "the prepare phase burns");
+        assert_eq!(schedule.outputs_at(962_149), 1);
         assert_eq!(schedule.outputs_at(962_150), 1, "the waterfall pays one");
         // Past the waterfall the cycle phase no longer decides it.
         assert_eq!(schedule.outputs_at(963_000), 1);
         assert!(schedule.starts_reward_cycle(962_150), "cycle 141 opens here");
         assert!(!schedule.starts_reward_cycle(962_151));
         assert!(super::PayoutSchedule::new(cycles, 2100).is_err());
+    }
+
+    /// The mining window is six blocks except where stacks-core says otherwise.
+    ///
+    /// Both exceptions matter on mainnet, and getting either wrong changes which
+    /// miner won: a one-block window is not a rougher answer than a six-block one.
+    #[test]
+    fn the_mining_window_collapses_in_a_prepare_phase_and_at_an_epoch_boundary() {
+        let cycles =
+            RewardCycleSchedule::new(666_050, 2100, Some(962_150)).expect("valid cycle schedule");
+        let schedule = super::PayoutSchedule::new(cycles, 100).expect("valid schedule");
+        // Without an epoch boundary to know about, only the prepare phase shortens
+        // it — offsets 2001 upward, and the following cycle's mod 0 block.
+        assert_eq!(schedule.mining_window_at(962_050), MINING_COMMITMENT_WINDOW);
+        assert_eq!(schedule.mining_window_at(962_051), 1);
+        assert_eq!(schedule.mining_window_at(962_149), 1);
+        assert_eq!(schedule.mining_window_at(962_150), 1, "the mod 0 block");
+        assert_eq!(schedule.mining_window_at(962_151), MINING_COMMITMENT_WINDOW);
+
+        // Epoch 4.0 activates at mainnet burn 960,230. The epoch at the bottom of
+        // the window is read seven blocks back, so the boundary is inside the
+        // window for 960,230 through 960,236 and those sortitions are weighed on
+        // their own block alone.
+        let schedule = schedule.activating_epoch_four_at(960_230);
+        assert_eq!(schedule.mining_window_at(960_229), MINING_COMMITMENT_WINDOW);
+        for height in 960_230..=960_236 {
+            assert_eq!(schedule.mining_window_at(height), 1, "{height}");
+        }
+        assert_eq!(schedule.mining_window_at(960_237), MINING_COMMITMENT_WINDOW);
     }
 
     #[test]
@@ -1603,6 +1792,7 @@ mod tests {
                     requires_single_commit: false,
                 },
                 super::PoxId::initial(),
+                MINING_COMMITMENT_WINDOW,
             )
             .expect("contiguous Bitcoin block");
     }
@@ -1714,24 +1904,6 @@ mod leader_key_tests {
     }
 }
 
-/// Whether a commitment landed in the burn block it was aiming at.
-///
-/// A commitment carries the modulus of the block it was built against, and is
-/// only an operation if it arrives in the block that follows. One that arrives
-/// late is a *missed* commitment: still a transaction, still able to chain its
-/// UTXO so the mining window survives a gap, but not part of the sortition and
-/// not part of the operations hash.
-///
-/// nano hashed every commitment it could decode, so a single late one — at burn
-/// 960,230, one of five — gave a different operations hash and a different
-/// consensus hash from there on.
-#[must_use]
-pub const fn commit_lands_in_block(burn_parent_modulus: u8, block_height: u64) -> bool {
-    let intended = (burn_parent_modulus as u64 % BURN_BLOCK_MINED_AT_MODULUS + 1)
-        % BURN_BLOCK_MINED_AT_MODULUS;
-    block_height % BURN_BLOCK_MINED_AT_MODULUS == intended
-}
-
 #[cfg(test)]
 mod pox_id_tests {
     use super::{PoxId, sortition_id};
@@ -1812,7 +1984,7 @@ mod pox_id_tests {
 
 #[cfg(test)]
 mod missed_commit_tests {
-    use super::{BURN_BLOCK_MINED_AT_MODULUS, commit_lands_in_block};
+    use super::{BURN_BLOCK_MINED_AT_MODULUS, commitment_is_on_time, commitment_miss_distance};
 
     /// A commitment is an operation only in the block after the one it names.
     #[test]
@@ -1820,18 +1992,36 @@ mod missed_commit_tests {
         // Burn 960,230 is 0 modulo five, so only a commitment built against
         // the block before it — modulus four — belongs there. That is exactly
         // the split mainnet made: four commitments accepted, one missed.
-        assert!(commit_lands_in_block(4, 960_230));
+        assert!(commitment_is_on_time(4, 960_230));
         for late in [0, 1, 2, 3] {
             assert!(
-                !commit_lands_in_block(late, 960_230),
+                !commitment_is_on_time(late, 960_230),
                 "modulus {late} is not aiming at burn 960,230"
             );
         }
 
         // The rule wraps, so the modulus before zero is the last one.
-        assert!(commit_lands_in_block(
+        assert!(commitment_is_on_time(
             u8::try_from(BURN_BLOCK_MINED_AT_MODULUS).expect("small") - 1,
             0
         ));
+    }
+
+    /// How late a commitment is, which decides whether it counts at all.
+    ///
+    /// One block late is a missed commitment whose UTXO still chains; more than
+    /// one is refused outright, because a miner able to file arbitrarily late
+    /// could bunch a whole window into one Bitcoin block.
+    #[test]
+    fn a_late_commitment_is_measured_in_blocks_and_refused_past_one() {
+        // Burn 960,230 wants modulus 4. Modulus 3 aimed one block earlier, so it
+        // is one late; modulus 2 is two late; and the count wraps at five.
+        assert_eq!(commitment_miss_distance(4, 960_230), 0);
+        assert_eq!(commitment_miss_distance(3, 960_230), 1);
+        assert_eq!(commitment_miss_distance(2, 960_230), 2);
+        assert_eq!(commitment_miss_distance(0, 960_230), 4);
+        // Wrapping the other way: burn 960,231 wants modulus 0, and modulus 4
+        // aimed at 960,230, one block earlier.
+        assert_eq!(commitment_miss_distance(4, 960_231), 1);
     }
 }

@@ -20,7 +20,7 @@ use nano_bitcoin::{BitcoinBlock, decode_block};
 use nano_primitives::{BitcoinHeaderHash, ConsensusHash, SortitionId};
 use nano_sortition::{
     LeaderKeys, OpsHash, PoxId, SnapshotChain, SortitionHash, SortitionSnapshot, SortitionWinner,
-    commit_lands_in_block,
+    commitment_is_on_time,
 };
 
 /// What a captured snapshot says, in the fields nano derives.
@@ -125,7 +125,7 @@ fn operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
         .iter()
         .filter(|operation| match &operation.kind {
             nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
-                commit_lands_in_block(*parent_modulus, block.height)
+                commitment_is_on_time(*parent_modulus, block.height)
             }
             _ => true,
         })
@@ -328,19 +328,6 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
     );
 }
 
-/// Winners the burn distribution names correctly across the window.
-///
-/// Twelve of the fourteen, and the two it misses — burn 960,230 and 960,233 —
-/// both name a *different* commitment carrying the *same* `new_seed`, because in
-/// Nakamoto every candidate in a burn block commits the hash of the parent
-/// tenure's coinbase proof and they are all identical. So the sortition hash
-/// still derives; what does not is which miner's leader key authorised the
-/// tenure. The remaining difference is in the min-median weighting of window
-/// slots a candidate has no commitment in — a variant that counts only the slots
-/// it does have fixes these two and breaks burn 960,228, so neither rule is the
-/// network's.
-const WINNERS_FLOOR: usize = 12;
-
 /// The mining window a chain is weighed over, which reaches behind the seed.
 ///
 /// `nano_sortition::MINING_COMMITMENT_WINDOW` blocks, and the capture's own seed
@@ -365,6 +352,264 @@ fn priming_blocks(root: &std::path::Path, seed: &Captured) -> Option<Vec<Bitcoin
     }
     blocks.reverse();
     Some(blocks)
+}
+
+/// Mainnet's calendar: cycle length 2100 from burn 666,050, a 100-block prepare
+/// phase, and the waterfall opening with cycle 141 at 962,150 — past this window,
+/// so every block in it sits in a reward phase.
+///
+/// Epoch 4.0 activates at burn 960,230 (`BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT`),
+/// which is inside this window, so the schedule has to know it: the seven blocks
+/// from there have an epoch boundary inside their mining window and are weighed on
+/// their own block alone.
+fn mainnet_payouts() -> nano_sortition::PayoutSchedule {
+    nano_sortition::PayoutSchedule::new(
+        nano_sortition::RewardCycleSchedule::new(666_050, 2100, Some(962_150))
+            .expect("valid cycle schedule"),
+        100,
+    )
+    .expect("valid payout schedule")
+    .activating_epoch_four_at(960_230)
+}
+
+/// Every Bitcoin block the window needs, including the six behind its seed.
+fn window_blocks(root: &std::path::Path, captured: &[Captured]) -> Option<BTreeMap<u64, BitcoinBlock>> {
+    Some(
+        priming_blocks(root, &captured[0])?
+            .into_iter()
+            .map(|block| (block.height, block))
+            .chain(captured.iter().skip(1).map(|snapshot| {
+                let raw = fs::read_to_string(
+                    root.join("bitcoin/blocks")
+                        .join(format!("{}.hex", snapshot.burn_header_hash)),
+                )
+                .expect("read the captured Bitcoin block");
+                let block = decode_block(
+                    snapshot.block_height,
+                    &hex::decode(raw.trim()).expect("the block is hexadecimal"),
+                    MAINNET_MAGIC,
+                )
+                .expect("decode the captured Bitcoin block");
+                (snapshot.block_height, block)
+            }))
+            .collect(),
+    )
+}
+
+/// nano's burn distribution against stacks-core's own `make_min_median_distribution`.
+///
+/// The cheapest oracle on the ladder, and the one that made the difference here:
+/// the distribution is a pure function of a commitment window, so stacks-core's own
+/// implementation can be *called* rather than inferred from the fourteen winners a
+/// capture records. Fourteen winners can only say whether an answer is wrong; this
+/// says which candidate, which window slot, and by how much.
+///
+/// The conversion is where the two representations differ, and the difference is
+/// the rule: nano files a missed commitment under the block it *arrived* in,
+/// because that is all a Bitcoin block knows, while stacks-core files it under the
+/// sortition it *intended* — always the block before, since a larger miss is
+/// refused outright (`check_intended_sortition`, `BlockCommitMissDistanceTooBig`).
+/// So a window slot holds the misses of the block above it, and the oldest slot's
+/// own misses belong below the window and are never read.
+fn assert_distribution_matches(
+    window: &[nano_sortition::CommitmentWindowBlock],
+    heights: &[u64],
+    label: &str,
+) {
+    use blockstack_lib::burnchains::{BurnchainSigner, Txid};
+    use blockstack_lib::chainstate::burn::distribution::BurnSamplePoint;
+    use blockstack_lib::chainstate::burn::operations::LeaderBlockCommitOp;
+    use blockstack_lib::chainstate::burn::operations::leader_block_commit::MissedBlockCommit;
+    use stacks_common::types::chainstate::{
+        BlockHeaderHash, BurnchainHeaderHash, SortitionId, VRFSeed,
+    };
+
+    let block_commits: Vec<Vec<LeaderBlockCommitOp>> = window
+        .iter()
+        .zip(heights)
+        .map(|(block, height)| {
+            block
+                .commitments
+                .iter()
+                .map(|commitment| LeaderBlockCommitOp {
+                    block_header_hash: BlockHeaderHash([0; 32]),
+                    new_seed: VRFSeed(commitment.vrf_seed),
+                    parent_block_ptr: 0,
+                    parent_vtxindex: 0,
+                    key_block_ptr: 0,
+                    key_vtxindex: 0,
+                    memo: vec![],
+                    burn_fee: commitment.burn_sats,
+                    input: (Txid(commitment.spent_txid), commitment.spent_output),
+                    burn_parent_modulus: 0,
+                    apparent_sender: BurnchainSigner(hex::encode(commitment.txid)),
+                    commit_outs: vec![],
+                    treatment: vec![],
+                    sunset_burn: 0,
+                    txid: Txid(commitment.txid),
+                    vtxindex: 0,
+                    block_height: *height,
+                    burn_header_hash: BurnchainHeaderHash([0; 32]),
+                })
+                .collect()
+        })
+        .collect();
+    let missed_commits: Vec<Vec<MissedBlockCommit>> = window
+        .iter()
+        .skip(1)
+        .map(|block| {
+            block
+                .missed_commitments
+                .iter()
+                .map(|missed| MissedBlockCommit {
+                    txid: Txid(missed.txid),
+                    input: (Txid(missed.spent_txid), missed.spent_output),
+                    intended_sortition: SortitionId([0; 32]),
+                })
+                .collect()
+        })
+        .collect();
+    let expects_single_commit: Vec<bool> = window
+        .iter()
+        .map(|block| block.requires_single_commit)
+        .collect();
+
+    let theirs = BurnSamplePoint::make_min_median_distribution(
+        u8::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("window fits u8"),
+        block_commits,
+        missed_commits,
+        expects_single_commit,
+    );
+    let ours = nano_sortition::commitment_distribution(window).expect("a distribution");
+
+    assert_eq!(ours.len(), theirs.len(), "candidate count {label}");
+    for (ours, theirs) in ours.iter().zip(&theirs) {
+        assert_eq!(
+            (
+                hex::encode(ours.candidate.txid),
+                u128::from(ours.burn_sats),
+                u128::from(ours.median_burn_sats),
+                ours.frequency,
+                hex::encode(ours.range_start.to_big_endian()),
+                hex::encode(ours.range_end.to_big_endian()),
+            ),
+            (
+                theirs.candidate.txid.to_hex(),
+                theirs.burns,
+                theirs.median_burn,
+                theirs.frequency,
+                theirs.range_start.to_hex_be(),
+                theirs.range_end.to_hex_be(),
+            ),
+            "burn sample for {} {label}",
+            theirs.candidate.txid.to_hex()
+        );
+    }
+}
+
+#[test]
+fn the_burn_distribution_matches_stacks_core() {
+    let Some(root) = capture() else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    let Some(blocks) = window_blocks(&root, &captured) else {
+        nano_conformance::skip_gate("the capture holds no Bitcoin blocks below its seed");
+        return;
+    };
+    let payouts = mainnet_payouts();
+    let keys = LeaderKeys::new();
+
+    for snapshot in captured.iter().skip(1) {
+        let target = snapshot.block_height;
+        let window_len = u64::try_from(payouts.mining_window_at(target)).expect("fits u64");
+        let heights: Vec<u64> = (target + 1 - window_len..=target).collect();
+        let window: Vec<_> = heights
+            .iter()
+            .map(|height| {
+                nano_sortition::commitment_window_block(
+                    blocks.get(height).expect("the window's Bitcoin block"),
+                    payouts.outputs_at(*height),
+                    &keys,
+                )
+            })
+            .collect();
+        // A block with no on-time commitment is why mainnet has no sortition at
+        // burn 960,222, 960,224, 960,227 and 960,229, and both implementations
+        // answer an empty distribution there — which is worth comparing too.
+        assert_distribution_matches(&window, &heights, &format!("at burn {target}"));
+    }
+}
+
+/// One window in which a chain reaches back *through* a missed commitment.
+///
+/// The captured mainnet window cannot falsify the filing rule: it holds exactly one
+/// missed commitment and nothing chains to it, so both placements — the block it
+/// arrived in and the block it aimed at — give the same distribution there. This is
+/// the window that tells them apart, and it is checked against stacks-core rather
+/// than against an expectation written down by hand.
+#[test]
+fn a_chain_reaching_through_a_missed_commitment_matches_stacks_core() {
+    use nano_sortition::{CommitmentWindowBlock, MiningCommitment, MissedCommitment};
+
+    let txid = |byte: u8| [byte; 32];
+    let commitment = |id: u8, spends: u8, burn_sats: u64| MiningCommitment {
+        txid: txid(id),
+        spent_txid: txid(spends),
+        spent_output: 3,
+        burn_sats,
+        vrf_seed: [0; 32],
+        vrf_public_key: None,
+    };
+    let empty = || CommitmentWindowBlock {
+        commitments: Vec::new(),
+        missed_commitments: Vec::new(),
+        requires_single_commit: false,
+    };
+    // Slot 3 holds the miner's older commitment; slot 4's block carries a missed
+    // commitment that spends it, which stacks-core files against slot 3; slot 5's
+    // candidate spends the miss. Under the filing rule the chain is
+    // candidate -> miss(slot 3), and slot 3's own commitment is then out of reach,
+    // so the chain is two long. Under the arrived-in placement it would be three,
+    // with a different median and a different weight.
+    let window = vec![
+        empty(),
+        empty(),
+        empty(),
+        CommitmentWindowBlock {
+            commitments: vec![commitment(0xb0, 0x00, 90_000)],
+            ..empty()
+        },
+        CommitmentWindowBlock {
+            missed_commitments: vec![MissedCommitment {
+                txid: txid(0xa0),
+                spent_txid: txid(0xb0),
+                spent_output: 3,
+            }],
+            ..empty()
+        },
+        CommitmentWindowBlock {
+            commitments: vec![
+                commitment(0xc0, 0xa0, 50_000),
+                commitment(0xc1, 0xff, 50_000),
+            ],
+            ..empty()
+        },
+    ];
+    let heights: Vec<u64> = (100..106).collect();
+    assert_distribution_matches(&window, &heights, "in the missed-commitment window");
+
+    let ours = nano_sortition::commitment_distribution(&window).expect("a distribution");
+    assert_eq!(
+        (ours[0].frequency, ours[1].frequency),
+        (2, 1),
+        "the chain stops at the miss, because the slot below it is not the one \
+         the miss was filed against"
+    );
 }
 
 /// The node's own tracker derives what the network derived, asking nothing.
@@ -400,15 +645,7 @@ fn the_node_tracker_derives_the_same_window() {
 
     let mut tracker = nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
         .expect("the tracker starts");
-    // Mainnet's calendar, and the waterfall opening with cycle 141 at 962,150 —
-    // past this window, so every block in it sits in a reward phase and its
-    // commitments pay two recipients.
-    let payouts = nano_sortition::PayoutSchedule::new(
-        nano_sortition::RewardCycleSchedule::new(666_050, 2100, Some(962_150))
-            .expect("valid cycle schedule"),
-        100,
-    )
-    .expect("valid payout schedule");
+    let payouts = mainnet_payouts();
 
     let blocks: BTreeMap<u64, BitcoinBlock> = priming
         .into_iter()
@@ -474,17 +711,18 @@ fn the_node_tracker_derives_the_same_window() {
         }
         let expected_winner =
             (snapshot.sortition != 0).then(|| snapshot.winning_block_txid.clone());
-        if derived.winner_txid.map(hex::encode) == expected_winner {
-            winners += 1;
-        }
+        assert_eq!(
+            derived.winner_txid.map(hex::encode),
+            expected_winner,
+            "the node names the winner at burn {}",
+            snapshot.block_height
+        );
+        winners += 1;
         checked += 1;
     }
     assert_eq!(checked, DERIVED_FLOOR, "the node derived the whole window");
-    // A floor rather than equality, for the same reason `DERIVED_FLOOR` is one:
-    // the winner's identity is the field still to close, and this is the number
-    // that has to go up.
-    assert!(
-        winners >= WINNERS_FLOOR,
-        "named {winners} winners, below the {WINNERS_FLOOR} already reached"
-    );
+    // Equality, not a floor. This was `winners >= 12` for as long as the winner's
+    // identity was the field that did not derive; it derives for all fourteen now,
+    // so a floor would only hide a regression.
+    assert_eq!(winners, DERIVED_FLOOR, "the node named every winner");
 }
