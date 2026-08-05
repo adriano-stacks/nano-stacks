@@ -274,3 +274,43 @@ Neither was available while chasing 8,667,467 and 8,668,161, which is why both
 cost hours of wall-clock each rather than minutes. `xtask call-both` against a
 live state is what actually found them, and it is fast — the expensive part was
 having no way to *re-run a block* after changing the compiler.
+
+## 8,665,719 is most likely a third compiler bug, in Pyth payload parsing
+
+The pristine clarity-wasm replay stops here, and the chain and nano disagree on
+one transaction:
+
+```
+chain   v0-4-market.borrow   success (ok true)
+nano    RuntimeFailure("Runtime(UnwrapFailure, Some([])))"   (err none)
+```
+
+Ruled out by `xtask eval` against the state at the stopping point, in seconds
+each: every `get-stacks-block-info?` read works, the ststx-ratio contract those
+feed answers `(ok u1796712)`, `tenure-height` is 251321 and `stacks-block-time`
+is 1785402333. No header lookup misses. So it is neither of the things task 055
+attributed it to.
+
+The transaction's arguments name the real path:
+
+```
+ft          'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.wstx
+amount      u257669916
+price-feeds (some (list 0x504e4155 01 …))
+```
+
+`0x504e4155` is `PNAU` — a **Pyth** price update. `borrow`'s first `try!` that
+touches it is `write-feeds` → `write-feed` → `contract-call?
+'SP1CGXWEAMG6P6FT04W66NVGJ7PQWMDAC19R7PJ0Y.pyth-oracle-v4
+verify-and-update-price-feeds`, which parses an 8 KB binary payload — merkle
+proofs, VAA signatures, buffer slicing.
+
+That matters because **`pyth-adapter-v1` was one of the four contracts
+clarity-wasm previously could not run at all**
+([[059-heal-the-contracts-the-interpreter-cannot-run]]). The compiler has a
+history in exactly this code. A payload-parsing path is also where the two bugs
+already fixed today would have hidden: buffer slicing and placeholder layout.
+
+Next: call `verify-and-update-price-feeds` with that payload under both engines.
+It is a `contract-call?` with one buffer argument, so `xtask call-both` can ask
+it directly — minutes, not hours.
