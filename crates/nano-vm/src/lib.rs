@@ -925,19 +925,34 @@ impl Vm {
         self.store.ledger_at(block)
     }
 
-    /// Put back the tenure-start answers an earlier run recorded.
+    /// Stand on the tenure-start answers a block's committed ledger holds.
     ///
     /// `get-tenure-info?` reads these, and they live in memory, so a restart
     /// without them reports the first block it executes as its tenure's start.
-    /// First-write-wins as everywhere else, so this cannot overwrite an answer
-    /// the current run has already given.
-    pub fn restore_tenure_starts(&mut self, starts: impl IntoIterator<Item = (u32, u32)>) {
-        for (tenure_height, stacks_height) in starts {
-            self.context
-                .tenure_starts
-                .entry(tenure_height)
-                .or_insert(stacks_height);
-        }
+    ///
+    /// The map is *replaced* rather than merged, which matters for the other
+    /// caller: a fork switch stands on an ancestor whose ledger no longer names
+    /// the tenures the abandoned branch started, and merging would keep
+    /// answering for them. Two branches can genuinely disagree about the Stacks
+    /// height a tenure height started at, and this map is not keyed by branch —
+    /// so the only safe rule is that it says exactly what the block being stood
+    /// on says. Nothing else seeds it before a caller gets here: at open it is
+    /// empty, and at a fork switch every entry in it belongs to a chain this
+    /// node is leaving.
+    pub fn stand_on_tenure_starts(&mut self, starts: impl IntoIterator<Item = (u32, u32)>) {
+        self.context.tenure_starts = starts.into_iter().collect();
+    }
+
+    /// The Stacks height `get-tenure-info?` answers for a tenure height.
+    ///
+    /// Readable because this map and the ledger's are two copies of one fact —
+    /// one here because Clarity reads it while a block executes, one there
+    /// because it has to survive the process — and every bug in this area has
+    /// been the two disagreeing. A caller that can only read the durable copy
+    /// cannot tell whether the answer the chain *gives* moved with it.
+    #[must_use]
+    pub fn tenure_start_answer(&self, tenure_height: u32) -> Option<u32> {
+        self.context.tenure_starts.get(&tenure_height).copied()
     }
 
     /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.

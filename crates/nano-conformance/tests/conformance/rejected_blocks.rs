@@ -11,10 +11,17 @@
 //! So this rejects the same block many times over and asserts that everything
 //! the node keeps is byte-for-byte what it was before the first attempt.
 //!
-//! The captured chain is a weak witness on its own — its blocks carry no fees,
-//! so the accounting it moves is small — and it is the invariant that matters,
-//! not the size of the number. `mainnet_rollback` puts the same question to a
-//! block that does carry fees.
+//! This one is a weak witness on its own, and deliberately kept anyway. The
+//! captured checkpoint names no started tenure, so `add_fees` counts for nothing
+//! and the accounting a rejection here moves is zero — which means this test
+//! would have passed before the bug was fixed. It asserts the right invariant on
+//! the real replay path, and that is what it is for.
+//!
+//! The witness that bites on fees is `nano-chainstate`'s own
+//! `retrying_a_rejected_block_leaves_no_state_beside_the_marf`: it seeds earnings
+//! for the tenure the checkpoint stands in so the captured block's 300 uSTX
+//! actually land, and asserts the whole ledger, the accounting bytes a restart
+//! would read, and the absence of any header or state for the rejected block.
 
 use std::{fs, path::Path};
 

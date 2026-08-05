@@ -95,7 +95,7 @@ invisible: every root matched, and the state beside the roots was wrong.
 - [x] Guard it with a test that rejects the same block many times and asserts
       nothing moved.
 - [x] Repair tenure 251323 in the live state directory.
-- [ ] Find out whether earlier tenures were inflated by earlier retry loops, and
+- [x] Find out whether earlier tenures were inflated by earlier retry loops, and
       rebuild the accounting rather than patching it if so.
 - [x] Make the guard bite on fees, not only on the invariant.
 
@@ -114,8 +114,11 @@ is the right thing to assert and the test is worth keeping; it is not evidence
 that this particular bug is gone.
 
 The strong witness is a mainnet block, and running one needs the real checkpoint
-opened — minutes, not a unit test. That version was written and dropped rather
-than committed unverified.
+opened. Not minutes: `mainnet-capture/chainstate/checkpoint-H` is a 153 GB
+`marf.sqlite` beside 229 GB of blobs, and importing it is hours. That version was
+written and dropped rather than committed unverified, and it stays dropped — the
+fee-biting witness below is a unit test over the captured checkpoint instead, and
+the live evidence at the maturity boundary is what covers the mainnet shape.
 
 ## The live state is repaired but not proven
 
@@ -219,11 +222,46 @@ MARF and its side store churn pages for reasons that have nothing to do with
 this, so the durable assertions are the tip, the content root, the parent link
 and the presence or absence of a header and of block state.
 
+## No earlier tenure is inflated; eight are missing instead
+
+Read out of the live state's own ledger row — the durable accounting is a
+`chain_ledger` row now, not `accounting.json`, so the file dated before the last
+restart says nothing about what the node owes:
+
+```
+tenures 167, spanning 251220 .. 251394, started 251395
+missing: 251322 251323 251324 251325 251326 251327 251328 251329
+largest fees: 200,829,082 (251252), 195,807,293 (251225), 192,485,112 (251251)
+```
+
+No inflation is left. The retry loop's signature would be a fee total near
+649,365,101 uSTX — 1,417 × 458,250 — and the largest tenure in the whole window is
+200,829,082, in a distribution where 24–47 STX a tenure is ordinary. The unverified
+older tenures the earlier note worried about are unremarkable.
+
+The defect is the opposite shape. Tenure 251,323 is not corrupt any more, it is
+**gone**, along with the seven around it: the checkpoint artifact is contiguous
+251,220–251,321, the node began mid-tenure 251,323, and the catch-up rounds that
+would have recorded 251,324 onwards died before writing anything — which is exactly
+the crash hole [[057]] names, seen after the fact in the data it lost. The
+per-block ledger row makes that impossible from here on; it does not put back what
+was already lost.
+
+So the answer to this item is "rebuild, not patch", and the rebuild is
+[[048-carry-complete-mainnet-tenure-accounting]]'s: nothing subtracted, the window
+re-derived from the accepted chain. What this task adds is a deadline for it. The
+hole bites at the maturity of 251,322, which is tenure 251,422, and the live node
+had reached 251,395 — 27 tenures of execution that will be thrown away.
+`known_earnings_span` now reports the contiguous run rather than the outer pair, so
+a hole shortens the window instead of hiding inside it; the call site that still
+has to consult it on the resume path is named in [[057]].
+
 ## Still open
 
-- The live mainnet accounting is still the repaired file, not a rebuilt one; the
-  44 lost tenure records and the unverified older tenures are
-  [[048-carry-complete-mainnet-tenure-accounting]]'s.
-- Crash consistency between the sealed root and the accounting file is
-  [[057-commit-and-recover-accepted-block-state-atomically]], and its remaining
-  half needs changes outside `nano-chainstate` — see the inventory there.
+- The live mainnet accounting is still the repaired file's descendant, not a
+  rebuilt one. The eight lost tenure records above are
+  [[048-carry-complete-mainnet-tenure-accounting]]'s, and rebuilding them needs the
+  live replay stopped and `xtask rebuild-accounting` taught to write the ledger row
+  — the node no longer reads `accounting.json` once a block has sealed.
+- Crash consistency between the sealed root and everything beside it is
+  [[057-commit-and-recover-accepted-block-state-atomically]], now closed.
