@@ -184,3 +184,48 @@ one's.
 Still true and untouched: `nano-miner`'s
 `hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
 block header hash where it should match on the txid.
+
+## The other half of the leader key: what it signs with
+
+A leader-key registration binds two things — the VRF public key this task resolves
+and a block-signing `Hash160`. The first says who may produce the tenure's
+coinbase proof; the second says who may sign its blocks. Both come out of the same
+registration, and resolving one is resolving the other.
+
+So [[050]] added the second rule beside these:
+`nano_chainstate::verify_miner_signature` against
+`registered_signing_key_hash(operations, winner_vrf_public_key)`, keyed by VRF key
+because the burnchain refuses a VRF key that is already registered, so one key
+names one registration. It runs on the follow path, on every tenure-start block,
+and rejects rather than warns.
+
+The capture supplies an oracle that makes it more than self-consistent:
+`tenure_vrf_enforcement::the_winning_registration_names_the_key_that_signed_the_tenure`
+asserts that **the block-signing hash the winner registered on Bitcoin is the
+`Hash160` of the key that signed the first block of the tenure it won**. One side
+comes out of a Bitcoin transaction and the other out of a header signature; nano
+is asked for neither. That is the chain stating what the rule may assume.
+
+Two more things fell out of the same reading:
+
+- A tenure change has to name the miner that signed the header it travels in
+  (`check_tenure_tx`). That needs no burnchain input at all, so it is enforced
+  unconditionally — and it is what stops a tenure change being lifted out of a
+  competing miner's block.
+- The registration a sortition resolves through is usually *not* in the burn block
+  the tenure sits in: a leader key is registered once and reused. So the signing
+  hash has to travel with the sortition, the way `sortition_hash` and
+  `winner_vrf_public_key` already do — one 20-byte field on `SortitionSnapshot`
+  and one on `BitcoinBlockContext`, plus a line in `nano-node`'s
+  `local_sortition`, which resolves the registration already. Until then the node
+  reports, once a tenure, that it knows which key won and not what that key signs
+  with.
+
+Still true and still outside this task's files: `nano-node` keeps the
+`(candidates == 1)` hedge around `winner_vrf_public_key` that [[049]] made
+obsolete, so in production the winner is usually `None` and both the proof check
+and the signature check report rather than run. The hedge is a one-line removal.
+
+And still true from the note above: `nano-miner`'s
+`hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
+block header hash where it should match on the txid.

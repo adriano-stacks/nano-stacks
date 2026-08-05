@@ -1,4 +1,4 @@
-//! The follow path enforces the tenure VRF rules, rather than merely owning them.
+//! The follow path enforces what a tenure claims about winning its sortition.
 //!
 //! `verify_coinbase_vrf_proof` and `verify_committed_vrf_seed` were correct and
 //! unreachable: every captured tenure was checked against both in a test, and
@@ -9,6 +9,12 @@
 //!
 //! So these tests go through `ChainState::append_nakamoto_block_with_bitcoin_operations`
 //! and ask what it does, not what the rules would have said.
+//!
+//! The miner signature is here too, because it is the same claim from the other
+//! side. The VRF proof says the winning leader key produced this tenure's proof;
+//! the signature says the winning leader key's *other* half — the block-signing
+//! hash its registration carries — signed the block. Both resolve through the same
+//! registration, and the capture is what says they agree in the field.
 
 use std::{fs, path::Path};
 
@@ -42,7 +48,8 @@ fn captured_tenure() -> Option<Tenure> {
     for path in nano_conformance::captured_block_paths(&fixture) {
         let block = NakamotoBlock::decode(&fs::read(&path).ok()?).ok()?;
         let view = block.header.consensus_hash.to_string();
-        let (Some(context), Some(operations)) = (snapshots.get(&view), operations.get(&view)) else {
+        let (Some(context), Some(operations)) = (snapshots.get(&view), operations.get(&view))
+        else {
             continue;
         };
         let captured = Captured {
@@ -99,9 +106,45 @@ fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
         })
 }
 
+/// The leader-key registration that produced this tenure's coinbase proof.
+///
+/// Found the same way and with the same caveat as `winning_key`: by asking which
+/// registration's VRF key verifies the proof.
+fn winning_registration(tenure: &Tenure) -> Option<nano_bitcoin::BitcoinOperation> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let key = winning_key(tenure)?;
+    nano_conformance::captured_bitcoin_operations(&fixture)?
+        .values()
+        .flatten()
+        .find(|operation| {
+            matches!(
+                operation.kind,
+                nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                    vrf_public_key,
+                    ..
+                } if vrf_public_key == key
+            )
+        })
+        .cloned()
+}
+
 /// Execute one tenure-start block against a fresh checkpoint and say whether it
 /// was accepted.
 fn accepts(tenure: &Tenure, context: BitcoinBlockContext) -> Result<(), String> {
+    accepts_with(tenure, context, &tenure.target.operations)
+}
+
+/// The same, with the Bitcoin operations the tenure's burn block is said to hold.
+///
+/// A leader-key registration is reused across tenures, so the one a sortition
+/// resolves through sits in a burn block far below the tenure it decides — which
+/// is why the operations are a parameter here. A node that has that registration
+/// in front of it checks the miner signature; one that does not says so.
+fn accepts_with(
+    tenure: &Tenure,
+    context: BitcoinBlockContext,
+    operations: &[nano_bitcoin::BitcoinOperation],
+) -> Result<(), String> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     let (mut chainstate, source) = nano_conformance::replay_chainstate(&fixture)
         .map_err(|error| format!("open the checkpoint: {error}"))?;
@@ -120,7 +163,7 @@ fn accepts(tenure: &Tenure, context: BitcoinBlockContext) -> Result<(), String> 
     chainstate
         .append_nakamoto_block_with_bitcoin_operations(
             context,
-            &tenure.target.operations,
+            operations,
             parent,
             &tenure.target.block,
         )
@@ -197,4 +240,121 @@ fn an_unknown_leader_key_accepts_the_block_and_says_so() {
     let mut context = tenure.target.context;
     context.winner_vrf_public_key = None;
     accepts(&tenure, context).expect("an uncheckable proof is not a failed one");
+}
+
+/// The capture says the two halves of a leader key belong together.
+///
+/// The oracle for the miner-signature rule, and it needs no rule to state it: the
+/// registration that produced this tenure's VRF proof also carries a
+/// block-signing hash, and that hash is the `Hash160` of the key that signed the
+/// tenure's first block. Nothing in nano is consulted for either side — one comes
+/// out of a Bitcoin transaction, the other out of a header signature — so this is
+/// the chain itself saying what `verify_miner_signature` is allowed to assume.
+#[test]
+fn the_winning_registration_names_the_key_that_signed_the_tenure() {
+    let Some(tenure) = captured_tenure() else {
+        nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
+        return;
+    };
+    let Some(registration) = winning_registration(&tenure) else {
+        nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
+        return;
+    };
+    let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+        block_signing_key_hash: Some(signing_key_hash),
+        ..
+    } = registration.kind
+    else {
+        nano_conformance::skip_gate("the winning registration carries no block-signing key hash");
+        return;
+    };
+    let recovered = nano_chainstate::recovered_miner_key_hash(&tenure.target.block.header)
+        .expect("the tenure's miner signature recovers");
+    assert_eq!(
+        recovered,
+        nano_primitives::Hash160::from_bytes(signing_key_hash),
+        "the block-signing hash the winner registered on Bitcoin is the hash of the key \
+         that signed the first block of the tenure it won"
+    );
+}
+
+/// With the registration in front of it, the follow path checks the signature.
+///
+/// The acceptance half: the winning key, the registration that carries its
+/// block-signing hash, and the block the network accepted.
+#[test]
+fn a_tenure_signed_by_the_winning_miner_is_accepted() {
+    let Some(tenure) = captured_tenure() else {
+        nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
+        return;
+    };
+    let (Some(key), Some(registration)) = (winning_key(&tenure), winning_registration(&tenure))
+    else {
+        nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
+        return;
+    };
+    let mut context = tenure.target.context;
+    context.winner_vrf_public_key = Some(key);
+    let mut operations = tenure.target.operations.clone();
+    operations.push(registration);
+    accepts_with(&tenure, context, &operations).expect("the tenure the network accepted");
+}
+
+/// A registration naming another block-signing key rejects the block.
+///
+/// Everything else about the block is the captured one's, including the tenure
+/// change that names its own miner — so this is the rule that catches a miner
+/// which forged a whole coherent block for a sortition it did not win.
+#[test]
+fn a_tenure_signed_by_a_miner_that_did_not_win_is_rejected() {
+    let Some(tenure) = captured_tenure() else {
+        nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
+        return;
+    };
+    let (Some(key), Some(registration)) = (winning_key(&tenure), winning_registration(&tenure))
+    else {
+        nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
+        return;
+    };
+    let mut forged = registration;
+    let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+        block_signing_key_hash,
+        ..
+    } = &mut forged.kind
+    else {
+        unreachable!("the registration is a registration");
+    };
+    *block_signing_key_hash = Some([7; 20]);
+    let mut context = tenure.target.context;
+    context.winner_vrf_public_key = Some(key);
+    let mut operations = tenure.target.operations.clone();
+    operations.push(forged);
+    let error = accepts_with(&tenure, context, &operations)
+        .expect_err("a block signed by a miner that did not win must be rejected");
+    assert!(
+        error.contains("whose leader key won its sortition"),
+        "the rejection names the winner: {error}"
+    );
+}
+
+/// Without the registration the signature is unchecked, and that is said out loud.
+///
+/// The state a node is actually in today, on every tenure: it can name the
+/// winning leader key, and the burn block that registered that key is far below
+/// the operations it is handed, so there is no block-signing hash to check
+/// against. The block is accepted — there is nothing to check it against — and
+/// the difference between that and a signature that verified has to be visible.
+#[test]
+fn an_unregistered_signing_key_accepts_the_block_and_says_so() {
+    let Some(tenure) = captured_tenure() else {
+        nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
+        return;
+    };
+    let Some(key) = winning_key(&tenure) else {
+        nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
+        return;
+    };
+    let mut context = tenure.target.context;
+    context.winner_vrf_public_key = Some(key);
+    accepts(&tenure, context).expect("an uncheckable signature is not a failed one");
 }

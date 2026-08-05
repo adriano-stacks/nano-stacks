@@ -55,8 +55,7 @@ fn open(directory: &Path) -> (ChainState, [u8; 32]) {
             .to_owned()
     };
     let decode = |value: &str| -> [u8; 32] {
-        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice())
-            .expect("32 bytes")
+        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice()).expect("32 bytes")
     };
     let source = decode(&field("source_state_id"));
     let root = nano_primitives::TrieHash::from_bytes(decode(&field("published_state_index_root")));
@@ -410,6 +409,44 @@ fn a_restart_before_a_bitcoin_reorganization_retracts_the_same_suffix() {
     );
 }
 
+/// A captured tenure-start block as a *different* miner would have produced it.
+///
+/// One second later, its tenure change naming this miner, and no signatures on
+/// it: the state root and the miner signature are what assembling the block
+/// produces, and the signers have not seen it. Everything else — the tenure it
+/// claims, the parent it ends, the coinbase and its VRF proof — is the captured
+/// block's, because those are what the retraction test is about.
+fn competing_tenure(captured: &NakamotoBlock) -> (nano_crypto::StacksPrivateKey, NakamotoBlock) {
+    let miner = nano_crypto::StacksPrivateKey::from_seed(b"a competing miner");
+    let mut forked = captured.clone();
+    forked.header.timestamp += 1;
+    forked.header.signer_signatures.clear();
+    let payload = forked
+        .transactions
+        .iter()
+        .find_map(|transaction| match transaction.payload().data() {
+            nano_codec::TransactionPayloadData::TenureChange(payload) => Some(payload.clone()),
+            _ => None,
+        })
+        .expect("a tenure-start block carries a tenure change");
+    forked.transactions[0] = nano_codec::Transaction::sign_standard(
+        nano_codec::TransactionVersion::Testnet,
+        forked.transactions[0].chain_id(),
+        nano_codec::AnchorMode::OnChainOnly,
+        &miner,
+        0,
+        0,
+        nano_codec::TransactionPayloadData::TenureChange(nano_codec::TenureChangePayload {
+            public_key_hash: nano_primitives::hash160(&miner.public_key().to_bytes_compressed()),
+            ..payload
+        }),
+    )
+    .expect("the tenure change signs");
+    forked.header.transaction_merkle_root =
+        nano_codec::transaction_merkle_root(&forked.transactions);
+    (miner, forked)
+}
+
 /// Stand on the block before the last tenure and execute a competing tenure over
 /// it, as a heavier Stacks fork would, answering with what the chain computed.
 fn stacks_fork(
@@ -440,19 +477,29 @@ fn stacks_fork(
     // MARF refuses because that version already exists. Its committed seed is the
     // captured one, so it is accepted only if the retraction put back the proof of
     // the tenure *before* the one it gave up.
-    let mut forked = blocks[start].clone();
-    forked.header.timestamp += 1;
+    //
+    // *Mined* rather than edited, because the follow path now authenticates the
+    // signatures a block carries ([[050]]): the timestamp is in both signature
+    // preimages, so the captured miner signature over a changed header recovers
+    // to some other key and the captured signer signatures belong to a block
+    // hash that no longer exists. A candidate has neither yet — this node is
+    // building it — so it goes in the way a competing miner's would, with a
+    // tenure change naming the miner that signs the header.
+    let (miner, forked) = competing_tenure(&blocks[start]);
     let view = forked.header.consensus_hash.to_string();
     let contexts =
         nano_conformance::captured_bitcoin_snapshots(&fixtures()).expect("captured contexts");
     let operations =
         nano_conformance::captured_bitcoin_operations(&fixtures()).expect("captured operations");
-    let applied = chainstate
-        .execute_nakamoto_block_with_bitcoin_operations(
+    let (forked, applied) = chainstate
+        .assemble_nakamoto_block_with_bitcoin_operations(
             *contexts.get(&view).expect("the tenure's Bitcoin context"),
-            operations.get(&view).expect("the tenure's Bitcoin operations"),
+            operations
+                .get(&view)
+                .expect("the tenure's Bitcoin operations"),
             Some(ancestor),
-            &forked,
+            forked,
+            &miner,
         )
         .expect("the competing tenure is accepted over the ancestor it stands on");
     let forked_id = *forked.block_id().as_bytes();
@@ -526,7 +573,9 @@ fn a_retraction_leaves_the_disk_where_it_found_it() {
         "the deepest sealed block is still the abandoned one: a retraction deletes no state"
     );
     assert!(
-        reopened.recover_ledger_at(abandoned_tip).expect("read back"),
+        reopened
+            .recover_ledger_at(abandoned_tip)
+            .expect("read back"),
         "and the ledger it committed is still there to stand on"
     );
     assert_eq!(
