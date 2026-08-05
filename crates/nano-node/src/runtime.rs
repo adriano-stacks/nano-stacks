@@ -305,7 +305,7 @@ async fn follow(
     if let (Some(executor), Some(directory)) =
         (executor.as_ref(), config.checkpoint.sortition.as_ref())
     {
-        start_deriving_sortitions(executor, directory).await;
+        start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
     }
 
     // A state built before headers were kept has none, so the first block it
@@ -615,14 +615,17 @@ async fn backfill_one_header(
 
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries
 /// the history that makes it possible.
-async fn start_deriving_sortitions(executor: &SharedExecutor, directory: &Path) {
-    match SortitionTracker::from_capture(directory, PoxId::initial()) {
+async fn start_deriving_sortitions(executor: &SharedExecutor, capture: &Path, state: &Path) {
+    match SortitionTracker::resume_or_capture(state, capture, PoxId::initial()) {
         Ok(tracker) => {
             println!(
                 "deriving sortitions locally from burn {}",
                 tracker.tip().bitcoin_height
             );
-            executor.lock().await.track_sortitions(tracker);
+            executor
+                .lock()
+                .await
+                .track_sortitions(tracker, state.to_path_buf());
         }
         Err(error) => eprintln!("cannot derive sortitions locally: {error}"),
     }

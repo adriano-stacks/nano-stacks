@@ -80,22 +80,27 @@ the captured fixture rather than by stopping a live node and hoping. The
 remaining unchecked item is a deterministic harness for rate limits and short
 pages, which the live mainnet run exercises but no test yet pins.
 
-## Restart re-derives every sortition since the checkpoint
+## The derived sortition chain is written down now
 
-Measured, not suspected. Restarting the mainnet replay at executed height
-8,666,159 resumes the Clarity state instantly — `resuming … sealed at block
-701653fb…` — and then logs `deriving sortitions locally from burn 960219` and
-does no block work for minutes. The checkpoint's burn anchor is 960,231 and the
-burn tip is past 964,000, so that is roughly four thousand burn blocks fetched
-one at a time over the Bitcoin REST source, on every start.
+It was not, and a chain that is not written down is re-derived from the
+checkpoint's burn anchor on every start over a run that grows for as long as the
+chain does. `SortitionTracker::save` writes the tip and the whole consensus-hash
+history in the capture's own format, so `resume_or_capture` is the same loader
+either way and a saved chain cannot be read more loosely than a captured one. It
+is written as the chain advances rather than at shutdown, because a node that is
+killed is exactly the one that must not start over, and through a rename so a torn
+history and a tip that does not end it can never be left behind.
 
-The Clarity state is durable and the sortition chain is not, so the cost of a
-restart grows with the distance between the checkpoint and the burn tip — which
-grows forever. That is the same class of problem as the executed-tip item above:
-part of what a node knows is persisted and part is rebuilt, and the split is not
-where an operator would guess.
+**A correction, because an earlier version of this note got it wrong.** It said
+the minutes of silence after a restart *were* that re-derivation, measured. That
+was an inference from the last log line before the silence, and the code
+contradicts it: `check_local_sortition` returns early unless the peer's sortition
+is exactly one above the tracker's tip, and with the tracker seeded at burn
+960,219 while the replay executes under burn 960,25x that condition never holds —
+so the tracker was not being walked at all. The header backfill is not it either;
+it prints per ancestor and printed nothing. What the silence actually was is not
+yet measured, and measuring it needs a replay that is not stopped at a
+divergence, which this one is.
 
-`snapshots.json` in the capture shows what the persisted shape should hold, and
-`mainnet_sortition`'s `the_node_tracker_derives_the_same_window` already proves
-the derivation is right — so this is about keeping the answer, not about
-computing it.
+Persisting the chain is still right, and is done. Attributing minutes to it was
+not.

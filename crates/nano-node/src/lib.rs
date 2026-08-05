@@ -32,6 +32,8 @@ pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
     /// The sortitions this node derives for itself, when it has the history to.
     sortition: Option<crate::sortition::SortitionTracker>,
+    /// Where the derived chain is written down, so a restart resumes it.
+    sortition_state: Option<std::path::PathBuf>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -375,6 +377,7 @@ where
         Ok(Self {
             chainstate,
             sortition: None,
+            sortition_state: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
@@ -394,6 +397,7 @@ where
         Self {
             chainstate,
             sortition: None,
+            sortition_state: None,
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
@@ -764,8 +768,18 @@ where
         self.observers = Some(observers);
     }
 
-    pub fn track_sortitions(&mut self, tracker: crate::sortition::SortitionTracker) {
+    /// Take over a derived sortition chain, and say where to keep it.
+    ///
+    /// A chain that is not written down is re-derived from the checkpoint's burn
+    /// anchor on every start, one Bitcoin block fetch at a time, over a run that
+    /// grows for as long as the chain does.
+    pub fn track_sortitions(
+        &mut self,
+        tracker: crate::sortition::SortitionTracker,
+        state: std::path::PathBuf,
+    ) {
         self.sortition = Some(tracker);
+        self.sortition_state = Some(state);
     }
 
     /// Derive this block's sortition locally and say if it differs.
@@ -792,13 +806,29 @@ where
         let Ok(block) = self.bitcoin.block_at(peer.bitcoin_height) else {
             return;
         };
-        match tracker.advance(&block, burn_spent) {
-            Ok(derived) if derived.consensus_hash != peer.consensus_hash => eprintln!(
-                "locally derived consensus hash at burn {} is {} where the peer says {}",
-                peer.bitcoin_height, derived.consensus_hash, peer.consensus_hash
-            ),
-            Ok(_) => {}
-            Err(error) => eprintln!("deriving the sortition locally failed: {error}"),
+        let derived = match tracker.advance(&block, burn_spent) {
+            Ok(derived) => {
+                if derived.consensus_hash != peer.consensus_hash {
+                    eprintln!(
+                        "locally derived consensus hash at burn {} is {} where the peer says {}",
+                        peer.bitcoin_height, derived.consensus_hash, peer.consensus_hash
+                    );
+                }
+                true
+            }
+            Err(error) => {
+                eprintln!("deriving the sortition locally failed: {error}");
+                false
+            }
+        };
+        // Written down as it advances rather than at shutdown, because a node
+        // that is killed is exactly the one that must not start over.
+        if derived
+            && let (Some(tracker), Some(state)) =
+                (self.sortition.as_ref(), self.sortition_state.as_ref())
+            && let Err(error) = tracker.save(state)
+        {
+            eprintln!("the derived sortition chain could not be written down: {error}");
         }
     }
 

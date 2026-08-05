@@ -672,6 +672,16 @@ impl SnapshotChain {
         })
     }
 
+    /// Every consensus hash behind the tip, oldest first.
+    ///
+    /// This is what seeds a chain: `with_history` needs the whole run, because
+    /// `ConsensusHash::from_ops` mixes hashes at power-of-two offsets and a
+    /// truncated history derives a different one from there on.
+    #[must_use]
+    pub fn history(&self) -> &[ConsensusHash] {
+        &self.consensus_hashes
+    }
+
     #[must_use]
     pub fn tip(&self) -> &SortitionSnapshot {
         self.snapshots.last().expect("snapshot chain has genesis")

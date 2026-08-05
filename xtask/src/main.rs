@@ -31,13 +31,14 @@ fn main() -> ExitCode {
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("eval") => eval_in_state(&env::args().skip(2).collect::<Vec<_>>()),
         Some("state-value") => state_value(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("snapshot-state") => snapshot_state(&env::args().skip(2).collect::<Vec<_>>()),
         Some("backfill-header") => backfill_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|call-both-tx|heal-contracts>"
+                "usage: cargo xtask <scoreboard|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -1709,6 +1710,78 @@ fn dump_refused_wasm() {
         }
         Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
         Err(error) => eprintln!("cannot read the module: {error}"),
+    }
+}
+
+/// Copy a node's state directory in seconds, so an experiment is reversible.
+///
+/// This is the feedback loop, not a convenience. Importing a mainnet checkpoint
+/// costs about four and a half hours, and until now that was the price of any
+/// change that turned out to corrupt a state — so the cautious move was to not
+/// try things, which is the worst possible effect on a divergence hunt.
+///
+/// On a copy-on-write filesystem the copy is a reflink: 33 GB in three seconds,
+/// sharing every block until one side writes. Refused rather than silently
+/// downgraded when the filesystem cannot do it, because a fallback that quietly
+/// costs 33 GB and several minutes is a decision the operator should make.
+fn snapshot_state(arguments: &[String]) -> ExitCode {
+    let [source, destination] = arguments else {
+        eprintln!(
+            "usage: cargo xtask snapshot-state <state-dir> <destination>\n\
+             the node must not be running: a half-written sqlite page copies as one"
+        );
+        return ExitCode::FAILURE;
+    };
+    let (source, destination) = (Path::new(source), Path::new(destination));
+    if !source.join("chainstate").is_dir() {
+        eprintln!("{} does not hold a chainstate", source.display());
+        return ExitCode::FAILURE;
+    }
+    if destination.exists() {
+        eprintln!(
+            "{} already exists; a snapshot never overwrites one",
+            destination.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // A `-wal` beside the database means the node is running or was killed, and
+    // either way the copy would be of a state nothing has committed.
+    for stray in ["chainstate/marf.sqlite-wal", "chainstate/clarity.sqlite-wal"] {
+        let path = source.join(stray);
+        if path.metadata().is_ok_and(|data| data.len() > 0) {
+            eprintln!(
+                "{} has uncommitted pages: stop the node before snapshotting it",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg("--reflink=always")
+        .arg(source)
+        .arg(destination)
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            println!("{} is now a snapshot of {}", destination.display(), source.display());
+            println!(
+                "it shares every block with the original until one of them is written to, \
+                 so it costs no disk until it diverges"
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!(
+                "this filesystem cannot reflink, so the copy would be a real 33 GB one. \
+                 Run `cp -a` yourself if that is what you want."
+            );
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("cannot run cp: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

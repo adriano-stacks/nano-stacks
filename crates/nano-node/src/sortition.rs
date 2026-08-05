@@ -19,7 +19,7 @@ use nano_sortition::{
     LeaderKeys, PoxId, SnapshotChain, SortitionError, SortitionSnapshot, SortitionWinner,
     commit_lands_in_block,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Why a locally derived sortition chain could not be started or advanced.
 #[derive(Debug)]
@@ -46,7 +46,7 @@ impl From<SortitionError> for TrackerError {
 }
 
 /// The consensus-hash history a checkpoint carries.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct History {
     hashes: Vec<String>,
 }
@@ -206,7 +206,7 @@ const fn commit_lands_in_block_of(
 }
 
 /// A snapshot a capture holds, in the fields a seed needs.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CapturedSnapshot {
     block_height: u64,
     burn_header_hash: String,
@@ -222,6 +222,76 @@ impl SortitionTracker {
     /// The `PoX` history is taken from the seed's own sortition identifier,
     /// which is the burn header hash and that bit vector hashed together — so
     /// the capture states it rather than a node guessing.
+    /// Resume from a state directory this tracker saved itself into, or start
+    /// from the capture the checkpoint came with.
+    ///
+    /// Deriving a sortition costs a Bitcoin block fetch, and the run from a
+    /// checkpoint's anchor to the burn tip grows for as long as the chain does —
+    /// so a node that re-derived on every start spent minutes before executing
+    /// anything, and would spend longer every week. The derivation is what has to
+    /// be local; keeping the answer is free.
+    ///
+    /// The saved form is the capture's own, so this is the same loader either way
+    /// and a saved chain cannot be read more loosely than a captured one.
+    pub fn resume_or_capture(
+        state: &Path,
+        capture: &Path,
+        pox_id: PoxId,
+    ) -> Result<Self, TrackerError> {
+        match Self::from_capture(state, pox_id.clone()) {
+            Ok(tracker) => Ok(tracker),
+            Err(saved) => Self::from_capture(capture, pox_id).map_err(|captured| {
+                TrackerError::Seed(format!(
+                    "neither the saved sortitions ({saved}) nor the capture ({captured}) \
+                     can seed a chain"
+                ))
+            }),
+        }
+    }
+
+    /// Write the chain down, so the next start resumes instead of re-deriving.
+    ///
+    /// Only the tip is written: a chain is seeded by the snapshot its history ends
+    /// at, and every snapshot before it has already done its work. The history
+    /// goes whole, because `ConsensusHash::from_ops` mixes hashes at power-of-two
+    /// offsets and a truncated one derives different hashes from there on.
+    pub fn save(&self, directory: &Path) -> Result<(), TrackerError> {
+        let write = |name: &str, bytes: Vec<u8>| -> Result<(), TrackerError> {
+            let path = directory.join(name);
+            let temporary = directory.join(format!("{name}.partial"));
+            // Two files that have to agree, so neither is left half-written: a
+            // torn history and a tip that does not end it seed nothing, and the
+            // node would fall back to the capture and re-derive in silence.
+            fs::write(&temporary, bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
+            fs::rename(&temporary, &path).map_err(|error| TrackerError::Seed(error.to_string()))
+        };
+        let tip = self.chain.tip();
+        let snapshots = vec![CapturedSnapshot {
+            block_height: tip.bitcoin_height,
+            burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
+            sortition_id: hex::encode(tip.sortition_id.as_bytes()),
+            consensus_hash: tip.consensus_hash.to_string(),
+            sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
+            total_burn: tip.total_burn.to_string(),
+        }];
+        let history = History {
+            hashes: self
+                .chain
+                .history()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        };
+        write(
+            "consensus-hashes.json",
+            serde_json::to_vec(&history).map_err(|error| TrackerError::Seed(error.to_string()))?,
+        )?;
+        write(
+            "snapshots.json",
+            serde_json::to_vec(&snapshots).map_err(|error| TrackerError::Seed(error.to_string()))?,
+        )
+    }
+
     pub fn from_capture(directory: &Path, pox_id: PoxId) -> Result<Self, TrackerError> {
         let bytes = fs::read(directory.join("snapshots.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;

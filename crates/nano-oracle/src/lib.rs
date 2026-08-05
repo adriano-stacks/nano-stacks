@@ -60,11 +60,14 @@ pub fn defined_functions(
     use clarity::vm::representations::SymbolicExpressionType::{Atom, List};
     let epoch = epoch_for_version(version);
     let mut tracker = LimitedCostTracker::new_free();
-    let Ok(parsed) = clarity::vm::ast::parse(contract, source, version, epoch) else {
+    // `build_ast` rather than `ast::parse`: the latter is gated on
+    // `clarity/testing`, and this crate must not need a feature that Cargo would
+    // unify into every binary built beside it.
+    let Ok(parsed) = build_ast(contract, source, &mut tracker.clone(), version, epoch) else {
         return HashMap::new();
     };
     let mut functions = HashMap::new();
-    for expression in &parsed {
+    for expression in &parsed.expressions {
         let List(form) = &expression.expr else {
             continue;
         };

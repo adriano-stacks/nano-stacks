@@ -15,6 +15,26 @@
 
 use std::process::Command;
 
+/// The crates the shipped `stacks-node` is built from.
+const PRODUCTION: [&str; 16] = [
+    "nano-primitives",
+    "nano-crypto",
+    "nano-address",
+    "nano-codec",
+    "nano-bitcoin",
+    "nano-sortition",
+    "nano-marf",
+    "nano-mempool",
+    "nano-vm",
+    "nano-chainstate",
+    "nano-sync",
+    "nano-stackerdb",
+    "nano-signer",
+    "nano-miner",
+    "nano-rpc",
+    "nano-node",
+];
+
 fn workspace() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -77,6 +97,37 @@ fn the_node_links_no_reference_node_crate() {
              something nano implements itself"
         );
     }
+}
+
+/// Every production crate builds on its own, without a dev-dependency's features.
+///
+/// `cargo build --workspace --all-targets` unifies features across everything it
+/// builds, so `nano-conformance`'s `stackslib = { features = ["testing"] }` was
+/// quietly making `clarity/testing` available to crates that must not need it —
+/// and a whole-workspace build reported clean while `cargo build -p xtask` did
+/// not. Building each production crate alone is what actually asks the question.
+#[test]
+fn the_production_closure_compiles_without_a_dev_dependencys_features() {
+    // One `cargo check` over exactly the production crates: features unify across
+    // a build graph, and a graph containing only these crates is one no
+    // dev-dependency can reach into. `check` rather than `build` because the
+    // question is whether it compiles, and a release build of all sixteen took
+    // four minutes — a gate against a slow loop should not be the slow part of it.
+    let mut command = Command::new(env!("CARGO"));
+    command.arg("check").arg("--all-targets");
+    for crate_name in PRODUCTION {
+        command.arg("--package").arg(crate_name);
+    }
+    let output = command
+        .current_dir(workspace())
+        .output()
+        .expect("cargo check runs");
+    assert!(
+        output.status.success(),
+        "the production crates do not compile on their own, so one of them depends \
+         on a feature something else in the workspace turns on:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The oracles are still available where they belong.
