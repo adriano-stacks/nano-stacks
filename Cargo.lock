@@ -2569,6 +2569,7 @@ dependencies = [
  "nano-vm",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
