@@ -198,9 +198,6 @@ pub enum SessionError {
     /// The peer sent a self-inconsistent Bitcoin view: the stable height must be
     /// exactly [`crate::wire::STABLE_CONFIRMATIONS`] below the tip.
     InconsistentView,
-    /// The peer sent more unsolicited messages than a reply is worth waiting
-    /// through.
-    TooChatty,
 }
 
 impl std::fmt::Display for SessionError {
@@ -229,7 +226,6 @@ impl std::fmt::Display for SessionError {
             Self::InconsistentView => {
                 formatter.write_str("peer's stable Bitcoin height does not follow its tip")
             }
-            Self::TooChatty => formatter.write_str("peer flooded rather than answering"),
         }
     }
 }
@@ -257,6 +253,14 @@ impl SessionError {
     ///
     /// A `Nack` is neither: it is an answer, and refusing a request is something an
     /// honest peer does constantly.
+    ///
+    /// **Volume is not a fault, and used to be.** A session once isolated a peer
+    /// that interleaved more than thirty-two unsolicited messages before a reply,
+    /// which read as flooding and was in fact mainnet working: the running node
+    /// reads a peer only when it wants something, so fifty seconds of ordinary
+    /// relay output — signer chunks, pushed blocks, relayed transactions — arrived
+    /// inside one ping's window. `tests/live_unsolicited.rs` counted it, and it
+    /// isolated the *busiest* peers first, which is precisely backwards.
     #[must_use]
     pub const fn is_protocol_fault(&self) -> bool {
         match self {
@@ -265,7 +269,6 @@ impl SessionError {
             | Self::InconsistentView
             | Self::WrongNetwork { .. }
             | Self::StaleEpoch(_)
-            | Self::TooChatty
             | Self::UnexpectedReply(_) => true,
             Self::Io(_) | Self::Timeout | Self::HandshakeRejected | Self::Nack(_) => false,
         }
@@ -284,12 +287,20 @@ impl From<WireError> for SessionError {
     }
 }
 
-/// How many unsolicited messages a peer may interleave before a reply.
+/// How many pushed messages one session holds for its caller.
 ///
-/// A peer legitimately pushes blocks and relays transactions while we are
-/// waiting, so this cannot be zero; a peer that never gets to the reply is
-/// either broken or stalling us, and either way it is not worth reading forever.
-const MAX_UNSOLICITED_PER_REQUEST: usize = 32;
+/// The peer decides how much it pushes and this node decides how often it
+/// collects, so the buffer needs a bound that is nobody's choice but ours. Beyond
+/// it the oldest are dropped and counted: a relayed transaction or signer chunk
+/// that nano missed will be pushed again by another peer, while a queue that grows
+/// with a peer's output is memory the peer gets to choose.
+const MAX_BUFFERED_PUSHES: usize = 256;
+
+/// How much to ask the socket for in one read.
+///
+/// Only a buffering hint — a message may be up to 16 MB and is assembled across
+/// as many reads as it takes.
+const READ_CHUNK: usize = 16 * 1024;
 
 /// A framed connection, which knows how to speak the protocol but not yet to
 /// whom.
@@ -301,7 +312,15 @@ const MAX_UNSOLICITED_PER_REQUEST: usize = 32;
 pub(crate) struct Framed {
     stream: TcpStream,
     protocol: Protocol,
-    private_key: StacksPrivateKey,
+    local: LocalPeer,
+    /// What to answer a peer's own requests with, when this node serves anything.
+    ///
+    /// Optional because a session is useful without it — a node still catching up
+    /// has nothing to serve — and shared because the same answers go to a peer that
+    /// dialled us and a peer we dialled. This protocol is symmetric once the
+    /// handshake is done, and treating it as request/reply in one direction only is
+    /// what left the running node counting a stock peer's `Ping` as unsolicited.
+    service: Option<std::sync::Arc<dyn crate::inbound::Service>>,
     pub(crate) view: ChainView,
     timeout: Duration,
     seq: u32,
@@ -312,6 +331,19 @@ pub(crate) struct Framed {
     remote_view: Option<ChainView>,
     pushed: Vec<Message>,
     unhandled: u64,
+    /// Bytes read from the socket that do not yet make a whole message.
+    ///
+    /// Everything goes through this because `AsyncReadExt::read_exact` is not
+    /// cancel-safe: a deadline expiring part-way through a message consumes bytes
+    /// and loses them, leaving the stream out of frame for good. That is fine when
+    /// the only response to a timeout is to throw the session away, and fatal for
+    /// [`Framed::drain`], whose whole job is to read what is there, stop, and carry
+    /// on using the connection.
+    buffer: Vec<u8>,
+    /// Pushes discarded because [`MAX_BUFFERED_PUSHES`] was reached.
+    dropped_pushes: u64,
+    /// Unsolicited messages handled since a caller last asked, answered or kept.
+    unsolicited: usize,
 }
 
 impl Framed {
@@ -325,7 +357,8 @@ impl Framed {
         Self {
             stream,
             protocol,
-            private_key: local.private_key.clone(),
+            local: local.clone(),
+            service: None,
             view,
             timeout,
             seq: initial_seq(),
@@ -333,6 +366,9 @@ impl Framed {
             remote_view: None,
             pushed: Vec::new(),
             unhandled: 0,
+            buffer: Vec::new(),
+            dropped_pushes: 0,
+            unsolicited: 0,
         }
     }
 
@@ -347,34 +383,159 @@ impl Framed {
             &self.view,
             seq,
             payload,
-            &self.private_key,
+            &self.local.private_key,
         )?;
         deadline(self.timeout, self.stream.write_all(&message.encode())).await??;
         Ok(())
     }
 
     /// Send a message and read until the reply to it arrives.
+    ///
+    /// Bounded by one overall deadline rather than by a count of the messages that
+    /// arrive first. The count bound was the bug behind mainnet isolating half its
+    /// peers: a peer relaying at mainnet's ordinary rate crosses any fixed count if
+    /// nano waits long enough between rounds, so the *volume* of unsolicited traffic
+    /// says nothing about the peer. What does say something is a peer that lets the
+    /// deadline pass without answering, and that comes back as a `Timeout` — a
+    /// backoff rather than an isolation, because a slow peer is nearly always a busy
+    /// one.
     async fn request(&mut self, payload: Payload) -> Result<Message, SessionError> {
+        // Anything the peer already sent is handled first, so the window this
+        // request has to read through spans a round trip rather than however long it
+        // has been since the last one.
+        self.drain().await?;
         let seq = self.next_seq();
         self.send(seq, payload).await?;
-        for _ in 0..=MAX_UNSOLICITED_PER_REQUEST {
-            let message = self.read().await?;
+        let until = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let message = self.read_until(until).await?;
             if message.preamble.seq == seq {
                 if let Payload::Nack(code) = message.payload {
                     return Err(SessionError::Nack(code));
                 }
                 return Ok(message);
             }
-            self.pushed.push(message);
+            self.handle_unsolicited(message).await?;
         }
-        Err(SessionError::TooChatty)
     }
 
-    /// Read one message: a fixed preamble, then the frame it announces.
+    /// Read one message, waiting no later than `until` for it.
+    async fn read_until(
+        &mut self,
+        until: tokio::time::Instant,
+    ) -> Result<Message, SessionError> {
+        loop {
+            if let Some(message) = self.take_message()? {
+                return Ok(message);
+            }
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SessionError::Timeout);
+            }
+            self.fill(remaining).await?;
+        }
+    }
+
+    /// Read one message with this session's ordinary deadline.
     pub(crate) async fn read(&mut self) -> Result<Message, SessionError> {
-        let mut header = [0; PREAMBLE_LEN];
-        deadline(self.timeout, self.stream.read_exact(&mut header)).await??;
-        let preamble = Preamble::decode(&header)?;
+        self.read_until(tokio::time::Instant::now() + self.timeout)
+            .await
+    }
+
+    /// Collect everything the peer has already sent, without waiting for more.
+    ///
+    /// This is what keeps a peer's pushes out of the next request's way. Nano reads
+    /// a session only when it wants something, so without it fifty seconds of
+    /// mainnet relay traffic sits in the kernel receive buffer and is all read inside
+    /// one ping — which is what the old count bound mistook for a flood.
+    ///
+    /// It never waits for the peer to *send* — `try_read` returns rather than
+    /// blocking, so "the peer has nothing queued" and "the peer is slow" cannot be
+    /// confused. It may wait to write a reply, because a request the peer is holding
+    /// open is exactly what this is for.
+    pub(crate) async fn drain(&mut self) -> Result<(), SessionError> {
+        loop {
+            while let Some(message) = self.take_message()? {
+                self.handle_unsolicited(message).await?;
+            }
+            let held = self.reserve();
+            let outcome = self.stream.try_read(&mut self.buffer[held..]);
+            self.buffer.truncate(held + outcome.as_ref().copied().unwrap_or(0));
+            match outcome {
+                // A clean close is not an error here: whatever the peer managed to
+                // send is still worth having, and the next read will report the end.
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(SessionError::Io(error)),
+            }
+        }
+    }
+
+    /// Deal with a message the caller did not ask for: answer it if the peer is
+    /// waiting on one, and otherwise keep it for the caller.
+    ///
+    /// The distinction is the whole of what was missing. A pushed block, a relayed
+    /// transaction and a signer chunk are announcements — measured at 0.2 to 0.8 a
+    /// second per mainnet peer — and dropping them costs nothing but timeliness. A
+    /// `Ping`, a `Handshake`, a `NatPunchRequest` or an inventory request is a peer
+    /// blocked on us, and dropping *those* is how a node stops being a peer other
+    /// nodes keep.
+    async fn handle_unsolicited(&mut self, message: Message) -> Result<(), SessionError> {
+        self.unsolicited = self.unsolicited.saturating_add(1);
+        let seq = message.preamble.seq;
+        let reply = match &message.payload {
+            // Answered from memory, and identical in both directions.
+            Payload::Ping(nonce) => Some(Payload::Pong(*nonce)),
+            // A nat punch is answered whether or not this node serves anything: all
+            // it discloses is the address we see the peer at, which is what it asked.
+            Payload::NatPunchRequest(nonce) => {
+                let from = self.stream.peer_addr()?;
+                Some(Payload::NatPunchReply(crate::wire::NatPunch {
+                    address: PeerAddress::from_ip(from.ip()),
+                    port: from.port(),
+                    nonce: *nonce,
+                }))
+            }
+            // A peer re-handshakes to refresh what it knows about us, and stock nodes
+            // do it as part of a neighbour walk. The key it announces has to be the
+            // key that signed it, and once it is, later messages are judged against
+            // it — a peer that rotates its key otherwise fails authentication on its
+            // next message, which would isolate it for having restarted.
+            //
+            // What is deliberately *not* updated is `Session::remote`: the endpoint
+            // and services this node fetches from stay the ones from the handshake it
+            // dialled into, so a peer cannot redirect our fetches mid-conversation.
+            Payload::Handshake(handshake) => {
+                let key = StacksPublicKey::from_bytes(&handshake.public_key)
+                    .map_err(|error| SessionError::Wire(crate::wire::WireError::Signature(error)))?;
+                if message.verify(&key).is_err() {
+                    return Err(SessionError::Unauthenticated);
+                }
+                self.peer_key = Some(key);
+                Some(Payload::HandshakeAccept(crate::wire::HandshakeAccept {
+                    handshake: self.local.announce(),
+                    heartbeat_interval: crate::inbound::HEARTBEAT_INTERVAL_SECS,
+                }))
+            }
+            payload => self
+                .service
+                .as_ref()
+                .and_then(|service| crate::inbound::answer_request(payload, service.as_ref())),
+        };
+        if let Some(reply) = reply {
+            return self.send(seq, reply).await;
+        }
+        self.buffer_push(message);
+        Ok(())
+    }
+
+    /// Take one whole message out of the buffer, if there is one.
+    fn take_message(&mut self) -> Result<Option<Message>, SessionError> {
+        let Some(header) = self.buffer.get(..PREAMBLE_LEN) else {
+            return Ok(None);
+        };
+        let preamble = Preamble::decode(header)?;
         if !self.protocol.accepts(&preamble) {
             return Err(SessionError::WrongNetwork {
                 peer_version: preamble.peer_version,
@@ -384,13 +545,69 @@ impl Framed {
         if !self.protocol.epoch_is_current(&preamble) {
             return Err(SessionError::StaleEpoch(preamble.peer_version));
         }
-        // `Preamble::decode` has already bounded `payload_len`, so this
-        // allocation is bounded by the protocol rather than by the peer.
-        let mut frame = vec![0; preamble.payload_len as usize];
-        deadline(self.timeout, self.stream.read_exact(&mut frame)).await??;
+        // `Preamble::decode` has already bounded `payload_len`, so the length added
+        // here is bounded by the protocol rather than by the peer.
+        let total = PREAMBLE_LEN + preamble.payload_len as usize;
+        if self.buffer.len() < total {
+            return Ok(None);
+        }
+        let rest = self.buffer.split_off(total);
+        let frame = std::mem::replace(&mut self.buffer, rest).split_off(PREAMBLE_LEN);
         let message = Message::decode(preamble, frame)?;
         self.observe(&message)?;
-        Ok(message)
+        Ok(Some(message))
+    }
+
+    /// Wait for more bytes from the peer.
+    ///
+    /// One `read` rather than a `read_exact`, because a single read is cancel-safe:
+    /// if the deadline expires the future is dropped without having consumed
+    /// anything, which is what lets a timeout leave the stream usable.
+    async fn fill(&mut self, timeout: Duration) -> Result<(), SessionError> {
+        let held = self.reserve();
+        let outcome = deadline(timeout, self.stream.read(&mut self.buffer[held..])).await;
+        // Whatever happened, the room made above stops being part of the message
+        // stream: left in, its zeroes would be read as the next preamble.
+        let read = match outcome {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                self.buffer.truncate(held);
+                return Err(SessionError::Io(error));
+            }
+            Err(error) => {
+                self.buffer.truncate(held);
+                return Err(error);
+            }
+        };
+        self.buffer.truncate(held + read);
+        if read == 0 {
+            return Err(SessionError::Io(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Make room in the buffer for one read, and say where it starts.
+    ///
+    /// Reads land straight in the buffer rather than in a stack array, because a
+    /// [`READ_CHUNK`]-sized local inside an `async fn` becomes part of every future
+    /// that awaits it — clippy's `large_futures` measured sixteen kilobytes per
+    /// session future, which is real memory once there are eight of them nested
+    /// inside a swarm round.
+    fn reserve(&mut self) -> usize {
+        let held = self.buffer.len();
+        self.buffer.resize(held + READ_CHUNK, 0);
+        held
+    }
+
+    /// Hold a message the caller did not ask for, up to the buffer's bound.
+    fn buffer_push(&mut self, message: Message) {
+        if self.pushed.len() >= MAX_BUFFERED_PUSHES {
+            self.pushed.remove(0);
+            self.dropped_pushes = self.dropped_pushes.saturating_add(1);
+        }
+        self.pushed.push(message);
     }
 
     /// Apply the per-message checks that are about the peer rather than the bytes.
@@ -543,11 +760,48 @@ impl Session {
         self.framed.view = view;
     }
 
+    /// Answer this peer's own requests from `service` for the rest of the session.
+    ///
+    /// Without one, a `GetNeighbors` or `GetNakamotoInv` from a peer nano dialled is
+    /// read and dropped — which is correct for a node that has nothing to serve and
+    /// wrong for one that does.
+    pub fn serving(&mut self, service: std::sync::Arc<dyn crate::inbound::Service>) {
+        self.framed.service = Some(service);
+    }
+
     /// Take the messages that arrived unsolicited, so a caller can feed pushed
     /// blocks and relayed transactions through its own validation.
     #[must_use]
     pub fn take_pushed(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.framed.pushed)
+    }
+
+    /// Collect what the peer has sent since we last looked, without waiting.
+    ///
+    /// A caller that only ever requests would leave a peer's pushes in the socket
+    /// until the next request read them; on mainnet that is tens of signer chunks and
+    /// pushed blocks per round, which is both a full receive window and a caller that
+    /// hears about a block late.
+    pub async fn collect(&mut self) -> Result<(), SessionError> {
+        self.framed.drain().await
+    }
+
+    /// How many unsolicited messages this session has dealt with since last asked.
+    ///
+    /// Read-and-reset, so a caller that asks once a round gets that round's number
+    /// without anything having to remember a previous total per peer. It counts the
+    /// requests answered as well as the pushes kept, because both are work a peer
+    /// asked of this node without being asked.
+    pub const fn take_unsolicited_count(&mut self) -> usize {
+        std::mem::replace(&mut self.framed.unsolicited, 0)
+    }
+
+    /// How many pushes were discarded because the caller did not collect fast
+    /// enough. Non-zero means this node is dropping relayed data, not that the peer
+    /// did anything wrong.
+    #[must_use]
+    pub const fn dropped_pushes(&self) -> u64 {
+        self.framed.dropped_pushes
     }
 
     /// Prove the peer is still there, and that it is still the same peer.

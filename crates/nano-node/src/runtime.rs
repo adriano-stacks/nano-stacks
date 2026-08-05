@@ -1633,14 +1633,22 @@ async fn peer_discovery(
                 round.connected, round.dialled, round.dropped, round.isolated, round.learned
             );
         }
-        // Everything peers pushed while we were asking them things. Counted and
-        // dropped, because acting on a pushed block means putting it through staging
-        // and the authenticated selection boundary, and doing it from here would be
-        // the one place in this crate that trusted a peer. Named as the next slice
-        // in task 054.
+        // Everything peers said unprompted. The count used to be reported as
+        // "unsolicited messages dropped", which was two mistakes in one phrase: they
+        // are announcements a peer is *supposed* to send — mainnet's are almost all
+        // signer chunks, at up to 0.8 a second per peer — and counting enough of them
+        // as misbehaviour is what was isolating four peers in seven.
+        //
+        // Pushed blocks and transactions are still dropped here, because acting on
+        // one means putting it through staging and the authenticated selection
+        // boundary, and doing it from this loop would be the one place that trusted a
+        // peer. That is the relay item in task 054.
         let pushed = swarm.take_pushed().len();
-        if pushed > 0 {
-            println!("p2p: {pushed} unsolicited messages dropped");
+        if round.collected > 0 {
+            println!(
+                "p2p: {} messages peers sent unprompted, {pushed} of them pushed data",
+                round.collected
+            );
         }
     }
 }

@@ -89,6 +89,9 @@ pub struct Round {
     pub isolated: usize,
     /// Addresses learned from a neighbour walk.
     pub learned: usize,
+    /// Messages peers sent unprompted and this round collected: pushed blocks,
+    /// relayed transactions, signer chunks, and the requests that were answered.
+    pub collected: usize,
 }
 
 /// One live outbound peer.
@@ -234,6 +237,8 @@ pub struct Swarm {
     limits: SwarmLimits,
     connected: Vec<Connected>,
     discovered: Discovered,
+    /// What to answer a peer's own requests with, when this node serves anything.
+    service: Option<Arc<dyn crate::inbound::Service>>,
     /// Which session to ask for neighbours next, so the walk moves around rather
     /// than learning one peer's whole view of the network and stopping.
     walk_cursor: usize,
@@ -255,8 +260,21 @@ impl Swarm {
             limits,
             connected: Vec::new(),
             discovered: Discovered::default(),
+            service: None,
             walk_cursor: 0,
         }
+    }
+
+    /// Answer the requests peers send on the connections *this node opened*.
+    ///
+    /// The same `Service` the listener answers with, because the protocol is
+    /// symmetric once handshook: a stock node that nano dialled will ask nano for
+    /// neighbours and inventories on that same socket, and a node that only answered
+    /// the connections dialled *to* it is invisible to every peer behind a NAT.
+    #[must_use]
+    pub fn serving(mut self, service: Arc<dyn crate::inbound::Service>) -> Self {
+        self.service = Some(service);
+        self
     }
 
     /// The handle the rest of the node reads while this runs.
@@ -302,9 +320,30 @@ impl Swarm {
         self.check_liveness(view, &mut round).await;
         self.dial_up_to_strength(view, &mut round).await;
         round.learned = self.walk_neighbors().await;
+        round.collected = self.collect().await;
         round.connected = self.connected.len();
         self.publish();
         round
+    }
+
+    /// Read what every peer said while we were not listening.
+    ///
+    /// The round ends here rather than beginning here, so a peer dialled *this* round
+    /// is read too. It matters that this happens at all: a session nobody reads
+    /// accumulates whatever the peer relays, and mainnet relays between 0.2 and 0.8
+    /// messages a second per peer — enough that fifty seconds of not listening looks
+    /// like a flood, which is what nano used to mistake it for.
+    async fn collect(&mut self) -> usize {
+        let mut faults = Vec::new();
+        let mut collected = 0;
+        for (index, peer) in self.connected.iter_mut().enumerate() {
+            if let Err(error) = peer.session.collect().await {
+                faults.push((index, error));
+            }
+            collected += peer.session.take_unsolicited_count();
+        }
+        self.retire(&faults);
+        collected
     }
 
     /// Ping every session, and act on whichever ones do not answer.
@@ -357,7 +396,10 @@ impl Swarm {
             )
             .await;
             match dialled {
-                Ok(session) => {
+                Ok(mut session) => {
+                    if let Some(service) = &self.service {
+                        session.serving(service.clone());
+                    }
                     // A completed handshake is the only thing that proves a key, so
                     // it is the only thing allowed to write one down.
                     let _ = self.peers.record_handshake(
