@@ -460,3 +460,22 @@ with `NANO_REQUIRE_MAINNET=1` and the mainnet capture present (156 ok, 6 failed,
 the same six gates failing on the same `skip_gate` panic for the same missing environment
 variable). `skip_gate` still panics rather than reporting green, which is the whole reason it
 exists.
+
+
+## The remaining test-execution cost is one gate, deliberately kept
+
+With 28 targets merged into one, `cargo test -p nano-conformance` spends nearly all
+its time in a single test: `release_dependencies`'s
+`the_production_closure_compiles_without_a_dev_dependencys_features`, which shells
+out to `cargo check` over the sixteen production crates. About 16 s of a 20 s run.
+
+That is not an oversight and it is not worth optimising away. Feature unification
+across a build graph is invisible to inspection — the bug it was written for made
+`cargo build --all-targets` report clean while `cargo build -p xtask` failed, and
+put the reference crates' *test* behaviour into a binary whose whole job is to
+observe mainnet. Nothing short of asking cargo actually knows.
+
+It was already cut once, from 243 s to 16 s, by using `check` over exactly the
+production crates rather than a release build of each in turn. Cutting it further
+would mean weakening what it proves. So it stays, and this note exists so the next
+person to look at the profile knows the cost is bought rather than accidental.
