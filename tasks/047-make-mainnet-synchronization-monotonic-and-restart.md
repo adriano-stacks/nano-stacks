@@ -208,3 +208,41 @@ checks the span a startup validation reads is still long enough to judge.
 Writing it caught something worth recording: the expectation was drafted on the
 pre-8,673,846 fee rule and the test refused it. The second credit's amount and
 recipient both come from `earnings[matured - 1]`, and the tree is right.
+
+## The MARF node cache was a fifth of one block's working set
+
+The replay was reading **900 MB per block** — 145 MB/s of `rchar` against a 30 GB
+`marf.sqlite` — and running at about 40 blocks a minute. Not a missing index: the
+node table is `WITHOUT ROWID` on `(block, idx)` and the plan is a primary-key
+search. It was the cache.
+
+A MARF lookup walks back-pointers into ancestor states, and a node standing on a
+checkpoint has 8.6 million ancestors, so one block's working set is on the order of
+200,000 nodes. `NODE_CACHE` was 20,000 per generation — under a fifth of that — so
+the cache thrashed on every block and the same nodes were decoded again for the
+next one. And `node_hash` had **no cache at all**, on a path that is read with the
+fanout of the trie: sealing a block hashes every node it touched, and each preimage
+needs every sibling's hash.
+
+Both are immutable per `(block, index)` — a state is addressed by the block that
+sealed it, so nothing rewrites one — which is what makes caching them safe rather
+than merely faster.
+
+| | before | after |
+|---|---|---|
+| replay throughput | ~40 blocks/min | **140 blocks/min** |
+| read volume | ~900 MB/block | ~250 MB/block |
+| execution, per block | 1.1 s | 0.30 s |
+| resident memory | ~2.5 GB | 3.3 GB |
+
+Three and a half hours to mainnet tip instead of twelve.
+
+**One thing that had to go in with it**, and is the reason a cache like this is not
+free: `forget()` drops every cache after a rolled-back write, because the cache
+would otherwise address rows the database no longer holds. A stale *hash* is worse
+than a stale node — it goes straight into a parent's preimage and moves a root — so
+the new cache is cleared there too. `marf_lockstep` and the whole conformance suite
+are what say it did not change an answer.
+
+`local` is still 0.06 s a block, halved but not gone; that is
+[[049-derive-canonical-sortitions-from-the-local-burncha]]'s.
