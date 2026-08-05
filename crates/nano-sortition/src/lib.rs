@@ -1001,6 +1001,26 @@ impl SnapshotChain {
         self.snapshots.first().expect("snapshot chain has genesis")
     }
 
+    /// The winning VRF seed the next sortition's sampling mixes.
+    ///
+    /// The most recent winner's, which is **not** the tip's: a burn block with no
+    /// sortition mixes no seed, so the sampling of the block after it reaches
+    /// back past it to the last block that elected somebody. Mainnet's burn
+    /// 960,222, 960,224, 960,227 and 960,229 are four such blocks in fifteen.
+    ///
+    /// It is one field rather than a walk for a chain being resumed, which is
+    /// exactly the case where a walk cannot answer: a chain seeded at a
+    /// sortition-less burn block holds no snapshot with a seed at all, and the
+    /// commitments of its own burn block carry the seed of the tenure they were
+    /// *bidding* for rather than the one last won.
+    #[must_use]
+    pub fn effective_winner_seed(&self) -> Option<[u8; 32]> {
+        self.snapshots
+            .iter()
+            .rev()
+            .find_map(|snapshot| snapshot.winner_vrf_seed)
+    }
+
     /// Adopt the winning seed of the snapshot the chain was seeded at.
     ///
     /// Only the sampling of the block *after* the root reads it, and a captured
@@ -1278,13 +1298,7 @@ impl SortitionEngine {
             .tip()
             .sortition_hash
             .mix_bitcoin_header(BitcoinHeaderHash::from_bytes(block.hash));
-        let previous_vrf_seed = self
-            .snapshots
-            .snapshots()
-            .iter()
-            .rev()
-            .find_map(|snapshot| snapshot.winner_vrf_seed)
-            .unwrap_or([0; 32]);
+        let previous_vrf_seed = self.snapshots.effective_winner_seed().unwrap_or([0; 32]);
         let winner = (statistics.block_burn != 0)
             .then(|| {
                 select_epoch4_winner(

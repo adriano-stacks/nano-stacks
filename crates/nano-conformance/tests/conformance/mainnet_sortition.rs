@@ -735,6 +735,107 @@ fn the_node_tracker_derives_the_same_window() {
     assert_eq!(winners, DERIVED_FLOOR, "the node named every winner");
 }
 
+/// A chain resumed from what it saved names the same winners as one that ran on.
+///
+/// The interesting seed is a burn block that elected **nobody**, and mainnet has
+/// four of them in this window of fifteen. The sampling of the block after a
+/// sortition mixes the most recent *winner's* VRF seed, so at such a block that
+/// seed belongs to an earlier block and is nowhere in the one being seeded at —
+/// while the commitments sitting in it carry the seed of the tenure they were
+/// bidding for, which is a different value and a plausible-looking one.
+///
+/// Adopting that names a different commitment as the winner. Nothing disagrees:
+/// every candidate in a Nakamoto burn block carries the same `new_seed`, so the
+/// sortition hash, the consensus hash and the burn total all still derive, and the
+/// only visible consequence is that the winner's leader key is the wrong one — so
+/// the coinbase proof of a tenure the network accepted fails to verify. That is
+/// what a live mainnet node did at burn 960,488, whose parent 960,487 had no
+/// sortition, once the leader-key registry made the proof checkable at all.
+///
+/// So the seed the next sampling mixes is saved with the chain, and this is the
+/// test that says the two chains agree. It fails if the saved field is dropped.
+#[test]
+fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
+    let Some(root) = capture() else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    let Some(blocks) = window_blocks(&root, &captured) else {
+        nano_conformance::skip_gate("the capture holds no Bitcoin blocks below its seed");
+        return;
+    };
+    let Some(position) = captured
+        .iter()
+        .position(|snapshot| snapshot.sortition == 0 && snapshot.block_height > captured[0].block_height)
+        .filter(|position| position + 1 < captured.len())
+    else {
+        nano_conformance::skip_gate("the captured window holds no sortition-less burn block");
+        return;
+    };
+    let pause = captured[position].block_height;
+    let next = captured[position + 1].block_height;
+    let read = |height: u64| {
+        blocks
+            .get(&height)
+            .cloned()
+            .ok_or_else(|| format!("no Bitcoin block at {height}"))
+    };
+    let payouts = mainnet_payouts();
+    let window = u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("fits u64");
+
+    // One chain that never stops, which is the answer both have to agree with:
+    // it is the one whose winners the capture itself confirms elsewhere.
+    let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
+        .expect("the capture carries the consensus hashes");
+    let mut running =
+        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history.clone())
+            .expect("the tracker starts");
+    running
+        .catch_up(read, captured[0].block_height, payouts, window)
+        .expect("the mining window fills");
+    let mut expected = None;
+    for snapshot in captured.iter().skip(1) {
+        let derived = running
+            .advance(&read(snapshot.block_height).expect("a block"), payouts)
+            .expect("the chain extends");
+        if snapshot.block_height == next {
+            expected = derived.winner_txid;
+        }
+    }
+    let expected = expected.expect("the block after the pause has a winner");
+
+    // The same chain, stopped at the sortition-less block, written down, and read
+    // back the way a restarting node reads it.
+    let mut stopping =
+        nano_node::sortition::SortitionTracker::new(seed_from(&captured[0]), history)
+            .expect("the tracker starts");
+    stopping
+        .catch_up(read, pause, payouts, window + 32)
+        .expect("the chain walks to the pause");
+    assert_eq!(stopping.tip().bitcoin_height, pause);
+    let saved = tempfile::tempdir().expect("a directory to save into");
+    stopping.save(saved.path()).expect("the chain is written down");
+
+    let mut resumed = nano_node::sortition::SortitionTracker::from_capture(saved.path())
+        .expect("the saved chain seeds a new one");
+    resumed
+        .catch_up(read, next, payouts, window + 1)
+        .expect("the resumed chain advances");
+    assert_eq!(
+        resumed.tip().winner_txid.map(hex::encode),
+        Some(hex::encode(expected)),
+        "a chain resumed at burn {pause}, which elected nobody, must name the same winner \
+         at burn {next} as one that never stopped"
+    );
+    println!(
+        "resumed at burn {pause} with no sortition and named the same winner at burn {next}"
+    );
+}
+
 /// What the tracker derived about one sortition, in what a validator reads.
 #[derive(Clone, Copy, Debug)]
 struct Derived {

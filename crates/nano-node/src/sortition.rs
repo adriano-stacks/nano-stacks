@@ -270,7 +270,14 @@ impl SortitionTracker {
             walk.reading += read.elapsed();
             walk.primed += 1;
             self.register_keys(&block);
-            if height == tip && let Some(seed) = unanimous_winner_seed(&block) {
+            // Only where the seed does not already carry one: a chain this node
+            // saved states the seed exactly, and the recovery below is a
+            // capture's fallback that holds only because a capture whose seed
+            // elected nobody is refused when it is loaded.
+            if height == tip
+                && self.tip().winner_vrf_seed.is_none()
+                && let Some(seed) = unanimous_winner_seed(&block)
+            {
                 self.engine.adopt_root_winner_seed(seed);
             }
             let commitments =
@@ -436,6 +443,19 @@ struct CapturedSnapshot {
     consensus_hash: String,
     sortition_hash: String,
     total_burn: String,
+    /// Whether this burn block elected anybody, as stacks-core's own column
+    /// spells it. Absent in a chain saved before this field existed.
+    #[serde(default)]
+    sortition: Option<i64>,
+    /// The winning VRF seed the next sampling has to mix — the most recent
+    /// winner's, not necessarily this block's.
+    ///
+    /// A chain saved at a burn block that elected nobody cannot recover it: the
+    /// commitments of such a block carry the seed of the tenure they were bidding
+    /// for, and adopting that samples the next sortition against a seed nobody
+    /// won. See [`nano_sortition::SnapshotChain::effective_winner_seed`].
+    #[serde(default)]
+    winner_vrf_seed: Option<String>,
 }
 
 impl SortitionTracker {
@@ -458,12 +478,22 @@ impl SortitionTracker {
     pub fn resume_or_capture(state: &Path, capture: &Path) -> Result<Self, TrackerError> {
         let mut tracker = match Self::from_capture(state) {
             Ok(tracker) => tracker,
-            Err(saved) => Self::from_capture(capture).map_err(|captured| {
-                TrackerError::Seed(format!(
-                    "neither the saved sortitions ({saved}) nor the capture ({captured}) \
-                     can seed a chain"
-                ))
-            })?,
+            Err(saved) => {
+                // Said out loud, because the fallback is not free: re-deriving
+                // from the checkpoint's own anchor is one Bitcoin block download
+                // per burn block, minutes of them on mainnet, and a node that
+                // prints nothing while doing it looks stopped.
+                eprintln!(
+                    "the saved sortitions cannot seed a chain, so it is re-derived from the \
+                     checkpoint: {saved}"
+                );
+                Self::from_capture(capture).map_err(|captured| {
+                    TrackerError::Seed(format!(
+                        "neither the saved sortitions ({saved}) nor the capture ({captured}) \
+                         can seed a chain"
+                    ))
+                })?
+            }
         };
         // A registry is checkpoint data, not derived data, so a state directory
         // written before it existed takes it from the capture rather than being
@@ -513,6 +543,13 @@ impl SortitionTracker {
             consensus_hash: tip.consensus_hash.to_string(),
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
+            sortition: Some(i64::from(tip.winner_txid.is_some())),
+            // The one field a resumed chain cannot derive and must not guess.
+            winner_vrf_seed: self
+                .engine
+                .snapshots()
+                .effective_winner_seed()
+                .map(hex::encode),
         }];
         let history = History {
             hashes: self
@@ -579,6 +616,39 @@ impl SortitionTracker {
 }
 
 fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerError> {
+    // The sampling of the block after the seed mixes the most recent winner's VRF
+    // seed, and where that seed is not the seed block's own it cannot be found in
+    // the seed block. Refusing here is what stops the alternative: adopting the
+    // seed the block's commitments were *bidding* with, which names a different
+    // winner and so a different leader key — a wrong answer that no consensus
+    // hash, sortition hash or burn total disagrees with, and that surfaces only
+    // as a valid tenure's coinbase proof being rejected. Mainnet does this once
+    // every three or four burn blocks.
+    match (seed.winner_vrf_seed.is_some(), seed.sortition) {
+        // Stated by the chain that derived it: nothing to recover.
+        (true, _) => {}
+        // A capture whose seed elected somebody: `prime` recovers the seed from
+        // that block's own commitments, which all carry it.
+        (false, Some(sortition)) if sortition != 0 => {}
+        (false, Some(_)) => {
+            return Err(TrackerError::Seed(format!(
+                "burn {} elected nobody, so the winning seed the next sortition mixes is an \
+                 older block's and this snapshot does not carry it — seed the chain at a \
+                 burn block that had a sortition, or resume from a chain that saved the seed",
+                seed.block_height
+            )));
+        }
+        (false, None) => {
+            return Err(TrackerError::Seed(format!(
+                "the snapshot at burn {} says neither whether that block elected anybody nor \
+                 what winning seed the next sortition mixes, which is how a chain saved \
+                 before those were written down looks. Guessing costs a wrongly named \
+                 winner one restart in three, and the only thing that names is the leader \
+                 key a coinbase proof is checked against — so this is re-derived instead.",
+                seed.block_height
+            )));
+        }
+    }
     let bytes = |value: &str, name: &str| -> Result<Vec<u8>, TrackerError> {
         hex::decode(value).map_err(|_| TrackerError::Seed(format!("{name} is not hexadecimal")))
     };
@@ -626,11 +696,17 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             "sortition hash",
         )?),
         winner_txid: None,
-        // The seed's own winner is unknown, and only the *next* block's sampling
-        // reads it — so the first sortition after a checkpoint is derived from a
-        // zero previous seed and its winner is not this node's to trust. It is
-        // reported for that reason rather than published.
-        winner_vrf_seed: None,
+        // The seed the sampling of the block after this one mixes. A chain this
+        // node saved states it, exactly, because it derived it. A capture does
+        // not, and then it is recovered from the seed's own burn block by
+        // `prime` — which is only sound where the seed block *elected* somebody,
+        // so a capture that says otherwise is refused above rather than seeded
+        // against a seed nobody won.
+        winner_vrf_seed: seed
+            .winner_vrf_seed
+            .as_deref()
+            .map(|value| thirty_two(value, "winning VRF seed"))
+            .transpose()?,
         winner_vrf_public_key: None,
         pox_id,
     })
