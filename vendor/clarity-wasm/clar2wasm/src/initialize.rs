@@ -11,7 +11,7 @@ use clarity::vm::types::{
 };
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
-use wasmtime::{AsContextMut, Linker, Module, Store, Val};
+use wasmtime::{AsContextMut, Linker, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
@@ -382,7 +382,10 @@ pub fn initialize_contract(
     let mut call_stack = CallStack::new();
     let epoch = global_context.epoch_id;
     let clarity_version = *contract_context.get_clarity_version();
-    let engine = wasmtime::Engine::default();
+    // One engine for every module the cache holds: a module can only be
+    // instantiated in a store belonging to the engine that built it.
+    let engine = module_cache.engine().clone();
+    let module = module_cache.native_module(wasm)?;
     let init_context = ClarityWasmContext::new_init(
         global_context,
         contract_context,
@@ -394,8 +397,6 @@ pub fn initialize_contract(
         None,
         module_cache,
     );
-    let module = Module::from_binary(&engine, wasm)
-        .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
     let mut store = Store::new(&engine, init_context);
     let mut linker = Linker::new(&engine);
     // Link in the host interface functions and globals.
@@ -519,9 +520,10 @@ pub fn call_function(
 
     let epoch = global_context.epoch_id;
     let clarity_version = *contract_context.get_clarity_version();
-    let engine = wasmtime::Engine::default();
-    let wasm_module = Module::from_binary(&engine, &module.wasm)
-        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    let engine = module_cache.engine().clone();
+    // Native code for a contract already called in this process comes back
+    // without touching Cranelift, which is the whole reason a replay moves.
+    let wasm_module = module.native(module_cache)?.clone();
     let context = ClarityWasmContext::new_run(
         global_context,
         contract_context,

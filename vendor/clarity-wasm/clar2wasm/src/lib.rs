@@ -3,12 +3,16 @@ use clarity::vm::analysis::{run_analysis, AnalysisDatabase, ContractAnalysis};
 use clarity::vm::ast::{build_ast_with_diagnostics, ContractAST};
 use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::diagnostic::Diagnostic;
+use clarity::vm::errors::VmExecutionError;
 use clarity::vm::resource_limiter::ResourceLimiter;
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::ClarityVersion;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 pub use walrus::Module;
 use wasm_generator::{GeneratorError, WasmGenerator};
+
+use crate::error::WasmError;
 
 mod cost;
 
@@ -52,33 +56,94 @@ pub struct CompileResult {
     pub contract_analysis: ContractAnalysis,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CompiledContract {
     pub wasm: Vec<u8>,
     pub analysis: ContractAnalysis,
+    /// The native code wasmtime makes of `wasm`, kept for the life of the
+    /// process. Cranelift costs milliseconds to seconds per contract, and a
+    /// running node calls a contract far more often than it deploys one, so
+    /// compiling per call — which is what a fresh `Engine` per call forces —
+    /// dominated everything else replay does.
+    native: OnceLock<wasmtime::Module>,
 }
 
-impl CompileResult {
-    pub fn into_compiled_contract(mut self) -> CompiledContract {
-        CompiledContract {
-            wasm: self.module.emit_wasm(),
-            analysis: self.contract_analysis,
+impl Clone for CompiledContract {
+    fn clone(&self) -> Self {
+        Self {
+            wasm: self.wasm.clone(),
+            analysis: self.analysis.clone(),
+            native: self.native.clone(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+impl CompiledContract {
+    pub fn new(wasm: Vec<u8>, analysis: ContractAnalysis) -> Self {
+        Self {
+            wasm,
+            analysis,
+            native: OnceLock::new(),
+        }
+    }
+
+    /// The native module for this contract, built at most once.
+    pub fn native(&self, cache: &ModuleCache) -> Result<&wasmtime::Module, VmExecutionError> {
+        if let Some(native) = self.native.get() {
+            return Ok(native);
+        }
+        let native = cache.native_module(&self.wasm)?;
+        let _ = self.native.set(native);
+        self.native
+            .get()
+            .ok_or_else(|| crate::error::wasm_error(WasmError::ModuleNotFound))
+    }
+}
+
+impl CompileResult {
+    pub fn into_compiled_contract(mut self) -> CompiledContract {
+        CompiledContract::new(self.module.emit_wasm(), self.contract_analysis)
+    }
+}
+
+/// The compiled contracts one execution context has to hand.
+///
+/// Holds the `Engine` as well, because a `Module` may only be instantiated in a
+/// store of the engine that made it: sharing the modules means sharing the
+/// engine.
+#[derive(Clone, Default)]
 pub struct ModuleCache {
-    contracts: HashMap<QualifiedContractIdentifier, CompiledContract>,
+    engine: wasmtime::Engine,
+    contracts: HashMap<QualifiedContractIdentifier, Arc<CompiledContract>>,
+}
+
+impl std::fmt::Debug for ModuleCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleCache")
+            .field("contracts", &self.contracts.len())
+            .finish()
+    }
 }
 
 impl ModuleCache {
     pub fn insert(&mut self, contract: QualifiedContractIdentifier, module: CompiledContract) {
-        self.contracts.insert(contract, module);
+        self.contracts.insert(contract, Arc::new(module));
     }
 
-    pub fn get(&self, contract: &QualifiedContractIdentifier) -> Option<&CompiledContract> {
+    pub fn get(&self, contract: &QualifiedContractIdentifier) -> Option<&Arc<CompiledContract>> {
         self.contracts.get(contract)
+    }
+
+    /// The engine every module in this cache belongs to.
+    pub fn engine(&self) -> &wasmtime::Engine {
+        &self.engine
+    }
+
+    /// Native code for `wasm`, compiled by this cache's engine.
+    pub fn native_module(&self, wasm: &[u8]) -> Result<wasmtime::Module, VmExecutionError> {
+        wasmtime::Module::from_binary(&self.engine, wasm)
+            .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))
     }
 }
 

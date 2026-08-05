@@ -335,10 +335,7 @@ impl TestEnvironment {
             .insert(contract_name.clone(), contract_context);
         self.module_cache.insert(
             contract_id,
-            CompiledContract {
-                wasm,
-                analysis: compile_result.contract_analysis,
-            },
+            CompiledContract::new(wasm, compile_result.contract_analysis),
         );
 
         self.cost_tracker = global_context.cost_track;

@@ -984,7 +984,7 @@ impl Vm {
         epoch: StacksEpochId,
     ) -> Result<(), VmExecutionError> {
         compile_under(&mut self.store, contract, source, version, epoch)
-            .and_then(|compiled| loadable(contract, compiled))
+            .and_then(|compiled| loadable(contract, compiled, self.modules.engine()))
             .map(|_| ())
     }
 
@@ -2426,8 +2426,10 @@ fn deploy_contract_with_wasm_in_context(
                 // or the deploy leaves an analysis behind for a contract that
                 // was never stored, and the interpreter fallback below deploys
                 // on top of it.
-                Ok(loadable(&contract, compiled.into_compiled_contract())
-                    .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?)
+                Ok(
+                    loadable(&contract, compiled.into_compiled_contract(), modules.engine())
+                        .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?,
+                )
             })
             .map_err(|error: StaticCheckError| {
                 ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
@@ -2764,8 +2766,9 @@ fn ensure_wasm_module(
     // The current epoch first, so the costs baked in are the ones the chain
     // charges now. Only a contract it rejects — one using a word a later epoch
     // removed — is rebuilt under the epoch it was deployable in.
+    let engine = modules.engine().clone();
     let compiled = match compile_under(store, contract, &source, version, StacksEpochId::Epoch40)
-        .and_then(|compiled| loadable(contract, compiled))
+        .and_then(|compiled| loadable(contract, compiled, &engine))
     {
         Ok(compiled) => compiled,
         Err(rejected) => {
@@ -2782,7 +2785,7 @@ fn ensure_wasm_module(
                 .filter(|epoch| **epoch >= epoch_for_version(version))
                 .find_map(|epoch| {
                     compile_under(store, contract, &source, version, *epoch)
-                        .and_then(|compiled| loadable(contract, compiled))
+                        .and_then(|compiled| loadable(contract, compiled, &engine))
                         .ok()
                         .map(|compiled| (*epoch, compiled))
                 })
@@ -2807,8 +2810,9 @@ fn ensure_wasm_module(
 fn loadable(
     contract: &QualifiedContractIdentifier,
     compiled: CompiledContract,
+    engine: &wasmtime::Engine,
 ) -> Result<CompiledContract, VmExecutionError> {
-    if let Err(error) = wasmtime::Module::validate(&wasmtime::Engine::default(), &compiled.wasm) {
+    if let Err(error) = wasmtime::Module::validate(engine, &compiled.wasm) {
         // A module the runtime refuses can only be read as bytes, so leave them
         // somewhere a disassembler can reach when asked.
         if let Some(path) = std::env::var_os("NANO_DUMP_REFUSED_WASM") {
