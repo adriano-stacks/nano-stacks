@@ -35,16 +35,16 @@ the observed retries is not a recovery procedure.
 
 ## Tasks
 
-- [ ] Inventory every mutable execution side effect outside the VM transaction,
+- [x] Inventory every mutable execution side effect outside the VM transaction,
       including tenure accounting, executed ancestry, tenure-start indexes,
       headers, native effects and emitted results.
-- [ ] Snapshot or stage those effects so root mismatch, validation failure or
+- [x] Snapshot or stage those effects so root mismatch, validation failure or
       any execution error restores the exact pre-block in-memory state.
-- [ ] Persist auxiliary state only after the candidate root and all consensus
+- [x] Persist auxiliary state only after the candidate root and all consensus
       checks accept the block.
-- [ ] Make returning an error from catch-up incapable of persisting rejected
+- [x] Make returning an error from catch-up incapable of persisting rejected
       candidate state.
-- [ ] Add a deterministic test that retries the same rejected block many times,
+- [x] Add a deterministic test that retries the same rejected block many times,
       restarts, and proves memory and disk remain byte-for-byte equivalent to
       the state before the first attempt.
 - [x] Exercise a real mainnet tenure-start rejection with non-zero fees and
@@ -97,7 +97,7 @@ invisible: every root matched, and the state beside the roots was wrong.
 - [x] Repair tenure 251323 in the live state directory.
 - [ ] Find out whether earlier tenures were inflated by earlier retry loops, and
       rebuild the accounting rather than patching it if so.
-- [ ] Make the guard bite on fees, not only on the invariant.
+- [x] Make the guard bite on fees, not only on the invariant.
 
 ## Acceptance Criteria
 
@@ -144,3 +144,86 @@ deterministic restart test still has to cover every side store named in the
 acceptance criteria. Close only after the reconstruction in
 [[048-carry-complete-mainnet-tenure-accounting]] and the crash boundary in
 [[057-commit-and-recover-accepted-block-state-atomically]] agree with the MARF.
+
+## The rollback is structural now, not remembered
+
+`ChainState` had five fields; four of them were the ones a block mutates outside
+the MARF, and rolling them back meant a hand-written tuple that named each field
+twice — once to snapshot, once to restore. Nothing made the two lists agree, and
+nothing at all made a *new* field appear in either. That is how the fee leak got
+in.
+
+Those four fields now live in one `ChainLedger`, and `execute_nakamoto_block`
+runs the block against a **clone** of it. The clone is moved into place by
+`adopt` only after the block seals; on any error it is dropped unread and the
+only rollback left is `vm.abort_block()`. There is no restore step to forget.
+
+`adopt` destructures `Self` exhaustively:
+
+```rust
+fn adopt(&mut self, sealed: ChainLedger) {
+    let Self { vm: _, ledger } = self;
+    *ledger = sealed;
+}
+```
+
+`ChainState` is down to two fields, so a third one does not compile until its
+author has decided
+whether it belongs in the VM — where a block's writes are already a MARF
+transaction — or in the ledger, where a rejected block cannot reach it. That is
+the compile-time guarantee the task asked for; it is not a test, and it cannot be
+satisfied by forgetting.
+
+What this makes impossible, and what it does not:
+
+- A rejected block cannot leave *any* field of the ledger behind, including ones
+  added later. Retrying it a thousand times is the same as not running it.
+- It cannot poison the VM's tenure-start map either: the block header is built
+  before the seal but written down after it, so a block that does not seal
+  contributes no `tenure_starts` entry (that map is first-write-wins, so a
+  rejected block's entry would have fixed the tenure's start height for every
+  later block) and no `block_header` row.
+- It does not stop a block from writing through `accounting_mut()`, which is
+  public and is how a node loads its accounting at startup. Nothing in the
+  execution path uses it any more.
+- It does not make the *VM's* non-MARF state transactional. `set_checkpoint_height`
+  in `check_before_executing` and the burn headers recorded from the sortition
+  are still unconditional; both are idempotent per block and neither is
+  consensus-visible, but they are not rolled back.
+
+Cost is unchanged: the old tuple already cloned the same three collections per
+block, so this is the same O(blocks since checkpoint) copy it always was.
+
+## The guard bites on fees now
+
+`retrying_a_rejected_block_leaves_no_state_beside_the_marf` (unit test in
+`nano-chainstate`) rejects the captured block 25 times with a state root it
+cannot produce — the same failure point a real divergence hits, after the
+transactions have run and the fees have been counted — and asserts the *whole*
+ledger is unchanged after each attempt, plus the accounting bytes a restart would
+read, the sealed tip, the content root it stands on, and that the rejected block
+has neither state nor a recorded header. Then it drops the chainstate, reopens
+the directory, and asserts the same of the disk. Then it executes the pristine
+block and compares root and ledger against a second chainstate in a fresh
+directory that never saw the rejected candidate.
+
+It bites on fees, which the old fixture-based guard did not: the captured block
+pays 300 uSTX, and the accounting is seeded with earnings for tenure 120 so that
+`add_fees` actually counts (the captured checkpoint names no started tenure, so
+nothing moved either way — which is exactly why the old test would have passed
+before the fix). Verified by putting the bug back: with `add_fees` writing
+through to `self.ledger`, attempt 0 fails with `fees: 300` against `fees: 0`.
+
+"Byte-for-byte" is asserted on the accounting JSON, not on the SQLite files: the
+MARF and its side store churn pages for reasons that have nothing to do with
+this, so the durable assertions are the tip, the content root, the parent link
+and the presence or absence of a header and of block state.
+
+## Still open
+
+- The live mainnet accounting is still the repaired file, not a rebuilt one; the
+  44 lost tenure records and the unverified older tenures are
+  [[048-carry-complete-mainnet-tenure-accounting]]'s.
+- Crash consistency between the sealed root and the accounting file is
+  [[057-commit-and-recover-accepted-block-state-atomically]], and its remaining
+  half needs changes outside `nano-chainstate` — see the inventory there.

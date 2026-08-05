@@ -241,7 +241,7 @@ pub fn sip_031_emission(network: Network, bitcoin_height: u64) -> u128 {
 /// A checkpoint carries the effects that mature over the tenures right after it,
 /// because those were earned before nano had any history. Everything later is
 /// derived from the tenures nano executed itself.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TenureAccounting {
     matured_effects: BTreeMap<u64, NativeBlockEffects>,
     earnings: BTreeMap<u64, TenureEarnings>,
@@ -617,10 +617,19 @@ struct BlockExecution<'a> {
     candidates: &'a [Transaction],
 }
 
-/// A chainstate execution context backed by versioned VM state.
-#[derive(Debug)]
-pub struct ChainState {
-    vm: Vm,
+/// Everything a block changes that the MARF does not hold.
+///
+/// One struct because a block runs against a *clone* of it and the clone is
+/// moved into place only once the block seals. There is no restore step to
+/// forget: a field added here is rolled back by construction, and a rejected
+/// block cannot leave any of it behind.
+///
+/// The hand-written snapshot this replaces had to be remembered in two places,
+/// and the one time it was not, mainnet block 8,665,780 added its 458,250 uSTX
+/// of fees to its tenure on all 1,417 of its retries — 649,365,101 uSTX of
+/// earnings that no MARF root disagreed with, because none of this is in a root.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ChainLedger {
     accounting: TenureAccounting,
     /// Stacks height each tenure started at, which `get-tenure-info?` maps back.
     tenure_start_heights: BTreeMap<u32, u32>,
@@ -633,6 +642,18 @@ pub struct ChainState {
     /// checkpoint has none for the tenure before its first, which is why this is
     /// an `Option` and why an absent one is reported rather than passed.
     parent_tenure_proof: Option<[u8; 80]>,
+}
+
+/// A chainstate execution context backed by versioned VM state.
+///
+/// Two fields, and deliberately only two: state either lives in the VM, where a
+/// block's writes are a MARF transaction, or in the ledger, which a block runs
+/// against a copy of. A third field would be neither, and `adopt` refuses to
+/// compile against one.
+#[derive(Debug)]
+pub struct ChainState {
+    vm: Vm,
+    ledger: ChainLedger,
 }
 
 /// The header version epoch 4.0 blocks carry, below the shadow flag.
@@ -778,10 +799,7 @@ impl ChainState {
     pub fn new(network: Network) -> Result<Self, ChainStateError> {
         Ok(Self {
             vm: Vm::new(network)?,
-            accounting: TenureAccounting::default(),
-            tenure_start_heights: BTreeMap::new(),
-            executed: Vec::new(),
-            parent_tenure_proof: None,
+            ledger: ChainLedger::default(),
         })
     }
 
@@ -794,10 +812,7 @@ impl ChainState {
     ) -> Result<Self, ChainStateError> {
         Ok(Self {
             vm: Vm::from_checkpoint(network, path, source, expected_root)?,
-            accounting: TenureAccounting::default(),
-            tenure_start_heights: BTreeMap::new(),
-            executed: Vec::new(),
-            parent_tenure_proof: None,
+            ledger: ChainLedger::default(),
         })
     }
 
@@ -815,10 +830,7 @@ impl ChainState {
     ) -> Result<Self, ChainStateError> {
         Ok(Self {
             vm: Vm::open_from_checkpoint(network, directory, checkpoint, source, expected_root)?,
-            accounting: TenureAccounting::default(),
-            tenure_start_heights: BTreeMap::new(),
-            executed: Vec::new(),
-            parent_tenure_proof: None,
+            ledger: ChainLedger::default(),
         })
     }
 
@@ -859,7 +871,7 @@ impl ChainState {
 
     /// Access the portable accounting ledger associated with this chainstate.
     pub const fn accounting_mut(&mut self) -> &mut TenureAccounting {
-        &mut self.accounting
+        &mut self.ledger.accounting
     }
 
     /// Return the committed MARF leaves for a block state.
@@ -1142,6 +1154,7 @@ impl ChainState {
     /// of bounded length.
     fn start_tenure(
         &mut self,
+        ledger: &mut ChainLedger,
         bitcoin_context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
         block: &NakamotoBlock,
@@ -1158,7 +1171,7 @@ impl ChainState {
             );
         }
         self.execute_bitcoin_operations(operations, bitcoin_context.height)?;
-        if let Some(schedule) = self.accounting.schedule() {
+        if let Some(schedule) = ledger.accounting.schedule() {
             let coinbase = schedule
                 .emission_at(bitcoin_context.height)
                 .saturating_add(bitcoin_context.accumulated_coinbase);
@@ -1167,10 +1180,12 @@ impl ChainState {
                     "tenure-start block has no coinbase transaction".to_owned(),
                 )
             })?;
-            self.accounting
+            ledger
+                .accounting
                 .record_earnings(u64::from(next_height), earnings);
         }
-        self.accounting
+        ledger
+            .accounting
             .effects_for_tenure(self.vm.network(), u64::from(next_height))
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
     }
@@ -1284,7 +1299,7 @@ impl ChainState {
                 context.height
             );
         }
-        if let Some(parent_proof) = self.parent_tenure_proof {
+        if let Some(parent_proof) = self.ledger.parent_tenure_proof {
             verify_committed_vrf_seed(&context.vrf_seed, &parent_proof)?;
         } else {
             eprintln!(
@@ -1354,24 +1369,19 @@ impl ChainState {
         self.check_before_executing(block, parent, bitcoin_context)?;
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
-        // Everything this node keeps outside the MARF, as it stood before the
-        // block ran. Aborting the MARF is not a rollback on its own: a block
-        // that fails its state root has already moved the tenure accounting,
-        // and a node retries a failing block for as long as it is running, so
-        // the fees are added again on every attempt. Left alone that silently
-        // inflates a tenure's earnings by thousands of times and corrupts the
-        // miner rewards that mature from them, while the MARF looks clean.
-        let unwind = (
-            self.accounting.clone(),
-            self.tenure_start_heights.clone(),
-            self.executed.clone(),
-            self.parent_tenure_proof,
-        );
+        // The block runs against a copy of everything kept outside the MARF, and
+        // the copy is adopted only once it seals. Aborting the MARF is not a
+        // rollback on its own: a block that fails its state root has already
+        // moved the tenure accounting, and a node retries a failing block for as
+        // long as it is running, so the fees were added again on every attempt —
+        // inflating a tenure's earnings by four orders of magnitude, and the
+        // miner rewards that mature from them, while the MARF looked clean.
+        let mut ledger = self.ledger.clone();
         let mut effects = effects;
         let result = (|| {
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
-                let matured = self.start_tenure(bitcoin_context, operations, block)?;
+                let matured = self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;
                 effects.credits.extend(matured.credits);
                 effects.liquid_supply_increase = effects
                     .liquid_supply_increase
@@ -1402,7 +1412,9 @@ impl ChainState {
             }
             self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
             let coinbase_height = u64::from(self.vm.tenure_height()?);
-            self.accounting.add_fees(coinbase_height, block_fees(block));
+            ledger
+                .accounting
+                .add_fees(coinbase_height, block_fees(block));
             let credited = effects.credits.len();
             // Only a block that actually matures miner rewards touches the
             // liquid supply for them — stacks-core guards this on having
@@ -1432,32 +1444,57 @@ impl ChainState {
                 sip_031_minted,
             };
             self.settle_state_root(block, root, &receipts, executed)?;
-            self.record_block_header(block, bitcoin_context)?;
+            let header = note_executed_block(&mut self.vm, &mut ledger, block, bitcoin_context)?;
             // Keep this tenure's proof: it is what the *next* tenure's committed
-            // seed has to hash to. Retained only once the block is accepted, and
-            // rolled back with everything else if it is not.
+            // seed has to hash to. On the copy, so a block that does not seal
+            // does not leave the next tenure checked against its seed.
             if let Some(proof) = coinbase_vrf_proof(block) {
-                self.parent_tenure_proof = Some(proof);
+                ledger.parent_tenure_proof = Some(proof);
             }
             let state_root = self.vm.seal_block_to(*block.block_id().as_bytes())?;
-            Ok(AppliedBlock {
-                bitcoin_height: bitcoin_context.height,
-                execution: ExecutionResult { state_root },
-                execution_cost,
-                receipts,
-            })
+            Ok((
+                AppliedBlock {
+                    bitcoin_height: bitcoin_context.height,
+                    execution: ExecutionResult { state_root },
+                    execution_cost,
+                    receipts,
+                },
+                header,
+            ))
         })();
-        if result.is_err() {
-            // Report why execution failed, not why the rollback did.
-            drop(self.vm.abort_block());
-            (
-                self.accounting,
-                self.tenure_start_heights,
-                self.executed,
-                self.parent_tenure_proof,
-            ) = unwind;
+        match result {
+            Ok((applied, header)) => {
+                // Written down after the seal, because nothing undoes it: the
+                // header goes into the side store and into the VM's burn-header
+                // and tenure-start maps, and the tenure-start entry is
+                // first-write-wins, so a rejected block that got this far would
+                // fix a tenure's start height for every later block. The seal is
+                // what makes a block real, so it goes first.
+                self.vm
+                    .record_block_header(*block.block_id().as_bytes(), header);
+                self.adopt(ledger);
+                Ok(applied)
+            }
+            Err(error) => {
+                // Report why execution failed, not why the rollback did. There is
+                // nothing else to undo: `ledger` is dropped unread.
+                drop(self.vm.abort_block());
+                Err(error)
+            }
         }
-        result
+    }
+
+    /// Take the ledger a sealed block produced as this chain's own.
+    ///
+    /// The exhaustive destructuring is the guard, not decoration: adding a field
+    /// to `ChainState` stops this compiling until the author decides whether it
+    /// belongs in `ChainLedger` — where a rejected block cannot reach it — or in
+    /// the VM, where a block's writes are already a transaction. The tuple this
+    /// replaces named its fields twice and could be satisfied by naming them
+    /// zero times.
+    fn adopt(&mut self, sealed: ChainLedger) {
+        let Self { vm: _, ledger } = self;
+        *ledger = sealed;
     }
 
     /// Take back the blocks a Bitcoin reorganization removed from the chain.
@@ -1472,23 +1509,27 @@ impl ChainState {
     pub fn retract(&mut self, reorg: &SortitionReorg) -> ChainRetraction {
         let invalidated: HashSet<_> = reorg.invalidated_consensus_hashes().into_iter().collect();
         let Some(fork) = self
+            .ledger
             .executed
             .iter()
             .position(|block| invalidated.contains(&block.consensus_hash))
         else {
             return ChainRetraction {
-                resume_from: self.executed.last().map(|block| block.block_id),
+                resume_from: self.ledger.executed.last().map(|block| block.block_id),
                 discarded: Vec::new(),
             };
         };
-        let discarded: Vec<_> = self.executed.split_off(fork);
+        let discarded: Vec<_> = self.ledger.executed.split_off(fork);
         if let Some(first) = discarded.first() {
-            self.accounting.retract_from(u64::from(first.tenure_height));
-            self.tenure_start_heights
+            self.ledger
+                .accounting
+                .retract_from(u64::from(first.tenure_height));
+            self.ledger
+                .tenure_start_heights
                 .retain(|tenure, _| *tenure < first.tenure_height);
         }
         ChainRetraction {
-            resume_from: self.executed.last().map(|block| block.block_id),
+            resume_from: self.ledger.executed.last().map(|block| block.block_id),
             discarded: discarded.into_iter().map(|block| block.block_id).collect(),
         }
     }
@@ -1501,7 +1542,7 @@ impl ChainState {
     #[must_use]
     pub fn executed_tenures(&self) -> Vec<ConsensusHash> {
         let mut tenures: Vec<ConsensusHash> = Vec::new();
-        for block in self.executed.iter().rev() {
+        for block in self.ledger.executed.iter().rev() {
             if tenures.last() != Some(&block.consensus_hash) {
                 tenures.push(block.consensus_hash);
             }
@@ -1518,7 +1559,8 @@ impl ChainState {
     /// everything after it is what the fork disputes.
     #[must_use]
     pub fn last_block_of_tenure(&self, consensus_hash: ConsensusHash) -> Option<[u8; 32]> {
-        self.executed
+        self.ledger
+            .executed
             .iter()
             .rev()
             .find(|block| block.consensus_hash == consensus_hash)
@@ -1544,19 +1586,23 @@ impl ChainState {
     /// cannot stand on a state it did not compute.
     pub fn retract_to(&mut self, block_id: [u8; 32]) -> ChainRetraction {
         let Some(position) = self
+            .ledger
             .executed
             .iter()
             .position(|block| block.block_id == block_id)
         else {
             return ChainRetraction {
-                resume_from: self.executed.last().map(|block| block.block_id),
+                resume_from: self.ledger.executed.last().map(|block| block.block_id),
                 discarded: Vec::new(),
             };
         };
-        let discarded: Vec<_> = self.executed.split_off(position + 1);
+        let discarded: Vec<_> = self.ledger.executed.split_off(position + 1);
         if let Some(first) = discarded.first() {
-            self.accounting.retract_from(u64::from(first.tenure_height));
-            self.tenure_start_heights
+            self.ledger
+                .accounting
+                .retract_from(u64::from(first.tenure_height));
+            self.ledger
+                .tenure_start_heights
                 .retain(|tenure, _| *tenure < first.tenure_height);
         }
         ChainRetraction {
@@ -1568,7 +1614,11 @@ impl ChainState {
     /// The blocks executed since the checkpoint, oldest first.
     #[must_use]
     pub fn executed_blocks(&self) -> Vec<[u8; 32]> {
-        self.executed.iter().map(|block| block.block_id).collect()
+        self.ledger
+            .executed
+            .iter()
+            .map(|block| block.block_id)
+            .collect()
     }
 
     /// Record what Clarity may later read about the block just executed.
@@ -1694,58 +1744,9 @@ impl ChainState {
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<(), ChainStateError> {
-        self.record_block_header(block, bitcoin_context)
-    }
-
-    fn record_block_header(
-        &mut self,
-        block: &NakamotoBlock,
-        bitcoin_context: BitcoinBlockContext,
-    ) -> Result<(), ChainStateError> {
-        let tenure_height = self.vm.tenure_height()?;
-        let stacks_height = u32::try_from(block.header.chain_length).map_err(|_| {
-            ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
-        })?;
-        if block_starts_new_tenure(block) {
-            self.tenure_start_heights.insert(tenure_height, stacks_height);
-        }
-        self.executed.push(ExecutedBlock {
-            block_id: *block.block_id().as_bytes(),
-            consensus_hash: block.header.consensus_hash,
-            tenure_height,
-        });
-        let miner = self
-            .accounting
-            .earnings_at(u64::from(tenure_height))
-            .and_then(|earnings| match &earnings.recipient {
-                PrincipalData::Standard(address) => Some((address.version(), address.1)),
-                PrincipalData::Contract(_) => None,
-            })
-            .unwrap_or((0, [0; 20]));
-        self.vm.record_block_header(
-            *block.block_id().as_bytes(),
-            nano_vm::BlockHeader {
-                burn_header_hash: bitcoin_context.burn_header_hash,
-                burn_block_height: u32::try_from(bitcoin_context.height).map_err(|_| {
-                    ChainStateError::InvalidTransaction("Bitcoin height overflows u32".to_owned())
-                })?,
-                burn_block_time: bitcoin_context.burn_block_time,
-                stacks_block_time: block.header.timestamp,
-                block_header_hash: *block.header.block_hash().as_bytes(),
-                consensus_hash: *block.header.consensus_hash.as_bytes(),
-                vrf_seed: bitcoin_context.vrf_seed,
-                miner_address: miner,
-                burn_spend_total: bitcoin_context.burn_spend_total,
-                burn_spend_winner: bitcoin_context.burn_spend_winner,
-                block_reward: self.accounting.reward_for_tenure(u64::from(tenure_height)),
-                tenure_height,
-                tenure_start_height: self
-                    .tenure_start_heights
-                    .get(&tenure_height)
-                    .copied()
-                    .unwrap_or(stacks_height),
-            },
-        );
+        let header = note_executed_block(&mut self.vm, &mut self.ledger, block, bitcoin_context)?;
+        self.vm
+            .record_block_header(*block.block_id().as_bytes(), header);
         Ok(())
     }
 
@@ -2201,6 +2202,68 @@ impl ChainState {
         }
         Ok(())
     }
+}
+
+/// Note a block in the ledger and build the header Clarity may read about it.
+///
+/// The header is returned rather than written, because building it needs the
+/// block's pending state — the tenure height comes out of it — while writing it
+/// down is durable and must wait for the seal. A caller that never seals simply
+/// drops the header, and the block leaves no trace of having been executed.
+///
+/// A free function, not a method: `backfill_block_header` has to hand it this
+/// chain's own ledger, and `&mut self` would already have borrowed it.
+fn note_executed_block(
+    vm: &mut Vm,
+    ledger: &mut ChainLedger,
+    block: &NakamotoBlock,
+    bitcoin_context: BitcoinBlockContext,
+) -> Result<nano_vm::BlockHeader, ChainStateError> {
+    let tenure_height = vm.tenure_height()?;
+    let stacks_height = u32::try_from(block.header.chain_length).map_err(|_| {
+        ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
+    })?;
+    if block_starts_new_tenure(block) {
+        ledger
+            .tenure_start_heights
+            .insert(tenure_height, stacks_height);
+    }
+    ledger.executed.push(ExecutedBlock {
+        block_id: *block.block_id().as_bytes(),
+        consensus_hash: block.header.consensus_hash,
+        tenure_height,
+    });
+    let miner = ledger
+        .accounting
+        .earnings_at(u64::from(tenure_height))
+        .and_then(|earnings| match &earnings.recipient {
+            PrincipalData::Standard(address) => Some((address.version(), address.1)),
+            PrincipalData::Contract(_) => None,
+        })
+        .unwrap_or((0, [0; 20]));
+    Ok(nano_vm::BlockHeader {
+        burn_header_hash: bitcoin_context.burn_header_hash,
+        burn_block_height: u32::try_from(bitcoin_context.height).map_err(|_| {
+            ChainStateError::InvalidTransaction("Bitcoin height overflows u32".to_owned())
+        })?,
+        burn_block_time: bitcoin_context.burn_block_time,
+        stacks_block_time: block.header.timestamp,
+        block_header_hash: *block.header.block_hash().as_bytes(),
+        consensus_hash: *block.header.consensus_hash.as_bytes(),
+        vrf_seed: bitcoin_context.vrf_seed,
+        miner_address: miner,
+        burn_spend_total: bitcoin_context.burn_spend_total,
+        burn_spend_winner: bitcoin_context.burn_spend_winner,
+        block_reward: ledger
+            .accounting
+            .reward_for_tenure(u64::from(tenure_height)),
+        tenure_height,
+        tenure_start_height: ledger
+            .tenure_start_heights
+            .get(&tenure_height)
+            .copied()
+            .unwrap_or(stacks_height),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2922,13 +2985,12 @@ mod tests {
 
     use nano_address::StacksAddress;
     use nano_codec::Transaction;
-    use nano_primitives::{BitcoinHeaderHash, Hash160, Network, TrieHash};
-    use nano_sortition::SortitionSnapshot;
+    use nano_primitives::{Hash160, Network, TrieHash};
 
     use super::{
-        BitcoinBlockContext, ChainState, NakamotoBlock, NativeBlockEffects, NativeStxCredit,
-        TenureAccounting, TenureAccountingError, TransactionStatus, check_postconditions,
-        principal_from_address,
+        BitcoinBlockContext, ChainLedger, ChainState, ChainStateError, NakamotoBlock,
+        NativeBlockEffects, NativeStxCredit, TenureAccounting, TenureAccountingError,
+        TransactionStatus, block_fees, check_postconditions, principal_from_address,
     };
 
     #[test]
@@ -3046,6 +3108,233 @@ mod tests {
             .expect("execute native effects");
 
         assert_ne!(baseline.execution.state_root, applied.execution.state_root);
+    }
+
+    /// How many times to reject the same block. The live loop ran 1,417 times;
+    /// the bug is already visible at two, and every attempt executes a block.
+    const REJECTED_ATTEMPTS: usize = 25;
+
+    /// The tenure the captured checkpoint is standing in, mid-tenure.
+    const CHECKPOINT_TENURE: u64 = 120;
+
+    /// Accounting that counts the fees of the tenure the checkpoint is inside.
+    ///
+    /// `add_fees` only counts for the tenure whose start block this node
+    /// executed, and the captured checkpoint names none — which is why the
+    /// captured chain on its own is a weak witness for the fee bug: nothing
+    /// moves either way. Recording earnings for tenure 120 is what a tenure-start
+    /// block does, and it is what makes the fees below actually land.
+    fn accounting_counting_fees() -> TenureAccounting {
+        let mut accounting = TenureAccounting::default();
+        accounting.record_earnings(
+            CHECKPOINT_TENURE,
+            TenureEarnings {
+                recipient: PrincipalData::parse("ST000000000000000000002AMW42H")
+                    .expect("boot principal"),
+                coinbase: 0,
+                fees: 0,
+            },
+        );
+        accounting
+    }
+
+    /// Open the captured checkpoint in `directory`, resuming what is there.
+    fn open_captured(directory: &Path) -> (ChainState, [u8; 32], BitcoinBlockContext) {
+        let (checkpoint, source, root, bitcoin_height) = captured_checkpoint();
+        let chainstate =
+            ChainState::open_from_checkpoint(Network::TESTNET, directory, checkpoint, source, root)
+                .expect("open the checkpoint durably");
+        (
+            chainstate,
+            source,
+            BitcoinBlockContext::at_height(bitcoin_height),
+        )
+    }
+
+    /// Rejecting the same block again and again must leave nothing behind.
+    ///
+    /// Fees reach the tenure accounting *before* the state root is checked, that
+    /// accounting is not in the MARF, and a node retries a block it cannot
+    /// execute for as long as it runs. Mainnet block 8,665,780 was attempted
+    /// 1,417 times at 458,250 uSTX of fees, and its tenure ended up recording
+    /// 649,365,101 — while every MARF root matched, because none of this is in a
+    /// root.
+    ///
+    /// So the assertion is on the whole ledger, not on a list of fields: a field
+    /// added to `ChainLedger` joins this comparison without anyone remembering
+    /// to add it. The fee assertion is separate and deliberate, because the
+    /// invariant passes trivially when no fees move at all.
+    #[test]
+    fn retrying_a_rejected_block_leaves_no_state_beside_the_marf() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut chainstate, source, context) = open_captured(directory.path());
+        *chainstate.accounting_mut() = accounting_counting_fees();
+
+        let block = captured_first_block();
+        let fees = block_fees(&block);
+        assert!(
+            fees > 0,
+            "the captured block has to pay a fee, or a rejection has no fees to leak"
+        );
+        // A root this block cannot produce, so it is rejected in
+        // `settle_state_root` — after its transactions ran and after its fees
+        // were counted, which is where the live divergence was rejected too.
+        let mut rejected = block.clone();
+        rejected.header.state_index_root = TrieHash::from_bytes([0xff; 32]);
+        let rejected_id = *rejected.block_id().as_bytes();
+
+        let before = chainstate.ledger.clone();
+        let owed = before.accounting.to_json().expect("encode the accounting");
+        let content_root = chainstate.state_content_root(source);
+
+        for attempt in 0..REJECTED_ATTEMPTS {
+            let error = chainstate
+                .append_nakamoto_block_with_bitcoin_context(context, Some(source), &rejected)
+                .expect_err("the block commits to a root it cannot produce");
+            assert!(
+                matches!(error, ChainStateError::StateRootMismatch { .. }),
+                "attempt {attempt} has to fail *after* the fees are counted, not before: {error}"
+            );
+            assert_eq!(
+                chainstate.ledger, before,
+                "attempt {attempt} leaves everything beside the MARF alone"
+            );
+            assert_eq!(
+                chainstate
+                    .accounting_mut()
+                    .to_json()
+                    .expect("encode the accounting"),
+                owed,
+                "attempt {attempt} writes the same accounting bytes a restart would read"
+            );
+            assert_eq!(
+                chainstate.tip(),
+                Some(source),
+                "attempt {attempt} seals nothing"
+            );
+            assert_eq!(
+                chainstate.state_content_root(source),
+                content_root,
+                "attempt {attempt} leaves the state it stands on alone"
+            );
+            assert!(
+                !chainstate.has_block_state(rejected_id),
+                "attempt {attempt} leaves no state for the block it rejected"
+            );
+            assert!(
+                !chainstate.has_recorded_header(rejected_id),
+                "attempt {attempt} writes down no header for the block it rejected"
+            );
+        }
+
+        // A restart reads the disk, not the memory the assertions above hold.
+        drop(chainstate);
+        let (mut chainstate, source, context) = open_captured(directory.path());
+        assert_eq!(
+            chainstate.tip(),
+            Some(source),
+            "the restart resumes at the checkpoint"
+        );
+        assert_eq!(chainstate.state_content_root(source), content_root);
+        assert!(!chainstate.has_block_state(rejected_id));
+        assert!(!chainstate.has_recorded_header(rejected_id));
+
+        // And an accepted block after all those rejections owes exactly what it
+        // would have owed had none of them happened.
+        *chainstate.accounting_mut() = accounting_counting_fees();
+        let applied = chainstate
+            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+            .expect("the pristine block executes");
+        assert_eq!(
+            chainstate
+                .accounting_mut()
+                .earnings_at(CHECKPOINT_TENURE)
+                .expect("the tenure is recorded")
+                .fees,
+            fees,
+            "the accepted block's fees are counted once, not once per attempt"
+        );
+
+        let pristine = tempfile::tempdir().expect("a directory");
+        let (mut untouched, source, context) = open_captured(pristine.path());
+        *untouched.accounting_mut() = accounting_counting_fees();
+        let expected = untouched
+            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+            .expect("the pristine block executes");
+        assert_eq!(
+            applied.execution.state_root, expected.execution.state_root,
+            "the retried chain seals the same root as one that never saw the rejected block"
+        );
+        assert_eq!(
+            chainstate.ledger, untouched.ledger,
+            "and owes the same as one that never saw the rejected block"
+        );
+    }
+
+    /// An accepted block's state and the header a later block reads it through
+    /// must both survive a restart.
+    ///
+    /// A sealed root whose header is missing is not a recoverable state: nothing
+    /// re-derives it, and the first contract to ask `get-block-info?` about that
+    /// block gets zeroes for a block the chain has real answers for. The header
+    /// is written after the seal for that reason, so this asserts the pair
+    /// arrives — the rejection test above asserts neither half arrives when the
+    /// block fails.
+    #[test]
+    fn an_accepted_block_is_durable_with_its_header_and_parent_link() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut chainstate, source, context) = open_captured(directory.path());
+        *chainstate.accounting_mut() = accounting_counting_fees();
+
+        let block = captured_first_block();
+        let id = *block.block_id().as_bytes();
+        chainstate
+            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+            .expect("the captured block executes");
+        assert_eq!(chainstate.tip(), Some(id));
+        let content_root = chainstate.state_content_root(id);
+        let header = chainstate
+            .recorded_header(id)
+            .expect("a header was written");
+        drop(chainstate);
+
+        let (chainstate, _, _) = open_captured(directory.path());
+        assert_eq!(
+            chainstate.tip(),
+            Some(id),
+            "the reopened state stands on the block it sealed"
+        );
+        assert_eq!(chainstate.state_content_root(id), content_root);
+        assert_eq!(chainstate.parent_of(id), Some(source));
+        assert_eq!(
+            chainstate.recorded_header(id).as_ref(),
+            Some(&header),
+            "a sealed root must not outlive the header a later block reads it through"
+        );
+    }
+
+    /// Nothing a block touches outside the MARF can escape the rollback.
+    ///
+    /// This is a compile-time claim, not a runtime one. `ChainState` has exactly
+    /// two fields and `adopt` destructures it exhaustively, so a third stops the
+    /// crate building until its author has put it in the VM — where a block's
+    /// writes are already a transaction — or in `ChainLedger`, which a block runs
+    /// against a clone of and which is dropped unread when the block fails. The
+    /// destructuring here says the same for the ledger's own fields: adding one
+    /// breaks this test, and the comment is what the compiler cannot say.
+    #[test]
+    fn the_ledger_holds_everything_a_block_changes_outside_the_marf() {
+        let ChainLedger {
+            accounting,
+            tenure_start_heights,
+            executed,
+            parent_tenure_proof,
+        } = ChainLedger::default();
+
+        assert_eq!(accounting, TenureAccounting::default());
+        assert!(tenure_start_heights.is_empty());
+        assert!(executed.is_empty());
+        assert!(parent_tenure_proof.is_none());
     }
 
     #[test]
