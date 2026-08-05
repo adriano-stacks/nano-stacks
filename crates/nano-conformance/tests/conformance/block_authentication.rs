@@ -35,13 +35,10 @@ fn checkpoint_and_block() -> (ChainState, NakamotoBlock) {
             .to_owned()
     };
     let decode = |value: &str| -> [u8; 32] {
-        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice())
-            .expect("32 bytes")
+        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice()).expect("32 bytes")
     };
 
-    let directory = Box::leak(Box::new(
-        tempfile::tempdir().expect("a directory"),
-    ));
+    let directory = Box::leak(Box::new(tempfile::tempdir().expect("a directory")));
     let source = decode(&field("source_state_id"));
     let mut chainstate = ChainState::open_from_checkpoint(
         nano_primitives::Network::TESTNET,
@@ -147,4 +144,3 @@ fn a_transaction_naming_another_chain_is_rejected() {
         "the rejection says which: {rejected}"
     );
 }
-

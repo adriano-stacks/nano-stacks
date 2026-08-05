@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use nano_codec::{CodecError, Transaction, TransactionPayloadType, transaction_merkle_root};
 use nano_crypto::{CryptoError, MessageSignature, StacksPublicKey};
 use nano_primitives::{
-    BitVec, BitVecError, BlockHeaderHash, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash,
-    sha512_256,
+    BitVec, BitVecError, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, StacksBlockId,
+    TrieHash, hash160, sha512_256,
 };
 
 /// A consensus-encoded Nakamoto block header.
@@ -252,33 +252,24 @@ impl SignerSet {
             .map_err(|_| SignerSetError::WeightOverflow)
     }
 
+    /// The same set keyed by signing-key hash, which is how state records it.
+    pub fn signing_weights(&self) -> Result<SignerWeights, SignerSetError> {
+        SignerWeights::new(
+            self.signers
+                .iter()
+                .map(|signer| {
+                    (
+                        hash160(&signer.public_key.to_bytes_compressed()),
+                        signer.weight,
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// Verify recovered signatures are unique, reward-set ordered, and sufficiently weighted.
     pub fn verify(&self, header: &NakamotoBlockHeader) -> Result<u32, SignerSetError> {
-        let digest = *header.signer_signature_hash().as_bytes();
-        let mut next_index = 0;
-        let mut signed_weight = 0_u32;
-        for signature in &header.signer_signatures {
-            let public_key = signature
-                .recover(&digest)
-                .map_err(SignerSetError::Signature)?;
-            let Some((index, signer)) = self
-                .signers
-                .iter()
-                .enumerate()
-                .skip(next_index)
-                .find(|(_, signer)| signer.public_key == public_key)
-            else {
-                return Err(SignerSetError::UnknownOrUnorderedSigner);
-            };
-            signed_weight = signed_weight
-                .checked_add(signer.weight)
-                .ok_or(SignerSetError::WeightOverflow)?;
-            next_index = index + 1;
-        }
-        if signed_weight < self.approval_threshold()? {
-            return Err(SignerSetError::InsufficientWeight);
-        }
-        Ok(signed_weight)
+        self.signing_weights()?.verify(header)
     }
 
     /// Order valid signer responses by reward-set index and require threshold weight.
@@ -310,8 +301,100 @@ impl SignerSet {
     }
 }
 
+/// The signer set as executed state records it: ordered signing-key hashes with
+/// the weight each carries.
+///
+/// The `.signers` boot contract stores a *principal* per signer rather than the
+/// public key it was derived from, so a set read back out of state can only be
+/// matched by `Hash160` — which is also how the burnchain names a miner, and is
+/// everything the three signature rules need: which key signed, in what order,
+/// for how much weight.
+///
+/// `SignerSet::verify` goes through here too. There is one implementation of the
+/// rule because there is one rule, and a second copy of it would be free to
+/// drift on the parts nothing exercises — ordering, most of all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerWeights {
+    entries: Vec<(Hash160, u32)>,
+}
+
+impl SignerWeights {
+    /// Construct a non-empty set with no signer named twice.
+    pub fn new(entries: Vec<(Hash160, u32)>) -> Result<Self, SignerSetError> {
+        if entries.is_empty() {
+            return Err(SignerSetError::Empty);
+        }
+        let unique = entries
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect::<BTreeSet<_>>();
+        if unique.len() != entries.len() {
+            return Err(SignerSetError::DuplicateSigner);
+        }
+        Ok(Self { entries })
+    }
+
+    /// The signers in reward-set order, which is the order signatures follow.
+    #[must_use]
+    pub fn entries(&self) -> &[(Hash160, u32)] {
+        &self.entries
+    }
+
+    /// The whole set's weight, which the threshold is seven tenths of.
+    pub fn total_weight(&self) -> Result<u32, SignerSetError> {
+        self.entries.iter().try_fold(0_u32, |total, (_, weight)| {
+            total
+                .checked_add(*weight)
+                .ok_or(SignerSetError::WeightOverflow)
+        })
+    }
+
+    /// The minimum signing weight that approves a block.
+    pub fn approval_threshold(&self) -> Result<u32, SignerSetError> {
+        u32::try_from((u64::from(self.total_weight()?) * 7).div_ceil(10))
+            .map_err(|_| SignerSetError::WeightOverflow)
+    }
+
+    /// Verify recovered signatures are unique, reward-set ordered, and sufficiently weighted.
+    ///
+    /// Recovery does not validate low-S: the network accepts signatures a naive
+    /// verifier rejects, and a signer set that refused them would refuse blocks
+    /// the chain is built on.
+    pub fn verify(&self, header: &NakamotoBlockHeader) -> Result<u32, SignerSetError> {
+        let digest = *header.signer_signature_hash().as_bytes();
+        let mut next_index = 0;
+        let mut signed_weight = 0_u32;
+        for signature in &header.signer_signatures {
+            let public_key = signature
+                .recover(&digest)
+                .map_err(SignerSetError::Signature)?;
+            let signing_hash = hash160(&public_key.to_bytes_compressed());
+            // Searching forward from the last match is what enforces both rules
+            // at once: a signer already counted is behind the cursor, and one
+            // out of reward-set order is behind it too.
+            let Some((index, (_, weight))) = self
+                .entries
+                .iter()
+                .enumerate()
+                .skip(next_index)
+                .find(|(_, (hash, _))| *hash == signing_hash)
+            else {
+                return Err(SignerSetError::UnknownOrUnorderedSigner);
+            };
+            signed_weight = signed_weight
+                .checked_add(*weight)
+                .ok_or(SignerSetError::WeightOverflow)?;
+            next_index = index + 1;
+        }
+        if signed_weight < self.approval_threshold()? {
+            return Err(SignerSetError::InsufficientWeight);
+        }
+        Ok(signed_weight)
+    }
+}
+
 /// Errors raised while constructing or applying a signer reward set.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignerSetError {
     Empty,
     DuplicateSigner,

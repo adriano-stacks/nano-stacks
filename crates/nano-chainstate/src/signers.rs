@@ -11,15 +11,23 @@ use clarity::vm::{
 };
 use nano_crypto::StacksPublicKey;
 use nano_primitives::Network;
-use nano_primitives::hash160;
+use nano_primitives::{Hash160, hash160};
 use nano_vm::{BitcoinBlockContext, Vm};
 
-use crate::{ChainStateError, SignerSet};
+use crate::{ChainStateError, SignerSet, SignerWeights};
 
 /// Reward addresses paid by one Bitcoin commitment.
 const OUTPUTS_PER_COMMIT: u32 = 2;
 
-/// Testnet address version for a standard single-signature principal.
+/// Address versions for a standard single-signature principal.
+///
+/// `handle_signer_stackerdb_update` renders each signer with
+/// `StacksAddress::p2pkh_from_hash(is_mainnet, ..)`, so the version follows the
+/// network. It was the testnet one unconditionally here, which is invisible on a
+/// testnet chain and would have written a principal mainnet does not for every
+/// signer of every cycle nano sets up — a state root divergence at the first
+/// prepare phase, with nothing else to show for it.
+const MAINNET_SINGLE_SIGNATURE_VERSION: u8 = 22;
 const TESTNET_SINGLE_SIGNATURE_VERSION: u8 = 26;
 
 /// The reward cycle a prepare-phase block computes the signer set for.
@@ -51,11 +59,91 @@ pub const fn reward_cycle_at(context: BitcoinBlockContext) -> Option<u64> {
     Some((context.height - context.first_height) / length)
 }
 
-/// The signer set that attests to blocks in `context`'s reward cycle.
+/// The signer set that attests to blocks in `context`'s reward cycle, as this
+/// chain's own executed state records it.
 ///
-/// Derived from this node's own executed state — the pox-5 linked list the
-/// network derives it from — so a block's signatures can be checked against
-/// something no peer supplied.
+/// Read out of `.signers` rather than re-derived from the pox-5 linked list, for
+/// three reasons that all point the same way:
+///
+/// - **It is the same answer, already checked.** The node writes those entries
+///   itself, in a prepare phase, from that same list — and the writes are
+///   consensus state, so a wrong set fails the state root of the block that
+///   wrote it. Re-deriving would repeat work the MARF root has already agreed
+///   with the network about.
+/// - **It reaches back before the checkpoint.** A cycle set up by stacks-core
+///   before the state was exported has no pox-5 positions to walk — mainnet's
+///   cycle 140 was stacked in pox-4 — but its `.signers` entries came across
+///   with the state. That is the difference between checking mainnet's signer
+///   weight today and not checking it at all.
+/// - **One contract call instead of forty-five.** The walk costs three calls per
+///   staker; on the captured chain that was 120 ms a block, twenty-five times
+///   what the rest of the block's validation costs.
+///
+/// A cycle nobody has set up yet answers `NoSignerSet`, which is not a fault in
+/// the block: the chain is well-formed and there is simply nothing recorded to
+/// check it against.
+pub fn recorded_signer_set(
+    vm: &mut Vm,
+    context: BitcoinBlockContext,
+) -> Result<SignerWeights, ChainStateError> {
+    let cycle = reward_cycle_at(context).ok_or(ChainStateError::NoSignerSet(0))?;
+    let signers = boot_contract(vm.network(), "signers");
+    let recorded = read_optional(
+        vm,
+        &signers,
+        "get-signers",
+        &[Value::UInt(u128::from(cycle))],
+    )
+    .map_err(|_| ChainStateError::NoSignerSet(cycle))?
+    .ok_or(ChainStateError::NoSignerSet(cycle))?;
+    let entries = recorded
+        .expect_list()
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?
+        .into_iter()
+        .map(signer_entry)
+        .collect::<Result<Vec<_>, ChainStateError>>()?;
+    if entries.is_empty() {
+        return Err(ChainStateError::NoSignerSet(cycle));
+    }
+    SignerWeights::new(entries)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
+}
+
+/// One `{ signer: principal, weight: uint }` as the contract stores it.
+fn signer_entry(value: Value) -> Result<(Hash160, u32), ChainStateError> {
+    let bad = |what: &str| ChainStateError::InvalidTransaction(format!("a signer entry {what}"));
+    let mut tuple = value.expect_tuple().map_err(|_| bad("is not a tuple"))?;
+    let signer = tuple
+        .data_map
+        .remove("signer")
+        .ok_or_else(|| bad("names no signer"))?
+        .expect_principal()
+        .map_err(|_| bad("names no principal"))?;
+    let weight = tuple
+        .data_map
+        .remove("weight")
+        .ok_or_else(|| bad("carries no weight"))?
+        .expect_u128()
+        .map_err(|_| bad("carries no weight"))?;
+    // Only the hash: the version byte in front of it says which network the
+    // principal was rendered for, and the same signer is the same signer on
+    // either. Matching on the whole principal would refuse every entry a
+    // stacks-core node wrote on mainnet.
+    let PrincipalData::Standard(address) = signer else {
+        return Err(bad("is a contract, not a signer"));
+    };
+    Ok((
+        Hash160::from_bytes(address.1),
+        u32::try_from(weight).map_err(|_| bad("weighs more than a signer can"))?,
+    ))
+}
+
+/// The signer set derived from the pox-5 positions stacked for a reward cycle.
+///
+/// This is the *derivation*; `recorded_signer_set` is what the chain wrote down
+/// from it. It stays here because `update_signer_set` writes from it, and it is
+/// worth reading beside the recorded set: the two agreeing is what makes reading
+/// the recorded one safe.
 pub fn active_signer_set(
     vm: &mut Vm,
     context: BitcoinBlockContext,
@@ -100,7 +188,7 @@ pub fn update_signer_set(
     let principals = set
         .signers()
         .iter()
-        .map(|signer| signing_principal(&signer.public_key))
+        .map(|signer| signing_principal(network, &signer.public_key))
         .collect::<Vec<_>>();
 
     let slots = tuple_list(
@@ -214,10 +302,15 @@ fn tuple_list(
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }
 
-fn signing_principal(public_key: &StacksPublicKey) -> PrincipalData {
+fn signing_principal(network: Network, public_key: &StacksPublicKey) -> PrincipalData {
+    let version = if network.is_mainnet() {
+        MAINNET_SINGLE_SIGNATURE_VERSION
+    } else {
+        TESTNET_SINGLE_SIGNATURE_VERSION
+    };
     PrincipalData::Standard(
         StandardPrincipalData::new(
-            TESTNET_SINGLE_SIGNATURE_VERSION,
+            version,
             *hash160(&public_key.to_bytes_compressed()).as_bytes(),
         )
         .expect("a standard address version is valid"),

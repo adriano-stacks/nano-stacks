@@ -1,10 +1,16 @@
+mod authenticate;
 mod nakamoto;
 mod signers;
 
-pub use nakamoto::{
-    NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, Signer, SignerSet, SignerSetError,
-    TenureError,
+pub use authenticate::{
+    ConsensusError, MAX_PROBLEMATIC_TRANSACTION_MARKERS, NAKAMOTO_BLOCK_VERSION_EPOCH_4,
+    recovered_miner_key_hash, registered_signing_key_hash, verify_miner_signature,
 };
+pub use nakamoto::{
+    NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, ProblematicTransaction, Signer,
+    SignerSet, SignerSetError, SignerWeights, TenureError,
+};
+pub use signers::reward_cycle_at;
 
 use clarity::vm::ClarityVersion as VmClarityVersion;
 use clarity::vm::Value;
@@ -144,12 +150,18 @@ const TESTNET_EMISSIONS: [(u64, u128); 6] = [
     (77_777 * 7, 250_000_000),
     (77_777 * 14, 125_000_000),
     (77_777 * 21, 62_500_000),
-    (TESTNET_STACKS_40_BURN_HEIGHT - TESTNET_GENESIS_BURN_HEIGHT, 1_000_000_000),
+    (
+        TESTNET_STACKS_40_BURN_HEIGHT - TESTNET_GENESIS_BURN_HEIGHT,
+        1_000_000_000,
+    ),
 ];
 const MAINNET_EMISSIONS: [(u64, u128); 3] = [
     (0, 1_000_000_000),
     (278_950, 500_000_000),
-    (MAINNET_STACKS_40_BURN_HEIGHT - MAINNET_GENESIS_BURN_HEIGHT, 1_000_000_000),
+    (
+        MAINNET_STACKS_40_BURN_HEIGHT - MAINNET_GENESIS_BURN_HEIGHT,
+        1_000_000_000,
+    ),
 ];
 
 const MAINNET_GENESIS_BURN_HEIGHT: u64 = 666_050;
@@ -347,13 +359,13 @@ impl TenureAccounting {
                     fees: earnings.fees,
                 })
                 .collect(),
-            coinbase_schedule: self.schedule.map(|schedule| {
-                TenureAccountingCheckpointSchedule {
+            coinbase_schedule: self
+                .schedule
+                .map(|schedule| TenureAccountingCheckpointSchedule {
                     mainnet: schedule.mainnet,
                     first_bitcoin_height: schedule.first_bitcoin_height,
                     initial_mining_bonus_ustx: schedule.initial_mining_bonus,
-                }
-            }),
+                }),
             started: self.started,
         }
     }
@@ -395,7 +407,10 @@ impl TenureAccounting {
         self.earnings.retain(|height, _| *height < coinbase_height);
         self.matured_effects
             .retain(|height, _| *height < coinbase_height);
-        if self.started.is_some_and(|started| started >= coinbase_height) {
+        if self
+            .started
+            .is_some_and(|started| started >= coinbase_height)
+        {
             // Not `None`: execution resumes inside the highest tenure that
             // survived, and this accounting *did* see that tenure's start block
             // — it is only later ones that were taken off the chain. Clearing
@@ -442,9 +457,9 @@ impl TenureAccounting {
     /// The STX a tenure earned, as `get-tenure-info? block-reward` reports it.
     #[must_use]
     pub fn reward_for_tenure(&self, coinbase_height: u64) -> u128 {
-        self.earnings
-            .get(&coinbase_height)
-            .map_or(0, |earnings| earnings.coinbase.saturating_add(earnings.fees))
+        self.earnings.get(&coinbase_height).map_or(0, |earnings| {
+            earnings.coinbase.saturating_add(earnings.fees)
+        })
     }
 
     pub fn record_earnings(&mut self, coinbase_height: u64, earnings: TenureEarnings) {
@@ -721,7 +736,8 @@ impl ChainLedger {
             .into_iter()
             .map(|block| {
                 Ok(ExecutedBlock {
-                    block_id: decode_hex(&block.block_id).ok_or_else(|| bad("an executed block"))?,
+                    block_id: decode_hex(&block.block_id)
+                        .ok_or_else(|| bad("an executed block"))?,
                     consensus_hash: ConsensusHash::from_bytes(
                         decode_hex(&block.consensus_hash)
                             .ok_or_else(|| bad("an executed block's tenure"))?,
@@ -779,45 +795,6 @@ pub struct ChainState {
     vm: Vm,
     ledger: ChainLedger,
 }
-
-/// The header version epoch 4.0 blocks carry, below the shadow flag.
-pub const NAKAMOTO_BLOCK_VERSION_EPOCH_4: u8 = 1;
-
-/// What a block claimed about itself that this chain does not accept.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsensusError {
-    HeaderVersion(u8),
-    TransactionNetwork { txid: [u8; 32] },
-    TransactionChainId { txid: [u8; 32], chain_id: u32 },
-    TransactionAnchorMode { txid: [u8; 32] },
-}
-
-impl std::fmt::Display for ConsensusError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::HeaderVersion(version) => {
-                write!(formatter, "block header version {version} is not epoch 4.0's")
-            }
-            Self::TransactionNetwork { txid } => write!(
-                formatter,
-                "transaction {} is for another network",
-                hex::encode(txid)
-            ),
-            Self::TransactionChainId { txid, chain_id } => write!(
-                formatter,
-                "transaction {} names chain {chain_id:#010x}",
-                hex::encode(txid)
-            ),
-            Self::TransactionAnchorMode { txid } => write!(
-                formatter,
-                "transaction {} is anchored off-chain, which 4.0 has no place for",
-                hex::encode(txid)
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConsensusError {}
 
 /// A block nano has executed, and the tenure it belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -933,6 +910,18 @@ impl ChainState {
         })
     }
 
+    /// Open chainstate over a state directory that already holds a chain.
+    ///
+    /// No checkpoint and no import: this is for reading what a node has written,
+    /// which `open_from_checkpoint` cannot do without being handed the checkpoint
+    /// the node started from as well.
+    pub fn open(network: Network, directory: impl AsRef<Path>) -> Result<Self, ChainStateError> {
+        Ok(Self {
+            vm: Vm::open(network, directory)?,
+            ledger: ChainLedger::default(),
+        })
+    }
+
     /// Open chainstate from a checkpointed Clarity MARF.
     pub fn from_checkpoint(
         network: Network,
@@ -992,10 +981,7 @@ impl ChainState {
     }
 
     /// Read an account's spendable STX at the state this chainstate reads from.
-    pub fn account_balance(
-        &mut self,
-        principal: &PrincipalData,
-    ) -> Result<u128, ChainStateError> {
+    pub fn account_balance(&mut self, principal: &PrincipalData) -> Result<u128, ChainStateError> {
         Ok(self.vm.account_balance(principal)?)
     }
 
@@ -1037,7 +1023,10 @@ impl ChainState {
     /// back at a restart or a retraction.
     #[must_use]
     pub fn tenure_start_height(&self, tenure_height: u32) -> Option<u32> {
-        self.ledger.tenure_start_heights.get(&tenure_height).copied()
+        self.ledger
+            .tenure_start_heights
+            .get(&tenure_height)
+            .copied()
     }
 
     /// The same height as Clarity answers it, from the VM's own map.
@@ -1378,33 +1367,78 @@ impl ChainState {
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
     }
 
-    /// Check a block's signer signatures against a set this node derived.
+    /// The signer set that attests to blocks in a burn block's reward cycle, as
+    /// this chain's executed state records it.
     ///
-    /// The set comes from pox-5 in this node's own executed state, so nothing
-    /// about who may attest to a block is taken from the peer that sent it.
+    /// Public because a caller checking a block it did not execute — a signer
+    /// weighing a proposal, a test weighing a capture — needs the same set the
+    /// follow path uses, and deriving it a second way is how the two drift.
+    pub fn recorded_signer_set(
+        &mut self,
+        context: BitcoinBlockContext,
+    ) -> Result<SignerWeights, ChainStateError> {
+        signers::recorded_signer_set(&mut self.vm, context)
+    }
+
+    /// The signer set derived from the pox-5 positions stacked for the cycle.
     ///
-    /// This reports rather than rejects while the derivation is being proved
-    /// against the chain: a set that is subtly wrong would turn every block away
-    /// and stop the node, which is a worse failure than a missing check. It
-    /// becomes a rejection once mainnet replay passes it in silence.
-    fn check_signer_signatures(&mut self, block: &NakamotoBlock, context: BitcoinBlockContext) {
-        if std::env::var_os("NANO_CHECK_SIGNERS").is_none() {
-            return;
-        }
-        match signers::active_signer_set(&mut self.vm, context) {
-            Ok(set) => {
-                if let Err(error) = set.verify(&block.header) {
+    /// Beside `recorded_signer_set` on purpose: the derivation is what the node
+    /// writes down at a prepare phase, and the two agreeing is what makes
+    /// reading the recorded one instead of walking pox-5 every block safe.
+    pub fn derived_signer_set(
+        &mut self,
+        context: BitcoinBlockContext,
+    ) -> Result<SignerSet, ChainStateError> {
+        signers::active_signer_set(&mut self.vm, context)
+    }
+
+    /// Check a block's signer signatures against the set its cycle recorded.
+    ///
+    /// Nothing about who may attest to a block comes from the peer that sent it:
+    /// the set is read out of this chain's own state, where a prepare phase wrote
+    /// it under the state root the network agreed with.
+    ///
+    /// A cycle with no recorded set is **reported and accepted**, and that is not
+    /// the same thing as a check that passed. Mainnet's cycle 140 was stacked in
+    /// pox-4, before the state nano imports, so the block that would have written
+    /// its `.signers` entries is below the checkpoint; a node replaying there has
+    /// nothing to check against and says so. Rejecting instead would refuse every
+    /// block of a chain the network is on, which is the worse failure of the two.
+    fn check_signer_signatures(
+        &mut self,
+        block: &NakamotoBlock,
+        context: BitcoinBlockContext,
+    ) -> Result<(), ChainStateError> {
+        match signers::recorded_signer_set(&mut self.vm, context) {
+            Ok(set) => set.verify(&block.header).map(|_| ()).map_err(|error| {
+                // The numbers go in the message because this is the one rejection
+                // an operator may see on a chain nobody has replayed yet, and
+                // "below threshold" without them says nothing about whether the
+                // block is wrong or the set is.
+                ChainStateError::InvalidTransaction(format!(
+                    "{}: reward cycle {:?} recorded {} signers weighing {:?}, of which {:?} \
+                     approves a block",
+                    ConsensusError::SignerWeight(error),
+                    signers::reward_cycle_at(context),
+                    set.entries().len(),
+                    set.total_weight(),
+                    set.approval_threshold(),
+                ))
+            }),
+            Err(error) => {
+                // Said once a tenure rather than once a block. The condition
+                // belongs to the whole reward cycle — thousands of blocks — and a
+                // line per block would bury everything else the run prints,
+                // which on mainnet is how a real message gets missed.
+                if block_starts_new_tenure(block) {
                     eprintln!(
-                        "block {} at height {} does not carry threshold signer weight: {error:?}",
-                        block.block_id(),
-                        block.header.chain_length
+                        "the tenure at burn {} carries signer signatures this node cannot \
+                         check: {error}",
+                        context.height
                     );
                 }
+                Ok(())
             }
-            Err(error) => eprintln!(
-                "no signer set for the cycle at burn {}: {error}",
-                context.height
-            ),
         }
     }
 
@@ -1418,7 +1452,16 @@ impl ChainState {
         block: &NakamotoBlock,
         parent: Option<[u8; 32]>,
         context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        root: RootPolicy<'_>,
     ) -> Result<(), ChainStateError> {
+        // A block this node is assembling is not one it is following, and the
+        // difference is signatures: the miner signs the header at seal time,
+        // after this runs, and the signers only see it afterwards. Every rule
+        // below that reads a signature would be asking a candidate for something
+        // it cannot have yet — and the miner's own answer to each of them is the
+        // code that builds the block.
+        let assembled = matches!(root, RootPolicy::Mine(_));
         if let Some(parent) = parent {
             let parent_height = block.header.chain_length.checked_sub(2).ok_or_else(|| {
                 ChainStateError::InvalidTransaction(
@@ -1432,10 +1475,128 @@ impl ChainState {
                 })?,
             );
         }
-        self.authenticate_block(block)
+        let signatures = if assembled {
+            authenticate::Signatures::Pending
+        } else {
+            authenticate::Signatures::Present
+        };
+        authenticate::authenticate_block(block, self.vm.network(), signatures)
             .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
-        self.check_signer_signatures(block, context);
+        self.check_tenure_continuity(block, parent)
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        if !assembled {
+            self.check_signer_signatures(block, context)?;
+            Self::check_miner_won_the_sortition(block, context, operations)
+                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        }
+        // Not conditional: a coinbase proof is the miner's own work rather than
+        // anyone's signature, so a candidate carries a real one and a miner that
+        // cannot prove it won its own sortition wants to hear about it here.
         self.check_tenure_vrf_if_starting(block, context)
+    }
+
+    /// Check a tenure change against the chain this node has executed.
+    ///
+    /// Two of the fields `check_nakamoto_tenure` validates against a tenure index
+    /// are answerable from the executed list: the tenure a change confirms is the
+    /// tenure its parent block belongs to, and the block count it reports is that
+    /// parent's height within it (`get_nakamoto_tenure_length`, which reads the
+    /// parent's own `height_in_tenure`).
+    ///
+    /// Both are skipped rather than guessed when the list cannot answer, and the
+    /// two cases are different. A parent that is not in the list at all is the
+    /// checkpoint's anchor — reported, because that is a real hole. A count whose
+    /// tenure begins below the retained window cannot be *completed*, and a
+    /// partial count is lower than the truth, so it would reject an honest block:
+    /// that one is passed over in silence, because the tenure tie beside it did
+    /// run and a mainnet tenure longer than the window would otherwise say so on
+    /// every block of it.
+    fn check_tenure_continuity(
+        &self,
+        block: &NakamotoBlock,
+        parent: Option<[u8; 32]>,
+    ) -> Result<(), ConsensusError> {
+        let Some(payload) = authenticate::tenure_change_payload(block) else {
+            return Ok(());
+        };
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        let Some(position) = self
+            .ledger
+            .executed
+            .iter()
+            .rposition(|executed| executed.block_id == parent)
+        else {
+            eprintln!(
+                "the tenure change at height {} names a previous tenure and a block count \
+                 this node cannot check: its parent is not among the blocks this chain has \
+                 executed, which is what the first tenure after a checkpoint looks like",
+                block.header.chain_length
+            );
+            return Ok(());
+        };
+        let executed = &self.ledger.executed[..=position];
+        let parent_tenure = executed[position].consensus_hash;
+        if payload.previous_tenure_consensus_hash != parent_tenure {
+            return Err(ConsensusError::TenureChangeParentTenure);
+        }
+        // A tenure is exactly the run of blocks sharing a consensus hash: a new
+        // sortition is a new hash, and an extension keeps the one it has, which
+        // is why `height_in_tenure` counts across extensions as well.
+        let blocks = executed
+            .iter()
+            .rev()
+            .take_while(|executed| executed.consensus_hash == parent_tenure)
+            .count();
+        if blocks < executed.len() && u32::try_from(blocks) != Ok(payload.previous_tenure_blocks) {
+            return Err(ConsensusError::TenureChangeBlockCount {
+                claimed: payload.previous_tenure_blocks,
+                executed: u32::try_from(blocks).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check the block was signed by the miner whose leader key won its sortition.
+    ///
+    /// This is the one rule that ties a block to the *burnchain* rather than to
+    /// its own contents. The tenure-change check in `authenticate_block` already
+    /// ties the miner signature to the tenure change the block carries, so a
+    /// tenure change lifted out of another miner's block does not survive — but a
+    /// miner that forges both is still not the winner, and only the leader key's
+    /// registered block-signing hash says so.
+    ///
+    /// Both inputs are local: the winning VRF public key comes from this node's
+    /// own burn distribution, and the registration comes from a Bitcoin block it
+    /// downloaded. Neither is usually *present* yet, and that is reported rather
+    /// than skipped — see the task note; a registration reused across tenures
+    /// sits in a burn block older than the operations handed to a block, so this
+    /// waits on the winner's signing hash travelling with the sortition.
+    fn check_miner_won_the_sortition(
+        block: &NakamotoBlock,
+        context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+    ) -> Result<(), ConsensusError> {
+        if !block_starts_new_tenure(block) {
+            return Ok(());
+        }
+        let Some(vrf_public_key) = context.winner_vrf_public_key else {
+            // `check_tenure_vrf` reports this one already, and once is enough.
+            return Ok(());
+        };
+        let Some(signing_key_hash) =
+            authenticate::registered_signing_key_hash(operations, &vrf_public_key)
+        else {
+            eprintln!(
+                "the tenure at burn {} carries a miner signature this node cannot check: it \
+                 knows which leader key won the sortition but not the block-signing key that \
+                 key was registered with, which is in the burn block that registered it",
+                context.height
+            );
+            return Ok(());
+        };
+        authenticate::verify_miner_signature(&block.header, &signing_key_hash)
     }
 
     /// A tenure-start block claims a tenure it says it won, and the VRF rules are
@@ -1505,40 +1666,17 @@ impl ChainState {
     /// Check what a block claims about itself before any of it is executed.
     ///
     /// A state root only says the block computes what its header commits to; it
-    /// says nothing about whether the block belongs to this chain at all. A
-    /// transaction carrying another network's version byte or chain identifier
-    /// is not a transaction on this chain, and one anchored off-chain names
-    /// microblocks, which 4.0 does not have — none of which a root would catch,
-    /// because a node that executes them computes a perfectly self-consistent
-    /// state for a chain nobody else is on.
-    ///
-    /// Nothing here is asked of the peer that supplied the block.
+    /// says nothing about whether the block belongs to this chain at all. The
+    /// rules are in `authenticate`, and every one of them answers from the block
+    /// and this chain's identity alone — nothing is asked of the peer that
+    /// supplied it, and nothing here reads state, which is what lets it run
+    /// before the VM is touched.
     pub fn authenticate_block(&self, block: &NakamotoBlock) -> Result<(), ConsensusError> {
-        let version = block.header.version & 0x7f;
-        if version != NAKAMOTO_BLOCK_VERSION_EPOCH_4 {
-            return Err(ConsensusError::HeaderVersion(block.header.version));
-        }
-        let network = self.vm.network();
-        for transaction in &block.transactions {
-            let mainnet = matches!(transaction.version(), nano_codec::TransactionVersion::Mainnet);
-            if mainnet != network.is_mainnet() {
-                return Err(ConsensusError::TransactionNetwork {
-                    txid: *transaction.txid().as_bytes(),
-                });
-            }
-            if transaction.chain_id() != network.chain_id() {
-                return Err(ConsensusError::TransactionChainId {
-                    txid: *transaction.txid().as_bytes(),
-                    chain_id: transaction.chain_id(),
-                });
-            }
-            if matches!(transaction.anchor_mode(), nano_codec::AnchorMode::OffChainOnly) {
-                return Err(ConsensusError::TransactionAnchorMode {
-                    txid: *transaction.txid().as_bytes(),
-                });
-            }
-        }
-        Ok(())
+        authenticate::authenticate_block(
+            block,
+            self.vm.network(),
+            authenticate::Signatures::Present,
+        )
     }
 
     /// Execute one block, optionally rejecting it before it is sealed when the
@@ -1556,7 +1694,7 @@ impl ChainState {
             effects,
             candidates,
         } = execution;
-        self.check_before_executing(block, parent, bitcoin_context)?;
+        self.check_before_executing(block, parent, bitcoin_context, operations, root)?;
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // The block runs against a copy of everything kept outside the MARF, and
@@ -2688,8 +2826,7 @@ pub fn verify_coinbase_vrf_proof(
     sortition_hash: &[u8; 32],
 ) -> Result<(), TenureVrfError> {
     let proof = coinbase_vrf_proof(block).ok_or(TenureVrfError::MissingProof)?;
-    let public_key =
-        VrfPublicKey::from_bytes(*leader_vrf_public_key)
+    let public_key = VrfPublicKey::from_bytes(*leader_vrf_public_key)
         .map_err(|_| TenureVrfError::MalformedProof)?;
     let proof = VrfProof::from_bytes(&proof).map_err(|_| TenureVrfError::MalformedProof)?;
     match Vrf::verify(&public_key, &proof, sortition_hash) {
@@ -3936,8 +4073,9 @@ mod tests {
             )
             .expect("record matured effects");
 
-        let restored = TenureAccounting::from_json(&accounting.to_json().expect("encode accounting"))
-            .expect("decode accounting");
+        let restored =
+            TenureAccounting::from_json(&accounting.to_json().expect("encode accounting"))
+                .expect("decode accounting");
         // Fees only keep accruing for the tenure whose start block was executed
         // here, so the round trip has to carry that over as well.
         let mut extended = restored;

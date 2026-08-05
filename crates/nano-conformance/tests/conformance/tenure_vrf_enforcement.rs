@@ -42,7 +42,8 @@ fn captured_tenure() -> Option<Tenure> {
     for path in nano_conformance::captured_block_paths(&fixture) {
         let block = NakamotoBlock::decode(&fs::read(&path).ok()?).ok()?;
         let view = block.header.consensus_hash.to_string();
-        let (Some(context), Some(operations)) = (snapshots.get(&view), operations.get(&view)) else {
+        let (Some(context), Some(operations)) = (snapshots.get(&view), operations.get(&view))
+        else {
             continue;
         };
         let captured = Captured {

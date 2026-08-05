@@ -45,6 +45,7 @@ mod pox_locking;
 mod rejected_blocks;
 mod release_dependencies;
 mod restart;
+mod signer_weight_enforcement;
 mod tenure_vrf_enforcement;
 mod trie_diff;
 mod wasm_builds_a_let_bound_placeholder;
