@@ -513,14 +513,38 @@ no widening at runtime: the value's shape depends on which arm ran.
 That is the model mismatch. clar2wasm fixes a value's wasm representation from its
 *static* type, and `If` gives both arms one static type — so whichever arm does not
 match that type is laid out wrongly, and no conversion fixes it because the two
-arms genuinely carry different numbers of fields. Either `If` must stop rewriting
-its arms' types and pass the result through memory instead of the value stack, or
-the arms must be ducked to whichever type the analysis actually chose for the `if`
-— and which one that is has not been established. Printing the `if`'s analysed type
-is the next measurement, and it is a one-line addition to `If::traverse`.
+arms genuinely carry different numbers of fields. **Which type the `if` chose, measured.** Printed from `If::traverse`:
 
-That is the honest state. Two named defects, one measured interpreter answer, one
-reduced test, and no fix yet.
+```
+if analysed as (tuple (a uint) (b uint))
+  true  arm { "a": uint, "b": uint }
+  false arm { "a": uint, "b": uint, "c": bool }
+```
+
+The `if` analyses as the **narrow** tuple. So the false arm has to be *narrowed* —
+field `c` dropped — and that **is** a representation change `duck_type` can express.
+The fix is a chain of three, and the first two were tried:
+
+1. **`need_ducktyping` must see a differing field set.** Fixed, and it is right:
+   compare by name and count rather than zipping positionally. On its own it changes
+   nothing here, because nothing was calling `duck_type` on this path.
+2. **`Print` must duck its result from its argument's type to the expression's.**
+   Applied on top of (1), and it moves the failure from "module will not load" to
+   `Incompatible types for duck typing: BoolType / UIntType`. So the duck is now
+   firing, and the value is reaching it.
+3. **`duck_type`'s own tuple conversion is positional too.** That `BoolType /
+   UIntType` is field `c: bool` being matched against `b: uint`. Tuple conversion
+   has to map by field *name* and drop fields absent from the target.
+
+(3) is where it stops. All three were reverted rather than left in: (1) and (2)
+together turn a load failure into an analysis failure, which is worse, and (3) is a
+change to shared conversion machinery that needs clar2wasm's own 1,375 tests and a
+mainnet replay behind it, not a hunch at the end of a session.
+
+The diagnosis is complete and the sequence is written down. `min1` in
+`wasm_response_fold` reproduces it in 0.01 s, and
+`NANO_TRACE_IF_TYPES` — a two-line print in `If::traverse`, also reverted — is how
+the analysed type was read.
 
 ## Two tools this needed, and now has
 
