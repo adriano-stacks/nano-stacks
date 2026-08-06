@@ -436,15 +436,9 @@ async fn stand_up() -> Environment {
     // Two peers over the same chain, and a burnchain of this chain's own Bitcoin
     // blocks. The peers are honest here on purpose: `follow_path` is where a peer
     // lies, and this test is about the process rather than about the choice.
-    let (first, first_task) = serve(Served {
-        blocks: served.clone(),
-        snapshots: snapshots(),
-    })
+    let (first, first_task) = serve(Served::honest(served.clone(), snapshots()))
     .await;
-    let (second, second_task) = serve(Served {
-        blocks: served.clone(),
-        snapshots: snapshots(),
-    })
+    let (second, second_task) = serve(Served::honest(served.clone(), snapshots()))
     .await;
     let (burnchain, burnchain_task) = serve_burnchain().await;
 

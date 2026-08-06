@@ -433,6 +433,15 @@ pub enum SyncError {
     InvalidAccount,
     /// Every peer in the pool has been asked and none could answer.
     NoPeer,
+    /// Every peer in the pool is rate limiting, so there is nobody left to ask.
+    ///
+    /// Distinct from [`SyncError::NoPeer`] because the two ask for opposite
+    /// things: a pool with nobody able to serve is a failed round, while a pool
+    /// that is throttling has not failed at all — the round keeps what it
+    /// fetched, executes it, and asks again. Answering `NoPeer` here is what
+    /// made one 429 end a mainnet round with an error before it executed
+    /// anything it already held.
+    Throttled,
     /// A peer answered a block request with a different block.
     ///
     /// Its own kind rather than a generic failure because it is the one thing a peer
@@ -451,6 +460,7 @@ impl SyncError {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Self::Http(error)
             if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS))
+            || matches!(self, Self::Throttled)
     }
 }
 
@@ -459,6 +469,7 @@ impl fmt::Display for SyncError {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
             Self::NoPeer => formatter.write_str("no peer left to ask"),
+            Self::Throttled => formatter.write_str("every peer is rate limiting this node"),
             Self::UnexpectedBlock { expected, found } => write!(
                 formatter,
                 "a peer answered the request for block {expected} with block {found}"
@@ -513,6 +524,7 @@ impl std::error::Error for SyncError {
             | Self::InvalidMempool
             | Self::InvalidAccount
             | Self::NoPeer
+            | Self::Throttled
             | Self::UnexpectedBlock { .. } => None,
         }
     }
@@ -1233,7 +1245,20 @@ impl TenureSource {
                 Err(error) => last = Some(error),
             }
         }
-        Err(last.unwrap_or(SyncError::NoPeer))
+        Err(last.unwrap_or_else(|| self.nobody_left()))
+    }
+
+    /// Why nothing came back when no peer was even asked.
+    ///
+    /// Every peer was skipped, and the reason decides what the caller does: a
+    /// pool that is throttling has not failed, so the round keeps what it has
+    /// and asks again, while an empty pool is a round that cannot proceed.
+    fn nobody_left(&self) -> SyncError {
+        if self.throttled.is_empty() {
+            SyncError::NoPeer
+        } else {
+            SyncError::Throttled
+        }
     }
 
     /// Fetch one block, from whichever peer is next and willing.
@@ -1272,7 +1297,7 @@ impl TenureSource {
                 Err(error) => last = Some(error),
             }
         }
-        Err(last.unwrap_or(SyncError::NoPeer))
+        Err(last.unwrap_or_else(|| self.nobody_left()))
     }
 
     /// Let every peer that had rate-limited be asked again.
@@ -1959,7 +1984,8 @@ mod tests {
 
     use super::{
         RATE_LIMIT_RETRIES, BlockUploadWire, BurnView, CandidateTip, Signer, SignerSet,
-        StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, choose_canonical_tip,
+        StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
+        choose_canonical_tip,
         parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
         parse_stacker_set, validate_tenure, validate_tenure_transition,
     };
@@ -2087,6 +2113,68 @@ mod tests {
         assert!(limited.is_rate_limited(), "{limited}");
         let missing = client.node_info().await.expect_err("the peer said 404");
         assert!(!missing.is_rate_limited(), "{missing}");
+    }
+
+    /// A pool with every peer throttled asks its caller to wait, not to stop.
+    ///
+    /// The distinction is the whole of a catch-up round's shape. A round that is
+    /// told "no peer left to ask" fails and discards itself; a round that is told
+    /// "everybody is throttling" keeps the blocks it staged, executes them and
+    /// asks again. `NoPeer` was answered for both, and a mainnet round that met
+    /// one 429 returned it before executing anything it already held.
+    ///
+    /// `Retry-After: 0` so the client's own retries cost this test nothing; what
+    /// is under test is the answer after them, not the waiting.
+    #[tokio::test]
+    async fn a_pool_with_every_peer_throttled_asks_the_caller_to_wait() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                let response = "HTTP/1.1 429 Too Many Requests\r\n\
+                                retry-after: 0\r\ncontent-length: 0\r\n\r\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+        let mut source = TenureSource::only(client);
+        let tenure = StacksBlockId::from_bytes([0x11; 32]);
+
+        let refused = source
+            .blocks_of_tenure(tenure)
+            .await
+            .expect_err("the peer said 429");
+        assert!(refused.is_rate_limited(), "{refused}");
+        assert_eq!(
+            source.throttled(),
+            1,
+            "the peer was not set aside, so the ask below is not the one under test"
+        );
+
+        // Asked again with nobody left to ask. Nothing was even sent this time,
+        // and the answer still has to be "wait".
+        let exhausted = source
+            .blocks_of_tenure(tenure)
+            .await
+            .expect_err("there is nobody left to ask");
+        assert!(matches!(exhausted, SyncError::Throttled), "{exhausted}");
+        assert!(exhausted.is_rate_limited(), "{exhausted}");
+
+        // And an empty pool still says the other thing, which is what keeps the
+        // two apart rather than collapsing them.
+        let mut empty = TenureSource::new(Vec::new());
+        assert!(matches!(
+            empty.blocks_of_tenure(tenure).await,
+            Err(SyncError::NoPeer)
+        ));
+
+        source.forgive_throttles();
+        assert_eq!(source.throttled(), 0);
     }
 
     /// A peer asking for a longer wait than this node would choose gets it.
