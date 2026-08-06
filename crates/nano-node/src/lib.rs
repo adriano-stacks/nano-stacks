@@ -70,11 +70,16 @@ pub struct CheckpointExecutor<S> {
 
 /// What this node derived for the burn block a Stacks block executes under.
 ///
-/// Both fields are validation inputs and nothing else: `check_tenure_vrf` reads
-/// them and no Clarity word does, so filling them from the local burnchain rather
-/// than from a peer moves no state root. Taking them from the peer would mean
-/// trusting the peer for the input that decides whether a tenure is the one the
-/// network elected, which is the whole point of deriving sortitions here.
+/// The first three are validation inputs and nothing else: `check_tenure_vrf`
+/// reads them and no Clarity word does, so filling them from the local burnchain
+/// rather than from a peer moves no state root. Taking them from the peer would
+/// mean trusting the peer for the input that decides whether a tenure is the one
+/// the network elected, which is the whole point of deriving sortitions here.
+///
+/// `burn_spends` is the opposite kind of thing and travels here because it comes
+/// from the same arithmetic: `get-block-info? miner-spend-total` and
+/// `miner-spend-winner` read it, it lands in the header this node writes down, and
+/// so it *does* move state roots.
 #[derive(Clone, Copy, Debug)]
 struct LocalSortition {
     sortition_hash: [u8; 32],
@@ -84,6 +89,22 @@ struct LocalSortition {
     /// The block-signing hash that key was registered with, when the registry
     /// carries one for it.
     winner_signing_key_hash: Option<[u8; 20]>,
+    /// What the sortition's miners spent, and the winner's share.
+    burn_spends: Option<nano_sortition::BurnSpends>,
+}
+
+impl LocalSortition {
+    /// Put the sortition's burn spends into the context a block executes under.
+    ///
+    /// Left alone when the derivation has no answer, which is a burn block that
+    /// elected nobody — and no tenure stands on one, so nothing that could have
+    /// been answered is left at zero by this.
+    fn record_burn_spends(self, bitcoin_context: &mut BitcoinBlockContext) {
+        if let Some(spends) = self.burn_spends {
+            bitcoin_context.burn_spend_total = u128::from(spends.total);
+            bitcoin_context.burn_spend_winner = u128::from(spends.winner);
+        }
+    }
 }
 
 /// Where a round of execution spent its time.
@@ -168,7 +189,8 @@ impl ExecutionTiming {
 ///
 /// These are the same constants every `BitcoinBlockContext` is already built
 /// from, so reading them here adds no new trust.
-fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> {
+#[must_use]
+pub fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> {
     let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
     let waterfall = pox.pox_5_activation_height.map(|activation| {
         pox.first_bitcoin_height
@@ -619,6 +641,7 @@ where
             bitcoin_context.sortition_hash = local.sortition_hash;
             bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
             bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
+            local.record_burn_spends(&mut bitcoin_context);
         }
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
@@ -941,7 +964,9 @@ where
         if let Some(resumed) = self.check_burnchain(node, staging).await? {
             round.reorganized = Some(resumed);
         }
-        round.executed = self.execute_staged(node, pox, staging, budget.execute).await?;
+        round.executed = self
+            .execute_staged(history, pox, staging, budget.execute)
+            .await?;
         // A descent that fetched blocks and executed none, while the peer is
         // ahead, is what a fork looks like from here: the peer's chain walked
         // past this node's tip on another branch, so nothing staged extends it
@@ -1108,10 +1133,15 @@ where
     /// a burn total that disagrees with a signed header means every consensus hash
     /// from here on is derived from a wrong number, so deriving stops rather than
     /// reporting the same wrongness at every block after it.
-    /// The sortition for a burn view, asked of a peer at most once.
+    /// The sortition for a burn view, asked of the pool at most once.
+    ///
+    /// The pool and not the round's own peer, because this request stalled a live
+    /// mainnet catch-up for fifty minutes: one discovered peer's HTTP port stopped
+    /// answering, every round asked it and only it, and each round abandoned the
+    /// 28,458 blocks already staged rather than executing them.
     async fn sortition_for(
         &mut self,
-        node: &SyncClient,
+        peers: &mut TenureSource,
         view: nano_primitives::ConsensusHash,
     ) -> Result<nano_sync::SortitionInfo, NodeExecutionError> {
         if let Some((known, sortition)) = self.sortition_view.as_ref()
@@ -1119,7 +1149,7 @@ where
         {
             return Ok(sortition.clone());
         }
-        let sortition = node.sortition(view).await?;
+        let sortition = peers.sortition(view).await?;
         self.sortition_view = Some((view, sortition.clone()));
         Ok(sortition)
     }
@@ -1238,6 +1268,7 @@ where
             sortition_hash: *tip.sortition_hash.as_bytes(),
             winner_vrf_public_key: tip.winner_vrf_public_key,
             winner_signing_key_hash: tip.winner_signing_key_hash,
+            burn_spends: tracker.burn_spends(),
         };
         // Rejected rather than reported. A Nakamoto header's `bitcoin_spent` is
         // the running burn total of its view and carries threshold signer weight,
@@ -1473,12 +1504,12 @@ where
     /// the view of the last block before it that did. The walk stops when the
     /// tenure does, since a block cannot inherit a view across tenures.
     async fn bitcoin_view_of(
-        node: &SyncClient,
+        peers: &mut TenureSource,
         block: &NakamotoBlock,
     ) -> Result<Option<nano_primitives::ConsensusHash>, NodeExecutionError> {
         let mut parent = block.header.parent_block_id;
         for _ in 0..TENURE_WALK_LIMIT {
-            let ancestor = node.block(parent).await?;
+            let ancestor = peers.block(parent).await?;
             if ancestor.header.consensus_hash != block.header.consensus_hash {
                 return Ok(None);
             }
@@ -1521,7 +1552,7 @@ where
     /// `NANO_TIMING=1` makes each round say where its seconds went.
     async fn execute_staged(
         &mut self,
-        node: &SyncClient,
+        peers: &mut TenureSource,
         pox: &PoxInfo,
         staging: &Staging,
         budget: usize,
@@ -1544,14 +1575,14 @@ where
             } else if self.bitcoin_view.is_none() {
                 // A resumed node did not execute the tenure change that stated
                 // the view, so it walks back to it.
-                self.bitcoin_view = Self::bitcoin_view_of(node, &block).await?;
+                self.bitcoin_view = Self::bitcoin_view_of(peers, &block).await?;
             }
             let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
             if previous_view.replace(view) != Some(view) {
                 timing.views += 1;
             }
             let phase = std::time::Instant::now();
-            let sortition = self.sortition_for(node, view).await?;
+            let sortition = self.sortition_for(peers, view).await?;
             timing.sortition += phase.elapsed();
             let phase = std::time::Instant::now();
             let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
@@ -1573,13 +1604,19 @@ where
             if let Some(local) = local? {
                 bitcoin_context.sortition_hash = local.sortition_hash;
                 bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
-            bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
+                bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
+                // Clarity-visible, unlike the three above, and the reason this
+                // whole derivation had to be right before it could be filled in:
+                // a wrong non-zero answer to `miner-spend-total` is harder to
+                // find than the zero this used to leave, and the offline replay
+                // that verifies every state root does not run this path.
+                local.record_burn_spends(&mut bitcoin_context);
             }
             let phase = std::time::Instant::now();
             self.seed_burn_headers(sortition.bitcoin_height);
             timing.headers += phase.elapsed();
             let phase = std::time::Instant::now();
-            let bitcoin_context = node
+            let bitcoin_context = peers
                 .tenure_coinbase_context(
                     &block,
                     self.chainstate.accounting_mut().schedule(),

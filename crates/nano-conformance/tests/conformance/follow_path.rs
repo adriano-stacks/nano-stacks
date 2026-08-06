@@ -404,6 +404,16 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
 pub const CHAIN_ID: u32 = 2_147_483_648;
 
 /// The stacking calendar the captured chain was produced under.
+///
+/// `pox_5_activation_height` is the chain's own `pox_v4_unlock_height`, which every
+/// captured `new_block` event states. It was `None` here, and that is not a
+/// harmless omission: the waterfall opens with the reward cycle after the one
+/// pox-5 activates in, and under the waterfall a commitment pays **one** output
+/// where a classic reward phase pays two. Without it `payout_schedule` counted two
+/// on a chain that pays one, so every candidate's burn read as its own change, no
+/// sortition was elected at any block of this capture and its running burn total
+/// never moved. `/v2/pox` states the field on a live chain, so this is a fixture
+/// that was missing what production is given.
 pub const fn pox() -> PoxInfo {
     PoxInfo {
         first_bitcoin_height: 0,
@@ -412,12 +422,20 @@ pub const fn pox() -> PoxInfo {
         reward_phase_length: 15,
         reward_slots: 30,
         rejection_fraction: None,
-        pox_5_activation_height: None,
+        pox_5_activation_height: Some(POX_5_ACTIVATION_HEIGHT),
         v1_unlock_height: None,
         v2_unlock_height: None,
         v3_unlock_height: None,
     }
 }
+
+/// The captured chain's `pox_v4_unlock_height`, as its `new_block` events state it.
+///
+/// With a 20-block cycle starting at Bitcoin 0 this puts the waterfall at burn 280,
+/// and the capture's snapshots agree without being asked: their `pox_payouts`
+/// column switches from two classic reward addresses to one `Addr32` P2TR — the
+/// sBTC taproot output — at exactly 280.
+pub const POX_5_ACTIVATION_HEIGHT: u32 = 262;
 
 /// A node standing on the captured checkpoint, with the anchor block applied.
 ///
@@ -944,22 +962,12 @@ fn derived_chain(
 
     let mut tracker = nano_node::sortition::SortitionTracker::from_capture(capture)
         .expect("the synthesized capture seeds a chain");
-    // One payout output per commitment, and this is a finding rather than a knob.
-    // `PayoutSchedule` answers two in a reward phase, because that is
-    // `OUTPUTS_PER_COMMIT`; the number a commitment actually pays is the number of
-    // *recipients the cycle's reward set holds*, capped at two. This capture's chain
-    // has one stacker, so every commitment pays one output of 20,000 sats and then
-    // its own change — and counting two makes a candidate's weight the size of its
-    // wallet, which is the trap [[049]] records for mainnet. Under the two-output
-    // rule this window derives no winner at all and the running burn total never
-    // moves; under one it derives the network's consensus hash at every block. The
-    // waterfall is how `PayoutSchedule` expresses one output today, so that is what
-    // is passed, and the missing rule is recorded on [[049]].
-    let payouts = nano_sortition::PayoutSchedule::new(
-        nano_sortition::RewardCycleSchedule::new(0, 20, Some(0)).expect("a reward cycle calendar"),
-        5,
-    )
-    .expect("a payout schedule");
+    // The node's own derivation from the node's own constants, not a schedule
+    // written out by hand here: the count of payout outputs is what decides every
+    // candidate's weight, so a test that stated it separately would be checking the
+    // tracker against a second opinion instead of against production. See `pox()`
+    // for what this capture pays and why it used to derive nothing.
+    let payouts = nano_node::payout_schedule(&pox()).expect("a payout schedule");
     let mut burnchain = burnchain.clone();
     tracker
         .catch_up(

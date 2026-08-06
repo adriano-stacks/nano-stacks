@@ -183,9 +183,10 @@ pub struct MissedCommitment {
 /// links at all, and getting it wrong makes every candidate's burn a change
 /// amount tens of thousands of times too large.
 ///
-/// A reward phase pays two recipients; a prepare phase burns to one address; the
-/// waterfall pays the one sBTC address. Mainnet's totals derive exactly under
-/// this rule across the captured window, which spans a reward phase.
+/// A reward phase pays `OUTPUTS_PER_COMMIT` outputs; a prepare phase burns to one
+/// address; the waterfall pays the one sBTC address. See
+/// [`PayoutSchedule::outputs_at`] for where that is written down in stacks-core
+/// and for the rule it is *not*.
 ///
 /// It also answers how many blocks the burn distribution is weighed over, which
 /// is not always six — see [`PayoutSchedule::mining_window_at`].
@@ -254,6 +255,32 @@ impl PayoutSchedule {
     }
 
     /// How many payout outputs a commitment in this Bitcoin block carries.
+    ///
+    /// stacks-core spells this out once, in `SortitionHandleTx::get_num_pox_payouts`
+    /// (`chainstate/burn/db/sortdb.rs`), and it is a function of the *height* alone:
+    /// one output under the waterfall, one in a prepare phase, `OUTPUTS_PER_COMMIT`
+    /// otherwise. Two other places have to agree with it and do —
+    /// `parse_pox_waterfall_commits` and `parse_pre_pox_waterfall_commits` read that
+    /// many outputs off the transaction, and `check_pox_pre_waterfall` requires the
+    /// commitment to carry exactly that many.
+    ///
+    /// **It is not the size of the reward set.** That was the standing suspicion,
+    /// because a small chain's cycle can hold fewer recipients than there are
+    /// outputs, and it is wrong in a way stacks-core is explicit about: a reward set
+    /// with one recipient is *padded with a burn address* to reach the full count —
+    /// `RewardSetInfo::into_commit_outs` pads what a miner pays, and
+    /// `check_pox_pre_waterfall` pads what a validator expects ("If the number of
+    /// recipients in the set was odd, we need to pad with a burn address"). So a
+    /// one-stacker cycle still pays two outputs, the second of them a burn, and the
+    /// count never moves with the recipients.
+    ///
+    /// The archive says the same thing without being asked to interpret anything.
+    /// A snapshot's `pox_payouts` column is `(addresses, amount-per-output)` where
+    /// the address list is padded to exactly this count, so
+    /// `amount × addresses.len()` is the block's whole payout burn — and it equals
+    /// the running `total_burn`'s own step at every captured block, on mainnet's
+    /// pre-waterfall reward phase (×2) and on the hacknet capture's waterfall (×1)
+    /// alike. `conformance/burn_spends.rs` asserts both directions.
     #[must_use]
     pub fn outputs_at(&self, bitcoin_height: u64) -> usize {
         if self.cycles.is_waterfall_at(bitcoin_height) {
@@ -409,6 +436,28 @@ pub struct BurnSample {
 pub struct CommitmentBurnStatistics {
     pub block_burn: u64,
     pub window_median_burn: u64,
+}
+
+/// What the miners of one burn block spent on its sortition.
+///
+/// Both numbers are Clarity-visible — `get-block-info?`/`get-tenure-info?` answer
+/// `miner-spend-total` and `miner-spend-winner` out of them — and the language
+/// documentation promises the winner's is no larger than the total. They are
+/// therefore reported together or not at all: a total without its winner is a
+/// broken invariant offered to a contract, which is worse than an absence.
+///
+/// stacks-core keeps them per tenure in the `payments` table's
+/// `burnchain_sortition_burn` and `burnchain_commit_burn` columns, filled at the
+/// tenure-start block from `SortitionDB::get_block_burn_amount` (every accepted
+/// commitment's `burn_fee` in the electing burn block) and from the winning
+/// commitment's own `burn_fee`. A `burn_fee` counts payout outputs only, so both
+/// depend on [`PayoutSchedule::outputs_at`] and on nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BurnSpends {
+    /// Every eligible commitment's payout burn in the burn block.
+    pub total: u64,
+    /// The winning commitment's own.
+    pub winner: u64,
 }
 
 pub fn commitment_burn_statistics(
@@ -1264,6 +1313,39 @@ impl SortitionEngine {
     #[must_use]
     pub fn commitment_window(&self) -> &[CommitmentWindowBlock] {
         &self.commitment_window
+    }
+
+    /// What the miners of the burn block at the tip spent on its sortition.
+    ///
+    /// The tip's own burn block is the last entry of the commitment window —
+    /// [`Self::append`] puts it there, and [`Self::prime`] ends with it for a chain
+    /// seeded at a checkpoint — so this is the same data the distribution was
+    /// weighed over, read again rather than recomputed from the burnchain.
+    ///
+    /// `None` where the winning commitment cannot be found among that block's
+    /// eligible ones: a chain whose window has not been primed, or a burn block
+    /// that elected nobody. The second is ordinary — mainnet leaves four such
+    /// blocks in every fifteen — and no tenure stands on one, so nothing that could
+    /// have an answer is denied one. See [`BurnSpends`] for why the pair is never
+    /// split.
+    #[must_use]
+    pub fn burn_spends(&self) -> Option<BurnSpends> {
+        let block = self.commitment_window.last()?;
+        let winner = self.snapshots.tip().winner_txid?;
+        let winner = block
+            .commitments
+            .iter()
+            .find(|commitment| commitment.txid == winner)?;
+        let total = block
+            .commitments
+            .iter()
+            .try_fold(0_u64, |total, commitment| {
+                total.checked_add(commitment.burn_sats)
+            })?;
+        Some(BurnSpends {
+            total,
+            winner: winner.burn_sats,
+        })
     }
 
     /// Retract every sortition above a Bitcoin height, and the commitment

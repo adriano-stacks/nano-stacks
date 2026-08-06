@@ -35,9 +35,23 @@ struct Captured {
     total_burn: String,
     sortition: i64,
     winning_block_txid: String,
+    /// stacks-core's `pox_payouts` column: `(addresses, amount-per-address)` as
+    /// JSON, with the address list padded to the payout-output count. It is the
+    /// archive's statement of the two Clarity-visible burn spends of a sortition —
+    /// see `burn_spends.rs`.
+    pox_payouts: String,
 }
 
-fn capture() -> Option<PathBuf> {
+impl Captured {
+    /// The block's whole payout burn, which is what `miner-spend-total` answers.
+    fn payout_burn(&self) -> u128 {
+        let (addresses, per_output): (Vec<serde_json::Value>, u128) =
+            serde_json::from_str(&self.pox_payouts).expect("the pox_payouts column is JSON");
+        per_output * addresses.len() as u128
+    }
+}
+
+pub fn capture() -> Option<PathBuf> {
     env::var("NANO_MAINNET_CAPTURE").ok().map(PathBuf::from)
 }
 
@@ -372,7 +386,7 @@ fn priming_blocks(root: &std::path::Path, seed: &Captured) -> Option<Vec<Bitcoin
 /// which is inside this window, so the schedule has to know it: the seven blocks
 /// from there have an epoch boundary inside their mining window and are weighed on
 /// their own block alone.
-fn mainnet_payouts() -> nano_sortition::PayoutSchedule {
+pub fn mainnet_payouts() -> nano_sortition::PayoutSchedule {
     nano_sortition::PayoutSchedule::new(
         nano_sortition::RewardCycleSchedule::new(666_050, 2100, Some(962_150))
             .expect("valid cycle schedule"),
@@ -696,38 +710,11 @@ fn the_node_tracker_derives_the_same_window() {
         let block = blocks
             .get(&snapshot.block_height)
             .expect("every captured snapshot has its Bitcoin block");
-        let derived = tracker.advance(block, payouts).expect("the tracker advances");
-        for (field, derived, captured) in [
-            (
-                "consensus hash",
-                hex::encode(derived.consensus_hash.as_bytes()),
-                snapshot.consensus_hash.clone(),
-            ),
-            (
-                "sortition hash",
-                hex::encode(derived.sortition_hash.as_bytes()),
-                snapshot.sortition_hash.clone(),
-            ),
-            (
-                "total burn",
-                derived.total_burn.to_string(),
-                snapshot.total_burn.clone(),
-            ),
-        ] {
-            assert_eq!(
-                derived, captured,
-                "the node derives the {field} at burn {}",
-                snapshot.block_height
-            );
-        }
-        let expected_winner =
-            (snapshot.sortition != 0).then(|| snapshot.winning_block_txid.clone());
-        assert_eq!(
-            derived.winner_txid.map(hex::encode),
-            expected_winner,
-            "the node names the winner at burn {}",
-            snapshot.block_height
-        );
+        let derived = tracker
+            .advance(block, payouts)
+            .expect("the tracker advances")
+            .clone();
+        assert_snapshot_derives(&derived, tracker.burn_spends(), snapshot);
         winners += 1;
         checked += 1;
     }
@@ -736,6 +723,79 @@ fn the_node_tracker_derives_the_same_window() {
     // identity was the field that did not derive; it derives for all fourteen now,
     // so a floor would only hide a regression.
     assert_eq!(winners, DERIVED_FLOOR, "the node named every winner");
+}
+
+/// Every field of one derived snapshot, against the archive's own row.
+///
+/// Its own function because the walk above is a walk and this is the comparison:
+/// the consensus, sortition and burn totals are what the network committed to, the
+/// winner is who it elected, and the two burn spends are what Clarity reads back.
+fn assert_snapshot_derives(
+    derived: &nano_sortition::SortitionSnapshot,
+    spends: Option<nano_sortition::BurnSpends>,
+    snapshot: &Captured,
+) {
+    for (field, ours, theirs) in [
+        (
+            "consensus hash",
+            hex::encode(derived.consensus_hash.as_bytes()),
+            snapshot.consensus_hash.clone(),
+        ),
+        (
+            "sortition hash",
+            hex::encode(derived.sortition_hash.as_bytes()),
+            snapshot.sortition_hash.clone(),
+        ),
+        (
+            "total burn",
+            derived.total_burn.to_string(),
+            snapshot.total_burn.clone(),
+        ),
+    ] {
+        assert_eq!(
+            ours, theirs,
+            "the node derives the {field} at burn {}",
+            snapshot.block_height
+        );
+    }
+    let expected_winner = (snapshot.sortition != 0).then(|| snapshot.winning_block_txid.clone());
+    assert_eq!(
+        derived.winner_txid.map(hex::encode),
+        expected_winner,
+        "the node names the winner at burn {}",
+        snapshot.block_height
+    );
+    // The two Clarity-visible spends of the sortition, against the archive's own
+    // `pox_payouts`. They are not a consensus *hash* input, so nothing above
+    // disagrees when they are wrong — a production node used to execute every block
+    // with both at zero and seal roots that matched, because no contract in a
+    // replayed window reads them.
+    let Some(spends) = spends else {
+        assert_eq!(
+            snapshot.sortition, 0,
+            "burn {} elected somebody but reported no burn spends",
+            snapshot.block_height
+        );
+        return;
+    };
+    assert_ne!(
+        snapshot.sortition, 0,
+        "burn {} elected nobody, so there is no winner's spend to report",
+        snapshot.block_height
+    );
+    assert_eq!(
+        u128::from(spends.total),
+        snapshot.payout_burn(),
+        "the total miners spent on the sortition at burn {}",
+        snapshot.block_height
+    );
+    assert!(
+        spends.winner > 0 && spends.winner <= spends.total,
+        "the winner of burn {} spent {} against a total of {}",
+        snapshot.block_height,
+        spends.winner,
+        spends.total
+    );
 }
 
 /// A chain resumed from what it saved names the same winners as one that ran on.
