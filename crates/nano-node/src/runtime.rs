@@ -5,9 +5,16 @@
 //! programs over three command lines.
 
 use std::{
-    collections::HashMap, error::Error, fs, future::Future, path::Path, sync::Arc,
+    collections::HashMap,
+    error::Error,
+    fs::{self, File, OpenOptions},
+    future::Future,
+    path::Path,
+    sync::Arc,
     time::Duration,
 };
+
+use fs2::FileExt as _;
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource};
 use nano_crypto::StacksPublicKey;
@@ -141,9 +148,41 @@ impl Drop for Phase {
     }
 }
 
+/// Hold a state directory for this process alone, for as long as it runs.
+///
+/// Two nodes on one directory is not a configuration, it is a corruption: each
+/// reads the sealed tip once at startup and then executes forward from its own
+/// idea of it, so the second one writes MARF versions the first has already
+/// written and every round after that fails with `MARF version already exists`.
+/// It happened here, by an operator restarting a node before the running one had
+/// finished stopping, and the ledger recovered intact only because a commit is one
+/// transaction. Nothing about that was luck to be relied on again.
+///
+/// An advisory lock and not a pid file, so a killed node leaves nothing to clean
+/// up: the kernel drops the lock with the file descriptor.
+fn hold_state_directory(working_dir: &Path) -> Result<File, Box<dyn Error>> {
+    fs::create_dir_all(working_dir)?;
+    let path = working_dir.join("node.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        format!(
+            "another nano-stacks node is already running on {}: {error}.              One state directory holds one node -- stop that one first, and check              that it has exited rather than assuming a signal was enough.",
+            working_dir.display()
+        )
+    })?;
+    Ok(lock)
+}
+
 /// Run a node until it is asked to stop or a role gives up.
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(&config.node.working_dir)?;
+    // Held for the lifetime of the process, and released by the kernel whatever
+    // way it ends. Makes the directory as well: nothing runs before this.
+    let _state = hold_state_directory(&config.node.working_dir)?;
     let mut roles: JoinSet<(Job, Role)> = JoinSet::new();
     // Written by the follow loop once there is a chain to describe, and read by the
     // discovery loop that starts before there is one.
@@ -2491,5 +2530,25 @@ block height found for Stacks block dd254a1691f90df22c1d4585c6526feda3b88b941f6f
         // writing a header under the wrong id is worse than not writing one.
         let error = "no burnchain block height found for Stacks block dd254a16";
         assert!(block_without_a_header(error).is_none());
+    }
+
+    /// One state directory holds one node, and the second one says so.
+    ///
+    /// Both halves matter. A node that refused a directory whose *previous* holder
+    /// had exited would be worse than no check at all -- a killed node leaves the
+    /// file behind -- so the lock is released with the descriptor and the directory
+    /// is takeable again straight after.
+    #[test]
+    fn a_state_directory_holds_one_node() {
+        let directory = tempfile::tempdir().expect("a state directory");
+        let held = super::hold_state_directory(directory.path()).expect("the first node holds it");
+        let refused = super::hold_state_directory(directory.path());
+        assert!(
+            refused.is_err(),
+            "a second node took a directory another one is running on"
+        );
+        drop(held);
+        super::hold_state_directory(directory.path())
+            .expect("a directory whose holder has gone is takeable");
     }
 }
