@@ -1710,15 +1710,6 @@ dependencies = [
 
 [[package]]
 name = "memoffset"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aa361d4faea93603064a027415f07bd8e1d5c88c9fbf68bf56a285428fd79ce"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
-name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
@@ -1733,19 +1724,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
-]
-
-[[package]]
-name = "nix"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3790c00a0150112de0f4cd161e3d7fc4b2d8a5542ffc35f099a2562aecb35c"
-dependencies = [
- "bitflags 1.3.2",
- "cc",
- "cfg-if",
- "libc",
- "memoffset 0.6.5",
 ]
 
 [[package]]
@@ -1939,7 +1917,7 @@ dependencies = [
  "inferno",
  "libc",
  "log",
- "nix 0.26.4",
+ "nix",
  "once_cell",
  "protobuf",
  "protobuf-codegen-pure",
@@ -2645,7 +2623,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "lazy_static",
  "libsecp256k1",
- "nix 0.23.2",
  "p256",
  "rand 0.8.5",
  "ripemd",
@@ -2660,7 +2637,6 @@ dependencies = [
  "slog-term",
  "thiserror",
  "toml",
- "winapi",
 ]
 
 [[package]]
@@ -3328,7 +3304,7 @@ dependencies = [
  "log",
  "mach",
  "memfd",
- "memoffset 0.9.1",
+ "memoffset",
  "paste",
  "rand 0.8.5",
  "rustix 0.38.44",

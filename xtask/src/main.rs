@@ -4265,6 +4265,110 @@ fn report_engines() {
     println!("  interpreter          not linked into the artifact; see the gates below");
 }
 
+/// Every `#[ignore]` in the execution engine's own suite and in the conformance
+/// suite, with the reason it gives.
+///
+/// tasks/060: "account for every ignored Clarity semantic differential in the
+/// release report. A known engine disagreement may not be waived merely because it
+/// has not appeared in the replayed mainnet window." A prose list would go stale
+/// the first time somebody added one, so this is a scan: it reads the reasons out
+/// of the sources and splits them by whether the reason is *infrastructure* — a
+/// test that needs a running node, a network or a fixture nobody has — or a
+/// **semantic** one, which is a disagreement about what Clarity means and is a
+/// failed release gate rather than a skipped test.
+///
+/// A test with a bare `#[ignore]` and no reason counts as semantic: an unexplained
+/// skip is the thing this section exists to make impossible.
+fn report_differentials() {
+    println!("\nignored tests");
+    let roots = [
+        "vendor/clarity-wasm/clar2wasm/src",
+        "vendor/clarity-wasm/clar2wasm/tests",
+        "crates",
+    ];
+    let mut semantic = Vec::new();
+    let mut infrastructure = 0usize;
+    for root in roots {
+        for (path, reason) in ignored_tests(&workspace_root().join(root)) {
+            if is_infrastructure(&reason) {
+                infrastructure += 1;
+            } else {
+                semantic.push((path, reason));
+            }
+        }
+    }
+    semantic.sort();
+    println!(
+        "  infrastructure       {infrastructure} (a running node, a network, or a fixture \
+         nobody has)"
+    );
+    if semantic.is_empty() {
+        println!("  semantic             0 -- no Clarity differential is waived by being skipped");
+        return;
+    }
+    println!(
+        "  semantic             {} -- each one is a failed release gate, not a skipped test",
+        semantic.len()
+    );
+    for (path, reason) in semantic {
+        println!("    {path}: {reason}");
+    }
+}
+
+/// Whether an ignore reason is about the environment rather than about Clarity.
+fn is_infrastructure(reason: &str) -> bool {
+    const ENVIRONMENT: [&str; 7] = [
+        "requires a",
+        "requires the",
+        "reads ",
+        "test system needs",
+        "not simulated",
+        "run when hunting",
+        "needs to be implemented",
+    ];
+    ENVIRONMENT.iter().any(|marker| reason.contains(marker))
+}
+
+/// Every `#[ignore]` under `root`, as `(file:line, reason)`.
+fn ignored_tests(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(ignored_tests(&path));
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let shown = path
+            .strip_prefix(workspace_root())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (line, text) in source.lines().enumerate() {
+            let trimmed = text.trim_start();
+            // The attribute, not a mention of it in prose: a doc comment
+            // explaining why something is *not* ignored would otherwise be counted.
+            if !trimmed.starts_with("#[ignore") {
+                continue;
+            }
+            let reason = trimmed
+                .split_once('"')
+                .and_then(|(_, rest)| rest.rsplit_once('"').map(|(reason, _)| reason.to_owned()))
+                .unwrap_or_else(|| "no reason given".to_owned());
+            found.push((format!("{shown}:{}", line + 1), reason));
+        }
+    }
+    found
+}
+
 fn report_artifact() {
     println!("\nartifact");
     let binary = workspace_root().join("target/release/stacks-node");
@@ -4500,6 +4604,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     );
     report_revision();
     report_engines();
+    report_differentials();
     report_artifact();
     report_checkpoint(state.as_deref());
     report_scoreboard();

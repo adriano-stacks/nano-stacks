@@ -279,7 +279,15 @@ mod tests {
         );
     }
 
-    #[ignore = "see issue #316"]
+    /// A deploy whose *last* top-level form is a definition.
+    ///
+    /// Not a differential at all, which is what measuring it settled: both engines
+    /// answer `(+ 3 4)`. A contract initialization returns the last top-level
+    /// expression that has a value — `initialize_contract` walks the analysed
+    /// expressions in reverse for the first with an expected type, and `eval_all`
+    /// keeps the last non-`None` result — and a `define-private` has none. The
+    /// `Ok(None)` this asserted was the expectation being wrong, not either engine,
+    /// and `#[ignore = "see issue #316"]` hid that for as long as it stood.
     #[test]
     fn top_level_define_last() {
         crosscheck(
@@ -288,7 +296,7 @@ mod tests {
 
 (define-private (foo) 42)
     ",
-            Ok(None),
+            Ok(Some(Value::Int(7))),
         );
     }
 

@@ -46,21 +46,37 @@ execution.
       history under [[070-carry-leader-key-history-into-proposal-validation]].
 - [ ] Submit a valid transaction through the public RPC and observe the same
       transaction admitted, mined, executed and emitted in `new_block`.
-- [ ] Finish `/v3/stacker_set`: preserve `stacked_amt`, serve the current
+- [x] Finish `/v3/stacker_set`: preserve `stacked_amt`, serve the current
       Waterfall shape and derive its sBTC address instead of returning V0/zero
-      placeholders.
-- [ ] Serve `/v3/blocks/:id` and `/v3/tenures/:id` from the durable executed
-      chain, not only the currently followed/recent view.
-- [ ] Populate matured rewards, reward set and miner transaction id in
+      placeholders. `DerivedRewardSet` keeps `stacked` and `pox_ustx_threshold`
+      through the pox-5 walk and `stacker_set_payload` emits the waterfall shape,
+      falling back to V0 only when the payout address cannot be derived; checked
+      field by field against `stackslib`'s own `RewardSet` serde.
+- [x] Serve `/v3/blocks/:id` and `/v3/tenures/:id` from the durable executed
+      chain, not only the currently followed/recent view. `nano-node/archive.rs`
+      is a bounded sqlite store written at seal and retracted on a fork switch; the
+      handlers ask it first. The invariant holds because it only ever holds blocks
+      the executor sealed.
+- [~] Populate matured rewards, reward set and miner transaction id in
       `new_block`, then compare receipts, costs and events with an independent
       stacks-core observer for the same executed blocks.
+      `miner_address`, `from_stacks_block_hash` and `from_index_consensus_hash` are
+      read back out of the executed-block archive, from the start block of the
+      tenure that matured. They stay absent for the first 100 tenures after a
+      checkpoint and for a node with no archive: a checkpoint carries what is owed,
+      not where it was earned, so they are empty rather than guessed. The
+      independent-observer comparison over the same *mainnet* blocks is the part
+      still open.
 - [x] Exercise a stock `stacks-signer`, transaction submitter and event observer
       against the binary far enough to validate RPC shapes, signer registration,
       StackerDB writes, transaction admission and observer payloads. This does
       not claim the signer accepted a block or the transaction was mined.
-- [ ] Fail StackerDB replication over between discovered peers under
+- [x] Fail StackerDB replication over between discovered peers under
       [[071-fail-over-signer-role-replication-across-peers]]; one initially
       selected HTTP client must not remain load-bearing for the hosted signer.
+      Six loops held one endpoint and none does now; `replication_failover.rs`
+      breaks the first peer six ways over real HTTP. The live half — removing a
+      configured peer from a running node — stays open there.
 
 ## Acceptance Criteria
 

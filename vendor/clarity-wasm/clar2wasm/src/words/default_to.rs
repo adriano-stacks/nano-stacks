@@ -109,7 +109,11 @@ impl ComplexWord for DefaultTo {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::{crosscheck_compare_only, evaluate};
+    use clarity::vm::errors::VmExecutionError;
+    use clarity::vm::types::TupleData;
+    use clarity::vm::{ClarityName, Value};
+
+    use crate::tools::{crosscheck_compare_only, evaluate, interpret};
 
     #[test]
     fn default_to_less_than_two_args() {
@@ -166,32 +170,68 @@ mod tests {
     /// is `clarity2_implicit_cast`, whose own comment calls the case "unreachable
     /// if the type-checker has already run successfully" — which is as close as
     /// the reference comes to saying that this type should not have been handed
-    /// out. Closing it needs the reference's own analysis —
-    /// `least_supertype` refusing the asymmetric pair the way it already refuses
-    /// the reverse one, or sanitizing a value to its analysed type on return — so
-    /// it is `#[ignore]`d here rather than papered over. Accounted for in
-    /// nano-stacks task 060 as a known engine disagreement.
+    /// out.
+    ///
+    /// Asserted rather than `#[ignore]`d, and asserted on *both* engines. An
+    /// ignored equality is a divergence nobody measures; the same divergence
+    /// pinned in both directions cannot move — in either engine — without turning
+    /// this red, and it is the reference's half that decides the chain. The `none`
+    /// branch must still agree, because there the value *is* its analysed type.
+    ///
+    /// Accounted for in nano-stacks task 068, which records why no choice inside
+    /// this word closes it: the conformant engine here is one whose values carry
+    /// their shape at run time.
     #[test]
-    #[ignore = "the reference's default-to answers with its branch's own tuple, which has no single static layout"]
     fn clar_default_to_narrowing_answers_with_the_branch_the_reference_took() {
-        crosscheck_compare_only(
+        const NARROWING: &str =
             "(define-read-only (whole (entry (optional { soft: bool, full: bool })))
-               (default-to { soft: false } entry))
-             (whole (some { soft: true, full: true }))",
+               (default-to { soft: false } entry))";
+
+        // The `some` branch: the payload's own two-field tuple in the reference,
+        // the analysed one-field tuple here.
+        let entry = "(whole (some { soft: true, full: true }))";
+        let wide = interpret(&format!("{NARROWING} {entry}"));
+        let narrow = evaluate(&format!("{NARROWING} {entry}"));
+        assert_ne!(
+            format!("{wide:?}"),
+            format!("{narrow:?}"),
+            "if this has closed, close the accounting in nano-stacks task 068 with it"
         );
-        // The reference refuses these two outright, so the harness reports them
-        // as "Interpreted snippet failed" beside a compiled run that succeeded.
-        crosscheck_compare_only(
-            "(define-data-var last { soft: bool } { soft: false })
-             (define-public (store (entry (optional { soft: bool, full: bool })))
-               (begin (var-set last (default-to { soft: false } entry)) (ok (var-get last))))
-             (store (some { soft: true, full: true }))",
+        assert_eq!(
+            format!("{wide:?}"),
+            format!(
+                "{:?}",
+                Ok::<_, VmExecutionError>(Some(
+                    Value::Tuple(
+                        TupleData::from_data(vec![
+                            (ClarityName::from_literal("full"), Value::Bool(true)),
+                            (ClarityName::from_literal("soft"), Value::Bool(true)),
+                        ])
+                        .unwrap()
+                    )
+                ))
+            ),
+            "the reference hands back the payload's own tuple"
         );
-        crosscheck_compare_only(
-            "(define-private (echo (t { soft: bool })) t)
-             (define-read-only (passed (entry (optional { soft: bool, full: bool })))
-               (echo (default-to { soft: false } entry)))
-             (passed (some { soft: true, full: true }))",
+        assert_eq!(
+            format!("{narrow:?}"),
+            format!(
+                "{:?}",
+                Ok::<_, VmExecutionError>(Some(
+                    Value::Tuple(
+                        TupleData::from_data(vec![(
+                            ClarityName::from_literal("soft"),
+                            Value::Bool(true)
+                        )])
+                        .unwrap()
+                    )
+                ))
+            ),
+            "and this hands back the analysed one"
         );
+
+        // The `none` branch: the default's own value, which is the analysed type in
+        // both, so it must agree.
+        crosscheck_compare_only(&format!("{NARROWING} (whole none)"));
     }
 }
