@@ -1007,9 +1007,18 @@ pub struct SnapshotChain {
     /// hashes rather than the snapshots keeps that history to twenty bytes a
     /// block — six megabytes for the whole of mainnet.
     consensus_hashes: Vec<ConsensusHash>,
-    /// The last burn height at or below the oldest snapshot still held that
-    /// elected somebody. See [`Self::last_sortition_at_or_below`].
-    sortition_below_window: Option<u64>,
+    /// Burn heights below the oldest snapshot still held that elected somebody,
+    /// ascending. See [`Self::last_sortition_at_or_below`].
+    ///
+    /// A list and not a single height, because the question is asked *at* a height
+    /// and not only at the tip. One value can answer for everything at or above
+    /// itself and for nothing below it, which is exactly the case a resumed chain
+    /// lands in: it is seeded at the burn block its history ends at and its window
+    /// holds nothing lower, while execution is still working through staged blocks
+    /// that stand on earlier burn views. Measured on a live mainnet follower --
+    /// seeded at burn 961,342, asked about 961,320, and it could only say "this
+    /// chain cannot say", which stops execution rather than minting a guess.
+    sortitions_below_window: Vec<u64>,
 }
 
 impl SnapshotChain {
@@ -1018,7 +1027,7 @@ impl SnapshotChain {
         Self {
             consensus_hashes: vec![genesis.consensus_hash],
             snapshots: vec![genesis],
-            sortition_below_window: None,
+            sortitions_below_window: Vec::new(),
         }
     }
 
@@ -1034,7 +1043,7 @@ impl SnapshotChain {
         Some(Self {
             snapshots: vec![genesis],
             consensus_hashes: history,
-            sortition_below_window: None,
+            sortitions_below_window: Vec::new(),
         })
     }
 
@@ -1277,7 +1286,7 @@ impl SnapshotChain {
             // every fifteen. Monotonic, because the walk only ever asks for the
             // *last* one.
             if dropped.winner_txid.is_some() {
-                self.sortition_below_window = Some(dropped.bitcoin_height);
+                self.remember_sortition_below_window(dropped.bitcoin_height);
             }
         }
     }
@@ -1316,7 +1325,32 @@ impl SnapshotChain {
             // The walk reached the oldest snapshot held without finding one. The
             // hint left behind by whatever fell out of the window — or recorded
             // when the chain was seeded — is then the only thing that can answer.
-            .or_else(|| self.sortition_below_window.filter(|height| *height <= bitcoin_height))
+            // Nothing in the window elected anybody at or below the height asked
+            // about, so the answer is whichever remembered height is the greatest
+            // one still at or below it. Ascending, so the reverse walk finds it
+            // first.
+            .or_else(|| {
+                self.sortitions_below_window
+                    .iter()
+                    .rev()
+                    .find(|height| **height <= bitcoin_height)
+                    .copied()
+            })
+    }
+
+    /// Remember a burn height that elected somebody and has left the window.
+    ///
+    /// Bounded by the window's own size: a chain asks about the burn blocks a
+    /// staged block can stand on, which is the same reach the snapshots keep, so a
+    /// list that grew with the chain would be keeping answers nobody can ask for.
+    fn remember_sortition_below_window(&mut self, bitcoin_height: u64) {
+        if self.sortitions_below_window.last() == Some(&bitcoin_height) {
+            return;
+        }
+        self.sortitions_below_window.push(bitcoin_height);
+        if self.sortitions_below_window.len() > SNAPSHOTS_KEPT {
+            self.sortitions_below_window.remove(0);
+        }
     }
 
     /// The last sortition at or below this chain's oldest retained snapshot.
@@ -1325,13 +1359,27 @@ impl SnapshotChain {
     /// that elected nobody has no snapshot with a winner in it at all and cannot
     /// walk further back. See [`Self::last_sortition_at_or_below`].
     #[must_use]
-    pub const fn sortition_below_window(&self) -> Option<u64> {
-        self.sortition_below_window
+    pub fn sortition_below_window(&self) -> Option<u64> {
+        self.sortitions_below_window.last().copied()
+    }
+
+    /// Every remembered height, ascending, so a chain can be written down and
+    /// resumed able to answer the same questions it could before.
+    #[must_use]
+    pub fn sortitions_below_window(&self) -> &[u64] {
+        &self.sortitions_below_window
     }
 
     /// Adopt that hint, for a chain being seeded from what a previous run saved.
-    pub const fn seed_sortition_below_window(&mut self, bitcoin_height: Option<u64>) {
-        self.sortition_below_window = bitcoin_height;
+    pub fn seed_sortition_below_window(&mut self, bitcoin_height: Option<u64>) {
+        self.sortitions_below_window = bitcoin_height.into_iter().collect();
+    }
+
+    /// Seed the whole remembered run, which is what a saved chain carries.
+    pub fn seed_sortitions_below_window(&mut self, heights: Vec<u64>) {
+        self.sortitions_below_window = heights;
+        self.sortitions_below_window.sort_unstable();
+        self.sortitions_below_window.dedup();
     }
 
     fn previous_consensus_hashes(&self) -> Vec<ConsensusHash> {
@@ -1703,9 +1751,44 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 mod tests {
     use super::{
         CommitmentWindowBlock, MINING_COMMITMENT_WINDOW, MiningCommitment, PoxIdTracker,
-        RewardCycleSchedule, SortitionEngine, SortitionHash, SortitionSnapshot,
+        RewardCycleSchedule, SnapshotChain, SortitionEngine, SortitionHash, SortitionSnapshot,
         commitment_burn_statistics, commitment_distribution, select_epoch4_winner, select_winner,
     };
+
+    /// A chain resumed at its saved tip can still say what elected somebody below it.
+    ///
+    /// The case a live mainnet follower stopped on: seeded at burn 961,342 with the
+    /// last sortition recorded as 961,342, then asked about 961,320 -- below the
+    /// seed. The window cannot reach it and one remembered height cannot answer for
+    /// it, so the node said "this chain cannot say" and refused to execute rather
+    /// than minting a tenure's coinbase from a guess.
+    #[test]
+    fn a_resumed_chain_answers_below_the_height_it_was_seeded_at() {
+        let seeded = || {
+            SnapshotChain::new(SortitionSnapshot::genesis(
+                961_342,
+                nano_primitives::BitcoinHeaderHash::from_bytes([7; 32]),
+            ))
+        };
+
+        // What a saved chain carries now: every height below the window that elected
+        // somebody, not only the newest.
+        let mut chain = seeded();
+        chain.seed_sortitions_below_window(vec![961_300, 961_318, 961_342]);
+        assert_eq!(chain.last_sortition_at_or_below(961_320), Some(961_318));
+        assert_eq!(chain.last_sortition_at_or_below(961_310), Some(961_300));
+        assert_eq!(chain.last_sortition_at_or_below(961_342), Some(961_342));
+        // Below everything remembered is still "this chain cannot say", which is the
+        // one answer that must never be guessed.
+        assert_eq!(chain.last_sortition_at_or_below(961_299), None);
+
+        // A state written before the run was carried keeps exactly what it had: one
+        // height, good for everything at or above itself and nothing below it.
+        let mut older = seeded();
+        older.seed_sortition_below_window(Some(961_342));
+        assert_eq!(older.last_sortition_at_or_below(961_342), Some(961_342));
+        assert_eq!(older.last_sortition_at_or_below(961_320), None);
+    }
 
     #[test]
     fn commitment_distribution_uses_minimum_median_burns() {

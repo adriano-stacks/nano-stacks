@@ -708,6 +708,21 @@ struct CapturedSnapshot {
     /// than guessed, and the chain re-derived from the checkpoint.
     #[serde(default)]
     last_sortition_height: Option<u64>,
+    /// Every burn height below the retained window that elected somebody,
+    /// ascending.
+    ///
+    /// The single height above answers for everything at or above itself and for
+    /// nothing below it, which is the case a resumed chain lands in: it is seeded at
+    /// the burn block its history ends at and holds no snapshot lower, while
+    /// execution is still working through staged blocks standing on earlier burn
+    /// views. Measured on a live mainnet follower -- seeded at burn 961,342, asked
+    /// about 961,320, and it could only say "this chain cannot say", which stops
+    /// execution rather than minting a guess.
+    ///
+    /// Absent from a state written before this existed, which then falls back to the
+    /// single height and is no worse than it was.
+    #[serde(default)]
+    sortitions_below_window: Vec<u64>,
 }
 
 impl SortitionTracker {
@@ -816,6 +831,18 @@ impl SortitionTracker {
                 .engine
                 .snapshots()
                 .last_sortition_at_or_below(tip.bitcoin_height),
+            // Every burn height that elected somebody and has left the window, not
+            // just the newest. A resumed chain is seeded at the burn block its
+            // history ends at and holds no snapshot below it, while execution is
+            // still working through staged blocks standing on earlier burn views --
+            // so one height answers for everything at or above itself and for
+            // nothing below, and the run is what makes the resumed chain able to
+            // answer what an unrestarted one could.
+            sortitions_below_window: self
+                .engine
+                .snapshots()
+                .sortitions_below_window()
+                .to_vec(),
         }];
         let history = History {
             hashes: self
@@ -883,6 +910,14 @@ impl SortitionTracker {
             .engine
             .snapshots_mut()
             .seed_sortition_below_window(seed.last_sortition_height);
+        // And the run behind it, where a saved chain carries one. Older states have
+        // none and fall back to the single height above, which is what they had.
+        if !seed.sortitions_below_window.is_empty() {
+            tracker
+                .engine
+                .snapshots_mut()
+                .seed_sortitions_below_window(seed.sortitions_below_window.clone());
+        }
         tracker.load_leader_keys(directory)?;
         Ok(tracker)
     }

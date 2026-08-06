@@ -53,11 +53,24 @@ never from fetched, staged or peer-reported height.
       > elected somebody, and a tenure's accumulated coinbase is minted from that
       > height — so block 8,712,512 is not executed rather than minting a guess
 
-      That is the frontier to work next: `SortitionTracker::previous_sortition_height`
-      walks back for the last burn block that elected a miner, and the retained
-      window does not reach it. A tenure's accumulated coinbase is minted from that
-      height, so a wrong answer is a wrong balance and a wrong root — refusing is
-      right, and the fix is to make the chain able to answer, not to let it guess.
+      Diagnosed and fixed at the source. `last_sortition_at_or_below` fell back to a
+      *single* remembered height, which answers for everything at or above itself and
+      nothing below it — and that is exactly the case a resumed chain lands in. This
+      state was seeded at burn 961,342 and asked about 961,320: the window holds no
+      snapshot that low and one height cannot reach it. A chain now remembers the
+      whole run of heights that left the window and writes it down, so a resumed
+      chain answers what an unrestarted one could
+      (`a_resumed_chain_answers_below_the_height_it_was_seeded_at`).
+
+      **This particular state is not repaired by it**, and the honest reason is that
+      it was written before the record existed: its `snapshots.json` carries the one
+      height and `sortitions_below_window` defaults to empty, so the node still stops
+      at 8,712,512 and still refuses to mint a coinbase from a guess. A chain that
+      syncs forward from here accumulates and persists the run; repairing *this* one
+      needs the burn heights re-derived, either by re-walking the sortition chain
+      from the checkpoint or from the burn views of the tenures the node has already
+      executed. That is the next step, and it is a repair rather than a consensus
+      change.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
