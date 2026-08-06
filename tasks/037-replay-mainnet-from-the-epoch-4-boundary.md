@@ -38,6 +38,12 @@ never from fetched, staged or peer-reported height.
       or reaches the tip. A targeted/resumed run reached **44,181 consecutive
       blocks**, from 8,665,601 through 8,709,782, after the trait-reference fix.
       This is a useful compiler frontier, not the pristine release frontier.
+      Re-measured off the durable executed tip rather than a log:
+      `/home/aldur/mainnet-tip/state` holds **46,626** consecutive blocks from
+      8,665,600, `/home/aldur/mainnet-wasm/state` 42,246 and
+      `/home/aldur/mainnet-node/state` 8,263. The scoreboard row reads them
+      straight out of the MARF's block table, so the number is a sealed height and
+      not a claim.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.

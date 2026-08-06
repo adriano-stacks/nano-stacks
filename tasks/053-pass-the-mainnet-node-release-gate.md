@@ -192,6 +192,41 @@ failure that means nothing, which is the same dishonesty as a skipped gate
 reporting green, pointing the other way. So the report is run with the four inputs
 whose pairing is unambiguous, and the rest are left absent and reported absent.
 
+## The inputs that pair, measured
+
+The report's rule -- "a gate handed the wrong fixture is worse than one handed
+none" -- was re-learned the expensive way and is now written down as a map rather
+than a warning. On this machine, with the fixtures that exist:
+
+```
+NANO_MAINNET_STATE       /home/aldur/mainnet-tip/state          46,626 executed from 8,665,600
+NANO_MAINNET_ANCHOR      8665600
+NANO_MAINNET_CAPTURE     /home/aldur/mainnet-capture            100 blocks from 8,665,601
+NANO_MAINNET_RECEIPTS    /home/aldur/mainnet-receipts           5,112 nano new_block payloads
+NANO_MAINNET_CHECKPOINT  .../mainnet-capture/chainstate/checkpoint-H
+NANO_MAINNET_MARF        .../checkpoint-H/marf.sqlite           the *checkpoint's*, not a node's
+NANO_MAINNET_BLOCK       a873389…932d                           the id that MARF was taken at
+NANO_MAINNET_ROOT        6759646…f44ec
+```
+
+That set answers **247 passed, 0 failed** under `NANO_REQUIRE_MAINNET`, up from 230
+before the fixtures were supplied at all.
+
+Three inputs this machine has must **not** be handed over, and what each wrongly
+reports is the reason to write them down:
+
+| Input | Why not | What it reports |
+|---|---|---|
+| `NANO_MAINNET_MARF` = a *nano* state's `marf.sqlite` | the variable means the checkpoint's MARF; a nano state has no external blobs to open | `stacks_core_finds_the_contract_nano_cannot` and `stacks_core_opens_a_mainnet_checkpoint_with_external_blobs` fail on a blob read |
+| `NANO_NODE_MARF` = `/home/aldur/mainnet-pristine` with `NANO_MAINNET_BLOCK` at the checkpoint | pristine has executed one block *above* the checkpoint, so its tip is not that id | `every_checkpointed_contract_is_reachable_in_the_imported_trie`: "1 of 21 unreachable: SP4SZE…native-pool-v1" |
+| `NANO_MAINNET_JOURNAL` = `mainnet-journal-8665602-8665607.txt` with the checkpoint's MARF | the journal's parent is `df4decb0…`, not the block named, and the MARF already holds it | `UNIQUE constraint failed: marf_data.block_hash` |
+
+`NANO_MAINNET_ARCHIVE=/home/aldur/mainnet-chainstate/mainnet` is a fourth: the
+archive answers `disk I/O error` on open, so `pre_checkpoint_headers` fails for the
+archive's sake and not nano's. Extract it again before using it.
+
+None of the four is a defect in the node, and all four look exactly like one.
+
 ## The artifact, not the dependency graph
 
 `wasm_is_the_engine` asks the sources and `cargo tree` whether an interpreter path
