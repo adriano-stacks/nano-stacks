@@ -316,6 +316,28 @@ pub struct CatchUpBudget {
     pub execute: usize,
 }
 
+/// What one bounded chunk of execution did, and why it stopped.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExecutedChunk {
+    blocks: usize,
+    /// Whether the peer asked this node to slow down part-way through.
+    rate_limited: bool,
+}
+
+/// Turn a peer's rate limit into the end of a chunk rather than a failure.
+///
+/// `Ok(None)` is "the peer asked this node to slow down": everything sealed
+/// before it stands, and what is still staged waits for the next round.
+fn ended_by_a_rate_limit<T>(
+    outcome: Result<T, NodeExecutionError>,
+) -> Result<Option<T>, NodeExecutionError> {
+    match outcome {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.is_rate_limited() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// What one round of catching up actually did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CatchUpRound {
@@ -354,6 +376,20 @@ pub enum NodeExecutionError {
 impl From<StagingError> for NodeExecutionError {
     fn from(error: StagingError) -> Self {
         Self::Staging(error)
+    }
+}
+
+impl NodeExecutionError {
+    /// Whether this is a peer asking the node to slow down.
+    ///
+    /// A round that stopped for this has not failed: it keeps every block it
+    /// sealed and asks again next poll.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::Sync(error) | Self::Descent { error, .. } => error.is_rate_limited(),
+            Self::Execution(_) | Self::Staging(_) | Self::MissingView => false,
+        }
     }
 }
 
@@ -976,45 +1012,72 @@ where
         budget: CatchUpBudget,
     ) -> Result<CatchUpRound, NodeExecutionError> {
         let mut round = CatchUpRound::default();
-        let peer_tip = node.tenure_info().await?.tip_block_id;
-
+        // A throttle is set aside for a *round*, and this is the round. Without
+        // this the pool was set aside for the life of the process: the first 429
+        // marked the peer throttled, `TenureSource` skipped it on every later
+        // round, and with nobody left to ask the descent answered an error before
+        // execution ever ran. That is the mainnet stall — hundreds of rounds after
+        // one 429, with the executed tip never moving off its anchor.
+        history.forgive_throttles();
         // What the peer added since the last round sits above everything
-        // staged, so this stops as soon as it meets a block already held.
+        // staged, so the descent stops as soon as it meets a block already held.
         let executed_tip = self.tip.block_id();
         let executed_height = self.tip.header.chain_length;
         // A descent that overshot leaves blocks below the executed tip, which
         // no round will ever execute and every round would otherwise resume
         // from.
         staging.remove_to(executed_height)?;
-        let mut fetched = Self::descend(
-            history,
-            staging,
-            peer_tip,
-            Stop {
-                block_id: executed_tip,
-                height: executed_height,
-            },
-            budget.fetch,
-            &mut round,
-        )
-        .await?;
-        // The descent itself continues from the furthest it has reached, which
-        // is what makes a rate-limited round cost nothing but time.
-        if let Some(resume) = staging.descent_resumes_at()? {
-            fetched += Self::descend(
-                history,
-                staging,
-                resume,
-                Stop {
-                    block_id: executed_tip,
-                    height: executed_height,
-                },
-                budget.fetch.saturating_sub(fetched),
-                &mut round,
-            )
-            .await?;
+        // A peer that will not even say where its tip is does not end the round:
+        // everything already staged can still be executed and sealed, and the
+        // descent picks up at the next poll. This was the first `?` of the round,
+        // so a throttled peer meant a node with twenty thousand blocks on disk
+        // executed none of them and reported a failure instead.
+        let stop = Stop {
+            block_id: executed_tip,
+            height: executed_height,
+        };
+        let peer_tip = match node.tenure_info().await {
+            Ok(info) => Some(info.tip_block_id),
+            Err(error) if error.is_rate_limited() => {
+                round.rate_limited = true;
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(peer_tip) = peer_tip {
+            let mut fetched =
+                Self::descend(history, staging, peer_tip, stop, budget.fetch, &mut round).await?;
+            // The descent itself continues from the furthest it has reached,
+            // which is what makes a rate-limited round cost nothing but time.
+            //
+            // Two conditions on it, and each is a stall that was measured. Not
+            // while this round is already out of peers to ask: asking a pool that
+            // has nothing left to give used to answer `NoPeer`, which is an error,
+            // and the round returned it instead of executing what it had just
+            // staged. And only while a gap is left to close: a tenure arrives
+            // whole, so the answer that reached the executed tip also staged
+            // blocks below it, and the lowest of those points at a tenure this
+            // node has already sealed — which was then asked for again on every
+            // round for as long as the peer's tip stayed inside one tenure, seven
+            // times over one tenure in the harness that found it.
+            if let Some(resume) = staging
+                .descent_resumes_at()?
+                .filter(|_| !round.rate_limited)
+                .filter(|(_, lowest)| *lowest > executed_height.saturating_add(1))
+                .map(|(resume, _)| resume)
+            {
+                fetched += Self::descend(
+                    history,
+                    staging,
+                    resume,
+                    stop,
+                    budget.fetch.saturating_sub(fetched),
+                    &mut round,
+                )
+                .await?;
+            }
+            round.fetched = fetched;
         }
-        round.fetched = fetched;
         // Before executing anything, ask Bitcoin whether the burn blocks this
         // node's sortitions were derived from still hold. A round is the right
         // place: a sortition is a fact about a Bitcoin block and many Stacks
@@ -1024,15 +1087,23 @@ where
         if let Some(resumed) = self.check_burnchain(node, staging).await? {
             round.reorganized = Some(resumed);
         }
-        round.executed = self
+        let executed = self
             .execute_staged(history, pox, staging, budget.execute)
             .await?;
+        round.executed = executed.blocks;
+        round.rate_limited |= executed.rate_limited;
         // A descent that fetched blocks and executed none, while the peer is
         // ahead, is what a fork looks like from here: the peer's chain walked
         // past this node's tip on another branch, so nothing staged extends it
         // and no later round ever will. Standing where the two chains agree is
         // what turns that from a stall into a reorganisation.
-        if round.executed == 0
+        //
+        // Not on a round the peer cut short: "executed nothing" then means the
+        // peer stopped answering, which says nothing about which chain it is on,
+        // and the two requests this asks would be the round's error instead of
+        // its progress.
+        if !round.rate_limited
+            && round.executed == 0
             && round.fetched > 0
             && let Ok(peer) = node.tenure_info().await
             && let Some(resume) = self.switch_to_fork(node, peer.consensus_hash).await?
@@ -1091,6 +1162,11 @@ where
                 .min_by_key(|block| block.header.chain_length)
                 .ok_or(NodeExecutionError::Sync(SyncError::EmptyTenure))?;
             let next = lowest.header.parent_block_id;
+            // Everything the answer carried, including what sits at or below the
+            // executed tip. Those blocks are dead weight the next round's
+            // `remove_to` drops — but they are also the only evidence that a peer
+            // is on another branch, since a fork's blocks are at heights this node
+            // has already sealed. Dropping them here silenced the fork switch.
             for block in &blocks {
                 staging.put(block)?;
             }
@@ -1592,75 +1668,117 @@ where
         }
     }
 
+    /// The Bitcoin context one staged block executes under, and the sortition
+    /// it was read from — or nothing when the peer started rate limiting.
+    ///
+    /// Everything here is a question for the peer or for this node's own
+    /// burnchain, which is why it is one step: it is the whole of what a chunk
+    /// can be cut short by, and the execution below it asks nobody anything.
+    async fn context_for(
+        &mut self,
+        peers: &mut TenureSource,
+        pox: &PoxInfo,
+        block: &NakamotoBlock,
+        timing: &mut ExecutionTiming,
+        previous_view: &mut Option<nano_primitives::ConsensusHash>,
+    ) -> Result<Option<(BitcoinBlockContext, nano_sync::SortitionInfo)>, NodeExecutionError> {
+        // The burn view, not the tenure. A tenure that outlives the burn
+        // block that elected it is extended, and the extension moves the
+        // view forward — so a block mid-tenure sees a later burn height
+        // than its own sortition, and `burn-block-height` is what a
+        // contract stores. Only a tenure change states the view, so it
+        // carries forward to the blocks that follow.
+        if let Some(view) = block.bitcoin_view_consensus_hash() {
+            self.bitcoin_view = Some(view);
+        } else if self.bitcoin_view.is_none() {
+            // A resumed node did not execute the tenure change that stated
+            // the view, so it walks back to it.
+            let Some(walked) = ended_by_a_rate_limit(Self::bitcoin_view_of(peers, block).await)?
+            else {
+                return Ok(None);
+            };
+            self.bitcoin_view = walked;
+        }
+        let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
+        if previous_view.replace(view) != Some(view) {
+            timing.views += 1;
+        }
+        let phase = std::time::Instant::now();
+        let Some(sortition) = ended_by_a_rate_limit(self.sortition_for(peers, view).await)? else {
+            return Ok(None);
+        };
+        timing.sortition += phase.elapsed();
+        let phase = std::time::Instant::now();
+        let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
+        timing.local += phase.elapsed();
+        let mut bitcoin_context = pox.bitcoin_context();
+        bitcoin_context.height = sortition.bitcoin_height;
+        // Clarity reads this back through `get-burn-block-info?`, and sBTC
+        // compares it against the hash a withdrawal was signed for. A
+        // context that leaves it zero makes every such call fail.
+        bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
+        // As in `apply_followed_tenure`: zero here is a wrong answer rather
+        // than a stall.
+        bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
+        bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
+        // Everything this node's own burnchain can answer, from there rather than
+        // from the peer whose answer is about to be compared against it. The
+        // validation inputs `check_tenure_vrf` reads, and the Clarity-visible ones
+        // that move a state root: see `LocalSortition`.
+        if let Some(local) = local? {
+            local.record(&mut bitcoin_context);
+        }
+        let phase = std::time::Instant::now();
+        self.seed_burn_headers(sortition.bitcoin_height);
+        timing.headers += phase.elapsed();
+        let phase = std::time::Instant::now();
+        let coinbase = peers
+            .tenure_coinbase_context(
+                block,
+                self.chainstate.accounting_mut().schedule(),
+                bitcoin_context,
+            )
+            .await
+            .map_err(NodeExecutionError::from);
+        let Some(bitcoin_context) = ended_by_a_rate_limit(coinbase)? else {
+            return Ok(None);
+        };
+        timing.coinbase += phase.elapsed();
+        Ok(Some((bitcoin_context, sortition)))
+    }
+
     /// Execute staged blocks forward from this node's tip, up to `budget`.
     ///
     /// `NANO_TIMING=1` makes each round say where its seconds went.
+    ///
+    /// A peer that starts rate limiting part-way through ends the chunk rather
+    /// than the round: every block before it is sealed and committed, and what
+    /// remains staged is executed by the next round without being fetched again.
+    /// Raising it as an error instead lost nothing durable — the blocks were
+    /// sealed — but it reported a round that had made progress as a failure, and
+    /// sent the follow loop looking for another peer over a 429.
     async fn execute_staged(
         &mut self,
         peers: &mut TenureSource,
         pox: &PoxInfo,
         staging: &Staging,
         budget: usize,
-    ) -> Result<usize, NodeExecutionError> {
+    ) -> Result<ExecutedChunk, NodeExecutionError> {
         let mut executed = 0;
+        let mut rate_limited = false;
         let mut timing = ExecutionTiming::default();
         let mut previous_view = None;
         while executed < budget {
             let Some(block) = staging.child_of(self.tip.block_id())? else {
                 break;
             };
-            // The burn view, not the tenure. A tenure that outlives the burn
-            // block that elected it is extended, and the extension moves the
-            // view forward — so a block mid-tenure sees a later burn height
-            // than its own sortition, and `burn-block-height` is what a
-            // contract stores. Only a tenure change states the view, so it
-            // carries forward to the blocks that follow.
-            if let Some(view) = block.bitcoin_view_consensus_hash() {
-                self.bitcoin_view = Some(view);
-            } else if self.bitcoin_view.is_none() {
-                // A resumed node did not execute the tenure change that stated
-                // the view, so it walks back to it.
-                self.bitcoin_view = Self::bitcoin_view_of(peers, &block).await?;
-            }
-            let view = self.bitcoin_view.unwrap_or(block.header.consensus_hash);
-            if previous_view.replace(view) != Some(view) {
-                timing.views += 1;
-            }
-            let phase = std::time::Instant::now();
-            let sortition = self.sortition_for(peers, view).await?;
-            timing.sortition += phase.elapsed();
-            let phase = std::time::Instant::now();
-            let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
-            timing.local += phase.elapsed();
-            let mut bitcoin_context = pox.bitcoin_context();
-            bitcoin_context.height = sortition.bitcoin_height;
-            // Clarity reads this back through `get-burn-block-info?`, and sBTC
-            // compares it against the hash a withdrawal was signed for. A
-            // context that leaves it zero makes every such call fail.
-            bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
-            // As in `apply_followed_tenure`: zero here is a wrong answer rather
-            // than a stall.
-            bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
-            bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
-            // The two validation-only inputs the tenure VRF rules read, from
-            // this node's own burnchain. Absent, `check_tenure_vrf` says which
-            // rule it could not run and why, which is the honest state; filled
-            // from the peer, it would be checking the peer against itself.
-            if let Some(local) = local? {
-                local.record(&mut bitcoin_context);
-            }
-            let phase = std::time::Instant::now();
-            self.seed_burn_headers(sortition.bitcoin_height);
-            timing.headers += phase.elapsed();
-            let phase = std::time::Instant::now();
-            let bitcoin_context = peers
-                .tenure_coinbase_context(
-                    &block,
-                    self.chainstate.accounting_mut().schedule(),
-                    bitcoin_context,
-                )
-                .await?;
-            timing.coinbase += phase.elapsed();
+            let Some((bitcoin_context, sortition)) = self
+                .context_for(peers, pox, &block, &mut timing, &mut previous_view)
+                .await?
+            else {
+                rate_limited = true;
+                break;
+            };
             // A burn block is news exactly once: when the tenure it elected
             // begins. `bitcoin_spent` is a running total, so the difference
             // between consecutive headers is what this burn block burned —
@@ -1701,7 +1819,10 @@ where
         if executed % TIMING_INTERVAL != 0 {
             timing.report(executed);
         }
-        Ok(executed)
+        Ok(ExecutedChunk {
+            blocks: executed,
+            rate_limited,
+        })
     }
 
     /// Execute a candidate block on the current tip and seal its committed state root.

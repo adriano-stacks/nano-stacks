@@ -29,12 +29,15 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
-use axum::{Router, extract::State, http::StatusCode, routing::get};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use nano_bitcoin::{BitcoinBlock, BitcoinSource};
-use nano_chainstate::{ChainState, NakamotoBlock};
+use nano_chainstate::NakamotoBlock;
 use nano_node::{CatchUpBudget, CheckpointExecutor, staging::Staging};
 use nano_primitives::ConsensusHash;
 use nano_sync::{PeerPool, PoxInfo, SyncClient, TenureSource};
@@ -81,7 +84,7 @@ pub fn captured_chain() -> Vec<NakamotoBlock> {
 /// Read through `decode_block_with_pre_stx` in height order, because a `PreStx`
 /// output authorises an operation up to six blocks later and a block decoded on
 /// its own would drop those pairings.
-fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
+pub fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
     let mut rows = snapshots();
     rows.sort_by_key(|snapshot| snapshot.block_height);
     let mut cache = nano_bitcoin::PreStxCache::new();
@@ -113,12 +116,12 @@ fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
 /// is exactly what a node sees: Bitcoin does not announce a reorganization, it
 /// answers differently at a height it answered before.
 #[derive(Clone, Debug)]
-struct MovableBurnchain {
+pub struct MovableBurnchain {
     blocks: Arc<std::sync::Mutex<BTreeMap<u64, BitcoinBlock>>>,
 }
 
 impl MovableBurnchain {
-    fn new(blocks: BTreeMap<u64, BitcoinBlock>) -> Self {
+    pub fn new(blocks: BTreeMap<u64, BitcoinBlock>) -> Self {
         Self {
             blocks: Arc::new(std::sync::Mutex::new(blocks)),
         }
@@ -159,16 +162,159 @@ impl BitcoinSource for MovableBurnchain {
     }
 }
 
+/// How a peer behaves badly, in the three ways a real one does.
+///
+/// Every field is deterministic and counted from the requests the node actually
+/// makes, so a scenario is reproducible without a clock, a sleep or a random
+/// number: the same node makes the same requests in the same order and meets the
+/// same refusals. Shared through `Arc` so a test keeps a handle on the policy it
+/// gave a peer and can move the peer's tip or start refusing between rounds.
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    /// Answer 429 to every *n*th request. `Some(1)` refuses everything.
+    refuse_every: Option<usize>,
+    /// Answer 429 to everything while this is set.
+    pub refusing: Arc<AtomicBool>,
+    /// Answer 429 to tenure requests only, while this is set.
+    ///
+    /// A peer that still says where its tip is and will not serve the history
+    /// below it, which is what a rate limit keyed by cost looks like — and the
+    /// only way to drive a descent into the throttle bookkeeping, since a peer
+    /// that refuses everything is never asked for a tenure at all.
+    pub refusing_tenures: Arc<AtomicBool>,
+    /// At most this many blocks in one `/v3/tenures/:id` answer.
+    page: Option<usize>,
+    /// How many of the served blocks are visible. Zero means all of them.
+    visible: Arc<AtomicUsize>,
+    /// Make one more block visible every *n*th request, so the tip moves while a
+    /// round is in flight rather than only between rounds.
+    reveal_every: Option<usize>,
+    /// Every path this peer was asked for, in order, and whether it answered.
+    asked: Arc<Mutex<Vec<(String, bool)>>>,
+}
+
+impl Policy {
+    /// Refuse every *n*th request with a 429.
+    #[must_use]
+    pub const fn refusing_every(mut self, requests: usize) -> Self {
+        self.refuse_every = Some(requests);
+        self
+    }
+
+    /// Never answer a tenure with more than this many blocks.
+    #[must_use]
+    pub const fn paged(mut self, blocks: usize) -> Self {
+        self.page = Some(blocks);
+        self
+    }
+
+    /// Start with `visible` blocks and admit one more every *n*th request.
+    #[must_use]
+    pub fn revealing(mut self, visible: usize, every: usize) -> Self {
+        self.visible = Arc::new(AtomicUsize::new(visible));
+        self.reveal_every = Some(every);
+        self
+    }
+
+    /// How many of them it answered with a 429.
+    pub fn refusals(&self) -> usize {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(_, admitted)| !admitted)
+            .count()
+    }
+
+    /// The tenures this peer actually answered, in order, as the block asked for.
+    ///
+    /// Answered rather than asked: the client retries a 429 on its own, so a
+    /// refused request appears several times over and would look like a caller
+    /// that walked the same history twice.
+    pub fn tenures_served(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(_, admitted)| *admitted)
+            .filter_map(|(path, _)| tenure_asked_for(path))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Record a request and say whether this one is refused.
+    fn admits(&self, path: &str) -> bool {
+        let mut asked = self.asked.lock().expect("the log is not poisoned");
+        let count = asked.len() + 1;
+        // The tip moves off the node's own requests rather than off a clock, so a
+        // round is interrupted at the same point on every run.
+        if self.reveal_every.is_some_and(|every| count.is_multiple_of(every)) {
+            self.visible.fetch_add(1, Ordering::SeqCst);
+        }
+        let refused = self.refusing.load(Ordering::SeqCst)
+            || (self.refusing_tenures.load(Ordering::SeqCst) && tenure_asked_for(path).is_some())
+            || self
+                .refuse_every
+                .is_some_and(|every| count.is_multiple_of(every));
+        let admitted = !refused;
+        asked.push((path.to_owned(), admitted));
+        admitted
+    }
+}
+
+/// The block a request asks for the tenure of, if that is what it asks.
+///
+/// `/v3/tenures/info` travels the same prefix and is a question about the peer
+/// rather than about a tenure, so it is told apart by the block identifier's
+/// length rather than by the route.
+fn tenure_asked_for(path: &str) -> Option<&str> {
+    path.strip_prefix("/v3/tenures/")
+        .filter(|block| block.len() == 64)
+}
+
 /// What one fake peer serves.
 pub struct Served {
     /// The chain it offers, lowest first. Its last block is its tip.
     pub blocks: Vec<NakamotoBlock>,
     pub snapshots: Vec<Snapshot>,
+    /// How it misbehaves while serving them.
+    pub policy: Policy,
 }
 
 impl Served {
+    /// A peer that answers everything it holds, as fast as it is asked.
+    pub fn honest(blocks: Vec<NakamotoBlock>, snapshots: Vec<Snapshot>) -> Self {
+        Self {
+            blocks,
+            snapshots,
+            policy: Policy::default(),
+        }
+    }
+
+    /// The same peer, misbehaving.
+    #[must_use]
+    pub fn under(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The blocks this peer is currently willing to admit it has.
+    ///
+    /// A prefix rather than the whole chain, because that is what a tip moving
+    /// looks like from outside: the peer answered for fewer blocks a moment ago
+    /// and answers for more now, and nothing else about it changed.
+    fn visible(&self) -> &[NakamotoBlock] {
+        let visible = self.policy.visible.load(Ordering::SeqCst);
+        let upto = if visible == 0 {
+            self.blocks.len()
+        } else {
+            visible.min(self.blocks.len())
+        };
+        &self.blocks[..upto]
+    }
+
     fn block(&self, id: &str) -> Option<Vec<u8>> {
-        self.blocks
+        self.visible()
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)
             .map(NakamotoBlock::encode)
@@ -178,28 +324,38 @@ impl Served {
     ///
     /// This is what `/v3/tenures/:id` answers, and it is what makes a descent one
     /// request per tenure rather than one per block.
+    ///
+    /// A `page` cuts the answer to the named block and the ones just below it,
+    /// which is the shape a bounded response has: a peer that will not serve a
+    /// whole tenure in one body serves the top of it and leaves the rest to be
+    /// asked for again from lower down.
     fn tenure(&self, id: &str) -> Option<Vec<u8>> {
-        let named = self
-            .blocks
+        let blocks = self.visible();
+        let named = blocks
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)?;
+        let tenure: Vec<&NakamotoBlock> = blocks
+            .iter()
+            .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
+            .filter(|block| block.header.chain_length <= named.header.chain_length)
+            .collect();
+        let page = self.policy.page.unwrap_or(tenure.len()).max(1);
         Some(
-            self.blocks
+            tenure[tenure.len().saturating_sub(page)..]
                 .iter()
-                .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
-                .flat_map(NakamotoBlock::encode)
+                .flat_map(|block| block.encode())
                 .collect(),
         )
     }
 
     fn tip(&self) -> &NakamotoBlock {
-        self.blocks.last().expect("a served chain has a tip")
+        self.visible().last().expect("a served chain has a tip")
     }
 
     fn info(&self) -> serde_json::Value {
         let tip = self.tip();
         let start = self
-            .blocks
+            .visible()
             .iter()
             .find(|block| block.header.consensus_hash == tip.header.consensus_hash)
             .unwrap_or(tip);
@@ -318,6 +474,33 @@ fn found(body: Option<Vec<u8>>) -> (StatusCode, Vec<u8>) {
     )
 }
 
+/// One place every request passes through, so a policy applies to all of them.
+///
+/// A rate limit is not a property of an endpoint — a throttled peer refuses the
+/// sortition a block needs as readily as the tenure above it — so refusing per
+/// route would only exercise the descent and never execution.
+///
+/// `Retry-After: 0` is answered deliberately: `SyncClient` honours what it is
+/// told as given, so this keeps the client's own three retries in the test
+/// without making the suite wait seconds for each one. What that costs is that
+/// the wait itself is not what is being pinned here; `nano-sync`'s own tests
+/// cover the honouring.
+async fn gate(
+    State(state): State<Arc<Served>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if state.policy.admits(request.uri().path()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "0")],
+        Vec::new(),
+    )
+        .into_response()
+}
+
 /// Start a peer on loopback and hand back a client pointed at it.
 pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
     let state = Arc::new(served);
@@ -384,6 +567,10 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 ))
             }),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            gate,
+        ))
         .with_state(state);
     // Port zero: several of these run inside one test binary and a fixed port
     // would make them collide.
@@ -441,29 +628,16 @@ pub const POX_5_ACTIVATION_HEIGHT: u32 = 262;
 ///
 /// Durable, in a directory of its own, because a retraction stands on the ledger
 /// the surviving block committed and an in-memory state has none to read back.
-fn node(
+/// The opener is `restart::open`, which is the one that recovers the ledger a
+/// sealed block committed — so a directory this has been pointed at twice
+/// resumes rather than starting over, and a catch-up across a restart is the
+/// same code path as a catch-up that was never interrupted.
+pub fn node(
     directory: &Path,
     burnchain: MovableBurnchain,
 ) -> (CheckpointExecutor<MovableBurnchain>, Vec<NakamotoBlock>) {
     let fixtures = fixtures();
-    let manifest = nano_node::CheckpointManifest::load(fixtures.join("chainstate/checkpoint-H"))
-        .expect("the checkpoint manifest reads");
-    let mut chainstate = ChainState::open_from_checkpoint(
-        nano_conformance::captured_network(&fixtures),
-        directory,
-        fixtures.join("chainstate/checkpoint-H/marf.sqlite"),
-        manifest.source_state_id,
-        manifest.state_index_root,
-    )
-    .expect("the checkpoint opens");
-    // The rewards the checkpoint still owes: a tenure this node executes pays out
-    // one earned before the state was exported, which only the checkpoint knows.
-    if let Some(accounting) = fs::read(fixtures.join("chainstate/checkpoint-H/native-effects.json"))
-        .ok()
-        .and_then(|contents| nano_chainstate::TenureAccounting::from_json(&contents).ok())
-    {
-        *chainstate.accounting_mut() = accounting;
-    }
+    let (chainstate, _) = crate::restart::open(directory);
     let chain = captured_chain();
     let anchor = chain.first().expect("the capture has blocks").clone();
     // The anchor's own context comes from the capture, as a configured node's
@@ -526,15 +700,9 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
         "the wrong chain is not longer, so nothing is being tested"
     );
 
-    let (honest_client, honest_task) = serve(Served {
-        blocks: honest.clone(),
-        snapshots: snapshots(),
-    })
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
     .await;
-    let (lying_client, lying_task) = serve(Served {
-        blocks: liar,
-        snapshots: snapshots(),
-    })
+    let (lying_client, lying_task) = serve(Served::honest(liar, snapshots()))
     .await;
 
     let against_the_liar = tempfile::tempdir().expect("a directory");
@@ -689,10 +857,7 @@ fn parted_view(
 async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
     let chain = captured_chain();
     let honest: Vec<_> = chain[..12].to_vec();
-    let (honest_client, honest_task) = serve(Served {
-        blocks: honest.clone(),
-        snapshots: snapshots(),
-    })
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
     .await;
 
     let directory = tempfile::tempdir().expect("a directory");
@@ -730,10 +895,10 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
             row.consensus_hash = replacement.to_string();
         }
     }
-    let (parted_client, parted_task) = serve(Served {
-        blocks: parted_view(&honest, disputed, replacement),
-        snapshots: parted,
-    })
+    let (parted_client, parted_task) = serve(Served::honest(
+        parted_view(&honest, disputed, replacement),
+        parted,
+    ))
     .await;
 
     let mut history = TenureSource::only(parted_client.clone());
@@ -789,10 +954,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
 #[tokio::test]
 async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     let chain = captured_chain();
-    let (client, task) = serve(Served {
-        blocks: chain[..12].to_vec(),
-        snapshots: snapshots(),
-    })
+    let (client, task) = serve(Served::honest(chain[..12].to_vec(), snapshots()))
     .await;
 
     let directory = tempfile::tempdir().expect("a directory");

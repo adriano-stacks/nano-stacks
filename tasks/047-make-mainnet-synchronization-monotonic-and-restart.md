@@ -41,7 +41,7 @@ hundreds of failed attempts.
       sealed blocks.
 - [x] Bound caches, response bodies and in-memory ancestry independently of
       distance from tip or peer-controlled response size.
-- [ ] Test gaps spanning long tenures and multiple tenures with deterministic
+- [x] Test gaps spanning long tenures and multiple tenures with deterministic
       429s, short pages, tip movement and a restart after every chunk boundary.
 
 ## Acceptance Criteria
@@ -246,3 +246,91 @@ are what say it did not change an answer.
 
 `local` is still 0.06 s a block, halved but not gone; that is
 [[049-derive-canonical-sortitions-from-the-local-burncha]]'s.
+
+## The last item was a test, and it found five bugs
+
+`crates/nano-conformance/tests/conformance/catch_up_rounds.rs` serves the captured
+chain over loopback as a peer that answers 429, cuts its tenure responses short
+and reveals its tip one block at a time, and drives `catch_up` round by round
+against it. It failed on its first run, and kept failing, so what closes the item
+is four fixes in the round and one in the descent rather than a test that agreed
+with the code.
+
+**Four ways one 429 ended a round that had work to do.**
+
+1. `node.tenure_info()` was the round's first `?`. A peer that would not say where
+   its tip is ended the round before anything staged was executed — so a node with
+   twenty thousand blocks on disk executed none of them and reported a failure. The
+   tip is optional now: no tip, no descent, and the round still executes what it
+   holds.
+2. A throttle was set aside for the process rather than for the round. A 429 marks
+   the peer throttled in `TenureSource` and nothing cleared it, so every later round
+   skipped every peer and got `NoPeer` — an error — before execution ran.
+   `forgive_throttles` existed and was called by the repair tools only; `catch_up`
+   calls it at the top of each round, which is what a round already meant.
+3. A pool with every peer throttled answered `NoPeer`: the same answer as an empty
+   pool, and the opposite instruction. It answers `SyncError::Throttled` now, which
+   `is_rate_limited()` covers, so a caller reads it as "wait" and not as "stop".
+4. A 429 *during execution* — the sortition for a new burn view, a tenure-start
+   block's coinbase, the ancestor walk a resumed node makes — aborted the round
+   after committing part of it. It ends the chunk instead, and the round says it was
+   rate limited.
+
+**And one wasted tenure request per round, for as long as the tip stayed inside
+one tenure.** A tenure arrives whole, so the descent that reaches the executed tip
+also stages blocks below it. `descent_resumes_at` reads the *lowest* staged block,
+which is then one this node has already sealed, and the second descent of the round
+asked for its tenure again — seven times over the anchor's tenure in the
+moving-tip scenario. It returns the lowest staged height alongside the parent now,
+and the resume runs only while a gap is left to close.
+
+Staging fewer blocks was the first attempt at that and it was wrong: the blocks at
+or below the executed tip are the only evidence that a peer is on another branch,
+because a fork's blocks are at heights this node has already sealed. Dropping them
+made `round.fetched` zero and silenced the fork switch, and
+`follow_path::a_peer_on_a_parted_burn_view_is_followed_onto_the_fork` said so
+within one run.
+
+**What the harness pins.** Seven tests, all offline against the captured fixture:
+
+- `a_gap_inside_one_tenure_closes_across_rounds` — heights 461 to 470, nine blocks
+  in one tenure, closed by rounds because the execution budget is three;
+- `a_gap_across_many_tenures_closes_under_rate_limits_and_short_pages` — 461 to
+  504, seven tenures including the capture's longest at twelve blocks, every fourth
+  request refused and no answer carrying more than three blocks;
+- `a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes` — a peer that
+  refuses everything for a whole round: the round is `Ok`, says it was rate
+  limited, fetches nothing, seals what it already had, keeps the rest of the
+  descent, and the next round finishes the gap without executing a block twice;
+- `a_peer_that_throttles_the_descent_is_asked_again_next_round` — a peer that
+  answers its tip and refuses the history below it, which is the only way a descent
+  reaches the throttle bookkeeping at all, and the round after it asks that peer
+  again;
+- `a_tip_that_moves_mid_round_is_followed` — one more block revealed every third
+  request, so the tip a round read at its start is stale before it finishes;
+- `a_restart_at_every_chunk_boundary_reaches_the_same_state` and
+  `..._survives_rate_limits_and_short_pages` — the chainstate, the staging store
+  and the peer client closed and reopened after every round, which is after every
+  committed chunk, reaching the same tip, the same header root, the same MARF
+  content root under it, the same executed suffix, accounting, parent tenure proof
+  and both copies of every tenure start height as a run that was never interrupted.
+
+Monotonicity is two counters rather than an impression: the executed height after
+every round, refused if it ever drops, and the blocks executed across all rounds
+against the height the chain advanced — equal, so a re-executed sealed block is
+counted rather than sampled. "Resumes from the last committed block rather than
+re-walking" is a third: no tenure may be answered more than twice over a whole run.
+
+Each of the five fixes was checked by reverting it and watching a named test fail.
+The pool-exhaustion error identity is `nano-sync`'s own
+`a_pool_with_every_peer_throttled_asks_the_caller_to_wait`, because with the other
+guards in place a round no longer reaches it.
+
+**What it cannot pin.** Scale: the capture is 340 blocks and its longest tenure is
+twelve, where the mainnet gap this task came from was 20,000 blocks and a tenure is
+bounded only by Bitcoin, so nothing here reaches a gap deeper than a fetch budget
+or a tenure longer than one response. Waiting: the peers answer `Retry-After: 0` so
+the client's three retries cost the suite nothing, and how long a node waits stays
+`nano-sync`'s test. And the loop: this drives `catch_up` directly, so peer
+reselection, `peer_failed` and the poll interval around it are still only exercised
+by `binary_restart`.

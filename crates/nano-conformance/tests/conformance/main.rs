@@ -25,6 +25,7 @@ mod binary_restart;
 mod block_authentication;
 mod block_height_keyword;
 mod burn_spends;
+mod catch_up_rounds;
 mod coinbase_schedule;
 mod engine_failure;
 mod engine_state_roots;
