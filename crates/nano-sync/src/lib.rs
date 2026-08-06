@@ -1080,22 +1080,9 @@ impl SyncClient {
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Ok(response.error_for_status()?);
             }
-            // Honour the peer's own answer when it gives one — and honour it
-            // *as given*. Capping `Retry-After` at the ceiling meant a peer
-            // asking for a minute was asked again in two seconds, which earns
-            // another 429 and keeps earning them: the ceiling is a bound on
-            // what this node invents for itself, not on what it was told.
-            //
             // Its own guess stays bounded, because a peer that says nothing
             // should not be able to stall a catch-up either.
-            let told = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(std::time::Duration::from_secs)
-                .map(|told| told.min(RETRY_AFTER_CEILING));
-            tokio::time::sleep(told.unwrap_or(wait)).await;
+            tokio::time::sleep(retry_after(response.headers()).unwrap_or(wait)).await;
             wait = wait.saturating_mul(2).min(RATE_LIMIT_CEILING);
         }
         Ok(self
@@ -1138,7 +1125,15 @@ pub struct TenureSource {
     peers: Vec<SyncClient>,
     /// Which peer the next tenure goes to.
     next: usize,
-    /// Peers that have rate-limited since the round began.
+    /// Peers that have rate-limited and are being left alone for now.
+    ///
+    /// Emptied by [`Self::sweep`] as soon as it holds every peer, which is the
+    /// difference between a follower that catches up and one that stops. The
+    /// set-aside was documented as lasting "a round" and nothing in a running node
+    /// ever ended one — `forgive_throttles` has a single caller in the tree and it
+    /// is a repair tool — so the first moment in which every mainnet peer answered
+    /// 429 once left the pool permanently empty, and every later round descended
+    /// nowhere for as long as the process lived.
     throttled: BTreeSet<usize>,
     /// Peers that have actually served a tenure, which is what makes "spread over the
     /// pool" a measurement rather than an intention.
@@ -1188,6 +1183,53 @@ impl TenureSource {
         self.peers.is_empty() || self.throttled.len() >= self.peers.len()
     }
 
+    /// Ask each willing peer in turn, and say which one answered.
+    ///
+    /// A peer that rate-limits is set aside for the rest of the walk so the work
+    /// moves to somebody else. When that has taken the last willing peer, the set
+    /// is emptied and the sweep goes round again: a rate limit is temporary, and
+    /// the alternative to asking a throttled peer again is never asking anybody
+    /// again. `SyncClient::send` has already waited the peer's own `Retry-After`
+    /// out before reporting one, so this is not a tighter loop than the peer asked
+    /// for.
+    async fn sweep<T, Ask, F>(&mut self, mut ask: F) -> Result<T, SyncError>
+    where
+        // By value rather than by reference: the ask is awaited while the throttle
+        // set is being written, and a `SyncClient` is two `Arc`s and a URL, so a
+        // clone per ask is cheaper than the borrow it avoids.
+        F: FnMut(SyncClient) -> Ask,
+        Ask: std::future::Future<Output = Result<T, SyncError>>,
+    {
+        if self.exhausted() {
+            self.throttled.clear();
+        }
+        let mut last = None;
+        for offset in 0..self.peers.len() {
+            let index = (self.next + offset) % self.peers.len();
+            if self.throttled.contains(&index) {
+                continue;
+            }
+            let Some(peer) = self.peers.get(index).cloned() else {
+                continue;
+            };
+            match ask(peer).await {
+                Ok(answer) => {
+                    // Start the next ask at the peer *after* this one, so the work
+                    // walks around the pool instead of settling on one member.
+                    self.next = index + 1;
+                    self.served.insert(index);
+                    return Ok(answer);
+                }
+                Err(error) if error.is_rate_limited() => {
+                    self.throttled.insert(index);
+                    last = Some(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(SyncError::NoPeer))
+    }
+
     /// Put a peer at the front of the queue, if it is in the pool.
     ///
     /// Used to honour what an inventory said: a peer that claims the cycle being
@@ -1209,31 +1251,8 @@ impl TenureSource {
         &mut self,
         tip: StacksBlockId,
     ) -> Result<Vec<NakamotoBlock>, SyncError> {
-        let mut last = None;
-        for offset in 0..self.peers.len() {
-            let index = (self.next + offset) % self.peers.len();
-            if self.throttled.contains(&index) {
-                continue;
-            }
-            let Some(peer) = self.peers.get(index) else {
-                continue;
-            };
-            match peer.blocks_of_tenure(tip).await {
-                Ok(blocks) => {
-                    // Start the next tenure at the peer *after* this one, so the work
-                    // walks around the pool instead of settling on one member.
-                    self.next = index + 1;
-                    self.served.insert(index);
-                    return Ok(blocks);
-                }
-                Err(error) if error.is_rate_limited() => {
-                    self.throttled.insert(index);
-                    last = Some(error);
-                }
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.unwrap_or(SyncError::NoPeer))
+        self.sweep(move |peer| async move { peer.blocks_of_tenure(tip).await })
+            .await
     }
 
     /// Fetch one block, from whichever peer is next and willing.
@@ -1250,29 +1269,8 @@ impl TenureSource {
     /// got back is the block it asked for. That is what makes spreading a repair over
     /// strangers safe in a way spreading a *choice* over them would not be.
     pub async fn block(&mut self, id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
-        let mut last = None;
-        for offset in 0..self.peers.len() {
-            let index = (self.next + offset) % self.peers.len();
-            if self.throttled.contains(&index) {
-                continue;
-            }
-            let Some(peer) = self.peers.get(index) else {
-                continue;
-            };
-            match peer.block(id).await {
-                Ok(block) => {
-                    self.next = index + 1;
-                    self.served.insert(index);
-                    return Ok(block);
-                }
-                Err(error) if error.is_rate_limited() => {
-                    self.throttled.insert(index);
-                    last = Some(error);
-                }
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.unwrap_or(SyncError::NoPeer))
+        self.sweep(move |peer| async move { peer.block(id).await })
+            .await
     }
 
     /// Let every peer that had rate-limited be asked again.
@@ -1285,7 +1283,7 @@ impl TenureSource {
         self.throttled.clear();
     }
 
-    /// Whether any peer has rate-limited since the last forgiveness.
+    /// How many peers are being left alone right now.
     #[must_use]
     pub fn throttled(&self) -> usize {
         self.throttled.len()
@@ -1696,6 +1694,24 @@ impl TenureFollower {
     }
 }
 
+/// How long a peer's own `Retry-After` asks this node to wait.
+///
+/// Honoured *as given*, up to [`RETRY_AFTER_CEILING`]. Capping it at the backoff
+/// this node invents for itself meant a peer asking for a minute was asked again
+/// two seconds later, which earns another 429 and keeps earning them — a mainnet
+/// accounting rebuild ran 1h45m against one rate-limited peer with six seconds of
+/// CPU to show for it. The ceiling is therefore a bound on a hostile or broken
+/// header rather than on a real one, and it is a separate function so that bound
+/// can be checked without waiting two minutes for it.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .map(|told| told.min(RETRY_AFTER_CEILING))
+}
+
 fn validate_tenure(
     start_block_id: StacksBlockId,
     blocks: &[NakamotoBlock],
@@ -1958,10 +1974,11 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RATE_LIMIT_RETRIES, BlockUploadWire, BurnView, CandidateTip, Signer, SignerSet,
-        StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, choose_canonical_tip,
-        parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
-        parse_stacker_set, validate_tenure, validate_tenure_transition,
+        RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, BlockUploadWire, BurnView, CandidateTip, Signer,
+        SignerSet, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
+        choose_canonical_tip, parse_block_hash, parse_block_id, parse_consensus_hash,
+        parse_prefixed_hash160, parse_stacker_set, retry_after, validate_tenure,
+        validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -2124,6 +2141,122 @@ mod tests {
         assert!(
             outcome.is_err(),
             "the peer asked for 30s and was waited for, rather than asked again in 2"
+        );
+    }
+
+    /// The bound on what a peer may ask for, checked without waiting for it.
+    ///
+    /// The test above proves the header is honoured; this one proves it is still
+    /// bounded, which cannot be shown by waiting — a peer asking for an hour and a
+    /// peer asking for two minutes are indistinguishable to an assertion that has
+    /// to return. So the arithmetic is asserted directly, and the two together say
+    /// what the code does: a real header as given, an absurd one capped.
+    #[test]
+    fn a_peers_retry_after_is_honoured_up_to_a_bound() {
+        let asking = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a header value"),
+            );
+            retry_after(&headers)
+        };
+        assert_eq!(
+            asking("30"),
+            Some(std::time::Duration::from_secs(30)),
+            "a peer asking for half a minute is waited for as asked"
+        );
+        assert_eq!(
+            asking(" 45 "),
+            Some(std::time::Duration::from_secs(45)),
+            "and the whitespace a header may carry is not a parse failure"
+        );
+        assert_eq!(
+            asking("3600"),
+            Some(RETRY_AFTER_CEILING),
+            "a peer asking for an hour cannot park a catch-up for one"
+        );
+        // An HTTP-date `Retry-After` is legal and is not parsed, which is
+        // deliberate: this node's own bounded backoff is a better answer than a
+        // date it may have mis-parsed into hours.
+        assert_eq!(asking("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    /// A pool whose peers have all rate-limited asks them again rather than stopping.
+    ///
+    /// The set-aside was documented as lasting "a round" and nothing in a running
+    /// node ever ended one, so it lasted for the life of the process: the first
+    /// moment in which every mainnet peer answered 429 once emptied the pool for
+    /// good, and every later round descended nowhere while reporting nobody to ask.
+    /// The answer a caller gets from a pool that has just been swept is still a rate
+    /// limit — which is what makes a catch-up round *end successfully* with the
+    /// blocks it staged — and never `NoPeer`, which is a reason to give up.
+    #[tokio::test]
+    async fn a_pool_of_rate_limited_peers_asks_them_again() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // No `Retry-After`, so the client's own bounded backoff applies and
+                // a call returns in about three seconds rather than the minutes a
+                // header may ask for.
+                let response = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+        let mut history = TenureSource::only(client);
+        let block = StacksBlockId::from_bytes([7; 32]);
+
+        let first = history
+            .blocks_of_tenure(block)
+            .await
+            .expect_err("the peer said 429");
+        assert!(first.is_rate_limited(), "{first}");
+        assert!(history.exhausted(), "the peer was not set aside");
+        let after_one = asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_one > 0, "the peer was never asked");
+
+        // The second ask finds nobody willing, forgives, and asks anyway. Both
+        // halves are the claim: the peer really is contacted again, and the answer
+        // is still a rate limit rather than `NoPeer`.
+        let second = history
+            .blocks_of_tenure(block)
+            .await
+            .expect_err("the peer said 429 again");
+        assert!(
+            !matches!(second, SyncError::NoPeer),
+            "a pool of rate-limited peers gave up instead of asking again"
+        );
+        assert!(second.is_rate_limited(), "{second}");
+        assert!(
+            asked.load(std::sync::atomic::Ordering::SeqCst) > after_one,
+            "the second ask reached no peer, so the pool had emptied itself"
+        );
+        assert!(history.exhausted(), "the peer was not set aside again");
+        history.forgive_throttles();
+        assert!(!history.exhausted());
+
+        // An empty pool is a different answer, and stays one: there is nobody to
+        // forgive, so nothing can make it willing.
+        assert!(
+            matches!(
+                TenureSource::new(Vec::new())
+                    .blocks_of_tenure(block)
+                    .await
+                    .expect_err("an empty pool cannot answer"),
+                SyncError::NoPeer
+            ),
+            "an empty pool is not a rate-limited one"
         );
     }
 

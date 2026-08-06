@@ -159,16 +159,103 @@ impl BitcoinSource for MovableBurnchain {
     }
 }
 
+/// Deterministic pressure a peer puts on a round.
+///
+/// Everything here is something a real peer does and a fixture normally does not:
+/// a public endpoint answers 429 when asked too often, bounds the body it will put
+/// in one response, and gains blocks while a round is walking it. The live mainnet
+/// run meets all three constantly; nothing offline did, which is what [[047]]'s
+/// last open item is about.
+///
+/// Counted rather than merely configured, so a test can assert the pressure was
+/// *applied*. A knob that silently did nothing would leave every assertion below
+/// it passing for the wrong reason.
+#[derive(Debug, Default)]
+pub struct Pressure {
+    /// How many 429s this peer will still hand out, and what `Retry-After` it
+    /// asks for.
+    ///
+    /// Bounded so the round eventually gets its answer: a peer that refuses
+    /// forever is a peer that is down, which is a different test.
+    pub rate_limits: std::sync::atomic::AtomicUsize,
+    pub retry_after: Option<u64>,
+    /// The most blocks one `/v3/tenures/:id` response will carry.
+    ///
+    /// `blocks_of_tenure` only requires the block it asked for to be among the
+    /// answers, so a short page ends a descent step inside a tenure and the next
+    /// step resumes from the lowest block it got.
+    pub page: Option<usize>,
+    /// How much of the chain this peer admits to holding.
+    ///
+    /// `None` is all of it. Raising it mid-round is a tip that moved.
+    pub visible: std::sync::Mutex<Option<usize>>,
+    /// What was actually done to the node.
+    pub limited: std::sync::atomic::AtomicUsize,
+    pub shortened: std::sync::atomic::AtomicUsize,
+}
+
+impl Pressure {
+    /// Whether this request is being refused, and for how long the peer asks.
+    fn refuse(&self) -> Option<u64> {
+        // Spent one at a time rather than by a modulus over a request counter:
+        // two peers and a retrying client make the request count depend on
+        // timing, and a budget does not.
+        let spent = self
+            .rate_limits
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok();
+        if !spent {
+            return None;
+        }
+        self.limited
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.retry_after.unwrap_or_default())
+    }
+}
+
 /// What one fake peer serves.
 pub struct Served {
     /// The chain it offers, lowest first. Its last block is its tip.
     pub blocks: Vec<NakamotoBlock>,
     pub snapshots: Vec<Snapshot>,
+    pub pressure: Pressure,
 }
 
 impl Served {
+    /// A peer that answers everything it holds, immediately and in full.
+    pub fn honest(blocks: Vec<NakamotoBlock>, snapshots: Vec<Snapshot>) -> Self {
+        Self {
+            blocks,
+            snapshots,
+            pressure: Pressure::default(),
+        }
+    }
+
+    /// How much of the chain this peer is currently admitting to.
+    fn chain(&self) -> &[NakamotoBlock] {
+        let visible = *self
+            .pressure
+            .visible
+            .lock()
+            .expect("the visible tip is not poisoned");
+        &self.blocks[..visible.unwrap_or(self.blocks.len()).min(self.blocks.len())]
+    }
+
+    /// Admit to holding `blocks` of the chain, as a peer that just gained some.
+    pub fn move_tip_to(&self, blocks: usize) {
+        *self
+            .pressure
+            .visible
+            .lock()
+            .expect("the visible tip is not poisoned") = Some(blocks);
+    }
+
     fn block(&self, id: &str) -> Option<Vec<u8>> {
-        self.blocks
+        self.chain()
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)
             .map(NakamotoBlock::encode)
@@ -179,27 +266,47 @@ impl Served {
     /// This is what `/v3/tenures/:id` answers, and it is what makes a descent one
     /// request per tenure rather than one per block.
     fn tenure(&self, id: &str) -> Option<Vec<u8>> {
-        let named = self
-            .blocks
+        let chain = self.chain();
+        let named = chain
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)?;
-        Some(
-            self.blocks
+        let mut of_tenure: Vec<&NakamotoBlock> = chain
+            .iter()
+            .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
+            .collect();
+        // A bounded body keeps the block that was *asked for* and drops the
+        // oldest, which is the direction a peer serving a tenure backwards from a
+        // named block truncates in — and the direction that leaves a descent
+        // something to resume from.
+        if let Some(page) = self.pressure.page
+            && of_tenure.len() > page
+        {
+            let keep = of_tenure
                 .iter()
-                .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
+                .position(|block| block.block_id() == named.block_id())
+                .unwrap_or(0);
+            let from = keep.saturating_sub(page.saturating_sub(1));
+            of_tenure = of_tenure[from..=keep].to_vec();
+            self.pressure
+                .shortened
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Some(
+            of_tenure
+                .into_iter()
                 .flat_map(NakamotoBlock::encode)
                 .collect(),
         )
     }
 
     fn tip(&self) -> &NakamotoBlock {
-        self.blocks.last().expect("a served chain has a tip")
+        self.chain().last().expect("a served chain has a tip")
     }
 
     fn info(&self) -> serde_json::Value {
         let tip = self.tip();
         let start = self
-            .blocks
+            .chain()
             .iter()
             .find(|block| block.header.consensus_hash == tip.header.consensus_hash)
             .unwrap_or(tip);
@@ -318,9 +425,38 @@ fn found(body: Option<Vec<u8>>) -> (StatusCode, Vec<u8>) {
     )
 }
 
+/// Answer 429 while this peer still has refusals to spend.
+///
+/// In front of every route rather than inside one, because what a rate limit
+/// interrupts is not chosen: a round asks for tenure info, tenures, blocks,
+/// sortitions and a burn view, and the interesting failure is the one that lands
+/// wherever the budget runs out.
+async fn throttle(
+    State(state): State<Arc<Served>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    match state.pressure.refuse() {
+        Some(seconds) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                seconds.to_string(),
+            )],
+        )
+            .into_response(),
+        None => next.run(request).await,
+    }
+}
+
 /// Start a peer on loopback and hand back a client pointed at it.
 pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
-    let state = Arc::new(served);
+    serve_shared(Arc::new(served)).await
+}
+
+/// The same, over a peer the test keeps a handle on so it can move its tip.
+pub async fn serve_shared(state: Arc<Served>) -> (SyncClient, tokio::task::JoinHandle<()>) {
     let router = Router::new()
         .route(
             "/v2/info",
@@ -384,6 +520,10 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 ))
             }),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            throttle,
+        ))
         .with_state(state);
     // Port zero: several of these run inside one test binary and a fixed port
     // would make them collide.
@@ -508,15 +648,9 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
         "the wrong chain is not longer, so nothing is being tested"
     );
 
-    let (honest_client, honest_task) = serve(Served {
-        blocks: honest.clone(),
-        snapshots: snapshots(),
-    })
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
     .await;
-    let (lying_client, lying_task) = serve(Served {
-        blocks: liar,
-        snapshots: snapshots(),
-    })
+    let (lying_client, lying_task) = serve(Served::honest(liar, snapshots()))
     .await;
 
     let against_the_liar = tempfile::tempdir().expect("a directory");
@@ -671,10 +805,7 @@ fn parted_view(
 async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
     let chain = captured_chain();
     let honest: Vec<_> = chain[..12].to_vec();
-    let (honest_client, honest_task) = serve(Served {
-        blocks: honest.clone(),
-        snapshots: snapshots(),
-    })
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
     .await;
 
     let directory = tempfile::tempdir().expect("a directory");
@@ -712,10 +843,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
             row.consensus_hash = replacement.to_string();
         }
     }
-    let (parted_client, parted_task) = serve(Served {
-        blocks: parted_view(&honest, disputed, replacement),
-        snapshots: parted,
-    })
+    let (parted_client, parted_task) = serve(Served::honest(parted_view(&honest, disputed, replacement), parted))
     .await;
 
     let mut history = TenureSource::only(parted_client.clone());
@@ -771,10 +899,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
 #[tokio::test]
 async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     let chain = captured_chain();
-    let (client, task) = serve(Served {
-        blocks: chain[..12].to_vec(),
-        snapshots: snapshots(),
-    })
+    let (client, task) = serve(Served::honest(chain[..12].to_vec(), snapshots()))
     .await;
 
     let directory = tempfile::tempdir().expect("a directory");
