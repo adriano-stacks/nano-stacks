@@ -734,7 +734,11 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             .as_deref()
             .map(|value| thirty_two(value, "winning VRF seed"))
             .transpose()?,
+        // Both `None` for the seed itself, and neither is ever read: a seed is
+        // taken as given and no tenure is validated against it. Every snapshot
+        // after it resolves them from the carried registry.
         winner_vrf_public_key: None,
+        winner_signing_key_hash: None,
         pox_id,
     })
 }

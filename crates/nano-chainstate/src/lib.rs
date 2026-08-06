@@ -1624,13 +1624,21 @@ impl ChainState {
             // `check_tenure_vrf` reports this one already, and once is enough.
             return Ok(());
         };
+        // The tenure's own burn block first: a registration *in* it is the
+        // sharpest evidence there is, because nothing about it was carried or
+        // trusted. Then the registry the checkpoint brought, which is where a key
+        // registered years earlier lives — and that is the ordinary case, since a
+        // leader key is registered once and named for as long as its miner mines.
         let Some(signing_key_hash) =
             authenticate::registered_signing_key_hash(operations, &vrf_public_key)
+                .or(context.winner_signing_key_hash)
         else {
             eprintln!(
                 "the tenure at burn {} carries a miner signature this node cannot check: it \
                  knows which leader key won the sortition but not the block-signing key that \
-                 key was registered with, which is in the burn block that registered it",
+                 key was registered with. It is in the burn block that registered it, and \
+                 only some registrations carry one at all -- 101 of mainnet's 2,477 -- so a \
+                 carried registry may legitimately not have it either",
                 context.height
             );
             return Ok(());

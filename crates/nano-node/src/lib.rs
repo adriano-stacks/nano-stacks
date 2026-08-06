@@ -81,6 +81,9 @@ struct LocalSortition {
     /// The winning commitment's leader-key VRF public key, when this node can
     /// name the winner without leaning on the burn distribution.
     winner_vrf_public_key: Option<[u8; 32]>,
+    /// The block-signing hash that key was registered with, when the registry
+    /// carries one for it.
+    winner_signing_key_hash: Option<[u8; 20]>,
 }
 
 /// Where a round of execution spent its time.
@@ -566,6 +569,7 @@ where
         if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent) {
             bitcoin_context.sortition_hash = local.sortition_hash;
             bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
+            bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
         }
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
@@ -1169,6 +1173,7 @@ where
         let local = LocalSortition {
             sortition_hash: *tip.sortition_hash.as_bytes(),
             winner_vrf_public_key: tip.winner_vrf_public_key,
+            winner_signing_key_hash: tip.winner_signing_key_hash,
         };
         if !tracker.agrees_with_header(bitcoin_spent) {
             eprintln!(
@@ -1354,6 +1359,7 @@ where
             if let Some(local) = local {
                 bitcoin_context.sortition_hash = local.sortition_hash;
                 bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
+            bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
             }
             let phase = std::time::Instant::now();
             self.seed_burn_headers(sortition.bitcoin_height);

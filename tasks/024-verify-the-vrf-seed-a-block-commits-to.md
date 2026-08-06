@@ -289,3 +289,26 @@ registry's answer to travel the way `winner_vrf_public_key` does — one field o
 Still true and still outside this task's files: `nano-miner`'s
 `hacknet_sortition_hash_verifies_the_winning_vrf_proof` matches on the committed
 block header hash where it should match on the txid.
+
+## Every rule runs now, measured on the live chain
+
+The last one to close was the *miner signature*, and it needed one field rather
+than one idea. `check_miner_won_the_sortition` looked for the winning leader key's
+block-signing `Hash160` in the tenure's **own** burn block operations — the one
+place a reused registration cannot be. A leader key is registered once and named
+for as long as its miner mines, so mainnet's 4.0 miners point at registrations
+made years earlier, far below any burnchain window a checkpointed node holds.
+
+`SortitionWinner`/`SortitionSnapshot`/`BitcoinBlockContext` now carry it, resolved
+from the same registration the VRF public key comes from and the same carried
+registry — 2,477 mainnet keys in 323 KB, of which 101 have a signing hash,
+including all five that mainnet's 4.0 miners use. The burn block is still asked
+*first*, because a registration in the tenure's own block is the sharpest evidence
+there is: nothing about it was carried or trusted.
+
+Live, on the pristine replay past 8,691,700: **zero** `cannot check` lines of any
+kind. Signer weight, miner signature, coinbase VRF proof and committed seed all
+run on every tenure, and none of them has rejected a block the network accepted.
+
+Before this, the same state printed two lines per tenure — one for the proof and
+one for the signature — for every tenure it started.

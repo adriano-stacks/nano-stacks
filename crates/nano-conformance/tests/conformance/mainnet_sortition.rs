@@ -206,6 +206,7 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         winner_txid: None,
         winner_vrf_seed: None,
         winner_vrf_public_key: None,
+        winner_signing_key_hash: None,
         pox_id: mainnet_pox_id(),
     }
 }
@@ -284,6 +285,7 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
                             new_seed,
                             ..
                         }) => Some(SortitionWinner {
+                            signing_key_hash: None,
                             vrf_public_key: None,
                             txid: operation.txid,
                             vrf_seed: *new_seed,
@@ -566,6 +568,7 @@ fn a_chain_reaching_through_a_missed_commitment_matches_stacks_core() {
 
     let txid = |byte: u8| [byte; 32];
     let commitment = |id: u8, spends: u8, burn_sats: u64| MiningCommitment {
+        signing_key_hash: None,
         txid: txid(id),
         spent_txid: txid(spends),
         spent_output: 3,

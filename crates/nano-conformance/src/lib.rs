@@ -4027,6 +4027,7 @@ mod tests {
             let winner_vrf_seed = (height % 3 == 0).then_some(hash);
             let winner = winner_vrf_seed.map(|vrf_seed| nano_sortition::SortitionWinner {
                 vrf_public_key: None,
+                signing_key_hash: None,
                 txid: hash,
                 vrf_seed,
             });
@@ -4216,6 +4217,7 @@ mod tests {
                             new_seed, ..
                         } => Some(nano_sortition::SortitionWinner {
                             vrf_public_key: None,
+                            signing_key_hash: None,
                             txid: winning_txid,
                             vrf_seed: new_seed,
                         }),

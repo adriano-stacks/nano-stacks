@@ -111,6 +111,14 @@ pub struct BitcoinBlockContext {
     ///
     /// Validation only, and `None` means "not known here", not "no key".
     pub winner_vrf_public_key: Option<[u8; 32]>,
+    /// The block-signing `Hash160` that leader key was registered with, which is
+    /// what the tenure's miner signs its headers under.
+    ///
+    /// A validation input like the one above and read by nothing in Clarity, so
+    /// it moves no state root. It comes from the registry a checkpoint carries
+    /// because a leader key is registered once and named for years afterwards, so
+    /// the tenure's own burn block is the one place it cannot be.
+    pub winner_signing_key_hash: Option<[u8; 20]>,
 }
 
 impl BitcoinBlockContext {
@@ -135,6 +143,7 @@ impl BitcoinBlockContext {
             burn_spend_winner: 0,
             sortition_hash: [0; 32],
             winner_vrf_public_key: None,
+            winner_signing_key_hash: None,
         }
     }
 }

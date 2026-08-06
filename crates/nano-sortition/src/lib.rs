@@ -89,6 +89,8 @@ pub struct MiningCommitment {
     /// The leader-key VRF public key this commitment named, when the burn block
     /// that registered it is one this node has seen.
     pub vrf_public_key: Option<[u8; 32]>,
+    /// The block-signing `Hash160` the same registration carried, if it had one.
+    pub signing_key_hash: Option<[u8; 20]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +106,11 @@ pub struct SortitionWinner {
     /// treated it as "no check needed" would be accepting an unverified proof;
     /// it has to say so instead.
     pub vrf_public_key: Option<[u8; 32]>,
+    /// The block-signing `Hash160` that registration carried, which is what the
+    /// tenure's miner signs its headers under. Optional twice over: the
+    /// registration may be below this node's window, and only some registrations
+    /// carry one at all.
+    pub signing_key_hash: Option<[u8; 20]>,
 }
 
 /// Bitcoin blocks a miner may name when it says which block it built on.
@@ -353,10 +360,18 @@ pub fn commitment_window_block(
                     .map(|output| output.amount_sats)
                     .sum(),
                 vrf_seed: *new_seed,
-                vrf_public_key: keys.usable(
-                    u64::from(*key_block_height),
-                    u32::from(*key_transaction_index),
-                ),
+                vrf_public_key: keys
+                    .registration(
+                        u64::from(*key_block_height),
+                        u32::from(*key_transaction_index),
+                    )
+                    .map(|registration| registration.vrf_public_key),
+                signing_key_hash: keys
+                    .registration(
+                        u64::from(*key_block_height),
+                        u32::from(*key_transaction_index),
+                    )
+                    .and_then(|registration| registration.signing_key_hash),
             });
         } else {
             missed_commitments.push(MissedCommitment {
@@ -798,6 +813,15 @@ pub struct SortitionSnapshot {
     /// The winning commitment's leader-key VRF public key, if this node saw the
     /// burn block that registered it. See `SortitionWinner::vrf_public_key`.
     pub winner_vrf_public_key: Option<[u8; 32]>,
+    /// The `Hash160` the winning leader key was registered with, which is what a
+    /// miner signs its tenure's blocks under.
+    ///
+    /// Carried for the same reason as the VRF key and from the same place: the
+    /// registration is far below any burnchain window a checkpointed node holds,
+    /// so the tenure's own burn block cannot answer it. Not every registration
+    /// has one — only 101 of mainnet's 2,477 do — so its absence is ordinary and
+    /// says the rule cannot run rather than that it failed.
+    pub winner_signing_key_hash: Option<[u8; 20]>,
     pub pox_id: PoxId,
 }
 
@@ -816,6 +840,7 @@ impl SortitionSnapshot {
             winner_txid: None,
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
+            winner_signing_key_hash: None,
             pox_id: PoxId::initial(),
         }
     }
@@ -1109,6 +1134,7 @@ impl SnapshotChain {
             winner_txid: winner.map(|winner| winner.txid),
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             winner_vrf_public_key: winner.and_then(|winner| winner.vrf_public_key),
+            winner_signing_key_hash: winner.and_then(|winner| winner.signing_key_hash),
             pox_id,
         };
         self.consensus_hashes.push(snapshot.consensus_hash);
@@ -1323,6 +1349,7 @@ impl SortitionEngine {
                             txid: distribution[index].candidate.txid,
                             vrf_seed: distribution[index].candidate.vrf_seed,
                             vrf_public_key: distribution[index].candidate.vrf_public_key,
+                            signing_key_hash: distribution[index].candidate.signing_key_hash,
                         },
                     )
                 })
@@ -1795,6 +1822,7 @@ mod tests {
             burn_sats: 10,
             vrf_seed: [hash; 32],
             vrf_public_key: None,
+            signing_key_hash: None,
         };
         engine
             .append(
@@ -1824,6 +1852,7 @@ mod tests {
     fn commitment(txid: u8, spent_txid: u8, burn_sats: u64) -> MiningCommitment {
         MiningCommitment {
             vrf_public_key: None,
+            signing_key_hash: None,
             txid: [txid; 32],
             spent_txid: [spent_txid; 32],
             spent_output: 3,
