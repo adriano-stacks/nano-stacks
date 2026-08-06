@@ -941,6 +941,15 @@ impl VersionedMarf {
         self.active.as_ref().map(|active| active.block)
     }
 
+    /// The height of the state currently being written.
+    ///
+    /// The height keys `begin` wrote are derived from it, so a recorder that
+    /// computed one of its own could record keys the trie does not hold.
+    #[must_use]
+    pub fn active_height(&self) -> Option<u32> {
+        self.active.as_ref().map(|active| active.height)
+    }
+
     /// Start a new state from an existing parent, or from an empty genesis state.
     pub fn begin(
         &mut self,
@@ -1242,13 +1251,18 @@ const BLOCK_HASH_TO_HEIGHT_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
 const BLOCK_HEIGHT_TO_HASH_KEY: &str = "__MARF_BLOCK_HEIGHT_TO_HASH";
 const OWN_BLOCK_HEIGHT_KEY: &str = "__MARF_BLOCK_HEIGHT_SELF";
 
-fn insert_metadata(
-    storage: &TrieStorage,
-    root_children: &mut Vec<TrieChild>,
+/// The MARF's own height keys for a state, in the order `begin` writes them.
+///
+/// Ordinary leaves, and part of the root — so their order is consensus like any
+/// other write's, and a journal that recorded a block's writes without them
+/// would seal a different trie. Public for exactly that reason: the recorder
+/// asks the MARF what it wrote rather than restating the rule beside it.
+#[must_use]
+pub fn height_keys(
     parent: Option<MarfBlockId>,
     block: MarfBlockId,
     height: u32,
-) -> Result<(), MarfError> {
+) -> Vec<(String, MarfValue)> {
     let mut entries = vec![
         (
             OWN_BLOCK_HEIGHT_KEY.to_owned(),
@@ -1276,7 +1290,17 @@ fn insert_metadata(
             MarfValue::from_u32(previous_height),
         ));
     }
-    for (key, value) in entries {
+    entries
+}
+
+fn insert_metadata(
+    storage: &TrieStorage,
+    root_children: &mut Vec<TrieChild>,
+    parent: Option<MarfBlockId>,
+    block: MarfBlockId,
+    height: u32,
+) -> Result<(), MarfError> {
+    for (key, value) in height_keys(parent, block, height) {
         insert_under_root(
             storage,
             root_children,

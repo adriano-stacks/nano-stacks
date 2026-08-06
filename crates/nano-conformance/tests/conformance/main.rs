@@ -66,3 +66,4 @@ mod wasm_match_binding_name;
 mod wasm_nft_allowance;
 mod wasm_response_fold;
 mod wasm_trait_fold;
+mod write_journal;
