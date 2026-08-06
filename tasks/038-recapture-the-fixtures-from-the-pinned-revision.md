@@ -56,7 +56,7 @@ this fixture tree is not.
       depth, and see where `replay: costs` lands.
 - [x] Capture a window whose maturing tenures are all Nakamoto ones, so the
       accounting the replay needs exists, and install it.
-- [ ] Include the checkpoint height's own block, so the attestation test in
+- [x] Include the checkpoint height's own block, so the attestation test in
       [[031-establish-a-trust-root-for-the-checkpoint]] can attest `checkpoint-H`
       itself rather than standing in a later block. The capture starts one block
       after the checkpoint, so that header is missing today.
@@ -145,3 +145,46 @@ that missed its Bitcoin block was being hashed into the block's `ops_hash`.
 
 The tree replays the new capture at 340/340 on state roots and receipts, and
 the cost row now fails for a reason that is nano's own.
+
+## The checkpoint's own block
+
+The capture already fetched it and threw it away: `checkpoint_root` asked
+`/v3/blocks/:id` for the block at the checkpoint height, sliced bytes 101..133
+out of the header for the state root, and dropped the rest. It now writes the
+whole block to `chainstate/checkpoint-H/block.bin`, and checks two of the fields
+it can check before believing the root — the height at bytes 1..9 and the tenure
+at 17..37 — because a peer answering with some other block would otherwise fix
+that block's root into the manifest as the checkpoint's.
+
+That closes the export half. It does not give the fixture tree the block,
+because neither installed capture can be re-taken: the Hacknet the fixtures came
+from is gone (its checkpoint state id `7dbd545f…` is a 404 on the Hacknet running
+today, which is a different chain), and the mainnet capture is a read-only 380 GB
+archive.
+
+So the attestation is now exercised against a real published checkpoint from the
+other direction. `fixtures/mainnet/checkpoint-block.bin` is the block that sealed
+the mainnet checkpoint nano runs from — Stacks height 8,665,600, block id
+`a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d`, 1,973 bytes
+from `api.mainnet.hiro.so/v3/blocks/:id`, the same reward cycle as the five
+envelope blocks already there.
+`the_published_mainnet_checkpoint_is_attested_by_the_header_that_sealed_it`
+hands `attest_checkpoint` the three values `checkpoint.toml` publishes — restated
+in the test, because a claim read out of the same directory as the state it
+describes checks nothing — the block, and the trimmed cycle-140 reward set. It
+attests: **2,708 signer weight against a threshold of 2,599**, the same two
+numbers the running mainnet node prints for the same checkpoint, and
+`attesting_block_id` is the checkpoint's own state id rather than a later block's.
+
+`a_signed_header_attests_the_checkpoint_it_sealed` now prefers
+`chainstate/checkpoint-H/block.bin` when a capture carries it and falls back to
+standing a later block in when it does not, so the Hacknet half upgrades itself
+at the next recapture without another change here.
+
+## What this does not prove
+
+Nothing here exercises the capture writing the block — that needs a node, like
+the rest of `capture-fixtures`. And an attestation is not a proof that the
+checkpoint's *bytes* are the state that root belongs to: it says mainnet's
+signers put threshold weight behind a header carrying that root at that height,
+which is the whole of the trust model in `docs/checkpoint-trust.md` and no more.

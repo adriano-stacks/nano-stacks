@@ -11,6 +11,10 @@
 //! network signed, recovers the same keys from it, orders them the same way,
 //! and counts the same weight against the same threshold. It proves nothing
 //! about execution.
+//!
+//! The block that sealed the mainnet checkpoint is kept beside them, because the
+//! same machinery is what makes a checkpoint trustworthy: its root is in the
+//! preimage those signatures cover.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,6 +104,68 @@ fn a_block_id_is_the_hash_the_network_serves_it_under() {
             "the block answers to the identifier it was fetched by"
         );
     }
+}
+
+/// What the mainnet checkpoint publishes about itself, as an operator hands it
+/// over: the height, the state and the root from
+/// `chainstate/checkpoint-H/checkpoint.toml`.
+///
+/// Restated here rather than read from a capture on purpose. These three values
+/// are the *claim* under test, and a claim read out of the same directory as the
+/// state it describes checks nothing. The Bitcoin height is not part of the
+/// claim the header can settle, so it is only carried.
+const CHECKPOINT_HEIGHT: u64 = 8_665_600;
+const CHECKPOINT_STATE_ID: &str = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d";
+const CHECKPOINT_STATE_ROOT: &str =
+    "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec";
+const CHECKPOINT_BITCOIN_HEIGHT: u64 = 960_231;
+
+fn thirty_two(hex: &str) -> [u8; 32] {
+    <[u8; 32]>::try_from(hex::decode(hex).expect("hexadecimal").as_slice()).expect("32 bytes")
+}
+
+/// The trust root, checked against the block that sealed the state it names.
+///
+/// nano cannot rebuild mainnet from genesis, so the state it starts from is
+/// bytes somebody else produced, and the only thing that makes its root more
+/// than an assertion is that mainnet's own signers signed a header containing
+/// it. That is the whole of `docs/checkpoint-trust.md`, and this is it offline:
+/// the published claim, the block at that height as the network serves it, and
+/// the reward set of its cycle fetched independently of the checkpoint.
+///
+/// The weight and threshold are the ones the running mainnet node reports for
+/// the same checkpoint, so this also pins that the offline check and the node's
+/// own startup check agree.
+#[test]
+fn the_published_mainnet_checkpoint_is_attested_by_the_header_that_sealed_it() {
+    let block = NakamotoBlock::decode(
+        &fs::read(mainnet().join("checkpoint-block.bin")).expect("read the checkpoint block"),
+    )
+    .expect("decode the checkpoint block");
+    assert_eq!(
+        block.header.chain_length, CHECKPOINT_HEIGHT,
+        "the kept block is the one at the checkpoint's height"
+    );
+
+    let manifest = nano_marf::CheckpointManifest {
+        format: "stacks-core-marf-sqlite-v2".to_owned(),
+        stacks_height: CHECKPOINT_HEIGHT,
+        source_state_id: thirty_two(CHECKPOINT_STATE_ID),
+        state_index_root: nano_primitives::TrieHash::from_bytes(thirty_two(CHECKPOINT_STATE_ROOT)),
+        first_bitcoin_height: CHECKPOINT_BITCOIN_HEIGHT,
+    };
+    let attestation = nano_node::attest_checkpoint(&manifest, &block.header, &reward_set())
+        .expect("mainnet's signers attest the checkpoint nano starts from");
+
+    assert_eq!(
+        attestation.attesting_block_id, manifest.source_state_id,
+        "the checkpoint is attested by its own block, not a later one"
+    );
+    assert_eq!(
+        (attestation.signer_weight, attestation.approval_threshold),
+        (2708, 2599),
+        "the offline attestation disagrees with what the node reports at startup"
+    );
 }
 
 /// The `PoX` unlock heights a mainnet capture has to carry itself.

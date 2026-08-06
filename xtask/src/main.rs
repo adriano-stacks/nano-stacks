@@ -10,7 +10,10 @@ use std::{
 };
 
 use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
-use nano_chainstate::{NakamotoBlock, Signer, SignerSet};
+// The maturity window comes from the node's own crate rather than being restated
+// here: the export refuses a window shorter than it, and a copy that drifted
+// would write a checkpoint the node it is for cannot pay from.
+use nano_chainstate::{MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet};
 use nano_primitives::Network;
 use serde_json::json;
 
@@ -1262,9 +1265,6 @@ fn print_public_key(private_key: Option<&str>) -> ExitCode {
     }
 }
 
-/// Tenures between a reward being earned and paid, mirroring stacks-core.
-const MINER_REWARD_MATURITY: u64 = 100;
-
 /// The reward one tenure earned, as stacks-core scheduled it.
 struct ScheduledPayment {
     recipient: String,
@@ -1735,8 +1735,8 @@ impl CaptureConfig {
             snapshots_by_consensus_hash(&snapshots, &blocks[0].consensus_hash)
                 .ok_or_else(|| "captured first block has no sortition snapshot".to_owned())?;
         let checkpoint = Self::block_at_height(blocks_db, self.checkpoint_height)?;
-        let checkpoint_root = self.checkpoint_root(&checkpoint)?;
         let checkpoint_dir = staging.join("chainstate/checkpoint-H");
+        let checkpoint_root = self.write_checkpoint_block(&checkpoint, &checkpoint_dir)?;
         copy_clarity_source(&node_root.join("chainstate/vm/clarity"), &checkpoint_dir)?;
         Self::write_native_effects(
             &node_root.join("chainstate/vm/index.sqlite"),
@@ -2008,7 +2008,24 @@ impl CaptureConfig {
         Ok(bitcoin_blocks)
     }
 
-    fn checkpoint_root(&self, checkpoint: &CapturedBlock) -> Result<String, String> {
+    /// Keep the block that sealed the checkpoint, and read its root out of it.
+    ///
+    /// The root is what the manifest publishes; the block is what makes that
+    /// root trustworthy, because a reward set signed a preimage containing it. A
+    /// capture that keeps only the root leaves the attestation with nothing to
+    /// check offline, and stands a later block in for the checkpoint's own — the
+    /// mechanism, but not the block a node actually adopts.
+    ///
+    /// The header is fixed-width up to the root, so the offsets are the layout:
+    /// `version(1) ‖ chain_length(8) ‖ burn_spent(8) ‖ consensus_hash(20) ‖
+    /// parent_block_id(32) ‖ tx_merkle_root(32)` puts `state_index_root` at 101.
+    /// Both identifying fields are checked, because a peer answering with a
+    /// different block would otherwise fix that block's root into the manifest.
+    fn write_checkpoint_block(
+        &self,
+        checkpoint: &CapturedBlock,
+        checkpoint_dir: &Path,
+    ) -> Result<String, String> {
         let raw_block = http_get(&format!(
             "{}/v3/blocks/{}",
             self.stacks_rpc, checkpoint.index_block_hash
@@ -2016,7 +2033,30 @@ impl CaptureConfig {
         let root = raw_block.get(101..133).ok_or_else(|| {
             "checkpoint block is too short to contain a state index root".to_owned()
         })?;
-        Ok(hex(root))
+        let root = hex(root);
+        let height = raw_block
+            .get(1..9)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| "checkpoint block is too short to state its height".to_owned())?;
+        if height != checkpoint.height {
+            return Err(format!(
+                "asked for the block at Stacks height {} and was served one at {height}",
+                checkpoint.height
+            ));
+        }
+        let consensus_hash = raw_block.get(17..37).map(hex).unwrap_or_default();
+        if consensus_hash != checkpoint.consensus_hash {
+            return Err(format!(
+                "the block served for the checkpoint is in tenure {consensus_hash}, not {}",
+                checkpoint.consensus_hash
+            ));
+        }
+        write_file(
+            &checkpoint_dir.join(nano_marf::CHECKPOINT_BLOCK_FILE),
+            &raw_block,
+        )?;
+        Ok(root)
     }
 
     fn current_reward_cycle(&self) -> Result<u64, String> {
@@ -2297,9 +2337,11 @@ fn parse_u128(field: &str, value: Option<&str>) -> Result<u128, String> {
 /// first payout it could not make was 27 tenures away — hours of execution,
 /// all of it thrown away. The `continue`s above are how a hole gets in:
 /// a tenure the archive cannot answer for is skipped rather than refused.
-            /// `last` is the deepest tenure the captured blocks belong to, and the
-            /// window has to reach it: a checkpoint whose earnings stop short of
-            /// its own tip owes nothing for the tenures between.
+///
+/// `last` is the deepest tenure the captured blocks belong to, and the window
+/// has to reach it: a checkpoint whose earnings stop short of its own tip owes
+/// nothing for the tenures between. One short of it is not, because a tenure's
+/// entry needs its successor's row and the deepest tenure has none yet.
 fn refuse_a_short_earnings_window(
     tenures: &[serde_json::Value],
     last: u64,
@@ -4470,5 +4512,99 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
             eprintln!("cannot write {output}: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MINER_REWARD_MATURITY, refuse_a_short_earnings_window};
+    use serde_json::json;
+
+    /// The shape `write_native_effects` builds: one entry per tenure it could
+    /// price, in ascending order, with the heights it could not simply absent.
+    fn window(heights: impl IntoIterator<Item = u64>) -> Vec<serde_json::Value> {
+        heights
+            .into_iter()
+            .map(|coinbase_height| {
+                json!({
+                    "coinbase_height": coinbase_height,
+                    "recipient": "SP000000000000000000002Q6VF78",
+                    "coinbase": 0,
+                    "fees": 0,
+                })
+            })
+            .collect()
+    }
+
+    /// A window a node can pay a full maturity window of tenures from.
+    ///
+    /// The export stops one tenure short of the deepest one its blocks belong
+    /// to, because a tenure's entry needs the row of its successor and the
+    /// deepest one has none — so this is the accepted case, not a tolerated one.
+    #[test]
+    fn a_full_window_is_written() {
+        let last = 8_665_600;
+        let tenures = window(last - MINER_REWARD_MATURITY - 1..last);
+        assert_eq!(refuse_a_short_earnings_window(&tenures, last), Ok(()));
+    }
+
+    /// An archive that answers for nothing is refused before a byte is written.
+    #[test]
+    fn an_empty_window_is_refused() {
+        let error = refuse_a_short_earnings_window(&window([]), 8_665_600)
+            .expect_err("an empty window was written");
+        assert!(
+            error.contains("no tenure earnings at all"),
+            "the refusal says what it saw: {error}"
+        );
+    }
+
+    /// The failure this guard was written for: 193 tenures spanning 201 heights.
+    ///
+    /// Outer bounds long enough and a hole in the middle, which a count cannot
+    /// see. The message has to name the missing height, because the operator's
+    /// next move is to ask the archive for that one tenure.
+    #[test]
+    fn a_holed_window_is_refused() {
+        let last = 8_665_600;
+        let missing = last - 27;
+        let tenures = window((last - 200..last).filter(|height| *height != missing));
+        let error = refuse_a_short_earnings_window(&tenures, last)
+            .expect_err("a holed window was written");
+        assert!(
+            error.contains(&missing.to_string()),
+            "the refusal names the missing tenure: {error}"
+        );
+    }
+
+    /// A window that stops short of the checkpoint's own tip.
+    ///
+    /// The tenures between owe nothing, and a node that reaches one of them
+    /// stops there — a hundred tenures after it started, having sealed
+    /// everything before.
+    #[test]
+    fn a_window_that_does_not_reach_the_checkpoint_is_refused() {
+        let last = 8_665_600;
+        let tenures = window(last - 200..last - 1);
+        let error = refuse_a_short_earnings_window(&tenures, last)
+            .expect_err("a window short of the tip was written");
+        assert!(
+            error.contains("would owe nothing"),
+            "the refusal says the tenures between owe nothing: {error}"
+        );
+    }
+
+    /// Two tenures where a hundred and one are needed, which is what the export
+    /// used to write: contiguous, reaching the tip, and still unpayable.
+    #[test]
+    fn a_short_window_is_refused() {
+        let last = 8_665_600;
+        let tenures = window(last - 2..last);
+        let error = refuse_a_short_earnings_window(&tenures, last)
+            .expect_err("a short window was written");
+        assert!(
+            error.contains(&format!("{} tenures", MINER_REWARD_MATURITY + 1)),
+            "the refusal says how many a checkpoint needs: {error}"
+        );
     }
 }

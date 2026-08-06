@@ -7,7 +7,15 @@ height 960,300 — after the epoch 4.0 boundary at 960,230.
 | file | source |
 |---|---|
 | `blocks/<block_id>.bin` | `GET /v3/blocks/:block_id`, consensus-serialized |
+| `checkpoint-block.bin` | the same call for `a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d` |
 | `stacker_set-140.json` | `GET /v3/stacker_set/140`, trimmed to signing keys and weights |
+
+`checkpoint-block.bin` is the block that sealed the mainnet checkpoint nano runs
+from — Stacks height 8,665,600, burn height 960,219, the same reward cycle as the
+five above. It is here because the trust root is a claim about *that* height: the
+checkpoint publishes a state root, and this header is where a reward set signed
+it. Without it the attestation could only be exercised against a later block
+standing in for a checkpoint.
 
 Neither needs a chainstate, which is what makes this possible where a full
 replay of mainnet is not: the reward set is published and the envelope is
