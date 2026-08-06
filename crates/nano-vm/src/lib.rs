@@ -5695,6 +5695,11 @@ mod tests {
         source: &str,
         epoch: StacksEpochId,
     ) {
+        // The last `epoch`, which is the top-level field `ContractAnalysis`
+        // deserializes; the earlier copy inside `contract_interface` is descriptive
+        // and is left alone.
+        const MARKER: &str = r#""epoch":""#;
+
         let analysis_key = format!("clr-meta::{contract}::analysis");
         let stored: String = vm
             .store
@@ -5705,10 +5710,6 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("the deploy stored a contract analysis");
-        // The last `epoch`, which is the top-level field `ContractAnalysis`
-        // deserializes; the earlier copy inside `contract_interface` is
-        // descriptive and is left alone.
-        const MARKER: &str = r#""epoch":""#;
         let field = stored
             .rfind(MARKER)
             .expect("the stored analysis names an epoch");
