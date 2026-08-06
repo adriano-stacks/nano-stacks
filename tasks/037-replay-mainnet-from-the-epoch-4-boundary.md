@@ -42,7 +42,7 @@ never from fetched, staged or peer-reported height.
 - [ ] Feed one identical journal through nano's MARF and the pinned stacks-core
       MARF, including rewrites, forks and the imported mainnet checkpoint, to
       separate execution differences from trie differences.
-- [ ] In a separately built conformance harness, compare compiler and
+- [x] In a separately built conformance harness, compare compiler and
       interpreter journals before sealing. The production node must not perform
       this crosscheck or contain a fallback path; matching diagnostic values are
       not a production conformance result.

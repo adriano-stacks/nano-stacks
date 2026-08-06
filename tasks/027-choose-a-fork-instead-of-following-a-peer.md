@@ -1,13 +1,14 @@
 ---
 id: "027"
 title: "Choose a fork instead of following a peer"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: improvement
 dependencies: ["026", "049", "050"]
 tags: ["mainnet", "sync"]
 created_at: 2026-07-30
+completed_at: 2026-08-06
 ---
 
 # Choose a fork instead of following a peer

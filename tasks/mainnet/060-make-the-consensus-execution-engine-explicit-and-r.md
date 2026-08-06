@@ -1063,3 +1063,40 @@ production call path — and `wasm_is_the_engine` forbids those strings anywhere
 the tree, so it failed on the first run. That is the boundary check working: a name
 that reads like a retired production switch is a hazard even when the thing behind
 it is a test, and the comment in `crosschecking_engines` now says so.
+
+## The mainnet regression slice cannot be built as written, and why
+
+The item asks to pin "roots, receipts, costs, events and consensus-visible writes"
+for a bounded mainnet compiler slice. Three of those five are not obtainable, and
+the reason is worth writing down rather than working around:
+
+`/home/aldur/mainnet-capture` declares `receipts = false` and holds **no**
+`events/new_block` at all. That stream is what a stacks-core node's *event
+observer* emits as it executes, so it exists only if somebody was listening at the
+time. It cannot be fetched afterwards: no public API serves stacks-core's
+`new_block` payload for a historical block, and the archive's `payments` and
+`matured_rewards` tables carry accounting rather than per-transaction receipts,
+costs or events. The hacknet capture has all five precisely because nano's own
+harness was the observer while that chain ran.
+
+So the slice can pin **roots** against the chain today and nothing else, which
+misses exactly the case this task discovered a week of work later: *a compile
+refusal at a call is invisible in the sealed root*, because a failed transaction
+writes nothing and seals the root an untouched block seals. A root-only slice would
+report green through the one failure it most needs to catch.
+
+Two ways to make it real, neither of them cheap, both recorded so the next person
+does not rediscover the dead end:
+
+- **Run a stacks-core node with an event observer over the slice** and capture the
+  stream properly. That is what `xtask capture-fixtures` does for hacknet and what
+  the mainnet capture skipped.
+- **Freeze nano's own receipts from a run whose roots matched the chain.** Not an
+  oracle — it is nano checking itself — but a legitimate *regression* gate: given
+  the roots are chain-verified, a compiler change that alters a receipt without
+  altering a root is caught, which is the invisible case. It needs the 146 GB
+  checkpoint import to re-execute, so it cannot live in CI as it stands.
+
+The half that *is* done is the one that stops a missing fixture reading as a pass:
+`skip_gate` plus `NANO_REQUIRE_MAINNET`, demonstrated both ways, so a release run
+that claims the mainnet gates are green had to actually run them.
