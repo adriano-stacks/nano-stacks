@@ -147,7 +147,7 @@ async fn nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api() {
     // fetched itself.
     let pool = PeerPool::from_endpoints(&endpoints);
     assert_eq!(pool.len(), endpoints.len());
-    let Some((peer, client)) = pool.choose_source(None).await else {
+    let Some((peer, client)) = pool.choose_source(None, None).await else {
         panic!(
             "none of the {} discovered endpoints served a tip; they were {endpoints:?}",
             endpoints.len()
@@ -231,7 +231,7 @@ async fn bulk_history_comes_from_several_mainnet_peers() {
     // is fetched from whoever `TenureSource` picks next.
     let pool = PeerPool::from_endpoints(&endpoints);
     let (_, chosen) = pool
-        .choose_source(None)
+        .choose_source(None, None)
         .await
         .expect("a discovered peer serves a tip");
     let mut cursor = chosen

@@ -206,6 +206,8 @@ pub enum TipRejection {
     UnknownOrUnorderedSigner,
     /// Its signatures do not recover.
     UnrecoverableSignature,
+    /// It names a burn view this node's own burnchain did not produce.
+    ForeignBurnView,
 }
 
 impl fmt::Display for TipRejection {
@@ -214,20 +216,52 @@ impl fmt::Display for TipRejection {
             Self::InsufficientWeight => "tip does not carry threshold signer weight",
             Self::UnknownOrUnorderedSigner => "tip carries a signature from outside the reward set",
             Self::UnrecoverableSignature => "tip carries a signature that does not recover",
+            Self::ForeignBurnView => {
+                "tip names a burn view this node's own burnchain did not produce"
+            }
         })
     }
 }
 
 impl std::error::Error for TipRejection {}
 
+/// What this node's own burnchain says about the tenure a peer is offering.
+///
+/// The point of this trait is that the answer comes from the node's own derived
+/// sortition chain rather than from the peer being weighed: a peer's
+/// `/v3/sortitions` answer describes the burnchain that peer read, which is the
+/// thing under suspicion.
+pub trait BurnView {
+    /// Whether the burn view a candidate names is one this node derived.
+    ///
+    /// `None` means *this node cannot judge*, which is the ordinary case while
+    /// catching up: the candidate stands on a burn block ahead of the ones this
+    /// node has derived, so nothing local contradicts it and the burn total of
+    /// every block it later executes is checked against this same chain
+    /// (`CheckpointExecutionError::BitcoinSpent`) as it gets there.
+    ///
+    /// `bitcoin_spent` is the candidate header's cumulative burn, which is what
+    /// places it against this node's own chain without asking anybody: it is the
+    /// running total of the burn view the block was built on, and the reward set
+    /// signed it.
+    fn derived(&self, consensus_hash: ConsensusHash, bitcoin_spent: u64) -> Option<bool>;
+}
+
 /// Whether a tip is one the network would accept, and what weight signed it.
 ///
 /// Length decides nothing on its own: a peer can serve a longer chain that no
 /// signer put its name to. Weight is what makes a chain canonical, so it is
 /// checked before length is even compared.
+///
+/// The set is a [`SignerWeights`] rather than a [`SignerSet`] because that is the
+/// form this node's *executed state* holds — `.signers`, written by whichever node
+/// reached the prepare phase, under a state root the network agreed with — and it
+/// is the same value `ChainState::check_signer_signatures` enforces at execution.
+/// Weighing selection against a set parsed from a peer's `/v3/stacker_set` would
+/// be asking the candidates' own network who may approve them.
 pub fn weigh_tip(
     header: &nano_chainstate::NakamotoBlockHeader,
-    signers: &SignerSet,
+    signers: &nano_chainstate::SignerWeights,
 ) -> Result<u32, TipRejection> {
     signers.verify(header).map_err(|error| match error {
         SignerSetError::InsufficientWeight => TipRejection::InsufficientWeight,
@@ -236,20 +270,64 @@ pub fn weigh_tip(
     })
 }
 
+/// Why this node will not follow a candidate, or nothing if it will.
+///
+/// Both rules answer from what this node holds for itself. The burn view is
+/// checked first because it is what decides whether the weight rule can be
+/// applied at all: a candidate standing on a burn block this node has not derived
+/// belongs to a reward cycle whose signer set this node's state may not record,
+/// and refusing it on weight would refuse every honest peer of a node that is
+/// catching up.
+fn refuse_tip(
+    candidate: &CandidateTip,
+    signers: Option<&nano_chainstate::SignerWeights>,
+    burn: Option<&dyn BurnView>,
+) -> Option<TipRejection> {
+    let judgeable = match burn {
+        Some(burn) => match burn.derived(
+            candidate.info.consensus_hash,
+            candidate.header.bitcoin_spent,
+        ) {
+            // A burn view this node derived: the tip is on this node's burnchain
+            // and in a cycle it has reached, so weight is enforced below.
+            Some(true) => true,
+            // A view at or below the ones this node derived that this node never
+            // derived is a different chain of Bitcoin blocks. No signature check
+            // would catch it — a chain built over another burnchain can be
+            // perfectly signed by the signers of *that* chain.
+            Some(false) => return Some(TipRejection::ForeignBurnView),
+            None => false,
+        },
+        // A node with no burn view of its own has nothing to say about which
+        // burnchain a tip stands on, so it applies the weight rule alone —
+        // strictly, which is the safe direction for a node that cannot tell an
+        // unreachable cycle from a wrong one.
+        None => true,
+    };
+    if !judgeable {
+        return None;
+    }
+    signers.and_then(|signers| weigh_tip(&candidate.header, signers).err())
+}
+
 /// Choose the tip to follow among the ones the peers are offering.
 ///
-/// A candidate has to carry threshold signer weight before its length counts.
-/// Among those, the longest chain wins, and an exact tie goes to the lowest
-/// block identifier so that every node following the same peers lands on the
-/// same block rather than on whichever answered first.
+/// A candidate has to survive both of this node's own checks before its length
+/// counts: the burn view it names has to be one this node's burnchain produced,
+/// and — where this node can judge the cycle — the signatures have to carry
+/// threshold weight against the set this node's executed state records. Among
+/// those, the longest chain wins, and an exact tie goes to the lowest block
+/// identifier so that every node looking at the same peers lands on the same
+/// block rather than on whichever answered first.
 #[must_use]
 pub fn choose_canonical_tip<'a>(
     candidates: &'a [CandidateTip],
-    signers: &SignerSet,
+    signers: Option<&nano_chainstate::SignerWeights>,
+    burn: Option<&dyn BurnView>,
 ) -> Option<&'a CandidateTip> {
     candidates
         .iter()
-        .filter(|candidate| weigh_tip(&candidate.header, signers).is_ok())
+        .filter(|candidate| refuse_tip(candidate, signers, burn).is_none())
         .max_by(|left, right| {
             left.header
                 .chain_length
@@ -1303,37 +1381,30 @@ impl PeerPool {
 
     /// Which peer to catch up from this round.
     ///
-    /// With a reward set this is [`choose_canonical_tip`]: threshold signer weight
-    /// first, then chain length, then the lower block identifier, so that every
-    /// node looking at the same peers lands on the same block rather than on
-    /// whichever answered first.
+    /// [`choose_canonical_tip`] decides: this node's own burn view, then the
+    /// signer weight its own executed state records, then chain length, then the
+    /// lower block identifier, so that every node looking at the same peers lands
+    /// on the same block rather than on whichever answered first.
     ///
-    /// Without one it falls back to the longest chain, and that is a *liveness*
-    /// choice rather than a security one — said plainly because the difference
-    /// matters. A reward set is not derivable until the checkpoint's cycle has been
-    /// reconstructed, and a node with no reward set that refused to sync would
-    /// never acquire one. What makes the fallback safe is that selection is not the
-    /// only check: every block this node executes still has to pass
-    /// `SignerSet::verify` at execution, so a peer offering an unsigned chain wins
-    /// the round and then fails to have a single block accepted, which distrusts it
-    /// by the ordinary path.
+    /// Both inputs are optional and the reasons differ. No reward set is a
+    /// *liveness* choice — said plainly because the difference matters: a set is
+    /// not readable until the cycle has been reached, and a node that refused to
+    /// sync without one would never acquire one. What makes it safe is that
+    /// selection is not the only check: every block this node executes is still
+    /// weighed against the set its own state records for that block's cycle, so a
+    /// peer offering an unsigned chain wins the round and then fails to have a
+    /// single block accepted. No burn view means this node derives no sortitions
+    /// of its own and so has nothing local to compare a tip's burnchain against.
     ///
     /// Either way the answer is derived from headers this node fetched and weighed
     /// itself, never from a peer's claim about its own height.
     pub async fn choose_source(
         &self,
-        signers: Option<&SignerSet>,
+        signers: Option<&nano_chainstate::SignerWeights>,
+        burn: Option<&dyn BurnView>,
     ) -> Option<(usize, SyncClient)> {
         let candidates = self.candidate_tips().await;
-        let chosen = match signers {
-            Some(signers) => choose_canonical_tip(&candidates, signers)?,
-            None => candidates.iter().max_by(|left, right| {
-                left.header
-                    .chain_length
-                    .cmp(&right.header.chain_length)
-                    .then_with(|| right.header.block_id().cmp(&left.header.block_id()))
-            })?,
-        };
+        let chosen = choose_canonical_tip(&candidates, signers, burn)?;
         let peer = chosen.peer;
         self.peer(peer).map(|client| (peer, client.clone()))
     }
@@ -1803,7 +1874,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RATE_LIMIT_RETRIES, BlockUploadWire, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError,
+        RATE_LIMIT_RETRIES, BlockUploadWire, BurnView, CandidateTip, Signer, SignerSet,
+        StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, choose_canonical_tip,
         parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
         parse_stacker_set, validate_tenure, validate_tenure_transition,
     };
@@ -2050,6 +2122,153 @@ mod tests {
             validate_tenure_transition(&previous, &fork),
             Err(SyncError::Fork)
         ));
+    }
+
+    /// What a node's own burnchain says, stated directly.
+    ///
+    /// The three answers rather than the rule that produces them: which burn
+    /// totals place a candidate below this node's tip is
+    /// `SortitionTracker::derived`'s business and has its own oracle in
+    /// `mainnet_sortition`, and a stub that recomputed it here would be testing
+    /// itself.
+    struct StubBurnView(std::collections::BTreeMap<[u8; 20], Option<bool>>);
+
+    impl BurnView for StubBurnView {
+        fn derived(&self, consensus_hash: ConsensusHash, _bitcoin_spent: u64) -> Option<bool> {
+            self.0
+                .get(consensus_hash.as_bytes())
+                .copied()
+                .unwrap_or(None)
+        }
+    }
+
+    /// A candidate tip a peer is offering, signed by `signer` if one is given.
+    fn candidate(
+        peer: usize,
+        consensus_hash: [u8; 20],
+        chain_length: u64,
+        signer: Option<&nano_crypto::StacksPrivateKey>,
+    ) -> CandidateTip {
+        let mut header = nano_chainstate::NakamotoBlockHeader {
+            version: 1,
+            chain_length,
+            bitcoin_spent: 1_000,
+            consensus_hash: ConsensusHash::from_bytes(consensus_hash),
+            parent_block_id: StacksBlockId::from_bytes([2; 32]),
+            transaction_merkle_root: nano_primitives::Sha256Sum::default(),
+            state_index_root: nano_primitives::TrieHash::from_bytes([4; 32]),
+            timestamp: 5,
+            miner_signature: nano_crypto::StacksPrivateKey::from_seed(b"miner").sign(&[5; 32]),
+            signer_signatures: Vec::new(),
+            pox_treatment: nano_primitives::BitVec::zeros(1).expect("a one-bit vector"),
+            problematic_transactions: Vec::new(),
+        };
+        if let Some(signer) = signer {
+            let digest = header.signer_signature_hash();
+            header.signer_signatures = vec![signer.sign(digest.as_bytes())];
+        }
+        CandidateTip {
+            peer,
+            info: tenure_info(consensus_hash, [7; 32], *header.block_id().as_bytes()),
+            header,
+        }
+    }
+
+    /// The fork choice refuses a burn view this node's own burnchain contradicts.
+    ///
+    /// The lie no signature check can catch: a chain built over a different chain
+    /// of Bitcoin blocks is perfectly signed by the signers of *that* chain, and
+    /// executing it produces a perfectly consistent state for a chain nobody else
+    /// is on. Only this node's own burnchain says otherwise.
+    #[test]
+    fn a_tip_on_a_burn_view_this_node_did_not_derive_is_refused() {
+        let ours = [1; 20];
+        let theirs = [2; 20];
+        let burn = StubBurnView(
+            [(ours, Some(true)), (theirs, Some(false))]
+                .into_iter()
+                .collect(),
+        );
+        // The foreign one is longer, so this cannot pass by the liar offering
+        // something worse.
+        let candidates = vec![
+            candidate(0, ours, 100, None),
+            candidate(1, theirs, 1_100, None),
+        ];
+        let chosen = choose_canonical_tip(&candidates, None, Some(&burn))
+            .expect("the derived view is a candidate");
+        assert_eq!(chosen.peer, 0, "the foreign burn view won the fork choice");
+
+        // With only the foreign one left, the node follows nothing. Stalling is
+        // visible and recoverable; following is a fork.
+        assert!(
+            choose_canonical_tip(&candidates[1..], None, Some(&burn)).is_none(),
+            "a burn view this node did not derive was adopted for being the only one"
+        );
+    }
+
+    /// A tip ahead of this node's burn view is followed, and weighed later.
+    ///
+    /// The liveness half, and the reason `derived` has three answers rather than
+    /// two: a node catching up stands thousands of burn blocks below every honest
+    /// peer, and one that refused what it could not yet judge would never acquire
+    /// the state that lets it judge. What makes it safe is that the burn total of
+    /// every block it executes is checked against this same chain as it reaches it.
+    #[test]
+    fn a_tip_ahead_of_this_nodes_burn_view_is_still_followed() {
+        let unknown = [9; 20];
+        let burn = StubBurnView(std::collections::BTreeMap::new());
+        let candidates = vec![candidate(0, unknown, 8_000_000, None)];
+        assert_eq!(
+            choose_canonical_tip(&candidates, None, Some(&burn)).map(|tip| tip.peer),
+            Some(0),
+            "a node that cannot judge a tip refused to follow it and would never catch up"
+        );
+    }
+
+    /// Signer weight is enforced where this node can judge the cycle, and not
+    /// where it cannot.
+    ///
+    /// Both halves in one test because they are one rule: the set a node reads out
+    /// of `.signers` is the set of *its own* burn view's cycle, so applying it to a
+    /// candidate thousands of burn blocks ahead would refuse the honest peer for
+    /// being in a cycle this node has not reached.
+    #[test]
+    fn weight_decides_a_judgeable_tip_and_not_one_beyond_this_nodes_view() {
+        let key = nano_crypto::StacksPrivateKey::from_seed(b"a signer of this cycle");
+        let signers = SignerSet::new(vec![Signer {
+            public_key: key.public_key(),
+            weight: 10,
+        }])
+        .expect("a set of one")
+        .signing_weights()
+        .expect("the set is well formed");
+
+        let ours = [1; 20];
+        let ahead = [2; 20];
+        let burn = StubBurnView([(ours, Some(true))].into_iter().collect());
+
+        // On this node's own burn view and unsigned: refused, however long.
+        let unsigned = vec![candidate(0, ours, 5_000, None)];
+        assert!(
+            choose_canonical_tip(&unsigned, Some(&signers), Some(&burn)).is_none(),
+            "an unsigned tip on this node's own burn view was followed"
+        );
+        // Signed by the cycle's own signer: followed.
+        let signed = vec![candidate(0, ours, 5_000, Some(&key))];
+        assert_eq!(
+            choose_canonical_tip(&signed, Some(&signers), Some(&burn)).map(|tip| tip.peer),
+            Some(0),
+        );
+        // Ahead of this node's burn view and unsigned: followed anyway, because
+        // this node's set is not the set that cycle uses and it has no way to say
+        // which is. Execution weighs each block against its own cycle's set.
+        let beyond = vec![candidate(0, ahead, 5_000, None)];
+        assert_eq!(
+            choose_canonical_tip(&beyond, Some(&signers), Some(&burn)).map(|tip| tip.peer),
+            Some(0),
+            "a node catching up refused a peer for being in a cycle it has not reached"
+        );
     }
 
     fn tenure_info(

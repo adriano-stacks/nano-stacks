@@ -177,6 +177,26 @@ impl SortitionTracker {
         history.get(history.len().checked_sub(back + 1)?).copied()
     }
 
+    /// Whether this chain's history holds a burn view, by consensus hash.
+    ///
+    /// A linear search over the hash history, which on mainnet is a quarter of a
+    /// million entries and twelve megabytes — cheap enough for a question asked
+    /// once per fork choice, and the reason the answer is not asked per block.
+    ///
+    /// The history reaches below the seed, where its entries came from the
+    /// checkpoint rather than from this node's own arithmetic. That is still this
+    /// node's own view and not the peer's, which is the distinction that matters
+    /// here: the alternative is having nothing to compare a peer's burnchain
+    /// against at all.
+    #[must_use]
+    pub fn holds_consensus_hash(&self, consensus_hash: ConsensusHash) -> bool {
+        self.engine
+            .snapshots()
+            .history()
+            .iter()
+            .any(|hash| *hash == consensus_hash)
+    }
+
     /// Commitments the burn block at the tip put up for its sortition.
     ///
     /// Reporting, not a gate: the winner derives whether or not the block left a
@@ -386,6 +406,22 @@ impl SortitionTracker {
     #[must_use]
     pub fn agrees_with_header(&self, bitcoin_spent: u64) -> bool {
         self.tip().total_burn == bitcoin_spent
+    }
+}
+
+/// What this chain says about a tip a peer is offering, for the fork choice.
+///
+/// The placement rule is the header's own cumulative burn. It is a *running*
+/// total over the burn view, so a header stating strictly less burn than this
+/// chain's tip was built on a burn block below the ones this chain derived — and
+/// every burn view below the tip is in the history, so its consensus hash has to
+/// be there. Equality is deliberately not judged: a burn block that elects nobody
+/// adds nothing to the total, so an honest peer one view *ahead* of this chain can
+/// state exactly this chain's total, and refusing that would refuse the peer that
+/// is right.
+impl nano_sync::BurnView for SortitionTracker {
+    fn derived(&self, consensus_hash: ConsensusHash, bitcoin_spent: u64) -> Option<bool> {
+        (bitcoin_spent < self.tip().total_burn).then(|| self.holds_consensus_hash(consensus_hash))
     }
 }
 
@@ -741,4 +777,64 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         winner_signing_key_hash: None,
         pox_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use nano_primitives::ConsensusHash;
+    use nano_sortition::{OpsHash, PoxId, SortitionHash, SortitionSnapshot};
+    use nano_sync::BurnView as _;
+
+    use super::SortitionTracker;
+
+    /// A chain standing on one snapshot, with one hash behind it.
+    fn tracker(total_burn: u64) -> SortitionTracker {
+        let behind = ConsensusHash::from_bytes([0xbe; 20]);
+        let seed = SortitionSnapshot {
+            bitcoin_height: 100,
+            bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+            sortition_id: nano_primitives::SortitionId::from_bytes([2; 32]),
+            parent_sortition_id: nano_primitives::SortitionId::from_bytes([3; 32]),
+            operations_hash: OpsHash::from_txids(&[]),
+            consensus_hash: ConsensusHash::from_bytes([0x7f; 20]),
+            total_burn,
+            sortition_hash: SortitionHash::from_bytes([4; 32]),
+            winner_txid: None,
+            winner_vrf_seed: None,
+            winner_vrf_public_key: None,
+            winner_signing_key_hash: None,
+            pox_id: PoxId::initial(),
+        };
+        let history = vec![behind, seed.consensus_hash];
+        SortitionTracker::new(seed, history).expect("the history ends at the seed")
+    }
+
+    /// Where a candidate's burn total places it against this chain.
+    ///
+    /// The three answers, and the boundary between them is what matters: a header
+    /// stating *strictly less* burn than this chain's tip was built below it and
+    /// has to name a view this chain holds, while one stating exactly the tip's
+    /// total may be a burn block ahead that elected nobody — the shape mainnet
+    /// leaves in four burn blocks out of every fifteen — and is not judged.
+    #[test]
+    fn a_burn_total_below_the_tip_places_a_candidate_on_this_chain() {
+        let tracker = tracker(1_000);
+        let tip = ConsensusHash::from_bytes([0x7f; 20]);
+        let behind = ConsensusHash::from_bytes([0xbe; 20]);
+        let foreign = ConsensusHash::from_bytes([0xaa; 20]);
+
+        assert_eq!(tracker.derived(tip, 999), Some(true));
+        assert_eq!(tracker.derived(behind, 999), Some(true));
+        assert_eq!(
+            tracker.derived(foreign, 999),
+            Some(false),
+            "a view below this chain's tip that this chain never derived is another burnchain"
+        );
+        assert_eq!(
+            tracker.derived(foreign, 1_000),
+            None,
+            "a candidate at this chain's own total may be a sortition-less block ahead of it"
+        );
+        assert_eq!(tracker.derived(foreign, 8_000_000), None);
+    }
 }

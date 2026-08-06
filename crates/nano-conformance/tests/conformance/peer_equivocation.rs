@@ -31,7 +31,7 @@
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::Path, sync::Arc};
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
-use nano_chainstate::{NakamotoBlock, Signer, SignerSet};
+use nano_chainstate::{NakamotoBlock, Signer, SignerSet, SignerWeights};
 use nano_crypto::StacksPublicKey;
 use nano_sync::{PeerPool, SyncClient, choose_canonical_tip, weigh_tip};
 
@@ -42,7 +42,7 @@ fn mainnet() -> std::path::PathBuf {
 }
 
 /// The reward set mainnet published for the cycle these blocks fall in.
-fn reward_set() -> SignerSet {
+fn reward_set() -> SignerWeights {
     let document: serde_json::Value =
         serde_json::from_slice(&fs::read(mainnet().join("stacker_set-140.json")).expect("read it"))
             .expect("parse the reward set");
@@ -64,7 +64,13 @@ fn reward_set() -> SignerSet {
             weight: u32::try_from(entry["weight"].as_u64().expect("a weight")).expect("it fits"),
         })
         .collect();
-    SignerSet::new(signers).expect("the reward set is not empty")
+    // By signing-key hash: that is the shape `.signers` holds and the one both the
+    // fork choice and execution weigh against, so a test that weighed a different
+    // shape would be exercising a rule the node does not apply.
+    SignerSet::new(signers)
+        .expect("the reward set is not empty")
+        .signing_weights()
+        .expect("the reward set is well formed")
 }
 
 /// The captured mainnet blocks, lowest first.
@@ -166,7 +172,7 @@ async fn chosen(
     }
     let candidates = pool.candidate_tips().await;
     let signers = reward_set();
-    choose_canonical_tip(&candidates, &signers)
+    choose_canonical_tip(&candidates, Some(&signers), None)
         .map(|candidate| (candidate.peer, candidate.header.block_id()))
 }
 

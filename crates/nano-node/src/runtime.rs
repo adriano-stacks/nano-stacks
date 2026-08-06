@@ -499,7 +499,13 @@ async fn follow(follower: Follower) -> Role {
     // choosing already existed, and nothing called it.
     let mut peer = peer;
     let mut node = Node::new(peer.clone());
-    let mut rounds_on_this_peer = 0_u32;
+    // Starting at the reselection point rather than at zero, so the *first* round
+    // weighs the pool instead of keeping whichever peer answered `reachable_peer`
+    // first. That peer was chosen for being reachable, which is all a node can ask
+    // before it has opened its state — and a node that then stayed with it for the
+    // next sixty rounds would be following a peer nothing had weighed for the first
+    // minute of every start.
+    let mut rounds_on_this_peer = RESELECT_ROUNDS;
     let mut peer_failed = false;
     // Bulk history comes from every peer known, which is not the same question as
     // which peer this round *follows*: following is a fork choice and has to land on
@@ -515,7 +521,9 @@ async fn follow(follower: Follower) -> Role {
         if peer_failed || rounds_on_this_peer >= RESELECT_ROUNDS {
             rounds_on_this_peer = 0;
             peer_failed = false;
-            if let Some(chosen) = better_peer(&peer, &config, discovered.as_ref()).await {
+            if let Some(chosen) =
+                better_peer(&peer, &config, discovered.as_ref(), executor.as_ref(), &pox).await
+            {
                 peer = chosen;
                 node = Node::new(peer.clone());
             }
@@ -1504,16 +1512,39 @@ impl BulkHistory {
 
 /// Re-weigh the peers and hand back a better one, if there is one.
 ///
-/// The weighing is `PeerPool::choose_source`, which is the boundary that has to
-/// stay in one place: a tip is compared on signer weight and length from headers
-/// this node fetched, never on a peer's claim about its own height.
+/// The weighing is `nano_sync::choose_canonical_tip`, which is the boundary that
+/// has to stay in one place: a tip is compared against this node's *own* answers —
+/// the burn view it derived from its own burnchain and the signer set its own
+/// executed state records — and then on the length of headers this node fetched.
+/// Nothing here is a peer's claim about its own height, its own cycle or its own
+/// burnchain.
+///
+/// The two phases are separated on purpose. Gathering the candidates is network
+/// work and takes no lock; weighing them locks the executed state and awaits
+/// nothing, because holding that lock across an HTTP round trip would stall every
+/// account read and every block admission behind the slowest peer in the pool.
 async fn better_peer(
     current: &SyncClient,
     config: &Config,
     discovered: Option<&Discovered>,
+    executor: Option<&SharedExecutor>,
+    pox: &PoxInfo,
 ) -> Option<SyncClient> {
     let pool = follow_pool(config, discovered);
-    let (_, chosen) = pool.choose_source(None).await?;
+    let candidates = pool.candidate_tips().await;
+    let peer = match executor {
+        Some(executor) => {
+            let mut executor = executor.lock().await;
+            let signers = executor.recorded_signer_set(bitcoin_context(config, pox));
+            let burn = executor.burn_view();
+            nano_sync::choose_canonical_tip(&candidates, signers.as_ref(), burn)?.peer
+        }
+        // A node with no executed state of its own — a signer-only or RPC-only
+        // configuration — has neither answer to weigh with, and says so by
+        // passing neither rather than by substituting a peer's.
+        None => nano_sync::choose_canonical_tip(&candidates, None, None)?.peer,
+    };
+    let chosen = pool.peer(peer)?.clone();
     (chosen.base_url() != current.base_url()).then(|| {
         println!(
             "following {} now, of {} peers known",

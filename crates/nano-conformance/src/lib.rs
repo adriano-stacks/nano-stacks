@@ -2670,7 +2670,11 @@ mod tests {
     #[test]
     fn a_longer_unsigned_chain_never_wins_the_fork_choice() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let signers = captured_signer_set(&fixture);
+        // By signing-key hash, which is the shape `.signers` records and the one
+        // both selection and execution weigh against.
+        let signers = captured_signer_set(&fixture)
+            .signing_weights()
+            .expect("the captured reward set is well formed");
         let blocks = captured_block_paths(&fixture)
             .into_iter()
             .map(|path| {
@@ -2712,13 +2716,13 @@ mod tests {
         };
         let candidates = vec![tip(0, forged), tip(1, signed.header.clone())];
 
-        let chosen = nano_sync::choose_canonical_tip(&candidates, &signers)
+        let chosen = nano_sync::choose_canonical_tip(&candidates, Some(&signers), None)
             .expect("a signed candidate is available");
         assert_eq!(chosen.peer, 1, "the signed tip wins despite being shorter");
 
         // With nothing signed, there is no canonical tip to follow at all.
         assert!(
-            nano_sync::choose_canonical_tip(&candidates[..1], &signers).is_none(),
+            nano_sync::choose_canonical_tip(&candidates[..1], Some(&signers), None).is_none(),
             "an unsigned chain is not a chain to follow"
         );
     }
@@ -2728,7 +2732,9 @@ mod tests {
     #[test]
     fn an_exact_tie_in_fork_choice_resolves_deterministically() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let signers = captured_signer_set(&fixture);
+        let signers = captured_signer_set(&fixture)
+            .signing_weights()
+            .expect("the captured reward set is well formed");
         let signed = captured_block_paths(&fixture)
             .into_iter()
             .map(|path| {
@@ -2755,8 +2761,8 @@ mod tests {
         let backwards = vec![tip(1), tip(0)];
 
         assert_eq!(
-            nano_sync::choose_canonical_tip(&forwards, &signers).map(|tip| tip.header.block_id()),
-            nano_sync::choose_canonical_tip(&backwards, &signers).map(|tip| tip.header.block_id()),
+            nano_sync::choose_canonical_tip(&forwards, Some(&signers), None).map(|tip| tip.header.block_id()),
+            nano_sync::choose_canonical_tip(&backwards, Some(&signers), None).map(|tip| tip.header.block_id()),
             "the order the peers answered in must not decide the tip"
         );
     }

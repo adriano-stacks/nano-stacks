@@ -1496,6 +1496,34 @@ where
         &mut self.chainstate
     }
 
+    /// The burn view this node derived for itself, for weighing a peer's tip.
+    ///
+    /// `None` when this node derives no sortitions — then a fork choice has
+    /// nothing of its own to compare a candidate's burnchain against and says so,
+    /// rather than falling back to the candidate's own answer about it.
+    #[must_use]
+    pub fn burn_view(&self) -> Option<&dyn nano_sync::BurnView> {
+        self.sortition
+            .as_ref()
+            .map(|tracker| tracker as &dyn nano_sync::BurnView)
+    }
+
+    /// The signer set this node's own executed state records for the cycle its
+    /// burn view sits in, for weighing a peer's tip.
+    ///
+    /// The same read `check_signer_signatures` makes before executing a block, so
+    /// what selection weighs against and what execution enforces are one value
+    /// from one place. A cycle with nothing recorded answers `None`, which leaves
+    /// length to decide — the same policy execution takes, for the same reason.
+    pub fn recorded_signer_set(
+        &mut self,
+        context: BitcoinBlockContext,
+    ) -> Option<nano_chainstate::SignerWeights> {
+        let mut context = context;
+        context.height = self.bitcoin_height();
+        self.chainstate.recorded_signer_set(context).ok()
+    }
+
     /// Return the most recently executed block.
     #[must_use]
     pub const fn tip(&self) -> &NakamotoBlock {
