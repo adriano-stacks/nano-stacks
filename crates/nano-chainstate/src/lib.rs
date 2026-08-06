@@ -2616,6 +2616,31 @@ impl ChainState {
                     *result
                 }
                 ContractCallOutcome::RuntimeFailure { cost, error } => {
+                    // A compile refusal at a *call* is not a chain outcome, and
+                    // this is where the two have to part company. At a deploy it
+                    // is one — mainnet rejects bad contracts too, so
+                    // `failed_deployment` records a receipt and carries on. But a
+                    // contract being *called* is already on chain, which means the
+                    // network compiled it and ran it; clarity-wasm refusing it is
+                    // nano's gap, not the transaction's, and turning it into a
+                    // failed transaction is the worst available answer: a failed
+                    // transaction writes nothing, so it seals the root an
+                    // untouched block seals, and the divergence is invisible in
+                    // every root and visible only in a receipt nobody is diffing.
+                    //
+                    // Rejecting the block is what 060's boundary asks for — every
+                    // clarity-wasm compile, load or trap failure rejects the
+                    // candidate — and it is how seven of the eight mainnet
+                    // divergences became findable at all.
+                    if nano_vm::is_contract_analysis_failure_message(&format!("{error:?}")) {
+                        return Err(ChainStateError::InvalidTransaction(format!(
+                            "clarity-wasm cannot run a contract this call names, and the \
+                             network ran it: {error}. That is a compiler gap rather than a \
+                             failed transaction, so the block is refused instead of sealed \
+                             -- a failed transaction writes nothing and would seal the same \
+                             root an untouched block seals"
+                        )));
+                    }
                     // The debug form carries the Clarity stack trace, which is
                     // the only thing that says which contract and which
                     // expression refused — the message alone says only that

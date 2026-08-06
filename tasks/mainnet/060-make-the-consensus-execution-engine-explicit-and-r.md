@@ -68,7 +68,7 @@ node may invoke.
 - [x] Record the clarity-wasm and compiler revisions in the report produced by
       [[053-pass-the-mainnet-node-release-gate]]. Still open for checkpoint
       provenance itself.
-- [ ] Tell a compile refusal at a *call* apart from one at a deploy. The first
+- [x] Tell a compile refusal at a *call* apart from one at a deploy. The first
       can only ever be a compiler gap; the second is a transaction the network
       also failed. Conflating them makes a gap invisible in the state root.
 
@@ -1006,3 +1006,29 @@ its convention asserted at the seam, not inferred at each end.
 mainnet vector: at 251,421, `SP2N4YMH4…` takes 1,000,000,000 and `SP70B98…`
 takes 15,114, and 22,539,119 appears in neither credit until the next tenure
 start.
+
+## A compile refusal at a call rejects the block now
+
+The release-gate run found that a compile refusal at a *call* is invisible in the
+sealed root: it became a failed transaction, a failed transaction writes nothing,
+so it sealed the root an untouched block seals — and the root a legitimate
+`ArithmeticUnderflow` seals. Only a receipt diff could tell them apart, and nothing
+on the follow path diffs receipts.
+
+The two cases are genuinely different and now part company where they should:
+
+- **At a deploy**, an analysis refusal is a chain outcome. Mainnet rejects bad
+  contracts too — a deployment naming a contract that does not exist yet is
+  ordinary — so `failed_deployment` records a receipt and carries on. 150 of them
+  in the replayed range.
+- **At a call**, the contract is *already on chain*, which means the network
+  compiled it and ran it. clarity-wasm refusing it is nano's gap and not the
+  transaction's, so the block is refused. That is what this task's own boundary
+  asks for — every clarity-wasm compile, load or trap failure rejects the candidate
+  — and it is how seven of the eight mainnet divergences became findable at all.
+
+Checked against the whole replay before being trusted, because a new rejection on
+the live path is the kind of change that can only be judged against the chain: the
+only call-site analysis failure in 1,899 log lines mentioning one is
+`487356b6…`, which is 8,666,585's `rewards-stx-v1` — the fourth divergence, fixed.
+Zero in the current run.

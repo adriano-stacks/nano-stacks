@@ -1,7 +1,7 @@
 ---
 id: "048"
 title: "Carry complete mainnet tenure accounting"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["043", "056"]
 tags: ["mainnet", "checkpoint", "chainstate"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Carry complete mainnet tenure accounting
@@ -25,9 +26,9 @@ not explicitly seeded must fail with `UnknownTenure`.
 
 - [x] Recapture mainnet accounting with the complete maturity window, emission
       schedule, current started tenure and accumulated fees.
-- [ ] Make capture fail when any required tenure in the maturity window is
+- [x] Make capture fail when any required tenure in the maturity window is
       absent instead of writing a partial checkpoint.
-- [ ] Validate network and checkpoint tenure height against the exported
+- [x] Validate network and checkpoint tenure height against the exported
       schedule and entries.
 - [x] Replay across at least 101 tenure starts, including a restart, and compare
       every state root.
@@ -298,3 +299,31 @@ maturity window is absent, and validating the network and checkpoint tenure heig
 against the exported schedule. `repair-ledger` now makes the hole *fixable* from
 stacks-core's own rows, and the startup check makes it *visible* — what neither
 does is stop a short capture being written in the first place.
+
+## Capture refuses a short window now, on contiguity rather than count
+
+`write_native_effects` already refused a window shorter than the maturity window —
+by **counting** its entries. A count cannot see the failure that actually happened:
+the live ledger held 193 tenures spanning 201 heights with eight missing in the
+middle, so its outer bounds said complete and long, and the first payout it could
+not make was 27 tenures away. The `continue`s in the export are how a hole gets in
+— a tenure the archive cannot answer for is skipped rather than refused.
+
+Three refusals now, each naming what it saw: a hole anywhere inside the window
+(with the missing height), a window that stops short of the tenure the captured
+blocks reach, and a window shorter than a maturity window. The message for the hole
+says why a hole is worse than a short window — "not a shorter window, a delayed
+failure" — because that is the reasoning somebody re-reading this will need.
+
+Exercising those refusals needs the 505 GB stacks-core archive, so they have no
+offline test and `mainnet_accounting.rs` says so out loud. What that file does check
+is an artifact that got *past* them, and it now also validates the schedule: the
+network flag, and that `first_bitcoin_height` is mainnet's 666,050. Without a
+schedule a node cannot price the coinbase of a tenure it executes itself; priced
+against the wrong network it prices every one of them wrongly, because the emission
+intervals and the first burn height both differ, and the first tenure start past the
+checkpoint diverges with nothing saying why.
+
+That closes this task. What it does not close is next door: `repair-ledger` reads
+the archive, and a node with no archive cannot repair itself — see
+[[054-join-and-synchronize-over-the-stacks-p2p-network]]'s bulk-history item.
