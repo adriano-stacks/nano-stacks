@@ -927,6 +927,27 @@ impl VersionedMarf {
         self.storage.tip().expect("trie storage")
     }
 
+    /// Give back every sealed state above a height.
+    ///
+    /// What this removes is uncommitted: a node commits the ledger and seals the
+    /// MARF for one block together, and a state above the block the ledger names is
+    /// therefore one no ledger points at — the residue of a block that was executed
+    /// and then abandoned, either because a kill landed between the two writes or
+    /// because the network moved on from it while this node was down.
+    ///
+    /// It has to be removed rather than ignored, because the MARF refuses to begin a
+    /// version that already exists: a node that re-fetched the same block would fail
+    /// every round for as long as it ran, which is what a live mainnet node did
+    /// before this existed. Removing it is safe in the way
+    /// [[056-make-rejected-block-execution-leave-no-state]] requires and re-executing
+    /// is cheap — the block is fetched again and sealed again.
+    pub fn discard_above(&mut self, height: u32) -> Result<usize, MarfError> {
+        if self.active.is_some() {
+            return Err(MarfError::WriteInProgress);
+        }
+        self.storage.discard_above(height)
+    }
+
     /// Read enough of the tip to say whether this store is coherent.
     ///
     /// Every other read on this type answers `Option` and treats a storage failure

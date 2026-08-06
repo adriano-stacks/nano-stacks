@@ -1251,6 +1251,11 @@ impl Vm {
         Ok(imported)
     }
 
+    /// Give back every sealed state above a height. See `MarfStore::discard_above`.
+    pub fn discard_above(&mut self, height: u32) -> Result<usize, MarfStoreError> {
+        self.store.discard_above(height)
+    }
+
     /// The deepest state on disk, which is where a restart resumes.
     #[must_use]
     pub fn tip(&self) -> Option<[u8; 32]> {
@@ -2201,6 +2206,15 @@ impl MarfStore {
             .as_mut()
             .map(|journal| std::mem::take(&mut journal.blocks))
             .unwrap_or_default()
+    }
+
+    /// Give back every sealed state above the block a ledger names.
+    ///
+    /// See `nano_marf::VersionedMarf::discard_above`: what it removes is state no
+    /// ledger points at, and leaving it there makes every later round fail on a
+    /// version that already exists.
+    pub fn discard_above(&mut self, height: u32) -> Result<usize, MarfStoreError> {
+        Ok(self.marf.discard_above(height)?)
     }
 
     /// The deepest sealed state, which is where a reopened store resumes.

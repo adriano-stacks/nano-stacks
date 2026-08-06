@@ -1196,6 +1196,25 @@ pub async fn open_chainstate(
         tip.block_id(),
         tip.header.chain_length
     );
+    // A state above the block this node is resuming at is one no ledger names: the
+    // residue of a block that was executed and then abandoned, either because a kill
+    // landed between the two writes of a commit or because the chain moved on from it
+    // while this node was down. It has to be given back rather than ignored, because
+    // the MARF refuses to begin a version that already exists -- so a node that
+    // fetched that block again failed *every* round for as long as it ran, which is
+    // what a live mainnet node did until this was here.
+    if let Ok(height) = u32::try_from(tip.header.chain_length) {
+        match chainstate.discard_above(height) {
+            Ok(0) => {}
+            Ok(given_back) => println!(
+                "gave back {given_back} sealed states above {height}, which no ledger named"
+            ),
+            // Reported rather than fatal: a node that cannot give them back is a node
+            // that will fail at the first block it re-executes, and saying so here is
+            // more use than a start that dies without naming the reason.
+            Err(error) => eprintln!("cannot give back the states above {height}: {error}"),
+        }
+    }
     recover_ledger(&mut chainstate, config, directory, &tip)?;
     Ok((chainstate, tip, None))
 }

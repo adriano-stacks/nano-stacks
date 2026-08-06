@@ -1008,6 +1008,17 @@ impl ChainState {
         self.vm.tip()
     }
 
+    /// Give back every sealed state above a height, which is state no ledger names.
+    pub fn discard_above(&mut self, height: u32) -> Result<usize, ChainStateError> {
+        Ok(self.vm.discard_above(height)?)
+    }
+
+    /// The height a sealed state sits at.
+    #[must_use]
+    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
+        self.vm.height_of(block)
+    }
+
     /// The state a block was built on, for walking back over a reorganization.
     #[must_use]
     pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {

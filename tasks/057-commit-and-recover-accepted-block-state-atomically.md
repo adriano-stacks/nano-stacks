@@ -267,3 +267,24 @@ anything else in `run`. An advisory lock and not a pid file, because a killed no
 must leave nothing to clean up: the kernel releases it with the descriptor, and the
 test asserts both halves — a second node is refused while the first holds it, and
 the directory is takeable straight after the holder goes.
+
+## A sealed state no ledger names has to be given back
+
+The live mainnet node stopped a second time on `MARF version already exists`, and it
+was not two nodes this time: one node, restarted, resuming at 8,707,625 with the MARF
+holding 8,707,626. A state above the block the ledger names is one no ledger points
+at — the residue of a block that was executed and then abandoned, either because a
+kill landed between the two writes of a commit or because the chain moved on from it
+while the node was down and the resume walked back to an ancestor.
+
+Ignoring it is not an option: the MARF refuses to *begin* a version that already
+exists, so a node that fetched that block again failed every round for as long as it
+ran. `VersionedMarf::discard_above` gives them back — in one transaction, so a kill
+inside it leaves the store as it was, and dropping every cache afterwards because a
+stale hash goes straight into a parent's preimage and moves a root. `open_chainstate`
+calls it with the height it is resuming at and says how many it gave back.
+
+This is the same rule [[056-make-rejected-block-execution-leave-no-state]] states,
+applied to the one case that survives a process: a rejected block leaves no state
+*within* a run because the write is rolled back, and now it leaves none across one
+either.

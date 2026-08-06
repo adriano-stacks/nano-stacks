@@ -213,6 +213,37 @@ impl TrieStorage {
         hash.map(|hash| block_id(&hash)).transpose()
     }
 
+    /// Delete every sealed state above a height, and the trie nodes they own.
+    ///
+    /// One transaction, so a kill in the middle of *this* leaves the store as it was.
+    pub(crate) fn discard_above(&self, height: u32) -> Result<usize, MarfError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let removed = (|| -> Result<usize, MarfError> {
+            self.connection.execute(
+                "DELETE FROM marf_node WHERE block IN (SELECT id FROM marf_block WHERE height > ?1)",
+                params![height],
+            )?;
+            Ok(self.connection.execute(
+                "DELETE FROM marf_block WHERE height > ?1",
+                params![height],
+            )?)
+        })();
+        match removed {
+            Ok(removed) => {
+                self.connection.execute_batch("COMMIT")?;
+                // The caches address rows that are gone now, and a stale *hash* is
+                // worse than a stale node -- it goes straight into a parent's
+                // preimage and moves a root.
+                self.forget();
+                Ok(removed)
+            }
+            Err(error) => {
+                self.connection.execute_batch("ROLLBACK")?;
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn block(&self, hash: MarfBlockId) -> Result<Option<BlockRecord>, MarfError> {
         if let Some(record) = self.blocks.borrow_mut().get(&hash) {
             return Ok(Some(record));
