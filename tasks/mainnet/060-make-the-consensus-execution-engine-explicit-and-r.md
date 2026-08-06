@@ -725,8 +725,8 @@ narrowed tuple back *whole* instead of reading it through `get` gives
 `{ soft: true }` under the compiler and `{ full: true, soft: true }` under the
 interpreter. That is the supertype asymmetry recorded below, now reachable
 through `default-to`, which is far more common than a `print` under an `if`.
-Pinned as `a_narrowed_default_handed_back_whole_agrees`, `#[ignore]`d with the
-reason. `blacklist-susdh-v1` reads all three of its `default-to`s through `get`,
+Pinned as `a_narrowed_default_agrees_wherever_it_escapes_a_get`, `#[ignore]`d
+with the reason. `blacklist-susdh-v1` reads all three of its `default-to`s through `get`,
 so 8,667,509 does not depend on it.
 
 ## Two things this leaves open
@@ -1181,7 +1181,6 @@ The regression is `conformance/block_info_tenure_height.rs`, which builds the
 smallest chain that can tell the two defects apart: tenure heights advancing at half
 the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
 time that is never a Stacks timestamp. Both engines are asked, and they now agree.
-||||||| Stash base
 
 ## The `match` shadowing item: the premise was wrong, and one map over is right
 
@@ -1316,3 +1315,114 @@ three of its `default-to`s through `get`; a contract that returns such an `if` o
 `default-to` whole, across a contract-call or into a receipt, would diverge on
 nano today. It is the one known open Clarity semantic differential, and it belongs
 in the release report as such.
+
+## It is not one divergence, it is five, and two of them move the state root
+
+The item asks for agreement on the *complete returned value*. Measured through
+`default-to` — the reachable route — the disagreement was never confined to a
+returned value. `(default-to { soft: false } entry)` over an
+`(optional { soft: bool, full: bool })`, with
+`entry = (some { soft: true, full: true })`, in every position the value can
+reach:
+
+| escape | clarity-wasm | reference |
+|---|---|---|
+| returned into a receipt | `0c0000000104736f667403` | `0c000000020466756c6c0304736f667403` |
+| `var-set` into a narrow var | `(ok { soft: true })`, the var written | `RuntimeCheck(TypeValueError)`, nothing written |
+| passed to a narrow parameter | `{ soft: true }`, the call runs | `RuntimeCheck(TypeValueError)` |
+| `is-eq` against `{ soft: true }` | `true` (`03`) | `false` (`04`) |
+| `print` | event value `{ soft: true }` | event value `{ full: true, soft: true }` |
+
+Eleven bytes against eighteen is the whole of the first row: `0c` tuple, a
+`u32` field count of 1 against 2, and `0466756c6c03` — `full: true` — present in
+one and absent in the other.
+
+Two of those five abort the transaction under the reference and succeed under
+nano, so they are **state-root** divergences and not receipt ones. A wrong root
+is the failure mode this task exists to prevent, and a `var-set` of a
+`default-to` is not an exotic shape.
+
+### Where each engine decides, exactly
+
+- **The reference's type.** `least_supertype_v2_1`'s `TupleType` arm
+  (`clarity-types/src/types/signatures.rs`) walks the *first* argument's
+  `type_map` and looks each name up in the second, dropping whatever the second
+  has left over; `check_special_default_to` calls it as
+  `least_supertype(default, payload)`, so the default's field set wins. The
+  reverse pair — a default *wider* than the payload — is a `TypeMismatch` and
+  never deploys.
+- **The reference's value.** `native_default_to`
+  (`clarity/src/vm/functions/options.rs:331`) returns `*data` for `some` and
+  `default` for `none`, unconverted either way. Nothing sanitizes a return.
+- **clar2wasm's layout.** `words/default_to.rs` sets only the *default* to the
+  expression's type and converts the payload with
+  `need_ducktyping` → `duck_type`; `duck_type.rs`'s `TupleType`/`TupleType` arm
+  of `duck_type_stack` `drop_value`s a source field the target does not name.
+  The host then reads the answer back per the function's analysed return type.
+- **The reference's run-time checks**, which is what turns a shape into an abort:
+  `ClarityDatabase::set_variable` calls `TypeSignature::admits`, and
+  `TupleTypeSignature::admits` refuses a differing field count outright;
+  `clarity2_implicit_cast` (`clarity/src/vm/callables.rs`) walks the *value's*
+  fields on the way into a function and raises `TypeValueError` for one the
+  parameter does not name; `Value`'s `PartialEq` on `TupleData` includes the type
+  signature, which is the `is-eq` row.
+
+The cast's own comment is the finding worth carrying upstream: *"This should be
+unreachable if the type-checker has already run successfully."* The reference's
+runtime believes this value cannot exist, and its analyzer hands it out. That is
+where the bug lives, and it is why no arrangement of bytes inside clar2wasm is
+the fix.
+
+### The one thing that was wrong in the note above
+
+It said epochs ≥ 2.4 sanitize function arguments, so a wide tuple would be
+narrowed at that boundary and the engines would agree there. Measured, they do
+not: `sanitize_in_function_invocation()` is `>= Epoch40`, and even in 4.0 the
+sanitizer never runs on this value because `clarity2_implicit_cast` refuses it
+two lines earlier. `Value::sanitize_value`'s tuple arm would have dropped the
+field quite happily. Read, then measured, then corrected — the earlier claim was
+read from one call site and inferred.
+
+### Why it still cannot be closed inside clar2wasm
+
+Unchanged, and now with a fifth escape behind it. A wasm value's representation
+is fixed by one static type; the reference's answer has two shapes and picks one
+at run time. Narrowing reproduces the `none` branch exactly and loses a field on
+the `some` branch. Widening reproduces the `some` branch and would have to invent
+a field for the other. A discriminant carried beside the value reproduces both
+and changes the representation of every tuple type in the program.
+
+A fourth option was considered and rejected on measurement rather than taste:
+clar2wasm *can* tell a narrowing that drops a real field from any other
+duck-typing, at compile time, and it does know at run time which branch it took —
+the `if_else` on the optional's indicator is right there. So it could trap on the
+wide branch and turn a silent divergence into a refused block, which this task's
+own boundary would prefer. It is not shippable: `blacklist-susdh-v1` takes that
+branch on every present entry and reads it through `get`, where the two engines
+agree, so the trap would stop mainnet replay at 8,667,509 on a contract that is
+correct today. A use-site rule — safe under `get`, unsafe everywhere else — is
+the shape a real compiler-side fix would take, and it is a static analysis over
+uses that clar2wasm does not have.
+
+### What is pinned, and where
+
+- `a_narrowed_default_agrees_wherever_it_escapes_a_get` in `wasm_response_fold`,
+  still `#[ignore]`d, now covering all five escapes rather than the returned
+  value alone. Un-ignoring it is the single gate for this item.
+- Three *not* ignored measurements beside it, so the claim keeps being checked
+  and the reference's half can never move quietly:
+  `the_reference_answer_here_has_no_single_static_layout` asserts the exact
+  serialized bytes of both branches,
+  `the_reference_carries_the_branch_into_state_and_into_a_comparison` asserts the
+  `var-set` refusal and the `is-eq` answer, and
+  `the_reference_refuses_to_pass_the_wide_tuple_to_a_function` asserts the cast
+  refusal.
+- `clar_default_to_narrowing_answers_with_the_branch_the_reference_took` in
+  `clar2wasm/src/words/default_to.rs` — the same three snippets in clar2wasm's
+  own crosscheck harness, `#[ignore]`d, so the reproducer sits in the file a
+  fixer would open. It is what to send upstream with the `least_supertype`
+  question.
+- Every differential in `wasm_response_fold` now compares the two engines'
+  **consensus serialization and emitted events** as well as their values, because
+  two values that print alike and serialize differently are still a divergence.
+  That is what caught the `print` event row.
