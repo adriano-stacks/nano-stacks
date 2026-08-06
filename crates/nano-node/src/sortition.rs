@@ -420,6 +420,16 @@ impl SortitionTracker {
         Ok(loaded)
     }
 
+    /// What the miners of the burn block at the tip spent on its sortition.
+    ///
+    /// Clarity reads both back as `miner-spend-total` and `miner-spend-winner`, so
+    /// this is a consensus answer and not a diagnostic. See
+    /// [`nano_sortition::BurnSpends`].
+    #[must_use]
+    pub fn burn_spends(&self) -> Option<nano_sortition::BurnSpends> {
+        self.engine.burn_spends()
+    }
+
     /// Whether the derived burn total is the one a signed header states.
     ///
     /// A Nakamoto header's `bitcoin_spent` is the burn view's running total and
@@ -534,6 +544,18 @@ struct CapturedSnapshot {
     /// spells it. Absent in a chain saved before this field existed.
     #[serde(default)]
     sortition: Option<i64>,
+    /// The txid of the commitment that won, as stacks-core's own column spells it.
+    ///
+    /// Read for one reason: the two Clarity-visible burn spends of a sortition are
+    /// the eligible commitments' payout burn and the *winner's* share of it, so the
+    /// seed has to name its winner or a node standing on the seed's own burn view —
+    /// which is every node for the first tenure after a restart — has half the
+    /// answer and offers a contract a winner's spend of zero.
+    ///
+    /// A capture writes all zeroes for a block that elected nobody, so the
+    /// `sortition` column above is what discriminates rather than the value.
+    #[serde(default)]
+    winning_block_txid: Option<String>,
     /// The winning VRF seed the next sampling has to mix — the most recent
     /// winner's, not necessarily this block's.
     ///
@@ -636,6 +658,7 @@ impl SortitionTracker {
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
             sortition: Some(i64::from(tip.winner_txid.is_some())),
+            winning_block_txid: tip.winner_txid.map(hex::encode),
             // The one field a resumed chain cannot derive and must not guess.
             winner_vrf_seed: self
                 .engine
@@ -787,7 +810,16 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             &seed.sortition_hash,
             "sortition hash",
         )?),
-        winner_txid: None,
+        // Named where the seed's block elected somebody, because the winner's own
+        // payout burn is a Clarity answer for every tenure standing on that burn
+        // view. The `sortition` column decides it rather than the value, since a
+        // capture writes all zeroes for a block that elected nobody.
+        winner_txid: match (seed.sortition, seed.winning_block_txid.as_deref()) {
+            (Some(sortition), Some(txid)) if sortition != 0 => {
+                Some(thirty_two(txid, "winning block txid")?)
+            }
+            _ => None,
+        },
         // The seed the sampling of the block after this one mixes. A chain this
         // node saved states it, exactly, because it derived it. A capture does
         // not, and then it is recovered from the seed's own burn block by

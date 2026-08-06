@@ -32,9 +32,10 @@ never validation inputs.
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
 - [~] Hand the local snapshot to block validation and execution — validation
-      takes the sortition hash from it; execution's Clarity-visible inputs
-      (`vrf_seed`, `burn_block_time`, the burn header hash) still come from the
-      peer, because they move state roots.
+      takes the sortition hash and the winner's registration from it, and
+      execution now takes the two burn spends `miner-spend-total` and
+      `miner-spend-winner`, which are Clarity-visible. `vrf_seed`,
+      `burn_block_time` and the burn header hash still come from the peer.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
 - [x] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
@@ -681,3 +682,75 @@ already computes has both, per block, for the same window `total_burn` comes fro
 Left unfixed here on purpose — it changes what a production node writes into a
 header, which is a state-root decision and wants its own measurement against the
 mainnet replay rather than a change made in passing.
+
+## The two burn spends are derived now, and what settled the payout count
+
+Both fields the note above left at zero are filled from the sortition tracker's own
+commitment window: `SortitionEngine::burn_spends` sums every eligible commitment's
+payout burn in the tip's burn block and picks the winner's out of it, reading the
+same window the distribution was weighed over rather than the burnchain again. They
+travel together or not at all — the Clarity documentation promises the winner's is a
+positive number no larger than the total, and half an invariant offered to a
+contract is worse than an absence — and `None` is a burn block that elected nobody,
+which no tenure stands on.
+
+**The payout-output count is not the size of the reward set.** That was the standing
+suspicion recorded here, and it is wrong in a way stacks-core is explicit about: a
+short reward set is *padded with burn addresses* to the full count
+(`RewardSetInfo::into_commit_outs`, and `check_pox_pre_waterfall`'s "if the number
+of recipients in the set was odd, we need to pad with a burn address"), so a
+one-stacker cycle still pays two outputs and the count never moves with the
+recipients. `get_num_pox_payouts` is a function of the height alone. The captured
+hacknet chain pays *one* because it is past the waterfall, which nano already knew
+how to answer; what it had never been told is where the waterfall began.
+
+Three oracles say so, cheapest first, in `conformance/burn_spends.rs`:
+
+- `RewardSetInfo::commit_outs_for` — stacks-core's own "single source of truth
+  shared by the miner and the parser" — is a pure function and is *called*, for a
+  one-recipient set, a full set, a prepare phase and the waterfall.
+- the archive's `pox_payouts` column states the count for every captured burn
+  block, and `amount × addresses.len()` equals the running `total_burn`'s own step
+  at every block that elected somebody — on mainnet's reward phase (×2) and on the
+  hacknet capture's waterfall (×1) alike.
+- the tracker's derived spends equal that column, on the capture whose window used
+  to derive nothing at all, and per block inside `mainnet_sortition`'s window walk.
+
+The conformance harness had the same trap one layer up: its `burn_spend_total`
+oracle summed *every* output of every commitment, change included, which on mainnet
+reads a 30,000-sat commitment as the 16–23 million behind it. It takes the payout
+count from the archive now, so the replay's oracle for that field is the archive
+rather than nano's own arithmetic.
+
+## Fifty minutes at SYN-SENT, and the peer a round could not get past
+
+The live mainnet catch-up stopped at 8,699,006 with 28,458 blocks already staged and
+executed none of them for fifty minutes, printing `executing the peer's chain
+failed: ... error sending request for url (http://<peer>:20443/v3/sortitions/consensus/<ch>)`
+once a round. Sampling the process found it at 1 tick of CPU per 20 seconds and one
+socket in `SYN-SENT`.
+
+Two things were wrong and both are this task's, because both are the node asking a
+peer for a sortition it derives itself:
+
+- **`execute_staged` asked one peer.** The pool that `catch_up` already threads
+  through the descent — `TenureSource`, which round-robins, sets a rate-limited peer
+  aside and spreads the work — was not used for the sortition lookup or for the
+  coinbase walk behind it, so one unreachable peer failed the round, and a failed
+  round abandons everything staged. It asks the pool now. The three duplicated
+  round-robin bodies became one `spread`, and the sortition lookup refuses an answer
+  that does not carry the consensus hash it asked for: that is the one field of a
+  sortition a peer must not choose, since every other one is checked by the state
+  root the block's own header commits to under threshold signer weight.
+- **A peer that cannot be reached was waited on for thirty seconds, per request.**
+  Discovery learns a peer's *p2p* port and its HTTP port is an assumption about the
+  port beside it, so a pool of strangers holds several addresses whose 20443 never
+  answers. `connect_timeout` is four seconds now, and a peer that fails to connect
+  or times out is set aside for the rest of the round like a throttled one — but
+  only for unreachability: a 404 is an ordinary answer in a walk over strangers, and
+  setting those aside would empty the pool within one descent.
+
+Restarted with both, the same state resumed and executed 80–195 blocks a minute
+against the same peer set. The lesson is the one already written on
+[[047-make-mainnet-synchronization-monotonic-and-restart]]: sample the process
+before believing any story about where time goes.
