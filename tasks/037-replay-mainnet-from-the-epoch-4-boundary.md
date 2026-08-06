@@ -39,11 +39,25 @@ never from fetched, staged or peer-reported height.
       blocks**, from 8,665,601 through 8,709,782, after the trait-reference fix.
       This is a useful compiler frontier, not the pristine release frontier.
       Re-measured off the durable executed tip rather than a log:
-      `/home/aldur/mainnet-tip/state` holds **46,626** consecutive blocks from
+      `/home/aldur/mainnet-tip/state` held **46,626** consecutive blocks from
       8,665,600, `/home/aldur/mainnet-wasm/state` 42,246 and
       `/home/aldur/mainnet-node/state` 8,263. The scoreboard row reads them
       straight out of the MARF's block table, so the number is a sealed height and
       not a claim.
+
+      Advanced by running the follower again with no hosted API: **46,911**
+      consecutive blocks, sealed at 8,712,511. It stops on a *derivation* limit and
+      not a divergence, and the node says so rather than guessing:
+
+      > the local sortition chain cannot say which burn block before 961,321 last
+      > elected somebody, and a tenure's accumulated coinbase is minted from that
+      > height — so block 8,712,512 is not executed rather than minting a guess
+
+      That is the frontier to work next: `SortitionTracker::previous_sortition_height`
+      walks back for the last burn block that elected a miner, and the retained
+      window does not reach it. A tenure's accumulated coinbase is minted from that
+      height, so a wrong answer is a wrong balance and a wrong root — refusing is
+      right, and the fix is to make the chain able to answer, not to let it guess.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
