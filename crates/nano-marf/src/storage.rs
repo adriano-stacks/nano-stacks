@@ -52,9 +52,20 @@ CREATE TABLE IF NOT EXISTS marf_node_staging (
 /// block, so the same nodes were decoded again for each of them.
 ///
 /// Nodes are small — a leaf or a Node4 is a couple of hundred bytes, and only a
-/// Node256 approaches 1.5 KB — so 250,000 per generation is a few hundred
-/// megabytes at worst for a structure the whole replay reads out of.
-const NODE_CACHE: usize = 250_000;
+/// Node256 approaches 1.5 KB — so this is a few hundred megabytes per generation
+/// for a structure the whole replay reads out of.
+///
+/// Raised from 250,000 after a second measurement at mainnet height 8.7 million,
+/// where 250,000 was *one* block's working set and consecutive blocks therefore
+/// evicted each other's ancestry: 39 MB/s of `rchar` for 2.2 transactions a block,
+/// with the process at 70% of one core and only 11 MB/s of it reaching the disk.
+/// The work is decoding nodes, not fetching them, so the cache is the lever.
+/// Measured, both directions. At 250,000 a mainnet block near height 8.7 million
+/// evicted the previous block's ancestry and execution cost 1.8 s a block; at
+/// 1,000,000 it cost 0.78 s, with *less* resident memory, because a cache hit
+/// spares a page-cache read. At 3,000,000 it got worse again — 1.16 s marginal —
+/// so this is a measured optimum and not a ceiling somebody stopped short of.
+const NODE_CACHE: usize = 1_000_000;
 const BLOCK_CACHE: usize = 65_536;
 
 const LEAF_RECORD: u8 = 0;

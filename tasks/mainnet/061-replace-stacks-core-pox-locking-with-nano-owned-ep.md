@@ -100,14 +100,15 @@ lock this module cannot compute. Comparing the two there would be comparing
 environments rather than handlers, so pox-1's reads and writes are asserted
 directly and the reason is in both files.
 
-## The stake window replays, and mainnet was never going to supply it
+## The captured stake window before mainnet's first pox-5 reward cycle
 
-The last item asked for *mainnet* `pox-5` transactions, and mainnet has none:
-it is still on `pox-4`, which is the same fact
-[[050-authenticate-every-followed-nakamoto-block]] records as the reason a pox-5
-reward set cannot be checked there either. Waiting for mainnet to cross the
-boundary was the only way to read that item literally, and it would have left
-the handler with no chain-level oracle at all in the meantime.
+At the replay frontier, mainnet's reward cycle 140 had been prepared under
+`pox-4`, so it could not supply a pox-5 reward set or signer window even though
+Epoch 4.0 and the pox-5 contract were active. Pox-5's first mainnet reward cycle
+is 141. Waiting for that boundary would have left the handler with no chain-level
+oracle in the meantime, so the implementation used the captured stake window
+below; [[052-wire-the-complete-rpc-and-event-surface-into-the-n]] and
+[[053-pass-the-mainnet-node-release-gate]] retain the live cycle-141 gate.
 
 The captured chain *does* stake. Fourteen `stx_lock_event`s across eight of its
 340 blocks, three stakers rolling their positions forward through five reward
@@ -139,8 +140,8 @@ the chain on the responses a chain actually produced.
 
 ## Remaining
 
-Nothing on this task. What is still open is next door: mainnet's own `pox-5`
-positions do not exist yet, so nothing here has been proved against a *mainnet*
-stake window, and it cannot be until mainnet crosses the 4.0 boundary. That is
-recorded on [[050-authenticate-every-followed-nakamoto-block]] rather than
-here, because it is the same missing fact and it blocks the signer set as well.
+Nothing on the dependency-removal implementation. What remains next door is
+proof against mainnet's first pox-5 reward cycle, cycle 141. That is recorded on
+[[052-wire-the-complete-rpc-and-event-surface-into-the-n]] and
+[[053-pass-the-mainnet-node-release-gate]] because it gates the signer set and
+client-facing behavior rather than whether `pox-locking` remains in production.

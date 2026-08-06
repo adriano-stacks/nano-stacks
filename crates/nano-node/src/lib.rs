@@ -129,6 +129,20 @@ impl LocalSortition {
     }
 }
 
+/// The burn block a sortition is derived for, and the answer to check it against.
+///
+/// Two callers, and the difference is the whole point of
+/// [[049-derive-canonical-sortitions-from-the-local-burncha]]: a view this node's
+/// own chain already names needs no peer at all, while a view it has not reached
+/// yet is located by a peer's answer and then derived anyway. The second carries
+/// that answer so the two can be compared; the first has nothing to compare
+/// against and needs nothing.
+#[derive(Clone, Copy, Debug)]
+struct BurnTarget<'a> {
+    bitcoin_height: u64,
+    peer: Option<&'a nano_sync::SortitionInfo>,
+}
+
 /// Where a round of execution spent its time.
 ///
 /// A follower is either executing or waiting, and a guess at which is worth
@@ -736,7 +750,11 @@ where
             .blocks
             .first()
             .map_or(0, |block| block.header.bitcoin_spent);
-        if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent)? {
+        let target = BurnTarget {
+            bitcoin_height: tenure.sortition.bitcoin_height,
+            peer: Some(&tenure.sortition),
+        };
+        if let Some(local) = self.local_sortition(pox, target, bitcoin_spent)? {
             local.record(&mut bitcoin_context);
         }
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
@@ -1293,9 +1311,11 @@ where
     fn local_sortition(
         &mut self,
         pox: &PoxInfo,
-        peer: &nano_sync::SortitionInfo,
+        target: BurnTarget<'_>,
         bitcoin_spent: u64,
     ) -> Result<Option<LocalSortition>, CheckpointExecutionError> {
+        let bitcoin_height = target.bitcoin_height;
+        let peer = target.peer;
         let Some(payouts) = payout_schedule(pox) else {
             return Ok(None);
         };
@@ -1309,9 +1329,7 @@ where
         else {
             return Ok(None);
         };
-        let behind = peer
-            .bitcoin_height
-            .saturating_sub(tracker.tip().bitcoin_height);
+        let behind = bitcoin_height.saturating_sub(tracker.tip().bitcoin_height);
         // Named before the walk, not after: every burn block costs a whole
         // Bitcoin block download, so a node closing a checkpoint's gap can be
         // busy for minutes, and a node that prints nothing for minutes teaches
@@ -1321,12 +1339,12 @@ where
                 "catching up the local sortition chain from burn {} to {}, {behind} blocks, \
                  one Bitcoin block download each",
                 tracker.tip().bitcoin_height,
-                peer.bitcoin_height
+                bitcoin_height
             );
         }
         let derived = match tracker.catch_up(
             |height| bitcoin.block_at(height),
-            peer.bitcoin_height,
+            bitcoin_height,
             payouts,
             crate::sortition::CATCH_UP_LIMIT,
         ) {
@@ -1347,25 +1365,27 @@ where
             }
         };
         let tip = tracker.tip();
-        if tip.bitcoin_height != peer.bitcoin_height {
+        if tip.bitcoin_height != bitcoin_height {
             // Said once per gap rather than per block: a validation that never
             // runs looks exactly like one that always passes, so the condition
             // has to be named, but not at every block behind it.
-            if self.sortition_gap != Some(peer.bitcoin_height) {
-                self.sortition_gap = Some(peer.bitcoin_height);
+            if self.sortition_gap != Some(bitcoin_height) {
+                self.sortition_gap = Some(bitcoin_height);
                 eprintln!(
                     "the local sortition chain ends at burn {} and this block stands on {}, \
                      {} away — more than one round of catching up may walk. Until it \
                      closes, the sortition this node executes under is the peer's, unchecked.",
                     tip.bitcoin_height,
-                    peer.bitcoin_height,
-                    peer.bitcoin_height.saturating_sub(tip.bitcoin_height)
+                    bitcoin_height,
+                    bitcoin_height.saturating_sub(tip.bitcoin_height)
                 );
             }
             return Ok(None);
         }
         self.sortition_gap = None;
-        report_disagreements(tip, peer);
+        if let Some(peer) = peer {
+            report_disagreements(tip, peer);
+        }
         // The winner's identity is published as derived. It used to be withheld
         // wherever more than one commitment competed, because the distribution
         // named 12 of the captured window's 14 — and the cause turned out not to
@@ -1402,7 +1422,7 @@ where
         // burnchain by trusting the peer more.
         if !tracker.agrees_with_header(bitcoin_spent) {
             return Err(CheckpointExecutionError::BitcoinSpent {
-                bitcoin_height: peer.bitcoin_height,
+                bitcoin_height: bitcoin_height,
                 header: bitcoin_spent,
                 derived: tip.total_burn,
             });
@@ -1709,7 +1729,14 @@ where
         };
         timing.sortition += phase.elapsed();
         let phase = std::time::Instant::now();
-        let local = self.local_sortition(pox, &sortition, block.header.bitcoin_spent);
+        let local = self.local_sortition(
+            pox,
+            BurnTarget {
+                bitcoin_height: sortition.bitcoin_height,
+                peer: Some(&sortition),
+            },
+            block.header.bitcoin_spent,
+        );
         timing.local += phase.elapsed();
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.height = sortition.bitcoin_height;

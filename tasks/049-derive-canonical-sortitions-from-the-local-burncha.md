@@ -31,11 +31,15 @@ never validation inputs.
 - [x] Derive consensus hash, sortition hash, winning commit transaction and
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
-- [~] Hand the local snapshot to block validation and execution — validation
-      takes the sortition hash and the winner's registration from it, and
-      execution now takes the two burn spends `miner-spend-total` and
-      `miner-spend-winner`, which are Clarity-visible. `vrf_seed`,
-      `burn_block_time` and the burn header hash still come from the peer.
+- [~] Hand the local snapshot to block validation and execution. Consensus
+      hash, sortition hash, winner, total burn, burn header hash/time, VRF seed
+      and both Clarity-visible burn spends are locally available. The remaining
+      production path still asks a peer for `/v3/sortitions` before resolving a
+      block's already-known consensus hash to its local burn-view height.
+- [ ] Resolve every known consensus hash and burn-view height from the local
+      snapshot history before making any peer request. A peer sortition response
+      may diagnose or help locate data, but must not supply execution context or
+      be required for progress.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
 - [x] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
@@ -46,6 +50,8 @@ never validation inputs.
 ## Acceptance Criteria
 
 - Removing `/v3/sortitions` access does not stop a node with a Bitcoin source.
+- A regression makes `/v3/sortitions` unavailable and proves a block on a known
+  local burn view validates and executes without attempting that request.
 - Tampered peer sortition data cannot change the selected or executed chain.
 - Mainnet captures match stacks-core for every consensus-visible snapshot field.
 - A Bitcoin reorganization selects the same surviving snapshot and Stacks fork

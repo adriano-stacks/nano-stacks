@@ -196,6 +196,31 @@ impl SortitionTracker {
             .contains(&consensus_hash)
     }
 
+    /// The Bitcoin height a burn view sits at, from this chain's own history.
+    ///
+    /// A consensus hash names a burn block, and the history is that naming in
+    /// order, so this is the reverse of [`Self::consensus_hash_at`] and the answer
+    /// a node otherwise had to ask a peer for. Searched from the tip backwards
+    /// because a follower's views arrive in ascending order and the newest is
+    /// almost always the one being asked about; the walk is bounded by the same
+    /// window a catch-up is, since a view further back than that belongs to a chain
+    /// this node is not executing.
+    ///
+    /// `None` where the history does not hold it: the view is ahead of this chain,
+    /// which one round of catching up may close, or it belongs to a burnchain this
+    /// node is not on, which no amount of walking will.
+    #[must_use]
+    pub fn height_of_consensus_hash(&self, consensus_hash: ConsensusHash) -> Option<u64> {
+        let history = self.engine.snapshots().history();
+        let tip = self.tip().bitcoin_height;
+        history
+            .iter()
+            .rev()
+            .take(usize::try_from(CATCH_UP_LIMIT).unwrap_or(usize::MAX))
+            .position(|hash| *hash == consensus_hash)
+            .and_then(|back| tip.checked_sub(u64::try_from(back).ok()?))
+    }
+
     /// Where this chain and Bitcoin's own history part company, if they do.
     ///
     /// One lookup when nothing moved: the walk stops at the first agreement and

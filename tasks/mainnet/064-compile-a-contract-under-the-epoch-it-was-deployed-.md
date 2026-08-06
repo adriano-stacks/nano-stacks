@@ -24,20 +24,17 @@ SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1 does not compile under
 epoch 4.0, rebuilt as Epoch33
 ```
 
-The code says what is wrong with this, in its own comment: *"a contract built
-under an older epoch is charged that epoch's costs, and its receipts will not
-match the network's."*
+The nearby comments claim that an older semantic epoch also selects an older
+cost schedule. That diagnosis is stale: `compile_under` passes the chosen
+semantic epoch and `Epoch40` cost epoch separately to
+`clar2wasm::compile_for_cost_epoch`. The separation is correct and needs a
+receipt-cost regression, but it is not the defect observed here.
 
-Two separate problems, and the second is the worse one:
-
-- **The costs are the wrong epoch's**, so the receipt this node produces for a
-  call into such a contract is not the receipt the network produced. That is
-  consensus-visible in a receipt oracle and invisible in a state root, which is
-  the shape [[037-replay-mainnet-from-the-epoch-4-boundary]] warns about.
-- **The epoch is chosen by what the compiler happens to accept**, not by the
-  chain. A clarity-wasm fix that makes epoch 4.0 accept the contract silently
-  changes which costs it is charged, so a compiler improvement moves a receipt.
-  Nothing in consensus should be a function of nano's own compiler version.
+The actual defect is worse than a stale comment: **the semantic epoch is chosen
+by what the compiler happens to accept**, not by the
+chain. A clarity-wasm fix that makes epoch 4.0 accept the contract silently
+changes which language semantics are compiled. Nothing in consensus should be
+a function of nano's own compiler revision or retry order.
 
 stacks-core does not guess: a contract is analyzed once, at deploy time, under
 the epoch and Clarity version then in force, and that analysis is stored. Keyword
@@ -50,10 +47,13 @@ old contract keeps working without any epoch being inferred at call time.
       contracts the replay hits it for. Report the count, not an example.
 - [ ] Read the deploy epoch out of the stored contract analysis rather than
       searching for an epoch that compiles.
-- [ ] Separate the two things the epoch currently decides: which words the
-      contract may use (its deploy epoch) from which cost table its execution is
-      charged against (the current epoch). If clarity-wasm bakes costs into the
-      module, say so and name what would have to change.
+- [ ] Preserve and verify the existing separation between language semantics
+      (deploy epoch) and execution charging (current epoch). Remove the stale
+      comments and pin a receipt/cost regression proving an old contract called
+      in Epoch 4.0 is charged with the Epoch 4.0 schedule.
+- [ ] Include the chain-derived semantic epoch and compiler identity in native
+      module cache identity or otherwise prove a cached module cannot outlive
+      either input.
 - [ ] Make a contract whose deploy epoch is unavailable reject the block rather
       than execute under a guessed epoch, per [[060]]'s boundary.
 - [ ] Pin it: a contract using a removed word, deployed before its removal,
