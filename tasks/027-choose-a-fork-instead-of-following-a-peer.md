@@ -278,3 +278,20 @@ it is on the branch it is already standing on. `switch_to_fork` answers with a
 tenure, so it resolves a fork **between burn views** — a peer that reorganized —
 and not two branches within a tenure. Those are decided at selection, by weight
 and length, before any of them is executed.
+
+### What is left, which is an oracle rather than an implementation
+
+Every task item above is checked and two of the three acceptance criteria are
+measured: a peer that reorganizes does not stall nano (it is followed onto the
+fork, standing on the last block both chains hold), and no single peer can
+withhold the canonical tip from a node with other peers (the pool, and
+`peer_equivocation`'s distrust cases).
+
+The third — *given two candidate forks, nano selects the one stacks-core selects* —
+is argued rather than measured. Weight then length is stacks-core's rule and
+nano's, but the tie-break between two equally long tips carrying threshold weight
+is nano's own (the lower block identifier, so that nodes looking at the same peers
+land on the same block). Nothing in the ladder settles what stacks-core does there,
+and inventing an answer here would be worse than saying so. It wants either
+stacks-core's own fork-choice call as an in-process oracle, or a live chain that
+produces the tie. The status stays open on that alone.
