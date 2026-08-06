@@ -34,8 +34,9 @@ never from fetched, staged or peer-reported height.
       can be imported at all.
 - [x] Replay forward and report the first divergence with the field that
       diverged.
-- [ ] Work the divergence point forward until it stops moving for a real reason
-      or reaches the tip.
+- [~] Work the divergence point forward until it stops moving for a real reason
+      or reaches the tip. **39,967 consecutive blocks** as of 2026-08-06, from
+      8,665,601 to 8,705,568, and still moving at 100 a minute — see below.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
@@ -46,7 +47,7 @@ never from fetched, staged or peer-reported height.
       interpreter journals before sealing. The production node must not perform
       this crosscheck or contain a fallback path; matching diagnostic values are
       not a production conformance result.
-- [ ] Replay from a pristine checkpoint entirely with clarity-wasm after
+- [~] Replay from a pristine checkpoint entirely with clarity-wasm after
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
       production evidence.
@@ -1026,3 +1027,52 @@ in minutes rather than reasoned about.
 `write_journal`'s six offline tests run on every commit against the captured
 fixture; the two mainnet ones are `skip_gate`d on `NANO_MAINNET_MARF` and
 `NANO_MAINNET_JOURNAL` and fail rather than skip under `NANO_REQUIRE_MAINNET`.
+
+## The scoreboard reports mainnet now, and what it can honestly say
+
+`cargo xtask scoreboard` had four rows, all of them about the 340-block captured
+fixture, and this task's first acceptance criterion asks for a mainnet depth beside
+them. It has two now:
+
+```
+replay: mainnet root durable executed tip       39967  from 8665601
+regression: mainnet  frozen receipt digests    500/500      8702046-8702592
+```
+
+Both are read off disk in milliseconds and neither runs anything, which is what
+keeps the board a command somebody actually types. And they are deliberately *not*
+called a replay of the same kind as the rows above them: those four are a replay
+against an oracle, where stacks-core produced both the roots and the receipts. For
+mainnet only the roots have an oracle — the signed headers — because no public API
+serves a historical `new_block`. So the depth row is the durable executed tip, read
+from the MARF's own block table rather than from anything fetched, staged or
+peer-reported, and the receipts row is a regression slice that says so.
+
+`NANO_MAINNET_STATE` names the state directory and `NANO_MAINNET_ANCHOR` the height
+the checkpoint was taken at. Without the first, the row says "no state" rather than
+zero, because zero is what a divergence at the first block looks like.
+
+## Where the depth stands, and the four things that moved it today
+
+**39,967 consecutive mainnet blocks**, 8,665,601 to 8,705,568, entirely through
+clarity-wasm, every state root matching the header the reward set signed. It was
+27,849 this morning and the run is still going at about 100 blocks a minute.
+
+None of the four things that moved it was a consensus bug, which is worth recording
+because the previous eight divergences all were:
+
+- **Fifty minutes at `SYN-SENT`.** The sortition lookup asked one peer, and an
+  unreachable peer cost the whole 30 s request budget per attempt, so every round
+  abandoned 28,458 staged blocks. It asks the pool now, with a four-second connect
+  timeout. Written up on
+  [[049-derive-canonical-sortitions-from-the-local-burncha]].
+- **Five sync bugs** the deterministic round harness found, the worst of which
+  disabled the peer pool for the life of the process after one 429. On
+  [[047-make-mainnet-synchronization-monotonic-and-restart]].
+- **The MARF node cache was a quarter of one block's working set** at this height,
+  so consecutive blocks evicted each other's ancestry: 1.8 s a block for 2.2
+  transactions. 0.78 s at a million entries, and worse again at three million.
+- **Half this machine's memory was a `/tmp` full of last week's scratch files**,
+  which is a page cache the replay was not getting. Not a code change, but it is
+  the second time a measurement here was wrong because of something outside the
+  process.

@@ -455,6 +455,91 @@ pub fn scoreboard_at(root: &Path, manifest: FixtureManifest) -> String {
     render_scoreboard(manifest, &replay)
 }
 
+/// What the board can say about mainnet, which is a different question from what
+/// it says about the captured fixture.
+///
+/// The captured rows are a *replay against an oracle*: 340 blocks whose roots and
+/// receipts stacks-core produced. Mainnet has no such oracle for receipts — no
+/// public API serves a historical `new_block` — so the two things it can report are
+/// the depth a durable state has actually executed to, and whether the frozen
+/// regression slice is intact. Both are read from disk and neither runs anything,
+/// so the board stays a command that answers in milliseconds.
+///
+/// `NANO_MAINNET_STATE` names a node's state directory. Without it the row says so
+/// rather than saying zero, because zero is what a divergence at the first block
+/// looks like.
+fn mainnet_rows() -> String {
+    let mut output = String::new();
+    let depth = std::env::var_os("NANO_MAINNET_STATE")
+        .map(PathBuf::from)
+        .and_then(|state| mainnet_executed_height(&state));
+    match depth {
+        Some((anchor, tip)) => {
+            let _ = writeln!(
+                output,
+                "replay: mainnet root durable executed tip   {:>9}  from {anchor}",
+                tip.saturating_sub(anchor)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "replay: mainnet root durable executed tip   no state  NANO_MAINNET_STATE"
+            );
+        }
+    }
+    match frozen_receipt_slice() {
+        Some((blocks, first, last)) => {
+            let _ = writeln!(
+                output,
+                "regression: mainnet  frozen receipt digests   {blocks:>4}/{blocks}      {first}-{last}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "regression: mainnet  frozen receipt digests    absent  fixtures/mainnet/receipts.json"
+            );
+        }
+    }
+    output
+}
+
+/// The anchor a mainnet state was imported at, and the height it has sealed to.
+///
+/// Read straight out of the MARF's own block table, because that is the only height
+/// that means anything: a fetched, staged or peer-reported one is not a block this
+/// node has executed.
+fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
+    let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite")).ok()?;
+    let tip = marf.tip()?;
+    let height = marf.height(tip)?;
+    // A checkpointed state's ancestry arrives with the import, so the anchor is the
+    // first height this node sealed itself: the checkpoint's own height plus one.
+    // `marf.first_sealed_height` is not a thing the MARF records, and the capture
+    // manifest is the wrong place to ask because a state can outlive it -- so the
+    // anchor is taken from the environment where it is known and the row reports the
+    // tip alone where it is not.
+    let anchor = std::env::var("NANO_MAINNET_ANCHOR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| u64::from(height));
+    Some((anchor, u64::from(height)))
+}
+
+/// How many blocks the frozen mainnet regression slice pins, and which.
+fn frozen_receipt_slice() -> Option<(usize, u64, u64)> {
+    #[derive(Deserialize)]
+    struct Slice {
+        first_height: u64,
+        last_height: u64,
+        blocks: Vec<ReceiptDigest>,
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainnet/receipts.json");
+    let slice: Slice = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    Some((slice.blocks.len(), slice.first_height, slice.last_height))
+}
+
 fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String {
     let mut output = String::from(
         "surface              oracle                     passing        first failure\n\
@@ -505,6 +590,7 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
             output,
             "replay: costs        receipt cost dimensions   not captured  needs an observer"
         );
+        let _ = write!(output, "{}", mainnet_rows());
         let _ = writeln!(
             output,
             "\nREPLAY DEPTH: {} / {} ({})",
@@ -526,6 +612,7 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
         output,
         "replay: costs        receipt cost dimensions     {costs}"
     );
+    let _ = write!(output, "{}", mainnet_rows());
     let _ = writeln!(
         output,
         "\nREPLAY DEPTH: {} / {} ({})",
