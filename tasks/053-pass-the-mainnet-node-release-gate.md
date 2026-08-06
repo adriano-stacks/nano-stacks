@@ -28,17 +28,19 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Force clarity-wasm compilation, module-load and runtime failures through
       the production boundary and prove each rejects without committing state
       or invoking the interpreter.
-- [ ] Catch up using a local Bitcoin source and multiple Stacks peers while
-      recording every executed height and verified root.
-- [ ] Restart during catch-up and at tip, then prove the same durable tip, root
+- [~] Catch up using a local Bitcoin source and multiple Stacks peers while
+      recording every executed height and verified root — done offline over the
+      captured chain, through the binary; the mainnet run still logs a root every
+      500 blocks rather than every one.
+- [x] Restart during catch-up and at tip, then prove the same durable tip, root
       and tenure accounting are resumed.
-- [ ] Inject failure and hard process termination at every block commit boundary
+- [x] Inject failure and hard process termination at every block commit boundary
       and prove recovery exposes no partially committed block.
 - [x] Retry a rejected block repeatedly and prove no durable or in-memory state
       changes before the accepted replacement arrives.
 - [x] Remove and lie through one Stacks peer and prove neither event changes the
       canonical executed result.
-- [ ] Exercise a Bitcoin reorganization and a Stacks fork switch.
+- [x] Exercise a Bitcoin reorganization and a Stacks fork switch.
 - [ ] Run the stock signer/client-facing RPC and an event observer against the
       same executed chain.
 - [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
@@ -414,3 +416,118 @@ and the node rather than unwinding. That is an API change across `nano-vm` and
 
 Recorded here rather than fixed because the wrong fix is cheap to reach for and
 the tests that refute it are not obvious ones to run.
+
+## The binary, killed nine times
+
+`binary_restart.rs`. The item this task kept deferring for want of "a state
+directory nothing is writing" — and the answer was to *make* one rather than to
+copy somebody's: the captured 340-block chain served as two loopback Stacks peers,
+its Bitcoin blocks served as a fake Esplora on the two endpoints
+`BitcoinRestSource` actually reads, and a fresh state directory imported from
+`fixtures/chainstate/checkpoint-H`. It stands up in about a second and the whole
+test runs in 46, offline, with no capture and no environment variable — so this
+gate cannot skip itself either.
+
+Nine `SIGKILL`s. Each run waits for a height **above** the one the run before it
+reached, which is what makes it failure injection at every block commit boundary
+rather than nine kills at the same one: every kill interrupts work that process
+did. `max_sync_blocks = 1`, so a round is a block.
+
+Four assertions after each kill, and they are four different claims:
+
+| claim | why it is separate |
+|---|---|
+| the state directory **opens** | a torn write recovery cannot read is a node that never comes back, which is what "no partially committed block" means in practice |
+| its tip is a block of the chain the peers serve | never a block nobody signed, never a half-written one |
+| the tip never goes backwards | a restart that lost a block would look like progress on the next round |
+| the tip is at most one block behind the height the node reported | the parent-or-child shape a crash between the ledger write and the MARF seal leaves, which is the shape recovery exists for |
+
+Then a tenth start reaches the served tip. That is the root check for every block
+below it, because the executor refuses a block whose state root differs from its
+header — reaching the tip is not evidence *about* the roots, it is the roots
+having matched.
+
+The node's own account of the run, which is the part worth reading:
+
+```
+executed 2 blocks, 461 to 463, 9 staged, state root 2cb30d9f…
+derived the reward set for cycle 18 from this node's own state: 3 signers, 30 of weight
+resuming …/chainstate from the state on disk, sealed at block adce5336… of height 463
+recovered the ledger committed with block adce5336…: 3 executed blocks to walk back
+  over, tenure 121 starting at height 462, parent tenure proof present
+fetching history from 2 peers: http://127.0.0.1:40171/, http://127.0.0.1:33309/
+following http://127.0.0.1:33309/ now, of 2 peers known
+```
+
+Ten process starts, the checkpoint imported once and resumed nine times, the
+ledger recovered *with its tenure start heights and parent tenure proof* every
+time, and the reward set derived from the node's own state at each start. Both
+peers in the pool, and the first round re-weighing them rather than keeping
+whichever answered first.
+
+**What it does not cover**, said plainly: a kill during the *checkpoint import*
+(`kill_during_import` has that at the library level), a state directory somebody
+else is writing (still unhandled, and still the panic recorded above), and a
+mainnet-scale state, where the import is hours rather than a second and the
+recovery walks a ledger of 8.6 million blocks rather than eleven.
+
+## A Bitcoin reorganization and a Stacks fork switch, through the round
+
+Both now run end to end, in `follow_path.rs`, over the same offline chain and
+through `CheckpointExecutor::catch_up` — the loop a running node runs.
+
+**The Bitcoin reorganization.** `check_burnchain` asks the burnchain once a round
+whether the block behind its sortition chain's tip still holds. One request when
+nothing moved; the walk of `find_fork` only when the answer differs. Then
+`retract_above`, `BitcoinSource::invalidate_from` (new on the trait — the node
+could not reach either source's own copy through the trait it holds them behind,
+which is why [[049]] recorded this as unwired), `ChainState::retract`, staging
+cleared, and the executor stood on the surviving block. The test moves the block
+the last executed tenure was elected in: one sortition retracted, two Stacks
+blocks given back, the surviving chain a prefix of the one executed.
+
+**The Stacks fork switch.** A peer whose burn view parted from this node's, served
+over HTTP with a `fork_info` of its own. The round fetches its blocks, executes
+none, and takes that as the question: `/v3/tenures/fork_info` against the tenures
+this node executed, standing on the last block of the one they agree about.
+
+Writing them found the bug that would have made both look like they worked:
+**neither the fork switch nor a retraction moved the executor's own tip.** The
+ledger rewound and the executor kept standing on the block it had just abandoned,
+so nothing staged was ever its child and no round after a switch executed anything
+— the stall the switch exists to remove, one step further along. It is
+`stand_on_block` now, which fetches the surviving block and *checks its identity*
+rather than trusting the answer.
+
+Neither of these is the live event, and this is the distinction this task exists to
+make: what is proved is that the node's own machinery notices and recovers, on real
+blocks and a real burnchain source, offline and in CI. A mainnet reorganization
+under a running nano node has still not happened.
+
+## Two peers, one of them serving a coherent wrong chain
+
+The other half of [[027]], and the case `peer_equivocation` could not reach: not a
+malformed message but a **coherent alternative history** — well-formed blocks,
+linking to each other, real transactions, real Merkle roots, real state roots,
+eleven blocks longer than the honest peer's, and belonging to no chain the reward
+set signed.
+
+It is refused twice over, and the control is what makes that mean something: on
+length alone the liar wins (asserted), weighed against the set `.signers` records
+the honest peer wins, the follow path executes none of what the liar serves, and
+the same checkpoint follows the honest peer to its tip. The round *fails* rather
+than quietly executing nothing, which is what sets `peer_failed` and makes the
+next round weigh the pool again.
+
+## What is still open, and what each one waits on
+
+- **Holding mainnet tip for 24 hours** — not attempted and not claimed. It needs
+  wall-clock and a node at the tip; the pristine run is a catch-up.
+- **A stock `stacks-signer` against the binary** — blocked on a pox-5 chain rather
+  than on nano: mainnet is on pox-4, so no waterfall reward set exists for the
+  current cycle, no `signers-*` contract is configured and no signer can hold a
+  slot. Same blocker as [[050]]'s and [[052]]'s.
+- **Recording every executed height and verified root on mainnet** — the offline
+  run above records every height it executed; the mainnet run still prints a root
+  every 500 blocks.
+- **A live Bitcoin reorganization** and a **live** fork switch, as above.
