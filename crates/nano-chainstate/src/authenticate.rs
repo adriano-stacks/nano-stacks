@@ -234,7 +234,14 @@ pub fn authenticate_block(
     }
     // A block with nothing in it is not merely pointless: it could not have
     // started a tenure and nobody was paid to produce it.
-    if block.transactions.is_empty() {
+    //
+    // Asked of a block that arrived, never of one being assembled: a mid-tenure
+    // candidate is *born* empty and is filled from the mempool by the execution
+    // that follows this check, so refusing it here refused every block a miner
+    // could build out of its pool. `execute_nakamoto_block` asks the same question
+    // of the assembled block once the pool has had its turn, which is the moment
+    // the answer means anything.
+    if signatures == Signatures::Present && block.transactions.is_empty() {
         return Err(ConsensusError::EmptyBlock);
     }
     for transaction in &block.transactions {

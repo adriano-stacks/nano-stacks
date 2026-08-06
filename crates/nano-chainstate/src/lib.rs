@@ -1842,6 +1842,15 @@ impl ChainState {
                 receipts.push(receipt);
             }
             self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
+            // Now that the pool has had its turn: a candidate is allowed to arrive
+            // empty and a *block* is not, and this is the first moment the two can
+            // be told apart. Refused here rather than after sealing, so a miner
+            // whose pool offered nothing admissible leaves no state behind.
+            if assembled && block.transactions.is_empty() {
+                return Err(ChainStateError::InvalidTransaction(
+                    ConsensusError::EmptyBlock.to_string(),
+                ));
+            }
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             ledger
                 .accounting
