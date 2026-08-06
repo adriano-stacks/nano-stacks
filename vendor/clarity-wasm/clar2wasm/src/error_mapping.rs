@@ -206,6 +206,23 @@ fn clone_runtime_check_error(error: &RuntimeCheckErrorKind) -> Option<RuntimeChe
         RuntimeCheckErrorKind::UnionTypeValueError(types, value) => Some(
             RuntimeCheckErrorKind::UnionTypeValueError(types.clone(), value.clone()),
         ),
+        // `at-block` in an epoch that withdrew it, raised by the host's
+        // `enter_at_block`. The identity matters twice over: it is the text in
+        // the receipt, and it decides whether there *is* a receipt.
+        // `RuntimeCheckErrorKind::rejectable()` is false for it, so stacks-core
+        // fails the transaction and accepts the block — while the fallback below
+        // turns it into `Expect("AtBlockUnavailable")`, an internal error that
+        // `is_acceptable_runtime_failure` refuses, which stops the node on a
+        // block the network accepted.
+        //
+        // `ContractCallExpectName` (`linker.rs`) is the other unit variant a host
+        // function raises and is still mangled that way. Left alone deliberately:
+        // correcting it turns a refused block into a failed transaction, which is
+        // a consensus-visible change and wants its own oracle rather than a
+        // guess made while passing.
+        RuntimeCheckErrorKind::AtBlockUnavailable => {
+            Some(RuntimeCheckErrorKind::AtBlockUnavailable)
+        }
         _ => None,
     }
 }

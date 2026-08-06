@@ -86,12 +86,13 @@ fn main() -> ExitCode {
         }
         Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
         Some("freeze-receipts") => freeze_receipts(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("compiler-identity") => compiler_identity(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|compiler-identity|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -4248,6 +4249,12 @@ fn report_engines() {
         "  clarity-wasm change  {}",
         captured("git", &["log", "-1", "--format=%h %s", "--", "vendor/clarity-wasm"])
     );
+    // The identity the *binary* carries, which is the one a state and a fixture
+    // can be bound to. The tree hash above is a claim about the repository; this
+    // is a hash of the sources that were compiled, so it is also right in a tree
+    // with uncommitted changes to the compiler -- which is exactly the tree where
+    // the two disagree and where the difference matters.
+    println!("  compiler identity    {}", nano_vm::COMPILER_IDENTITY);
     for crate_name in ["wasmtime", "clarity", "stackslib"] {
         println!("  {crate_name:<20} {}", locked_version(crate_name));
     }
@@ -4329,6 +4336,44 @@ fn report_checkpoint(state: Option<&Path>) {
             directory.display()
         ),
         Err(error) => println!("  {} is unreadable: {error}", directory.display()),
+    }
+    report_state_engines(&directory);
+}
+
+/// Which clarity-wasm builds wrote the state, and whether this artifact is one.
+///
+/// A checkpoint's manifest describes where the state *started*; every root beyond
+/// it is a compiler's arithmetic, so the compiler belongs in the same paragraph.
+/// A state naming a build other than the artifact's is not an error — a compiler
+/// fix is an ordinary event — but a release that claims those roots as evidence
+/// for *this* binary has to say which builds produced them.
+fn report_state_engines(directory: &Path) {
+    let recorded = nano_vm::recorded_engine_identities(directory);
+    if recorded.is_empty() {
+        println!(
+            "  engine identity      UNRECORDED — this state was written before a build \
+             stamped one, so which compiler produced its roots is not knowable from it"
+        );
+        return;
+    }
+    for (identity, first_seen) in &recorded {
+        println!(
+            "  engine identity      {identity} (first opened at unix {first_seen}){}",
+            if identity == nano_vm::COMPILER_IDENTITY {
+                " — this artifact"
+            } else {
+                ""
+            }
+        );
+    }
+    if !recorded
+        .iter()
+        .any(|(identity, _)| identity == nano_vm::COMPILER_IDENTITY)
+    {
+        println!(
+            "  engine identity      NONE of the above is this artifact's compiler, so its \
+             roots are another build's work"
+        );
     }
 }
 
@@ -4492,6 +4537,40 @@ fn release_report(arguments: &[String]) -> ExitCode {
 /// A digest and not the payloads, because 500 mainnet blocks of receipts are
 /// 250 MB and this has to live in CI. Any change to a status, a cost dimension, an
 /// event or the block's own identity moves it.
+/// Name the compiler in a clarity-wasm source tree, this build's or another's.
+///
+/// With no argument it prints what this binary was built from, which is what a
+/// state and a fixture get stamped with. With a directory it computes the same
+/// identity for that tree — so the compiler behind a fixture frozen before this
+/// existed can be recovered rather than asserted:
+///
+/// ```sh
+/// git archive <commit> vendor/clarity-wasm | tar -x -C /tmp/old
+/// cargo xtask compiler-identity /tmp/old/vendor/clarity-wasm
+/// ```
+fn compiler_identity(arguments: &[String]) -> ExitCode {
+    match arguments {
+        [] => {
+            println!("{}", nano_vm::COMPILER_IDENTITY);
+            ExitCode::SUCCESS
+        }
+        [directory] => match nano_vm::compiler_identity_of(Path::new(directory)) {
+            Some(identity) => {
+                println!("{identity}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("{directory} is not a readable clarity-wasm source tree");
+                ExitCode::FAILURE
+            }
+        },
+        _ => {
+            eprintln!("usage: cargo xtask compiler-identity [<clarity-wasm-dir>]");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn freeze_receipts(arguments: &[String]) -> ExitCode {
     let [observer, output, rest @ ..] = arguments else {
         eprintln!(
@@ -4535,6 +4614,11 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
     }
     let document = json!({
         "source": "nano-stacks event observer, blocks whose state root the chain verified",
+        // What produced these receipts. A frozen slice is nano checking itself, so
+        // it is only evidence about a compiler if it says which one — and a slice
+        // whose compiler is unknown cannot satisfy the release gate at all
+        // (`mainnet_receipts::the_frozen_mainnet_slice_names_its_compiler`).
+        "compiler": nano_vm::COMPILER_IDENTITY,
         "first_height": frozen.first().map(|entry| entry.height),
         "last_height": frozen.last().map(|entry| entry.height),
         "blocks": frozen,

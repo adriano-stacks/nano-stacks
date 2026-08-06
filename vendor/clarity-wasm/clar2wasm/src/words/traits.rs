@@ -147,10 +147,11 @@ mod tests {
     use clarity::vm::types::{
         CallableData, QualifiedContractIdentifier, StandardPrincipalData, TraitIdentifier,
     };
-    use clarity::vm::{ClarityName, ContractName, Value};
+    use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value};
 
     use crate::tools::{
-        crosscheck, crosscheck_expect_failure, crosscheck_multi_contract, TestEnvironment,
+        crosscheck, crosscheck_expect_failure, crosscheck_multi_contract,
+        crosscheck_multi_contract_with_env, TestEnvironment,
     };
 
     //
@@ -333,6 +334,82 @@ mod tests {
                 )
                 .unwrap(),
             )),
+        );
+    }
+
+    /// The same `print` of a trait reference, under the epoch-2.05 type checker.
+    ///
+    /// This is mainnet 8,707,847, and the epoch is the whole of it.
+    /// `SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-bid-v5` — Clarity 1,
+    /// analysed in **Epoch 2.05** — has `(print { collection_id: collection, … })`
+    /// where `collection` is a `<nft-trait>` parameter. The 2.05 type checker
+    /// types such a parameter `TraitReferenceType`; 2.1's types it
+    /// `CallableType(CallableSubtype::Trait(_))`, and only the second spelling
+    /// was in `type_for_serialization`'s mapping to `PrincipalType`. So the type
+    /// clar2wasm wrote into literal memory for `print` to read back was
+    /// `(tuple (collection_id <SP2PAB….nft-trait.nft-trait>))`, and `<…>` holding
+    /// a *qualified* trait identifier is not Clarity anybody can parse — the
+    /// angle brackets take a local alias `use-trait` introduced. The round-trip
+    /// check in `serialized_type_of` therefore failed the build, at a *call*,
+    /// which is nano's gap and not the transaction's, so the node refused the
+    /// block and replay stopped.
+    ///
+    /// `trait_list` above covers the same `print` at the latest epoch and passes
+    /// either way, which is why the gap survived: nothing asked the question in
+    /// the epoch 146,000 mainnet contracts were analysed in.
+    #[test]
+    fn print_a_trait_reference_under_the_two_oh_five_type_checker() {
+        let trait_contract = ContractName::from_literal("my-trait-contract");
+        let trait_snippet = r#"
+(define-trait my-trait
+  ((add (int int) (response int int))))
+(define-public (add (a int) (b int))
+  (ok (+ a b))
+)
+            "#;
+
+        // A trait reference on its own, in a tuple, and in a list: the tuple is
+        // the mainnet shape, and the other two are the same type reached through
+        // `type_for_serialization`'s other recursive arms.
+        let printing = ContractName::from_literal("use-trait");
+        let printing_snippet = r#"
+(use-trait the-trait .my-trait-contract.my-trait)
+(define-private (foo (adder <the-trait>))
+  (begin
+    (print adder)
+    (print (list adder))
+    (print { collection_id: adder, id: u1 })))
+(foo .my-trait-contract)
+            "#;
+
+        // The value the reference implementation prints, and the reason the fix
+        // is `PrincipalType` rather than some other stand-in: at 2.05 a trait
+        // reference *is* a contract principal — no `CallableContract`, and the
+        // tuple's own field type is `principal`.
+        let deployer = QualifiedContractIdentifier {
+            issuer: StandardPrincipalData::transient(),
+            name: ContractName::from_literal("my-trait-contract"),
+        };
+        let printed = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (
+                    ClarityName::from_literal("collection_id"),
+                    Value::Principal(clarity::vm::types::PrincipalData::Contract(deployer)),
+                ),
+                (ClarityName::from_literal("id"), Value::UInt(1)),
+            ])
+            .expect("a tuple"),
+        );
+
+        // Epoch 2.05 pairs with Clarity 1 (`epoch_and_clarity_match`), so this
+        // is the contract's own pairing rather than one the harness rewrote.
+        crosscheck_multi_contract_with_env(
+            &[
+                (trait_contract, trait_snippet),
+                (printing, printing_snippet),
+            ],
+            Ok(Some(printed)),
+            TestEnvironment::new(StacksEpochId::Epoch2_05, ClarityVersion::Clarity1),
         );
     }
 

@@ -3461,4 +3461,48 @@ mod tests {
             );
         }
     }
+
+    /// A constant naming a contract, called while the contract is *deploying*.
+    ///
+    /// `special_contract_call` accepts a constant as a static dispatch target
+    /// only when three things hold (`clarity/src/vm/functions/database.rs:100`):
+    /// the Clarity version `supports_callables()`, the epoch
+    /// `supports_call_with_constant()` — and `!contract_context.is_deploying`.
+    /// The third is a *runtime* property, not a syntactic one: the same function
+    /// body refuses when a deploy's top level reaches it and dispatches when a
+    /// later transaction calls it.
+    ///
+    /// clar2wasm has no counterpart. Measured, at the executing epoch:
+    ///
+    /// ```text
+    /// compiled     Ok(Some(Response { committed: true, data: UInt(1) }))
+    /// interpreted  Err(RuntimeCheck(ContractCallExpectName))
+    /// ```
+    ///
+    /// So a deployment whose top level calls a contract through a constant
+    /// succeeds here and fails on the chain — a *state root* divergence and not
+    /// only a receipt one, since the reference's deploy transaction writes
+    /// nothing. It is `#[ignore]`d rather than fixed because the fix is a runtime
+    /// branch inside the module on a flag the host would have to publish, which
+    /// is more than a mapping change and wants its own measurement against
+    /// mainnet. Accounted for in tasks/060 as a known engine disagreement.
+    #[test]
+    #[ignore = "clar2wasm dispatches a constant contract-call while deploying, which the reference refuses with ContractCallExpectName"]
+    fn a_constant_contract_call_while_deploying_agrees() {
+        crosscheck_multi_contract(
+            &[
+                (
+                    ContractName::from_literal("callee"),
+                    "(define-public (foo) (ok u1))",
+                ),
+                (
+                    ContractName::from_literal("caller"),
+                    "(define-constant target .callee) (contract-call? target foo)",
+                ),
+            ],
+            Err(clarity::vm::errors::VmExecutionError::RuntimeCheck(
+                clarity::vm::errors::RuntimeCheckErrorKind::ContractCallExpectName,
+            )),
+        );
+    }
 }

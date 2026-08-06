@@ -1145,28 +1145,63 @@ smallest chain that can tell the two defects apart: tenure heights advancing at 
 the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
 time that is never a Stacks timestamp. Both engines are asked, and they now agree.
 
-## 8,707,846, and the next stop is a trait reference in a stored analysis
+## 8,707,847: a trait reference in a `print`, and the epoch that spells it differently
 
-The tenure-height fix moved the frontier from 8,706,193 to **8,707,846** — 42,245
-consecutive mainnet blocks from the checkpoint — and it stopped again, on the other
-kind of failure this task tracks.
+Replay parked at **8,707,846** and refused the block above it, correctly — a compile
+refusal at a *call* is nano's gap and not the transaction's:
 
-Not a wrong answer this time but no answer: reading
-`SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-bid-v5`'s **stored analysis**
-back fails, because a serialized type signature in it holds a *sugared* trait
-reference — `.nft-trait.nft-trait`, an implicit-issuer contract identifier with a
-trait name after it — and the type parser wants a fully qualified one. It is the
-"trait lists and contract-analysis types" divergence the W6 spec named as expected
-and nobody had reached until now.
+```
+SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-bid-v5: contract analysis
+failed: Type error: serialized type cannot be deserialized: … Build Ast Error:
+SeparatorExpected(".nft-trait.nft-trait")
+```
 
-The node refuses the block rather than sealing it, which is the rule
-[[060-make-the-consensus-execution-engine-explicit-and-r]] added after this exact
-distinction cost a week: a compile refusal at a *call* writes nothing and would
-otherwise seal the root an untouched block seals, so it would be invisible in the
-state root and visible only in a receipt.
+**It is not a failure to read the stored analysis**, which is the reading the message
+invites. That analysis deserializes: nano read `epoch: Epoch2_05` and
+`clarity_version: Clarity1` out of it, which is what selected the semantics the
+module was built under, and `sqlite3` plus `json.load` read the whole of it. The
+failure is later and entirely inside clar2wasm — `WasmGenerator::serialized_type_of`,
+which writes an expression's analysed type into literal memory as a *string* so a
+host function can read the value back, and checks the round trip at compile time.
 
-Two things about the loop are worth recording, because they are what makes this a
-day's work rather than a week's. The state sealed at the divergence's parent is a
-reflink copy taken in eleven seconds, so the fix is worked against the real parent.
-And the *receipts* are what localize it: the failing transaction is named in the log
-with the contract and the reason, before any state is inspected.
+`marketplace-bid-v5` has `(print { collection_id: collection, … })` where
+`collection` is a `<nft-trait>` parameter. The type written out was
+
+```
+(tuple (collection_id <SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait>) …)
+```
+
+and a *qualified* trait identifier inside angle brackets is not Clarity anybody can
+parse: `<…>` takes the local alias `use-trait` introduces, so the lexer reads the
+contract principal and then finds `.nft-trait` where a separator belongs. That is the
+whole of `SeparatorExpected`.
+
+**The epoch is the cause, and it is the same shape as [[064]]'s.**
+`type_for_serialization` already mapped `CallableType(CallableSubtype::Trait(_))` to
+`PrincipalType` — "callable metadata is not part of a serialized principal value" —
+but the **2.05 type checker types a `<trait>` parameter `TraitReferenceType`**, a
+different variant for the same thing, and 2.1's types it `CallableType`. A contract
+analysed in 2.05 keeps that spelling forever. So `trait_list` in
+`words/traits.rs`, which prints a list of trait references at the *latest* epoch, has
+passed all along, and nothing asked the question in the epoch 62,076 mainnet
+contracts were analysed in.
+
+`TraitReferenceType(_)` now maps to `PrincipalType` beside the other two. That is not
+an expedient: measured, the reference implementation prints such a value with the
+tuple field type **`principal`** and the value `Principal(Contract(…))` — at 2.05 a
+trait reference is a contract principal, with no `CallableContract` wrapper.
+
+### The oracle, and what it settles
+
+`print_a_trait_reference_under_the_two_oh_five_type_checker` in
+`vendor/clarity-wasm/clar2wasm/src/words/traits.rs` — clar2wasm's own crosscheck
+harness, which *can* express this one, because `Epoch2_05` and `Clarity1` are a
+pairing `epoch_and_clarity_match` accepts, so the harness runs the contract's own
+pairing rather than rewriting it. Three positions of the same type: a trait reference
+alone, in a list, and in a tuple, the last being the mainnet shape.
+
+Before the fix it reproduces the mainnet error exactly —
+`SeparatorExpected(".my-trait-contract.my-trait")` — and the interpreter answers the
+tuple. That is also the confirmation the coordinator asked for and I did not want to
+assume: **the interpreter is untroubled**, so the state is not corrupt and this is a
+compiler gap.

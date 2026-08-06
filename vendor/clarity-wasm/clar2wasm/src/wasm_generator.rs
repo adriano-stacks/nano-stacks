@@ -1124,7 +1124,24 @@ impl WasmGenerator {
             // NoType and BoolType have the same size (both type and inner)
             NoType => BoolType,
             // Callable metadata is not part of a serialized principal value.
-            CallableType(_) | ListUnionType(_) => PrincipalType,
+            //
+            // `TraitReferenceType` is here because it is the *same type* under
+            // an older type checker: 2.05's types a `<trait>` parameter
+            // `TraitReferenceType` where 2.1's types it
+            // `CallableType(CallableSubtype::Trait(_))`, and a contract analysed
+            // in 2.05 keeps that spelling forever. Both carry a trait identifier
+            // that a serialized value does not, and both are a contract
+            // principal at run time — the reference implementation prints such a
+            // value with the tuple type `principal`, which is measured in
+            // `words/traits.rs`'s
+            // `print_a_trait_reference_under_the_two_oh_five_type_checker`.
+            //
+            // Leaving it out was mainnet 8,707,847: the type written into
+            // literal memory came out as `<SP2PAB….nft-trait.nft-trait>`, and a
+            // qualified trait identifier inside angle brackets is not Clarity —
+            // `<…>` takes the local alias `use-trait` introduces — so the round
+            // trip in `serialized_type_of` refused the module at a *call*.
+            CallableType(_) | ListUnionType(_) | TraitReferenceType(_) => PrincipalType,
             // Recursive types
             ResponseType(types) => ResponseType(Box::new((
                 self.type_for_serialization(&types.0),
@@ -2149,6 +2166,24 @@ impl WasmGenerator {
     pub fn func_by_name(&self, name: &str) -> FunctionId {
         #[allow(clippy::unwrap_used)]
         get_function(&self.module, name).unwrap()
+    }
+
+    /// The epoch this module will execute in, when the module knows it.
+    ///
+    /// A module carries two epochs and they answer different questions. The
+    /// semantic epoch — `contract_analysis.epoch`, the one the chain recorded at
+    /// deploy time — fixes what the source *means*. The charging epoch, set by
+    /// [`Self::with_cost_code_for_epoch`], is the epoch the chain is running
+    /// *now*: it is where the cost table comes from, and so it is also the epoch
+    /// whose runtime rules apply. A word that a later epoch withdrew is decided
+    /// by this one, not by the semantic epoch.
+    ///
+    /// `None` only when cost code is switched off, which is a diagnostic build
+    /// and never a node: `compile_for_cost_epoch` is given `emit_cost_code:
+    /// true` on every production path. A caller that gets `None` must fall back
+    /// to whatever runtime check the host function makes.
+    pub(crate) fn executing_epoch(&self) -> Option<clarity::types::StacksEpochId> {
+        self.cost_context.as_ref().map(|context| context.epoch)
     }
 
     pub fn get_function_type(&self, name: &str) -> Option<&FunctionType> {
