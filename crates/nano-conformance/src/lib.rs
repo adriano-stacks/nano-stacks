@@ -400,6 +400,9 @@ pub enum ReplayDivergence {
     Receipt(String),
     Application(String),
     Fixture(String),
+    /// The two engines answer a call in this block differently, checked before
+    /// anything was sealed.
+    Engine(String),
 }
 
 #[must_use]
@@ -833,6 +836,121 @@ type ExecuteBlock = fn(
     &NakamotoBlock,
 ) -> Result<nano_chainstate::AppliedBlock, nano_chainstate::ChainStateError>;
 
+
+/// Whether to put every contract call through both engines before sealing.
+///
+/// Deliberately not named after any of the four interpreter switches task 060
+/// retired from the production call path. `wasm_is_the_engine` forbids their
+/// names anywhere in the tree and caught the first spelling of this one, which is
+/// the check working: a name that reads like a retired production switch is a
+/// hazard even when the thing behind it is a test.
+///
+/// Off by default and read only here, in the conformance harness. The
+/// interpreter is a differential oracle and nothing else — task 060's boundary is
+/// that the shipped node cannot reach it, and it cannot: it lives in
+/// `nano-oracle`, which `nano-node` does not depend on. This is the *test* side of
+/// that boundary, which the same task asks for in as many words.
+fn crosschecking_engines() -> bool {
+    std::env::var_os("NANO_REPLAY_BOTH_ENGINES").is_some()
+}
+
+/// Ask both engines every contract call in a block, before the block is applied.
+///
+/// Before, not after, and that is the whole point: at this moment the chainstate
+/// stands on the parent, which is the state the call actually ran against. Each
+/// call opens a block on the parent and aborts it, so nothing is sealed and no
+/// root moves.
+///
+/// Answers a description of the first disagreement. Seven of the eight mainnet
+/// divergences found so far were a compiler bug that showed up first as a
+/// different answer to one call, and every one of them was localised with this
+/// comparison run by hand (`xtask call-both-tx`); running it in the harness is
+/// the same question asked without being asked to.
+fn engines_disagree_before_sealing(
+    chainstate: &mut ChainState,
+    parent: Option<[u8; 32]>,
+    block: &NakamotoBlock,
+) -> Option<String> {
+    let parent = parent?;
+    for transaction in &block.transactions {
+        let nano_codec::TransactionPayloadData::ContractCall {
+            address,
+            contract_name,
+            function_name,
+            arguments,
+        } = transaction.payload().data()
+        else {
+            continue;
+        };
+        let Some(origin) = transaction.origin_address() else {
+            continue;
+        };
+        let Ok(sender) = clarity::vm::types::PrincipalData::parse(&origin.to_string()) else {
+            continue;
+        };
+        let name = format!("{address}.{contract_name}");
+        let Ok(contract) = clarity::vm::types::QualifiedContractIdentifier::parse(&name) else {
+            continue;
+        };
+        let encoded: Vec<Vec<u8>> = arguments
+            .iter()
+            .map(|argument| argument.as_bytes().to_vec())
+            .collect();
+        let mut answers = [String::new(), String::new()];
+        for (slot, interpreted) in answers.iter_mut().zip([false, true]) {
+            let vm = chainstate.vm_mut();
+            if vm.begin_block(Some(parent), [0xcc; 32]).is_err() {
+                return None;
+            }
+            let free = clarity::vm::costs::LimitedCostTracker::new_free();
+            let outcome = if interpreted {
+                nano_oracle::interpret_contract_call(
+                    vm,
+                    nano_oracle::ContractCall {
+                        sender: sender.clone(),
+                        sponsor: None,
+                        contract: contract.clone(),
+                        function: function_name,
+                        arguments: &encoded,
+                    },
+                    free,
+                )
+            } else {
+                vm.execute_contract_call_outcome(
+                    sender.clone(),
+                    None,
+                    contract.clone(),
+                    function_name,
+                    &encoded,
+                    &free,
+                )
+            };
+            *slot = match &outcome {
+                Ok(
+                    nano_vm::ContractCallOutcome::Success(result)
+                    | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+                ) => format!("{:?}", result.value),
+                Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+                    format!("failed: {error:?}")
+                }
+                Err(error) => format!("error: {error:?}"),
+            };
+            drop(vm.abort_block());
+        }
+        let [compiled, interpreted] = answers;
+        if compiled != interpreted {
+            return Some(format!(
+                "the engines answer {name}::{function_name} in transaction {} differently: \
+                 clarity-wasm says {compiled} and the interpreter says {interpreted}. \
+                 clarity-wasm is the engine that has to run mainnet, so this is a compiler \
+                 bug to fix rather than a reason to prefer the other answer",
+                transaction.txid()
+            ));
+        }
+    }
+    None
+}
+
 fn apply_captured_block(
     capture: &ReplayInputs<'_>,
     chainstate: &mut ChainState,
@@ -902,6 +1020,11 @@ fn apply_captured_block(
                 "block consensus hash is absent from captured Bitcoin operations".to_owned(),
             )
         })?;
+    if crosschecking_engines()
+        && let Some(disagreement) = engines_disagree_before_sealing(chainstate, parent, &block)
+    {
+        return Err(ReplayDivergence::Engine(disagreement));
+    }
     let applied = execute(chainstate, bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;
     let cost_divergence = match &event {
@@ -1020,9 +1143,10 @@ impl std::fmt::Display for ReplayDivergence {
             Self::StateRoot { expected, actual } => {
                 write!(formatter, "state root {expected} != {actual}")
             }
-            Self::Application(message) | Self::Fixture(message) | Self::Receipt(message) => {
-                formatter.write_str(message)
-            }
+            Self::Application(message)
+            | Self::Fixture(message)
+            | Self::Receipt(message)
+            | Self::Engine(message) => formatter.write_str(message),
         }
     }
 }

@@ -59,7 +59,7 @@ node may invoke.
       reference interpreter; use direct state access or clarity-wasm.
 - [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
       compiler-hostile deployments and calls, with no healing or engine switch.
-- [ ] Compare clarity-wasm with the interpreter before sealing in the
+- [x] Compare clarity-wasm with the interpreter before sealing in the
       conformance harness and retain minimized regression fixtures for every
       disagreement found.
 - [ ] Pin roots, receipts, costs, events and consensus-visible writes for a
@@ -1032,3 +1032,34 @@ the live path is the kind of change that can only be judged against the chain: t
 only call-site analysis failure in 1,899 log lines mentioning one is
 `487356b6…`, which is 8,666,585's `rewards-stx-v1` — the fourth divergence, fixed.
 Zero in the current run.
+
+## The engine comparison runs in the harness, before sealing
+
+`NANO_REPLAY_BOTH_ENGINES=1` puts every contract call in every replayed block
+through both engines and stops the replay on the first disagreement — **before**
+the block is applied, which is the whole point: at that moment the chainstate
+stands on the parent, which is the state the call actually ran against. Each call
+opens a block on the parent and aborts it, so nothing is sealed and no root moves.
+
+Over the captured 340 blocks it finds nothing, and the honest reading of that is
+that the fixture is a hacknet chain the two engines already agree on — its value is
+on a mainnet slice, where seven of the eight divergences lived.
+
+**So it was proved to bite rather than assumed to.** Inverting the comparison for
+one run stops the replay at block 76, on a real
+`ST000000000000000000002AMW42H.pox-5::stake-update` — a PoX contract call, the
+awkward kind — with both engines' answers printed. That is the mechanism reaching
+real calls at a real depth and refusing to seal. Reverted immediately; the run
+either side of it is 340/340.
+
+The minimized fixtures the item also asks for are already here and named after the
+bugs they hold: `wasm_response_fold`, `wasm_trait_fold`, `wasm_nft_allowance`,
+`wasm_match_binding_name`, `wasm_builds_a_let_bound_placeholder`,
+`tenure_fee_maturity`.
+
+**The naming, because the test caught it.** The first spelling of the switch
+contained `NANO_CROSSCHECK`, one of the four names task 060 retired from the
+production call path — and `wasm_is_the_engine` forbids those strings anywhere in
+the tree, so it failed on the first run. That is the boundary check working: a name
+that reads like a retired production switch is a hazard even when the thing behind
+it is a test, and the comment in `crosschecking_engines` now says so.

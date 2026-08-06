@@ -1,7 +1,7 @@
 ---
 id: "054"
 title: "Join and synchronize over the Stacks P2P network"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["027"]
 tags: ["mainnet", "p2p", "sync", "networking"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Join and synchronize over the Stacks P2P network

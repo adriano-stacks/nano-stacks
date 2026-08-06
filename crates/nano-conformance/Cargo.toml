@@ -19,6 +19,10 @@ nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
 nano-vm = { path = "../nano-vm" }
 nano-oracle = { path = "../nano-oracle" }
+# A normal dependency rather than a dev one because `src/lib.rs`'s pre-seal engine
+# comparison needs the Clarity value and principal types. Visible to the tests
+# either way, and this crate is never in the node's graph.
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -32,7 +36,6 @@ nano-rpc = { path = "../nano-rpc" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "time"] }
-clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 proptest = "1.11.0"
