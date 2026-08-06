@@ -40,31 +40,31 @@ use nano_primitives::ConsensusHash;
 use nano_sync::{PeerPool, PoxInfo, SyncClient, TenureSource};
 use serde::Deserialize;
 
-fn fixtures() -> PathBuf {
+pub fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
 /// One row of the captured `snapshots` table, in the fields a peer answers with.
 #[derive(Clone, Debug, Deserialize)]
-struct Snapshot {
-    block_height: u64,
-    burn_header_hash: String,
+pub struct Snapshot {
+    pub block_height: u64,
+    pub burn_header_hash: String,
     sortition_id: String,
     parent_sortition_id: String,
     burn_header_timestamp: u64,
-    consensus_hash: String,
+    pub consensus_hash: String,
     sortition: u8,
     #[serde(default)]
     miner_pk_hash: Option<String>,
 }
 
-fn snapshots() -> Vec<Snapshot> {
+pub fn snapshots() -> Vec<Snapshot> {
     serde_json::from_slice(&fs::read(fixtures().join("sortition/snapshots.json")).expect("read"))
         .expect("the captured snapshots parse")
 }
 
 /// The captured chain, lowest block first.
-fn captured_chain() -> Vec<NakamotoBlock> {
+pub fn captured_chain() -> Vec<NakamotoBlock> {
     let mut blocks: Vec<NakamotoBlock> = nano_conformance::captured_block_paths(&fixtures())
         .into_iter()
         .map(|path| {
@@ -160,10 +160,10 @@ impl BitcoinSource for MovableBurnchain {
 }
 
 /// What one fake peer serves.
-struct Served {
+pub struct Served {
     /// The chain it offers, lowest first. Its last block is its tip.
-    blocks: Vec<NakamotoBlock>,
-    snapshots: Vec<Snapshot>,
+    pub blocks: Vec<NakamotoBlock>,
+    pub snapshots: Vec<Snapshot>,
 }
 
 impl Served {
@@ -211,6 +211,43 @@ impl Served {
             "tip_block_id": hex::encode(tip.block_id()),
             "tip_height": tip.header.chain_length,
             "reward_cycle": 0,
+        })
+    }
+
+    /// `/v2/info`, which is how a starting node learns the chain and how far
+    /// ahead this peer is.
+    fn node_info(&self) -> serde_json::Value {
+        let tip = self.tip();
+        serde_json::json!({
+            "burn_block_height": self
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.consensus_hash == tip.header.consensus_hash.to_string())
+                .map_or(0, |snapshot| snapshot.block_height),
+            "stacks_tip_height": tip.header.chain_length,
+            "stacks_tip": hex::encode(tip.header.block_hash().as_bytes()),
+            "stacks_tip_consensus_hash": hex::encode(tip.header.consensus_hash.as_bytes()),
+            "network_id": CHAIN_ID,
+        })
+    }
+
+    /// `/v2/pox`, the stacking calendar every execution context is built from.
+    fn pox_info(&self) -> serde_json::Value {
+        let calendar = pox();
+        serde_json::json!({
+            "first_burnchain_block_height": calendar.first_bitcoin_height,
+            "current_burnchain_block_height": self
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.block_height)
+                .max()
+                .unwrap_or_default(),
+            "prepare_phase_block_length": calendar.prepare_phase_length,
+            "reward_phase_block_length": calendar.reward_phase_length,
+            "reward_slots": calendar.reward_slots,
+            "rejection_fraction": serde_json::Value::Null,
+            "contract_versions": [],
+            "epochs": [],
         })
     }
 
@@ -282,9 +319,17 @@ fn found(body: Option<Vec<u8>>) -> (StatusCode, Vec<u8>) {
 }
 
 /// Start a peer on loopback and hand back a client pointed at it.
-async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
+pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
     let state = Arc::new(served);
     let router = Router::new()
+        .route(
+            "/v2/info",
+            get(|State(state): State<Arc<Served>>| async move { axum::Json(state.node_info()) }),
+        )
+        .route(
+            "/v2/pox",
+            get(|State(state): State<Arc<Served>>| async move { axum::Json(state.pox_info()) }),
+        )
         .route(
             "/v3/tenures/info",
             get(|State(state): State<Arc<Served>>| async move { axum::Json(state.info()) }),
@@ -355,8 +400,11 @@ async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
     (client, handle)
 }
 
+/// The chain identifier the captured chain carries, from its own provenance.
+pub const CHAIN_ID: u32 = 2_147_483_648;
+
 /// The stacking calendar the captured chain was produced under.
-const fn pox() -> PoxInfo {
+pub const fn pox() -> PoxInfo {
     PoxInfo {
         first_bitcoin_height: 0,
         bitcoin_height: 0,

@@ -32,7 +32,7 @@ strands it.
 - [x] Wire the production runtime and `catch_up` to poll that pool instead of
       selecting the first reachable HTTP peer and constructing one
       `SyncClient`.
-- [ ] Choose between candidates using enforced signer authentication and the
+- [x] Choose between candidates using enforced signer authentication and the
       locally derived burn view from [[049-derive-canonical-sortitions-from-the-local-burncha]]
       and [[050-authenticate-every-followed-nakamoto-block]], not peer claims.
 - [x] Give back the blocks after a named ancestor, so a heavier fork can be
@@ -41,7 +41,7 @@ strands it.
       stands there.
 - [x] Call it from the follow path instead of stalling.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
-- [ ] Exercise two simultaneous peers through the production runtime: one
+- [x] Exercise two simultaneous peers through the production runtime: one
       stale, withholding or invalid, and one serving the canonical chain.
 
 ## Acceptance Criteria
@@ -172,3 +172,109 @@ runs two simultaneous peers through the production runtime with one of them
 stale, withholding or lying. `nano-p2p`'s `loopback.rs` isolates a peer that
 signs with the wrong key and one on the wrong network; a peer that serves a
 plausible but wrong *chain* through the follow path is the case still missing.
+
+## Both remaining items, closed
+
+### The set and the burn view are this node's own now
+
+`choose_source` took a `SignerSet` a caller happened to hold and the runtime
+passed `None`, so the production fork choice was **length alone**. Two things it
+compares against are now answers this node computed for itself, and the shapes
+say so:
+
+- **The signer set is a `SignerWeights`** — the form `.signers` records and the
+  value `check_signer_signatures` enforces before executing a block — read out of
+  the executed state at this node's own burn view (`CheckpointExecutor::recorded_signer_set`).
+  Selection and execution weigh against one set from one place. Weighing selection
+  against a set parsed from a peer's `/v3/stacker_set` would be asking the
+  candidates' own network who may approve them.
+- **The burn view is the derived sortition chain's**, through the new
+  `nano_sync::BurnView`, implemented on `SortitionTracker`.
+
+`BurnView::derived` has **three** answers rather than two, and that is the whole
+design. A header's `bitcoin_spent` is a running total under threshold signer
+weight, so:
+
+| the candidate's burn total | what this node can say |
+|---|---|
+| strictly below the derived tip's | it was built below this chain, so its consensus hash **must** be one this chain holds — otherwise it is another burnchain, refused |
+| exactly the derived tip's | it may be a burn block *ahead* that elected nobody — mainnet leaves four such in every fifteen — so **not judged** |
+| above | ahead of this node; not judged here, and every block it later executes has its burn total checked against this same chain |
+
+That last row is also why the weight rule is conditional: the set a node reads is
+its *own* cycle's, and enforcing it on a candidate thousands of burn blocks ahead
+would refuse every honest peer of a node that is catching up. So a tip on a burn
+view this node derived is weighed strictly, and one beyond it is followed on
+length with execution as the backstop — which is the same policy execution itself
+takes for a cycle with nothing recorded, for the same reason.
+
+Three tests in `nano-sync` pin the three cases, and one in `nano-node` pins the
+placement rule at its boundary: a foreign hash at the tip's own total is *not*
+refused, because a sortition-less block ahead states exactly that total.
+
+The first round now re-weighs, too. `reachable_peer` still picks whichever peer
+answers first — which is all a node can ask before its state is open — but the
+follow loop no longer keeps that peer for sixty rounds before asking whether
+anything better exists.
+
+### A peer serving a coherent wrong chain, through the follow path
+
+`follow_path.rs`, and it drives `CheckpointExecutor::catch_up` — the loop a
+running node runs — against real HTTP peers over the captured chain, so the
+descent, the staging store, execution, the state-root check and the fork switch
+are all in it.
+
+The wrong chain is the captured chain re-timed and re-linked from the anchor up:
+every block well-formed, every parent linking, real transactions, real Merkle
+roots, real state roots, and eleven blocks longer than the honest peer's. What
+cannot be reproduced is the signatures — they are over a preimage containing the
+timestamp — and that is not a weakness of the fixture, it is the reason a wrong
+chain is refusable at all. An attacker faces exactly this.
+
+Three claims, and the control is what makes the other two mean anything:
+
+- **On length alone the liar wins.** Asserted, so the refusal below is the weight
+  rule doing the work rather than the fixture being unattractive.
+- **Weighed against the set `.signers` records, the honest peer wins.**
+- **The follow path executes none of what the liar serves.** The round *fails*,
+  and that shape is deliberate: a block that cannot be executed ends the round,
+  which is what sets `peer_failed` and makes the next round weigh the pool again.
+  A round that quietly executed nothing would leave the node on the liar forever.
+  The executed tip and the executed chain are byte-identical afterwards.
+- **The same checkpoint follows the honest peer to its tip**, which is what makes
+  the refusal a judgement rather than an inability.
+
+Which signature rule fires depends on where the branch parts, and both say the
+same thing — nobody who could have signed this block did. A tenure-start block is
+refused by the **miner** rule, because the header signature no longer recovers to
+the key the tenure change names; a mid-tenure block is refused by the reward set's
+**weight**. This branch parts at a tenure start, so the miner rule answers.
+
+Two state directories, not one: staging is keyed by parent block, so a single
+store holding both branches would hand a round whichever child of the anchor it
+found first — a property of a test double and not of a node.
+
+### And a peer whose burn view parted, which is the fork switch itself
+
+`a_peer_on_a_parted_burn_view_is_followed_onto_the_fork`. Nothing about the peer's
+blocks is malformed; they descend from a tenure this node did not execute. The
+round fetches them, executes none, and takes *that* as the question worth asking —
+`/v3/tenures/fork_info` back to the oldest tenure this node executed, against the
+tenures it executed, standing on the last block of the one they agree about.
+
+Writing it found the bug that would have made the whole path look like it worked:
+**neither `switch_to_fork` nor a retraction moved the executor's own tip.** The
+ledger rewound and the executor kept standing on the block it had just abandoned,
+so nothing staged was ever its child and no round after a switch executed
+anything — the stall the fork switch exists to remove, one step further along.
+`stand_on_block` fetches the surviving block, **checks its identity rather than
+trusting the answer**, and drops the burn view and cached sortition that belonged
+to the abandoned branch.
+
+One limit worth writing down, because it decides what this path can and cannot
+resolve: a consensus hash is a fact about a *burn* block, so two Stacks branches
+inside one tenure carry the same one, and the last block this node executed under
+it is on the branch it is already standing on. `switch_to_fork` answers with a
+tenure, so it resolves a fork **between burn views** — a peer that reorganized —
+and not two branches within a tenure. Those are decided at selection, by weight
+and length, before any of them is executed.

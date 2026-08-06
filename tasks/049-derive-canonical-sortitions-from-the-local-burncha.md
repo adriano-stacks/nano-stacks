@@ -37,7 +37,7 @@ never validation inputs.
       peer, because they move state roots.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
-- [ ] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
+- [x] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
       path and replay the affected Stacks tenures. Nothing calls `find_fork`,
       `SortitionEngine::retract_above` or `ChainState::retract` outside tests;
       one bug the reading found is fixed below.
@@ -570,3 +570,89 @@ derived 125 sortitions locally, now standing on burn 960488 (104.42s reading 125
 Four orders of magnitude, and the slow side is a hosted Esplora rather than
 anything this crate does. There is nothing to optimise here that is not a caching
 decision about the burnchain.
+
+## The reorganization is wired, and it costs one request a round
+
+`CheckpointExecutor::check_burnchain`, called from `catch_up` before anything is
+executed. The gating is what the measurement above demanded: **one
+`block_hash_at` per round**, for the height the sortition chain's tip stands on,
+and the walk of `find_fork` only when that answer differs. Not per Stacks block —
+a sortition is a fact about a Bitcoin block and many Stacks blocks stand on one,
+which is the per-block cost this task established does not exist and must not be
+reinstated.
+
+What it does with the news, in order: `find_fork` against Bitcoin,
+`SortitionEngine::retract_above` at the fork point, `BitcoinSource::invalidate_from`
+so the surviving chain's `PreStx` window is the only one left, `ChainState::retract`
+for the Stacks blocks the invalidated tenures carried, the derived chain written
+down *before* anything is executed on the replacement branch, staging cleared, and
+the executor stood on the surviving block.
+
+Three things about it that were decisions rather than mechanics:
+
+- **A burnchain that cannot be read is not a burnchain that moved.** A failed
+  `block_hash_at` is reported and the round carries on; treating the two alike
+  would retract a chain over a network error.
+- **A reorganization reaching below the chain's own root is refused**, naming the
+  height and saying the state needs a checkpoint Bitcoin agrees with. Nothing
+  local can say what replaced a checkpoint's burn anchor.
+- **What it replaces was worse than doing nothing.** A `TrackerError::Bitcoin`
+  used to disable the local derivation and go back to the peer's sortitions — a
+  disagreement about the burnchain answered by trusting the peer *more*.
+
+`BitcoinSource::invalidate_from` is new on the trait, with a default no-op body:
+both real sources have had one for months and the node could not reach either
+through the trait it holds them behind, which is why this was recorded as unwired.
+A source that keeps nothing — a fixture, a recorded window — has nothing to forget,
+and requiring the method would put an empty body in every one of them.
+
+`follow_path::a_bitcoin_reorganization_retracts_the_blocks_it_invalidated` drives
+it through `catch_up` over the captured chain: the burnchain gives back the block
+the last executed tenure was elected in, one sortition is retracted, two Stacks
+blocks are given back, the surviving chain is a prefix of the one executed, the
+executor stands on the surviving block and staging is empty.
+
+## The captured hacknet chain derives — and why it did not
+
+Writing that test needed a *derived* sortition chain over the fixture capture,
+because `find_fork` walks the snapshots a node took and a checkpoint-seeded chain
+has one. It did not derive: the consensus hash was wrong at every block above the
+seed and the running burn total never moved at all.
+
+The cause is a rule this crate does not have. **The number of payout outputs a
+commitment pays is the number of recipients the cycle's reward set holds, capped
+at `OUTPUTS_PER_COMMIT`.** `PayoutSchedule::outputs_at` answers two in a reward
+phase unconditionally. The captured chain has *one* stacker, so every commitment
+there pays one output of 20,000 sats and then its own change — and counting two
+makes each candidate's weight the size of its wallet, which is exactly the trap
+this task records for mainnet, one layer down. With the wrong count no winner is
+selected at all, so the burn total stops moving and every consensus hash after it
+is wrong for that reason alone.
+
+Measured both ways on burn 362–367 of the capture:
+
+```
+two payout outputs:  no winner at any block, total_burn frozen at the seed's 7,380,000
+one payout output:   all five consensus hashes and the running total derive exactly
+                     (7,440,000 → 7,440,000 → 7,440,000 → 7,460,000 → 7,480,000)
+```
+
+It does not bite on mainnet, where every cycle has thousands of recipients and the
+count is two — which is why the mainnet window derives and this one never did. It
+bites on **every** small chain: hacknet, a private testnet, and the tail of a
+mainnet cycle where a reward set could run short. The fix is `outputs_at` reading
+the recipient count of the cycle's reward set rather than assuming two, which is a
+`nano-sortition` change and another agent's file; `follow_path` passes the schedule
+that matches what the chain actually did and says so where it does it.
+
+Two smaller things the same work turned up:
+
+- **A chain cannot be derived across a reward-cycle boundary it has not resolved.**
+  `advance` refuses at a block that opens a cycle, because the consensus hash mixes
+  one bit per cycle and whether that cycle chose an anchor block is not yet
+  knowable. Correct, and it means a test or a node seeding inside a cycle has to
+  stay inside it — the fixture's boundary at burn 361 is why `follow_path` seeds at
+  the second executed tenure rather than the first.
+- **`SortitionTracker::save` now makes its directory.** A chain with nowhere to be
+  written down is re-derived from the checkpoint on the next start, one Bitcoin
+  block download per burn block, and the only sign of it is a line in a log.
