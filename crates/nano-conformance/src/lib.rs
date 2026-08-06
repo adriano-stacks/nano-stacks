@@ -1488,6 +1488,17 @@ fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
         .0
 }
 
+/// Where the captured chain deployed the sBTC registry `.pox-5` reads.
+///
+/// A deployment rather than a boot contract, so it is a fact about the capture in
+/// the same way its chain identifier and burnchain magic are, and a node is told
+/// it by configuration. The captured chain's is not where stacks-core defaults a
+/// testnet to.
+#[must_use]
+pub fn captured_sbtc_registry(root: &Path) -> Option<String> {
+    provenance_field(root, "sbtc_registry_contract")
+}
+
 /// The burnchain magic the captured chain prefixes its `OP_RETURN`s with.
 fn captured_magic(root: &Path) -> [u8; 2] {
     provenance_field(root, "bitcoin_magic")

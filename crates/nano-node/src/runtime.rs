@@ -367,23 +367,27 @@ fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
 ///
 /// A round that executed nothing reads exactly like one that executed a
 /// thousand blocks unless it says so, which is how a node that had never
-/// executed a single block past its checkpoint looked healthy for hours.
-fn report_round(from: u64, round: CatchUpRound, tip: &NakamotoBlock) {
+/// executed a single block past its checkpoint looked healthy for hours. So the
+/// two are different sentences and not the same sentence with a zero in it: a
+/// batch that executed something names where it started, where it ended, how
+/// many blocks that was and the state root it sealed, and a batch that executed
+/// nothing says so first and has no root to name.
+fn round_report(from: u64, round: &CatchUpRound, tip: &NakamotoBlock) -> String {
     let limited = if round.rate_limited {
         ", peer rate limiting"
     } else {
         ""
     };
     if round.executed == 0 {
-        println!(
+        format!(
             "executed nothing: sealed at {from}, {} staged, {} fetched{limited}",
             round.staged, round.fetched
-        );
+        )
     } else {
-        println!(
+        format!(
             "executed {} blocks, {from} to {}, {} staged, state root {}{limited}",
             round.executed, tip.header.chain_length, round.staged, tip.header.state_index_root
-        );
+        )
     }
 }
 
@@ -430,7 +434,7 @@ async fn execute_round(
     let mut peer_failed = false;
     let from = executor.tip().header.chain_length;
     match executor.catch_up(peer, history, pox, staging, budget).await {
-        Ok(round) => report_round(from, round, executor.tip()),
+        Ok(round) => println!("{}", round_report(from, &round, executor.tip())),
         // A round that stops partway has still sealed everything up to where it
         // stopped, and that is what has to be recorded: reporting only successful
         // rounds left a node that had executed eighty-three blocks claiming
@@ -550,8 +554,15 @@ async fn follow(follower: Follower) -> Role {
         if peer_failed || rounds_on_this_peer >= RESELECT_ROUNDS {
             rounds_on_this_peer = 0;
             peer_failed = false;
-            if let Some(chosen) =
-                better_peer(&peer, &config, discovered.as_ref(), executor.as_ref(), &pox).await
+            if let Some(chosen) = better_peer(
+                &peer,
+                &config,
+                discovered.as_ref(),
+                executor.as_ref(),
+                &pox,
+                state.as_ref(),
+            )
+            .await
             {
                 peer = chosen;
                 node = Node::new(peer.clone());
@@ -606,6 +617,7 @@ async fn follow(follower: Follower) -> Role {
                     &last_sortition_winners(node.view().as_ref()),
                     &mut published,
                     &peer,
+                    config.node.pox_5_sbtc_registry_contract.as_deref(),
                 )
                 .await;
             }
@@ -873,6 +885,9 @@ struct RewardCyclePublication {
 /// is the whole difference between serving a reward set and relaying one. The
 /// document nano writes here is the one `SyncClient` parses, so a node's own
 /// `/v3/stacker_set` can attest another node's checkpoint.
+///
+/// `registry` is where this chain's sBTC registry is deployed, which decides
+/// whether the document can carry a waterfall payout address at all.
 async fn publish_reward_cycle(
     state: &RpcState,
     executor: &SharedExecutor,
@@ -881,6 +896,7 @@ async fn publish_reward_cycle(
     winners: &[nano_primitives::Hash160],
     published: &mut RewardCyclePublication,
     peer: &SyncClient,
+    registry: Option<&str>,
 ) {
     context.height = executor.lock().await.bitcoin_height();
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
@@ -896,7 +912,7 @@ async fn publish_reward_cycle(
         executor.lock().await.chainstate_mut().vm_mut(),
         context,
     );
-    let (signers, threshold) = match derived {
+    let derived = match derived {
         Ok(derived) => derived,
         Err(error) => {
             if published.complained != Some(cycle) {
@@ -910,22 +926,39 @@ async fn publish_reward_cycle(
             return;
         }
     };
-    let entries: Vec<nano_rpc::RewardSetSigner> = signers
-        .signers()
-        .iter()
-        .map(|signer| nano_rpc::RewardSetSigner {
-            signing_key: signer.public_key.to_bytes_compressed(),
-            // Not carried by `SignerSet`, which keeps only the weight it
-            // apportioned from the amount. A signer's own weight is what decides
-            // whether a block is attested, so it is served; the amount behind it
-            // is reported as zero rather than reconstructed from the weight,
-            // which would be the threshold back again and not the amount.
-            stacked_amount: 0,
-            weight: signer.weight,
-        })
-        .collect();
+    let entries = nano_rpc::derived_signers(&derived);
+    // The one output a waterfall cycle pays, derived from this node's own sBTC
+    // registry state. Without it the document cannot claim the 4.0 shape, so a
+    // chain whose registry nano cannot read is served the version every reader
+    // accepts and the reason is said once.
+    let sbtc_address = match executor
+        .lock()
+        .await
+        .chainstate_mut()
+        .sbtc_payout_address(registry)
+    {
+        Ok(address) => Some(address),
+        Err(error) => {
+            if published.complained != Some(cycle) {
+                published.complained = Some(cycle);
+                eprintln!(
+                    "this node cannot derive the waterfall payout address from its own sBTC \
+                     registry state, so /v3/stacker_set/{cycle} carries the version 0 shape \
+                     without it: {error}"
+                );
+            }
+            None
+        }
+    };
     state
-        .publish_stacker_set(cycle, nano_rpc::stacker_set_payload(&entries, threshold))
+        .publish_stacker_set(
+            cycle,
+            nano_rpc::stacker_set_payload(
+                &entries,
+                derived.pox_ustx_threshold,
+                sbtc_address.as_ref(),
+            ),
+        )
         .await;
     let writers: Vec<nano_primitives::Hash160> = entries
         .iter()
@@ -2059,16 +2092,17 @@ async fn better_peer(
     discovered: Option<&Discovered>,
     executor: Option<&SharedExecutor>,
     pox: &PoxInfo,
+    state: Option<&RpcState>,
 ) -> Option<SyncClient> {
     let pool = follow_pool(config, discovered);
     let candidates = pool.candidate_tips().await;
-    let peer = match executor {
+    let selected = match executor {
         Some(executor) => {
             let mut held = executor.lock().await;
             let signers = held.recorded_signer_set(bitcoin_context(config, pox));
             let burn = held.burn_view();
             let chosen = nano_sync::choose_canonical_tip(&candidates, signers.as_ref(), burn)
-                .map(|tip| tip.peer);
+                .map(|tip| (tip.peer, tip.header.block_id(), tip.header.chain_length));
             // Released before the answer is acted on: every account read and every
             // block admission takes this same lock.
             drop(held);
@@ -2077,9 +2111,24 @@ async fn better_peer(
         // A node with no executed state of its own — a signer-only or RPC-only
         // configuration — has neither answer to weigh with, and says so by
         // passing neither rather than by substituting a peer's.
-        None => nano_sync::choose_canonical_tip(&candidates, None, None)?.peer,
+        None => nano_sync::choose_canonical_tip(&candidates, None, None)
+            .map(|tip| (tip.peer, tip.header.block_id(), tip.header.chain_length))?,
     };
+    let (peer, stacks_tip, stacks_height) = selected;
     let chosen = pool.peer(peer)?.clone();
+    // What the choice chose, published from the choice: it is remade on a timer
+    // whether or not the answer moves, and it is the one of the three heights
+    // that is nobody else's — a peer advertises, this node selects, the executor
+    // executes.
+    if let Some(state) = state {
+        state
+            .publish_selected(nano_rpc::SelectedTip {
+                stacks_height,
+                stacks_tip,
+                peer: chosen.base_url().to_string(),
+            })
+            .await;
+    }
     (chosen.base_url() != current.base_url()).then(|| {
         println!(
             "following {} now, of {} peers known",
@@ -2714,6 +2763,68 @@ async fn terminated() {
 
 #[cfg(test)]
 mod tests {
+    /// Every execution batch says where it started, where it ended, how many
+    /// blocks that was and the root it sealed — and a batch that executed nothing
+    /// says *that*, in a sentence nothing else produces.
+    ///
+    /// This is the line an operator reads to know whether a node is moving. It
+    /// was once one sentence with a count in it, so a node that had executed
+    /// nothing past its checkpoint printed the same shape as one executing a
+    /// thousand blocks a round, and looked healthy for hours.
+    #[test]
+    fn every_execution_batch_names_its_start_end_count_and_root() {
+        let mut tip = test_block(1_200);
+        tip.header.state_index_root = nano_primitives::TrieHash::from_bytes([0xab; 32]);
+        let round = |executed: usize, rate_limited: bool| crate::CatchUpRound {
+            reorganized: None,
+            fetched: 40,
+            executed,
+            staged: 9,
+            rate_limited,
+        };
+
+        let moved = super::round_report(1_100, &round(100, false), &tip);
+        assert_eq!(
+            moved,
+            format!(
+                "executed 100 blocks, 1100 to 1200, 9 staged, state root {}",
+                tip.header.state_index_root
+            )
+        );
+
+        // A round that executed nothing has no root to name and must not be
+        // mistakable for one that did.
+        let still = super::round_report(1_100, &round(0, false), &tip);
+        assert_eq!(still, "executed nothing: sealed at 1100, 9 staged, 40 fetched");
+        assert!(!still.contains("state root"));
+
+        // The peer asking a node to slow down is not the node failing to move.
+        assert!(
+            super::round_report(1_100, &round(0, true), &tip).ends_with(", peer rate limiting")
+        );
+    }
+
+    /// A header with nothing in it but the two fields the report reads.
+    fn test_block(chain_length: u64) -> super::NakamotoBlock {
+        super::NakamotoBlock {
+            header: nano_chainstate::NakamotoBlockHeader {
+                version: 1,
+                chain_length,
+                bitcoin_spent: 0,
+                consensus_hash: nano_primitives::ConsensusHash::from_bytes([0; 20]),
+                parent_block_id: nano_primitives::StacksBlockId::from_bytes([7; 32]),
+                transaction_merkle_root: nano_primitives::Sha256Sum::default(),
+                state_index_root: nano_primitives::TrieHash::from_bytes([0; 32]),
+                timestamp: 0,
+                miner_signature: nano_crypto::MessageSignature::from_bytes([0; 65]),
+                signer_signatures: Vec::new(),
+                pox_treatment: nano_primitives::BitVec::zeros(1).expect("a bit vector"),
+                problematic_transactions: Vec::new(),
+            },
+            transactions: Vec::new(),
+        }
+    }
+
     /// A state directory belongs to the checkpoint it was built from.
     ///
     /// Its trie stands on that checkpoint's state, so pointing it at another

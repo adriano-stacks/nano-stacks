@@ -160,7 +160,7 @@ fn the_derived_and_recorded_signer_sets_agree() {
     let derived = chainstate
         .derived_signer_set(context)
         .expect("the cycle has pox-5 positions")
-        .0
+        .signers
         .signing_weights()
         .expect("the derived set is well formed")
         .entries()

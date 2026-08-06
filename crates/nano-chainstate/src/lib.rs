@@ -57,6 +57,15 @@ pub struct AppliedBlock {
     pub execution: ExecutionResult,
     pub execution_cost: ExecutionCost,
     pub receipts: Vec<TransactionReceipt>,
+    /// The miner rewards this block matured, which only a tenure-start block
+    /// does. Reported here because execution is the only place that knows them:
+    /// they are credited from the tenure accounting and leave no trace in the
+    /// block.
+    pub matured_rewards: Vec<NativeStxCredit>,
+    /// The reward set this block computed, if it is the prepare-phase block that
+    /// computed one. Not "the set of this cycle" — a node can read that any
+    /// time; this is the transition, which is what an observer is told about.
+    pub reward_set: Option<signers::DerivedRewardSet>,
 }
 
 /// Native accounting that is applied when an epoch-4 block is finalized.
@@ -1429,14 +1438,27 @@ impl ChainState {
     /// writes down at a prepare phase, and the two agreeing is what makes
     /// reading the recorded one instead of walking pox-5 every block safe.
     ///
-    /// Answers the per-slot stacking threshold alongside, because that exists
-    /// only in the derivation: it is `pox_ustx_threshold` in the reward set a
-    /// node serves, and nothing recomputes it from the weights `.signers` holds.
+    /// Answers the per-slot stacking threshold and the stacked amounts
+    /// alongside, because those exist only in the derivation: they are
+    /// `pox_ustx_threshold` and `stacked_amt` in the reward set a node serves,
+    /// and nothing recomputes them from the weights `.signers` holds.
     pub fn derived_signer_set(
         &mut self,
         context: BitcoinBlockContext,
-    ) -> Result<(SignerSet, u128), ChainStateError> {
+    ) -> Result<signers::DerivedRewardSet, ChainStateError> {
         signers::active_signer_set(&mut self.vm, context)
+    }
+
+    /// The single output this chain's waterfall cycles pay, as its own sBTC
+    /// registry names it.
+    ///
+    /// The registry is a deployment rather than a boot contract, so anything but
+    /// mainnet has to be told where its own is.
+    pub fn sbtc_payout_address(
+        &mut self,
+        registry: Option<&str>,
+    ) -> Result<nano_address::PoxAddress, ChainStateError> {
+        signers::sbtc_payout_address(&mut self.vm, registry)
     }
 
     /// Check a block's signer signatures against the set its cycle recorded.
@@ -1761,6 +1783,9 @@ impl ChainState {
         // miner rewards that mature from them, while the MARF looked clean.
         let mut ledger = self.ledger.clone();
         let mut effects = effects;
+        // Kept apart from `effects`, which also carries whatever the caller
+        // brought: an observer is told what *matured*, not what was credited.
+        let mut matured_rewards = Vec::new();
         let result = (|| {
             // Inside the block, and first: the reward set is read out of state, so
             // it has to be read from the state *this block* stands on. Before the
@@ -1775,6 +1800,7 @@ impl ChainState {
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
                 let matured = self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;
+                matured_rewards.clone_from(&matured.credits);
                 effects.credits.extend(matured.credits);
                 effects.liquid_supply_increase = effects
                     .liquid_supply_increase
@@ -1788,7 +1814,8 @@ impl ChainState {
             // The signer set is written before the block's transactions, so it
             // must be computed here rather than alongside the matured rewards.
             let coinbase_height = u64::from(self.vm.tenure_height()?);
-            signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
+            let reward_set =
+                signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
             let mut execution_cost = ExecutionCost::ZERO;
             let mut receipts = Vec::with_capacity(block.transactions.len());
             for transaction in &block.transactions {
@@ -1860,6 +1887,8 @@ impl ChainState {
                 execution: ExecutionResult { state_root },
                 execution_cost,
                 receipts,
+                matured_rewards: std::mem::take(&mut matured_rewards),
+                reward_set,
             })
         })();
         match result {

@@ -5,10 +5,13 @@
 //! writes are consensus state, so a node that skips them diverges from the
 //! reward cycle onwards.
 
+use std::collections::BTreeMap;
+
 use clarity::vm::{
     ClarityName, Value,
     types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData},
 };
+use nano_address::{PoxAddress, PoxAddressType32};
 use nano_crypto::StacksPublicKey;
 use nano_primitives::Network;
 use nano_primitives::{Hash160, hash160};
@@ -18,6 +21,22 @@ use crate::{ChainStateError, SignerSet, SignerWeights};
 
 /// Reward addresses paid by one Bitcoin commitment.
 const OUTPUTS_PER_COMMIT: u32 = 2;
+
+/// The sBTC registry a waterfall cycle's payout address is derived from.
+///
+/// Not a boot contract, so `boot_code_id` cannot name it. Mainnet's is fixed and
+/// non-negotiable; every other chain deploys its own, which is why stacks-core
+/// makes that one configurable (`NodeConfig::pox_5_sbtc_registry_contract`) — and
+/// why nano asks for it rather than defaulting. The captured hacknet chain's is
+/// at `ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039`, not at the testnet
+/// deployment, so a default would have been wrong on the first chain tried.
+const SBTC_REGISTRY_MAINNET: &str = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry";
+
+/// The Clarity type prefix of a contract principal, which is how the sBTC
+/// deposit script names the recipient (`clarity-types`, `PrincipalData`'s
+/// `inner_consensus_serialize`: the prefix, the issuer's version and hash, then
+/// the contract name length-prefixed).
+const CONTRACT_PRINCIPAL_PREFIX: u8 = 6;
 
 /// Address versions for a standard single-signature principal.
 ///
@@ -138,55 +157,171 @@ fn signer_entry(value: Value) -> Result<(Hash160, u32), ChainStateError> {
     ))
 }
 
-/// The signer set derived from the pox-5 positions stacked for a reward cycle,
-/// and the per-slot stacking threshold it was apportioned against.
+/// A reward cycle's signer set as its own `PoX-5` positions derive it.
+///
+/// `SignerSet` alone is what consensus needs — a key and a weight — and it is
+/// deliberately no more than that. Everything else here exists only in the
+/// derivation and cannot be recovered from a weight afterwards: the per-slot
+/// threshold, and what each signer actually stacked. Both are fields of the
+/// `/v3/stacker_set` document a signer reads, so a node that discards them
+/// serves zeros.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedRewardSet {
+    pub reward_cycle: u64,
+    /// The weighted signers, in the order the signature check and the signer
+    /// bitvec read them.
+    pub signers: SignerSet,
+    /// What each signer stacked, in `signers` order.
+    pub stacked: Vec<u128>,
+    pub pox_ustx_threshold: u128,
+}
+
+/// The signer set derived from the pox-5 positions stacked for a reward cycle.
 ///
 /// This is the *derivation*; `recorded_signer_set` is what the chain wrote down
 /// from it, and reading that is what block validation does. This one stays
 /// because `update_signer_set` writes from it, because the two agreeing is what
-/// makes reading the recorded one safe — and because the threshold exists only
-/// here. It is `pox_ustx_threshold` in the reward set a node publishes over RPC,
-/// and nothing can recompute it from the weights `.signers` records.
+/// makes reading the recorded one safe — and because the threshold and the
+/// stacked amounts exist only here.
 pub fn active_signer_set(
     vm: &mut Vm,
     context: BitcoinBlockContext,
-) -> Result<(SignerSet, u128), ChainStateError> {
+) -> Result<DerivedRewardSet, ChainStateError> {
     let cycle = reward_cycle_at(context).ok_or(ChainStateError::NoSignerSet(0))?;
-    let reward_slots = context.reward_phase_length * OUTPUTS_PER_COMMIT;
-    let stakers = stake_entries(vm, cycle)?;
+    derive_signer_set(vm, cycle, context.reward_phase_length * OUTPUTS_PER_COMMIT)
+}
+
+/// Walk a cycle's positions and apportion them over its reward slots.
+fn derive_signer_set(
+    vm: &mut Vm,
+    reward_cycle: u64,
+    reward_slots: u32,
+) -> Result<DerivedRewardSet, ChainStateError> {
+    let stakers = stake_entries(vm, reward_cycle)?;
     if stakers.is_empty() {
-        return Err(ChainStateError::NoSignerSet(cycle));
+        return Err(ChainStateError::NoSignerSet(reward_cycle));
     }
-    SignerSet::from_reward_slots(stakers, reward_slots)
+    // Summed per key exactly as the apportionment sums it: one signer may hold
+    // more than one position, and the amount served has to be the amount weighed.
+    let mut amounts: BTreeMap<[u8; 33], u128> = BTreeMap::new();
+    for (key, amount) in &stakers {
+        let entry = amounts.entry(key.to_bytes_compressed()).or_default();
+        *entry = entry.saturating_add(*amount);
+    }
+    let (signers, pox_ustx_threshold) = SignerSet::from_reward_slots(stakers, reward_slots)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    let stacked = signers
+        .signers()
+        .iter()
+        .map(|signer| {
+            amounts
+                .get(&signer.public_key.to_bytes_compressed())
+                .copied()
+                .unwrap_or_default()
+        })
+        .collect();
+    Ok(DerivedRewardSet {
+        reward_cycle,
+        signers,
+        stacked,
+        pox_ustx_threshold,
+    })
+}
+
+/// The single Bitcoin output a waterfall reward cycle pays.
+///
+/// It is not an address anyone chose: it is the taproot output key of the sBTC
+/// deposit script for the registry's current aggregate key, paying `.pox-5`
+/// (`chainstate/nakamoto/signer_set.rs`, `pox_5_compute_and_update_signers`).
+/// A chain with no registry to ask has no waterfall address, and says so.
+pub fn sbtc_payout_address(
+    vm: &mut Vm,
+    configured: Option<&str>,
+) -> Result<PoxAddress, ChainStateError> {
+    let network = vm.network();
+    let registry = sbtc_registry_contract(network, configured)?;
+    let sender = PrincipalData::Standard(registry.issuer.clone());
+    let value = vm.call_contract_values(&sender, &registry, "get-current-aggregate-pubkey", &[])?;
+    let value = match value {
+        Value::Response(response) if response.committed => *response.data,
+        other => other,
+    };
+    let key: [u8; 33] = expect_buffer(value)?.try_into().map_err(|_| {
+        ChainStateError::InvalidTransaction(
+            "the sBTC registry's aggregate key is not 33 bytes".to_owned(),
+        )
+    })?;
+    let recipient = contract_principal_bytes(&boot_contract(network, "pox-5"));
+    let output = nano_bitcoin::sbtc::sbtc_pox5_deposit_taproot_output_key(&key, &recipient)
+        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    Ok(PoxAddress::Addr32 {
+        mainnet: network.is_mainnet(),
+        address_type: PoxAddressType32::P2tr,
+        bytes: output,
+    })
+}
+
+/// The registry contract this chain reads its aggregate key from.
+///
+/// Mainnet's is the constant whatever an operator says, because a mainnet node
+/// reading another contract's aggregate key would derive a payout address the
+/// network does not pay. Anywhere else there is nothing to fall back on.
+fn sbtc_registry_contract(
+    network: Network,
+    configured: Option<&str>,
+) -> Result<QualifiedContractIdentifier, ChainStateError> {
+    let name = if network.is_mainnet() {
+        SBTC_REGISTRY_MAINNET
+    } else {
+        configured.ok_or_else(|| {
+            ChainStateError::InvalidTransaction(
+                "this chain's sBTC registry contract is not configured".to_owned(),
+            )
+        })?
+    };
+    QualifiedContractIdentifier::parse(name)
         .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))
 }
 
-/// Compute and store the next cycle's signer set, if this block starts a prepare phase.
+/// A contract principal in the encoding the deposit script commits to.
+fn contract_principal_bytes(contract: &QualifiedContractIdentifier) -> Vec<u8> {
+    let name = contract.name.as_bytes();
+    let mut bytes = Vec::with_capacity(23 + name.len());
+    bytes.push(CONTRACT_PRINCIPAL_PREFIX);
+    bytes.push(contract.issuer.version());
+    bytes.extend_from_slice(&contract.issuer.1);
+    bytes.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
+    bytes.extend_from_slice(name);
+    bytes
+}
+
+/// Compute and store the next cycle's signer set, if this block starts a prepare
+/// phase, and answer with the set it wrote.
+///
+/// The answer is what a `new_block` event reports as the cycle a block anchored:
+/// this is the one place that knows a set was computed rather than merely
+/// readable, and stacks-core publishes it from the same transition.
 pub fn update_signer_set(
     vm: &mut Vm,
     context: BitcoinBlockContext,
     coinbase_height: u64,
-) -> Result<(), ChainStateError> {
+) -> Result<Option<DerivedRewardSet>, ChainStateError> {
     let Some(reward_cycle) = prepare_phase_reward_cycle(context) else {
-        return Ok(());
+        return Ok(None);
     };
     let network = vm.network();
     let signers = boot_contract(network, "signers");
     // A cycle is only set up once, by whichever block reaches the prepare phase first.
     let Ok(last_set_cycle) = read_u128(vm, &signers, "get-last-set-cycle", &[]) else {
-        return Ok(());
+        return Ok(None);
     };
     if last_set_cycle >= u128::from(reward_cycle) {
-        return Ok(());
+        return Ok(None);
     }
 
     let reward_slots = context.reward_phase_length * OUTPUTS_PER_COMMIT;
-    let stakers = stake_entries(vm, reward_cycle)?;
-    if stakers.is_empty() {
-        return Err(ChainStateError::NoSignerSet(reward_cycle));
-    }
-    let (set, _) = SignerSet::from_reward_slots(stakers, reward_slots)
-        .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+    let derived = derive_signer_set(vm, reward_cycle, reward_slots)?;
+    let set = &derived.signers;
     let principals = set
         .signers()
         .iter()
@@ -195,13 +330,13 @@ pub fn update_signer_set(
 
     let slots = tuple_list(
         &principals,
-        &set,
+        set,
         &ClarityName::from_literal("num-slots"),
         |_| Value::UInt(1),
     )?;
     let weights = tuple_list(
         &principals,
-        &set,
+        set,
         &ClarityName::from_literal("weight"),
         |weight| Value::UInt(u128::from(weight)),
     )?;
@@ -221,7 +356,7 @@ pub fn update_signer_set(
         "set-signers",
         &[Value::UInt(u128::from(reward_cycle)), weights],
     )?;
-    Ok(())
+    Ok(Some(derived))
 }
 
 /// Walk the `PoX-5` linked list of signers registered for a reward cycle.

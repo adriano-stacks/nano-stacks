@@ -28,6 +28,7 @@ mod block_info_tenure_height;
 mod burn_spends;
 mod catch_up_rounds;
 mod coinbase_schedule;
+mod derived_reward_set;
 mod engine_failure;
 mod engine_state_roots;
 mod event_delivery;

@@ -37,8 +37,8 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
 pub use events::{
     BlockEventContext, DEFAULT_DISPATCH_ATTEMPTS, EventDispatcher, EventKind, MaturedReward,
-    ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner,
-    mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
+    ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner, derived_signers,
+    matured_rewards, mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
     proposal_response_payload, stackerdb_chunks_payload, stacker_set_payload,
 };
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
@@ -104,6 +104,14 @@ pub struct RpcState {
     /// height and no view, and the height is the whole of what "how far behind
     /// am I" needs.
     followed_height: Arc<RwLock<Option<u64>>>,
+    /// The tip this node's own fork choice picked out of what its peers offered.
+    ///
+    /// The third of the three heights, and the one nothing else can be read off:
+    /// peers *advertise* tips, this node *selects* one by signer weight and burn
+    /// view, and it *executes* up to some height at or below it. A selection that
+    /// is not the highest thing advertised is a tip this node refused, and
+    /// reporting only the ends makes that invisible.
+    selected: Arc<RwLock<Option<SelectedTip>>>,
     /// What this node executed and sealed, which every Stacks-compatible route
     /// answers from.
     executed: Arc<RwLock<Option<Executed>>>,
@@ -170,6 +178,7 @@ impl RpcState {
         Self {
             followed: Arc::new(RwLock::new(None)),
             followed_height: Arc::new(RwLock::new(None)),
+            selected: Arc::new(RwLock::new(None)),
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
@@ -289,6 +298,16 @@ impl RpcState {
     /// exactly the node the number exists for.
     pub async fn publish_followed_height(&self, height: u64) {
         *self.followed_height.write().await = Some(height);
+    }
+
+    /// Say which tip this node's fork choice picked, and off whom.
+    ///
+    /// Published by the choice itself rather than by whoever acts on it: the
+    /// choice is remade on a timer whether or not the answer changes, and a
+    /// node that reported it only when it changed peers would stop reporting it
+    /// exactly when it settled.
+    pub async fn publish_selected(&self, selected: SelectedTip) {
+        *self.selected.write().await = Some(selected);
     }
 
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
@@ -565,6 +584,7 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
 /// nano's own, and exists so that catching up is measurable.
 async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncStatusWire>, RpcError> {
     let followed = *state.followed_height.read().await;
+    let selected = state.selected.read().await.clone();
     let tip = state
         .executed
         .read()
@@ -573,6 +593,11 @@ async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncSta
         .map(|executed| executed.tip.clone());
     Ok(axum::Json(SyncStatusWire {
         followed_stacks_height: followed,
+        selected_stacks_height: selected.as_ref().map(|selected| selected.stacks_height),
+        selected_stacks_tip: selected
+            .as_ref()
+            .map(|selected| selected.stacks_tip.to_string()),
+        selected_from_peer: selected.map(|selected| selected.peer),
         executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
         executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
         executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
@@ -1500,9 +1525,21 @@ pub struct SealedTip {
     pub state_index_root: TrieHash,
 }
 
+/// The tip this node's fork choice settled on, and who offered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedTip {
+    pub stacks_height: u64,
+    pub stacks_tip: StacksBlockId,
+    /// The peer it came from, named the way an operator configured it.
+    pub peer: String,
+}
+
 #[derive(Serialize)]
 struct SyncStatusWire {
     followed_stacks_height: Option<u64>,
+    selected_stacks_height: Option<u64>,
+    selected_stacks_tip: Option<String>,
+    selected_from_peer: Option<String>,
     executed_stacks_height: Option<u64>,
     executed_stacks_tip: Option<String>,
     executed_state_index_root: Option<String>,
@@ -2101,6 +2138,68 @@ mod tests {
         assert_eq!(status["blocks_behind"], json!(8));
     }
 
+    /// Three heights, three names, one route that reports all three.
+    ///
+    /// The peer *advertises* a tip, this node's fork choice *selects* one, and the
+    /// executor *executes* up to a third. They are three different facts and the
+    /// middle one is the one nothing else can be read off: a node whose selection
+    /// sits below what its peers advertise has refused a tip, and a node whose
+    /// execution sits below its selection is catching up. Reporting only the ends
+    /// cannot tell those two apart, and that is the whole of what
+    /// [[046-distinguish-followed-and-executed-chain-tips]] was about.
+    #[tokio::test]
+    async fn the_followed_selected_and_executed_tips_are_three_separate_answers() {
+        let state = RpcState::new(NETWORK);
+        // The peer says 12. The fork choice would not have the highest thing
+        // offered and settled on 9. This node has executed 4.
+        state.publish(captured_view()).await;
+        state
+            .publish_selected(super::SelectedTip {
+                stacks_height: 9,
+                stacks_tip: StacksBlockId::from_bytes([9; 32]),
+                peer: "http://peer.example:20443/".to_owned(),
+            })
+            .await;
+        state
+            .publish_executed(SealedTip {
+                stacks_height: 4,
+                stacks_tip: StacksBlockId::from_bytes([4; 32]),
+                stacks_block_hash: BlockHeaderHash::from_bytes([5; 32]),
+                consensus_hash: ConsensusHash::from_bytes([6; 20]),
+                bitcoin_height: 3,
+                state_index_root: TrieHash::from_bytes([7; 32]),
+            })
+            .await;
+
+        let status = body_json(
+            router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/nano/sync_status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(status["followed_stacks_height"], json!(12));
+        assert_eq!(status["selected_stacks_height"], json!(9));
+        assert_eq!(status["executed_stacks_height"], json!(4));
+        assert_eq!(
+            status["selected_stacks_tip"],
+            json!(StacksBlockId::from_bytes([9; 32]).to_string())
+        );
+        assert_eq!(
+            status["selected_from_peer"],
+            json!("http://peer.example:20443/")
+        );
+        // Behind the peer, not behind the selection: how far there is left to go
+        // is measured against what the network has, and a fork choice that
+        // refused the peer's tip does not shorten the journey.
+        assert_eq!(status["blocks_behind"], json!(8));
+    }
+
     /// A node that has followed a peer but executed nothing must not answer the
     /// Stacks tip at all, rather than answering with the peer's.
     #[tokio::test]
@@ -2688,7 +2787,7 @@ mod tests {
         state
             .publish_stacker_set(
                 140,
-                super::stacker_set_payload(&signers, 50_000_000_000),
+                super::stacker_set_payload(&signers, 50_000_000_000, None),
             )
             .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
