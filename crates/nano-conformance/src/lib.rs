@@ -750,6 +750,19 @@ pub fn replay_into(
     }
 }
 
+/// The capture a test should read, which is not always the one in the tree.
+///
+/// `NANO_FIXTURES` points the suite at a capture outside the repository — the way
+/// a mainnet or a live-hacknet one is read without installing it first, and the
+/// same variable the scoreboard already honoured. A test that hardcodes
+/// `CARGO_MANIFEST_DIR/fixtures` cannot be handed a chain the in-tree one does not
+/// contain, which is how five VRF gates came to be unrunnable: the tree's capture
+/// carries no leader-key registry, and the chain it came from is gone.
+#[must_use]
+pub fn capture_root(default: &Path) -> std::path::PathBuf {
+    std::env::var_os("NANO_FIXTURES").map_or_else(|| default.to_path_buf(), std::path::PathBuf::from)
+}
+
 /// Every captured block, in height order.
 #[must_use]
 pub fn captured_block_paths(fixture: &Path) -> Vec<std::path::PathBuf> {

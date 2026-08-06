@@ -44,11 +44,22 @@ not wired into proposal execution.
       those before it.
 - [x] Wire the same local tracker into proposal validation that canonical block
       execution uses. `hosting::LocalBurnView`. See *What was actually broken*.
-- [ ] Pin a proposal whose miner key was registered below the ordinary retained
+- [~] Pin a proposal whose miner key was registered below the ordinary retained
       burn window, plus wrong-key and wrong-parent-VRF controls. The wrong-key and
-      wrong-parent-VRF halves are `conformance/tenure_vrf_enforcement.rs`; the
-      below-the-window registration needs a capture whose leader key sits below
-      its own burn span, which the current mainnet capture does not have.
+      wrong-parent-VRF halves are `conformance/tenure_vrf_enforcement.rs`, and that
+      file no longer hardcodes the in-tree capture: it takes any capture through
+      `nano_conformance::capture_root`, and it resolves a winning commitment's key
+      through `sortition/leader-keys.json` as well as through the registrations
+      inside the captured Bitcoin window. That second source is the whole point —
+      a key is registered once and named for years, so on mainnet the registration
+      is below any window a capture keeps, and searching the captured Bitcoin
+      blocks alone could only ever find the exotic case.
+      Not yet closed: on the live pox-5 capture (keys at burn 204, window 375–399)
+      none of the three registered keys verifies the chosen tenure's coinbase proof
+      against the captured sortition hash, so the gate still reports that it cannot
+      run rather than passing. That is either the tenure the helper picks or that
+      chain's data, and it wants its own measurement — the mainnet capture, whose
+      keys *do* resolve, is the one to pin it with.
 - [ ] Run a stock `stacks-signer` against nano and retain evidence that it
       accepts and signs a valid proposal after nano validates it locally.
 

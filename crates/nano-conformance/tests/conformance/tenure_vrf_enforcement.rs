@@ -41,7 +41,7 @@ struct Tenure {
 /// anchor block is not one — so the blocks before it come along, and run with
 /// the contexts the network gave them.
 fn captured_tenure() -> Option<Tenure> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let fixture = capture();
     let snapshots = nano_conformance::captured_bitcoin_snapshots(&fixture)?;
     let operations = nano_conformance::captured_bitcoin_operations(&fixture)?;
     let mut prefix = Vec::new();
@@ -85,9 +85,37 @@ fn captured_tenure() -> Option<Tenure> {
 /// which exists to show the rejections below are not rejecting everything. The
 /// rejections do not depend on this.
 fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    let operations = nano_conformance::captured_bitcoin_operations(&fixture)?;
-    operations
+    let fixture = capture();
+    candidate_keys(&fixture).into_iter().find(|key| {
+        nano_chainstate::verify_coinbase_vrf_proof(
+            &tenure.target.block,
+            key,
+            &tenure.target.context.sortition_hash,
+        )
+        .is_ok()
+    })
+}
+
+fn capture() -> std::path::PathBuf {
+    nano_conformance::capture_root(&Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
+}
+
+/// Every VRF key the capture could resolve a winning commitment through.
+///
+/// Two sources, and the second is the one that matters. The captured Bitcoin
+/// blocks hold the registrations that happened *inside* the captured burn window —
+/// which on a chain a few hundred blocks old is most of them, and on mainnet is
+/// almost none. A leader key is registered once and named for years afterwards, so
+/// the registration a winning commitment names normally sits far below any window a
+/// capture keeps: the live pox-5 hacknet registers at burn 204 and is still naming
+/// those three keys at burn 393.
+///
+/// `sortition/leader-keys.json` is the artifact that exists for exactly that, and
+/// reading it here is what makes these gates runnable against a capture whose keys
+/// are below its own window — which is the ordinary case, not the exotic one.
+fn candidate_keys(fixture: &Path) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = nano_conformance::captured_bitcoin_operations(fixture)
+        .unwrap_or_default()
         .values()
         .flatten()
         .filter_map(|operation| match operation.kind {
@@ -96,14 +124,21 @@ fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
             } => Some(vrf_public_key),
             _ => None,
         })
-        .find(|key| {
-            nano_chainstate::verify_coinbase_vrf_proof(
-                &tenure.target.block,
-                key,
-                &tenure.target.context.sortition_hash,
-            )
-            .is_ok()
-        })
+        .collect();
+    let registry = fixture
+        .join("sortition")
+        .join(nano_node::sortition::LEADER_KEY_FILE);
+    if let Ok(bytes) = fs::read(&registry)
+        && let Ok(records) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+    {
+        keys.extend(records.iter().filter_map(|record| {
+            let hex = record.get("public_key")?.as_str()?;
+            <[u8; 32]>::try_from(hex::decode(hex).ok()?.as_slice()).ok()
+        }));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// The leader-key registration that produced this tenure's coinbase proof.
@@ -111,7 +146,7 @@ fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
 /// Found the same way and with the same caveat as `winning_key`: by asking which
 /// registration's VRF key verifies the proof.
 fn winning_registration(tenure: &Tenure) -> Option<nano_bitcoin::BitcoinOperation> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let fixture = capture();
     let key = winning_key(tenure)?;
     nano_conformance::captured_bitcoin_operations(&fixture)?
         .values()
@@ -145,7 +180,7 @@ fn accepts_with(
     context: BitcoinBlockContext,
     operations: &[nano_bitcoin::BitcoinOperation],
 ) -> Result<(), String> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let fixture = capture();
     let (mut chainstate, source) = nano_conformance::replay_chainstate(&fixture)
         .map_err(|error| format!("open the checkpoint: {error}"))?;
     let mut parent = Some(source);
