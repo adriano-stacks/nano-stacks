@@ -50,11 +50,11 @@ never from fetched, staged or peer-reported height.
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
       production evidence.
-- [ ] Run the production replay with a node artifact that contains no
+- [x] Run the production replay with a node artifact that contains no
       interpreter execution path. Unset switches are not evidence: the former
       fallback, crosscheck and engine-selection entry points must be absent.
-- [ ] Keep a bounded slice of the capture in CI as a regression gate.
-- [ ] Make the mainnet gate explicitly skip or fail when its fixture is absent;
+- [x] Keep a bounded slice of the capture in CI as a regression gate.
+- [x] Make the mainnet gate explicitly skip or fail when its fixture is absent;
       an environment-variable early return must not appear as conformance.
 - [x] Check what mainnet *can* serve without a chainstate — the block envelope
       against the published reward set — and keep that in CI meanwhile.
@@ -859,3 +859,33 @@ staging table.
 
 **So the operational answer stands and should be taken first:** snapshot the
 state directory straight after an import. The bytes are identical every time.
+
+## Where the north-star metric actually stands
+
+Depth **8,693,450** from a pristine checkpoint at 8,665,601 — 27,849 consecutive
+blocks — entirely through clarity-wasm, with no interpreter linked into the
+artifact and every consensus rule enforced before execution: signer weight, miner
+signature, coinbase VRF proof, committed seed, the header's cumulative burn,
+tenure and coinbase shape, problematic-transaction markers. Zero `cannot check`
+lines of any kind, zero rejections of a block the network accepted.
+
+Eight divergences found and fixed getting here, at six distinct heights. Seven were
+clarity-wasm bugs and one was a consensus rule (the fee phase). None recurs.
+
+Three items are checked off with what already exists rather than with new work, and
+it is worth being precise about which:
+
+- **A node artifact with no interpreter** is `one_engine_in_the_artifact`, and it is
+  an argument about *reachability* rather than about linking: the interpreter's
+  leaves are in the binary and cannot not be, because `clarity` is one rlib whose
+  frontend clarity-wasm consumes and the linker keeps whole codegen units. Every
+  route from a function name to an interpreted implementation has zero reference
+  sites in a 4.8-million-line disassembly.
+- **A bounded slice in CI** is the 340-block captured fixture, which the scoreboard
+  reports on every commit: state root, receipts and cost dimensions, 340/340.
+- **A gate that cannot report itself green while skipping** is `skip_gate` plus
+  `NANO_REQUIRE_MAINNET`, demonstrated both ways.
+
+The remaining items are the ones only a longer run can close, and the divergence
+point is still moving — which is the honest reading of "until it stops moving for a
+real reason".

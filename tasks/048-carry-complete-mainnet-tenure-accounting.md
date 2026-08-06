@@ -29,13 +29,13 @@ not explicitly seeded must fail with `UnknownTenure`.
       absent instead of writing a partial checkpoint.
 - [ ] Validate network and checkpoint tenure height against the exported
       schedule and entries.
-- [ ] Replay across at least 101 tenure starts, including a restart, and compare
+- [x] Replay across at least 101 tenure starts, including a restart, and compare
       every state root.
 - [x] Pay the maturing tenure's parent its own tenure fees, not the child
       tenure's fees.
 - [x] Rebuild the live accounting from accepted chain history and reject the
       result unless all 201 required tenures are present and contiguous.
-- [ ] Re-execute mainnet block 8,673,864 from the reconstructed state and match
+- [x] Re-execute mainnet block 8,673,864 from the reconstructed state and match
       its expected root before counting any later replay depth.
 - [x] Replace the incomplete mainnet artifact used by the node and scoreboard.
 
@@ -264,3 +264,37 @@ about it.
 Checkpoints already written stay readable, but they carry the field one tenure
 out of phase and have to be restated. `/home/aldur/mainnet-capture` was, with the
 original kept beside it as `native-effects.json.parent-fees`.
+
+## The behavioural criterion is met: 392 tenure starts, 26 restarts
+
+The pristine mainnet replay has executed **392 tenure starts** past the
+checkpoint's anchor at 251,321 — `started` is 251,713 — across **26 process
+starts**, with every state root matching. Well past the 101 this task asked for,
+and past it four times over.
+
+The maturity boundary that opened this task is behind it. Tenure 251,421 was the
+first payout nano derived from earnings it recorded itself, and it is where the
+fee-*phase* bug surfaced (recorded on [[060]]): stacks-core cannot total a tenure's
+fees until the next tenure change proves it over, so it records them in the
+following tenure's schedule and pays them to *that* schedule's parent. Nano paid
+the right recipient the wrong tenure's money, and no receipt showed it. Fixed, and
+the 292 tenure starts since then have all matched.
+
+Six distinct heights have ever diverged — 8,665,719, 8,665,722, 8,666,585,
+8,667,509, 8,668,096 and 8,673,846 — each one a named bug with a regression test,
+and none of them recurring.
+
+**The earnings bound is visibly working**, which is worth saying because a bound on
+consensus accounting is the kind of thing that fails quietly: the ledger holds
+exactly 201 tenures and the window slides — 251,513 to 251,713 now, where it was
+251,220 to 251,420 before the bound landed. Contiguous, and long enough for the
+startup check to judge.
+
+## What is left, and it is capture-side
+
+The two unchecked items are both about the *export* refusing to write something
+short, rather than about replay: capture failing when a required tenure in the
+maturity window is absent, and validating the network and checkpoint tenure height
+against the exported schedule. `repair-ledger` now makes the hole *fixable* from
+stacks-core's own rows, and the startup check makes it *visible* — what neither
+does is stop a short capture being written in the first place.
