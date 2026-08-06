@@ -100,13 +100,24 @@ defect at all. The three `at_block_*` tests already in `words/blockinfo.rs` carr
 `#[ignore = "test system needs to be improved relative to versioning and epochs"]`
 for the same reason.
 
+Re-read while auditing the rest, there is a **second blocker under that one**, and
+it is the one that would survive relaxing `epoch_and_clarity_match`.
+`TestEnvironment` compiles through `compile` (`tools.rs:267`), which hands its
+single `epoch` argument to `compile_for_cost_epoch` *twice* (`lib.rs:202-212`), once
+as the semantic epoch and once as the charging epoch. `executing_epoch()` is the
+charging one, so inside that harness it is definitionally equal to the semantic
+epoch and the gap this task is about — semantics of 3.3, chain at 4.0 — cannot exist
+there at all. Expressing it needs a second epoch threaded through both the compiled
+and the interpreted deploy paths *and* the planted contract below, since a contract
+containing `at-block` cannot be deployed at 4.0 by either engine. That is the same
+fixture built twice, so the pin stays where it is.
+
 Where it *can* be expressed is nano's own harness, which deploys a Clarity 2
 contract into an epoch-4.0 state already (`conformance/block_info_tenure_height.rs`
 does exactly that) — but a contract *containing* `at-block` cannot be deployed under
 epoch 4.0 at all, since analysis refuses the word whatever the version. So the pin
 needs a planted stored analysis, which is the shape [[064]]'s deploy-epoch fixture
-already builds. That is the remaining item and it is a test-fixture problem rather
-than a production one.
+already builds, and which is the next section.
 
 ## The pin exists, and it found that the gate was in the wrong place
 
@@ -170,11 +181,37 @@ The write dimensions are the part that matters for how this was ever invisible: 
 refusal writes nothing, so a block whose only difference is a refused read seals the
 root an untouched block seals.
 
-## Every other epoch-gated runtime predicate in `clarity/src/vm/functions`
+## Every epoch-gated runtime predicate in the Clarity VM
 
-Read exhaustively out of the pinned revision (`efc34a0`), excluding test modules.
+Read exhaustively out of the pinned revision (`efc34a0`, the one
+`nano-conformance/Cargo.toml` names), excluding test modules, over
+`clarity/src/vm/functions/**`, `callables.rs`, `contexts.rs`, `vm/mod.rs`,
+`database/**`, `costs/`, `types/`, `ast/`, `analysis/**` and `clarity-types`. The
+search was for all **24** named `StacksEpochId` predicates
+(`stacks-common/src/types/mod.rs:518-873`) *and* for bare `StacksEpochId::Epoch*`
+comparisons, because four of the runtime gates are not named predicates at all
+(`vm/mod.rs:327`, `functions/mod.rs:869`, `functions/database.rs:983`,
+`callables.rs:229,245`).
+
 nano executes only at epoch 4.0, so the question for each is: does the wasm path
 produce **4.0's** answer, and can the other answer be reached at all?
+
+**The question is not the same for every site**, which is what makes the list
+shorter than its length. nano links the `clarity` crate: `ClarityDatabase`,
+`AssetMap`, `LimitedCostTracker`, `build_ast` and `run_analysis` are stacks-core's
+own code running in nano's process (`crates/nano-vm/src/lib.rs:11-18,3736`). A
+predicate inside them has exactly one implementation and cannot disagree with
+itself. What clar2wasm *replaces* is `functions/**` and the call and eval
+machinery in `callables.rs` and `vm/mod.rs` — **18 decisions at 29 sites** — and
+only those can diverge. The rest, **17 decisions at 45 sites**, are listed below
+them so the count is the whole population rather than the interesting part of it.
+
+Epoch *threading* — `admits(epoch, …)`, `cons_list(epoch)`,
+`least_supertype(epoch)`, `parse_type_repr(epoch)`, `sanitize_value(epoch, …)` —
+is counted once, at the bottom of the first table, rather than at each of its ~40
+call sites: the decision is in the callee, which nano links.
+
+### The 18 clar2wasm has to answer itself
 
 | predicate | site | 4.0's answer | wasm path |
 |---|---|---|---|
@@ -188,7 +225,42 @@ produce **4.0's** answer, and can the other answer be reached at all?
 | `switch_on_global_epoch!` ×10 | `database.rs`, `assets.rs` | the ≥2.05 variant | one implementation, which is that variant; the `Epoch20` branch is unreachable |
 | `match exec_state.epoch()` in `special_concat` | `sequences.rs:415` | `v600`, variadic | variadic `concat`, which is what W6.2 built |
 | `Value::sanitize_value(epoch, …)` on a contract-call return | `database.rs:267` | sanitize | by construction: a wasm value is laid out from its analysed type, so an over-wide value has nowhere to exist. The residue of that is the tuple-supertype asymmetry already accounted for on [[060]] |
-| `admits(epoch, …)`, `cons_list(epoch)`, `least_supertype(epoch)` | `assets.rs`, `sequences.rs`, `conversions.rs` | 4.0's | the host functions pass `global_context.epoch_id` |
+| `uses_arg_size_for_cost()` | `callables.rs:186` | charge an argument at the size of the value | `wasm_generator.rs:1182` `runtime_size` emits the value's own size; `cost.rs`'s `charges_an_argument_for_what_it_holds`. The refusal path had no counterpart until now — see below |
+| `sanitize_in_function_invocation()` | `callables.rs:302` | sanitize the argument against the parameter type | by layout: a wasm argument is written into the callee's declared type, so a wider one has nowhere to go. Where it *refuses* instead, the two engines disagreed until now — see below |
+| `< Epoch21` / `>= Epoch21` trait-reference arguments | `callables.rs:229,245` | `CallableType`, not `TraitReferenceType` | `initialize.rs`'s `implicit_contract_cast`, which re-tags nested trait references too; `words/traits.rs`'s `print_a_trait_reference_under_the_two_oh_five_type_checker` |
+| `uses_pre_sanitized_variables()` | `vm/mod.rs:220,230` | borrow, charging no clone | a compiled constant is emitted into the module, so nothing is cloned and nothing is charged for cloning, which is 4.0's answer. The load-time half of the same predicate is linked, below |
+| `>= Epoch2_05` (`NativeFunction205` cost input) | `vm/mod.rs:327` | the per-word cost input, not `args.len()` | one implementation, the cost tables of `cost/clar*.rs`, which are the ≥2.05 variant |
+| `>= Epoch21` (`as-contract` has a cost) | `functions/mod.rs:869` | charge `AsContract` | charged unconditionally, `cost/clar3.rs:656`; `conformance/as_contract_codegen.rs` |
+| `Value::sanitize_value(epoch, type_of(value), …)` at the call entry | `contexts.rs:1355` | sanitize | the identity: the expected type *is* the value's own, so it re-canonicalizes and cannot narrow. clar2wasm's entry (`initialize.rs`'s `call_function`) does not run it, and the crosschecks below are what says that agrees |
+| `Value::sanitize_value(epoch, …)` on a contract-call return | `database.rs:267` | sanitize | by construction: a wasm value is laid out from its analysed type, so an over-wide value has nowhere to exist. The residue of that is the tuple-supertype asymmetry already accounted for on [[060]] |
+| `admits(epoch, …)`, `cons_list(epoch)`, `least_supertype(epoch)`, `parse_type_repr(epoch)` | `assets.rs`, `sequences.rs`, `conversions.rs`, `define.rs`, `functions/mod.rs:637` | 4.0's | the host functions pass `global_context.epoch_id` — 40 of the ~109 mentions of an epoch in `linker.rs` are exactly that |
+
+### The 17 nano links rather than reimplements
+
+One implementation each, stacks-core's own, compiled into nano and reached through
+the same call. Listed because "no counterpart" and "cannot disagree" are different
+answers and the item asked for the population.
+
+| predicate | sites | what it decides |
+|---|---|---|
+| `value_sanitizing()` | `database/clarity_db.rs:585`, `database/key_value_wrapper.rs:435`, `clarity-types/src/types/serialization.rs:1260` | whether a value read from or written to the store is sanitized |
+| `uses_marfed_block_time()` | `clarity_db.rs:1045` | whether the block time is a MARF key — nano writes it in `setup_block_metadata` |
+| `< Epoch30` tenure height | `clarity_db.rs:1124,1146` | tenure height is stored, not the block height |
+| `>= Epoch22`, `>= Epoch25`, `>= Epoch40` unlock heights | `clarity_db.rs:1216,1226,1236` | the v2/v3/v4 PoX auto-unlock heights; the 4.0 one is pox-5 activation |
+| `clarity_uses_tip_burn_block()` | `clarity_db.rs:1287,1372` | burn-block reads use the tip, not the parent |
+| `uses_pre_sanitized_variables()` at load | `contexts.rs:2156`, via `clarity_db.rs:916` | contract variables are sanitized when the contract is loaded |
+| `sums_stacking_assetmap()` | `contexts.rs:507,566` | a second stacking entry sums instead of erroring; nano reaches it through `GlobalContext::log_stacking` (`contexts.rs:1900`) from `nano-vm/src/pox.rs:350,379` |
+| `supports_cost_voting_contract()` | `costs/mod.rs:958,998` | 4.0 retires cost voting, which is why a cost tracker builds over an empty store |
+| `limits_parameter_and_method_count()` | `types/signatures.rs:415,423,449`, `analysis/type_checker/v2_1/mod.rs:1458` | the 3.3 caps on trait methods and function parameters |
+| `rejects_parse_depth_errors()` | `ast/errors.rs:210` | whether a parse-depth error invalidates the block or fails the transaction |
+| `rejects_supertype_too_large()` | `analysis/errors.rs:694` | same question for `SupertypeTooLarge` |
+| `supports_at_block()` (analysis half) | `analysis/.../natives/mod.rs:138` | the deploy-time half of this task's pair |
+| `fixes_tuple_merge_size_check()` (analysis half) | `natives/mod.rs:231` | why the runtime half above is unreachable |
+| `analysis_memory()` | `natives/mod.rs:329,344`, `natives/options.rs:303,318`, `v2_1/mod.rs:1488,1878,1893,1908,1931,1948,1967,1981,1994,2008,2022,2047,2068` | analysis-time memory metering |
+| `surfaces_trait_compliance_cost_errors()` | `v2_1/mod.rs:732` | a cost error inside trait checking is itself, not `IncompatibleTrait` |
+| `meters_in_contract_trait_entry()` | `v2_1/mod.rs:1084` | `AnalysisUseTraitEntry` for in-memory traits too |
+| `switch_on_global_epoch!`'s `Epoch10` arm | `functions/mod.rs:42` | unreachable in any epoch nano runs |
+| `mempool_garbage_behavior()`, `mining_commitment_frequency()`, `uses_nakamoto_*()`, `starts_reward_cycle_at_0()`, `includes_sip_031()`, `enforces_strict_signature_order()`, `allows_pox_punishment()`, `block_commits_to_parent()`, `supports_shadow_blocks()`, `supports_pox_missed_slot_unlocks()`, `supports_sip040_post_conditions()`, `supports_staking_post_conditions()`, `allows_tx_signatures_with_high_s()`, `supports_specific_budget_extends()`, `coinbase_reward()` | outside `clarity/`, in `stackslib` | not VM predicates at all; nano's counterparts are its chainstate, and each is pinned by its own conformance test rather than here |
 
 **One predicate has no counterpart and it is not epoch-gated**, which is why the item
 would have missed it and why it is recorded here rather than quietly:
@@ -215,6 +287,52 @@ wants its own measurement against mainnet.
 and said so in the code: correcting it turns a refused block into a failed
 transaction, which is consensus-visible and wants an oracle rather than a guess made
 while passing.
+
+## What the audit turned up: a refused argument was refused differently
+
+`sanitize_in_function_invocation()` is new in 4.0, so its row could not be settled
+by reading — the question is whether the wasm path *reaches the same answer by
+layout*, and the only way to know is to ask both engines. Measured at the executing
+epoch, with `crosscheck_cost`, which compares the value and all five cost
+dimensions:
+
+```
+(define-public (f (a {x: uint})) (ok (get x a)))  called with {x: u1, y: u2}
+compiled     Err(RuntimeCheck(TypeError(         {x: uint}, {x: uint, y: uint})))
+interpreted  Err(RuntimeCheck(TypeValueError(    {x: uint}, "Tuple(...{x,y}...)")))
+```
+
+Both refuse — layout is not the divergence — but **they refuse with different error
+identities, and for different costs**, and a mistyped contract-call argument is an
+ordinary transaction anyone can send. At 4.0 a `RuntimeCheck` error is
+`ClarityRuntimeTxError::AnalysisError`, which keeps the transaction and records
+`error.to_string()` as its `vm_error`
+(`stackslib/src/chainstate/stacks/db/transactions.rs:1448`), so the string is in the
+receipt; and a refused call writes nothing, so a state root sees neither.
+
+Two fixes in `initialize.rs`'s `call_function`, both measured before being claimed:
+
+* **the identity.** `clarity2_implicit_cast` (`callables.rs:527`) and the
+  `admits` arm after it (`callables.rs:334`) both raise `TypeValueError(expected,
+  value)`. The compiler raised `TypeError(expected, type_of(value))` for every
+  mistyped argument, of any shape — a wider tuple, a wrong primitive, a sequence
+  longer than the parameter.
+* **the cost.** `execute_apply` charges `UserFunctionApplication` and one
+  `InnerTypeCheckCost` per argument *before* it type-checks or even counts them
+  (`callables.rs:174-210`), so a refused call has paid for all of them. In a
+  compiled contract those charges are in the function's own prelude, which a call
+  refused at this boundary never enters, so it paid nothing: 115 against 183 for one
+  `int` passed as a `uint`. `charge_refused_application` pays them on the refusal
+  path only, over the passed arguments at 4.0 and the declared parameters before 3.3
+  because that is the split `uses_arg_size_for_cost()` makes.
+
+Five crosschecks in `initialize.rs`'s `refused_arguments`: a wider tuple, a wrong
+primitive type, an over-long sequence, too many arguments and too few. Each fails on
+the identity with the first fix reverted and on the cost with the second.
+
+The wrong-arity pair is there because the interpreter charges *before* it counts, so
+the two directions charge over different sets — and it is the one shape where the
+refusal is not about a type at all.
 
 ## What none of this proves
 

@@ -1,7 +1,7 @@
 ---
 id: "064"
 title: "Compile a contract under the epoch it was deployed in"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["060"]
 tags: ["mainnet", "vm", "clarity", "conformance"]
 created_at: 2026-08-06
+completed_at: 2026-08-06
 ---
 
 # Compile a contract under the epoch it was deployed in
@@ -157,6 +158,43 @@ does; its comment now says which argument means what and why.
   its module built byte for byte. This one **does not** fail with the search
   restored, and that is a finding rather than a weak test: see below.
 
+### The removed-word pin, and what stands in for the network
+
+The last item is closed by `conformance/at_block_refusal.rs` and by [[066]], which
+is where it went: a contract whose stored analysis names **Epoch 3.3 / Clarity 2**
+and whose source uses `at-block`, called at 4.0 through both engines from planted
+state — because a contract *containing* the word cannot be deployed at 4.0 by
+either engine, which is the whole shape of the case.
+
+**"The network's" receipt is not obtainable, and what replaces it is stronger than
+a paraphrase would be.** The mainnet capture declares `receipts = false` and no
+public API serves a historical receipt, so the oracle is stacks-core's own
+consensus snapshot: `runtime_check_error_kind_at_block_unavailable_ccall`
+(`stackslib/src/chainstate/tests/runtime_analysis_tests.rs`) deploys a contract in
+3.3, calls it in 3.4, and records `vm_error: Some(AtBlockUnavailable)`, `(err
+none)`, the block accepted, and
+
+```
+ExecutionCost { write_length: 0, write_count: 0, read_length: 159, read_count: 3, runtime: 275 }
+```
+
+nano charges that, in both engines, for that contract's source copied byte for byte
+— `read_length` is the contract's size, which is why it is copied rather than
+paraphrased. All five dimensions are asserted, and the write dimensions are the
+reason this was ever invisible: a refusal writes nothing, so the block it produces
+seals the root an untouched block seals.
+
+Writing it falsified two of [[066]]'s own closed items — the `AtBlock` cost was
+being charged for a refusal that charges nothing, and the error was arriving as
+`Internal(InvariantViolation(…))`, which would have stopped the block where
+stacks-core fails the transaction and carries on. Both are recorded there.
+
+The three tests also cover the other half of the item, which is that the contract
+is still *callable*: `a_branch_that_never_reaches_at_block_still_answers` — a
+removed word under an untaken branch answers, and only the taken branch refuses.
+Widening the refusal to the contract would have satisfied "it errors" and been a
+different divergence.
+
 ### What it does not prove
 
 - **The module bytes do not distinguish these epochs.** Measured: for the
@@ -167,17 +205,14 @@ does; its comment now says which argument means what and why.
   a clarity-wasm fix could move it silently. The consequence for the cache is that
   an explicit semantic epoch in the key would have partitioned entries holding the
   same code; the key stays the output.
-- **`at-block` still evaluates, where mainnet refuses it.** stacks-core checks
-  `supports_at_block()` twice: at analysis time against the *deploy* epoch
+- **That `at-block` refuses is [[066]]'s doing, not this task's.** stacks-core
+  checks `supports_at_block()` twice: at analysis time against the *deploy* epoch
   (`type_checker/v2_1/natives/mod.rs:138`) and again at *runtime* against the
   *current* epoch (`functions/database.rs:562`, `RuntimeCheckErrorKind::
-  AtBlockUnavailable`). So calling `reserve-v1.get-stx-stacking-at-block` on
-  mainnet today errors. clar2wasm's `AtBlock` word carries no such runtime gate,
-  so a module built under 2.4 evaluates it and returns a value. That is a real
-  receipt divergence on those 881 contracts, it is unchanged by this task, and it
-  is a clarity-wasm gap rather than an epoch-selection one. The last item stays
-  open for it, because pinning it needs the network's receipt for such a call and
-  the mainnet capture declares `receipts = false`.
+  AtBlockUnavailable`). Only the first is an epoch-selection question and only the
+  first was this task's. The second was a clarity-wasm gap on the same 881
+  contracts, closed there, and the pin above is shared between the two because the
+  fixture is the same one.
 - The count is of `(at-block` call sites in stored sources, not of contracts a
   compilation refuses. Compiling all 146,141 to get the exact figure was not done.
 - No offline gate in the suite executes real mainnet contracts, so this change is

@@ -11,6 +11,7 @@ use clarity::vm::types::{
 };
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::StacksEpochId;
 use wasmtime::{AsContextMut, Linker, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
@@ -462,6 +463,49 @@ pub fn initialize_contract(
     Ok(ContractInitReturn { ret, cost })
 }
 
+/// Charge what a refused call was already charged before it was refused.
+///
+/// `DefinedFunction::execute_apply` charges `UserFunctionApplication` and one
+/// `InnerTypeCheckCost` per argument *before* it type-checks any argument, so a
+/// call refused for a mistyped one has still paid for all of them. A compiled
+/// contract charges the same things in the function's own prelude, which a call
+/// refused at this boundary never enters — so the refusal pays them here, and
+/// the cost in the receipt is the cost the chain records.
+fn charge_refused_application(
+    tracker: &mut GlobalContext,
+    arguments: &[Value],
+    expected: &[TypeSignature],
+    epoch: StacksEpochId,
+) -> Result<(), VmExecutionError> {
+    runtime_cost(
+        ClarityCostFunction::UserFunctionApplication,
+        tracker,
+        expected.len(),
+    )?;
+    // From 3.3 an argument is checked at the size of the value passed, not of
+    // the type declared (`callables.rs`, `uses_arg_size_for_cost`) — which is
+    // also why the two branches count different things when the call was
+    // refused for having the wrong number of arguments in the first place.
+    if epoch.uses_arg_size_for_cost() {
+        for argument in arguments {
+            runtime_cost(
+                ClarityCostFunction::InnerTypeCheckCost,
+                tracker,
+                argument.size()?,
+            )?;
+        }
+    } else {
+        for expected_type in expected {
+            runtime_cost(
+                ClarityCostFunction::InnerTypeCheckCost,
+                tracker,
+                expected_type.size()?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_function(
     function_name: &str,
@@ -506,9 +550,12 @@ pub fn call_function(
     };
     let expected_arguments = function.get_arg_types();
     let read_only = function.is_read_only();
+    let epoch = global_context.epoch_id;
     // Entering the function and type-checking its arguments is charged by the
-    // function's own prelude, which runs whoever calls it.
+    // function's own prelude, which runs whoever calls it — except when the call
+    // is refused here and never enters it.
     if arguments.len() != expected_arguments.len() {
+        charge_refused_application(global_context, arguments, expected_arguments, epoch)?;
         return Err(
             clarity::vm::errors::RuntimeCheckErrorKind::IncorrectArgumentCount(
                 expected_arguments.len(),
@@ -518,7 +565,6 @@ pub fn call_function(
         );
     }
 
-    let epoch = global_context.epoch_id;
     let clarity_version = *contract_context.get_clarity_version();
     let engine = module_cache.engine().clone();
     // Native code for a contract already called in this process comes back
@@ -558,10 +604,23 @@ pub fn call_function(
     let mut wasm_arguments = Vec::new();
     for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
         let argument = implicit_contract_cast(expected_type, argument);
+        // `TypeValueError` and not `TypeError`: the interpreter refuses a
+        // mistyped transaction argument by naming the *value*
+        // (`DefinedFunction::execute_apply`, `clarity2_implicit_cast`), and the
+        // refusal is a receipt — a contract-call that fails a runtime check at
+        // 4.0 keeps its transaction, with `error.to_string()` recorded as its
+        // `vm_error`. Naming the argument's type instead put a different string
+        // in the receipt for every mistyped call.
         if !expected_type.admits(&epoch, &argument)? {
-            return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeError(
+            charge_refused_application(
+                store.data_mut().global_context,
+                arguments,
+                expected_arguments,
+                epoch,
+            )?;
+            return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
                 Box::new(expected_type.clone()),
-                Box::new(TypeSignature::type_of(&argument)?),
+                argument.to_error_string(),
             )
             .into());
         }
@@ -699,5 +758,85 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
                 .unwrap_or_else(|_| argument.clone())
         }
         _ => argument.clone(),
+    }
+}
+
+/// A transaction argument the callee's type refuses.
+///
+/// Nothing here is epoch-gated, which is why an audit of the epoch-gated runtime
+/// predicates found it: `execute_apply` reaches the same refusal through
+/// `sanitize_in_function_invocation()`, a predicate new in 4.0, and the two
+/// engines were measured to see whether they agreed at 4.0. They did not, and
+/// the disagreement was in the two things a refused transaction leaves behind —
+/// its `vm_error` string and its cost — neither of which a state root can see,
+/// because a refused call writes nothing.
+///
+/// [`crosscheck_cost`] asserts both: the returned value or error, and all five
+/// cost dimensions, for the same call through both engines.
+#[cfg(test)]
+mod refused_arguments {
+    use clarity::vm::types::TupleData;
+    use clarity::vm::{ClarityName, Value};
+
+    use crate::tools::crosscheck_cost;
+
+    fn name(name: &str) -> ClarityName {
+        #[allow(clippy::expect_used)]
+        ClarityName::try_from(name).expect("a Clarity name")
+    }
+
+    /// A tuple carrying a field the parameter does not declare.
+    ///
+    /// The shape a transaction produces, since a contract-call's arguments are
+    /// deserialized without the callee's type in hand. `clarity2_implicit_cast`
+    /// refuses it by naming the value; the compiler named its type.
+    #[test]
+    fn a_wider_tuple_is_refused_the_way_the_interpreter_refuses_it() {
+        let wide = Value::Tuple(
+            TupleData::from_data(vec![
+                (name("x"), Value::UInt(1)),
+                (name("y"), Value::UInt(2)),
+            ])
+            .expect("a tuple"),
+        );
+        crosscheck_cost(
+            "(define-public (f (a {x: uint})) (ok (get x a)))",
+            "f",
+            &[wide],
+        );
+    }
+
+    #[test]
+    fn an_argument_of_the_wrong_type_is_refused_the_same_way() {
+        crosscheck_cost("(define-public (f (a uint)) (ok a))", "f", &[Value::Int(1)]);
+    }
+
+    #[test]
+    fn a_sequence_longer_than_the_parameter_is_refused_the_same_way() {
+        crosscheck_cost(
+            "(define-public (f (a (buff 2))) (ok a))",
+            "f",
+            &[Value::buff_from(vec![1, 2, 3, 4]).expect("a buffer")],
+        );
+    }
+
+    /// The wrong number of arguments, in both directions.
+    ///
+    /// `execute_apply` charges the application and one type check per argument
+    /// *before* it counts them, so this refusal is not free either — and the
+    /// count it charges over is the passed arguments at 4.0 and the declared
+    /// parameters before 3.3, which is why the two directions are both here.
+    #[test]
+    fn too_many_arguments_cost_what_the_interpreter_charges_for_them() {
+        crosscheck_cost(
+            "(define-public (f (a uint)) (ok a))",
+            "f",
+            &[Value::UInt(1), Value::UInt(2)],
+        );
+    }
+
+    #[test]
+    fn too_few_arguments_cost_what_the_interpreter_charges_for_them() {
+        crosscheck_cost("(define-public (f (a uint)) (ok a))", "f", &[]);
     }
 }
