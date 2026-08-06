@@ -791,6 +791,7 @@ async fn follow(follower: Follower) -> Role {
                     published: &mut rounds.published,
                     peer: &rounds.peer,
                     registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
+                    checkpoint: &config.checkpoint,
                 })
                 .await;
             }
@@ -1065,6 +1066,50 @@ struct RewardCycleInputs<'a> {
     /// Where this chain's sBTC registry is deployed, which decides whether the
     /// document can carry a waterfall payout address at all.
     registry: Option<&'a str>,
+    /// The checkpoint this node started from, which carries the only answer for
+    /// its own reward cycle.
+    checkpoint: &'a crate::config::CheckpointConfig,
+}
+
+/// Serve the `/v3/stacker_set` document the checkpoint carried, when the cycle
+/// asked for is the checkpoint's own.
+///
+/// Answers `false` for every other cycle, including one this node simply has not
+/// reached: the document is one cycle's and pretending otherwise would serve a
+/// stale signer set, which is worse than serving none.
+async fn carry_checkpoint_set(
+    state: &RpcState,
+    published: &mut RewardCyclePublication,
+    checkpoint: &crate::config::CheckpointConfig,
+    cycle: u64,
+    context: nano_chainstate::BitcoinBlockContext,
+) -> bool {
+    let mut at_checkpoint = context;
+    at_checkpoint.height = checkpoint.anchor_bitcoin_height;
+    if nano_chainstate::signers::reward_cycle_at(at_checkpoint) != Some(cycle) {
+        return false;
+    }
+    let Some(document) = checkpoint
+        .attesting_reward_set
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    let stacker_set = document["stacker_set"].clone();
+    if stacker_set.is_null() {
+        return false;
+    }
+    if published.served != Some(cycle) {
+        println!(
+            "serving the reward set the checkpoint carried for cycle {cycle}, which was \
+             stacked before this node's history begins and cannot be derived from its state"
+        );
+    }
+    state.publish_stacker_set(cycle, stacker_set).await;
+    published.served = Some(cycle);
+    true
 }
 
 /// Publish the reward set the executed state derives, and configure the
@@ -1084,6 +1129,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         published,
         peer,
         registry,
+        checkpoint,
     } = inputs;
     context.height = executor.lock().await.bitcoin_height();
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
@@ -1101,6 +1147,15 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
     );
     let derived = match derived {
         Ok(derived) => derived,
+        // Nothing to walk is the ordinary answer for the cycle a checkpointed
+        // node starts in, and it is not a fault: that cycle was stacked before
+        // the boundary — on mainnet, in pox-4 — so it has no pox-5 positions and
+        // cannot be derived from this state at all. What the network published
+        // for it is what the checkpoint already carries to attest itself with,
+        // so it is served verbatim rather than not at all.
+        Err(_) if carry_checkpoint_set(state, published, checkpoint, cycle, context).await => {
+            return;
+        }
         Err(error) => {
             if published.complained != Some(cycle) {
                 published.complained = Some(cycle);
@@ -3054,6 +3109,52 @@ mod tests {
             },
             transactions: Vec::new(),
         }
+    }
+
+    /// The cycle a checkpointed node starts in has no pox-5 positions to walk,
+    /// and the checkpoint is the only thing that can answer for it.
+    ///
+    /// Mainnet's cycle 140 was stacked in pox-4, before the boundary the export
+    /// was taken at, so `active_signer_set` finds nothing and is right to. The
+    /// document that attested the checkpoint *is* what the network published for
+    /// that cycle, so it is served verbatim — and only for that cycle, because
+    /// serving one cycle's signers as another's is worse than serving none.
+    #[tokio::test]
+    async fn the_checkpoint_answers_for_the_cycle_it_was_taken_in() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let document = directory.path().join("stacker-set.json");
+        std::fs::write(
+            &document,
+            br#"{"stacker_set":{"signers":[{"signing_key":"00","weight":1}]}}"#,
+        )
+        .expect("write the document");
+        let checkpoint = crate::config::CheckpointConfig {
+            marf: directory.path().join("marf.sqlite"),
+            source_state_id: String::new(),
+            state_root: String::new(),
+            anchor_block: directory.path().join("anchor.bin"),
+            anchor_bitcoin_height: 960_231,
+            tenure_accounting: None,
+            attesting_block: None,
+            attesting_reward_set: Some(document),
+            sortition: None,
+        };
+        let mut context = nano_chainstate::BitcoinBlockContext::at_height(961_300);
+        context.first_height = 666_050;
+        context.prepare_phase_length = 100;
+        context.reward_phase_length = 2_000;
+
+        let state = super::RpcState::new(super::Network::MAINNET);
+        let mut published = super::RewardCyclePublication::default();
+        assert!(
+            super::carry_checkpoint_set(&state, &mut published, &checkpoint, 140, context).await,
+            "the checkpoint's own cycle is answered"
+        );
+        assert_eq!(published.served, Some(140));
+        assert!(
+            !super::carry_checkpoint_set(&state, &mut published, &checkpoint, 141, context).await,
+            "a later cycle is not answered with the checkpoint's signers"
+        );
     }
 
     /// A state directory belongs to the checkpoint it was built from.
