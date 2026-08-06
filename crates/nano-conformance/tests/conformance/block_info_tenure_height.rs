@@ -174,7 +174,7 @@ fn ask(function: &str) -> [clarity::vm::Value; 2] {
             None,
             contract(),
             function,
-            &[height.clone()],
+            std::slice::from_ref(&height),
             &LimitedCostTracker::new_free(),
         )
         .expect("the compiled call runs");
