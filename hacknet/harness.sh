@@ -30,6 +30,9 @@ PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 MINE_INTERVAL_EPOCH3=${MINE_INTERVAL_EPOCH3:-10}
 # Seconds a frozen Stacks tip is tolerated while Bitcoin keeps advancing.
 STALL_SECS=${STALL_SECS:-240}
+# Where the node binaries are. Release by default: this node executes every
+# block it is given, and a debug build is too slow to keep up with a tenure.
+BIN=${NANO_BIN_DIR:-$ROOT/target/release}
 
 log() { printf '\n== %s\n' "$*" >&2; }
 die() { printf 'harness: %s\n' "$*" >&2; exit 1; }
@@ -172,10 +175,13 @@ PY
 
 nano_state() {
     nano_running || { echo "not running"; return 0; }
-    local roles="signing"
-    grep -q '^\[miner\]' "$RUN/nano.toml" && roles="signing and mining"
+    local roles=()
+    grep -q '^\[signer\]' "$RUN/nano.toml" && roles+=(signing)
+    grep -q '^\[miner\]' "$RUN/nano.toml" && roles+=(mining)
+    grep -q '^rpc_bind' "$RUN/nano.toml" && roles+=("serving an RPC")
     printf 'node %s for participant %s as pid %s\n' \
-        "$roles" "$(cat "$RUN/replaced-participant")" "$(cat "$RUN/nano.pid")"
+        "$(IFS=,; echo "${roles[*]:-following only}")" \
+        "$(cat "$RUN/replaced-participant")" "$(cat "$RUN/nano.pid")"
 }
 
 nano_running() {
@@ -238,6 +244,7 @@ network = "testnet"
 chain_id = $chain_id
 peers = ["$peer/"]
 ${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
+${NANO_PROPOSAL_TOKEN:+block_proposal_token = \"$NANO_PROPOSAL_TOKEN\"}
 event_observers = [${NANO_EVENT_OBSERVERS:+\"${NANO_EVENT_OBSERVERS//,/\", \"}\"}]
 
 [burnchain]
@@ -253,12 +260,22 @@ state_root = "$(checkpoint_value published_state_index_root)"
 anchor_block = "$RUN/checkpoint/anchor-block.bin"
 anchor_bitcoin_height = $(checkpoint_value first_bitcoin_height)
 tenure_accounting = "$RUN/checkpoint/native-effects.json"
+attesting_block = "$RUN/checkpoint/checkpoint-block.bin"
+attesting_reward_set = "$RUN/checkpoint/reward-set.json"
+
+EOF
+        # The signer half is a stock stacks-signer when this node hosts one, so
+        # the node runs none of its own: one validator, one chain state.
+        if [ -z "${NANO_HOSTED_SIGNER:-}" ]; then
+            cat <<EOF
 
 [signer]
 private_key = "$key"
 EOF
-        # The miner half only exists once its Bitcoin identity does.
-        if [ -s "$RUN/leader-key.txt" ]; then
+        fi
+        # The miner half only exists once its Bitcoin identity does, and a node
+        # hosting somebody else's signer is not competing for tenures.
+        if [ -s "$RUN/leader-key.txt" ] && [ -z "${NANO_HOSTED_SIGNER:-}" ]; then
             cat <<EOF
 
 [miner]
@@ -277,7 +294,7 @@ nano_start() {
     local index=${1:?participant index}
     nano_stop
     nano_config "$index"
-    "$ROOT/target/debug/stacks-node" start --config "$RUN/nano.toml" \
+    "$BIN/stacks-node" start --config "$RUN/nano.toml" \
         >> "$RUN/nano.log" 2>&1 &
     echo $! > "$RUN/nano.pid"
     printf 'nano runs as pid %s, logging to %s\n' "$(cat "$RUN/nano.pid")" "$RUN/nano.log" >&2
@@ -314,6 +331,136 @@ replace() {
     log "starting the nano node for participant $index against $(peer_url "$(stock_index "$index")")"
     echo "$index" > "$RUN/replaced-participant"
     nano_start "$index"
+}
+
+# Replace one participant with nano as the *node* half only, and let a stock
+# stacks-signer be the signer half against nano's RPC.
+#
+# `replace` proves nano can sign for a network. This proves the other direction,
+# which is the harder one: a stock signer has no chain state and no peers, so
+# every proposal it sees, every verdict it acts on and every chunk it writes goes
+# through nano's RPC. The network still needs all three signatures, so a chain
+# that keeps advancing is the stock signer having done all of that through nano.
+#
+# The signer runs on the host network because a Hacknet container cannot reach a
+# host port through the bridge here, and nano is a host process.
+host() {
+    need_source
+    local index=${1:?participant index}
+    local port=${NANO_HOST_PORT:-24443} endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
+    local sink=${NANO_SINK_PORT:-3801} key token image
+    [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
+    [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
+    key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    token=$(sed -n 's/^auth_password = "\(.*\)"$/\1/p' "$SRC/docker/stacks/stacks-signer.toml")
+    [ -n "$token" ] || die "the signer template sets no auth_password"
+
+    # nano comes up *before* the participant it replaces goes down, and the
+    # participant only goes down once nano is answering. Hacknet needs all three
+    # signatures, so a signer missing for a whole prepare phase leaves the cycle
+    # after it with no PoX anchor block and the chain never recovers — which is
+    # what every failed start of this command used to cost.
+    echo "$index" > "$RUN/replaced-participant"
+    # nano's own events, recorded beside the stock nodes' so the two can be read
+    # against each other for the same blocks.
+    nano_sink "$sink"
+    log "starting the nano node for participant $index, hosting a signer on :$endpoint"
+    NANO_HOSTED_SIGNER=1 \
+    NANO_RPC_BIND="0.0.0.0:$port" \
+    NANO_PROPOSAL_TOKEN="$token" \
+    NANO_EVENT_OBSERVERS="http://127.0.0.1:$endpoint,http://127.0.0.1:$sink" \
+        nano_start "$index"
+    nano_ready "$port" || { nano_stop; die "nano did not come up; nothing was stopped"; }
+
+    log "stopping stock participant $index: stacks-miner-$index and stacks-signer-$index"
+    compose stop "stacks-miner-$index" "stacks-signer-$index"
+
+    image=$(docker inspect --format '{{.Config.Image}}' "stacks-signer-$index")
+    docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
+    mkdir -p "$RUN/hosted-signer"
+    log "starting a stock stacks-signer against nano at 127.0.0.1:$port"
+    docker run -d --name "$HOSTED_SIGNER" --network host \
+        -v "$SRC/docker/stacks/stacks-signer.toml:/data/config.toml.in:ro" \
+        -v "$RUN/hosted-signer:/data/signer" \
+        -e "SIGNER_PRIVATE_KEY=$key" \
+        -e "STACKS_NODE_HOST=127.0.0.1:$port" \
+        -e "STACKS_SIGNER_ENDPOINT=0.0.0.0:$endpoint" \
+        --entrypoint /bin/bash "$image" -c \
+        'cd /data && perl -pe '\''s/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/$ENV{$1}/ge'\'' \
+            < config.toml.in > config.toml && exec stacks-signer run --config config.toml' \
+        > /dev/null
+    printf 'the stock signer runs as %s, logging to docker logs %s\n' \
+        "$HOSTED_SIGNER" "$HOSTED_SIGNER" >&2
+}
+
+HOSTED_SIGNER=nano-hosted-signer
+
+# Wait until nano can host a signer: a tip to serve, and the reward set derived.
+#
+# The reward set is the gate that matters. Until nano has walked pox-5 for the
+# active cycle it configures no `signers-*` contract, so a signer pointed at it
+# holds no slot and writes nowhere — and the node it replaced would already be
+# stopped.
+nano_ready() {
+    local port=${1:?rpc port} deadline=$((SECONDS + ${NANO_READY_SECS:-600})) cycle
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        nano_running || { printf 'nano exited: see %s\n' "$RUN/nano.log" >&2; return 1; }
+        cycle=$(curl -sf --max-time 5 "http://127.0.0.1:$port/v2/pox" 2>/dev/null |
+            python3 -c 'import json,sys;print(json.load(sys.stdin)["current_cycle"]["id"])' \
+            2>/dev/null || true)
+        if [ -n "$cycle" ] &&
+            curl -sf --max-time 5 "http://127.0.0.1:$port/v3/stacker_set/$cycle" > /dev/null; then
+            printf 'nano serves cycle %s and its signers\047 StackerDB contracts\n' "$cycle" >&2
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'nano did not derive a reward set within the wait\n' >&2
+    return 1
+}
+
+# Record nano's own events on the host, where nano runs.
+nano_sink() {
+    local port=${1:-3801} out=$RUN/nano-events
+    if [ -f "$RUN/nano-sink.pid" ] && kill -0 "$(cat "$RUN/nano-sink.pid")" 2>/dev/null; then
+        log "nano's event sink is already recording into $out"
+        return 0
+    fi
+    mkdir -p "$out"
+    log "recording nano's events into $out"
+    python3 "$ROOT/hacknet/event-sink.py" "$out" "$port" \
+        >> "$RUN/nano-sink.log" 2>&1 &
+    echo $! > "$RUN/nano-sink.pid"
+}
+
+# Stop the hosted signer and nano, and put the stock participant back.
+unhost() {
+    need_source
+    docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
+    [ -f "$RUN/nano-sink.pid" ] && kill "$(cat "$RUN/nano-sink.pid")" 2>/dev/null
+    rm -f "$RUN/nano-sink.pid"
+    restore
+}
+
+# Assert a stock signer, a submitter and an observer all work through nano.
+verify_hosted() {
+    need_source
+    local index port=${NANO_HOST_PORT:-24443} key
+    index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
+    [ -n "$index" ] || die "no participant is hosted"
+    [ -n "$(docker ps -q --filter "name=^${HOSTED_SIGNER}$")" ] ||
+        die "the hosted stock signer is not running"
+    key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    # The first account the broadcaster sends transfers from, which genesis funds.
+    log "verifying the stock signer, a submitter and an observer against nano"
+    NANO_HOSTED_RPC="http://127.0.0.1:$port/" \
+    NANO_HOSTED_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
+    NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
+    NANO_EVENT_DIR="$RUN/nano-events" \
+    NANO_STOCK_EVENT_DIR="$RUN/events" \
+    NANO_FUNDED_KEY="$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)" \
+        cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
+        --test conformance hosted_signer -- --ignored --nocapture --test-threads 1
 }
 
 # Assert the network keeps doing every kind of work while nano signs for it.
@@ -377,7 +524,7 @@ register() {
     consensus_hash=$(curl -sf "$(peer_url 1)/v2/info" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["pox_consensus"])')
     log "registering nano's leader key against consensus hash $consensus_hash"
-    "$ROOT/target/debug/stacks-register-leader-key" \
+    "$BIN/stacks-register-leader-key" \
         --bitcoin-rpc "$BITCOIN_RPC/wallet/${NANO_BITCOIN_WALLET:-nano-miner}" \
         --bitcoin-rpc-user "$(compose_value BITCOIN_RPC_USER)" \
         --bitcoin-rpc-password-file "$RUN/bitcoin-rpc.pass" \
@@ -499,7 +646,10 @@ mine) mine ;;
 config) shift && nano_config "${1:-$(cat "$RUN/replaced-participant" 2>/dev/null)}" &&
     cat "$RUN/nano.toml" ;;
 replace) shift && replace "$@" ;;
+host) shift && host "$@" ;;
+unhost) unhost ;;
 verify) verify ;;
+verify-hosted) verify_hosted ;;
 restore) restore ;;
 observe) observe ;;
 stop-observing) stop_observing ;;
@@ -513,12 +663,15 @@ usage: harness.sh <command>
   wait <height> [s]  wait for a Bitcoin height, failing on a Stacks stall
   checkpoint         export the state a nano participant validates from
   replace <1|2|3>    stop one stock participant and run nano in its place
+  host <1|2|3>       run nano as the node half and a stock stacks-signer on it
+  unhost             stop the hosted signer and restore the participant
   fund [btc]         give nano a funded Bitcoin wallet and miner keys
   register           register nano's leader key on Bitcoin
   mine               restart nano with the mining role on
   config             print the configuration nano would start from
   traffic [seconds]  deploy a contract and call it for a while
   verify             assert the network keeps working with nano in place
+  verify-hosted      assert a stock signer, submitter and observer work through nano
   status             heights, reward cycle, and nano state
   observe            record new_block receipts a fixture capture needs
   restore            put the stock participant back

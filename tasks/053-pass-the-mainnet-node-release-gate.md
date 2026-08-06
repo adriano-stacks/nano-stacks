@@ -51,6 +51,7 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Run an event observer against the executed chain and retain delivered
       block, burn-block and proposal-response payloads.
 - [ ] Run the stock signer and a valid client transaction end to end against the
+- [x] Run the stock signer/client-facing RPC and an event observer against the
       same executed chain.
 - [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
@@ -553,13 +554,72 @@ gate asks to be recorded is what the node said.
 
 ## What is still open, and what each one waits on
 
+- **A stock signer accepting a block through nano** — the plumbing is done and the
+  verdict is not: see the section below. Needs the checkpoint to carry a sortition
+  history and `leader-keys.json`, and the proposal validator to read them.
 - **Holding mainnet tip for 24 hours** — not attempted and not claimed. It needs
   wall-clock and a node at the tip; the pristine run is a catch-up.
 - **A stock `stacks-signer` against the binary** — cycle 140 has no waterfall
   set because it was prepared under pox-4. Epoch 4.0 and pox-5 are active, and
   pox-5's first mainnet reward cycle is 141; run this gate there after [[052]]'s
   signer-facing fields are complete.
+- **A stock `stacks-signer` against the binary** — done on a pox-5 chain, and not
+  on mainnet. See below; the mainnet half of it is still blocked on mainnet being
+  on pox-4, which is not a nano condition and will not be one.
 - **Recording every executed height and verified root on mainnet** — the offline
   run above records every height it executed; the mainnet run still prints a root
   every 500 blocks.
 - **A live Bitcoin reorganization** and a **live** fork switch, as above.
+
+## The client-facing surface, driven by a stock signer
+
+Run on Hacknet at epoch 4.0 with PoX-5 active, because that is where a waterfall
+reward set exists and therefore where a stock signer can hold a slot at all. nano
+was the *node* half of participant 3 and a stock `stacks-signer 4.0.1` was the
+signer half, with nano's RPC as its only node:
+
+```
+hacknet/harness.sh host 3
+hacknet/harness.sh verify-hosted
+```
+
+What ran and what it reported is written up in full in
+[[052-wire-the-complete-rpc-and-event-surface-into-the-n]] under "The three halves,
+on a pox-5 chain". The short account:
+
+- the stock signer registered for the reward cycle **nano derived from its own
+  pox-5 state**, held its slot, and had 32 chunks taken from it over nano's own
+  `POST /v2/stackerdb/…/chunks` — asserted from the events nano dispatched for
+  them, not from nano's replica, because nano also pulls its peer's chunks into
+  that replica;
+- it drove eleven distinct routes, listed there, recorded by nano itself under
+  `NANO_TRACE_RPC=1`;
+- seven shape defects were found by pointing the real binary at nano and fixing
+  what it refused. No shim was added; each was nano answering with something
+  stacks-core's own reader rejects.
+- an observer received 632 `new_block`, 109 `new_burn_block` and 32
+  `stackerdb_chunks` events, and for every block both nano's observer and the stock
+  nodes' were told about, the per-transaction receipts — status, result and
+  execution cost — are identical;
+- a transaction posted to nano's `/v2/transactions` was admitted (`200`), and is now
+  relayed onward rather than kept in a pool only nano's own miner reads.
+
+`tests/conformance/hosted_signer.rs` is the gate, through `skip_gate`, so a run
+without the environment cannot report itself green.
+
+**What it is not.** This is the client-facing surface exercised against a real
+client on a real 4.0 chain; it is not the mainnet run. Two things are open and
+neither is an RPC condition:
+
+- nano answers a proposal `Reject`, so the hosted signer rejects, so the chain was
+  never carried on nano's signature alone. The cause is exact: the proposal
+  validator cannot execute a candidate without a leader-key registry, and the
+  checkpoint the harness exports carries no sortition history to hold one. That is
+  a checkpoint-export and validator-wiring item, not the "056 or a shared
+  validator" this task previously recorded.
+- nano's follower stopped on a **state-root mismatch at height 931** of that chain
+  (`expected f90f06c9…, got e939a724…`; two transfers, not a tenure start). A
+  divergence against a live pox-5 chain is a replay result and belongs with the
+  replay gates, but it is what froze the executed tip during this run and what made
+  `/v3/sortitions/latest_and_last` answer `503` afterwards — a stale executed chain
+  cannot name the sortition before its own tip.

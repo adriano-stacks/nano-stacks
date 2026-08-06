@@ -138,7 +138,7 @@ async fn start(
         if let Err(error) = announcer.announce(&peer, &signers).await {
             eprintln!("signer state announcement failed: {error}");
         }
-        if let Err(error) = catch_up(&peer, &mut live, config.node.max_sync_blocks).await {
+        if let Err(error) = catch_up(&peer, live.validator_mut(), config.node.max_sync_blocks).await {
             eprintln!("signer chainstate sync failed: {error}");
             sleep(interval).await;
             continue;
@@ -195,9 +195,9 @@ async fn binding(
 ///
 /// A signer that has not executed the chain the proposal builds on cannot
 /// verify its state root, so this runs before every round of signing.
-async fn catch_up(
+pub(crate) async fn catch_up(
     peer: &SyncClient,
-    signer: &mut LiveSigner<ChainstateProposalValidator<BurnchainSource>>,
+    validator: &mut Validator,
     max_blocks: usize,
 ) -> Result<(), String> {
     let tip = peer
@@ -205,11 +205,7 @@ async fn catch_up(
         .await
         .map_err(|error| error.to_string())?
         .tip_block_id;
-    if signer
-        .validator_mut()
-        .validator_mut()
-        .has_trusted_block(&tip)
-    {
+    if validator.validator_mut().has_trusted_block(&tip) {
         return Ok(());
     }
 
@@ -220,8 +216,7 @@ async fn catch_up(
             .block(block_id)
             .await
             .map_err(|error| format!("could not decode canonical block {block_id}: {error}"))?;
-        if signer
-            .validator_mut()
+        if validator
             .validator_mut()
             .has_trusted_block(&block.block_id())
         {
@@ -242,18 +237,15 @@ async fn catch_up(
             .sortition(block.header.consensus_hash)
             .await
             .map_err(|error| error.to_string())?;
-        let schedule = signer.validator_mut().coinbase_schedule();
+        let schedule = validator.coinbase_schedule();
         if let Some(accumulated) = peer
             .accumulated_coinbase(block, schedule, sortition.bitcoin_height)
             .await
             .map_err(|error| error.to_string())?
         {
-            signer
-                .validator_mut()
-                .set_accumulated_coinbase(sortition.bitcoin_height, accumulated);
+            validator.set_accumulated_coinbase(sortition.bitcoin_height, accumulated);
         }
-        signer
-            .validator_mut()
+        validator
             .validator_mut()
             .observe(block, sortition.bitcoin_height)
             .map_err(|error| {

@@ -52,6 +52,8 @@ execution.
 - [ ] Populate matured rewards, reward set and miner transaction id in
       `new_block`, then compare receipts, costs and events with an independent
       stacks-core observer for the same executed blocks.
+- [x] Exercise a stock `stacks-signer`, transaction submitter and event observer
+      against the binary.
 
 ## Acceptance Criteria
 
@@ -448,3 +450,188 @@ against the binary" is three claims, and they are not in the same state.
 [[053-pass-the-mainnet-node-release-gate]] carries the same split for the release
 gate as a whole, under "what is proved, what is staged, and what needs
 wall-clock".
+
+## The three halves, on a pox-5 chain
+
+Hacknet on epoch 4.0 removes the blocker above: a waterfall reward set exists, so a
+stock signer can hold a slot. `hacknet/harness.sh host 3` runs nano as the *node*
+half of a participant and a stock `stacks-signer` 4.0.1 as the signer half, with
+nano's RPC as its only node. That is the hard direction — the signer keeps no chain
+state and knows no peers, so every proposal it reads, every verdict it acts on and
+every chunk it writes has to come out of nano.
+
+nano runs no signer of its own in that configuration. The proposal validator and
+the embedded signer are the same chain state, and opening it twice is the recorded
+panic; so a node does one or the other, and `start_hosting` says which.
+
+### What the stock signer actually did
+
+It registered, held its slot, and wrote through nano:
+
+```
+Signer #0 (ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551) is registered for reward cycle 19.
+Cycle #19 Signer #0 Signer is registered for reward cycle 19 as signer #0. Initialized signer state.
+Cycle #19 Signer #0: Received state machine update from signer 02007311430123d4cad97f4f7e86e023b28143130a18…
+```
+
+The reward cycle it registered for is the one **nano derived from its own pox-5
+state**, not one it relayed:
+
+```
+derived the reward set for cycle 19 from this node's own state: 3 signers, 30 of weight,
+  replicating their StackerDB contracts
+replicating .miners for the miners that hold its slots, in order: 8585d3e4…, 8585d3e4…
+```
+
+`NANO_TRACE_RPC=1` makes every request name itself, which is the only record of
+*which* routes a client used — a signer's own log does not keep one. The routes the
+stock signer drove, verbatim from nano:
+
+```
+GET  /v2/info                                                        200
+GET  /v2/pox                                                         200
+GET  /v2/accounts/:principal                                         200
+GET  /v3/stacker_set/:cycle                                          200
+GET  /v3/sortitions/latest_and_last                                  200 / 503
+GET  /v3/tenures/tip_metadata/:consensus_hash                        200
+GET  /v3/tenures/fork_info/:start/:stop                              200
+GET  /v2/stackerdb/…/signers-1-2/:slot                               200
+POST /v2/stackerdb/…/signers-{0,1}-2/chunks                          200
+POST /v2/contracts/call-read/…/signers/get-last-set-cycle            200
+POST /v2/contracts/call-read/…/signers/stackerdb-get-signer-slots-page 200
+```
+
+**32 chunks were taken from it over that POST route**, all `StateMachineUpdate`,
+each verified against the writer nano assigned the slot. `tests/conformance/hosted_signer.rs`
+asserts them from the `stackerdb_chunks` events nano dispatched and *not* from
+nano's replica, because nano also pulls its peer's chunks into the same replica and
+the hosted signer shares its key with the stock signer it replaced — a chunk read
+out of the replica could be either one's. An event is dispatched only where a chunk
+was POSTed, and nothing but the hosted signer POSTs to nano. Getting that wrong is
+how the first version of this test reported a *replicated* acceptance as the hosted
+signer's work.
+
+### Five things a stock signer could not read, and now can
+
+Every one of these was found by pointing the real binary at nano and reading what
+it refused. None of them needed a shim to work around; they were nano answering
+with a shape stacks-core's own reader rejects, which is a defect rather than a
+difference.
+
+| Route | What was wrong |
+|---|---|
+| `/v2/info` | no `pox_consensus` and no `server_version`; `PeerInfo` requires both. `stacks_tip` was the block *identifier* where the reader wants the block hash. |
+| `/v2/pox` | seven fields of `RPCPoxInfoData` absent — `current_cycle`, `next_cycle`, `epochs`, `current_epoch`, `reward_cycle_id`, `contract_versions[].first_reward_cycle_id`, and the sBTC contracts. serde refuses a document missing a field, so answering with a useful subset is answering with nothing. |
+| `/v3/sortitions`, `/v3/sortitions/latest_and_last` | not served at all. The signer builds its whole view of who may mine from the second, and refuses to build one if the pair is not returned together. |
+| `/v3/tenures/fork_info/:start/:stop`, `/v3/tenures/tip_metadata/:ch` | not served at all. The first is the signer's reorganization check; the second it asks on every tenure it evaluates. |
+| `/v3/sortitions/consensus/:ch` | `vrf_seed` was absent, and `prefix_opt_hex` deserializes a *field* — a missing one is an error and not a `None`, so every sortition document nano served was unreadable. |
+| `POST /v2/stackerdb/…/chunks` | a refusal carried no `metadata`, so a writer was told "wrong version" without being told which. A stock signer was seen walking its version number up one request at a time, 1643, 1644, 1645… |
+| `stackerdb_chunks` event | named its contract with the `address.name` string the route is keyed by; the reader wants Clarity's `QualifiedContractIdentifier`, and a signer's event listener drops the whole event. |
+
+`event_observer.rs` now runs `StackerDBChunksEvent` and `BurnBlockEvent` — the
+readers a hosted signer's listener uses — over nano's hand-written payloads, which
+is the offline half of the last row and would have caught it.
+
+### StackerDB replication, which is what makes hosting possible at all
+
+A node that serves only its own replica hosts a signer that can see no proposals
+and whose answers reach nobody: the miner counting a response reads it from *its*
+replica, and nothing carried it there. nano's own signer never needed this because
+it reads and writes the peer's StackerDB directly.
+
+So `hosting::replicate` pulls each contract's chunks from the peer and pushes back
+what nano took, over the same `/v2/stackerdb` routes a signer uses. Every pulled
+chunk goes through `StackerDbStore::put`, which verifies it against the writer nano
+assigned the slot — replication, not trust; a peer serving a forged chunk gets it
+refused, and the log says so.
+
+`.miners` no longer refuses to replicate when the last two sortitions went to
+different miners. Which winner owns which slot is `num_sortitions % 2`, a count a
+checkpointed node has never made — but **every slot's metadata is signed by the
+writer that owns it**, so recovering the peer's listing says who that is, checked
+against the miners this node saw win. Both slots have to resolve or nothing is
+configured: a slot assigned to the wrong writer refuses the very chunks it exists
+for, and the first version of this guessed the second slot from the first, which
+left a hosted signer with nothing to answer while the log said `.miners` was
+replicated.
+
+### The transaction submitter
+
+`/v2/transactions` was a black hole with a `200`: it admitted into the pool the
+node's *own miner* reads and told nobody, so a transaction posted to a following
+node could never be mined by anybody. It is now relayed the way a block admitted
+over the API already was — announced to the p2p relay by the follow loop, from the
+same place and for the same reason.
+
+Live, against nano on hacknet:
+
+```
+nano admitted 43f6862ebbc1a47cc8db4490a40d39bfc55dcbaf9154c14b7f72ffebd40a6c35 into the
+  mempool its miner reads, answering 200 OK
+the network reports 43f6862e… as not mined: nano admitted it, and this configuration
+  does not mine
+```
+
+Admission is nano's own answer and is asserted. Whether it is *mined* is the
+network's, and the test reports it rather than asserting it: this node follows and
+does not mine, so being mined depends on the relay reaching a miner, and conflating
+the two would be claiming the second on the strength of the first.
+
+### The event observer
+
+A listener in nano's `event_observers`, recording every event to a file
+(`hacknet/event-sink.py` now keeps all of them, not only `new_block`):
+
+```
+nano's observer received 632 new_block events
+nano's observer received 109 new_burn_block events
+nano's observer received 32 stackerdb_chunks events
+the receipts agree for all 632 blocks both observers were told about
+```
+
+The last line is the one that matters. The same sink recorded what the *stock*
+nodes' observer was told for the same blocks, and for every block both saw, nano's
+per-transaction receipts — `txid`, `status`, `raw_result`, `execution_cost` — are
+identical to stacks-core's, along with the block height and the parent identifier.
+A payload that merely arrives says nothing about whether it describes the same
+execution; this says it does, 632 times.
+
+### What this does not prove
+
+- **The hosted signer has not accepted a block through nano.** It answers `Reject`
+  because nano does, and nano does because its proposal validator cannot execute a
+  candidate: `proposal execution failed: invalid transaction: committed seed is not
+  the hash of the parent tenure's VRF proof`. The cause is named exactly — the
+  validator has no leader-key registry, because `[checkpoint] sortition` is what
+  carries one and `signer-checkpoint.sh` exports no sortition history. A
+  registration is named for years after it is made, so it is far below any burn
+  window a follower holds. This is the same hole as before, localized: it is not
+  "056 or a shared validator" but *the checkpoint not carrying `leader-keys.json`
+  and the snapshots that seed a tracker*, plus wiring that tracker into the
+  proposal validator the way it is wired into the executor.
+- **nano's follower stopped on a state-root mismatch** at height 931 of that chain
+  (`expected f90f06c9…, got e939a724…`, two transfers, not a tenure start), so its
+  executed tip froze and `/v3/sortitions/latest_and_last` then answered `503` — a
+  stale executed chain cannot name the sortition before its tip. A divergence on a
+  pox-5 hacknet chain is a replay finding of its own and is not this task's.
+- The chain was **not** kept running on nano's signature alone. Hacknet needs all
+  three, and a signer that rejects stalls it; the runs above therefore kept the
+  stock signer available and switched it off only in bounded windows. What
+  `hacknet_replacement` shows for nano's own signer is not shown here for a hosted
+  one.
+
+### One thing learned the expensive way
+
+**A Hacknet signer missing for a whole prepare phase kills the chain.** No blocks
+in the prepare phase means no PoX anchor block for the cycle after it, and the
+coordinator then repeats `Missing canonical anchor block` forever. Two chains were
+lost to it — one to a previous run's node dying mid-prepare-phase, one to failed
+starts of `host` while the participant it replaces was already stopped. `host` now
+starts nano *first*, waits until it answers `/v2/pox` and `/v3/stacker_set`, and
+only then stops the stock pair; a failed start stops nothing.
+
+`check_maturity_window` also refused every checkpoint a fresh network can produce.
+The earliest payout any block can ask for is tenure 1, because a tenure below the
+maturity horizon matures nothing — so earnings reaching back to the chain's first
+tenure are complete however few they are, and demanding a hundred of them made nano
+unable to start from any chain less than a hundred tenures old.

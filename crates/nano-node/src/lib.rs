@@ -1,4 +1,5 @@
 pub mod config;
+pub mod hosting;
 pub mod miner;
 pub mod runtime;
 pub mod signer;

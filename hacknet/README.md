@@ -43,6 +43,37 @@ node with `SIGTERM`. Set `NANO_RPC_BIND` to serve the public RPC as well, and
 whether nano is running. `wait` fails as soon as Bitcoin advances with a frozen
 Stacks tip, which is what a broken replacement looks like.
 
+## The other direction: a stock signer on nano
+
+```
+hacknet/harness.sh host 3           # nano as the node half, a stock signer on its RPC
+hacknet/harness.sh verify-hosted    # assert the signer, a submitter and an observer work
+hacknet/harness.sh unhost           # stop the hosted signer and restore the participant
+```
+
+`replace` proves nano can sign for a network. `host` proves the harder direction:
+nano is the *node*, and the signer half is a stock `stacks-signer` process whose
+only node is nano. It keeps no chain state and knows no peers, so every proposal
+it reads, every verdict it acts on and every chunk it writes has to come out of
+nano — `/v2/info`, `/v2/pox`, `/v3/sortitions/latest_and_last`,
+`/v3/tenures/fork_info`, `/v3/block_proposal` with its auth token, and
+`/v2/stackerdb/...` in both directions. The chain still needs all three
+signatures, so a chain that keeps advancing is that signer having done all of it
+through nano.
+
+nano runs no signer of its own in this configuration: the proposal validator and
+the embedded signer are the same chain state, and one owner is the whole point.
+The stock signer runs on the host network, because a Hacknet container cannot
+reach a host port through the bridge here and nano is a host process.
+
+**nano comes up before the participant it replaces goes down.** Hacknet needs all
+three signatures, so a signer missing for a whole prepare phase leaves the cycle
+after it with no PoX anchor block, and the chain never recovers. `host` therefore
+starts nano, waits until it answers `/v2/pox` and `/v3/stacker_set` — the second
+being the gate that matters, since until nano has derived the reward set it
+configures no `signers-*` contract and a signer pointed at it holds no slot — and
+only then stops the stock pair. A failed start stops nothing.
+
 Each command is independent, so a run can be inspected or interrupted at any
 stage. The clone, the checkpoint, the configuration, the log and every byte of
 nano's own state live under `~/.cache/nano-stacks/hacknet` (`NANO_HACKNET_HOME`),

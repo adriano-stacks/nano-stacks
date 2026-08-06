@@ -364,3 +364,45 @@ fn a_served_reward_set_is_read_back_by_stacks_cores_own_reader() {
         assert_eq!(entry.stacked_amt, signer.stacked_amount);
     }
 }
+
+/// The three payloads a hosted signer's event listener reads, against its reader.
+///
+/// A stock signer's listener is not tolerant: it deserializes each event into a
+/// stackslib type and drops the whole event when a field is the wrong shape, so
+/// a payload that is merely close is a payload that never arrives. This is the
+/// cheapest oracle for the ones nano writes by hand, and it found a real defect —
+/// `stackerdb_chunks` named its contract with the `address.name` string the route
+/// is keyed by, where the reader wants Clarity's `QualifiedContractIdentifier`.
+#[test]
+fn the_events_a_signer_listens_for_are_read_back_by_stacks_cores_own_readers() {
+    use blockstack_lib::chainstate::stacks::events::{BurnBlockEvent, StackerDBChunksEvent};
+    use nano_crypto::StacksPrivateKey;
+    use nano_stackerdb::Chunk;
+
+    let key = StacksPrivateKey::from_seed(b"writer");
+    let mut chunk = Chunk::new(1, 7, b"a response".to_vec());
+    chunk.sign(&key).expect("sign the chunk");
+    let payload = nano_rpc::stackerdb_chunks_payload(
+        "ST000000000000000000002AMW42H.signers-0-1",
+        std::slice::from_ref(&chunk),
+    );
+    let read: StackerDBChunksEvent =
+        serde_json::from_value(payload).expect("stacks-core reads nano's chunk event");
+    assert_eq!(read.contract_id.name.to_string(), "signers-0-1");
+    assert_eq!(read.modified_slots.len(), 1);
+    assert_eq!(read.modified_slots[0].slot_id, 1);
+    assert_eq!(read.modified_slots[0].slot_version, 7);
+    assert_eq!(read.modified_slots[0].data, b"a response".to_vec());
+
+    let burn = nano_rpc::new_burn_block_payload(
+        BitcoinHeaderHash::from_bytes([3; 32]),
+        900_000,
+        nano_primitives::ConsensusHash::from_bytes([4; 20]),
+        BitcoinHeaderHash::from_bytes([5; 32]),
+        1_500,
+    );
+    let read: BurnBlockEvent =
+        serde_json::from_value(burn).expect("stacks-core reads nano's burn block event");
+    assert_eq!(read.burn_block_height, 900_000);
+    assert_eq!(read.burn_amount, 1_500);
+}

@@ -197,7 +197,11 @@ pub fn new_burn_block_payload(
 #[must_use]
 pub fn stackerdb_chunks_payload(contract_id: &str, chunks: &[Chunk]) -> Value {
     json!({
-        "contract_id": contract_id,
+        // A `QualifiedContractIdentifier`, not the `address.name` string the route
+        // is keyed by: stacks-core's reader wants the Clarity type, whose issuer is
+        // a version byte and twenty hash bytes. A string here is a payload a stock
+        // signer's event listener refuses outright, which is how this was found.
+        "contract_id": qualified_contract(contract_id),
         "modified_slots": chunks
             .iter()
             .map(|chunk| json!({
@@ -208,6 +212,25 @@ pub fn stackerdb_chunks_payload(contract_id: &str, chunks: &[Chunk]) -> Value {
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// A `StackerDB` contract as Clarity names it: an issuer and a contract name.
+///
+/// The issuer is `StandardPrincipalData`, a tuple struct, so it is an array of
+/// the version byte and the twenty hash bytes — which is what its derived
+/// `Serialize` writes and what its `Deserialize` demands.
+fn qualified_contract(contract_id: &str) -> Value {
+    let (address, name) = contract_id
+        .split_once('.')
+        .unwrap_or((contract_id, contract_id));
+    let unknown = (0u8, [0u8; 20]);
+    let issuer = address
+        .parse::<nano_address::StacksAddress>()
+        .map_or(unknown, |address| {
+            (address.version(), *address.hash160().as_bytes())
+        });
+    let issuer = json!([issuer.0, issuer.1]);
+    json!({ "issuer": issuer, "name": name })
 }
 
 /// Why a node refused a block proposal (`net/api/postblock_proposal.rs:87`).

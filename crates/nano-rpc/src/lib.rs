@@ -27,7 +27,7 @@ use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
-use nano_primitives::{ConsensusHash, Network, StacksBlockId, TrieHash};
+use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,6 +54,23 @@ pub use stackerdb::{ChunkRefusal, StackerDbStore};
 pub trait BlockAdmission: Send {
     /// Why this block is not one this chain would accept, if it is not.
     fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String>;
+}
+
+/// A block waiting to be vouched for, and where the verdict goes.
+///
+/// Authentication does not look at a state root, so a node that answered `Ok` on
+/// it alone would be telling a signer to sign whatever the proposer computed. The
+/// only truthful answer comes from running the block, and running it needs a chain
+/// state that is allowed to hold a candidate — which the node's executor is not.
+///
+/// So the route asks rather than decides: it hands the block to whichever part of
+/// the node keeps such a state and waits for the answer, exactly as an uploaded
+/// block is handed to the executor. The refusal carries the code as well as the
+/// reason, because only the validator knows whether the block was wrong or this
+/// node was not ready to say.
+pub struct ProposalRequest {
+    pub block: NakamotoBlock,
+    pub verdict: tokio::sync::oneshot::Sender<Result<(), (String, ProposalRejectCode)>>,
 }
 
 /// One coherent view of what this node executed.
@@ -95,6 +112,17 @@ pub struct RpcState {
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
     /// The validator an uploaded block or a proposal has to pass.
     admission: Option<Arc<Mutex<dyn BlockAdmission>>>,
+    /// Where a proposal goes to be executed and answered for.
+    proposals: Option<mpsc::UnboundedSender<ProposalRequest>>,
+    /// Where a chunk this node took is passed on, so a signer hosted here reaches
+    /// the miner it is answering.
+    chunks: Option<mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>>,
+    /// Where a transaction this node admitted is passed on to the network.
+    ///
+    /// A node that keeps what it accepted to itself is a black hole with a `200`:
+    /// it looks like acceptance and behaves like a drop, since only a miner that
+    /// sees the transaction can ever mine it.
+    submitted: Option<mpsc::UnboundedSender<Transaction>>,
     mempool: Option<Arc<Mutex<Mempool>>>,
     /// The chain this node is on, which no peer needs to be asked about.
     network: Network,
@@ -146,6 +174,9 @@ impl RpcState {
             events,
             chain: None,
             admission: None,
+            proposals: None,
+            chunks: None,
+            submitted: None,
             mempool: None,
             network,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
@@ -174,6 +205,33 @@ impl RpcState {
     #[must_use]
     pub fn with_block_admission(mut self, admission: Arc<Mutex<dyn BlockAdmission>>) -> Self {
         self.admission = Some(admission);
+        self
+    }
+
+    /// Vouch for proposals only after this validator has executed them.
+    #[must_use]
+    pub fn with_proposal_validator(
+        mut self,
+        proposals: mpsc::UnboundedSender<ProposalRequest>,
+    ) -> Self {
+        self.proposals = Some(proposals);
+        self
+    }
+
+    /// Pass the transactions this node admits on to the network over this channel.
+    #[must_use]
+    pub fn with_transaction_relay(mut self, submitted: mpsc::UnboundedSender<Transaction>) -> Self {
+        self.submitted = Some(submitted);
+        self
+    }
+
+    /// Pass the chunks this node takes on to the network over this channel.
+    #[must_use]
+    pub fn with_chunk_relay(
+        mut self,
+        chunks: mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>,
+    ) -> Self {
+        self.chunks = Some(chunks);
         self
     }
 
@@ -326,20 +384,51 @@ pub fn router(state: RpcState) -> Router {
             "/v2/stackerdb/{address}/{contract}/{slot_id}/{slot_version}",
             get(stackerdb_chunk_at_version),
         )
+        .route("/v3/sortitions", get(latest_sortition))
+        .route("/v3/sortitions/latest_and_last", get(latest_and_last_sortition))
         .route("/v3/sortitions/consensus/{consensus_hash}", get(sortition))
         .route("/v3/stacker_set/{cycle}", get(stacker_set))
         .route("/v3/tenures/info", get(tenure_info))
+        .route("/v3/tenures/fork_info/{start}/{stop}", get(tenure_fork_info))
+        .route(
+            "/v3/tenures/tip_metadata/{consensus_hash}",
+            get(tenure_tip_metadata),
+        )
         .route("/v3/tenures/{start_block_id}", get(tenure))
         .route("/v3/blocks/upload", post(upload_block))
         .route("/v3/blocks/{block_id}", get(block))
         .route("/v3/block_proposal", post(block_proposal))
         .route("/events", get(events))
+        .layer(axum::middleware::from_fn(trace))
         .with_state(state)
 }
 
 /// Serve the public RPC until the listener is stopped.
 pub async fn serve(listener: tokio::net::TcpListener, state: RpcState) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
+}
+
+/// Whether every request is to name itself.
+///
+/// Off by default, because a node at tip answers a few requests a second and the
+/// operator is reading for the one line that matters. On, it is the only record of
+/// *which* routes a client actually used — the question "does a stock signer run
+/// against nano" is answered by that list, and a signer's own log does not keep it.
+static TRACE_REQUESTS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("NANO_TRACE_RPC").is_some());
+
+/// Say what was asked for and what was answered.
+async fn trace(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !*TRACE_REQUESTS {
+        return next.run(request).await;
+    }
+    let (method, path) = (
+        request.method().clone(),
+        request.uri().path().to_owned(),
+    );
+    let response = next.run(request).await;
+    println!("rpc {method} {path} -> {}", response.status().as_u16());
+    response
 }
 
 #[derive(Debug)]
@@ -458,8 +547,13 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
     Ok(axum::Json(NodeInfoWire {
         burn_block_height: tip.bitcoin_height,
         stacks_tip_height: tip.stacks_height,
-        stacks_tip: tip.stacks_tip.to_string(),
+        stacks_tip: tip.stacks_block_hash.to_string(),
         stacks_tip_consensus_hash: tip.consensus_hash.to_string(),
+        // The burn view this node has *executed* under, which is the newest
+        // sortition it derived and checked. A node reporting the burnchain tip it
+        // had not yet elected a tenure from would be reporting its peer's view.
+        pox_consensus: tip.consensus_hash.to_string(),
+        server_version: format!("nano-stacks {}", env!("CARGO_PKG_VERSION")),
         network_id,
     }))
 }
@@ -491,27 +585,106 @@ async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncSta
 /// The cycle constants are this node's own, and the height is the one it
 /// executed: a caller told a burn height it can then ask no account about is
 /// being told about the peer.
-async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<PoxInfoWire>, RpcError> {
+///
+/// The shape is `RPCPoxInfoData`'s, in full, because a stock signer reads this
+/// route into that type and serde refuses a document missing a field — so
+/// answering with a useful subset is answering with nothing. Where nano has the
+/// value it gives it; where it does not it gives the type's zero and says so
+/// here, which is the same rule the `new_block` payload follows.
+///
+/// What nano genuinely does not know:
+///
+/// - `pox_activation_threshold_ustx`, `total_liquid_supply_ustx` and the cycles'
+///   `stacked_ustx`: read from `.pox-5`'s `get-pox-info`, which nothing in nano
+///   calls, and no consumer of this route needs.
+/// - the epochs before 4.0. nano is a 4.0-only node started from a checkpoint at
+///   or after the boundary, so the earlier epochs are not its history to report;
+///   `epochs` carries the one it executes under and `current_epoch` names it,
+///   which is the field a signer actually reads.
+/// - the sBTC contracts, unless the operator configured them.
+async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
     let executed = executed(&state).await?;
     let network = state.network;
     let pox = executed.pox.ok_or(RpcError::Unavailable)?;
-    Ok(axum::Json(PoxInfoWire {
-        first_burnchain_block_height: pox.first_bitcoin_height,
-        current_burnchain_block_height: executed.tip.bitcoin_height,
-        prepare_phase_block_length: pox.prepare_phase_length,
-        reward_phase_block_length: pox.reward_phase_length,
-        reward_slots: pox.reward_slots,
-        rejection_fraction: pox.rejection_fraction,
-        contract_versions: pox
-            .pox_5_activation_height
-            .map(|height| {
-                vec![PoxContractVersionWire {
-                    activation_burnchain_block_height: height,
-                    contract_id: network.boot_contract_id("pox-5"),
-                }]
-            })
-            .unwrap_or_default(),
-    }))
+    let height = executed.tip.bitcoin_height;
+    let cycle_length = u64::from(pox.reward_phase_length + pox.prepare_phase_length);
+    let cycle = height.saturating_sub(pox.first_bitcoin_height) / cycle_length.max(1);
+    let next_start = pox.first_bitcoin_height + (cycle + 1) * cycle_length;
+    let prepare_start = next_start.saturating_sub(u64::from(pox.prepare_phase_length));
+    // The reward-slot threshold nano derived for the cycle, from its own pox-5
+    // state. Absent means nano has not resolved that cycle, which is also the
+    // honest answer to whether PoX is active as far as this node is concerned.
+    let (this_threshold, next_threshold, resolved) = {
+        let sets = state.stacker_sets.read().await;
+        let threshold = |cycle: u64| -> u64 {
+            sets.get(&cycle)
+                .and_then(|set| set.get("pox_ustx_threshold"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        };
+        (
+            threshold(cycle),
+            threshold(cycle + 1),
+            sets.contains_key(&cycle),
+        )
+    };
+    let activation = u64::from(pox.pox_5_activation_height.unwrap_or_default());
+    Ok(axum::Json(json!({
+        "contract_id": network.boot_contract_id("pox-5"),
+        "pox_activation_threshold_ustx": 0,
+        "first_burnchain_block_height": pox.first_bitcoin_height,
+        "current_burnchain_block_height": height,
+        "prepare_phase_block_length": pox.prepare_phase_length,
+        "reward_phase_block_length": pox.reward_phase_length,
+        "reward_slots": pox.reward_slots,
+        "rejection_fraction": pox.rejection_fraction,
+        "total_liquid_supply_ustx": 0,
+        "current_cycle": {
+            "id": cycle,
+            "min_threshold_ustx": this_threshold,
+            "stacked_ustx": 0,
+            "is_pox_active": resolved,
+        },
+        "next_cycle": {
+            "id": cycle + 1,
+            "min_threshold_ustx": next_threshold,
+            "min_increment_ustx": 0,
+            "stacked_ustx": 0,
+            "prepare_phase_start_block_height": prepare_start,
+            "blocks_until_prepare_phase": prepare_start.cast_signed() - height.cast_signed(),
+            "reward_phase_start_block_height": next_start,
+            "blocks_until_reward_phase": next_start.saturating_sub(height),
+            "ustx_until_pox_rejection": Value::Null,
+        },
+        "epochs": [{
+            "epoch_id": "Epoch40",
+            "start_height": activation,
+            "end_height": i64::MAX,
+            "block_limit": {
+                "write_length": 15_000_000,
+                "write_count": 15_000,
+                "read_length": 200_000_000,
+                "read_count": 30_000,
+                "runtime": 5_000_000_000u64,
+            },
+            "network_epoch": 16,
+        }],
+        "current_epoch": "Epoch40",
+        "min_amount_ustx": this_threshold,
+        "prepare_cycle_length": pox.prepare_phase_length,
+        "reward_cycle_id": cycle,
+        "reward_cycle_length": cycle_length,
+        "rejection_votes_left_required": Value::Null,
+        "next_reward_cycle_in": next_start.saturating_sub(height),
+        "contract_versions": [{
+            "contract_id": network.boot_contract_id("pox-5"),
+            "activation_burnchain_block_height": activation,
+            "first_reward_cycle_id": activation.saturating_sub(pox.first_bitcoin_height)
+                / cycle_length.max(1),
+        }],
+        "pox_5_sbtc_contract": "",
+        "pox_5_sbtc_registry_contract": "",
+    })))
 }
 
 async fn tenure_info(
@@ -539,6 +712,127 @@ async fn sortition(
         .find(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
         .ok_or(RpcError::NotFound)?;
     Ok(axum::Json(vec![SortitionInfoWire::from(sortition)]))
+}
+
+/// The sortition this node is standing on, which is the one that elected its tip.
+///
+/// stacks-core answers this from its burnchain tip. nano answers from the tenure
+/// its executed tip belongs to, because a burn block it has not executed a tenure
+/// for is one it cannot describe: it would have to name a winner it never checked.
+async fn latest_sortition(
+    State(state): State<RpcState>,
+) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
+    let latest = executed(&state)
+        .await?
+        .chain
+        .last()
+        .ok_or(RpcError::Unavailable)?
+        .sortition
+        .clone();
+    Ok(axum::Json(vec![SortitionInfoWire::from(latest)]))
+}
+
+/// The current sortition and the one before it that also had a winner.
+///
+/// A signer reads its whole view of who may mine from this one route, and refuses
+/// to build one at all if the second entry is missing while the first names a
+/// `last_sortition_ch` — so the pair is served together or not at all.
+async fn latest_and_last_sortition(
+    State(state): State<RpcState>,
+) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
+    let chain = executed(&state).await?.chain;
+    let latest = chain.last().ok_or(RpcError::Unavailable)?.sortition.clone();
+    let mut sortitions = vec![latest.clone()];
+    if let Some(previous) = latest.last_sortition_consensus_hash {
+        let last = chain
+            .iter()
+            .map(|tenure| &tenure.sortition)
+            .rfind(|sortition| sortition.consensus_hash == previous)
+            .ok_or(RpcError::NotFound)?;
+        sortitions.push(last.clone());
+    }
+    Ok(axum::Json(
+        sortitions.into_iter().map(SortitionInfoWire::from).collect(),
+    ))
+}
+
+/// The last block of a tenure and the burn view it was built under.
+///
+/// A stock signer asks this on every tenure it evaluates, and it is the one route
+/// here that serves a whole block header as JSON — `anchored_header` is
+/// stacks-core's `StacksBlockHeaderTypes`, externally tagged, with every hash
+/// written as bare hex because that is what its own reader accepts.
+async fn tenure_tip_metadata(
+    State(state): State<RpcState>,
+    Path(consensus_hash): Path<String>,
+) -> Result<axum::Json<Value>, RpcError> {
+    let tenure = executed(&state)
+        .await?
+        .chain
+        .into_iter()
+        .rfind(|tenure| tenure.sortition.consensus_hash.to_string() == consensus_hash)
+        .ok_or(RpcError::NotFound)?;
+    let header = &tenure.blocks.last().ok_or(RpcError::NotFound)?.header;
+    Ok(axum::Json(json!({
+        "anchored_header": { "Nakamoto": {
+            "version": header.version,
+            "chain_length": header.chain_length,
+            "burn_spent": header.bitcoin_spent,
+            "consensus_hash": header.consensus_hash.to_string(),
+            "parent_block_id": header.parent_block_id.to_string(),
+            "tx_merkle_root": header.transaction_merkle_root.to_string(),
+            "state_index_root": header.state_index_root.to_string(),
+            "timestamp": header.timestamp,
+            "miner_signature": hex::encode(header.miner_signature.as_bytes()),
+            "signer_signature": header
+                .signer_signatures
+                .iter()
+                .map(|signature| hex::encode(signature.as_bytes()))
+                .collect::<Vec<_>>(),
+            "pox_treatment": hex::encode(header.pox_treatment.wire_bytes()),
+            "problematic_txs": header
+                .problematic_transactions
+                .iter()
+                .map(|marker| json!({ "tx_index": marker.index, "category": marker.category }))
+                .collect::<Vec<_>>(),
+        }},
+        // The tenure's burn view is the consensus hash that elected it: nano keeps
+        // no separate per-block burn view, and for a tenure's own last block the
+        // two are the same thing.
+        "burn_view": header.consensus_hash.to_string(),
+    })))
+}
+
+/// How many tenures a fork check walks back, as stacks-core's own limit.
+const FORK_INFO_DEPTH: usize = 10;
+
+/// The tenures between two sortitions, newest first, as a signer's fork check
+/// asks for them: from `stop` back to the height of `start`.
+async fn tenure_fork_info(
+    State(state): State<RpcState>,
+    Path((start, stop)): Path<(String, String)>,
+) -> Result<axum::Json<Vec<TenureForkInfoWire>>, RpcError> {
+    let chain = executed(&state).await?.chain;
+    let position = |consensus_hash: &str| {
+        chain
+            .iter()
+            .rposition(|tenure| tenure.sortition.consensus_hash.to_string() == consensus_hash)
+    };
+    let first = position(&start).ok_or(RpcError::NotFound)?;
+    let last = position(&stop).ok_or(RpcError::NotFound)?;
+    if last < first {
+        return Err(RpcError::BadRequest(
+            "the stop sortition is older than the start sortition".to_owned(),
+        ));
+    }
+    Ok(axum::Json(
+        chain[first..=last]
+            .iter()
+            .rev()
+            .take(FORK_INFO_DEPTH)
+            .map(TenureForkInfoWire::from)
+            .collect(),
+    ))
 }
 
 async fn stacker_set(
@@ -641,10 +935,20 @@ async fn submit_transaction(
     let chain = state.chain()?;
     let mut mempool = mempool.lock().await;
     let mut chain = chain.lock().await;
-    let admission = mempool.submit(transaction, &ExecutedTip::new(&mut *chain), now_seconds());
+    let admission = mempool.submit(
+        transaction.clone(),
+        &ExecutedTip::new(&mut *chain),
+        now_seconds(),
+    );
     drop(chain);
     drop(mempool);
     admission.map_err(|rejection| RpcError::Rejected(rejection.into_json(txid)))?;
+    // Admitted here is admitted for the whole network: the pool this node keeps
+    // is only read by its own miner, and a transaction nobody else hears about
+    // cannot be mined by anybody else.
+    if let Some(submitted) = &state.submitted {
+        let _ = submitted.send(transaction);
+    }
     Ok(axum::Json(txid.to_string()))
 }
 
@@ -762,7 +1066,22 @@ async fn stackerdb_chunk_upload(
     let metadata = SlotMetadataWire::from(&chunk.metadata());
     let contract_id = format!("{address}.{contract}");
     let announce = chunk.clone();
+    let slot_id = chunk.slot_id;
     let accepted = state.stackerdb.write().await.put(&contract_id, chunk);
+    // What the slot holds *now*, which a refused writer needs: stacks-core answers
+    // a refusal with the current metadata so the writer can pick up the version,
+    // and a client told nothing walks its version number up one request at a time
+    // — which is what a stock signer was seen doing against this route.
+    let held = state
+        .stackerdb
+        .read()
+        .await
+        .metadata(&contract_id)
+        .and_then(|slots| {
+            slots
+                .get(usize::try_from(slot_id).unwrap_or(usize::MAX))
+                .map(SlotMetadataWire::from)
+        });
     Ok(axum::Json(match accepted {
         Ok(()) => {
             // A chunk becomes news exactly when a slot takes it, which is here:
@@ -773,12 +1092,19 @@ async fn stackerdb_chunk_upload(
                 EventKind::StackerDbChunks,
                 &stackerdb_chunks_payload(&contract_id, std::slice::from_ref(&announce)),
             );
+            // A chunk written here has to leave here, or a signer this node hosts
+            // is talking to nobody: the miner counting its response reads the
+            // chunk from its own replica, and nothing else carries it there.
+            if let Some(chunks) = &state.chunks {
+                let _ = chunks.send((contract_id.clone(), announce.clone()));
+            }
             json!({ "accepted": true, "metadata": metadata })
         }
         Err(refusal) => json!({
             "accepted": false,
             "reason": refusal.reason(),
             "code": refusal.code(),
+            "metadata": held,
         }),
     }))
 }
@@ -859,11 +1185,32 @@ async fn block_proposal(
     )
     .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
 
-    let outcome = judge_proposal(&state, &proposal, &block).await;
-    state.dispatch(
-        EventKind::ProposalResponse,
-        &proposal_response_payload(block.header.signer_signature_hash(), &outcome),
-    );
+    let digest = block.header.signer_signature_hash();
+    match judge_proposal(&state, &proposal, &block).await {
+        Verdict::Now(outcome) => state.dispatch(
+            EventKind::ProposalResponse,
+            &proposal_response_payload(digest, &outcome),
+        ),
+        // Executing a block takes as long as it takes, and stacks-core answers the
+        // request before it starts — so the wait happens here, off the request, and
+        // the verdict travels the way a signer already reads it.
+        Verdict::Pending(answered, size) => {
+            let announced = state.clone();
+            tokio::spawn(async move {
+                let started = SystemTime::now();
+                let answer = answered.await;
+                let elapsed = started
+                    .elapsed()
+                    .map_or(0, |elapsed| {
+                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                    });
+                announced.dispatch(
+                    EventKind::ProposalResponse,
+                    &proposal_response_payload(digest, &resolve(answer, size, elapsed)),
+                );
+            });
+        }
+    }
     Ok((
         StatusCode::ACCEPTED,
         axum::Json(json!({
@@ -877,8 +1224,10 @@ async fn judge_proposal(
     state: &RpcState,
     proposal: &BlockProposalWire,
     block: &NakamotoBlock,
-) -> ProposalOutcome {
-    let rejected = |reason: String, code| ProposalOutcome::Rejected { reason, code };
+) -> Verdict {
+    let rejected = |reason: String, code| {
+        Verdict::Now(ProposalOutcome::Rejected { reason, code })
+    };
     // The chain identifier is in the request rather than in the block, and a
     // proposal for another chain is not a proposal at all.
     if let Some(chain_id) = proposal.chain_id
@@ -909,11 +1258,11 @@ async fn judge_proposal(
         // Already executed, so the state root was already checked. Zero cost is
         // the value stacks-core itself reports for a block it did not have to
         // execute, and a signer reads it that way.
-        return ProposalOutcome::Accepted {
+        return Verdict::Now(ProposalOutcome::Accepted {
             cost: clarity::vm::costs::ExecutionCost::ZERO,
             size: block.encode().len() as u64,
             validation_time_ms: 0,
-        };
+        });
     }
     if !state.holds_parent_of(block).await {
         return rejected(
@@ -924,21 +1273,76 @@ async fn judge_proposal(
             ProposalRejectCode::UnknownParent,
         );
     }
-    // Admitted for execution but not vouched for: the offer is what gets the
-    // block executed and its root checked, and the refusal is what stops a
-    // signer treating "we will look at it" as "we agree with it".
+    // Admitted for execution: the offer is what gets the block onto this node's
+    // own chain once the network agrees on it, and it happens whether or not this
+    // node is able to vouch for the block first.
     if let Err(error) = state.offer_block(block.clone()) {
         return rejected(
             format!("this node cannot take the block: {error:?}"),
             ProposalRejectCode::ChainstateError,
         );
     }
-    rejected(
-        "this node validates a proposal by executing it, and has not executed \
-         this block yet; it has been admitted and its state root will be checked then"
-            .to_owned(),
-        ProposalRejectCode::ChainstateError,
-    )
+    let Some(proposals) = &state.proposals else {
+        // Admitted, and that is all: a node with no proposal validator cannot run
+        // the block off its tip, and a signer must not read "we will look at it"
+        // as "we agree with it".
+        return rejected(
+            "this node validates a proposal by executing it, and has no proposal \
+             validator configured to execute this one; it has been admitted and its \
+             state root will be checked when the chain reaches it"
+                .to_owned(),
+            ProposalRejectCode::ChainstateError,
+        );
+    };
+    let (verdict, answered) = tokio::sync::oneshot::channel();
+    if proposals
+        .send(ProposalRequest {
+            block: block.clone(),
+            verdict,
+        })
+        .is_err()
+    {
+        return rejected(
+            "this node's proposal validator has stopped".to_owned(),
+            ProposalRejectCode::ChainstateError,
+        );
+    }
+    Verdict::Pending(answered, block.encode().len() as u64)
+}
+
+/// What a route can say about a proposal now, and what it has to wait for.
+enum Verdict {
+    Now(ProposalOutcome),
+    /// The validator was asked; the answer and the block's size come later.
+    Pending(
+        tokio::sync::oneshot::Receiver<Result<(), (String, ProposalRejectCode)>>,
+        u64,
+    ),
+}
+
+/// Turn the validator's answer into the outcome an observer is told.
+///
+/// The cost is reported as zero rather than invented: the validator answers
+/// whether the root holds, and stacks-core itself reports zero for a block it did
+/// not have to execute, which is how a signer reads it
+/// (`stacks-signer/src/v0/signer.rs:1569`).
+fn resolve(
+    answer: Result<Result<(), (String, ProposalRejectCode)>, tokio::sync::oneshot::error::RecvError>,
+    size: u64,
+    elapsed: u64,
+) -> ProposalOutcome {
+    match answer {
+        Ok(Ok(())) => ProposalOutcome::Accepted {
+            cost: clarity::vm::costs::ExecutionCost::ZERO,
+            size,
+            validation_time_ms: elapsed,
+        },
+        Ok(Err((reason, code))) => ProposalOutcome::Rejected { reason, code },
+        Err(_) => ProposalOutcome::Rejected {
+            reason: "this node's proposal validator stopped before answering".to_owned(),
+            code: ProposalRejectCode::ChainstateError,
+        },
+    }
 }
 
 fn now_seconds() -> u64 {
@@ -1087,6 +1491,10 @@ struct BlockProposalWire {
 pub struct SealedTip {
     pub stacks_height: u64,
     pub stacks_tip: StacksBlockId,
+    /// The tip's block hash, which is not its identifier: `/v2/info` reports the
+    /// hash and every other route reports the identifier, and a signer reads the
+    /// former into a `BlockHeaderHash`.
+    pub stacks_block_hash: BlockHeaderHash,
     pub consensus_hash: ConsensusHash,
     pub bitcoin_height: u64,
     pub state_index_root: TrieHash,
@@ -1107,24 +1515,10 @@ struct NodeInfoWire {
     stacks_tip_height: u64,
     stacks_tip: String,
     stacks_tip_consensus_hash: String,
+    /// The burn view, which a signer reads separately from the tenure's.
+    pox_consensus: String,
+    server_version: String,
     network_id: u32,
-}
-
-#[derive(Serialize)]
-struct PoxInfoWire {
-    first_burnchain_block_height: u64,
-    current_burnchain_block_height: u64,
-    prepare_phase_block_length: u32,
-    reward_phase_block_length: u32,
-    reward_slots: u32,
-    rejection_fraction: Option<u64>,
-    contract_versions: Vec<PoxContractVersionWire>,
-}
-
-#[derive(Serialize)]
-struct PoxContractVersionWire {
-    activation_burnchain_block_height: u32,
-    contract_id: String,
 }
 
 #[derive(Serialize)]
@@ -1165,6 +1559,10 @@ struct SortitionInfoWire {
     stacks_parent_ch: Option<String>,
     last_sortition_ch: Option<String>,
     committed_block_hash: Option<String>,
+    /// The seed this sortition produced, which stacks-core's own reader requires
+    /// to be present: `prefix_opt_hex` deserializes a field, and a missing one is
+    /// an error rather than a `None`.
+    vrf_seed: Option<String>,
 }
 
 impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
@@ -1189,8 +1587,57 @@ impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
             committed_block_hash: sortition
                 .committed_block_hash
                 .map(|hash| format!("0x{hash}")),
+            vrf_seed: sortition.vrf_seed.map(|seed| format!("0x{}", hex::encode(seed))),
         }
     }
+}
+
+/// One tenure as a signer's fork check reads it (`TenureForkingInfo`).
+///
+/// The blocks are served with the tenure, because that is what the check is: a
+/// signer asks which tenures descend from a sortition it knows and compares the
+/// blocks in them against the ones it was asked to sign on top of.
+#[derive(Serialize)]
+struct TenureForkInfoWire {
+    burn_block_hash: String,
+    burn_block_height: u64,
+    sortition_id: String,
+    parent_sortition_id: String,
+    consensus_hash: String,
+    was_sortition: bool,
+    first_block_mined: Option<String>,
+    /// The tenure's blocks, consensus-serialized as one length-prefixed vector
+    /// and hex-encoded, which is what `prefix_opt_hex_codec` reads.
+    nakamoto_blocks: Option<String>,
+}
+
+impl From<&FollowedTenure> for TenureForkInfoWire {
+    fn from(tenure: &FollowedTenure) -> Self {
+        let sortition = &tenure.sortition;
+        Self {
+            burn_block_hash: format!("0x{}", sortition.bitcoin_block_hash),
+            burn_block_height: sortition.bitcoin_height,
+            sortition_id: format!("0x{}", sortition.sortition_id),
+            parent_sortition_id: format!("0x{}", sortition.parent_sortition_id),
+            consensus_hash: format!("0x{}", sortition.consensus_hash),
+            was_sortition: sortition.was_sortition,
+            first_block_mined: tenure
+                .blocks
+                .first()
+                .map(|block| format!("0x{}", block.block_id())),
+            nakamoto_blocks: Some(format!("0x{}", hex::encode(encode_blocks(&tenure.blocks)))),
+        }
+    }
+}
+
+/// A block vector in the consensus encoding: a big-endian count, then the blocks.
+fn encode_blocks(blocks: &[NakamotoBlock]) -> Vec<u8> {
+    let count = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+    let mut bytes = count.to_be_bytes().to_vec();
+    for block in blocks {
+        bytes.extend(block.encode());
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -1609,6 +2056,7 @@ mod tests {
         let sealed = SealedTip {
             stacks_height: 4,
             stacks_tip: StacksBlockId::from_bytes([7; 32]),
+            stacks_block_hash: BlockHeaderHash::from_bytes([6; 32]),
             consensus_hash: ConsensusHash::from_bytes([8; 20]),
             bitcoin_height: 3,
             state_index_root: TrieHash::from_bytes([9; 32]),
@@ -1628,7 +2076,12 @@ mod tests {
         )
         .await;
         assert_eq!(info["stacks_tip_height"], json!(4));
-        assert_eq!(info["stacks_tip"], json!(sealed.stacks_tip.to_string()));
+        // The hash, not the identifier: this is the one route that reports the
+        // block hash, because a signer reads it into a `BlockHeaderHash`.
+        assert_eq!(
+            info["stacks_tip"],
+            json!(sealed.stacks_block_hash.to_string())
+        );
         assert_eq!(info["burn_block_height"], json!(3));
 
         let status = body_json(
@@ -1728,6 +2181,7 @@ mod tests {
         SealedTip {
             stacks_height: block.header.chain_length,
             stacks_tip: block.block_id(),
+            stacks_block_hash: block.header.block_hash(),
             consensus_hash: block.header.consensus_hash,
             bitcoin_height: 11,
             state_index_root: block.header.state_index_root,
@@ -2196,10 +2650,11 @@ mod tests {
             panic!("exactly one chunk was announced, got {announced:?}");
         };
         assert_eq!(event, "stackerdb_chunks");
-        assert_eq!(
-            payload["contract_id"],
-            json!("ST000000000000000000002AMW42H.signers-0-1")
-        );
+        // Clarity's own identifier, not the `address.name` the route is keyed
+        // by: the boot address is version 26 and twenty zero bytes.
+        assert_eq!(payload["contract_id"]["name"], json!("signers-0-1"));
+        assert_eq!(payload["contract_id"]["issuer"][0], json!(26));
+        assert_eq!(payload["contract_id"]["issuer"][1], json!(vec![0u8; 20]));
         assert_eq!(
             payload["modified_slots"][0]["data"],
             json!(hex::encode(b"a response"))

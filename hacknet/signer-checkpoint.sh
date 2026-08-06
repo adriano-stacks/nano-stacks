@@ -182,6 +182,16 @@ json.dump(
 )
 PY
 
+# The reward set that signed the checkpoint block, which is what makes the
+# checkpoint's state root worth anything: the checkpoint asserting its own root
+# is not evidence. Read from the peer's `/v3/stacker_set`, which is a document
+# obtained without the checkpoint and readable by anything.
+checkpoint_bitcoin_height=$(curl -sf "$PEER/v3/sortitions/consensus/$checkpoint_consensus_hash" |
+  python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["burn_block_height"])')
+attesting_cycle=$(curl -sf "$PEER/v2/pox" |
+  python3 -c "import sys,json;p=json.load(sys.stdin);print(($checkpoint_bitcoin_height - p['first_burnchain_block_height']) // p['reward_cycle_length'])")
+curl -sf "$PEER/v3/stacker_set/$attesting_cycle" -o "$OUT/reward-set.json"
+
 # The same manifest a captured fixture publishes, so a checkpoint reads the
 # same whether it came from here or from `cargo xtask capture-fixtures`.
 cat > "$OUT/checkpoint.toml" <<EOF
@@ -190,5 +200,6 @@ checkpoint_stacks_height = $checkpoint_height
 source_state_id = "$checkpoint_id"
 published_state_index_root = "$state_root"
 first_bitcoin_height = $anchor_bitcoin_height
+attesting_reward_cycle = $attesting_cycle
 EOF
 cat "$OUT/checkpoint.toml"

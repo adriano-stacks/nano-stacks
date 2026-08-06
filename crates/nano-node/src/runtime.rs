@@ -70,7 +70,7 @@ const RESUME_ATTEMPTS: u32 = 30;
 /// The `StackerDB` message contracts a reward cycle's signers write to:
 /// block responses, state machine updates and pre-commits, in that order
 /// (`MessageSlotID`). A cycle's signer set owns one slot in each.
-const SIGNER_MESSAGE_IDS: [u32; 3] = [1, 2, 3];
+pub(crate) const SIGNER_MESSAGE_IDS: [u32; 3] = [1, 2, 3];
 
 /// A job the node runs, and what its stopping means for the rest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +81,10 @@ pub enum Job {
     Miner,
     /// The p2p transport: peer discovery, and the listener that answers peers.
     Peers,
+    /// Executing the proposals this node is asked to vouch for.
+    Proposals,
+    /// Keeping this node's `StackerDB` replicas and its peer's in step.
+    Replication,
 }
 
 impl Job {
@@ -98,7 +102,10 @@ impl Job {
             // configured, and losing the listener only costs this node its place in
             // other nodes' peer tables. Neither is worth stopping a node that is
             // still executing the chain.
-            Self::Rpc | Self::Miner | Self::Peers => false,
+            // A node hosting a signer stops being useful to it when either of
+            // these stops, but the chain it follows is unaffected, and the signer
+            // says so far louder than this node could.
+            Self::Rpc | Self::Miner | Self::Peers | Self::Proposals | Self::Replication => false,
         }
     }
 }
@@ -111,6 +118,8 @@ impl std::fmt::Display for Job {
             Self::Signer => "signer",
             Self::Miner => "miner",
             Self::Peers => "peer network",
+            Self::Proposals => "proposal validator",
+            Self::Replication => "StackerDB replication",
         })
     }
 }
@@ -233,42 +242,24 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // miner cannot see accepts them and never mines them, which is worse than
     // refusing them.
     let mempool = Arc::new(Mutex::new(nano_mempool::Mempool::new(network)));
-    // Where a block admitted over the public API is handed to the executor. One
-    // channel, drained by the follow loop into the same staging store the peer's
-    // blocks land in, so an upload and a followed block are the same thing from
-    // the moment they are authenticated.
-    let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
-
-    let state = start_rpc(
-        &config,
-        network,
-        executor.clone(),
-        mempool.clone(),
-        &dispatcher,
-        blocks,
-        &mut roles,
-    )
-    .await?;
+    let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone());
+    let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
     // view fresh.
     let executing_follower = config.miner.is_none();
-    if let (Some(miner), Some(executor)) = (config.miner.clone(), executor.clone()) {
-        let runtime = miner::Runtime {
-            config: config.clone(),
-            miner,
-            network,
-            pox: pox.clone(),
-            peer: peer.clone(),
-            executor,
-            dispatcher,
-            mempool: mempool.clone(),
-            relay: relay.clone(),
-        };
-        roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
-    }
+    start_miner(
+        &config,
+        network,
+        &pox,
+        &peer,
+        (executor.clone(), mempool.clone()),
+        (dispatcher, relay.clone()),
+        &mut roles,
+    );
     start_signer(&config, network, &pox, &peer, discovered.as_ref(), &mut roles).await?;
+    start_hosting(&config, network, &pox, &peer, state.as_ref(), hosted, &mut roles).await?;
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
@@ -285,7 +276,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             source,
             state,
             executor,
-            offered,
+            offered: api_to_loop.offered,
+            submitted: api_to_loop.submitted,
         };
         roles.spawn(async move { (Job::Follower, follow(follower).await) });
     }
@@ -364,6 +356,7 @@ fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     SealedTip {
         stacks_height: tip.header.chain_length,
         stacks_tip: tip.block_id(),
+        stacks_block_hash: tip.header.block_hash(),
         consensus_hash: tip.header.consensus_hash,
         bitcoin_height,
         state_index_root: tip.header.state_index_root,
@@ -489,6 +482,8 @@ struct Follower {
     executor: Option<SharedExecutor>,
     /// Blocks the public API authenticated, waiting to be staged.
     offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    /// Transactions the public API admitted, waiting to be passed on.
+    submitted: tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
 }
 
 /// Follow the peer, publishing what it validated and executing along it.
@@ -506,6 +501,7 @@ async fn follow(follower: Follower) -> Role {
         state,
         executor,
         mut offered,
+        mut submitted,
     } = follower;
     let directory = config.chainstate_dir(NODE_CHAINSTATE);
     let interval = Duration::from_secs(config.node.poll_interval_secs);
@@ -565,6 +561,7 @@ async fn follow(follower: Follower) -> Role {
         // before the round that executes it: nothing about them is special from
         // here on, which is the point.
         stage_admitted_blocks(&mut offered, &staging, &relay);
+        relay_admitted_transactions(&mut submitted, &relay);
         // Everything peers pushed, through the same boundary. Before the round that
         // executes, so a block a peer pushed a moment ago is executed in the round
         // that follows rather than the one after it.
@@ -604,11 +601,11 @@ async fn follow(follower: Follower) -> Role {
                 publish_reward_cycle(
                     state,
                     executor,
-                    &config,
                     network,
-                    &pox,
+                    bitcoin_context(&config, &pox),
                     &last_sortition_winners(node.view().as_ref()),
                     &mut published,
+                    &peer,
                 )
                 .await;
             }
@@ -672,6 +669,23 @@ fn stage_admitted_blocks(
             ),
         }
         relay.announce(nano_p2p::Offer::block(None, block));
+    }
+}
+
+/// Pass on the transactions the public API admitted.
+///
+/// Same reasoning as the blocks above and the same place for it: the pool this
+/// node keeps is read by its own miner alone, so a node that admits a transaction
+/// and tells nobody has accepted it into a hole. Admission already happened — on
+/// this node's own rules, against its own accounts — so all that is left is to
+/// say so.
+fn relay_admitted_transactions(
+    submitted: &mut tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    relay: &nano_p2p::Relay,
+) {
+    while let Ok(transaction) = submitted.try_recv() {
+        println!("relaying the transaction {} this node admitted", transaction.txid());
+        relay.announce(nano_p2p::Offer::transaction(None, Box::new(transaction)));
     }
 }
 
@@ -846,10 +860,10 @@ struct RewardCyclePublication {
     complained: Option<u64>,
     /// The cycle whose miner slots could not be assigned, for the same reason.
     ambiguous_miners: Option<u64>,
-    /// The key `.miners` is currently replicated for. Reconfiguring a contract
-    /// clears every chunk in it, so this is only done when the writer changes —
-    /// doing it per round would drop the proposal a signer is reading.
-    miner_writer: Option<nano_primitives::Hash160>,
+    /// Who `.miners` is currently replicated for, in slot order. Reconfiguring a
+    /// contract clears every chunk in it, so this is only done when the writers
+    /// change — doing it per round would drop the proposal a signer is reading.
+    miner_writers: Option<Vec<nano_primitives::Hash160>>,
 }
 
 /// Publish the reward set the executed state derives, and configure the
@@ -862,18 +876,17 @@ struct RewardCyclePublication {
 async fn publish_reward_cycle(
     state: &RpcState,
     executor: &SharedExecutor,
-    config: &Config,
     network: Network,
-    pox: &PoxInfo,
+    mut context: nano_chainstate::BitcoinBlockContext,
     winners: &[nano_primitives::Hash160],
     published: &mut RewardCyclePublication,
+    peer: &SyncClient,
 ) {
-    let mut context = bitcoin_context(config, pox);
     context.height = executor.lock().await.bitcoin_height();
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
         return;
     };
-    configure_miner_slots(state, network, cycle, winners, published).await;
+    configure_miner_slots(state, network, cycle, winners, published, peer).await;
     if published.served == Some(cycle) {
         return;
     }
@@ -937,7 +950,7 @@ async fn publish_reward_cycle(
     );
 }
 
-/// The block-signing keys that won the last two sortitions, newest first.
+/// The block-signing keys that won the most recent sortitions, newest first.
 ///
 /// Whose commitment won a burn block needs the burn distribution, which nano
 /// cannot derive ([[049-derive-sortitions-locally]]), so this is the peer's
@@ -955,54 +968,122 @@ fn last_sortition_winners(view: Option<&nano_sync::NodeView>) -> Vec<nano_primit
         if let Some(hash) = tenure.sortition.miner_public_key_hash {
             winners.push(hash);
         }
-        if winners.len() == 2 {
+        if winners.len() == MINER_SLOT_CANDIDATES {
             break;
         }
     }
     winners
 }
 
+/// How many recent sortition winners a `.miners` slot may be attributed to.
+///
+/// Two would be the answer if both slots were always rewritten every tenure, and
+/// they are not: a slot keeps the last chunk its owner wrote, which can be several
+/// tenures old. So the candidates are the recent winners rather than the last two,
+/// and every attribution is still checked against a signature.
+const MINER_SLOT_CANDIDATES: usize = 8;
+
 /// Replicate `.miners`, so a signer hosted here can read what a miner proposed.
 ///
 /// The two slots belong to the last two sortition winners, and which winner gets
 /// which is `num_sortitions % 2` in stacks-core — a count over the whole
 /// burnchain that a checkpointed node has never made and no snapshot nano holds
-/// carries. So the slots are configured only where the answer cannot be got
-/// wrong: when the last two winners are the same key, which is every chain with
-/// one miner. Otherwise it says so and replicates nothing, because a `.miners`
-/// replica with the two slots swapped refuses the very chunks it exists for.
+/// carries. A `.miners` replica with its two slots swapped refuses the very chunks
+/// it exists for, so the count has to come from somewhere.
+///
+/// It comes from the chunks. Every slot's metadata is signed by the writer that
+/// owns it, so asking the peer for its `.miners` listing and recovering each
+/// signature says which winner holds which slot — and says it in a form this node
+/// checks rather than believes: the recovered key has to be one of the two winners
+/// this node saw win. A peer that lies is a peer whose chunks stop verifying.
+///
+/// Only the winners are needed a priori, and where those come from is unchanged.
 async fn configure_miner_slots(
     state: &RpcState,
     network: Network,
     cycle: u64,
     winners: &[nano_primitives::Hash160],
     published: &mut RewardCyclePublication,
+    peer: &SyncClient,
 ) {
     let Some(&latest) = winners.first() else {
         return;
     };
+    let contract = crate::config::miner_contract(network);
     let previous = winners.get(1).copied().unwrap_or(latest);
-    if previous != latest {
+    let assignment = if previous == latest {
+        // One miner, so no order to get wrong.
+        Some(vec![latest, latest])
+    } else {
+        miner_slots(peer, &contract, winners).await
+    };
+    let Some(assignment) = assignment else {
         if published.ambiguous_miners != Some(cycle) {
             published.ambiguous_miners = Some(cycle);
             eprintln!(
-                "the last two sortitions were won by different miners ({latest} and \
-                 {previous}), and this node cannot say which of the two .miners slots each \
-                 owns without a sortition count, so it replicates neither"
+                "the recent sortitions were won by more than one miner and this node \
+                 cannot attribute both .miners slots to one of them from the chunks they \
+                 hold, so it replicates neither: a slot assigned to the wrong writer \
+                 refuses the proposals it exists for"
             );
         }
         return;
-    }
-    if published.miner_writer == Some(latest) {
+    };
+    if published.miner_writers.as_ref() == Some(&assignment) {
         return;
     }
-    published.miner_writer = Some(latest);
-    let contract = crate::config::miner_contract(network);
-    state.stackerdb().write().await.configure(
-        &format!("{}.{}", contract.address, contract.name),
-        vec![latest, latest],
-    );
-    println!("replicating .miners for the miner {latest} that won the last two sortitions");
+    published.miner_writers = Some(assignment.clone());
+    let names = assignment
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    state
+        .stackerdb()
+        .write()
+        .await
+        .configure(&crate::hosting::identifier(&contract), assignment);
+    println!("replicating .miners for the miners that hold its slots, in order: {names}");
+}
+
+/// Who owns each `.miners` slot, read off the peer's own listing.
+///
+/// Each slot's metadata is signed by the writer that owns it, so recovering the
+/// signature says who that is — checked against the miners this node saw win a
+/// sortition, so a peer naming a stranger gets nothing configured.
+///
+/// **Both slots have to resolve.** A slot nano assigns to the wrong writer refuses
+/// the very chunks it exists for, and a `.miners` replica that refuses proposals is
+/// worse than one that has none: the first looks configured. Guessing the second
+/// slot from the first is exactly that mistake, and it is what left a hosted signer
+/// with no proposals to answer while the log said `.miners` was replicated.
+async fn miner_slots(
+    peer: &SyncClient,
+    contract: &nano_stackerdb::StackerDbContract,
+    winners: &[nano_primitives::Hash160],
+) -> Option<Vec<nano_primitives::Hash160>> {
+    let client = nano_stackerdb::StackerDbClient::new(peer.base_url().clone()).ok()?;
+    let listing = client.slot_metadata(contract).await.ok()?;
+    let (mut first, mut second) = (None, None);
+    for metadata in listing {
+        if metadata.slot_version == 0 {
+            continue;
+        }
+        for writer in winners {
+            if !metadata.verify(*writer).unwrap_or(false) {
+                continue;
+            }
+            match metadata.slot_id {
+                0 => first = Some(*writer),
+                1 => second = Some(*writer),
+                _ => {}
+            }
+        }
+    }
+    match (first, second) {
+        (Some(first), Some(second)) if first != second => Some(vec![first, second]),
+        _ => None,
+    }
 }
 
 /// Open the executed state, when this node is a role that reads it.
@@ -1245,22 +1326,90 @@ async fn resume_from(
     .into())
 }
 
+/// What the public API hands the rest of the node, and what it reads.
+///
+/// Three channels and two shared values, together because they are the whole of
+/// the API's connection to the node: a route can only ever offer something to a
+/// loop that can check it, and each of these is one such offer.
+struct ApiWiring {
+    executor: Option<SharedExecutor>,
+    mempool: Arc<Mutex<nano_mempool::Mempool>>,
+    /// Where a block admitted over the public API is handed to the executor,
+    /// drained by the follow loop into the same staging store the peer's blocks
+    /// land in — so an upload and a followed block are the same thing from the
+    /// moment they are authenticated.
+    blocks: tokio::sync::mpsc::UnboundedSender<NakamotoBlock>,
+    proposals: tokio::sync::mpsc::UnboundedSender<nano_rpc::ProposalRequest>,
+    chunks: tokio::sync::mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>,
+    submitted: tokio::sync::mpsc::UnboundedSender<nano_codec::Transaction>,
+}
+
+/// The far ends of the channels the follow loop drains.
+struct FollowedChannels {
+    offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    submitted: tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+}
+
+/// The far ends of the channels the hosting role drains.
+struct HostedChannels {
+    proposed: tokio::sync::mpsc::UnboundedReceiver<nano_rpc::ProposalRequest>,
+    written: tokio::sync::mpsc::UnboundedReceiver<(String, nano_stackerdb::Chunk)>,
+}
+
+impl ApiWiring {
+    /// Build the wiring, handing back the ends that belong to other roles.
+    fn new(
+        executor: Option<SharedExecutor>,
+        mempool: Arc<Mutex<nano_mempool::Mempool>>,
+    ) -> (Self, FollowedChannels, HostedChannels) {
+        let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
+        let (proposals, proposed) = tokio::sync::mpsc::unbounded_channel();
+        let (chunks, written) = tokio::sync::mpsc::unbounded_channel();
+        let (relayed, submitted) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                executor,
+                mempool,
+                blocks,
+                proposals,
+                chunks,
+                submitted: relayed,
+            },
+            FollowedChannels { offered, submitted },
+            HostedChannels { proposed, written },
+        )
+    }
+}
+
 /// Serve the public RPC, if this node is configured to.
 async fn start_rpc(
     config: &Config,
     network: Network,
-    executor: Option<SharedExecutor>,
-    mempool: Arc<Mutex<nano_mempool::Mempool>>,
+    wiring: ApiWiring,
     dispatcher: &EventDispatcher,
-    blocks: tokio::sync::mpsc::UnboundedSender<NakamotoBlock>,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
 ) -> Result<Option<RpcState>, Box<dyn Error>> {
+    let ApiWiring {
+        executor,
+        mempool,
+        blocks,
+        proposals,
+        chunks,
+        submitted,
+    } = wiring;
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
     let mut state = RpcState::new(network)
         .with_mempool(mempool)
-        .with_block_sink(blocks);
+        .with_block_sink(blocks)
+        .with_chunk_relay(chunks)
+        .with_transaction_relay(submitted);
+    // Only when a validator is actually running: a channel with nobody at the far
+    // end would have the route promise a verdict that never arrives.
+    if config.signer.is_none() && config.node.block_proposal_token.is_some() {
+        state = state.with_proposal_validator(proposals);
+    }
     if let Some(executor) = executor {
         // The same mutex behind two trait objects, so an account read and a block
         // admission are serialized against each other and against execution: the
@@ -1292,6 +1441,35 @@ async fn start_rpc(
     Ok(Some(state))
 }
 
+/// Mine the tenures this node wins, if it is configured to mine at all.
+fn start_miner(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peer: &SyncClient,
+    chain: (Option<SharedExecutor>, Arc<Mutex<nano_mempool::Mempool>>),
+    announce: (EventDispatcher, nano_p2p::Relay),
+    roles: &mut JoinSet<(Job, Role)>,
+) {
+    let (executor, mempool) = chain;
+    let (dispatcher, relay) = announce;
+    let (Some(miner), Some(executor)) = (config.miner.clone(), executor) else {
+        return;
+    };
+    let runtime = miner::Runtime {
+        config: config.clone(),
+        miner,
+        network,
+        pox: pox.clone(),
+        peer: peer.clone(),
+        executor,
+        dispatcher,
+        mempool,
+        relay,
+    };
+    roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
+}
+
 /// Validate proposals for the active reward cycle, if this node signs.
 ///
 /// The signer's chain state is opened here rather than in the task, so a state it
@@ -1321,6 +1499,68 @@ async fn start_signer(
         (
             Job::Signer,
             signer::run(running, signer, network, peer, validator).await,
+        )
+    });
+    Ok(())
+}
+
+/// Run the two halves of hosting somebody else's signer, if this node serves an
+/// RPC for one to use.
+///
+/// The proposal validator keeps a chain state that may hold a candidate, and
+/// nano's embedded signer keeps the same one — so a node does one or the other.
+/// A configuration asking for both would open the same store twice, and the
+/// honest reading of it is that the operator meant the signer they configured.
+async fn start_hosting(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peer: &SyncClient,
+    state: Option<&RpcState>,
+    hosted: HostedChannels,
+    roles: &mut JoinSet<(Job, Role)>,
+) -> Result<(), Box<dyn Error>> {
+    let HostedChannels { proposed, written } = hosted;
+    let Some(state) = state.cloned() else {
+        return Ok(());
+    };
+    let (running, replicating) = (config.clone(), config.clone());
+    let (validating_peer, replicating_peer) = (peer.clone(), peer.clone());
+    roles.spawn(async move {
+        (
+            Job::Replication,
+            crate::hosting::replicate(replicating, network, replicating_peer, state, written).await,
+        )
+    });
+    // A validator is a second chain state, so it is opened only for a node that can
+    // actually be asked: `/v3/block_proposal` refuses every request without the
+    // token, and there is nothing for a validator to answer.
+    if config.signer.is_some() || config.node.block_proposal_token.is_none() {
+        return Ok(());
+    }
+    // A pool of the one peer this role holds: a resume asks the network, and a
+    // hosting node has not been given a discovery handle to widen it with.
+    let mut resume_pool = TenureSource::only(peer.clone());
+    let validator = signer::open(
+        config,
+        network,
+        pox,
+        &mut resume_pool,
+        &config.chainstate_dir(SIGNER_CHAINSTATE),
+    )
+    .await?;
+    let cycles = pox.clone();
+    roles.spawn(async move {
+        (
+            Job::Proposals,
+            crate::hosting::validate_proposals(
+                running,
+                cycles,
+                validating_peer,
+                validator,
+                proposed,
+            )
+            .await,
         )
     });
     Ok(())
@@ -1581,7 +1821,13 @@ fn check_maturity_window(accounting: &TenureAccounting) -> Result<(), Box<dyn Er
         // Nothing seeded at all is a genesis start, which owes nothing yet.
         return Ok(());
     };
-    if last - first < MINER_REWARD_MATURITY {
+    // A chain younger than the maturity horizon owes nothing before its own first
+    // tenure: the earliest payout any block can ask for is tenure 1, because a
+    // tenure below the horizon matures nothing at all. So earnings that reach back
+    // to the chain's beginning are complete however few of them there are, and
+    // demanding a hundred of them would make nano unable to start from any chain
+    // less than a hundred tenures old — which is every fresh test network.
+    if first > 1 && last - first < MINER_REWARD_MATURITY {
         return Err(format!(
             "the checkpoint carries earnings for tenures {first} to {last}, which is {} of the \
              {} a node needs: every tenure it executes before its own mature pays out one of \
@@ -2479,6 +2725,39 @@ mod tests {
         let refused = super::already_adopted([1; 32], [2; 32])
             .expect_err("a different checkpoint is refused");
         assert!(refused.contains("descends from checkpoint"), "{refused}");
+    }
+
+    /// A checkpoint owes the hundred tenures before it, unless the chain is
+    /// younger than that — in which case it owes everything there is.
+    ///
+    /// The earliest payout any block can ask for is tenure 1, because a tenure
+    /// below the maturity horizon matures nothing. So earnings reaching back to
+    /// the chain's first tenure are complete however few they are, and the
+    /// alternative is a node that cannot start from any network less than a
+    /// hundred tenures old.
+    #[test]
+    fn a_short_window_is_enough_only_when_it_reaches_the_chain_s_beginning() {
+        let earnings = |first: u64, last: u64| {
+            let tenures = (first..=last)
+                .map(|height| {
+                    format!(
+                        r#"{{"coinbase_height":{height},"recipient":"ST000000000000000000002AMW42H",
+                            "coinbase":1000,"fees":0}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            nano_chainstate::TenureAccounting::from_json(
+                format!(r#"{{"matured_effects":[],"tenures":[{tenures}]}}"#).as_bytes(),
+            )
+            .expect("the accounting reads")
+        };
+        super::check_maturity_window(&earnings(1, 12))
+            .expect("a young chain owes nothing before its own first tenure");
+        super::check_maturity_window(&earnings(50, 200)).expect("a full window is enough");
+        let refused = super::check_maturity_window(&earnings(50, 60))
+            .expect_err("a window that neither reaches back nor spans the horizon is refused");
+        assert!(refused.to_string().contains("tenures 50 to 60"), "{refused}");
     }
 
     /// The reward set that attests a checkpoint is read from what a node serves.

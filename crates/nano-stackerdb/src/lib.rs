@@ -103,6 +103,43 @@ impl StackerDbClient {
             .collect())
     }
 
+    /// Return the signed metadata of every slot of a contract.
+    ///
+    /// The signature is the point: it is what lets a replica check a chunk it
+    /// pulled from somewhere else, and what names the slot's writer without
+    /// anybody having to be trusted about it.
+    pub async fn slot_metadata(
+        &self,
+        contract: &StackerDbContract,
+    ) -> Result<Vec<SlotMetadata>, StackerDbClientError> {
+        let path = format!("v2/stackerdb/{}/{}", contract.address, contract.name);
+        let slots: Vec<SlotVersionWire> = self.get_json(&path).await?;
+        Ok(slots
+            .into_iter()
+            .map(|slot| SlotMetadata {
+                slot_id: slot.slot_id,
+                slot_version: slot.slot_version,
+                data_hash: parse_hash(slot.data_hash.as_deref()),
+                signature: parse_signature(slot.signature.as_deref()),
+            })
+            .collect())
+    }
+
+    /// Fetch the bytes a slot held at one version, if it still holds them.
+    pub async fn chunk_at(
+        &self,
+        contract: &StackerDbContract,
+        slot: u32,
+        version: u32,
+    ) -> Result<Option<Vec<u8>>, StackerDbClientError> {
+        let path = chunk_path(contract.address, &contract.name, slot, Some(version));
+        let response = self.client.get(self.url(&path)?).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.bytes().await?.to_vec()))
+    }
+
     /// Fetch the latest bytes written to a slot, if that slot has content.
     pub async fn latest_chunk(
         &self,
@@ -170,6 +207,28 @@ impl StackerDbClient {
 struct SlotVersionWire {
     slot_id: u32,
     slot_version: u32,
+    /// Present on a metadata listing and absent from an acknowledgement, which
+    /// is why both are read through one shape.
+    data_hash: Option<String>,
+    signature: Option<String>,
+}
+
+/// A hash a node wrote out, or a zero hash when it wrote none.
+///
+/// An unwritten slot is reported with no useful metadata at all, and it is not an
+/// error: it is a slot nothing has been put in yet.
+fn parse_hash(value: Option<&str>) -> Sha256Sum {
+    value
+        .and_then(|value| hex::decode(value.trim_start_matches("0x")).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map_or_else(Sha256Sum::default, Sha256Sum::from_bytes)
+}
+
+fn parse_signature(value: Option<&str>) -> MessageSignature {
+    value
+        .and_then(|value| hex::decode(value.trim_start_matches("0x")).ok())
+        .and_then(|bytes| <[u8; 65]>::try_from(bytes).ok())
+        .map_or_else(|| MessageSignature::from_bytes([0; 65]), MessageSignature::from_bytes)
 }
 
 #[derive(Deserialize)]
