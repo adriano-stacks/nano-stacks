@@ -457,6 +457,13 @@ pub enum CheckpointExecutionError {
         header: u64,
         derived: u64,
     },
+    /// A peer placed a burn view at a height this node's own chain says is
+    /// another burn block's.
+    BurnViewHeight {
+        view: nano_primitives::ConsensusHash,
+        peer: u64,
+        derived: u64,
+    },
 }
 
 impl fmt::Display for CheckpointExecutionError {
@@ -480,6 +487,17 @@ impl fmt::Display for CheckpointExecutionError {
                  would catch, because executing over the wrong burnchain produces a perfectly \
                  consistent state for a chain nobody else is on."
             ),
+            Self::BurnViewHeight {
+                view,
+                peer,
+                derived,
+            } => write!(
+                formatter,
+                "a peer places burn view {view} at height {peer} and this node's own \
+                 sortition chain derived it at {derived}. The height decides which Bitcoin \
+                 block every Clarity-visible burn field is read from, so this is not a \
+                 disagreement to report and carry on from."
+            ),
         }
     }
 }
@@ -488,7 +506,10 @@ impl std::error::Error for CheckpointExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ChainState(error) => Some(error),
-            Self::Bitcoin(_) | Self::Link(_) | Self::BitcoinSpent { .. } => None,
+            Self::Bitcoin(_)
+            | Self::Link(_)
+            | Self::BitcoinSpent { .. }
+            | Self::BurnViewHeight { .. } => None,
         }
     }
 }
@@ -1304,6 +1325,25 @@ where
             return Ok(sortition.clone());
         }
         let sortition = peers.sortition(view).await?;
+        // Where this node's own chain already names the view, the peer does not get
+        // to say which burn block it is. The pool has already refused an answer
+        // carrying another view's consensus hash; this refuses one that agrees about
+        // the hash and lies about the height, which is the same substitution made
+        // one field along — and the height decides which Bitcoin block every
+        // Clarity-visible burn field is then read from.
+        if let Some(height) = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.height_of_consensus_hash(view))
+            && height != sortition.bitcoin_height
+        {
+            return Err(CheckpointExecutionError::BurnViewHeight {
+                view,
+                peer: sortition.bitcoin_height,
+                derived: height,
+            }
+            .into());
+        }
         self.sortition_view = Some((view, sortition.clone()));
         Ok(sortition)
     }
@@ -1422,7 +1462,7 @@ where
         // burnchain by trusting the peer more.
         if !tracker.agrees_with_header(bitcoin_spent) {
             return Err(CheckpointExecutionError::BitcoinSpent {
-                bitcoin_height: bitcoin_height,
+                bitcoin_height,
                 header: bitcoin_spent,
                 derived: tip.total_burn,
             });
