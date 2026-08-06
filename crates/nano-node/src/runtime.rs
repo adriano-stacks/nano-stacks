@@ -496,19 +496,7 @@ async fn follow(follower: Follower) -> Role {
         execute: config.node.max_sync_blocks,
     };
     let mut pox = pox;
-    // Derive sortitions alongside the peer's answers, when the checkpoint
-    // carries the history that makes it possible.
-    if let (Some(executor), Some(directory)) =
-        (executor.as_ref(), config.checkpoint.sortition.as_ref())
-    {
-        let phase = Phase::start("seeding the local sortition chain");
-        start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
-        drop(phase);
-    }
-
-    if let Some(executor) = executor.as_ref() {
-        backfill_ancestors(executor, &peer, &pox, source).await;
-    }
+    prepare_to_follow(executor.as_ref(), &config, &peer, &pox, source).await;
     let mut peer_height = u64::MAX;
     let mut executed_height = 0;
     let mut published = RewardCyclePublication::default();
@@ -602,6 +590,31 @@ async fn follow(follower: Follower) -> Role {
         }
         sleep(interval).await;
     }
+}
+
+/// What a follower does once, before its first round.
+///
+/// Both halves are the executor's and neither belongs in the loop: a sortition
+/// chain is seeded from the checkpoint once, and the ancestor headers a state was
+/// written without are written down once. Extracted so the loop below is the loop.
+async fn prepare_to_follow(
+    executor: Option<&SharedExecutor>,
+    config: &Config,
+    peer: &SyncClient,
+    pox: &PoxInfo,
+    source: [u8; 32],
+) {
+    let Some(executor) = executor else {
+        return;
+    };
+    // Derive sortitions alongside the peer's answers, when the checkpoint
+    // carries the history that makes it possible.
+    if let Some(directory) = config.checkpoint.sortition.as_ref() {
+        let phase = Phase::start("seeding the local sortition chain");
+        start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
+        drop(phase);
+    }
+    backfill_ancestors(executor, peer, pox, source).await;
 }
 
 /// Take the blocks the public API admitted and stage them.
