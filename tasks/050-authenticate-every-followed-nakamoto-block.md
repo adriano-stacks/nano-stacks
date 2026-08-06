@@ -1,7 +1,7 @@
 ---
 id: "050"
 title: "Authenticate every followed Nakamoto block"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["024", "049"]
 tags: ["mainnet", "chainstate", "consensus"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Authenticate every followed Nakamoto block
@@ -32,7 +33,7 @@ state and local burn view.
 - [x] Finish [[024-verify-the-vrf-seed-a-block-commits-to]] on this path.
 - [x] Validate tenure-change and coinbase semantics against the local snapshot.
 - [x] Enforce the header version for the active epoch.
-- [ ] Enforce `bitcoin_spent`, PoX treatment and problematic transaction rules.
+- [x] Enforce `bitcoin_spent`, PoX treatment and problematic transaction rules.
 - [x] Enforce transaction version, chain ID, network and anchor-mode constraints
       on followed blocks, not only in the mempool.
 - [x] Reject before beginning VM execution and return a distinct consensus error.
@@ -372,3 +373,42 @@ It wants the registry's answer to travel the way `winner_vrf_public_key` does �
 and one substitution in `check_miner_won_the_sortition`. That last function is in
 the half of `nano-chainstate` this change was not allowed to touch, which is the
 only reason it is still open.
+
+## `bitcoin_spent` rejects now, and the old behaviour was backwards
+
+A Nakamoto header's `bitcoin_spent` is the running burn total of its burn view and
+carries threshold signer weight, so it is the one field of a followed block that can
+be checked against nano's *own* burnchain with nothing taken from a peer. And no
+state root would catch it: a node executing over the wrong chain of Bitcoin blocks
+computes a perfectly consistent state for a chain nobody else is on.
+
+`SortitionTracker::agrees_with_header` already made the comparison. What it did with
+a disagreement was the problem — it stopped deriving sortitions and went back to
+*the peer's*, which answers a disagreement about the burnchain by trusting the peer
+more. It is now `CheckpointExecutionError::BitcoinSpent`, before anything executes,
+naming both totals and the burn height.
+
+Live on the pristine replay past 8,693,400: not raised once.
+
+**PoX treatment** needs nothing, and the reason is in `plan.md`'s W8:
+`check_pox_bitvector` is a no-op under the waterfall because `rewarded_addresses()`
+is `None` — there is one sBTC output and no reward set to index into, so a bit
+vector has nothing to be wrong about. **Problematic transaction rules** landed with
+the tenure/coinbase shape work: the cap is pinned against `stackslib`'s own
+constant, and order, bounds and the absence of a marker on a coinbase or tenure
+change each have their own rejection.
+
+### The one field this cost, and the one it did not
+
+`BitcoinBlockContext` was carrying `derived_bitcoin_spent` for a version of this
+that put the check in `ChainState`. It crossed 256 bytes and clippy's
+`large_types_passed_by_value` began cascading through every signature that takes the
+context by value — which is most of them, because it is `Copy` on purpose. Reverted:
+the derived total lives in the tracker, the tracker is in the node, and
+`local_sortition` runs before `apply`, so the rule is before execution where it
+belongs without the context growing at all.
+
+The right long-term shape is probably to move the three validation-only fields
+(`sortition_hash`, `winner_vrf_public_key`, `winner_signing_key_hash`) behind one
+`Option` of their own, since they are exactly the fields no Clarity word reads.
+Recorded rather than done.

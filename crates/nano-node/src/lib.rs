@@ -286,6 +286,14 @@ pub enum CheckpointExecutionError {
     ChainState(ChainStateError),
     Bitcoin(String),
     Link(String),
+    /// The header's cumulative burn is not the total this node derived from its
+    /// own burnchain, so this block was built over a different chain of Bitcoin
+    /// blocks than the one this node read.
+    BitcoinSpent {
+        bitcoin_height: u64,
+        header: u64,
+        derived: u64,
+    },
 }
 
 impl fmt::Display for CheckpointExecutionError {
@@ -296,6 +304,19 @@ impl fmt::Display for CheckpointExecutionError {
             Self::Link(error) => {
                 write!(formatter, "checkpoint execution chain link failed: {error}")
             }
+            Self::BitcoinSpent {
+                bitcoin_height,
+                header,
+                derived,
+            } => write!(
+                formatter,
+                "the block at burn {bitcoin_height} says {header} burn has been spent and \
+                 this node's own burnchain makes it {derived}. That total is what the reward \
+                 set signed, so a disagreement means this block was built over a different \
+                 chain of Bitcoin blocks than the one this node read -- which no state root \
+                 would catch, because executing over the wrong burnchain produces a perfectly \
+                 consistent state for a chain nobody else is on."
+            ),
         }
     }
 }
@@ -304,7 +325,7 @@ impl std::error::Error for CheckpointExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ChainState(error) => Some(error),
-            Self::Bitcoin(_) | Self::Link(_) => None,
+            Self::Bitcoin(_) | Self::Link(_) | Self::BitcoinSpent { .. } => None,
         }
     }
 }
@@ -566,7 +587,7 @@ where
             .blocks
             .first()
             .map_or(0, |block| block.header.bitcoin_spent);
-        if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent) {
+        if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent)? {
             bitcoin_context.sortition_hash = local.sortition_hash;
             bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
             bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
@@ -1067,8 +1088,10 @@ where
         pox: &PoxInfo,
         peer: &nano_sync::SortitionInfo,
         bitcoin_spent: u64,
-    ) -> Option<LocalSortition> {
-        let payouts = payout_schedule(pox)?;
+    ) -> Result<Option<LocalSortition>, CheckpointExecutionError> {
+        let Some(payouts) = payout_schedule(pox) else {
+            return Ok(None);
+        };
         // Split the borrow: the tracker reads burn blocks through the same
         // source the executor holds.
         let Self {
@@ -1077,7 +1100,7 @@ where
             ..
         } = self
         else {
-            return None;
+            return Ok(None);
         };
         let behind = peer
             .bitcoin_height
@@ -1132,7 +1155,7 @@ where
             Err(error) => {
                 eprintln!("deriving the sortition locally failed: {error}");
                 self.sortition = None;
-                return None;
+                return Ok(None);
             }
         };
         let tip = tracker.tip();
@@ -1151,7 +1174,7 @@ where
                     peer.bitcoin_height.saturating_sub(tip.bitcoin_height)
                 );
             }
-            return None;
+            return Ok(None);
         }
         self.sortition_gap = None;
         report_disagreements(tip, peer);
@@ -1175,18 +1198,21 @@ where
             winner_vrf_public_key: tip.winner_vrf_public_key,
             winner_signing_key_hash: tip.winner_signing_key_hash,
         };
+        // Rejected rather than reported. A Nakamoto header's `bitcoin_spent` is
+        // the running burn total of its view and carries threshold signer weight,
+        // so this is the one field of a followed block that can be checked against
+        // nano's own burnchain with nothing taken from a peer — and no state root
+        // would catch it, because a node executing over the wrong chain of Bitcoin
+        // blocks computes a perfectly consistent state for a chain nobody else is
+        // on. It used to stop deriving and go back to the peer's sortitions, which
+        // is exactly the wrong direction: it answered a disagreement about the
+        // burnchain by trusting the peer more.
         if !tracker.agrees_with_header(bitcoin_spent) {
-            eprintln!(
-                "the locally derived burn total at burn {} is {} where the header signed by \
-                 the reward set says {} — every consensus hash after this one would be \
-                 derived from a wrong total, so this node stops deriving and goes back to \
-                 the peer's sortitions",
-                peer.bitcoin_height,
-                tip.total_burn,
-                bitcoin_spent
-            );
-            self.sortition = None;
-            return None;
+            return Err(CheckpointExecutionError::BitcoinSpent {
+                bitcoin_height: peer.bitcoin_height,
+                header: bitcoin_spent,
+                derived: tip.total_burn,
+            });
         }
         // Written down as it advances rather than at shutdown, because a node
         // that is killed is exactly the one that must not start over — and only
@@ -1208,7 +1234,7 @@ where
                 );
             }
         }
-        Some(local)
+        Ok(Some(local))
     }
 
     /// Stand on the last block a peer's chain and this one agree about.
@@ -1356,7 +1382,7 @@ where
             // this node's own burnchain. Absent, `check_tenure_vrf` says which
             // rule it could not run and why, which is the honest state; filled
             // from the peer, it would be checking the peer against itself.
-            if let Some(local) = local {
+            if let Some(local) = local? {
                 bitcoin_context.sortition_hash = local.sortition_hash;
                 bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
             bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;

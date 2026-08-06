@@ -94,6 +94,9 @@ pub enum ConsensusError {
     ProblematicMarkerTarget(u32),
     /// The signatures do not carry the reward set's threshold weight.
     SignerWeight(SignerSetError),
+    /// The header's cumulative burn is not the total this node derived from its
+    /// own burnchain for the same burn view.
+    BitcoinSpent { header: u64, derived: u64 },
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -189,6 +192,10 @@ impl std::fmt::Display for ConsensusError {
             Self::ProblematicMarkerTarget(index) => write!(
                 formatter,
                 "problematic-transaction marker {index} points at a coinbase or tenure change"
+            ),
+            Self::BitcoinSpent { header, derived } => write!(
+                formatter,
+                "the header spends {header} burn and this node's burnchain makes it {derived}"
             ),
             Self::SignerWeight(error) => write!(formatter, "signer signatures: {error}"),
         }
