@@ -224,21 +224,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // The chain is only executed when something reads the executed state: a
     // signer-only node validates proposals in its own store and would be
     // executing every block twice for nobody.
-    let executor = if config.node.rpc_bind.is_some() || config.miner.is_some() {
-        let phase = Phase::start("opening the executed state");
-        let executor = open_executor(
-            &config,
-            network,
-            &pox,
-            &peer,
-            &config.chainstate_dir(NODE_CHAINSTATE),
-        )
-        .await?;
-        drop(phase);
-        Some(Arc::new(Mutex::new(executor)))
-    } else {
-        None
-    };
+    let executor = open_executed_state(&config, network, &pox, discovered.as_ref()).await?;
     let dispatcher = EventDispatcher::new(config.node.event_observers()?);
     let phase = Phase::start("announcing the blocks already executed");
     announce_executed_blocks(executor.as_ref(), &dispatcher).await;
@@ -282,7 +268,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         };
         roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
     }
-    start_signer(&config, network, &pox, &peer, &mut roles).await?;
+    start_signer(&config, network, &pox, &peer, discovered.as_ref(), &mut roles).await?;
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
@@ -1019,6 +1005,35 @@ async fn configure_miner_slots(
     println!("replicating .miners for the miner {latest} that won the last two sortitions");
 }
 
+/// Open the executed state, when this node is a role that reads it.
+///
+/// The chain is only executed when something reads it: a signer-only node validates
+/// proposals in its own store and would be executing every block twice for nobody.
+async fn open_executed_state(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    discovered: Option<&Discovered>,
+) -> Result<Option<SharedExecutor>, Box<dyn Error>> {
+    if config.node.rpc_bind.is_none() && config.miner.is_none() {
+        return Ok(None);
+    }
+    let phase = Phase::start("opening the executed state");
+    // Every peer known, so a resume asks the network rather than whichever peer
+    // answered first.
+    let mut resume_pool = TenureSource::new(follow_pool(config, discovered).into_clients());
+    let executor = open_executor(
+        config,
+        network,
+        pox,
+        &mut resume_pool,
+        &config.chainstate_dir(NODE_CHAINSTATE),
+    )
+    .await?;
+    drop(phase);
+    Ok(Some(Arc::new(Mutex::new(executor))))
+}
+
 /// Open the chain this node executes, resuming whatever is already on disk.
 ///
 /// The first start imports the checkpoint and applies the block after it. Every
@@ -1028,11 +1043,11 @@ pub async fn open_executor(
     config: &Config,
     network: Network,
     pox: &PoxInfo,
-    peer: &SyncClient,
+    peers: &mut TenureSource,
     directory: &Path,
 ) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
     let (chainstate, anchor, context) =
-        open_chainstate(config, network, pox, peer, directory).await?;
+        open_chainstate(config, network, pox, peers, directory).await?;
     let bitcoin = bitcoin_source(config)?;
     match context {
         Some(context) => Ok(CheckpointExecutor::from_chainstate(
@@ -1050,7 +1065,7 @@ pub async fn open_chainstate(
     config: &Config,
     network: Network,
     pox: &PoxInfo,
-    peer: &SyncClient,
+    peers: &mut TenureSource,
     directory: &Path,
 ) -> Result<(ChainState, NakamotoBlock, Option<BitcoinBlockContext>), Box<dyn Error>> {
     let source = config.checkpoint.source_state_id()?;
@@ -1093,7 +1108,7 @@ pub async fn open_chainstate(
         ancestors.push(parent);
         walk = parent;
     }
-    let tip = resume_from(ancestors, peer, tip, directory).await?;
+    let tip = resume_from(ancestors, peers, tip, directory).await?;
     println!(
         "resuming {} from the state on disk, sealed at block {} of height {}",
         directory.display(),
@@ -1183,18 +1198,25 @@ const RESUME_ANCESTORS: usize = 256;
 
 async fn resume_from(
     ancestors: Vec<[u8; 32]>,
-    peer: &SyncClient,
+    peers: &mut TenureSource,
     tip: [u8; 32],
     directory: &Path,
 ) -> Result<NakamotoBlock, Box<dyn Error>> {
     let sealed = StacksBlockId::from_bytes(tip);
     let mut waited = 0;
     loop {
-        match patiently(|| peer.block(sealed)).await {
+        // The pool, not one peer. One peer's 404 is that peer's answer: a node
+        // whose sealed tip is a block the peer it happened to reach has not got
+        // yet would walk its own chain back and abandon state that is perfectly
+        // canonical. `TenureSource::block` asks the others and refuses an answer
+        // that is not the block asked for, so the walk below only starts once
+        // *nobody* has it.
+        match peers.block(sealed).await {
             Ok(block) => return Ok(block),
             Err(_) if waited < RESUME_ATTEMPTS => {
                 waited += 1;
-                println!("waiting for the peer to catch up to block {sealed}");
+                peers.forgive_throttles();
+                println!("waiting for the peers to catch up to block {sealed}");
                 sleep(Duration::from_secs(1)).await;
             }
             Err(_) => break,
@@ -1202,7 +1224,8 @@ async fn resume_from(
     }
 
     for (walked, ancestor) in ancestors.iter().enumerate() {
-        if let Ok(block) = patiently(|| peer.block(StacksBlockId::from_bytes(*ancestor))).await {
+        peers.forgive_throttles();
+        if let Ok(block) = peers.block(StacksBlockId::from_bytes(*ancestor)).await {
             println!(
                 "block {sealed} left the chain; carrying on from {}, {} back",
                 block.block_id(),
@@ -1213,9 +1236,9 @@ async fn resume_from(
     }
 
     Err(format!(
-        "the state in {} is sealed at block {sealed}, and the peer has none of its {} ancestors \
-         either; nothing on the network extends it, so it needs another peer or a fresh \
-         checkpoint",
+        "the state in {} is sealed at block {sealed}, and no peer in the pool has any of its \
+         {} ancestors either; nothing the network serves extends it, so it needs a peer \
+         nobody here has reached or a fresh checkpoint",
         directory.display(),
         ancestors.len()
     )
@@ -1279,16 +1302,18 @@ async fn start_signer(
     network: Network,
     pox: &PoxInfo,
     peer: &SyncClient,
+    discovered: Option<&Discovered>,
     roles: &mut JoinSet<(Job, Role)>,
 ) -> Result<(), Box<dyn Error>> {
     let Some(signer) = config.signer.clone() else {
         return Ok(());
     };
+    let mut resume_pool = TenureSource::new(follow_pool(config, discovered).into_clients());
     let validator = signer::open(
         config,
         network,
         pox,
-        peer,
+        &mut resume_pool,
         &config.chainstate_dir(SIGNER_CHAINSTATE),
     )
     .await?;

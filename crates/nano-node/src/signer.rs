@@ -42,11 +42,11 @@ pub async fn open(
     config: &Config,
     network: Network,
     pox: &PoxInfo,
-    peer: &SyncClient,
+    peers: &mut nano_sync::TenureSource,
     directory: &Path,
 ) -> Result<Validator, Box<dyn Error>> {
     let (mut chainstate, anchor, pending) =
-        runtime::open_chainstate(config, network, pox, peer, directory).await?;
+        runtime::open_chainstate(config, network, pox, peers, directory).await?;
     let mut bitcoin = runtime::bitcoin_source(config)?;
     let mut context = runtime::bitcoin_context(config, pox);
     context.height = config.checkpoint.anchor_bitcoin_height;
