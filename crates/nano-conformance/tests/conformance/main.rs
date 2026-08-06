@@ -42,6 +42,7 @@ mod mainnet_checkpoint;
 mod mainnet_codec;
 mod mainnet_codegen;
 mod mainnet_envelope;
+mod mainnet_receipts;
 mod mainnet_sortition;
 mod marf_lockstep;
 mod mempool;

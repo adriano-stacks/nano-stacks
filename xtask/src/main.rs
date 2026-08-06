@@ -43,12 +43,13 @@ fn main() -> ExitCode {
             export_leader_keys(&env::args().skip(2).collect::<Vec<_>>())
         }
         Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("freeze-receipts") => freeze_receipts(&env::args().skip(2).collect::<Vec<_>>()),
         Some("rebuild-accounting") => {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -4370,5 +4371,84 @@ fn release_report(arguments: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Freeze a bounded slice of an observer's `new_block` stream as a regression
+/// fixture: one digest a block, over the receipts rather than over the payload.
+///
+/// The mainnet capture holds no `new_block` events and cannot be made to — that
+/// stream only exists if somebody was listening while the chain executed, and no
+/// public API serves it for a historical block. So this is deliberately **not** an
+/// oracle: it is nano's own receipts, from blocks whose `state_index_root` the
+/// chain verified before they were sealed. What it catches is the one failure a
+/// root cannot: a compiler change that alters a receipt, a cost dimension or an
+/// event without altering any state, which is exactly what a refused contract call
+/// does — it writes nothing and seals the root an untouched block seals.
+///
+/// A digest and not the payloads, because 500 mainnet blocks of receipts are
+/// 250 MB and this has to live in CI. Any change to a status, a cost dimension, an
+/// event or the block's own identity moves it.
+fn freeze_receipts(arguments: &[String]) -> ExitCode {
+    let [observer, output, rest @ ..] = arguments else {
+        eprintln!(
+            "usage: cargo xtask freeze-receipts <observer-dir> <out.json> [first-height] [count]"
+        );
+        return ExitCode::from(2);
+    };
+    let first: u64 = rest.first().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let count: usize = rest
+        .get(1)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    let directory = PathBuf::from(observer).join("new_block");
+    let mut paths: Vec<PathBuf> = match fs::read_dir(&directory) {
+        Ok(entries) => entries.filter_map(|entry| Some(entry.ok()?.path())).collect(),
+        Err(error) => {
+            eprintln!("cannot read {}: {error}", directory.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    paths.sort();
+    let mut frozen = Vec::new();
+    for path in paths {
+        let Ok(body) = fs::read(&path) else { continue };
+        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            eprintln!("skipping an unreadable payload: {}", path.display());
+            continue;
+        };
+        let height = payload["block_height"].as_u64().unwrap_or_default();
+        if height < first {
+            continue;
+        }
+        frozen.push(nano_conformance::receipt_digest(&payload));
+        if frozen.len() >= count {
+            break;
+        }
+    }
+    if frozen.is_empty() {
+        eprintln!("no payloads at or above height {first} under {}", directory.display());
+        return ExitCode::FAILURE;
+    }
+    let document = json!({
+        "source": "nano-stacks event observer, blocks whose state root the chain verified",
+        "first_height": frozen.first().map(|entry| entry.height),
+        "last_height": frozen.last().map(|entry| entry.height),
+        "blocks": frozen,
+    });
+    match fs::write(output, serde_json::to_vec_pretty(&document).unwrap_or_default()) {
+        Ok(()) => {
+            println!(
+                "froze {} blocks, {} to {}, into {output}",
+                frozen.len(),
+                frozen.first().map_or(0, |entry| entry.height),
+                frozen.last().map_or(0, |entry| entry.height),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cannot write {output}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }

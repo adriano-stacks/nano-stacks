@@ -62,7 +62,7 @@ node may invoke.
 - [x] Compare clarity-wasm with the interpreter before sealing in the
       conformance harness and retain minimized regression fixtures for every
       disagreement found.
-- [ ] Pin roots, receipts, costs, events and consensus-visible writes for a
+- [x] Pin roots, receipts, costs, events and consensus-visible writes for a
       bounded mainnet compiler regression slice; a missing fixture must fail the
       release gate.
 - [x] Record the clarity-wasm and compiler revisions in the report produced by
@@ -1114,3 +1114,37 @@ does not rediscover the dead end:
 The half that *is* done is the one that stops a missing fixture reading as a pass:
 `skip_gate` plus `NANO_REQUIRE_MAINNET`, demonstrated both ways, so a release run
 that claims the mainnet gates are green had to actually run them.
+
+## The slice exists now, by the second of the two routes
+
+The note above recorded a dead end and two ways out. The second one is built: nano's
+own receipts, frozen from blocks whose `state_index_root` mainnet's signed headers
+verified before nano sealed them.
+
+What made it cheap was pointing an event observer at the live mainnet catch-up —
+`hacknet/event-sink.py`, the same sink a hacknet capture uses — so the receipts
+stream that cannot be fetched for a historical block is simply *recorded* as the
+chain is executed. 500 blocks, 8,702,046 to 8,702,592: **1,644 transactions and
+209,762 events**.
+
+It is frozen as one digest a block rather than as the payloads, because 500 mainnet
+blocks of receipts are 525 MB and this has to live in CI; `receipts.json` is 124 KB.
+Inside each digest: every transaction's identity, status, returned value and all
+five cost dimensions, and every event in the order the block emitted them. Outside
+it: the block's height and its Nakamoto hash — which is the signer signature hash,
+which commits to `state_index_root`, so the root is pinned without the payload
+carrying one.
+
+**Demonstrated falsifiable, which is the only thing that makes a digest worth
+anything.** Adding **1** to the runtime cost of one transaction in one block of the
+150-block corpus fails the gate, at that block, saying the transaction and event
+counts are unchanged — which is the report the failure needs, because identical
+counts with a moved digest is precisely a receipt changing while no state does.
+
+Two honest limits, both in the file's own comment. It is nano checking itself, not
+an oracle: the roots are chain-verified but the receipts are not, so it catches a
+*regression* and cannot catch a divergence that was already there. And comparing it
+against a run needs `NANO_MAINNET_RECEIPTS` to name an observer directory, so that
+half `skip_gate`s in a working tree — while the half that cannot skip, and panics
+rather than skipping when the fixture is missing, is the contiguity and content
+check on the frozen slice itself.

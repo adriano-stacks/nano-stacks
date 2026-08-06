@@ -767,6 +767,79 @@ struct ReplayInputs<'a> {
     receipts: bool,
 }
 
+
+/// One block's receipts, reduced to what a regression has to notice.
+///
+/// Kept as a digest rather than as the payload because 500 mainnet blocks of
+/// receipts are 250 MB and this lives in CI. Every field a compiler change could
+/// move is inside the digest: each transaction's identity, its status, all five
+/// cost dimensions, the value it returned, and the ordered events it emitted. The
+/// block's own identity is outside it, so a mismatch says *which* block and then
+/// what about it.
+///
+/// `block` is the Nakamoto block hash, which is the signer signature hash, which
+/// commits to `state_index_root` -- so freezing it pins the root without the
+/// payload carrying one.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ReceiptDigest {
+    pub height: u64,
+    pub block: String,
+    pub transactions: usize,
+    pub events: usize,
+    /// `Sha512_256` over the ordered receipts, hexadecimal.
+    pub digest: String,
+}
+
+/// Reduce an event observer's `new_block` payload to a [`ReceiptDigest`].
+///
+/// The ordering is the payload's own, which is consensus: a receipt list is the
+/// order the block executed in, and an event list is the order the block emitted.
+#[must_use]
+pub fn receipt_digest(payload: &serde_json::Value) -> ReceiptDigest {
+    let strip = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("0x")
+            .to_owned()
+    };
+    let mut preimage = Vec::new();
+    let transactions = payload["transactions"].as_array().cloned().unwrap_or_default();
+    for transaction in &transactions {
+        preimage.extend_from_slice(strip(&transaction["txid"]).as_bytes());
+        preimage.extend_from_slice(strip(&transaction["status"]).as_bytes());
+        preimage.extend_from_slice(strip(&transaction["raw_result"]).as_bytes());
+        let cost = &transaction["execution_cost"];
+        for dimension in [
+            "runtime",
+            "read_count",
+            "read_length",
+            "write_count",
+            "write_length",
+        ] {
+            preimage.extend_from_slice(cost[dimension].to_string().as_bytes());
+        }
+    }
+    let events = payload["events"].as_array().cloned().unwrap_or_default();
+    for event in &events {
+        preimage.extend_from_slice(strip(&event["txid"]).as_bytes());
+        preimage.extend_from_slice(strip(&event["type"]).as_bytes());
+        preimage.extend_from_slice(event["committed"].to_string().as_bytes());
+        // Whatever payload the event carries, canonically: an event's shape is
+        // per type and enumerating them here would be a second definition of it.
+        preimage.extend_from_slice(
+            serde_json::to_vec(event).unwrap_or_default().as_slice(),
+        );
+    }
+    ReceiptDigest {
+        height: payload["block_height"].as_u64().unwrap_or_default(),
+        block: strip(&payload["block_hash"]),
+        transactions: transactions.len(),
+        events: events.len(),
+        digest: hex::encode(nano_primitives::sha512_256(&preimage).as_bytes()),
+    }
+}
+
 /// Whether a gate that cannot run may quietly report nothing.
 ///
 /// Most of these tests need a capture or a node's state directory, and skipping
