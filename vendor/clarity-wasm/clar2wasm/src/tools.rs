@@ -980,9 +980,21 @@ pub fn crosscheck_multi_contract_with_env(
 
     // compare with expected final value
     let final_value = compiled_results.last().unwrap_or(&Ok(None));
+    // Every contract's own result, not just the last one's. A multi-contract
+    // crosscheck fails at the *end*, and the last contract is often only the
+    // messenger: `contract-hash? .callee` answering `(err u2)` says the callee is
+    // absent and nothing about why. Both engines agreeing hides it further, because
+    // the per-contract comparison above then passes in silence.
     assert_eq!(
-        final_value, &expected,
-        "final value is not the expected {final_value:?}"
+        final_value,
+        &expected,
+        "final value is not the expected {final_value:?}\nper contract:\n{}",
+        contracts
+            .iter()
+            .zip(&compiled_results)
+            .map(|((name, _), result)| format!("  {name}: {result:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     compare_events(interpreted_env.get_events(), compiled_env.get_events());

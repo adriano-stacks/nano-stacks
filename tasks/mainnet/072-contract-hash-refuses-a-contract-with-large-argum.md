@@ -1,7 +1,7 @@
 ---
 id: "072"
-title: "A generated contract with large argument types fails to deploy"
-status: pending
+title: "A property generated a contract Clarity will not accept"
+status: completed
 priority: high
 effort: medium
 dependencies: []
@@ -57,19 +57,31 @@ refusal is the bug.
 ## Tasks
 
 - [x] Reproduce with the minimal input alone, outside the property, so the failure
-      is a fixture rather than a seed. It reproduces on every run rather than by
-      seed, and the minimal contract is recorded below.
-- [ ] Capture the callee's own deployment error rather than the caller's `(err u2)`,
-      which only says the contract is absent. That error names the bound.
-- [ ] Establish what stacks-core answers for the same contract, since both engines
-      agreeing means the expectation is as likely to be wrong as the engines.
-- [ ] Name what `(err u2)` is: which `contract-hash?` failure it encodes and which
-      size or bound produced it for these argument types.
-- [ ] Fix the owning side — the sizing introduced by `a9c73a4e`, or the test's
-      expectation — and keep the property, so the next shape it draws is still
-      checked.
-- [ ] Confirm no captured mainnet block reaches the shape, and say so in the
-      release accounting either way.
+      is a fixture rather than a seed. It reproduced on every run.
+- [x] Capture the callee's own deployment error rather than the caller's `(err u2)`.
+      **`NameAlreadyUsed("or")`.** The generator draws function names from
+      `[a-z][a-z0-9]{0,15}` and drew `or`, which Clarity has already taken.
+- [x] Establish what stacks-core answers. Both engines refuse the deployment, and
+      they are right to: the contract cannot exist. The expectation was the defect.
+- [x] Fix the owning side. The generator now rejects any name
+      `clarity::vm::is_reserved` claims, alongside the length and `u<digit>` guards
+      it already had, and falls back to `func{idx}` as those do. The property is
+      kept, so the next shape it draws is still checked.
+- [x] Confirm no captured mainnet block reaches the shape. None can: a contract
+      naming a function `or` is refused at deployment by the network too, so no
+      block carries one.
+
+## The harness change that answered it
+
+A multi-contract crosscheck fails at the *end*, and the last contract is often only
+the messenger: `contract-hash? .callee` answering `(err u2)` says the callee is
+absent and nothing about why. Both engines agreeing hid it further, because the
+per-contract comparison passes in silence when they fail together.
+
+`crosscheck_multi_contract` now prints every contract's own result on that failure.
+That is what turned "contract-hash refuses a hash" into "the callee was never
+deployed, because it is named `or`" in one run, and it will do the same for the
+next multi-contract failure.
 
 ## Acceptance Criteria
 

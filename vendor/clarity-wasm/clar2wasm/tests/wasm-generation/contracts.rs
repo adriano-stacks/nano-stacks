@@ -670,11 +670,20 @@ proptest! {
         )
         .prop_map(|defs| {
             defs.into_iter().enumerate().map(|(idx, (func_type, name, tys, result))| {
-                // Ensure function name is at least 2 characters and doesn't start with "u" followed by digit
-                // (which could be confused with uint literals like u0, u1, etc.)
+                // Ensure function name is at least 2 characters, doesn't start with
+                // "u" followed by a digit (which could be confused with uint literals
+                // like u0, u1), and is not a name Clarity has already taken.
+                //
+                // That last one is why this property failed on a contract nobody
+                // could deploy: the generator drew `or`, the callee was refused with
+                // `NameAlreadyUsed("or")` by *both* engines -- correctly -- and the
+                // property then asked `contract-hash?` for the hash of a contract
+                // that did not exist, getting `(err u2)`, "contract missing". The
+                // engines were right and the contract was ungenerable.
                 let func_name = if name.is_empty()
                     || name.len() == 1
                     || (name.starts_with('u') && name.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+                    || clarity::vm::is_reserved(&name, &TestConfig::clarity_version())
                 {
                     format!("func{}", idx)
                 } else {
