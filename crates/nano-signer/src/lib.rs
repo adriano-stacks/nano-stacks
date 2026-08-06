@@ -1180,6 +1180,15 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         self.signer.set_writer_slot(writer_slot);
         self.last_proposal = None;
     }
+
+    /// Read proposals from, and write responses into, another peer's replica.
+    ///
+    /// `last_proposal` is kept: it records what this signer has already answered,
+    /// which is a fact about the signer and not about the peer it heard it from.
+    /// Clearing it would have a failover answer the same proposal twice.
+    pub fn use_client(&mut self, client: StackerDbClient) {
+        self.client = client;
+    }
 }
 
 /// The proposal a signer should answer out of what its miner slots hold.
@@ -1266,6 +1275,15 @@ impl StateAnnouncer {
     pub fn rebind(&mut self, contract: StackerDbContract, writer_slot: u32) {
         self.contract = contract;
         self.writer_slot = writer_slot;
+        self.announced = None;
+    }
+
+    /// Announce through another peer's replica.
+    ///
+    /// `announced` is cleared with it: what has already been said was said to
+    /// somebody else, and the new peer's replica has not heard it.
+    pub fn use_client(&mut self, client: StackerDbClient) {
+        self.client = client;
         self.announced = None;
     }
 
@@ -1431,9 +1449,27 @@ impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
         Self { client, service }
     }
 
+    /// The peer this signer is reading from, for a caller that has to ask it
+    /// something on the signer's behalf.
+    #[must_use]
+    pub const fn peer(&self) -> &SyncClient {
+        &self.client
+    }
+
     /// Return the signer service so a new reward cycle can rebind it.
     pub const fn service_mut(&mut self) -> &mut SignerService<ActiveSortitionValidator<V>> {
         &mut self.service
+    }
+
+    /// Point this signer at another peer.
+    ///
+    /// A signer that keeps the one peer it was built with makes that peer's
+    /// availability its own: nothing it reads or writes reaches the network past a
+    /// peer that has stopped answering. Which peer serves a round cannot change a
+    /// verdict — the proposal is authenticated and executed either way — so
+    /// retargeting is a liveness move and nothing more.
+    pub fn use_peer(&mut self, client: SyncClient) {
+        self.client = client;
     }
 
     /// Return the active validator so its independently verified chain view can advance.

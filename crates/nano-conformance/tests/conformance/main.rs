@@ -63,6 +63,7 @@ mod pox_five_replay;
 mod pre_checkpoint_headers;
 mod pox_locking;
 mod rejected_blocks;
+mod replication_failover;
 mod release_dependencies;
 mod restart;
 mod signer_weight_enforcement;

@@ -15,12 +15,14 @@ use nano_signer::{
     AccumulatedCoinbase, ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner,
     LiveSigner, SignerConfig as EmbeddedSignerConfig, SignerService, StateAnnouncer,
 };
-use nano_stackerdb::{StackerDbClient, StackerDbContract};
-use nano_sync::{PoxInfo, SyncClient};
+use nano_p2p::Discovered;
+use nano_stackerdb::StackerDbContract;
+use nano_sync::{PoxInfo, TenureSource};
 use tokio::time::sleep;
 
 use crate::{
     config::{Config, SignerConfig, cycle_contract, miner_contract},
+    hosting::Replicas,
     runtime,
 };
 
@@ -71,10 +73,11 @@ pub async fn run(
     config: Config,
     signer: SignerConfig,
     network: Network,
-    peer: SyncClient,
+    discovered: Option<Discovered>,
+    peers: TenureSource,
     validator: Validator,
 ) -> runtime::Role {
-    start(config, signer, network, peer, validator)
+    start(config, signer, network, discovered, peers, validator)
         .await
         .map_err(|error| format!("the signer stopped: {error}"))
 }
@@ -83,9 +86,18 @@ async fn start(
     config: Config,
     signer: SignerConfig,
     network: Network,
-    peer: SyncClient,
+    discovered: Option<Discovered>,
+    mut peers: TenureSource,
     validator: Validator,
 ) -> Result<(), Box<dyn Error>> {
+    // The pool the chain is followed over, not one client picked out of it: a
+    // signer bound to the peer it started with makes that peer's availability its
+    // own, and on mainnet that peer was the hosted API this node is meant not to
+    // need.
+    let mut replicas = Replicas::from_endpoints(&peers.endpoints());
+    let (peer, replica) = replicas
+        .current_pair()
+        .ok_or_else(|| Box::<dyn Error>::from("no peer for the signer to read proposals from"))?;
     let key = signer.private_key()?;
     let embedded = EmbeddedSigner::from_state_file(
         EmbeddedSignerConfig {
@@ -98,15 +110,15 @@ async fn start(
         config.node.working_dir.join(STATE_FILE),
     )?;
     let service = SignerService::new(
-        StackerDbClient::new(peer.base_url().clone())?,
+        replica.clone(),
         miner_contract(network),
         cycle_contract(network, 0, RESPONSE_MESSAGE_ID),
         cycle_contract(network, 0, PRE_COMMIT_MESSAGE_ID),
         embedded,
     );
-    let mut live = LiveSigner::new(peer.clone(), service);
+    let mut live = LiveSigner::new(peer, service);
     let mut announcer = StateAnnouncer::new(
-        StackerDbClient::new(peer.base_url().clone())?,
+        replica,
         cycle_contract(network, 0, STATE_MESSAGE_ID),
         0,
         key.clone(),
@@ -114,8 +126,25 @@ async fn start(
 
     let interval = Duration::from_secs(config.node.poll_interval_secs);
     let mut bound_cycle = None;
+    let mut serving = replicas.serving().map(ToOwned::to_owned);
     loop {
-        let signers = match binding(&peer, network, &key).await {
+        // A set-aside is a round's fact, and a signer's round is a poll: forgiving
+        // them here is what stops a peer that failed once from being written off for
+        // the life of the node.
+        peers.forgive_throttles();
+        replicas.refresh(&runtime::follow_endpoints(&config, discovered.as_ref()));
+        // Retargeted only when the turn has actually moved on, so an ordinary round
+        // keeps the connections it had.
+        if let Some((peer, replica)) = replicas.retargeted(&mut serving) {
+            println!(
+                "the signer reads proposals and writes chunks through {}",
+                peer.base_url()
+            );
+            live.use_peer(peer);
+            live.service_mut().use_client(replica.clone());
+            announcer.use_client(replica);
+        }
+        let signers = match binding(&mut peers, network, &key).await {
             Ok(binding) => {
                 if bound_cycle != Some(binding.cycle) {
                     println!(
@@ -135,16 +164,23 @@ async fn start(
                 continue;
             }
         };
-        if let Err(error) = announcer.announce(&peer, &signers).await {
+        if let Err(error) = announcer.announce(live.peer(), &signers).await {
             eprintln!("signer state announcement failed: {error}");
+            replicas.rotate();
         }
-        if let Err(error) = catch_up(&peer, live.validator_mut(), config.node.max_sync_blocks).await {
+        if let Err(error) =
+            catch_up(&mut peers, live.validator_mut(), config.node.max_sync_blocks).await
+        {
             eprintln!("signer chainstate sync failed: {error}");
             sleep(interval).await;
             continue;
         }
-        if let Err(error) = live.poll().await {
-            eprintln!("signer poll failed: {error}");
+        match live.poll().await {
+            Ok(_) => replicas.credit(),
+            Err(error) => {
+                eprintln!("signer poll failed: {error}");
+                replicas.rotate();
+            }
         }
         sleep(interval).await;
     }
@@ -161,17 +197,17 @@ struct Binding {
 }
 
 async fn binding(
-    peer: &SyncClient,
+    peers: &mut TenureSource,
     network: Network,
     key: &StacksPrivateKey,
 ) -> Result<Binding, String> {
-    let cycle = peer
+    let cycle = peers
         .tenure_info()
         .await
         .map_err(|error| error.to_string())?
         .reward_cycle;
     let public_key = key.public_key().to_bytes_compressed();
-    let signers = peer
+    let signers = peers
         .stacker_set(cycle)
         .await
         .map_err(|error| error.to_string())?
@@ -196,11 +232,11 @@ async fn binding(
 /// A signer that has not executed the chain the proposal builds on cannot
 /// verify its state root, so this runs before every round of signing.
 pub(crate) async fn catch_up(
-    peer: &SyncClient,
+    peers: &mut nano_sync::TenureSource,
     validator: &mut Validator,
     max_blocks: usize,
 ) -> Result<(), String> {
-    let tip = peer
+    let tip = peers
         .tenure_info()
         .await
         .map_err(|error| error.to_string())?
@@ -212,7 +248,7 @@ pub(crate) async fn catch_up(
     let mut blocks = Vec::new();
     let mut block_id = tip;
     for _ in 0..max_blocks {
-        let block = peer
+        let block = peers
             .block(block_id)
             .await
             .map_err(|error| format!("could not decode canonical block {block_id}: {error}"))?;
@@ -233,12 +269,12 @@ pub(crate) async fn catch_up(
     }
 
     for block in blocks.iter().rev() {
-        let sortition = peer
+        let sortition = peers
             .sortition(block.header.consensus_hash)
             .await
             .map_err(|error| error.to_string())?;
         let schedule = validator.coinbase_schedule();
-        if let Some(accumulated) = peer
+        if let Some(accumulated) = peers
             .accumulated_coinbase(block, schedule, sortition.bitcoin_height)
             .await
             .map_err(|error| error.to_string())?

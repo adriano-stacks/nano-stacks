@@ -264,8 +264,17 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         (dispatcher, relay.clone()),
         &mut roles,
     );
-    start_signer(&config, network, &pox, &peer, discovered.as_ref(), &mut roles).await?;
-    start_hosting(&config, network, &pox, &peer, state.as_ref(), hosted, &mut roles).await?;
+    start_signer(&config, network, &pox, discovered.as_ref(), &mut roles).await?;
+    start_hosting(
+        &config,
+        network,
+        &pox,
+        discovered.as_ref(),
+        state.as_ref(),
+        hosted,
+        &mut roles,
+    )
+    .await?;
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
@@ -1781,27 +1790,28 @@ async fn start_signer(
     config: &Config,
     network: Network,
     pox: &PoxInfo,
-    peer: &SyncClient,
     discovered: Option<&Discovered>,
     roles: &mut JoinSet<(Job, Role)>,
 ) -> Result<(), Box<dyn Error>> {
     let Some(signer) = config.signer.clone() else {
         return Ok(());
     };
-    let mut resume_pool = TenureSource::new(follow_pool(config, discovered).into_clients());
+    let mut pool = TenureSource::new(follow_pool(config, discovered).into_clients());
     let validator = signer::open(
         config,
         network,
         pox,
-        &mut resume_pool,
+        &mut pool,
         &config.chainstate_dir(SIGNER_CHAINSTATE),
     )
     .await?;
-    let (running, peer) = (config.clone(), peer.clone());
+    // The same pool the resume walked, kept rather than dropped: a signer handed one
+    // client out of it depends on that client for the life of the node.
+    let (running, found) = (config.clone(), discovered.cloned());
     roles.spawn(async move {
         (
             Job::Signer,
-            signer::run(running, signer, network, peer, validator).await,
+            signer::run(running, signer, network, found, pool, validator).await,
         )
     });
     Ok(())
@@ -1818,7 +1828,7 @@ async fn start_hosting(
     config: &Config,
     network: Network,
     pox: &PoxInfo,
-    peer: &SyncClient,
+    discovered: Option<&Discovered>,
     state: Option<&RpcState>,
     hosted: HostedChannels,
     roles: &mut JoinSet<(Job, Role)>,
@@ -1828,11 +1838,21 @@ async fn start_hosting(
         return Ok(());
     };
     let (running, replicating) = (config.clone(), config.clone());
-    let (validating_peer, replicating_peer) = (peer.clone(), peer.clone());
+    let endpoints = follow_endpoints(config, discovered);
+    let replicas = crate::hosting::Replicas::from_endpoints(&endpoints);
+    let (validating_found, replicating_found) = (discovered.cloned(), discovered.cloned());
     roles.spawn(async move {
         (
             Job::Replication,
-            crate::hosting::replicate(replicating, network, replicating_peer, state, written).await,
+            crate::hosting::replicate(
+                replicating,
+                network,
+                replicating_found,
+                replicas,
+                state,
+                written,
+            )
+            .await,
         )
     });
     // A validator is a second chain state, so it is opened only for a node that can
@@ -1841,14 +1861,17 @@ async fn start_hosting(
     if config.signer.is_some() || config.node.block_proposal_token.is_none() {
         return Ok(());
     }
-    // A pool of the one peer this role holds: a resume asks the network, and a
-    // hosting node has not been given a discovery handle to widen it with.
-    let mut resume_pool = TenureSource::only(peer.clone());
+    // The pool, not one member of it: everything this role asks a peer for -- the
+    // tip it catches up to, the sortition a proposal names, the coinbase its tenure
+    // accumulated -- is content-addressed or checked against this node's own burn
+    // view, so spreading it costs nothing and pinning it costs the liveness of every
+    // signer this node hosts.
+    let mut pool = TenureSource::new(follow_pool(config, discovered).into_clients());
     let validator = signer::open(
         config,
         network,
         pox,
-        &mut resume_pool,
+        &mut pool,
         &config.chainstate_dir(SIGNER_CHAINSTATE),
     )
     .await?;
@@ -1859,7 +1882,8 @@ async fn start_hosting(
             crate::hosting::validate_proposals(
                 running,
                 cycles,
-                validating_peer,
+                validating_found,
+                pool,
                 validator,
                 proposed,
             )
@@ -2276,7 +2300,7 @@ fn follow_pool(config: &Config, discovered: Option<&Discovered>) -> PeerPool {
     PeerPool::from_endpoints(&follow_endpoints(config, discovered))
 }
 
-fn follow_endpoints(config: &Config, discovered: Option<&Discovered>) -> Vec<String> {
+pub(crate) fn follow_endpoints(config: &Config, discovered: Option<&Discovered>) -> Vec<String> {
     let mut endpoints = config.node.peers.clone();
     for endpoint in discovered.map(Discovered::endpoints).unwrap_or_default() {
         if !endpoints.contains(&endpoint) {

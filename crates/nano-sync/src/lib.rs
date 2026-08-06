@@ -1592,6 +1592,53 @@ impl TenureSource {
     pub fn throttled(&self) -> usize {
         self.throttled.len()
     }
+
+    /// The tip a peer reports, from whichever peer is next and willing.
+    ///
+    /// A claim, not a decision — which is why it is safe to take from a stranger:
+    /// it names a block to go and fetch, and the block is then authenticated
+    /// against this node's own reward set and burn view before anything is
+    /// executed. `PeerPool::choose_source` is where a *tip* gets chosen.
+    pub async fn tenure_info(&mut self) -> Result<TenureInfo, SyncError> {
+        self.spread(|peer| async move { peer.tenure_info().await })
+            .await
+    }
+
+    /// One cycle's reward set, from whichever peer is next and willing.
+    pub async fn stacker_set(&mut self, cycle: u64) -> Result<StackerSet, SyncError> {
+        self.spread(|peer| async move { peer.stacker_set(cycle).await })
+            .await
+    }
+
+    /// Ask the pool for something it has no method of its own for.
+    ///
+    /// The rotation, the round's set-asides and the record of who answered are the
+    /// point, and they are the same three whatever is being asked — so a caller
+    /// with its own protocol (`StackerDB` replication is the one) walks the pool
+    /// through here rather than growing a second copy of the loop.
+    ///
+    /// It hands over a `SyncClient` because that is what carries the endpoint;
+    /// a caller wanting a different client for the same peer builds one from
+    /// `base_url()`. What it must not do is decide anything on the strength of
+    /// which peer answered — every chunk taken this way is still verified against
+    /// the writer the slot was assigned to.
+    pub async fn ask<T, A, F>(&mut self, ask: A) -> Result<T, SyncError>
+    where
+        A: FnMut(SyncClient) -> F,
+        F: Future<Output = Result<T, SyncError>>,
+    {
+        self.spread(ask).await
+    }
+
+    /// The endpoints this pool holds, so a caller can tell whether discovery has
+    /// found anything new without rebuilding it.
+    #[must_use]
+    pub fn endpoints(&self) -> Vec<String> {
+        self.peers
+            .iter()
+            .map(|peer| peer.base_url().to_string())
+            .collect()
+    }
 }
 
 /// Several peers, and which of them have proved unreliable.
