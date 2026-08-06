@@ -19,6 +19,13 @@ use crate::{CheckpointError, MarfBlockId, checkpoint::parse_hex};
 
 /// The manifest a checkpoint directory publishes.
 const MANIFEST_FILE: &str = "checkpoint.toml";
+/// The consensus-serialized block that sealed the checkpoint's state, when the
+/// checkpoint carries it.
+///
+/// A manifest states a root; this block is what a reward set signed it in. The
+/// node fetches it from a peer, so a checkpoint without it is still adoptable —
+/// keeping it is what lets the attestation be checked with no network at all.
+pub const CHECKPOINT_BLOCK_FILE: &str = "block.bin";
 /// The record a node keeps in its own state directory.
 const PROVENANCE_FILE: &str = "checkpoint-provenance.toml";
 /// The record that an import into a state directory is under way.

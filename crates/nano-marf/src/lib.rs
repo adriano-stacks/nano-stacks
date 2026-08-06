@@ -8,7 +8,8 @@ mod storage;
 
 pub use checkpoint::{CheckpointError, import_checkpoint, import_checkpoint_into, import_pcs};
 pub use provenance::{
-    CheckpointAttestation, CheckpointManifest, CheckpointProvenance, UnfinishedImport,
+    CHECKPOINT_BLOCK_FILE, CheckpointAttestation, CheckpointManifest, CheckpointProvenance,
+    UnfinishedImport,
 };
 use storage::{BlockRecord, TrieStorage};
 

@@ -47,7 +47,7 @@ It now exports 102 tenures where it exported 4.
 
 - [x] Export every tenure whose reward has not matured at the checkpoint.
 - [x] Confirm on a live network that a node runs past the maturity horizon.
-- [ ] Fail the export when the window is short, rather than writing a
+- [x] Fail the export when the window is short, rather than writing a
       checkpoint that stalls a node a hundred tenures later.
 
 ## Acceptance Criteria
@@ -78,3 +78,39 @@ invalid transaction: signer set is empty
 
 which is [[044-name-a-reward-cycle-nobody-stacked-for]] — and turned out to be
 the network running out of stacking, not nano.
+
+## The export refuses, and now something checks that it does
+
+`refuse_a_short_earnings_window` has been in `write_native_effects` since
+`8b69598f`, called before the file is serialized, so a short or holed window is
+never written. What it did not have was a test: the comment in
+`mainnet_accounting.rs` said so — "that refusal needs the 505 GB stacks-core
+archive to exercise and so has no test here" — and that was true of the export
+around it, but not of the guard, which is a pure function over the entries the
+export has just built.
+
+Five tests in `xtask`, one per way a window fails and one for the shape that
+passes:
+
+- `a_full_window_is_written` — 101 contiguous tenures ending one short of the
+  deepest one the captured blocks belong to. One short is the accepted case, not
+  a tolerated one: a tenure's entry needs its successor's row for the fees, and
+  the deepest tenure has none yet.
+- `an_empty_window_is_refused` — an archive that answers for nothing.
+- `a_holed_window_is_refused` — the failure this guard exists for: outer bounds
+  spanning 200 heights with one missing 27 tenures in. The assertion is that the
+  message names the missing height, because that is the operator's next query.
+- `a_window_that_does_not_reach_the_checkpoint_is_refused`.
+- `a_short_window_is_refused` — contiguous, reaching the tip, two tenures long,
+  which is what the export used to write.
+
+`MINER_REWARD_MATURITY` is no longer restated in `xtask`; it comes from
+`nano-chainstate`, so the threshold the export refuses below and the one the node
+refuses below cannot drift apart.
+
+## What this does not prove
+
+The guard is checked against the entries handed to it, not against the ones the
+archive produces. The queries above it — the `continue`s that skip a tenure the
+archive cannot price, which is how a hole gets in — still need the 505 GB
+chainstate to exercise, and nothing here replaces the live run recorded above.
