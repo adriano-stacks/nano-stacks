@@ -1,6 +1,6 @@
 ---
 id: "072"
-title: "contract-hash refuses a contract with large argument types"
+title: "A generated contract with large argument types fails to deploy"
 status: pending
 priority: high
 effort: medium
@@ -18,6 +18,25 @@ type: bug
 fails: `contract-hash?` answers `(err u2)` where the test expects the contract's
 hash. Make it answer the hash, or establish that `(err u2)` is what stacks-core
 answers and fix the expectation.
+
+## What `(err u2)` turned out to mean
+
+`err u2` is `contract-hash?`'s *contract missing* (`linker.rs`, "contract missing
+=> (err u2)"). So the caller deployed and ran fine; what failed is the **callee's
+own deployment**, and `contract-hash?` is only the messenger. The title's original
+guess -- that hashing was refusing -- was wrong.
+
+That reframes the whole task. Both engines refuse to deploy the generated callee,
+and `crosscheck_multi_contract` compares the two engines per contract *before* it
+compares against the expectation, so that half passes: nano and the reference agree
+the contract does not deploy. The property then asks for its hash anyway.
+
+The suspect is therefore the **expectation**, not the engines: a generated contract
+that legitimately fails to deploy has no hash to return. What has to be established
+is *why* it fails -- a size, a cost or an analysis bound on those argument types --
+and whether stacks-core refuses the same deployment. If it does, the property must
+stop expecting a hash for a contract that never existed; if it does not, the
+refusal is the bug.
 
 ## What is known
 
@@ -37,8 +56,11 @@ answers and fix the expectation.
 
 ## Tasks
 
-- [ ] Reproduce with the minimal input alone, outside the property, so the failure
-      is a fixture rather than a seed.
+- [x] Reproduce with the minimal input alone, outside the property, so the failure
+      is a fixture rather than a seed. It reproduces on every run rather than by
+      seed, and the minimal contract is recorded below.
+- [ ] Capture the callee's own deployment error rather than the caller's `(err u2)`,
+      which only says the contract is absent. That error names the bound.
 - [ ] Establish what stacks-core answers for the same contract, since both engines
       agreeing means the expectation is as likely to be wrong as the engines.
 - [ ] Name what `(err u2)` is: which `contract-hash?` failure it encodes and which
