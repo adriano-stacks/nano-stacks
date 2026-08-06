@@ -150,7 +150,10 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     loop {
         let mut executor = executor.lock().await;
         if let Err(error) = executor
-            .catch_up(&state.peer, &mut history, &state.pox, &staging, budget)
+            // No schedule, for the same reason it follows one peer: a miner sits at
+            // the tip, where the tenure it wants next is the one that peer is
+            // currently producing and no inventory names it yet.
+            .catch_up(&state.peer, &mut history, &state.pox, &staging, budget, &[])
             .await
         {
             eprintln!("following the peer failed: {error}");

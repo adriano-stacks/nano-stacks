@@ -417,12 +417,20 @@ fn round_report(from: u64, round: &CatchUpRound, tip: &NakamotoBlock) -> String 
     } else {
         ""
     };
+    // Named rather than counted into `fetched`, because the two answer different
+    // questions: how much history a round acquired, and how much of it the peers'
+    // inventories chose rather than a walk back from one peer's tip.
+    let scheduled = if round.scheduled == 0 {
+        String::new()
+    } else {
+        format!(", {} tenures the inventory scheduled", round.scheduled)
+    };
     batch_report(
         from,
         round.executed,
         tip,
         &format!(
-            ", {} staged, {} fetched{limited}",
+            ", {} staged, {} fetched{scheduled}{limited}",
             round.staged, round.fetched
         ),
     )
@@ -483,23 +491,45 @@ struct ExecutedRound {
     peer_failed: bool,
 }
 
+/// What one catch-up round reads, as one value for the same reason `Follower` is
+/// one: a round now takes the peer, the pool, the calendar, the store, the budget,
+/// the handle it publishes through and what the peers claimed, and seven positional
+/// arguments hide which is which.
+struct RoundInputs<'a> {
+    /// The peer this round follows, which is a fork choice and lands on one answer.
+    peer: &'a SyncClient,
+    /// Where bulk history comes from, which is work to be spread and does not.
+    history: &'a mut TenureSource,
+    pox: &'a PoxInfo,
+    staging: &'a Staging,
+    budget: CatchUpBudget,
+    advertised: &'a Advertised,
+    /// What the peers said about the cycle being walked, tenure by tenure. Empty
+    /// when the transport is off, which leaves the round the backward descent it was.
+    claims: Vec<nano_p2p::TenureClaim>,
+}
+
 /// Run one catch-up round, and publish what it makes this node able to say.
 ///
 /// Extracted from the follow loop because it is the only part that holds the
 /// executor lock, and holding a lock is worth being able to see the boundary of.
-async fn execute_round(
-    executor: &SharedExecutor,
-    peer: &SyncClient,
-    history: &mut TenureSource,
-    pox: &PoxInfo,
-    staging: &Staging,
-    budget: CatchUpBudget,
-    advertised: &Advertised,
-) -> ExecutedRound {
+async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> ExecutedRound {
+    let RoundInputs {
+        peer,
+        history,
+        pox,
+        staging,
+        budget,
+        advertised,
+        claims,
+    } = inputs;
     let mut executor = executor.lock().await;
     let mut peer_failed = false;
     let from = executor.tip().header.chain_length;
-    match executor.catch_up(peer, history, pox, staging, budget).await {
+    match executor
+        .catch_up(peer, history, pox, staging, budget, &claims)
+        .await
+    {
         Ok(round) => println!("{}", round_report(from, &round, executor.tip())),
         // A round that stops partway has still sealed everything up to where it
         // stopped, and that is what has to be recorded: reporting only successful
@@ -665,12 +695,15 @@ async fn follow(follower: Follower) -> Role {
         if let Some(executor) = executor.as_ref() {
             let round = execute_round(
                 executor,
-                &peer,
-                &mut history.source,
-                &pox,
-                &staging,
-                budget,
-                &advertised,
+                RoundInputs {
+                    peer: &peer,
+                    history: &mut history.source,
+                    pox: &pox,
+                    staging: &staging,
+                    budget,
+                    advertised: &advertised,
+                    claims: discovered.as_ref().map(Discovered::claims).unwrap_or_default(),
+                },
             )
             .await;
             executed_height = round.executed_height;

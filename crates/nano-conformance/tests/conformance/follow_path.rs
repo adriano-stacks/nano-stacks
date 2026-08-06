@@ -56,7 +56,7 @@ pub struct Snapshot {
     parent_sortition_id: String,
     burn_header_timestamp: u64,
     pub consensus_hash: String,
-    sortition: u8,
+    pub sortition: u8,
     #[serde(default)]
     miner_pk_hash: Option<String>,
 }
@@ -246,6 +246,25 @@ impl Policy {
             .count()
     }
 
+    /// The burn views whose tenures were asked of this peer, in order.
+    ///
+    /// The request only an inventory-driven forward schedule makes: `/v3/tenures/:id`
+    /// is a backward walk's request and needs an identifier from the answer above,
+    /// while a burn view is derived locally and names a tenure before anything above
+    /// it is known. Recording which views were asked of *which* peer is how "the
+    /// schedule honoured the inventory" becomes a measurement.
+    pub fn tenures_asked_by_view(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter_map(|(path, _)| path.strip_prefix("/v3/tenures/fork_info/"))
+            .filter_map(|range| range.split_once('/'))
+            .filter(|(start, stop)| start == stop)
+            .map(|(start, _)| start.trim_start_matches("0x").to_lowercase())
+            .collect()
+    }
+
     /// How many of them it answered with a 429.
     pub fn refusals(&self) -> usize {
         self.asked
@@ -315,6 +334,9 @@ pub struct Served {
     /// that does not serve it looks like. [[049]]'s first acceptance criterion is that
     /// taking it away does not stop a node with a Bitcoin source of its own.
     sortitions: bool,
+    /// Whether a tenure asked for by burn view is answered with another tenure's
+    /// blocks.
+    lying_tenures: bool,
 }
 
 impl Served {
@@ -325,7 +347,15 @@ impl Served {
             snapshots,
             policy: Policy::default(),
             sortitions: true,
+            lying_tenures: false,
         }
+    }
+
+    /// The same peer, answering every scheduled tenure with somebody else's blocks.
+    #[must_use]
+    pub const fn lying_about_tenures(mut self) -> Self {
+        self.lying_tenures = true;
+        self
     }
 
     /// The same peer, misbehaving.
@@ -482,6 +512,15 @@ impl Served {
     }
 
     /// The burn view between two consensus hashes, newest first.
+    ///
+    /// Each entry carries the whole tenure that burn block elected, hex-encoded, as
+    /// stacks-core's `prefix_opt_hex_codec` states it and as nano's own RPC does. That
+    /// is what makes a tenure addressable by the burn view that elected it rather than
+    /// by a block identifier only the answer above it carries — the request an
+    /// inventory-driven forward schedule makes.
+    ///
+    /// The consensus hash is stated `0x`-prefixed here, because that is what both real
+    /// implementations state and a client that could not read it could not read either.
     fn fork_info(&self, start: &str, stop: &str) -> serde_json::Value {
         let height = |hash: &str| {
             self.snapshots
@@ -497,17 +536,55 @@ impl Served {
             .iter()
             .filter(|snapshot| snapshot.block_height >= stop && snapshot.block_height <= start)
             .map(|snapshot| {
+                let tenure = self.tenure_of(&snapshot.consensus_hash);
                 serde_json::json!({
                     "burn_block_height": snapshot.block_height,
-                    "consensus_hash": snapshot.consensus_hash,
+                    "consensus_hash": format!("0x{}", snapshot.consensus_hash),
                     "was_sortition": snapshot.sortition == 1,
-                    "first_block_mined": serde_json::Value::Null,
+                    "first_block_mined": tenure
+                        .first()
+                        .map(|block| format!("0x{}", hex::encode(block.block_id()))),
+                    "nakamoto_blocks": format!("0x{}", hex::encode(encode_blocks(&tenure))),
                 })
             })
             .collect();
         entries.reverse();
         serde_json::Value::Array(entries)
     }
+
+    /// Every block this peer holds of the tenure a burn view elected.
+    ///
+    /// `lying_tenures` answers with the blocks of a *different* tenure instead, which
+    /// is the one substitution a fetch addressed by burn view is open to: nothing in
+    /// the answer is the identifier that was asked for, so only the view each block's
+    /// own header states can refuse it.
+    fn tenure_of(&self, consensus_hash: &str) -> Vec<NakamotoBlock> {
+        let wanted = |block: &NakamotoBlock| block.header.consensus_hash.to_string();
+        let answer = if self.lying_tenures {
+            self.visible()
+                .iter()
+                .map(wanted)
+                .find(|hash| hash != consensus_hash)
+                .unwrap_or_else(|| consensus_hash.to_owned())
+        } else {
+            consensus_hash.to_owned()
+        };
+        self.visible()
+            .iter()
+            .filter(|block| wanted(block) == answer)
+            .cloned()
+            .collect()
+    }
+}
+
+/// A block vector in the consensus encoding: a big-endian count, then the blocks.
+fn encode_blocks(blocks: &[NakamotoBlock]) -> Vec<u8> {
+    let count = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+    let mut bytes = count.to_be_bytes().to_vec();
+    for block in blocks {
+        bytes.extend(block.encode());
+    }
+    bytes
 }
 
 /// What a peer answers for bytes it either holds or does not.
@@ -790,7 +867,7 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
         execute: 64,
     };
     let outcome = executor
-        .catch_up(&lying_client, &mut history, &pox(), &staging, budget)
+        .catch_up(&lying_client, &mut history, &pox(), &staging, budget, &[])
         .await;
     // The round *fails*, and that shape is deliberate rather than incidental: a
     // block that cannot be executed ends the round, which is what sets
@@ -837,7 +914,7 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
         Staging::open(&against_the_honest.path().join("staging.sqlite")).expect("staging opens");
     let mut history = TenureSource::only(honest_client.clone());
     let round = executor
-        .catch_up(&honest_client, &mut history, &pox(), &staging, budget)
+        .catch_up(&honest_client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("the captured chain executes");
     assert!(
@@ -916,7 +993,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
     };
     let mut history = TenureSource::only(honest_client.clone());
     executor
-        .catch_up(&honest_client, &mut history, &pox(), &staging, budget)
+        .catch_up(&honest_client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("the captured chain executes");
     let tenures = executor.chainstate_mut().executed_tenures();
@@ -949,7 +1026,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
 
     let mut history = TenureSource::only(parted_client.clone());
     let round = executor
-        .catch_up(&parted_client, &mut history, &pox(), &staging, budget)
+        .catch_up(&parted_client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("a peer on another fork is not an error");
     assert_eq!(
@@ -1013,7 +1090,7 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
         execute: 64,
     };
     let round = executor
-        .catch_up(&client, &mut history, &pox(), &staging, budget)
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("the captured chain executes");
     assert!(round.executed > 0, "nothing was executed to retract");
@@ -1054,7 +1131,7 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     // Bitcoin gives back the block the last executed tenure was elected in.
     burnchain.reorganize(retracted_at);
     let round = executor
-        .catch_up(&client, &mut history, &pox(), &staging, budget)
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("a reorganized burnchain is not an error");
     let resumed = round
@@ -1099,7 +1176,7 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
 /// it. A round that fetches without executing is ordinary — a descent walks the gap
 /// from the peer's tip downwards and only the round that reaches this node's own tip
 /// can execute anything — so the loop is not stopped by one.
-async fn close_the_gap(
+pub async fn close_the_gap(
     executor: &mut CheckpointExecutor<MovableBurnchain>,
     client: &SyncClient,
     history: &mut TenureSource,
@@ -1110,7 +1187,7 @@ async fn close_the_gap(
     let mut executed = 0;
     for _ in 0..ROUNDS {
         let round = executor
-            .catch_up(client, history, &pox(), staging, budget)
+            .catch_up(client, history, &pox(), staging, budget, &[])
             .await
             .expect("a round commits what it executed");
         executed += round.executed;
@@ -1125,10 +1202,10 @@ async fn close_the_gap(
 const ROUNDS: usize = 64;
 
 /// The reward cycle length the captured chain was produced under.
-const CYCLE: u64 = 20;
+pub const CYCLE: u64 = 20;
 
 /// The burn height a captured snapshot gives a block's tenure.
-fn burn_height_of(rows: &[Snapshot], block: &NakamotoBlock) -> u64 {
+pub fn burn_height_of(rows: &[Snapshot], block: &NakamotoBlock) -> u64 {
     let Some(row) = rows
         .iter()
         .find(|row| row.consensus_hash == block.header.consensus_hash.to_string())
@@ -1142,7 +1219,7 @@ fn burn_height_of(rows: &[Snapshot], block: &NakamotoBlock) -> u64 {
 ///
 /// The first is the checkpoint's own, and a chain seeded below it would have to
 /// derive across the block that opens the reward cycle.
-fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBlock) -> u64) -> u64 {
+pub fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBlock) -> u64) -> u64 {
     let mut views: Vec<u64> = chain.iter().map(burn_of).collect();
     views.dedup();
     *views.get(1).expect("the capture holds two burn views")
@@ -1337,7 +1414,7 @@ fn burn_heights(tenures: &[ConsensusHash]) -> Vec<u64> {
 /// The capture it reads is written here from the fixture's own snapshots, cut at
 /// the seed — a history may only seed the snapshot it *ends* at, because every hash
 /// above that has to be derived rather than quoted.
-fn derived_chain(
+pub fn derived_chain(
     seed: u64,
     upto: u64,
     burnchain: &MovableBurnchain,

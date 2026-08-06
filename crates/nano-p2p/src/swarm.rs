@@ -181,6 +181,7 @@ pub struct Discovered {
 struct Snapshot {
     endpoints: Vec<String>,
     claiming: Vec<String>,
+    claims: Vec<TenureClaim>,
     connected: usize,
     known: usize,
 }
@@ -195,13 +196,29 @@ impl Discovered {
     /// The endpoints of peers whose inventory says they hold tenures of the cycle
     /// this node last asked about.
     ///
-    /// This is what an inventory *buys*, on a downloader that walks parent links
-    /// backwards: not a schedule but a shortlist. A peer that claims none of the
-    /// cycle being walked is a wasted round trip, and finding that out by asking it
-    /// for a tenure is exactly the round trip an inventory exists to avoid.
+    /// The shortlist rather than the schedule: what an inventory is worth to a
+    /// downloader walking parent links backwards, which is that a peer claiming none
+    /// of the cycle is a wasted round trip. [`Self::claims`] is the same answer
+    /// per-tenure, which is what a forward schedule needs.
     #[must_use]
     pub fn claiming(&self) -> Vec<String> {
         self.read().claiming
+    }
+
+    /// What each peer said, tenure by tenure, about the cycle last asked about.
+    ///
+    /// The scheduling input [`crate::assign_tenures`] takes. Published rather than
+    /// summarised because the bit indices are the whole point: a shortlist of
+    /// endpoints says which peers to ask, and only the vectors say *which peer for
+    /// which tenure* — which is the difference between spreading a walk over the pool
+    /// and asking a peer for history it has already said it does not have.
+    ///
+    /// Claims from peers that serve no HTTP endpoint are kept. They carry no place to
+    /// fetch from, and `assign_tenures` drops them for that reason, but dropping them
+    /// here would make "how many peers claimed this tenure" unanswerable.
+    #[must_use]
+    pub fn claims(&self) -> Vec<TenureClaim> {
+        self.read().claims
     }
 
     /// How many outbound sessions are live.
@@ -262,6 +279,9 @@ pub struct Swarm {
     /// exchanged, kept so that a round which asks about no cycle does not erase what
     /// the previous one learned.
     claiming: Vec<String>,
+    /// The claims those endpoints came from, kept for the same reason and published
+    /// for the download schedule.
+    claims: Vec<TenureClaim>,
 }
 
 impl Swarm {
@@ -283,6 +303,7 @@ impl Swarm {
             service: None,
             walk_cursor: 0,
             claiming: Vec::new(),
+            claims: Vec::new(),
         }
     }
 
@@ -509,16 +530,12 @@ impl Swarm {
 
     /// Ask every peer about a reward cycle, and remember who has any of it.
     ///
-    /// The result is a shortlist of endpoints, not a schedule, because nano's
-    /// downloader walks parent links backwards and so always knows the one tenure it
-    /// wants next — there is no set of wanted tenures to spread. What an inventory is
-    /// worth on that downloader is still real: a peer that claims none of the cycle
-    /// being walked has nothing to serve, and asking it for a tenure to find out is
-    /// exactly the round trip the inventory exists to avoid.
-    ///
-    /// [`assign_tenures`] is the scheduler for a forward download driven by bit
-    /// indices, which is a different downloader; it stays where it is until there is
-    /// one.
+    /// Two answers come out of it, and they are for the two things an inventory is
+    /// worth. The shortlist of endpoints is what a downloader walking parent links
+    /// backwards can use: a peer claiming none of the cycle has nothing to serve, and
+    /// asking it for a tenure to find that out is exactly the round trip an inventory
+    /// exists to avoid. The claims themselves are what [`assign_tenures`] schedules a
+    /// *forward* download from, per tenure rather than per peer.
     pub async fn exchange_inventories(
         &mut self,
         cycle_start: ConsensusHash,
@@ -535,6 +552,7 @@ impl Swarm {
             .collect();
         let answered = claiming.len();
         self.claiming = claiming;
+        self.claims = claims;
         self.publish();
         answered
     }
@@ -596,6 +614,7 @@ impl Swarm {
         self.discovered.publish(Snapshot {
             endpoints,
             claiming: self.claiming.clone(),
+            claims: self.claims.clone(),
             connected: self.connected.len(),
             known: self.peers.count().unwrap_or(0),
         });
