@@ -35,6 +35,7 @@ mod event_queue;
 mod fork_retraction;
 mod follow_path;
 mod hacknet_replacement;
+mod incoherent_state;
 mod kill_during_import;
 mod kill_during_replay;
 mod mainnet_accounting;
