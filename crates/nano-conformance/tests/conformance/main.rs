@@ -64,6 +64,7 @@ mod rejected_blocks;
 mod release_dependencies;
 mod restart;
 mod signer_weight_enforcement;
+mod submitted_transaction;
 mod tenure_continuity;
 mod tenure_fee_maturity;
 mod tenure_vrf_enforcement;
