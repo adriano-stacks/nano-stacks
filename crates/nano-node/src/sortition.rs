@@ -808,6 +808,28 @@ impl SortitionTracker {
     /// goes whole, because `ConsensusHash::from_ops` mixes hashes at power-of-two
     /// offsets and a truncated one derives different hashes from there on.
     pub fn save(&self, directory: &Path) -> Result<(), TrackerError> {
+        self.save_standing_on(directory, self.tip().bitcoin_height)
+    }
+
+    /// Write the chain down as it stood at a burn block, which is not always its tip.
+    ///
+    /// The tip runs *ahead* of execution: `locate_view` walks toward Bitcoin's end
+    /// to find the burn block a block names, and it keeps what it derived. Saving
+    /// that tip means a resumed chain is seeded above the burn view execution still
+    /// needs — and a chain only walks forward, so every staged block standing lower
+    /// finds no snapshot, the local derivation returns nothing, and the tenure VRF
+    /// check falls back to a peer's answer and fails. Measured on the live mainnet
+    /// follower: seeded at burn 961,342, stopped on burn 961,321 with `committed seed
+    /// is not the hash of the parent tenure's VRF proof`.
+    ///
+    /// So the chain is written down as it stood on the burn view it has *executed*
+    /// to. What is above that is a lookahead, and re-deriving it costs the same
+    /// bounded walk that produced it.
+    pub fn save_standing_on(
+        &self,
+        directory: &Path,
+        bitcoin_height: u64,
+    ) -> Result<(), TrackerError> {
         // A chain that has nowhere to be written down is re-derived from the
         // checkpoint on the next start, one Bitcoin block download per burn block,
         // and the only sign of it is a line in a log. Making the directory is
@@ -822,7 +844,11 @@ impl SortitionTracker {
             fs::write(&temporary, bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
             fs::rename(&temporary, &path).map_err(|error| TrackerError::Seed(error.to_string()))
         };
-        let tip = self.tip();
+        // The tip when execution has caught up to it, and never above what the
+        // history can be truncated to.
+        let tip = self
+            .snapshot_at(bitcoin_height.min(self.tip().bitcoin_height))
+            .unwrap_or_else(|| self.tip());
         let snapshots = vec![CapturedSnapshot {
             block_height: tip.bitcoin_height,
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
@@ -860,13 +886,21 @@ impl SortitionTracker {
                 .to_vec(),
         }];
         let history = History {
-            hashes: self
-                .engine
-                .snapshots()
-                .history()
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            // Truncated to end at the snapshot above, because `from_capture` seeds a
+            // chain from the snapshot its history ends at and refuses a pair that
+            // disagree. The hashes dropped are the lookahead's, and the next start
+            // re-derives them by walking forward.
+            hashes: {
+                let history = self.engine.snapshots().history();
+                let ahead = usize::try_from(
+                    self.tip().bitcoin_height.saturating_sub(tip.bitcoin_height),
+                )
+                .unwrap_or(0);
+                history[..history.len().saturating_sub(ahead)]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            },
         };
         // The registry goes with them, and it has to: a key registered in the
         // burn blocks this chain has already walked past would otherwise be lost

@@ -1893,7 +1893,10 @@ where
             return;
         };
         let written = std::time::Instant::now();
-        if let Err(error) = tracker.save(state) {
+        // Standing on the burn view this node has executed to, not on the tip the
+        // view-locating walk reached: a chain saved above what execution needs is
+        // one a restart cannot use, because it only walks forward.
+        if let Err(error) = tracker.save_standing_on(state, self.bitcoin_height()) {
             eprintln!("the derived sortition chain could not be written down: {error}");
         } else {
             println!(
