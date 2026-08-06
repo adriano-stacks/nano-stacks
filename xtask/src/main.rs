@@ -2774,8 +2774,11 @@ fn describe_stored_value(value: &str) {
 fn rebuild_accounting(arguments: &[String]) -> ExitCode {
     let [state, peer, tip, tenure_height] = arguments else {
         eprintln!(
-            "usage: cargo xtask rebuild-accounting <state-dir> <peer-url> <tip-block-id> \
-             <tip-tenure-height>"
+            "usage: cargo xtask rebuild-accounting <state-dir> <peer-urls> <tip-block-id> \
+             <tip-tenure-height>\n\
+             <peer-urls> may be a comma-separated list; a repair of a few hundred tenures \
+             is thousands of requests, and one endpoint's rate limit is the whole of its \
+             speed"
         );
         return ExitCode::FAILURE;
     };
@@ -2858,13 +2861,30 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
 
 /// Walk back from `tip`, summing each tenure's transaction fees.
 fn count_fees(
-    peer: &str,
+    peers: &str,
     tip: [u8; 32],
     tenure_height: u64,
     oldest: u64,
 ) -> Result<std::collections::BTreeMap<u64, u64>, String> {
-    let url = peer.parse().map_err(|_| format!("{peer} is not a URL"))?;
-    let client = nano_sync::SyncClient::new(url).map_err(|error| format!("{error}"))?;
+    // Over the pool rather than one client. A walk of a few hundred tenures is
+    // thousands of block requests, and sent down one connection to a hosted API the
+    // rate limit *is* the repair's speed — one run was left going for 1h45m. The
+    // spreading is `TenureSource`'s: consecutive requests go to different peers, a
+    // throttled peer is set aside, and a peer that cannot serve one block costs a
+    // request rather than the walk. It is safe over strangers because a block is
+    // content-addressed and `SyncClient::block` refuses an answer that is not the
+    // block asked for.
+    let endpoints: Vec<String> = peers
+        .split(',')
+        .map(|peer| peer.trim().to_owned())
+        .filter(|peer| !peer.is_empty())
+        .collect();
+    let pool = nano_sync::PeerPool::from_endpoints(&endpoints);
+    if pool.is_empty() {
+        return Err(format!("none of {peers} is a usable peer URL"));
+    }
+    println!("counting fees over {} peers", pool.len());
+    let mut source = nano_sync::TenureSource::new(pool.into_clients());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| format!("{error}"))?;
 
     let mut fees = std::collections::BTreeMap::new();
@@ -2873,12 +2893,12 @@ fn count_fees(
     let mut consensus = None;
     runtime.block_on(async {
         while height >= oldest {
-            // A public peer rate-limits a walk this long, and being turned away
-            // is not a reason to give up on a repair that has to be complete to
-            // be worth anything.
+            // Being turned away by every peer at once is not a reason to give up on a
+            // repair that has to be complete to be worth anything: the throttles are
+            // forgiven and the walk carries on, which is what a rate limit asks for.
             let mut block = Err(String::new());
             for attempt in 0..8u32 {
-                match client.block(block_id).await {
+                match source.block(block_id).await {
                     Ok(fetched) => {
                         block = Ok(fetched);
                         break;
@@ -2889,6 +2909,7 @@ fn count_fees(
                             2 + attempt * 3,
                         )))
                         .await;
+                        source.forgive_throttles();
                     }
                 }
             }
@@ -2907,9 +2928,10 @@ fn count_fees(
                 // hours, and without this it is indistinguishable from a hang —
                 // which is exactly how one run was left going for 1h45m.
                 println!(
-                    "tenure {height}: {} counted, {} to go",
+                    "tenure {height}: {} counted, {} to go, over {} peers",
                     fees.len(),
-                    height.saturating_sub(oldest)
+                    height.saturating_sub(oldest),
+                    source.served_by()
                 );
             }
             consensus = Some(this);
