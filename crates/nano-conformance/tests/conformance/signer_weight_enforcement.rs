@@ -490,12 +490,11 @@ fn mainnet_context(capture: &Path) -> BitcoinBlockContext {
         .expect("the capture records its provenance");
     let checkpoint = fs::read_to_string(capture.join("chainstate/checkpoint-H/checkpoint.toml"))
         .expect("the capture records its checkpoint");
-    BitcoinBlockContext {
-        first_height: number(&provenance, "pox_first_bitcoin_height"),
-        prepare_phase_length: u32::try_from(number(&provenance, "pox_prepare_phase_length"))
-            .expect("the prepare phase fits"),
-        reward_phase_length: u32::try_from(number(&provenance, "pox_reward_phase_length"))
-            .expect("the reward phase fits"),
-        ..BitcoinBlockContext::at_height(number(&checkpoint, "first_bitcoin_height"))
-    }
+    let mut context = BitcoinBlockContext::at_height(number(&checkpoint, "first_bitcoin_height"));
+    context.first_height = number(&provenance, "pox_first_bitcoin_height");
+    context.prepare_phase_length = u32::try_from(number(&provenance, "pox_prepare_phase_length"))
+        .expect("the prepare phase fits");
+    context.reward_phase_length = u32::try_from(number(&provenance, "pox_reward_phase_length"))
+        .expect("the reward phase fits");
+    context
 }

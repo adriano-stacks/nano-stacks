@@ -238,15 +238,18 @@ where
     }
 
     fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
-        BitcoinBlockContext {
-            height: bitcoin_height,
-            accumulated_coinbase: self
-                .accumulated
-                .get(&bitcoin_height)
-                .copied()
-                .unwrap_or_default(),
-            ..self.bitcoin_context
-        }
+        let mut context = self.bitcoin_context;
+        // Both, not the view alone: a proposal's tenure and its view are the same
+        // burn block unless the caller has said the tenure was extended, and moving
+        // the view while leaving the tenure at whatever the standing context held
+        // would have the prepare-phase rule read another block's height.
+        context.move_to_burn_block(bitcoin_height);
+        context.accumulated_coinbase = self
+            .accumulated
+            .get(&bitcoin_height)
+            .copied()
+            .unwrap_or_default();
+        context
     }
 
     fn validate_block(

@@ -51,7 +51,7 @@ pub async fn open(
         runtime::open_chainstate(config, network, pox, peers, directory).await?;
     let mut bitcoin = runtime::bitcoin_source(config)?;
     let mut context = runtime::bitcoin_context(config, pox);
-    context.height = config.checkpoint.anchor_bitcoin_height;
+    context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
     if let Some(pending) = pending {
         let operations = bitcoin.block_at(pending.height)?;
         let parent = chainstate.tip();

@@ -147,7 +147,7 @@ impl LocalSortition {
         bitcoin_context.sortition_hash = self.sortition_hash;
         bitcoin_context.winner_vrf_public_key = self.winner_vrf_public_key;
         bitcoin_context.winner_signing_key_hash = self.winner_signing_key_hash;
-        bitcoin_context.height = self.bitcoin_height;
+        bitcoin_context.move_to_burn_block(self.bitcoin_height);
         bitcoin_context.burn_header_hash = self.burn_header_hash;
         if self.burn_block_time > 0 {
             bitcoin_context.burn_block_time = self.burn_block_time;
@@ -838,7 +838,7 @@ where
         pox: &PoxInfo,
     ) -> Result<Vec<AppliedBlock>, CheckpointExecutionError> {
         let mut bitcoin_context = pox.bitcoin_context();
-        bitcoin_context.height = tenure.sortition.bitcoin_height;
+        bitcoin_context.move_to_burn_block(tenure.sortition.bitcoin_height);
         bitcoin_context.burn_header_hash = *tenure.sortition.bitcoin_block_hash.as_bytes();
         // `get-tenure-info? time` and `vrf-seed` read these back. Left zero they
         // answer zero, which is not a failure a replay notices — it is a wrong
@@ -1202,7 +1202,7 @@ where
                     Err(error) => return Err(error.into()),
                 };
             let mut bitcoin_context = pox.bitcoin_context();
-            bitcoin_context.height = sortition.bitcoin_height;
+            bitcoin_context.move_to_burn_block(sortition.bitcoin_height);
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
             self.seed_burn_headers(sortition.bitcoin_height);
             bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
@@ -2274,7 +2274,7 @@ where
                 .map_or(0, |sortition| sortition.bitcoin_height),
         };
         let mut bitcoin_context = pox.bitcoin_context();
-        bitcoin_context.height = bitcoin_height;
+        bitcoin_context.move_to_burn_block(bitcoin_height);
         if let Some(sortition) = peer.as_ref() {
             // Clarity reads this back through `get-burn-block-info?`, and sBTC
             // compares it against the hash a withdrawal was signed for. A
@@ -2300,6 +2300,27 @@ where
         timing.local += phase.elapsed();
         if let Some(local) = local {
             local.record(&mut bitcoin_context);
+        }
+        // After `record`, which moves the whole burn block: the tenure's own burn
+        // height, which is the view's until this block extends its tenure past the
+        // sortition that elected it. Derived like every other burn fact here -- the
+        // tenure is named by the block's own `consensus_hash` and this node's
+        // sortition chain says which burn block that is -- and left as the view where
+        // the chain cannot name it, which is what it is wherever nothing was
+        // extended.
+        //
+        // Exactly one rule reads it: the prepare-phase signer-set update, which
+        // stacks-core drives from the tenure's sortition. Reading the view there is
+        // what parted the roots at pox-5 height 931.
+        if let Some(tenure) = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash))
+            .filter(|tenure| *tenure != bitcoin_context.height)
+        {
+            let view = bitcoin_context.height;
+            bitcoin_context.move_to_burn_block(tenure);
+            bitcoin_context.extend_view_to(view);
         }
         let phase = std::time::Instant::now();
         self.seed_burn_headers(bitcoin_height);
@@ -2542,7 +2563,7 @@ where
         context: BitcoinBlockContext,
     ) -> Option<nano_chainstate::SignerWeights> {
         let mut context = context;
-        context.height = self.bitcoin_height();
+        context.move_to_burn_block(self.bitcoin_height());
         self.chainstate.recorded_signer_set(context).ok()
     }
 

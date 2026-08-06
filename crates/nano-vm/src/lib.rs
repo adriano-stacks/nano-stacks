@@ -97,7 +97,27 @@ pub enum ContractCallOutcome {
 /// Bitcoin context required while executing one block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitcoinBlockContext {
+    /// The burn block this block *executes in* -- its Clarity burn view.
+    ///
+    /// Every Clarity-visible burn fact follows this: `burn-block-height`,
+    /// `get-burn-block-info?`, the seed. A tenure extend moves it forward.
     pub height: u64,
+    /// The burn height of the sortition that elected this block's *tenure*.
+    ///
+    /// The same block as `height` until a tenure is extended, which is why
+    /// [`Self::move_to_burn_block`] sets both and is the only way to move `height`:
+    /// a path that moved the view and left this behind would read another block's
+    /// height, and exactly one consensus rule reads it.
+    ///
+    /// That rule is the prepare-phase signer-set update. stacks-core drives it from
+    /// `tenure_block_snapshot.block_height` (`setup_block`,
+    /// `chainstate/nakamoto/mod.rs`), so a block whose *view* has crossed into a
+    /// prepare phase while its *tenure* has not writes nothing -- and on a chain
+    /// whose sortitions have stopped, that is the difference between setting a
+    /// cycle's signer set and not setting it. It is what parted the roots at pox-5
+    /// height 931: the view jumped seven burn blocks to 399 and the tenure stayed
+    /// at 392.
+    tenure_bitcoin_height: u32,
     pub first_height: u64,
     pub prepare_phase_length: u32,
     pub reward_phase_length: u32,
@@ -137,11 +157,46 @@ pub struct BitcoinBlockContext {
 }
 
 impl BitcoinBlockContext {
+    /// Move to a burn block: tenure and view together, which is what they are
+    /// until something says a tenure was extended past its own sortition.
+    ///
+    /// The only way to move `height`, so that a path which forgets the tenure
+    /// cannot exist. Where the two really differ -- a followed or replayed block
+    /// carrying a tenure extend -- the caller says so afterwards with
+    /// [`Self::extend_view_to`].
+    pub const fn move_to_burn_block(&mut self, height: u64) {
+        self.height = height;
+        self.tenure_bitcoin_height = Self::as_burn_height(height);
+    }
+
+    /// Move the view forward while the tenure stays where it was.
+    pub const fn extend_view_to(&mut self, view: u64) {
+        self.height = view;
+    }
+
+    /// The tenure's own burn height, as the one rule that reads it wants it.
+    #[must_use]
+    pub const fn tenure_burn_height(&self) -> u64 {
+        self.tenure_bitcoin_height as u64
+    }
+
+    /// Saturating, because a burn height past `u32::MAX` is no chain anybody is on
+    /// and a wrapped one would read as a real height. `u32` as stacks-core holds it.
+    #[allow(clippy::cast_possible_truncation)]
+    const fn as_burn_height(height: u64) -> u32 {
+        if height > 0xffff_ffff {
+            u32::MAX
+        } else {
+            height as u32
+        }
+    }
+
     /// Construct a context when only the current Bitcoin height is available.
     #[must_use]
     pub const fn at_height(height: u64) -> Self {
         Self {
             height,
+            tenure_bitcoin_height: Self::as_burn_height(height),
             first_height: 0,
             prepare_phase_length: 0,
             reward_phase_length: 0,

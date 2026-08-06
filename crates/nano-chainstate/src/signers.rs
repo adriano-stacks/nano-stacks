@@ -56,10 +56,23 @@ const TESTNET_SINGLE_SIGNATURE_VERSION: u8 = 26;
 #[must_use]
 pub fn prepare_phase_reward_cycle(context: BitcoinBlockContext) -> Option<u64> {
     let length = u64::from(context.prepare_phase_length + context.reward_phase_length);
-    if context.height <= context.first_height || length == 0 {
+    // The *tenure's* burn height, not the block's burn view. stacks-core drives
+    // this from `tenure_block_snapshot.block_height` (`setup_block`,
+    // `chainstate/nakamoto/mod.rs`), and the two part company the moment a tenure
+    // is extended: the extend moves the view forward while the tenure keeps the
+    // burn block that elected it.
+    //
+    // Reading the view set a cycle's signer set for a prepare phase the tenure had
+    // not reached. On the live pox-5 chain, whose sortitions had stopped at burn
+    // 393, block 931's view jumped to burn 399 -- inside cycle 19's prepare phase --
+    // while its tenure stayed at 392. nano set cycle 20's set and stacks-core did
+    // not: `last-set-cycle` on that chain is still 19. Four keys of difference,
+    // identical receipts, identical costs, and the state roots parted.
+    let height = context.tenure_burn_height();
+    if height <= context.first_height || length == 0 {
         return None;
     }
-    let effective = context.height - context.first_height;
+    let effective = height - context.first_height;
     let index = effective % length;
     if index != 0 && index <= length - u64::from(context.prepare_phase_length) {
         return None;
@@ -510,13 +523,19 @@ mod tests {
     use super::prepare_phase_reward_cycle;
 
     fn context(height: u64) -> BitcoinBlockContext {
-        BitcoinBlockContext {
-            height,
-            first_height: 0,
-            prepare_phase_length: 5,
-            reward_phase_length: 15,
-            ..BitcoinBlockContext::at_height(height)
-        }
+        let mut context = BitcoinBlockContext::at_height(height);
+        context.first_height = 0;
+        context.prepare_phase_length = 5;
+        context.reward_phase_length = 15;
+        context
+    }
+
+    /// A block whose tenure sat at one burn block while an extend moved its view to
+    /// another, which is the only way the two part.
+    fn extended(tenure: u64, view: u64) -> BitcoinBlockContext {
+        let mut context = context(tenure);
+        context.extend_view_to(view);
+        context
     }
 
     #[test]
@@ -528,5 +547,32 @@ mod tests {
         // The last block of a cycle belongs to that cycle, not the next one.
         assert_eq!(prepare_phase_reward_cycle(context(320)), Some(16));
         assert_eq!(prepare_phase_reward_cycle(context(321)), None);
+    }
+
+    /// An extended tenure whose *view* has reached a prepare phase its *tenure* has
+    /// not sets up nothing.
+    ///
+    /// stacks-core drives this from `tenure_block_snapshot.block_height`
+    /// (`setup_block`), so the two answers part the moment a tenure is extended: the
+    /// extend moves the Clarity burn view forward and the tenure keeps the burn block
+    /// that elected it.
+    ///
+    /// This is pox-5 height 931, minimised. There the tenure sat at burn 392 -- that
+    /// chain's sortitions had stopped at 393 -- and one extend moved the view to burn
+    /// 399, inside cycle 19's prepare phase. Reading the view set cycle 20's signer
+    /// set where stacks-core set nothing: `last-set-cycle` on that chain is still 19.
+    /// Four keys of difference, identical receipts, identical costs, and the state
+    /// roots parted.
+    #[test]
+    fn an_extended_view_does_not_set_up_the_tenures_next_cycle() {
+        // The view is in the prepare phase and the tenure is not: nothing.
+        assert_eq!(prepare_phase_reward_cycle(extended(312, 316)), None);
+        assert_eq!(prepare_phase_reward_cycle(extended(392, 399)), None);
+        // Both in it: the tenure's own cycle, and the view is not consulted.
+        assert_eq!(prepare_phase_reward_cycle(extended(316, 319)), Some(16));
+        // The tenure in it and the view past it, which an extend also produces.
+        assert_eq!(prepare_phase_reward_cycle(extended(316, 322)), Some(16));
+        // An extend that moves nothing is the ordinary block.
+        assert_eq!(prepare_phase_reward_cycle(extended(316, 316)), Some(16));
     }
 }

@@ -482,7 +482,7 @@ impl State {
 
         let sortition = self.peer.sortition(state.tip.consensus_hash).await?;
         let mut context = runtime::bitcoin_context(&self.config, &self.pox);
-        context.height = sortition.bitcoin_height;
+        context.move_to_burn_block(sortition.bitcoin_height);
         let burn_view = self.peer.sortition_tip().await?;
         let candidate = if extend_due {
             println!(
@@ -555,7 +555,7 @@ impl State {
         .await?;
 
         let mut context = runtime::bitcoin_context(&self.config, &self.pox);
-        context.height = won.bitcoin_height;
+        context.move_to_burn_block(won.bitcoin_height);
         let context = self
             .peer
             .tenure_coinbase_context(

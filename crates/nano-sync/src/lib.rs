@@ -414,23 +414,21 @@ impl PoxInfo {
     /// Convert the node response into the context required for VM execution.
     #[must_use]
     pub fn bitcoin_context(&self) -> BitcoinBlockContext {
-        BitcoinBlockContext {
-            height: self.bitcoin_height,
-            first_height: self.first_bitcoin_height,
-            prepare_phase_length: self.prepare_phase_length,
-            reward_phase_length: self.reward_phase_length,
-            rejection_fraction: self.rejection_fraction.unwrap_or(0),
-            v1_unlock_height: self.v1_unlock_height.unwrap_or(u32::MAX),
-            v2_unlock_height: self.v2_unlock_height.unwrap_or(u32::MAX),
-            v3_unlock_height: self.v3_unlock_height.unwrap_or(u32::MAX),
-            pox_5_activation_height: self.pox_5_activation_height.unwrap_or(u32::MAX),
-            // Only a tenure-start block collects a coinbase, so its caller
-            // fills this in from the sortitions around it.
-            accumulated_coinbase: 0,
-            // The tenure's own burn block, which its caller reads from the
-            // sortition that awarded it.
-            ..BitcoinBlockContext::at_height(self.bitcoin_height)
-        }
+        // Through `at_height` so the tenure's burn height comes with the view: the
+        // two are the same block until a caller says a tenure was extended.
+        let mut context = BitcoinBlockContext::at_height(self.bitcoin_height);
+        context.first_height = self.first_bitcoin_height;
+        context.prepare_phase_length = self.prepare_phase_length;
+        context.reward_phase_length = self.reward_phase_length;
+        context.rejection_fraction = self.rejection_fraction.unwrap_or(0);
+        context.v1_unlock_height = self.v1_unlock_height.unwrap_or(u32::MAX);
+        context.v2_unlock_height = self.v2_unlock_height.unwrap_or(u32::MAX);
+        context.v3_unlock_height = self.v3_unlock_height.unwrap_or(u32::MAX);
+        context.pox_5_activation_height = self.pox_5_activation_height.unwrap_or(u32::MAX);
+        // Only a tenure-start block collects a coinbase, so its caller fills this
+        // in from the sortitions around it.
+        context.accumulated_coinbase = 0;
+        context
     }
 }
 

@@ -1169,11 +1169,22 @@ fn apply_captured_block(
         // Replay can start mid-tenure, where the view is the tenure's own sortition.
         *bitcoin_view = block.header.consensus_hash.to_string();
     }
+    // The view's snapshot carries everything Clarity reads. The tenure's carries the
+    // one thing the prepare-phase rule reads, and they are the same snapshot unless
+    // this block extends its tenure past the burn block that elected it.
     let mut bitcoin_context = *capture.snapshots.get(bitcoin_view.as_str()).ok_or_else(|| {
         ReplayDivergence::Fixture(
             "block Bitcoin view is absent from captured Bitcoin snapshots".to_owned(),
         )
     })?;
+    if let Some(tenure) = capture
+        .snapshots
+        .get(block.header.consensus_hash.to_string().as_str())
+    {
+        let view = bitcoin_context.height;
+        bitcoin_context.move_to_burn_block(tenure.height);
+        bitcoin_context.extend_view_to(view);
+    }
     let event_path = capture.root.join("events/new_block").join(
         path.file_stem()
             .map(|name| format!("{}.json", name.to_string_lossy()))
@@ -1567,16 +1578,20 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                 .unwrap_or(([0; 32], 0));
             Some((
                 snapshot.consensus_hash.clone(),
-                BitcoinBlockContext {
-                    first_height,
-                    prepare_phase_length,
-                    reward_phase_length,
-                    burn_header_hash: decode_hash(&snapshot.burn_header_hash)?,
-                    burn_block_time: snapshot.burn_header_timestamp,
-                    vrf_seed,
-                    burn_spend_total,
-                    burn_spend_winner,
-                    ..BitcoinBlockContext::at_height(snapshot.block_height)
+                {
+                    // Through `at_height`, so this snapshot's burn block is both the
+                    // tenure and the view. A replayed block carrying an extend moves
+                    // the view on afterwards, in `execute_captured_block`.
+                    let mut context = BitcoinBlockContext::at_height(snapshot.block_height);
+                    context.first_height = first_height;
+                    context.prepare_phase_length = prepare_phase_length;
+                    context.reward_phase_length = reward_phase_length;
+                    context.burn_header_hash = decode_hash(&snapshot.burn_header_hash)?;
+                    context.burn_block_time = snapshot.burn_header_timestamp;
+                    context.vrf_seed = vrf_seed;
+                    context.burn_spend_total = burn_spend_total;
+                    context.burn_spend_winner = burn_spend_winner;
+                    context
                 },
             ))
         })
@@ -3768,7 +3783,7 @@ mod tests {
                 .account_balance(&recipient)
                 .expect("read the recipient's balance");
             let mut context = captured_context;
-            context.height = height;
+            context.move_to_burn_block(height);
             let applied = chainstate
                 .execute_nakamoto_block_with_bitcoin_operations(
                     context,

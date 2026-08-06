@@ -1140,7 +1140,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         registry,
         checkpoint,
     } = inputs;
-    context.height = executor.lock().await.bitcoin_height();
+    context.move_to_burn_block(executor.lock().await.bitcoin_height());
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
         return;
     };
@@ -1450,7 +1450,7 @@ pub async fn open_chainstate(
         *chainstate.accounting_mut() = accounting(config, directory)?;
         let anchor = NakamotoBlock::decode(&fs::read(&config.checkpoint.anchor_block)?)?;
         let mut context = bitcoin_context(config, pox);
-        context.height = config.checkpoint.anchor_bitcoin_height;
+        context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
         return Ok((chainstate, anchor, Some(context)));
     };
     // A peer that does not have this block yet is usually one still catching

@@ -31,12 +31,13 @@ fn main() {
     vm.begin_block_execution(
         Some(block),
         [0x7f; 32],
-        BitcoinBlockContext {
-            first_height: 0,
-            prepare_phase_length: 5,
-            reward_phase_length: 15,
-            pox_5_activation_height: 262,
-            ..BitcoinBlockContext::at_height(height)
+        {
+            let mut context = BitcoinBlockContext::at_height(height);
+            context.first_height = 0;
+            context.prepare_phase_length = 5;
+            context.reward_phase_length = 15;
+            context.pox_5_activation_height = 262;
+            context
         },
     )
     .expect("begin a probe block");
