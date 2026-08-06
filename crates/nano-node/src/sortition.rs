@@ -536,6 +536,16 @@ impl CapturedLeaderKey {
 struct CapturedSnapshot {
     block_height: u64,
     burn_header_hash: String,
+    /// The burn block's header time, as stacks-core's own column spells it.
+    ///
+    /// Clarity reads it back as `burn-block-time`, so a chain seeded here has to
+    /// state it for its seed the way it states the seed's burn total: the tenure
+    /// standing on the seed's own burn view is executed before this chain has
+    /// advanced once. Absent in a chain saved before this field existed, and then
+    /// the seed's own answer is unavailable rather than wrong — every block after
+    /// it derives from the Bitcoin header.
+    #[serde(default)]
+    burn_header_timestamp: u64,
     sortition_id: String,
     consensus_hash: String,
     sortition_hash: String,
@@ -655,6 +665,7 @@ impl SortitionTracker {
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
             sortition_id: hex::encode(tip.sortition_id.as_bytes()),
             consensus_hash: tip.consensus_hash.to_string(),
+            burn_header_timestamp: tip.bitcoin_timestamp,
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
             sortition: Some(i64::from(tip.winner_txid.is_some())),
@@ -794,6 +805,7 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
     Ok(SortitionSnapshot {
         bitcoin_height: seed.block_height,
         bitcoin_header_hash,
+        bitcoin_timestamp: seed.burn_header_timestamp,
         sortition_id,
         parent_sortition_id: nano_primitives::SortitionId::from_bytes([0; 32]),
         // Never read: only the hash of a block *after* the seed is derived.
@@ -854,6 +866,7 @@ mod tests {
         let seed = SortitionSnapshot {
             bitcoin_height: 100,
             bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+            bitcoin_timestamp: 0,
             sortition_id: nano_primitives::SortitionId::from_bytes([2; 32]),
             parent_sortition_id: nano_primitives::SortitionId::from_bytes([3; 32]),
             operations_hash: OpsHash::from_txids(&[]),

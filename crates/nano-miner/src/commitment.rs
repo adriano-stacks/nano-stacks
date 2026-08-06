@@ -327,6 +327,7 @@ mod tests {
         let mut bitcoin = FixedBitcoin(vec![BitcoinBlock {
             height: 2,
             hash: [0; 32],
+            timestamp: 0,
             operations: vec![commitment(3, 0)],
         }]);
 
@@ -420,11 +421,13 @@ mod tests {
             BitcoinBlock {
                 height: 1,
                 hash: [0; 32],
+                timestamp: 0,
                 operations: vec![registration(0, [1; 20]), registration(1, [9; 20])],
             },
             BitcoinBlock {
                 height: 2,
                 hash: [0; 32],
+                timestamp: 0,
                 operations: vec![commitment(4, 0), commitment(5, 1)],
             },
         ]);

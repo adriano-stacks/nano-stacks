@@ -851,6 +851,13 @@ impl fmt::Display for PoxId {
 pub struct SortitionSnapshot {
     pub bitcoin_height: u64,
     pub bitcoin_header_hash: BitcoinHeaderHash,
+    /// The burn block's header time, which Clarity reads as `burn-block-time`.
+    ///
+    /// Carried on the snapshot rather than read from the burnchain again at
+    /// execution time, because a chain resumed from a capture has to be able to
+    /// state it for its own seed, and stacks-core's `snapshots` table records it
+    /// beside every other field here as `burn_header_timestamp`.
+    pub bitcoin_timestamp: u64,
     pub sortition_id: SortitionId,
     pub parent_sortition_id: SortitionId,
     pub operations_hash: OpsHash,
@@ -880,6 +887,7 @@ impl SortitionSnapshot {
         Self {
             bitcoin_height,
             bitcoin_header_hash,
+            bitcoin_timestamp: 0,
             sortition_id: SortitionId::from_bytes(*bitcoin_header_hash.as_bytes()),
             parent_sortition_id: SortitionId::from_bytes(*bitcoin_header_hash.as_bytes()),
             operations_hash: OpsHash([0; 32]),
@@ -1172,6 +1180,7 @@ impl SnapshotChain {
         let snapshot = SortitionSnapshot {
             bitcoin_height: block.height,
             bitcoin_header_hash,
+            bitcoin_timestamp: block.timestamp,
             sortition_id: sortition_id(bitcoin_header_hash, &pox_id),
             parent_sortition_id: parent.sortition_id,
             operations_hash,
@@ -1531,7 +1540,10 @@ impl std::error::Error for SortitionError {}
 #[must_use]
 pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
     let bitcoin_header_hash = BitcoinHeaderHash::from_bytes(block.hash);
-    SortitionSnapshot::genesis(block.height, bitcoin_header_hash)
+    SortitionSnapshot {
+        bitcoin_timestamp: block.timestamp,
+        ..SortitionSnapshot::genesis(block.height, bitcoin_header_hash)
+    }
 }
 
 #[cfg(test)]
@@ -1945,6 +1957,7 @@ mod tests {
 
     fn bitcoin_block(height: u64, hash: u8) -> nano_bitcoin::BitcoinBlock {
         nano_bitcoin::BitcoinBlock {
+            timestamp: 0,
             height,
             hash: [hash; 32],
             operations: Vec::new(),

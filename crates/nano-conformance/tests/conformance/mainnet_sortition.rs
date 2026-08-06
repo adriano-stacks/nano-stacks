@@ -28,6 +28,8 @@ use nano_sortition::{
 struct Captured {
     block_height: u64,
     burn_header_hash: String,
+    /// The burn block's header time, which Clarity reads as `burn-block-time`.
+    burn_header_timestamp: u64,
     sortition_id: String,
     consensus_hash: String,
     sortition_hash: String,
@@ -200,6 +202,7 @@ fn report_operations(height: u64, block: &BitcoinBlock) {
 fn seed_from(genesis: &Captured) -> SortitionSnapshot {
     SortitionSnapshot {
         bitcoin_height: genesis.block_height,
+        bitcoin_timestamp: genesis.burn_header_timestamp,
         bitcoin_header_hash: BitcoinHeaderHash::from_bytes(
             <[u8; 32]>::try_from(decode(&genesis.burn_header_hash).as_slice()).expect("32 bytes"),
         ),
@@ -740,6 +743,18 @@ fn assert_snapshot_derives(
             "consensus hash",
             hex::encode(derived.consensus_hash.as_bytes()),
             snapshot.consensus_hash.clone(),
+        ),
+        (
+            // Clarity-visible as `burn-block-time`, and the last of the three
+            // execution inputs the node used to take from a peer.
+            "burn header time",
+            derived.bitcoin_timestamp.to_string(),
+            snapshot.burn_header_timestamp.to_string(),
+        ),
+        (
+            "burn header hash",
+            hex::encode(derived.bitcoin_header_hash.as_bytes()),
+            snapshot.burn_header_hash.clone(),
         ),
         (
             "sortition hash",
