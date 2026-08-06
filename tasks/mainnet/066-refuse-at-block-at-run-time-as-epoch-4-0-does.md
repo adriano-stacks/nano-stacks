@@ -1,7 +1,7 @@
 ---
 id: "066"
 title: "Refuse at-block at run time, as epoch 4.0 does"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["064"]
 tags: ["mainnet", "vm", "clarity", "consensus"]
 created_at: 2026-08-06
+completed_at: 2026-08-06
 ---
 
 # Refuse at-block at run time, as epoch 4.0 does
@@ -113,8 +114,7 @@ contract into an epoch-4.0 state already (`conformance/block_info_tenure_height.
 does exactly that) — but a contract *containing* `at-block` cannot be deployed under
 epoch 4.0 at all, since analysis refuses the word whatever the version. So the pin
 needs a planted stored analysis, which is the shape [[064]]'s deploy-epoch fixture
-already builds. That is the remaining item and it is a test-fixture problem rather
-than a production one.
+already builds, and which is the next section.
 
 ## The pin exists, and it found that the gate was in the wrong place
 
