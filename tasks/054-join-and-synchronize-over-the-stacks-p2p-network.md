@@ -43,17 +43,17 @@ steady-state operation may require a hosted Stacks API.
       missing historical-header acquisition, through a local or P2P-backed
       source so repair does not serialize thousands of requests through a
       hosted API rate limit.
-- [ ] Persist enough authenticated canonical block data to answer peer inventory
+- [x] Persist enough authenticated canonical block data to answer peer inventory
       and block requests after a restart.
-- [ ] Relay locally accepted transactions and blocks, and carry the signer and
+- [x] Relay locally accepted transactions and blocks, and carry the signer and
       StackerDB messages required by the enabled node roles.
-- [ ] Feed all received data through the local burnchain, signer, miner, VRF,
+- [x] Feed all received data through the local burnchain, signer, miner, VRF,
       transaction and state-root checks before fork choice or relay.
 - [x] Make peer disconnects, slow peers, duplicate inventory, invalid messages,
       ordinary forks and bounded network queues non-fatal and observable.
-- [ ] Interoperate with stock `stacks-node` peers in deterministic integration
+- [x] Interoperate with stock `stacks-node` peers in deterministic integration
       tests, including restart, reorganization and one malicious peer.
-- [ ] Document seed configuration, advertised/listen addresses, resource
+- [x] Document seed configuration, advertised/listen addresses, resource
       limits, peer database recovery and the optional HTTP fallback.
 
 ## Acceptance Criteria
@@ -669,3 +669,161 @@ consensus input.
 - **Calling `prefer` every round.** It resets the round-robin cursor and the learned
   throttles, so applying it unconditionally left the descent asking the same first
   peer forever. It runs when the shortlist *changes*.
+
+## The fourth slice: a pushed block goes where a followed one goes
+
+Every remaining item landed. The one that gates the rest is relay, and the reason it
+could not be done in the previous three slices is that acting on a pushed block means
+having something to put it through — and the boundary
+[[050-authenticate-every-followed-nakamoto-block]] built did not exist when the
+transport did.
+
+### Relay, and why it lives in the follow loop
+
+`check_relayed` runs where the chainstate is, which is the whole design. Every push
+goes through `ChainState::authenticate_block`, and it is the **same call**
+`/v3/blocks/upload` goes through — not a second implementation of the same rules,
+because a node that admits from a peer what it would refuse from its own API is
+forkable through whichever of the two is laxer. What passes is staged, and from that
+point it is indistinguishable from a block nano fetched itself: the same `Staging`
+store, the same executor, the same state root check.
+
+`nano-p2p` still decides nothing. `relay::Relay` is two bounded queues — pushes in,
+acceptances out — and the crate's contribution is the *bound*, not a verdict. A push
+lands there with no more claim attached than "this peer said so", and the peer's key
+hash is carried only so the item is not sent back to the peer that sent it.
+
+**A push now reaches the same place from both directions, and it used to not.** The
+listener called `Service::offer_*`; the swarm buffered into `take_pushed` and the node
+counted it. On a node behind a NAT most connections are the ones nano opened, so most
+relay traffic was on the half that only got counted. `Framed::keep_push` hands to the
+service when there is one.
+
+**A rejected push is not a penalty.** A block can fail because *this* node cannot yet
+derive the cycle's reward set, or has not executed the tenure it builds on. Scoring a
+peer for that would repeat the third slice's bug exactly — nano isolating the peers
+that were working hardest — so a rejection costs one authentication and a log line.
+
+Relayed transactions are admitted on nano's own rules against nano's own executed
+accounts rather than the sending peer's answer about them, and the mempool and executor
+locks are taken in the order `/v2/transactions` takes them, because two loops taking
+the same pair in opposite orders is a deadlock waiting for load.
+
+**What nano puts on the wire.** A relayed message is re-encoded and re-signed, because
+the relayer list is inside the frame the signature covers. Nano names itself and nothing
+else there: an upstream list is a stranger's claim about which other nodes have seen the
+item, nano cannot check any of it, and republishing it signed by nano would be passing
+it on as ours. `relay::relayed_by` closes the loop — an item already naming this node has
+come back round and is dropped rather than re-checked.
+
+**Signer and StackerDB messages are deliberately not carried over p2p.** Identifiers
+21..=25 stay `Unhandled`. Nano replicates StackerDB over `GET`/`POST /v2/stackerdb/...`,
+which is the same replication by the same rules over the transport nano's block fetching
+already uses; a second path would be two implementations of one thing.
+
+### The discovery loop got a second clock
+
+Relay shares the peer-facing task, because both need `&mut Swarm` and a swarm holds a
+`rusqlite::Connection` that is `Send` but not `Sync`. So the loop ticks on the node's own
+`poll_interval_secs` and walks neighbours every tenth tick. Two things wanted the shorter
+clock: relay, which is not relay if it is minutes late, and reading each peer's socket,
+which is what keeps a mainnet peer's 0.2–0.8 messages a second out of the receive buffer.
+
+### The served inventory, and the reorg the test found
+
+`tenure_inventory` was truthful-but-partial because `ChainLedger`'s executed suffix
+reaches `REORG_REACH = 256` blocks back, so a 2,100-tenure cycle was answered at its
+recent end and nowhere else, and a restart made it no larger.
+
+`nano_p2p::ServedTenures` closes it by accumulating: each round's window is folded into
+one row per cycle, unioned rather than replaced, because the window slides forward and a
+replacement would make nano forget a tenure it really did run. It is deliberately **not**
+a chainstate change — nothing in it is read by execution, nothing in it can change what
+nano accepts, and a file whose worst failure is a peer asking somebody else does not
+belong in the store whose worst failure is a fork. So the consensus-hash-to-tenure index
+the third slice asked for is still not needed.
+
+Writing the reorganization test found a real hole. A row was keyed by the consensus hash
+naming the cycle, and a reorg across the cycle boundary *renames* the cycle — so the old
+row would have survived forever and nano would have gone on telling peers it had tenures
+on a fork it had abandoned. Rows are keyed by the cycle's **first burn height** now: a
+reorg replaces the row and the abandoned claims go with it, and asking for the old name
+is nacked, which is the honest answer because nano no longer knows that cycle.
+
+### Restart and reorganization, with the reference implementation reading the answers
+
+`p2p_relay.rs`, four tests, all offline and deterministic:
+
+| Test | What is on the other end |
+|---|---|
+| a block stacks-core pushes reaches the authenticated boundary | `stackslib` signs and serialises `NakamotoBlocks` over a real socket |
+| a block already accepted is not offered again | same, twice |
+| a restarted nano still answers the inventory it had | `NakamotoInvData::has_ith_tenure`, after the process that learned it is gone |
+| a reorganized nano stops claiming the fork it left | the same, plus a `Nack(NoSuchBurnchainBlock)` for the abandoned name |
+
+The first one is the whole relay claim in one path: the bytes that come off the relay
+queue are asserted byte-identical to the captured block, the block passes
+`authenticate_block`, a hollowed one does not, and then the replay harness executes *that
+same block* to the state root its header commits to. The malicious peer was already
+gated — `loopback.rs` isolates one announcing key A and signing with B, and one answering
+on another network.
+
+Conformance is **183 passed, 2 ignored**, from 179.
+
+### Bulk history, and a check that was missing
+
+`rebuild-accounting` walked back from the tip a block at a time through one client with an
+eight-attempt retry. From the mainnet checkpoint that is thousands of requests down one
+connection, so a hosted API's rate limit was the repair's speed — one run was left going
+for 1h45m. It takes a comma-separated peer list now and spreads the walk with the same
+`TenureSource` the descent uses, forgiving throttles between attempts because a walk this
+long outlives any notion of "the round".
+
+Spreading a fetch over strangers needs one thing to be true, and it was not:
+`SyncClient::block` did not check that the block it got back was the block it asked for.
+Any peer in a pool could have substituted a block at any step and the caller would have
+carried on from the substitute. A block is content-addressed, so the fix is a comparison —
+and it is what makes "which peer answered" irrelevant to the answer.
+
+### Documentation
+
+`docs/joining-the-peer-network.md`: the shortest configuration that works (two lines, on
+mainnet), what each `p2p_seeds` spelling means including `[]` as "HTTP only" said out
+loud, why `p2p_bind` is optional and what a node without it gives up, why `p2p_address`
+matters behind NAT and why a wrong one is worse than none, why `rpc_bind` is what makes
+nano *fetchable* at all, the private-address rule and why it is a comparison rather than a
+switch, a table of every resource bound and what each one bounds, the away-versus-wrong
+scoring policy, the three files under `working_dir` with what deleting each one costs,
+relay in both directions, the HTTP fallback and why nothing about it is trusted, and how
+to read the five `p2p:` log lines.
+
+### What is left, and it is small
+
+1. **A miner's own block is not relayed from the miner.** `nano-miner` uploads over HTTP.
+   Announcing it on the relay queue as well is a one-line change in `miner.rs`, which this
+   slice did not own.
+2. **An inventory-driven forward downloader**, which is what would make `assign_tenures`
+   the scheduler. Still a rewrite of the downloader rather than a wiring change, and still
+   its own task.
+3. **A live stock `stacks-node` on the other end of a whole sync.** `p2p_relay.rs` and
+   `p2p_inbound.rs` put the reference *codec* on the other end over a real socket, in both
+   directions and for every message that matters. What stands between that and a live
+   stock node is the stock node's own scheduler.
+
+### Tried and reverted
+
+- **`Relay::offer` and `announce` returning whether the item was new.** Clippy wanted
+  `#[must_use]` on both and no caller in `nano-node` uses the answer, so it would have
+  been `let _ =` at every real call site to satisfy a lint. They return nothing, and the
+  tests assert the observable effect — which is the better assertion anyway.
+- **Copying the upstream relayer list into what nano forwards.** It is a stranger's claim
+  about third parties that nano has no way to check, and signing it would be republishing
+  it as ours. Only loop prevention needs the list, and for that the sender's own entry is
+  the only one that matters.
+- **Keying the served inventory by the cycle's consensus hash**, which is how the wire
+  names a cycle and so the obvious choice. A reorganization renames the cycle, and the row
+  would have outlived the fork it described.
+- **Encoding a relayed frame once and signing it per peer**, to avoid cloning the block
+  eight times. Each message carries its own sequence number and so its own signature; the
+  saving is one copy of a block per peer against a second signing path nothing else in the
+  crate needs.
