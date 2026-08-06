@@ -67,9 +67,23 @@ node may invoke.
       release gate.
 - [x] Record the clarity-wasm and compiler revisions in the report produced by
       [[053-pass-the-mainnet-node-release-gate]].
-- [ ] Bind checkpoint provenance and every reusable compiler fixture to the
+- [x] Bind checkpoint provenance and every reusable compiler fixture to the
       exact clarity-wasm/compiler revision that produced it; a fixture from an
       unknown compiler build cannot satisfy the release gate.
+      Split three ways, because the three things have different owners. A
+      *checkpoint* is stacks-core's state, so binding it to a nano compiler
+      revision would be a false claim; what the state directory records instead is
+      every nano build that has opened it (`recorded_engine_identities`), which is
+      the right binding for the roots beyond the checkpoint and is what
+      `report_state_engines` prints. A *frozen receipt slice* is nano's own output
+      and `freeze-receipts` stamps `COMPILER_IDENTITY` into it —
+      `the_frozen_mainnet_slice_names_its_compiler` now refuses one that does not,
+      via `skip_gate`, so it prints a reason offline and *fails* under
+      `NANO_REQUIRE_MAINNET`: the in-tree slice predates the field, so the release
+      report cannot come out clean until it is re-frozen. Not asserted *equal* to
+      this artifact's compiler, deliberately — a baseline frozen by an earlier
+      build is exactly what catches a change in this one. The `.clar` fixtures are
+      inputs minimized from the chain and need no binding.
 - [x] Tell a compile refusal at a *call* apart from one at a deploy. The first
       can only ever be a compiler gap; the second is a transaction the network
       also failed. Conflating them makes a gap invisible in the state root.

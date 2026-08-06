@@ -34,6 +34,11 @@ struct Frozen {
     first_height: u64,
     last_height: u64,
     blocks: Vec<ReceiptDigest>,
+    /// The compiler build whose receipts these are.
+    ///
+    /// `Option`, because a slice frozen before the field existed has none — and
+    /// that is the case the gate below refuses rather than the case it ignores.
+    compiler: Option<String>,
 }
 
 fn frozen() -> Frozen {
@@ -44,6 +49,51 @@ fn frozen() -> Frozen {
     let body = fs::read(&path)
         .unwrap_or_else(|error| panic!("the mainnet receipt slice at {}: {error}", path.display()));
     serde_json::from_slice(&body).expect("the mainnet receipt slice is JSON")
+}
+
+/// A frozen slice has to say which compiler produced it.
+///
+/// [[060-make-the-consensus-execution-engine-explicit-and-r]]: "a fixture from an
+/// unknown compiler build cannot satisfy the release gate." These digests are
+/// **nano's own** receipts, so they are evidence about a compiler only if the
+/// compiler is named — an unnamed slice pins a number without saying whose, and a
+/// release quoting it would be quoting nothing.
+///
+/// Not asserted equal to this artifact's compiler, deliberately. A baseline frozen
+/// by an earlier build is exactly what catches a change in this one; requiring
+/// equality would make every compiler fix fail the gate and would train people to
+/// re-freeze the baseline instead of reading it.
+///
+/// A slice with no compiler at all is `skip_gate`, which is not leniency: it
+/// prints a reason offline and *fails* under `NANO_REQUIRE_MAINNET`, so the
+/// release report cannot come out clean until the slice is re-frozen with
+/// `cargo xtask freeze-receipts`.
+#[test]
+fn the_frozen_mainnet_slice_names_its_compiler() {
+    let frozen = frozen();
+    let Some(compiler) = frozen.compiler else {
+        nano_conformance::skip_gate(
+            "the frozen mainnet receipt slice names no compiler, so it is evidence about no \
+             build: re-freeze it with `cargo xtask freeze-receipts`",
+        );
+        return;
+    };
+    assert_eq!(
+        compiler.len(),
+        64,
+        "a compiler identity is a 32-byte hash of the sources that were compiled, not {compiler:?}"
+    );
+    assert!(
+        compiler.chars().all(|character| character.is_ascii_hexdigit()),
+        "a compiler identity is hexadecimal, not {compiler:?}"
+    );
+    if compiler != nano_vm::COMPILER_IDENTITY {
+        eprintln!(
+            "the frozen slice is compiler {compiler}'s work and this artifact is {}: a \
+             difference here is what the baseline is for, not a fault",
+            nano_vm::COMPILER_IDENTITY
+        );
+    }
 }
 
 /// The slice is a contiguous run of mainnet blocks, and every block says something.
