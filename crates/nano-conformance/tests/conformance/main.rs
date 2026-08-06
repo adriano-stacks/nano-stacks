@@ -24,6 +24,7 @@ mod as_contract_sender;
 mod binary_restart;
 mod block_authentication;
 mod block_height_keyword;
+mod block_info_tenure_height;
 mod burn_spends;
 mod catch_up_rounds;
 mod coinbase_schedule;

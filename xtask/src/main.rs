@@ -3240,18 +3240,17 @@ fn call_both(arguments: &[String]) -> ExitCode {
         encoded.push(bytes);
     }
 
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
-        Ok(vm) => vm,
+    let mut chain = match open_state_as_the_node_left_it(&Path::new(state).join("chainstate")) {
+        Ok(chain) => chain,
         Err(error) => {
-            eprintln!("cannot open the state: {error:?}");
+            eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
+    let Some(tip) = chain.tip() else {
         eprintln!("the state is sealed at no block");
         return ExitCode::FAILURE;
     };
-
     let caller = match sender.as_deref() {
         Some(text) if text.contains('.') => {
             clarity::vm::types::QualifiedContractIdentifier::parse(text)
@@ -3261,7 +3260,7 @@ fn call_both(arguments: &[String]) -> ExitCode {
             .unwrap_or_else(|_| identifier.issuer.clone().into()),
         None => identifier.issuer.clone().into(),
     };
-    match ask_both_engines(&mut vm, tip, &caller, &identifier, function, &encoded) {
+    match ask_both_engines(chain.vm_mut(), tip, &caller, &identifier, function, &encoded) {
         Ok([compiler, interpreter]) => {
             println!("compiler     {compiler}");
             println!("interpreter  {interpreter}");
@@ -3276,6 +3275,27 @@ fn call_both(arguments: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Open a state the way the node that wrote it stands on it.
+///
+/// `Vm::open` starts with an empty tenure-start map; the node seeds it from the
+/// ledger committed with the tip's seal. Without that, every `get-block-info?`
+/// and `get-tenure-info?` reaching a tenure below the tip answers Clarity `none`
+/// where the chain answers a height — which made the interpreter look like the
+/// engine that was wrong about mainnet block 8,706,194 when it was the only one
+/// right.
+fn open_state_as_the_node_left_it(
+    directory: &Path,
+) -> Result<nano_chainstate::ChainState, String> {
+    let mut chain = nano_chainstate::ChainState::open(Network::MAINNET, directory)
+        .map_err(|error| format!("cannot open the state: {error:?}"))?;
+    if let Some(tip) = chain.tip() {
+        chain
+            .recover_ledger_at(tip)
+            .map_err(|error| format!("cannot read the ledger the tip sealed: {error:?}"))?;
+    }
+    Ok(chain)
 }
 
 /// Ask both engines the same contract call and print what each answered.
@@ -3360,14 +3380,14 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let chainstate = Path::new(state).join("chainstate");
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, &chainstate) {
-        Ok(vm) => vm,
+    let mut chain = match open_state_as_the_node_left_it(&chainstate) {
+        Ok(chain) => chain,
         Err(error) => {
-            eprintln!("cannot open the state: {error:?}");
+            eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
+    let Some(tip) = chain.tip() else {
         eprintln!("the state is sealed at no block");
         return ExitCode::FAILURE;
     };
@@ -3402,7 +3422,7 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
         if only.as_ref().is_some_and(|wanted| wanted != &txid) {
             continue;
         }
-        match ask_both_engines_about(&mut vm, tip, transaction) {
+        match ask_both_engines_about(chain.vm_mut(), tip, transaction) {
             Ok(Some([compiler, interpreter])) => {
                 println!("  compiler     {compiler}");
                 println!("  interpreter  {interpreter}");
