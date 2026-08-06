@@ -900,6 +900,15 @@ where
             .await?;
         }
         round.fetched = fetched;
+        // Before executing anything, ask Bitcoin whether the burn blocks this
+        // node's sortitions were derived from still hold. A round is the right
+        // place: a sortition is a fact about a Bitcoin block and many Stacks
+        // blocks stand on one, so asking per block would reinstate a per-block
+        // burnchain round trip that measurement says does not exist
+        // ([[049-derive-canonical-sortitions-from-the-local-burncha]]).
+        if let Some(resumed) = self.check_burnchain(node, staging).await? {
+            round.reorganized = Some(resumed);
+        }
         round.executed = self.execute_staged(node, pox, staging, budget.execute).await?;
         // A descent that fetched blocks and executed none, while the peer is
         // ahead, is what a fork looks like from here: the peer's chain walked
@@ -1237,6 +1246,147 @@ where
         Ok(Some(local))
     }
 
+    /// Stand on a block this node executed before, after giving back the rest.
+    ///
+    /// A retraction rewinds the executed chain and the accounting, and this is the
+    /// other half: the executor's own tip. Without it a node that retracted kept
+    /// standing on the block it had just abandoned, so nothing staged was ever its
+    /// child and no round after the switch executed anything — a stall that looks
+    /// exactly like the one the fork switch was built to remove.
+    ///
+    /// The block comes back from the peer because a full block is not what a
+    /// chainstate keeps, and its identity is checked rather than taken: a peer
+    /// answering `/v3/blocks/:id` with something else must not be able to choose
+    /// where this node stands.
+    ///
+    /// The three views derived from the tip are dropped rather than adjusted. The
+    /// burn view and the cached sortition belonged to the branch just abandoned,
+    /// and the Bitcoin height is re-read from the header this node wrote down for
+    /// the block it now stands on.
+    async fn stand_on_block(
+        &mut self,
+        node: &SyncClient,
+        block_id: [u8; 32],
+    ) -> Result<(), NodeExecutionError> {
+        let block = node.block(StacksBlockId::from_bytes(block_id)).await?;
+        if *block.block_id().as_bytes() != block_id {
+            return Err(NodeExecutionError::Execution(
+                CheckpointExecutionError::Link(format!(
+                    "the peer answered for block {} with block {}, so this node cannot stand \
+                     on the ancestor it retracted to",
+                    hex::encode(block_id),
+                    block.block_id()
+                )),
+            ));
+        }
+        self.tip = block;
+        self.bitcoin_view = None;
+        self.sortition_view = None;
+        self.bitcoin_height = 0;
+        Ok(())
+    }
+
+    /// Ask Bitcoin whether the burn blocks behind this node's sortitions still hold.
+    ///
+    /// One `block_hash_at` a round when nothing moved, which is the cheap half of
+    /// `find_fork` done deliberately rather than as a side effect: the incremental
+    /// read inside `BitcoinSource` notices a reorganization too, but only once it
+    /// happens to read that height again, and what it did with the news was to
+    /// stop deriving sortitions and go back to the peer's — answering a
+    /// disagreement about the burnchain by trusting the peer more.
+    ///
+    /// A reorganization deeper than the chain's root is not survivable here and
+    /// says so: nothing local can tell what replaced a checkpoint's own burn
+    /// anchor.
+    async fn check_burnchain(
+        &mut self,
+        node: &SyncClient,
+        staging: &Staging,
+    ) -> Result<Option<[u8; 32]>, NodeExecutionError> {
+        let Self {
+            sortition: Some(tracker),
+            bitcoin,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let (height, hash) = {
+            let tip = tracker.tip();
+            (tip.bitcoin_height, *tip.bitcoin_header_hash.as_bytes())
+        };
+        match bitcoin.block_hash_at(height) {
+            Ok(current) if current == hash => return Ok(None),
+            Ok(_) => {}
+            // A burnchain that cannot be read is not a burnchain that moved, and
+            // treating the two alike would retract a chain over a network error.
+            Err(error) => {
+                eprintln!("cannot ask Bitcoin whether burn block {height} still holds: {error}");
+                return Ok(None);
+            }
+        }
+        println!(
+            "Bitcoin no longer holds the block at height {height} this node snapshotted, \
+             so the sortitions above the fork point are being given back"
+        );
+        let fork = tracker
+            .find_fork(|height| bitcoin.block_hash_at(height))
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        let reorg = match fork {
+            // The tip came back while the fork was being located, which is an
+            // ordinary race on a chain that reorganized once and reorganized back.
+            nano_sortition::Fork::Canonical => return Ok(None),
+            nano_sortition::Fork::Above(height) => tracker
+                .retract_above(height)
+                .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?,
+            nano_sortition::Fork::BeyondChainRoot {
+                root_bitcoin_height,
+            } => {
+                return Err(CheckpointExecutionError::Bitcoin(format!(
+                    "the Bitcoin reorganization reaches below burn block {root_bitcoin_height}, \
+                     which is where this node's sortition chain was seeded — nothing local can \
+                     say what replaced it, so this state needs a checkpoint Bitcoin agrees with"
+                ))
+                .into());
+            }
+        };
+        // The surviving chain's `PreStx` window only: an operation authorised by
+        // an output in a block Bitcoin dropped was never an operation.
+        bitcoin.invalidate_from(reorg.resume_bitcoin_height());
+        let retraction = self.chainstate.retract(&reorg);
+        // Written down before anything is executed on the replacement branch, so a
+        // node killed here restarts on the retracted chain rather than on the one
+        // Bitcoin abandoned.
+        if let (Some(tracker), Some(state)) =
+            (self.sortition.as_ref(), self.sortition_state.as_ref())
+            && let Err(error) = tracker.save(state)
+        {
+            eprintln!("the retracted sortition chain could not be written down: {error}");
+        }
+        let Some(resume) = retraction.resume_from.filter(|_| !retraction.discarded.is_empty())
+        else {
+            println!(
+                "{} sortitions were retracted and no block this node executed stood on any \
+                 of them, so the executed chain is unchanged",
+                reorg.depth()
+            );
+            return Ok(None);
+        };
+        println!(
+            "a Bitcoin reorganization {} blocks deep took back {} Stacks blocks; standing on {} \
+             and reading the burnchain again from {}",
+            reorg.depth(),
+            retraction.discarded.len(),
+            hex::encode(resume),
+            reorg.resume_bitcoin_height()
+        );
+        // Everything staged descends from the abandoned branch's tip or from
+        // tenures that no longer exist, so it is refetched rather than sorted out.
+        staging.clear()?;
+        self.stand_on_block(node, resume).await?;
+        Ok(Some(resume))
+    }
+
     /// Stand on the last block a peer's chain and this one agree about.
     ///
     /// A peer that reorganises past this node used to strand it: the follower
@@ -1276,6 +1426,12 @@ where
             retraction.discarded.len(),
             hex::encode(block)
         );
+        // The executor's own tip, which the retraction does not move. Without this
+        // the switch rewound the ledger and left the executor standing on the block
+        // it had just abandoned, so no staged block was ever its child and every
+        // round after the switch executed nothing — the stall this whole path
+        // exists to remove, one step further along.
+        self.stand_on_block(node, block).await?;
         Ok(retraction.resume_from)
     }
 

@@ -1377,6 +1377,13 @@ impl nano_bitcoin::BitcoinSource for BurnchainSource {
             Self::Rest(source) => source.block_hash_at(height),
         }
     }
+
+    fn invalidate_from(&mut self, height: u64) {
+        match self {
+            Self::Rpc(source) => source.invalidate_from(height),
+            Self::Rest(source) => source.invalidate_from(height),
+        }
+    }
 }
 
 /// The first configured peer that answers, so one dead peer is not a dead node.
@@ -1534,10 +1541,15 @@ async fn better_peer(
     let candidates = pool.candidate_tips().await;
     let peer = match executor {
         Some(executor) => {
-            let mut executor = executor.lock().await;
-            let signers = executor.recorded_signer_set(bitcoin_context(config, pox));
-            let burn = executor.burn_view();
-            nano_sync::choose_canonical_tip(&candidates, signers.as_ref(), burn)?.peer
+            let mut held = executor.lock().await;
+            let signers = held.recorded_signer_set(bitcoin_context(config, pox));
+            let burn = held.burn_view();
+            let chosen = nano_sync::choose_canonical_tip(&candidates, signers.as_ref(), burn)
+                .map(|tip| tip.peer);
+            // Released before the answer is acted on: every account read and every
+            // block admission takes this same lock.
+            drop(held);
+            chosen?
         }
         // A node with no executed state of its own — a signer-only or RPC-only
         // configuration — has neither answer to weigh with, and says so by

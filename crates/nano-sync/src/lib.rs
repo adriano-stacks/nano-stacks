@@ -231,7 +231,10 @@ impl std::error::Error for TipRejection {}
 /// sortition chain rather than from the peer being weighed: a peer's
 /// `/v3/sortitions` answer describes the burnchain that peer read, which is the
 /// thing under suspicion.
-pub trait BurnView {
+///
+/// `Sync` because [`PeerPool::choose_source`] holds one across the request that
+/// gathers the candidate tips, and that future is spawned as a task.
+pub trait BurnView: Sync {
     /// Whether the burn view a candidate names is one this node derived.
     ///
     /// `None` means *this node cannot judge*, which is the ordinary case while
@@ -2246,7 +2249,7 @@ mod tests {
 
         let ours = [1; 20];
         let ahead = [2; 20];
-        let burn = StubBurnView([(ours, Some(true))].into_iter().collect());
+        let burn = StubBurnView(std::iter::once((ours, Some(true))).collect());
 
         // On this node's own burn view and unsigned: refused, however long.
         let unsigned = vec![candidate(0, ours, 5_000, None)];

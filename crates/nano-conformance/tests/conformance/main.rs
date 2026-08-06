@@ -30,6 +30,7 @@ mod event_delivery;
 mod event_observer;
 mod event_queue;
 mod fork_retraction;
+mod follow_path;
 mod hacknet_replacement;
 mod kill_during_import;
 mod kill_during_replay;

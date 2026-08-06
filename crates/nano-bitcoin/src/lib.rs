@@ -59,6 +59,23 @@ pub trait BitcoinSource {
 
     /// One block's header hash, without decoding its transactions.
     fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error>;
+
+    /// Forget everything read at or above a height, after a reorganization.
+    ///
+    /// Both real sources walk forward incrementally and carry a `PreStx` window
+    /// six blocks wide, and neither is sound over a chain that moved underneath
+    /// them: an operation authorised by a `PreStx` output in a block Bitcoin no
+    /// longer holds is not an operation at all. A caller that has located the
+    /// fork point against its own snapshots calls this with the first height that
+    /// no longer holds, and the next read walks forward from there.
+    ///
+    /// Provided rather than required, because a source that keeps nothing —
+    /// a fixture, a recorded window — has nothing to forget, and making it
+    /// mandatory would put an empty body in every one of them. Until this existed
+    /// the node could not reach either source's own `invalidate_from` through the
+    /// trait it holds them behind, which is why [[049]] recorded the reorganization
+    /// path as unwired.
+    fn invalidate_from(&mut self, _height: u64) {}
 }
 
 /// Bitcoin Core RPC-backed protocol-operation source.
@@ -340,6 +357,10 @@ impl BitcoinSource for BitcoinRestSource {
     fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
         Self::block_hash_at(self, height)
     }
+
+    fn invalidate_from(&mut self, height: u64) {
+        Self::invalidate_from(self, height);
+    }
 }
 
 /// Decode a big-endian block hash as Esplora prints it.
@@ -363,6 +384,10 @@ impl BitcoinSource for BitcoinRpcSource {
 
     fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
         Self::block_hash_at(self, height)
+    }
+
+    fn invalidate_from(&mut self, height: u64) {
+        Self::invalidate_from(self, height);
     }
 }
 

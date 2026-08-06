@@ -193,8 +193,32 @@ impl SortitionTracker {
         self.engine
             .snapshots()
             .history()
-            .iter()
-            .any(|hash| *hash == consensus_hash)
+            .contains(&consensus_hash)
+    }
+
+    /// Where this chain and Bitcoin's own history part company, if they do.
+    ///
+    /// One lookup when nothing moved: the walk stops at the first agreement and
+    /// starts at the tip. `nano_bitcoin::BitcoinSource::block_hash_at` is what a
+    /// node passes.
+    pub fn find_fork<E>(
+        &self,
+        canonical_hash: impl FnMut(u64) -> Result<[u8; 32], E>,
+    ) -> Result<nano_sortition::Fork, E> {
+        self.engine.snapshots().find_fork(canonical_hash)
+    }
+
+    /// Give back every sortition above a Bitcoin height.
+    ///
+    /// Refused when the reorganization is deeper than the commitment window this
+    /// chain retained, because the replacement branch's first sortition would then
+    /// be weighed over fewer blocks than the network weighed it over — a short
+    /// window is a different answer, not a rougher one.
+    pub fn retract_above(
+        &mut self,
+        bitcoin_height: u64,
+    ) -> Result<nano_sortition::SortitionReorg, TrackerError> {
+        Ok(self.engine.retract_above(bitcoin_height)?)
     }
 
     /// Commitments the burn block at the tip put up for its sortition.
@@ -589,6 +613,11 @@ impl SortitionTracker {
     /// goes whole, because `ConsensusHash::from_ops` mixes hashes at power-of-two
     /// offsets and a truncated one derives different hashes from there on.
     pub fn save(&self, directory: &Path) -> Result<(), TrackerError> {
+        // A chain that has nowhere to be written down is re-derived from the
+        // checkpoint on the next start, one Bitcoin block download per burn block,
+        // and the only sign of it is a line in a log. Making the directory is
+        // cheaper than that, and the failure is reported rather than swallowed.
+        fs::create_dir_all(directory).map_err(|error| TrackerError::Seed(error.to_string()))?;
         let write = |name: &str, bytes: Vec<u8>| -> Result<(), TrackerError> {
             let path = directory.join(name);
             let temporary = directory.join(format!("{name}.partial"));
