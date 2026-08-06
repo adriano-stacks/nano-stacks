@@ -6102,6 +6102,22 @@ fn link_enter_at_block_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data_mut().global_context.epoch_id;
+                // The *executing* epoch, not the one the module was built under,
+                // and this is why the check cannot be a compile-time one: a
+                // contract published before 3.4 was analysed with `at-block`
+                // available and keeps that analysis forever, while the chain it
+                // runs on has taken the word away. stacks-core checks it twice for
+                // exactly that reason -- at analysis against the deploy epoch, and
+                // here against the current one (`special_at_block`,
+                // `clarity/src/vm/functions/database.rs`) -- and 881 contracts in
+                // the mainnet checkpoint have an `(at-block` call site.
+                //
+                // Before the argument count and before the cost, as it is there:
+                // the refusal charges no `AtBlock` cost, and the cost is in the
+                // receipt.
+                if !epoch.supports_at_block() {
+                    return Err(RuntimeCheckErrorKind::AtBlockUnavailable.into());
+                }
 
                 let block_hash = read_from_wasm(
                     memory,
