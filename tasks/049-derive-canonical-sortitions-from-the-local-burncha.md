@@ -656,3 +656,28 @@ Two smaller things the same work turned up:
 - **`SortitionTracker::save` now makes its directory.** A chain with nowhere to be
   written down is re-derived from the checkpoint on the next start, one Bitcoin
   block download per burn block, and the only sign of it is a line in a log.
+
+## Two Clarity-visible burn fields the production path leaves at zero
+
+Found while pointing the follow path at the captured chain, and it belongs to the
+`[~]` item above rather than to the reorganization work.
+
+`BitcoinBlockContext` carries `burn_spend_total` and `burn_spend_winner` — what
+every miner spent on a sortition and the winner's share — and they land in the
+recorded header, where `get-burn-block-info?` reads them back. The offline replay
+harness fills both from the captured Bitcoin block. **`CheckpointExecutor::execute_staged`
+fills neither**, so a node following the chain executes every block with both at
+zero while the replay that verifies the state roots executes with the real numbers.
+
+Nothing has caught it, and the reason is worth writing down rather than relying on:
+no contract in the captured chain or in the replayed mainnet window reads either
+field, so the two paths seal the same roots. A contract that read one would diverge
+on a *production* node and agree in every offline replay — the one shape of
+divergence the north-star metric cannot see, because the metric does not run the
+production path.
+
+It is derivable rather than borrowable: the burn distribution the sortition tracker
+already computes has both, per block, for the same window `total_burn` comes from.
+Left unfixed here on purpose — it changes what a production node writes into a
+header, which is a state-root decision and wants its own measurement against the
+mainnet replay rather than a change made in passing.
