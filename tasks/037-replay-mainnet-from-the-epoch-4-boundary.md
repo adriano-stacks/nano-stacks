@@ -62,15 +62,32 @@ never from fetched, staged or peer-reported height.
       chain answers what an unrestarted one could
       (`a_resumed_chain_answers_below_the_height_it_was_seeded_at`).
 
-      **This particular state is not repaired by it**, and the honest reason is that
-      it was written before the record existed: its `snapshots.json` carries the one
-      height and `sortitions_below_window` defaults to empty, so the node still stops
-      at 8,712,512 and still refuses to mint a coinbase from a guess. A chain that
-      syncs forward from here accumulates and persists the run; repairing *this* one
-      needs the burn heights re-derived, either by re-walking the sortition chain
-      from the checkpoint or from the burn views of the tenures the node has already
-      executed. That is the next step, and it is a repair rather than a consensus
-      change.
+      A state written before the record existed is repaired from the executed
+      ledger, which already knows the answer: a tenure exists only because a
+      sortition chose its miner, so every executed tenure's burn block elected one.
+      `track_sortitions` takes those heights and hands them to the chain — this
+      node's own answers, never a peer's, and free. Verified live: it reported
+      *"takes 5 elected burn heights from the tenures this node executed, 961,313 to
+      961,318"* and the `cannot say which burn block` refusal went to **zero**.
+
+      **The next frontier, one layer down.** With that answered the follower now
+      stops on:
+
+      > the local sortition chain holds no snapshot for burn 961,321, which this
+      > block stands on: it ends at burn 961,342 and keeps a bounded window behind
+      > that
+      >
+      > … committed seed is not the hash of the parent tenure's VRF proof
+
+      The saved sortition tip (961,342) is **ahead of the burn view the executed tip
+      needs** (~961,318), and a chain can only walk forward — so every block between
+      them stands on a burn block it has no snapshot for, the local derivation
+      returns nothing, and the VRF seed check falls back to the peer's answer and
+      fails. The fix is to stop saving a sortition tip ahead of what execution still
+      needs: either persist the retained window rather than the tip alone, or seed
+      the resumed chain at the executed tip's burn view and re-walk forward. That is
+      the same shape of defect as the one above, one level up, and it is what to do
+      next.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.

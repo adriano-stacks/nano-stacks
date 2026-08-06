@@ -521,6 +521,21 @@ impl SortitionTracker {
         }
     }
 
+    /// Take on burn heights known to have elected somebody, from outside this chain.
+    ///
+    /// The executed ledger is the source: a tenure exists only because a sortition
+    /// chose its miner, so every executed tenure's burn block elected one. That is
+    /// how a chain resumed at its own tip regains the ability to answer for burn
+    /// blocks below it, which its snapshots no longer reach and which staged blocks
+    /// still stand on.
+    pub fn remember_elected_heights(&mut self, heights: Vec<u64>) {
+        let mut known = self.engine.snapshots().sortitions_below_window().to_vec();
+        known.extend(heights);
+        self.engine
+            .snapshots_mut()
+            .seed_sortitions_below_window(known);
+    }
+
     /// How many leader-key registrations this chain can resolve a winner through.
     #[must_use]
     pub fn leader_keys(&self) -> usize {

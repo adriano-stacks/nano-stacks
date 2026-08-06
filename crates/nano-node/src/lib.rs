@@ -1677,9 +1677,37 @@ where
     /// grows for as long as the chain does.
     pub fn track_sortitions(
         &mut self,
-        tracker: crate::sortition::SortitionTracker,
+        mut tracker: crate::sortition::SortitionTracker,
         state: std::path::PathBuf,
     ) {
+        // Every tenure this node executed stands on a burn block that elected
+        // somebody -- a tenure exists only because a sortition chose its miner -- so
+        // the executed chain already knows the answer the resumed sortition chain
+        // cannot reach back for. Taken from what this node executed itself, never
+        // from a peer, and free: the consensus hashes are in the ledger and the
+        // heights are a lookup in the history the checkpoint carries.
+        //
+        // This is what repairs a state written before the run of heights was kept.
+        // Without it a resumed chain answers only at or above the burn block it was
+        // seeded at, and a staged block standing lower stops execution -- mainnet at
+        // 8,712,512, asked about burn 961,320 from a chain seeded at 961,342.
+        let executed = self.chainstate.executed_tenures();
+        let mut heights: Vec<u64> = executed
+            .iter()
+            .filter_map(|tenure| tracker.height_of_consensus_hash(*tenure))
+            .collect();
+        if !heights.is_empty() {
+            heights.sort_unstable();
+            heights.dedup();
+            println!(
+                "the sortition chain takes {} elected burn heights from the tenures this node \
+                 executed, {} to {}",
+                heights.len(),
+                heights.first().copied().unwrap_or_default(),
+                heights.last().copied().unwrap_or_default(),
+            );
+            tracker.remember_elected_heights(heights);
+        }
         self.sortition = Some(tracker);
         self.sortition_state = Some(state);
     }
