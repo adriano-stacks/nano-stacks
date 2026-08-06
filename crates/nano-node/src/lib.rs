@@ -101,7 +101,7 @@ pub struct CheckpointExecutor<S> {
 /// stranger — and a stranger's wrong answer would seal a root the block's own
 /// header refuses, which is how a substitution this deep can be made at all.
 #[derive(Clone, Copy, Debug)]
-struct LocalSortition {
+pub(crate) struct LocalSortition {
     bitcoin_height: u64,
     sortition_hash: [u8; 32],
     /// The winning commitment's leader-key VRF public key, when this node can
@@ -128,7 +128,22 @@ impl LocalSortition {
     /// A field the derivation has no answer for is left as it was rather than
     /// zeroed: the peer's answer stands until this node can better it, and a zero
     /// would be a wrong answer offered to a contract rather than a missing one.
-    fn record(self, bitcoin_context: &mut BitcoinBlockContext) {
+    /// Everything about one burn block, as this node's own sortition chain derived
+    /// it.
+    pub(crate) const fn from_snapshot(snapshot: &nano_sortition::SortitionSnapshot) -> Self {
+        Self {
+            bitcoin_height: snapshot.bitcoin_height,
+            sortition_hash: *snapshot.sortition_hash.as_bytes(),
+            winner_vrf_public_key: snapshot.winner_vrf_public_key,
+            winner_signing_key_hash: snapshot.winner_signing_key_hash,
+            burn_spends: snapshot.burn_spends,
+            burn_header_hash: *snapshot.bitcoin_header_hash.as_bytes(),
+            burn_block_time: snapshot.bitcoin_timestamp,
+            winner_vrf_seed: snapshot.winner_vrf_seed,
+        }
+    }
+
+    pub(crate) fn record(self, bitcoin_context: &mut BitcoinBlockContext) {
         bitcoin_context.sortition_hash = self.sortition_hash;
         bitcoin_context.winner_vrf_public_key = self.winner_vrf_public_key;
         bitcoin_context.winner_signing_key_hash = self.winner_signing_key_hash;
@@ -1911,16 +1926,7 @@ where
         // this node. Nothing belongs here in its place: a burn block that elects
         // no winner while carrying commitments is ordinary — mainnet's 960,222
         // is one — so the count is a report on the tracker and not a condition.
-        let local = LocalSortition {
-            bitcoin_height: snapshot.bitcoin_height,
-            sortition_hash: *snapshot.sortition_hash.as_bytes(),
-            winner_vrf_public_key: snapshot.winner_vrf_public_key,
-            winner_signing_key_hash: snapshot.winner_signing_key_hash,
-            burn_spends: snapshot.burn_spends,
-            burn_header_hash: *snapshot.bitcoin_header_hash.as_bytes(),
-            burn_block_time: snapshot.bitcoin_timestamp,
-            winner_vrf_seed: snapshot.winner_vrf_seed,
-        };
+        let local = LocalSortition::from_snapshot(snapshot);
         // Rejected rather than reported. A Nakamoto header's `bitcoin_spent` is
         // the running burn total of its view and carries threshold signer weight,
         // so this is the one field of a followed block that can be checked against

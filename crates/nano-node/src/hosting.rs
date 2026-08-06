@@ -33,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use nano_bitcoin::BitcoinSource as _;
 use nano_p2p::Discovered;
 use nano_primitives::Network;
 use nano_rpc::{ProposalRejectCode, ProposalRequest, RpcState};
@@ -61,6 +62,7 @@ pub async fn validate_proposals(
     mut requests: UnboundedReceiver<ProposalRequest>,
 ) -> Role {
     let interval = Duration::from_secs(config.node.poll_interval_secs);
+    let mut burn = LocalBurnView::open(&config);
     let mut endpoints = peers.endpoints();
     println!(
         "validating block proposals for the signers this node hosts, over {} peers",
@@ -88,7 +90,15 @@ pub async fn validate_proposals(
         let Some(request) = request else {
             return Err("the proposal route closed".to_owned());
         };
-        let verdict = judge(&config, &pox, &mut peers, &mut validator, &request).await;
+        let verdict = judge(
+            &config,
+            &pox,
+            &mut peers,
+            burn.as_mut(),
+            &mut validator,
+            &request,
+        )
+        .await;
         // Nobody is left to tell if the request was abandoned, which is not an
         // error: the block was still executed and the state was still checked.
         drop(request.verdict.send(verdict));
@@ -121,11 +131,109 @@ fn refresh_pool(
     *endpoints = found;
 }
 
+/// The burn block a proposal is validated under, derived from this node's own
+/// burnchain.
+///
+/// A proposal names a burn view, and everything execution reads from that view --
+/// the sortition hash the coinbase proof is over, the seed the winning commitment
+/// carried, the winning miner's registered keys -- has to come from somewhere. The
+/// validator was refreshing only the *height*, so every proposal was checked
+/// against the checkpoint anchor's seed and every tenure-start one was rejected as
+/// `committed seed is not the hash of the parent tenure's VRF proof`. The peer that
+/// served the proposal is the wrong place to get it from: two of those fields
+/// decide whether the tenure is the one the network elected, and the rest land in
+/// the state root the header commits to.
+///
+/// So the same chain the canonical path derives is derived here, off the same
+/// Bitcoin blocks, and written down as it advances so a restart resumes it.
+struct LocalBurnView {
+    tracker: crate::sortition::SortitionTracker,
+    bitcoin: crate::runtime::BurnchainSource,
+    state: std::path::PathBuf,
+}
+
+impl LocalBurnView {
+    /// Resume the derived chain, or seed it from the checkpoint that carries one.
+    fn open(config: &Config) -> Option<Self> {
+        let capture = config.checkpoint.marf.parent()?;
+        let state = config.node.working_dir.clone();
+        let tracker = crate::sortition::SortitionTracker::resume_or_capture(&state, capture)
+            .inspect_err(|error| {
+                eprintln!(
+                    "the proposal validator cannot derive burn views locally, so it can check \
+                     no tenure's VRF: {error}"
+                );
+            })
+            .ok()?;
+        let bitcoin = crate::runtime::bitcoin_source(config)
+            .inspect_err(|error| {
+                eprintln!("the proposal validator has no burnchain to derive from: {error}");
+            })
+            .ok()?;
+        println!(
+            "the proposal validator derives burn views locally from burn {} on PoX history {}",
+            tracker.tip().bitcoin_height,
+            tracker.tip().pox_id
+        );
+        Some(Self {
+            tracker,
+            bitcoin,
+            state,
+        })
+    }
+
+    /// Fill in the burn block `view` names, or say why this node cannot.
+    fn record(
+        &mut self,
+        view: nano_primitives::ConsensusHash,
+        pox: &PoxInfo,
+        context: &mut nano_chainstate::BitcoinBlockContext,
+    ) -> Result<(), String> {
+        let payouts = crate::payout_schedule(pox)
+            .ok_or_else(|| "no payout schedule, so no sortition can be derived".to_owned())?;
+        let burnchain_tip = self
+            .bitcoin
+            .tip_height()
+            .map_err(|error| format!("this node's burnchain cannot be read: {error}"))?;
+        let (found, walk) = {
+            let Self {
+                tracker, bitcoin, ..
+            } = self;
+            tracker
+                .locate_view(
+                    view,
+                    |height| bitcoin.block_at(height),
+                    burnchain_tip,
+                    payouts,
+                    crate::sortition::CATCH_UP_LIMIT,
+                )
+                .map_err(|error| format!("deriving the burn view locally failed: {error}"))?
+        };
+        // Written down only as it advances: many proposals stand on one burn block,
+        // and rewriting the whole derived history for each of them is a third of a
+        // second on mainnet for a history that has not changed.
+        if walk.advanced > 0
+            && let Err(error) = self.tracker.save(&self.state)
+        {
+            eprintln!("the derived sortition chain could not be written down: {error}");
+        }
+        let height =
+            found.ok_or_else(|| format!("burn view {view} is not on this node's burnchain yet"))?;
+        let snapshot = self
+            .tracker
+            .snapshot_at(height)
+            .ok_or_else(|| format!("no derived snapshot for burn {height}"))?;
+        crate::LocalSortition::from_snapshot(snapshot).record(context);
+        Ok(())
+    }
+}
+
 /// Execute one proposal and say what happened to it.
 async fn judge(
     config: &Config,
     pox: &PoxInfo,
     peers: &mut TenureSource,
+    burn: Option<&mut LocalBurnView>,
     validator: &mut Validator,
     request: &ProposalRequest,
 ) -> Result<(), (String, ProposalRejectCode)> {
@@ -171,6 +279,24 @@ async fn judge(
         }
     }
     let bitcoin_height = sortition.bitcoin_height;
+    // Derived, and refused rather than guessed at. Validating under the standing
+    // context would check this proposal against whatever burn block the last one
+    // stood on -- the anchor's, for the first -- which is how a valid tenure came
+    // to be reported as an invalid one.
+    if let Some(burn) = burn {
+        let mut context = validator.validator_mut().bitcoin_context();
+        burn.record(block.header.consensus_hash, pox, &mut context)
+            .map_err(|error| {
+                (
+                    format!(
+                        "this node cannot derive the burn view {} the proposal names: {error}",
+                        block.header.consensus_hash
+                    ),
+                    ProposalRejectCode::NoSuchTenure,
+                )
+            })?;
+        validator.validator_mut().set_bitcoin_context(context);
+    }
     validator.set_context(sortition, cycle);
     validator
         .validate(&BlockProposal {

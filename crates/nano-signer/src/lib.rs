@@ -214,6 +214,29 @@ where
         self.trusted.contains_key(block_id)
     }
 
+    /// Replace the burn block every later proposal is validated under.
+    ///
+    /// Only `height` and the accumulated coinbase were ever refreshed, so
+    /// `sortition_hash`, `vrf_seed` and the winning miner's keys stayed at the
+    /// checkpoint anchor's values for the life of the process. A tenure-start
+    /// proposal was therefore checked against the anchor's committed seed and
+    /// rejected as `committed seed is not the hash of the parent tenure's VRF
+    /// proof` — a node telling a signer that a perfectly good block was invalid.
+    ///
+    /// The caller derives this from its own burnchain, never from the peer that
+    /// served the proposal: every field of it is either Clarity-visible, and so
+    /// lands in the root the header commits to, or decides whether the tenure is
+    /// the one the network elected.
+    pub const fn set_bitcoin_context(&mut self, context: BitcoinBlockContext) {
+        self.bitcoin_context = context;
+    }
+
+    /// The burn block proposals are currently validated under.
+    #[must_use]
+    pub const fn bitcoin_context(&self) -> BitcoinBlockContext {
+        self.bitcoin_context
+    }
+
     fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
         BitcoinBlockContext {
             height: bitcoin_height,

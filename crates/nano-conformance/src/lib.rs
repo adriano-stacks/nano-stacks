@@ -2316,6 +2316,115 @@ mod tests {
             .expect("observe candidate");
     }
 
+    /// The burn block a proposal is validated under has to be the proposal's own.
+    ///
+    /// `ChainstateProposalValidator` refreshed only `height` and the accumulated
+    /// coinbase per proposal, so `sortition_hash`, `vrf_seed` and the winning
+    /// miner's registered keys stayed at whatever the validator was *constructed*
+    /// with -- the checkpoint anchor's, for the life of the process. A tenure-start
+    /// proposal was therefore checked against the anchor's committed seed and
+    /// rejected as `committed seed is not the hash of the parent tenure's VRF
+    /// proof`: the node telling a stock signer that a perfectly good block was
+    /// invalid, which is what the hosted-signer run measured.
+    ///
+    /// Two halves, and the first is what makes the second mean anything: the
+    /// captured burn blocks have to disagree about the seed at all, or a validator
+    /// carrying the wrong one would look correct.
+    #[test]
+    fn a_proposal_is_validated_under_its_own_burn_block() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
+        let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
+        let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read blocks")
+            .map(|entry| entry.expect("block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let first = NanoNakamotoBlock::decode(&fs::read(&paths[0]).expect("read first block"))
+            .expect("decode first block");
+        let second = NanoNakamotoBlock::decode(&fs::read(&paths[1]).expect("read second block"))
+            .expect("decode second block");
+        let first_context = *snapshots
+            .get(&first.header.consensus_hash.to_string())
+            .expect("first Bitcoin context");
+        let second_context = *snapshots
+            .get(&second.header.consensus_hash.to_string())
+            .expect("second Bitcoin context");
+        assert_ne!(
+            (first_context.vrf_seed, first_context.sortition_hash),
+            (second_context.vrf_seed, second_context.sortition_hash),
+            "two burn blocks that agree about the seed cannot show which one was used"
+        );
+
+        let mut chainstate = captured_chainstate(&fixture);
+        let mut bitcoin = FixtureBitcoinSource {
+            blocks: [
+                (&first_context, &first.header.consensus_hash),
+                (&second_context, &second.header.consensus_hash),
+            ]
+            .into_iter()
+            .map(|(context, consensus_hash)| {
+                (
+                    context.height,
+                    BitcoinBlock {
+                        height: context.height,
+                        hash: [0; 32],
+                        timestamp: context.burn_block_time,
+                        operations: bitcoin_operations
+                            .get(&consensus_hash.to_string())
+                            .expect("Bitcoin operations")
+                            .clone(),
+                    },
+                )
+            })
+            .collect(),
+        };
+        let first_operations = bitcoin
+            .block_at(first_context.height)
+            .expect("first Bitcoin operations");
+        chainstate
+            .append_nakamoto_block_with_bitcoin_operations(
+                first_context,
+                &first_operations.operations,
+                Some(source),
+                &first,
+            )
+            .expect("apply anchor block");
+        let mut validator =
+            ChainstateProposalValidator::new(chainstate, &first, first_context, bitcoin);
+
+        // As built: the anchor's burn block, whatever height a proposal names.
+        assert_eq!(
+            validator.bitcoin_context().vrf_seed,
+            first_context.vrf_seed,
+            "the standing context is the one the validator was constructed with"
+        );
+
+        // What the hosted validator does before every proposal, out of its own
+        // derived sortition chain rather than out of the peer that served it.
+        validator.set_bitcoin_context(second_context);
+        assert_eq!(
+            validator.bitcoin_context().vrf_seed,
+            second_context.vrf_seed,
+            "and the proposal's own burn block is what replaces it"
+        );
+        assert_eq!(
+            validator.bitcoin_context().sortition_hash,
+            second_context.sortition_hash,
+            "including the sortition hash the coinbase proof is over"
+        );
+
+        validator
+            .validate(&BlockProposal {
+                block: second,
+                bitcoin_height: second_context.height,
+                reward_cycle: 0,
+                data: BlockProposal::empty_data(),
+            })
+            .expect("the proposal still executes to the state root it commits to");
+    }
+
     #[test]
     fn checkpoint_executor_executes_captured_descendants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
