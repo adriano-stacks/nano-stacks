@@ -34,8 +34,9 @@ never from fetched, staged or peer-reported height.
       can be imported at all.
 - [x] Replay forward and report the first divergence with the field that
       diverged.
-- [ ] Work the divergence point forward until it stops moving for a real reason
-      or reaches the tip.
+- [~] Work the divergence point forward until it stops moving for a real reason
+      or reaches the tip. **39,967 consecutive blocks** as of 2026-08-06, from
+      8,665,601 to 8,705,568, and still moving at 100 a minute — see below.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
@@ -46,7 +47,7 @@ never from fetched, staged or peer-reported height.
       interpreter journals before sealing. The production node must not perform
       this crosscheck or contain a fallback path; matching diagnostic values are
       not a production conformance result.
-- [ ] Replay from a pristine checkpoint entirely with clarity-wasm after
+- [~] Replay from a pristine checkpoint entirely with clarity-wasm after
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
       production evidence.
@@ -1026,3 +1027,120 @@ in minutes rather than reasoned about.
 `write_journal`'s six offline tests run on every commit against the captured
 fixture; the two mainnet ones are `skip_gate`d on `NANO_MAINNET_MARF` and
 `NANO_MAINNET_JOURNAL` and fail rather than skip under `NANO_REQUIRE_MAINNET`.
+
+## The scoreboard reports mainnet now, and what it can honestly say
+
+`cargo xtask scoreboard` had four rows, all of them about the 340-block captured
+fixture, and this task's first acceptance criterion asks for a mainnet depth beside
+them. It has two now:
+
+```
+replay: mainnet root durable executed tip       39967  from 8665601
+regression: mainnet  frozen receipt digests    500/500      8702046-8702592
+```
+
+Both are read off disk in milliseconds and neither runs anything, which is what
+keeps the board a command somebody actually types. And they are deliberately *not*
+called a replay of the same kind as the rows above them: those four are a replay
+against an oracle, where stacks-core produced both the roots and the receipts. For
+mainnet only the roots have an oracle — the signed headers — because no public API
+serves a historical `new_block`. So the depth row is the durable executed tip, read
+from the MARF's own block table rather than from anything fetched, staged or
+peer-reported, and the receipts row is a regression slice that says so.
+
+`NANO_MAINNET_STATE` names the state directory and `NANO_MAINNET_ANCHOR` the height
+the checkpoint was taken at. Without the first, the row says "no state" rather than
+zero, because zero is what a divergence at the first block looks like.
+
+## Where the depth stands, and the four things that moved it today
+
+**39,967 consecutive mainnet blocks**, 8,665,601 to 8,705,568, entirely through
+clarity-wasm, every state root matching the header the reward set signed. It was
+27,849 this morning and the run is still going at about 100 blocks a minute.
+
+None of the four things that moved it was a consensus bug, which is worth recording
+because the previous eight divergences all were:
+
+- **Fifty minutes at `SYN-SENT`.** The sortition lookup asked one peer, and an
+  unreachable peer cost the whole 30 s request budget per attempt, so every round
+  abandoned 28,458 staged blocks. It asks the pool now, with a four-second connect
+  timeout. Written up on
+  [[049-derive-canonical-sortitions-from-the-local-burncha]].
+- **Five sync bugs** the deterministic round harness found, the worst of which
+  disabled the peer pool for the life of the process after one 429. On
+  [[047-make-mainnet-synchronization-monotonic-and-restart]].
+- **The MARF node cache was a quarter of one block's working set** at this height,
+  so consecutive blocks evicted each other's ancestry: 1.8 s a block for 2.2
+  transactions. 0.78 s at a million entries, and worse again at three million.
+- **Half this machine's memory was a `/tmp` full of last week's scratch files**,
+  which is a page cache the replay was not getting. Not a code change, but it is
+  the second time a measurement here was wrong because of something outside the
+  process.
+
+## The divergence point stopped moving at 8,706,194, for a real reason
+
+**40,592 consecutive mainnet blocks**, 8,665,601 through 8,706,193, and then a state
+root mismatch at 8,706,194: the header commits to `c081728e…` and nano seals
+`e3ba858b…`.
+
+The receipts oracle localized it before any state was inspected, which is the
+argument for having one. Two of the block's six transactions call
+`SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.age009-token-lock::get-tokens-many`, and
+both diverge identically:
+
+| | mainnet | nano |
+|---|---|---|
+| result | `(ok (list (err u3) …))`, uniformly `err u3` | `(err u3)` ×17, then `(err u1002)` ×23 |
+| read_count | 785 | 596 |
+| write_count | 152 | 68 |
+| runtime | 5,017,505 | 4,843,401 |
+
+Both engines call the transaction a **success**, so a status check sees nothing. From
+the eighteenth list element on nano takes another branch and does half the writes,
+which is what moves the root. This is the shape the receipts gate exists for and the
+reason [[060-make-the-consensus-execution-engine-explicit-and-r]] insists a root
+alone is not evidence.
+
+A second, smaller disagreement sits in the same block and is being treated as its own
+defect rather than folded into this one: `pox-5::stake` returns the byte-identical
+value with identical read and write dimensions and **runtime 1,533,155 against
+mainnet's 1,533,104** — 51 units.
+
+The state sealed at the divergence's parent was reflink-copied out of the production
+run in 11 seconds (btrfs, 61 GB apparent, no extra disk), so the fix is being worked
+against the real parent rather than against a reconstruction. That is the loop the
+earlier note asked for and could not have: a 4.5-hour import per experiment is what
+made this expensive before.
+
+## `get-block-info?` was reading a Stacks height where the chain reads a tenure height
+
+The divergence at 8,706,194 was two defects in one host function, both in
+clarity-wasm and both right in the interpreter:
+
+- **The height is a tenure height from epoch 3.0 on.** `get-block-info?` predates
+  Nakamoto, so a Clarity 1 or Clarity 2 contract passing `(- block-height u1)` is
+  passing a *tenure* height — the same switch `block-height` itself made, so that
+  the idiom keeps meaning what it meant. stacks-core translates it in
+  `special_get_block_info` before its range check; clarity-wasm passed the number
+  straight to the Stacks-height reads, which on mainnet names a block from about
+  twenty months earlier. Classic primary testnet is excluded, there and now here.
+- **`time` is the burn block time**, not the Nakamoto header's own timestamp.
+  `get-stacks-block-info? time` is the one that reads the timestamp;
+  clarity-wasm called that for both.
+
+`age009-token-lock::get-tokens-many` compares
+`(unwrap-panic (get-block-info? time (- block-height u1)))` against a vesting
+timestamp forty times over. Against a time twenty months stale, twenty-three of the
+forty took the other branch, returned the contract's own
+`ERR-BLOCK-HEIGHT-NOT-REACHED`, and did half the writes — a transaction both engines
+called a success, with the value, the write count and the root as the only evidence.
+
+**Verified against the chain, not against a reconstruction.** The production binary,
+standing on the reflink-copied state sealed at 8,706,193, executes 8,706,194 and
+seals `c081728eee3693c80147983ccc72e486082fe3f80cfc488acca46639bbe51ee6` — the root
+the signed header commits to — and 32 blocks after it with no mismatch of any kind.
+
+The regression is `conformance/block_info_tenure_height.rs`, which builds the
+smallest chain that can tell the two defects apart: tenure heights advancing at half
+the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
+time that is never a Stacks timestamp. Both engines are asked, and they now agree.

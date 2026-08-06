@@ -12,9 +12,10 @@
 //! or holed one in the first place — contiguity rather than a count, because a
 //! count is what it used to check and a count cannot see the failure that
 //! happened: the live ledger held 193 tenures spanning 201 heights with eight
-//! missing in the middle, so its outer bounds said complete and long. That
-//! refusal needs the 505 GB stacks-core archive to exercise and so has no test
-//! here; this file is what catches an artifact that got past it.
+//! missing in the middle, so its outer bounds said complete and long. The
+//! refusal itself is unit-tested in `xtask`; the queries that feed it need the
+//! 505 GB stacks-core archive, and this file is what catches an artifact that
+//! got past both.
 
 use std::{env, fs, path::PathBuf};
 

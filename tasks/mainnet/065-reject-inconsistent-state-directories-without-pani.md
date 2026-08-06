@@ -32,16 +32,16 @@ panic.
 
 ## Tasks
 
-- [ ] Reproduce the missing-MARF-block case with a deterministic fixture rather
+- [x] Reproduce the missing-MARF-block case with a deterministic fixture rather
       than depending on a race while copying a live directory.
-- [ ] Propagate a typed storage/startup error through the node boundary instead
+- [x] Propagate a typed storage/startup error through the node boundary instead
       of `expect`/panic when a sealed block's trie data is unavailable.
-- [ ] Include the missing block identifier and affected database/path in the
+- [x] Include the missing block identifier and affected database/path in the
       diagnostic without dumping keys, values or unrelated state.
-- [ ] Prove the node opens a clean shutdown directory and every crash-injection
+- [x] Prove the node opens a clean shutdown directory and every crash-injection
       directory from [[057-commit-and-recover-accepted-block-state-atomically]]
       exactly as before.
-- [ ] Document that copying a live working directory is not an atomic backup;
+- [x] Document that copying a live working directory is not an atomic backup;
       name the supported stop/snapshot procedure.
 
 ## Acceptance Criteria
@@ -53,3 +53,40 @@ panic.
   green.
 - The task does not claim that a file-by-file copy of a running node is a valid
   snapshot format.
+
+## Asked once, at open, of the rows a torn copy actually loses
+
+`VersionedMarf::verify_tip` reads the tip's block record, its root node, and every
+ancestor its Merkle skip-list reaches, and `MarfStore::open` turns a failure into
+`MarfStoreError::IncoherentState`. That is the whole check: a trie is immutable per
+`(block, index)`, so a store that was whole when it opened stays whole, and every
+read after this may keep treating storage failure as impossible. What is not
+impossible is opening a store that was *never* whole.
+
+The message is the deliverable as much as the refusal is:
+
+```
+this state directory is not whole: /…/chainstate/marf.sqlite: MARF storage error:
+trie storage is missing trie node 461/20. Nothing was written. A node's working
+directory is not a backup format while it runs -- stop the node, then copy.
+```
+
+It names the file, the missing node, that nothing was written, and the supported
+procedure. It dumps no keys and no values.
+
+Three tests, and the second and third are the ones that could have been skipped:
+
+- the tip's trie rows deleted outright — the same absence a mid-write copy leaves,
+  with none of the timing — is refused, and the assertions are on the *message*
+  rather than only on the failure;
+- refusing **changes no file**: every file's length and modification time is
+  fingerprinted either side of the attempt. A startup check that repaired,
+  truncated or vacuumed would be a second way to lose state, and an operator's
+  next move after this error is usually to copy the directory and look at it;
+- a clean directory still opens to the tip it sealed. The check runs on every
+  start, so one that was too strict would refuse the state every node has —
+  `kill_during_replay`, `kill_during_import` and `binary_restart` are the rest of
+  that argument and run unchanged.
+
+**What this does not claim.** A file-by-file copy of a running node is not a
+snapshot format and this does not make it one. It makes the failure legible.

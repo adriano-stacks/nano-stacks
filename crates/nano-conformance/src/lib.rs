@@ -455,6 +455,91 @@ pub fn scoreboard_at(root: &Path, manifest: FixtureManifest) -> String {
     render_scoreboard(manifest, &replay)
 }
 
+/// What the board can say about mainnet, which is a different question from what
+/// it says about the captured fixture.
+///
+/// The captured rows are a *replay against an oracle*: 340 blocks whose roots and
+/// receipts stacks-core produced. Mainnet has no such oracle for receipts — no
+/// public API serves a historical `new_block` — so the two things it can report are
+/// the depth a durable state has actually executed to, and whether the frozen
+/// regression slice is intact. Both are read from disk and neither runs anything,
+/// so the board stays a command that answers in milliseconds.
+///
+/// `NANO_MAINNET_STATE` names a node's state directory. Without it the row says so
+/// rather than saying zero, because zero is what a divergence at the first block
+/// looks like.
+fn mainnet_rows() -> String {
+    let mut output = String::new();
+    let depth = std::env::var_os("NANO_MAINNET_STATE")
+        .map(PathBuf::from)
+        .and_then(|state| mainnet_executed_height(&state));
+    match depth {
+        Some((anchor, tip)) => {
+            let _ = writeln!(
+                output,
+                "replay: mainnet root durable executed tip   {:>9}  from {anchor}",
+                tip.saturating_sub(anchor)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "replay: mainnet root durable executed tip   no state  NANO_MAINNET_STATE"
+            );
+        }
+    }
+    match frozen_receipt_slice() {
+        Some((blocks, first, last)) => {
+            let _ = writeln!(
+                output,
+                "regression: mainnet  frozen receipt digests   {blocks:>4}/{blocks}      {first}-{last}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "regression: mainnet  frozen receipt digests    absent  fixtures/mainnet/receipts.json"
+            );
+        }
+    }
+    output
+}
+
+/// The anchor a mainnet state was imported at, and the height it has sealed to.
+///
+/// Read straight out of the MARF's own block table, because that is the only height
+/// that means anything: a fetched, staged or peer-reported one is not a block this
+/// node has executed.
+fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
+    let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite")).ok()?;
+    let tip = marf.tip()?;
+    let height = marf.height(tip)?;
+    // A checkpointed state's ancestry arrives with the import, so the anchor is the
+    // first height this node sealed itself: the checkpoint's own height plus one.
+    // `marf.first_sealed_height` is not a thing the MARF records, and the capture
+    // manifest is the wrong place to ask because a state can outlive it -- so the
+    // anchor is taken from the environment where it is known and the row reports the
+    // tip alone where it is not.
+    let anchor = std::env::var("NANO_MAINNET_ANCHOR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| u64::from(height));
+    Some((anchor, u64::from(height)))
+}
+
+/// How many blocks the frozen mainnet regression slice pins, and which.
+fn frozen_receipt_slice() -> Option<(usize, u64, u64)> {
+    #[derive(Deserialize)]
+    struct Slice {
+        first_height: u64,
+        last_height: u64,
+        blocks: Vec<ReceiptDigest>,
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainnet/receipts.json");
+    let slice: Slice = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    Some((slice.blocks.len(), slice.first_height, slice.last_height))
+}
+
 fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String {
     let mut output = String::from(
         "surface              oracle                     passing        first failure\n\
@@ -505,6 +590,7 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
             output,
             "replay: costs        receipt cost dimensions   not captured  needs an observer"
         );
+        let _ = write!(output, "{}", mainnet_rows());
         let _ = writeln!(
             output,
             "\nREPLAY DEPTH: {} / {} ({})",
@@ -526,6 +612,7 @@ fn render_scoreboard(manifest: FixtureManifest, replay: &ReplayDepth) -> String 
         output,
         "replay: costs        receipt cost dimensions     {costs}"
     );
+    let _ = write!(output, "{}", mainnet_rows());
     let _ = writeln!(
         output,
         "\nREPLAY DEPTH: {} / {} ({})",
@@ -765,6 +852,79 @@ struct ReplayInputs<'a> {
     snapshots: &'a BTreeMap<String, BitcoinBlockContext>,
     bitcoin_operations: &'a BTreeMap<String, Vec<BitcoinOperation>>,
     receipts: bool,
+}
+
+
+/// One block's receipts, reduced to what a regression has to notice.
+///
+/// Kept as a digest rather than as the payload because 500 mainnet blocks of
+/// receipts are 250 MB and this lives in CI. Every field a compiler change could
+/// move is inside the digest: each transaction's identity, its status, all five
+/// cost dimensions, the value it returned, and the ordered events it emitted. The
+/// block's own identity is outside it, so a mismatch says *which* block and then
+/// what about it.
+///
+/// `block` is the Nakamoto block hash, which is the signer signature hash, which
+/// commits to `state_index_root` -- so freezing it pins the root without the
+/// payload carrying one.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ReceiptDigest {
+    pub height: u64,
+    pub block: String,
+    pub transactions: usize,
+    pub events: usize,
+    /// `Sha512_256` over the ordered receipts, hexadecimal.
+    pub digest: String,
+}
+
+/// Reduce an event observer's `new_block` payload to a [`ReceiptDigest`].
+///
+/// The ordering is the payload's own, which is consensus: a receipt list is the
+/// order the block executed in, and an event list is the order the block emitted.
+#[must_use]
+pub fn receipt_digest(payload: &serde_json::Value) -> ReceiptDigest {
+    let strip = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("0x")
+            .to_owned()
+    };
+    let mut preimage = Vec::new();
+    let transactions = payload["transactions"].as_array().cloned().unwrap_or_default();
+    for transaction in &transactions {
+        preimage.extend_from_slice(strip(&transaction["txid"]).as_bytes());
+        preimage.extend_from_slice(strip(&transaction["status"]).as_bytes());
+        preimage.extend_from_slice(strip(&transaction["raw_result"]).as_bytes());
+        let cost = &transaction["execution_cost"];
+        for dimension in [
+            "runtime",
+            "read_count",
+            "read_length",
+            "write_count",
+            "write_length",
+        ] {
+            preimage.extend_from_slice(cost[dimension].to_string().as_bytes());
+        }
+    }
+    let events = payload["events"].as_array().cloned().unwrap_or_default();
+    for event in &events {
+        preimage.extend_from_slice(strip(&event["txid"]).as_bytes());
+        preimage.extend_from_slice(strip(&event["type"]).as_bytes());
+        preimage.extend_from_slice(event["committed"].to_string().as_bytes());
+        // Whatever payload the event carries, canonically: an event's shape is
+        // per type and enumerating them here would be a second definition of it.
+        preimage.extend_from_slice(
+            serde_json::to_vec(event).unwrap_or_default().as_slice(),
+        );
+    }
+    ReceiptDigest {
+        height: payload["block_height"].as_u64().unwrap_or_default(),
+        block: strip(&payload["block_hash"]),
+        transactions: transactions.len(),
+        events: events.len(),
+        digest: hex::encode(nano_primitives::sha512_256(&preimage).as_bytes()),
+    }
 }
 
 /// Whether a gate that cannot run may quietly report nothing.
@@ -1426,6 +1586,22 @@ fn checkpoint_manifest(root: &Path) -> Option<nano_marf::CheckpointManifest> {
     nano_marf::CheckpointManifest::load(root.join("chainstate/checkpoint-H")).ok()
 }
 
+/// The block that sealed the checkpoint, when the capture kept it.
+///
+/// Absent from every capture taken before `capture-fixtures` started keeping it,
+/// and a capture is not invalid for that — a node fetches the block from a peer.
+/// What it costs is that the attestation cannot be checked offline against the
+/// state a node would actually import.
+#[must_use]
+pub fn captured_checkpoint_block(root: &Path) -> Option<NakamotoBlock> {
+    let bytes = fs::read(
+        root.join("chainstate/checkpoint-H")
+            .join(nano_marf::CHECKPOINT_BLOCK_FILE),
+    )
+    .ok()?;
+    NakamotoBlock::decode(&bytes).ok()
+}
+
 #[must_use]
 pub fn checkpoint_state(root: &Path) -> Option<([u8; 32], TrieHash)> {
     let manifest = checkpoint_manifest(root)?;
@@ -1450,8 +1626,8 @@ mod tests {
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
         baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_accounting, captured_chainstate, captured_signer_set, captured_signer_sets,
-        checkpoint_manifest,
+        captured_accounting, captured_chainstate, captured_checkpoint_block, captured_signer_set,
+        captured_signer_sets, checkpoint_manifest,
         checkpoint_state,
         decode_hash, scoreboard, validate_fixture_tree,
     };
@@ -1782,24 +1958,34 @@ mod tests {
     ///
     /// `signer_signature_hash` covers `state_index_root`, so a header the
     /// reward set put threshold weight behind states what the state root at
-    /// that height was. The capture starts one block after the checkpoint, so
-    /// the attestation runs against a captured block treated as a checkpoint —
-    /// the mechanism is the same one a mainnet checkpoint goes through.
+    /// that height was.
+    ///
+    /// A capture that carries the checkpoint's own block is attested against it,
+    /// which is what a node does. A capture taken before the tool kept that
+    /// block has only the ones after it, so the first of those stands in as a
+    /// checkpoint of its own: the mechanism is identical, the block is not the
+    /// one a node would adopt. `mainnet_envelope` attests a real published
+    /// checkpoint against the block that sealed it.
     #[test]
     fn a_signed_header_attests_the_checkpoint_it_sealed() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let signers = captured_signer_set(&fixture);
         let published = checkpoint_manifest(&fixture).expect("checkpoint manifest");
-        let block = NanoNakamotoBlock::decode(
-            &fs::read(captured_block_paths(&fixture).first().expect("captured block"))
-                .expect("read block"),
-        )
-        .expect("decode block");
-        let manifest = nano_marf::CheckpointManifest {
-            stacks_height: block.header.chain_length,
-            source_state_id: *block.block_id().as_bytes(),
-            state_index_root: block.header.state_index_root,
-            ..published
+        let (block, manifest) = if let Some(block) = captured_checkpoint_block(&fixture) {
+            (block, published)
+        } else {
+            let block = NanoNakamotoBlock::decode(
+                &fs::read(captured_block_paths(&fixture).first().expect("captured block"))
+                    .expect("read block"),
+            )
+            .expect("decode block");
+            let manifest = nano_marf::CheckpointManifest {
+                stacks_height: block.header.chain_length,
+                source_state_id: *block.block_id().as_bytes(),
+                state_index_root: block.header.state_index_root,
+                ..published
+            };
+            (block, manifest)
         };
 
         let directory = tempfile::tempdir().expect("state directory");
@@ -2914,6 +3100,143 @@ mod tests {
         );
     }
 
+    /// A burn view whose height this test states, so a tie can be placed.
+    struct StatedBurnView(std::collections::BTreeMap<String, u64>);
+
+    impl nano_sync::BurnView for StatedBurnView {
+        fn derived(&self, _: nano_primitives::ConsensusHash, _: u64) -> Option<bool> {
+            // Nothing about *this* test: the tie-break is what is under test, and a
+            // rejection would decide the question before it was asked.
+            None
+        }
+
+        fn height_of(&self, consensus_hash: nano_primitives::ConsensusHash) -> Option<u64> {
+            self.0.get(&consensus_hash.to_string()).copied()
+        }
+    }
+
+    /// The tie between two equally high tips goes the way stacks-core's goes.
+    ///
+    /// Transcribed from `SortitionDB::set_stacks_block_accepted_at_tip`, which is
+    /// the only place in stacks-core that decides it:
+    ///
+    /// ```text
+    /// if cur_height < stacks_block_height  -> replace
+    /// else if cur_height > stacks_block_height -> keep
+    /// else if cur_ch == consensus_hash     -> keep      // same tenure
+    /// else  // "break ties by going with the latter-signed block"
+    ///   replace iff sn_current.block_height < sn_accepted.block_height
+    /// ```
+    ///
+    /// So the tie-break is the burn height of each tip's **own sortition**, later
+    /// wins. Nano compared block identifiers, which is deterministic and *not this
+    /// rule* — two nodes could stand on different tips of the same length, each
+    /// behaving as designed. That is what this task suspected and what this pins.
+    ///
+    /// It is transcribed rather than called, and the reason is worth being exact
+    /// about: the rule lives inside a `&mut SortitionHandleTx` method that reads two
+    /// snapshots out of a sortition database and writes the winner back. There is no
+    /// pure function to hand two headers to. What *is* checked against stacks-core
+    /// here is the input the rule consumes — the burn height of a consensus hash,
+    /// which `mainnet_sortition` already asserts nano derives identically for every
+    /// block of the captured mainnet window.
+    #[test]
+    fn the_fork_choice_tie_break_is_the_later_sortition() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signers = captured_signer_set(&fixture)
+            .signing_weights()
+            .expect("the captured reward set is well formed");
+        let blocks: Vec<NanoNakamotoBlock> = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .filter(|block| nano_sync::weigh_tip(&block.header, &signers).is_ok())
+            .collect();
+        // Two tips of equal length in *different* tenures, which is the only branch
+        // of the rule that compares anything.
+        let mut tenures: Vec<&NanoNakamotoBlock> = Vec::new();
+        for block in &blocks {
+            if !tenures
+                .iter()
+                .any(|kept| kept.header.consensus_hash == block.header.consensus_hash)
+            {
+                tenures.push(block);
+            }
+        }
+        assert!(
+            tenures.len() >= 2,
+            "the capture holds only {} signed tenures, so no tie between different \
+             sortitions can be built",
+            tenures.len()
+        );
+        let (earlier, later) = (tenures[0], tenures[1]);
+        let candidate = |block: &NanoNakamotoBlock, peer: usize, height: u64| {
+            let mut header = block.header.clone();
+            // Equal length is the premise; the tie-break is what decides.
+            header.chain_length = height;
+            nano_sync::CandidateTip {
+                peer,
+                info: nano_sync::TenureInfo {
+                    consensus_hash: header.consensus_hash,
+                    tenure_start_block_id: block.block_id(),
+                    parent_consensus_hash: header.consensus_hash,
+                    parent_tenure_start_block_id: header.parent_block_id,
+                    tip_block_id: block.block_id(),
+                    tip_height: height,
+                    reward_cycle: 0,
+                },
+                header,
+            }
+        };
+        let view = StatedBurnView(
+            [
+                (earlier.header.consensus_hash.to_string(), 100),
+                (later.header.consensus_hash.to_string(), 101),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let candidates = vec![candidate(earlier, 0, 500), candidate(later, 1, 500)];
+        // The weight rule is deliberately out of this test, and it has to be: a
+        // header's chain length is inside its signature preimage, so *making* two
+        // real captured tips equally long invalidates both signatures. Two equally
+        // long, equally weighted, genuinely signed tips cannot be built from a
+        // capture at all -- only mined -- so what is pinned here is the comparator
+        // that runs after refusal, and refusal has its own tests either side of
+        // this one.
+        let chosen = nano_sync::choose_canonical_tip(&candidates, None, Some(&view))
+            .expect("one of two tips is canonical");
+        assert_eq!(
+            chosen.header.consensus_hash,
+            later.header.consensus_hash,
+            "the tip whose sortition is at the higher burn height wins the tie, as \
+             stacks-core's `sn_current.block_height < sn_accepted.block_height` does"
+        );
+        // And the other way round, so the answer is the rule rather than the order.
+        let swapped = vec![candidate(later, 0, 500), candidate(earlier, 1, 500)];
+        assert_eq!(
+            nano_sync::choose_canonical_tip(&swapped, None, Some(&view))
+                .map(|tip| tip.header.consensus_hash),
+            Some(later.header.consensus_hash),
+        );
+        // A longer chain still wins outright: the tie-break is a tie-break.
+        let longer = vec![candidate(earlier, 0, 501), candidate(later, 1, 500)];
+        assert_eq!(
+            nano_sync::choose_canonical_tip(&longer, None, Some(&view))
+                .map(|tip| tip.header.consensus_hash),
+            Some(earlier.header.consensus_hash),
+        );
+        // With no burn view to place them, the deterministic identifier decides --
+        // which is where stacks-core keeps whichever block it happened to see first,
+        // so there is no answer of its own to agree with.
+        assert!(
+            nano_sync::choose_canonical_tip(&candidates, None, None).is_some(),
+            "a tie this node cannot place still resolves"
+        );
+    }
+
     /// A reorganization takes the tenures it invalidated off the executed chain.
     ///
     /// The burnchain side retracts snapshots; this is the other half, which
@@ -3243,15 +3566,26 @@ mod tests {
         );
     }
 
-    /// A tenure-start block inside the emission schedule moves real STX.
+    /// A tenure-start block inside the emission schedule moves real STX, and
+    /// moves the liquid supply with it.
     ///
     /// The capture's own burn heights sit far below the schedule, which is why
     /// replay stays green without the emission at all; executing one of its
     /// tenure-start blocks against a Bitcoin height inside the schedule is what
     /// shows the mint lands. The state root is not checked, because the height
     /// is not the one the block committed to.
+    ///
+    /// The same block is executed twice, once at each height, because the supply
+    /// is not readable as a number: the MARF holds the hash of the value, so what
+    /// can be compared is the leaf itself, and the emission is the only term of
+    /// that write which the Bitcoin height moves. A mint that credited the
+    /// recipient without raising the supply passes every other assertion here
+    /// and seals a root the network does not have.
     #[test]
     fn a_tenure_start_block_mints_the_sip_031_emission() {
+        /// Where Clarity keeps the liquid supply, which every mint has to raise.
+        const LIQUID_SUPPLY: &str = "_stx-data::ustx_liquid_supply";
+
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let network = captured_network(&fixture);
         let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
@@ -3272,40 +3606,55 @@ mod tests {
         let expected = nano_chainstate::sip_031_emission(network, bitcoin_height);
         assert!(expected > 0, "the chosen height must be inside the schedule");
 
-        let mut chainstate = captured_chainstate(&fixture);
         let recipient = clarity::vm::types::PrincipalData::Contract(
             clarity::vm::types::QualifiedContractIdentifier::parse(
                 &network.boot_contract_id("sip-031"),
             )
             .expect("the SIP-031 contract is a valid identifier"),
         );
-        let before = chainstate
-            .account_balance(&recipient)
-            .expect("read the recipient's balance");
-
-        let mut context = *snapshots
+        let captured_context = *snapshots
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
-        context.height = bitcoin_height;
-        let applied = chainstate
-            .execute_nakamoto_block_with_bitcoin_operations(
-                context,
-                bitcoin_operations
-                    .get(&block.header.consensus_hash.to_string())
-                    .expect("Bitcoin operations"),
-                Some(source),
-                &block,
-            )
-            .expect("execute block");
+        let operations = bitcoin_operations
+            .get(&block.header.consensus_hash.to_string())
+            .expect("Bitcoin operations");
 
-        let after = chainstate
-            .account_balance(&recipient)
-            .expect("read the recipient's balance");
-        assert_eq!(after - before, expected, "the emission did not land");
+        // Each run starts from the checkpoint, which imports into memory, so the
+        // two are independent states rather than one state executed twice.
+        let executed = |height: u64| {
+            let mut chainstate = captured_chainstate(&fixture);
+            let before = chainstate
+                .account_balance(&recipient)
+                .expect("read the recipient's balance");
+            let mut context = captured_context;
+            context.height = height;
+            let applied = chainstate
+                .execute_nakamoto_block_with_bitcoin_operations(
+                    context,
+                    operations,
+                    Some(source),
+                    &block,
+                )
+                .expect("execute block");
+            let after = chainstate
+                .account_balance(&recipient)
+                .expect("read the recipient's balance");
+            let supply = chainstate
+                .state_leaves(*block.block_id().as_bytes())
+                .expect("the block sealed its leaves")
+                .into_iter()
+                .find(|(path, _)| *path == nano_marf::key_path(LIQUID_SUPPLY.as_bytes()))
+                .map(|(_, value)| value)
+                .expect("every block writes the liquid supply");
+            (after - before, applied.receipts, supply)
+        };
+
+        let (credited, receipts, supply) = executed(bitcoin_height);
+        assert_eq!(credited, expected, "the emission did not land");
 
         // The mint is reported on the coinbase, which is where stacks-core
         // attaches it and so where a receipt comparison looks for it.
-        let minted = applied.receipts.iter().any(|receipt| {
+        let minted = receipts.iter().any(|receipt| {
             receipt.result.events.iter().any(|event| {
                 matches!(
                     event,
@@ -3316,48 +3665,98 @@ mod tests {
             })
         });
         assert!(minted, "the coinbase receipt does not report the mint");
+
+        // The same block at the height it was actually mined at, which the
+        // schedule does not reach.
+        assert_eq!(
+            nano_chainstate::sip_031_emission(network, captured_context.height),
+            0,
+            "the capture's own heights are below the schedule"
+        );
+        let (uncredited, quiet, unraised) = executed(captured_context.height);
+        assert_eq!(uncredited, 0, "an emission landed outside the schedule");
+        assert!(
+            !quiet.iter().any(|receipt| {
+                receipt.result.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        clarity::vm::events::StacksTransactionEvent::STXEvent(
+                            clarity::vm::events::STXEventType::STXMintEvent(data),
+                        ) if data.recipient == recipient
+                    )
+                })
+            }),
+            "a mint was reported outside the schedule"
+        );
+        assert_ne!(
+            supply, unraised,
+            "the emission credited the recipient without raising the liquid supply"
+        );
     }
 
     /// The emission a tenure-start block mints to `.sip-031`.
     ///
-    /// stacks-core's release schedule is behind a `testing` feature that swaps
-    /// in an overridable table, so the intervals are compared against the static
-    /// ones the release build uses rather than through the accessor.
+    /// stacks-core's own lookup is the oracle, not a copy of it: a `testing`
+    /// build reads the schedule out of an overridable table and nothing else, so
+    /// the release table is installed into that override and
+    /// `get_sip_031_emission_at_height` is then asked. That covers the scan rule
+    /// as well as the amounts — a table read with `>` instead of `>=` mints a
+    /// tenure late at every boundary. Every probe height comes from the table
+    /// rather than from a list restated here, so an interval that moves is
+    /// caught rather than probed around.
+    ///
+    /// This also stands in for stacks-core's `includes_sip_031()` gate, which
+    /// nano has no counterpart to. Two things make it unreachable: mainnet's
+    /// first interval *is* the epoch 3.2 boundary, asserted below against
+    /// stacks-core's own constant, and nano executes epoch 4.0 blocks only, so
+    /// the gate is open in every block it will ever finalize.
     #[test]
     fn sip_031_emission_matches_stacks_core() {
-        let reference = |network: Network, height: u64| -> u128 {
-            let intervals: &[stacks_common::types::SIP031EmissionInterval] = if network.is_mainnet()
-            {
-                &*stacks_common::types::SIP031_EMISSION_INTERVALS_MAINNET
-            } else {
-                &*stacks_common::types::SIP031_EMISSION_INTERVALS_TESTNET
-            };
-            intervals
-                .iter()
-                .find(|interval| height >= interval.start_height)
-                .map_or(0, |interval| interval.amount)
+        use stacks_common::types::{
+            SIP031_EMISSION_INTERVALS_MAINNET, SIP031_EMISSION_INTERVALS_TESTNET,
+            SIP031EmissionInterval, set_test_sip_031_emission_schedule,
         };
 
         for network in [Network::MAINNET, Network::TESTNET] {
+            let schedule: Vec<SIP031EmissionInterval> = if network.is_mainnet() {
+                SIP031_EMISSION_INTERVALS_MAINNET.to_vec()
+            } else {
+                SIP031_EMISSION_INTERVALS_TESTNET.to_vec()
+            };
             // Every interval boundary, the height either side of it, and the
             // range below the schedule where nothing is minted at all.
-            let boundaries = if network.is_mainnet() {
-                vec![907_740, 960_300, 1_012_860, 1_065_420, 1_117_980, 1_170_540]
-            } else {
-                (1..=6).map(|step| 71_525 + 360 * step).collect()
-            };
-            let mut heights = vec![0, 1, 100_000];
-            for boundary in boundaries {
-                heights.extend([boundary - 1, boundary, boundary + 1]);
+            let mut heights = vec![0, 1, 100_000, u64::from(u32::MAX)];
+            for interval in &schedule {
+                let start = interval.start_height;
+                heights.extend([start - 1, start, start + 1]);
             }
-            heights.push(u64::from(u32::MAX));
+            // The override ignores its `mainnet` argument, so one network's
+            // table is installed at a time. Nothing else in this binary reads
+            // it.
+            set_test_sip_031_emission_schedule(Some(schedule));
             for height in heights {
+                let minted = nano_chainstate::sip_031_emission(network, height);
                 assert_eq!(
-                    nano_chainstate::sip_031_emission(network, height),
-                    reference(network, height),
+                    minted,
+                    SIP031EmissionInterval::get_sip_031_emission_at_height(
+                        height,
+                        network.is_mainnet()
+                    ),
                     "SIP-031 emission diverges at Bitcoin height {height}"
                 );
+                // The epoch gate, where it can be checked at all: nano reads a
+                // non-mainnet chain's epochs from its own configuration and
+                // executes it at 4.0, so only mainnet has a boundary to compare
+                // against.
+                assert!(
+                    minted == 0
+                        || !network.is_mainnet()
+                        || height >= blockstack_lib::core::BITCOIN_MAINNET_STACKS_32_BURN_HEIGHT,
+                    "mainnet mints {minted} at Bitcoin height {height}, below the epoch 3.2 \
+                     boundary where stacks-core's `includes_sip_031()` first opens"
+                );
             }
+            set_test_sip_031_emission_schedule(None);
         }
     }
 
@@ -3629,6 +4028,28 @@ mod tests {
             if right != [0; 4] {
                 prop_assert_eq!(uint_to_words(ours_left / ours_right), (reference_left / reference_right).0);
             }
+            // Subtraction and the big-endian conversion, which the two
+            // implementations disagree about in opposite directions if either is
+            // wrong: `primitive_types` refuses an underflow where stacks-core's own
+            // `Uint256` wraps, and a byte order is only ever visible against
+            // somebody else's.
+            if ours_left >= ours_right {
+                let (ours_difference, _) = ours_left.overflowing_sub(ours_right);
+                prop_assert_eq!(
+                    uint_to_words(ours_difference),
+                    (reference_left - reference_right).0
+                );
+            }
+            // `to_u8_slice` is stacks-core's *little*-endian conversion and
+            // `to_u8_slice_be` the big-endian one; asking the wrong one of the pair
+            // is how this assertion first failed, on nano's correct answer.
+            let ours_big_endian = ours_left.to_big_endian();
+            prop_assert_eq!(ours_big_endian, reference_left.to_u8_slice_be());
+            prop_assert_eq!(ours_left.to_little_endian(), reference_left.to_u8_slice());
+            prop_assert_eq!(
+                uint_to_words(nano_primitives::Uint256::from_big_endian(&ours_big_endian)),
+                left
+            );
         }
 
         #[test]

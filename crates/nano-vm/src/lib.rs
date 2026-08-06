@@ -2020,12 +2020,23 @@ pub enum MarfStoreError {
     /// quietly short of some of its ancestry is what this whole path exists to
     /// stop.
     MalformedHeaderExport,
+    /// The store opened and is not whole: a sealed state whose trie data, or one of
+    /// the ancestors its root is computed over, is not there.
+    ///
+    /// Its own variant because it is the one storage failure that is an *operator*
+    /// error rather than a bug -- a copy taken from a running node, a restore that
+    /// stopped early -- and the message has to be actionable rather than a
+    /// backtrace.
+    IncoherentState(String),
 }
 
 impl std::fmt::Display for MarfStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Marf(error) => write!(formatter, "MARF error: {error}"),
+            Self::IncoherentState(detail) => {
+                write!(formatter, "this state directory is not whole: {detail}")
+            }
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
             Self::Io(error) => write!(formatter, "chainstate I/O error: {error}"),
@@ -2085,7 +2096,20 @@ impl MarfStore {
         UnfinishedImport::refuse(directory)?;
         let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
         let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
-        let tip = marf.tip();
+        // Asked once, here, and the answer decides whether this directory is one a
+        // node may run on. Every read after it treats storage failure as impossible,
+        // which is correct for a store that was whole when it opened and wrong for
+        // one that never was: an interrupted restore, a truncated file, or a
+        // file-by-file copy taken while a node was writing -- which is not an atomic
+        // snapshot, however convenient it looks. Refusing here turns that into a
+        // named startup error instead of a panic thousands of blocks later.
+        let tip = marf.verify_tip().map_err(|error| {
+            MarfStoreError::IncoherentState(format!(
+                "{}: {error}. Nothing was written. A node's working directory is not \
+                 a backup format while it runs -- stop the node, then copy.",
+                directory.join(MARF_FILE).display()
+            ))
+        })?;
         Ok(Self::assemble(network, marf, side_store, tip))
     }
 

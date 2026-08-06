@@ -8,7 +8,8 @@ mod storage;
 
 pub use checkpoint::{CheckpointError, import_checkpoint, import_checkpoint_into, import_pcs};
 pub use provenance::{
-    CheckpointAttestation, CheckpointManifest, CheckpointProvenance, UnfinishedImport,
+    CHECKPOINT_BLOCK_FILE, CheckpointAttestation, CheckpointManifest, CheckpointProvenance,
+    UnfinishedImport,
 };
 use storage::{BlockRecord, TrieStorage};
 
@@ -924,6 +925,36 @@ impl VersionedMarf {
     #[must_use]
     pub fn tip(&self) -> Option<MarfBlockId> {
         self.storage.tip().expect("trie storage")
+    }
+
+    /// Read enough of the tip to say whether this store is coherent.
+    ///
+    /// Every other read on this type answers `Option` and treats a storage failure
+    /// as impossible, which is right *once a store has been opened successfully* --
+    /// a trie is immutable per `(block, index)` and nothing rewrites one. What is
+    /// not impossible is opening a store that was never whole: an interrupted
+    /// import, a truncated restore, or a file-by-file copy taken while a node was
+    /// writing, which is not an atomic snapshot however convenient it looks.
+    ///
+    /// So the question is asked exactly once, here, at open time, and it is asked
+    /// of the rows a partial copy actually loses: the tip's own block record, its
+    /// root node, and every ancestor its Merkle skip-list reaches. A caller that
+    /// gets an error out of this has an operator problem to name rather than a
+    /// panic to report -- and nothing has been written, because this only reads.
+    pub fn verify_tip(&self) -> Result<Option<MarfBlockId>, MarfError> {
+        let Some(tip) = self.storage.tip()? else {
+            return Ok(None);
+        };
+        let record = self.storage.block(tip)?.ok_or(MarfError::UnknownVersion)?;
+        if self.sealed_root(tip)?.is_none() && record.node.is_some() {
+            return Err(MarfError::UnknownVersion);
+        }
+        // The skip-list, which is what a root is computed over: a missing ancestor
+        // is a store that can be read and cannot be extended, and finding that out
+        // at the first sealed block rather than at open time is what produced the
+        // panic this exists to replace.
+        self.ancestor_roots_for(&self.storage.jumps(tip)?)?;
+        Ok(Some(tip))
     }
 
     /// Whether a sealed state exists.

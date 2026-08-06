@@ -39,10 +39,8 @@ reports where to resume. `nano-sync` has `fork_point`, `PeerPool` and
 
 - [x] On a sealed tip the peers do not have, find the last block they do.
 - [x] Resume from the surviving block instead of stopping.
-- [ ] Ask the other peers before concluding the chain moved: one peer's 404 is
-      that peer's answer, not the network's. The node follows one peer today;
-      `PeerPool` from [[027-choose-a-fork-instead-of-following-a-peer]] is what
-      this needs.
+- [x] Ask the other peers before concluding the chain moved: one peer's 404 is
+      that peer's answer, not the network's.
 - [x] Stop only when no ancestor of the state on disk is on the chain, which is
       the case a checkpoint really cannot be extended from.
 
@@ -73,3 +71,24 @@ Confirmed on a live network. The same restart that killed the previous build —
 switching the mining role on, with the signer's sealed tip reorganized away in
 between — now walks back, takes its signing slot for the cycle, and stays up.
 The node has run for minutes where it used to exit in seconds.
+
+## The resume asks the network now
+
+`resume_from` asked the one peer that `reachable_peer` happened to answer first, and
+took its 404 as the chain having moved. A node whose sealed tip is a block that peer
+has not got yet would then walk its own chain backwards and abandon state that is
+perfectly canonical — and on mainnet the peer that answers first is often a hosted
+API a few blocks behind.
+
+It asks `TenureSource` now: every peer configured and every peer p2p discovery found,
+round-robin, with a rate limit setting a peer aside rather than ending the attempt.
+The walk back only begins once *nobody* in the pool has the tip, and the error a node
+stops on says so in those words rather than blaming "the peer".
+
+Two things this rests on, both of which came from elsewhere: a block is
+content-addressed and `TenureSource::block` refuses an answer that is not the block
+asked for, so spreading the question over strangers cannot change the answer; and
+throttles are forgiven between attempts, without which one 429 during a resume would
+empty the pool for the rest of the startup —
+[[047-make-mainnet-synchronization-monotonic-and-restart]] found that the hard way in
+the round loop.

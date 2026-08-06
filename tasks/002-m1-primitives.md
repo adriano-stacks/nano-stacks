@@ -24,7 +24,7 @@ hashing, bounded bit-vector wire encoding, and integer-only arithmetic.
 - [x] Implement `Uint256` addition, subtraction, multiplication, division, and
   canonical big-endian conversion.
 - [x] Implement bounded `BitVec` construction and wire encoding.
-- [ ] Add stacks-core differential tests for all primitive surfaces.
+- [x] Add stacks-core differential tests for all primitive surfaces.
 
 ## Acceptance Criteria
 
@@ -33,3 +33,22 @@ hashing, bounded bit-vector wire encoding, and integer-only arithmetic.
   suite pass.
 - Differential tests compare the same random inputs with stacks-core before the
   milestone is marked complete.
+
+## The two gaps were subtraction and the byte orders
+
+Every primitive surface this task built is compared against stacks-core on random
+inputs — the five hashes, `Uint256` addition, multiplication and division, `BitVec`
+set/get and its wire format — and two were missing: subtraction, and the canonical
+byte conversions this task's own item list names.
+
+Adding them found nothing wrong with nano and something worth knowing about the
+oracle. `Uint256::to_u8_slice` is stacks-core's **little**-endian conversion and
+`to_u8_slice_be` its big-endian one; the first assertion written here compared
+nano's big-endian bytes against `to_u8_slice` and failed on the correct answer.
+Both directions are asserted now, which is what makes the pair unmistakable.
+
+Subtraction is asserted only where it does not underflow, deliberately:
+`primitive_types` refuses an underflow and stacks-core's `Uint256` wraps, so the
+two disagree there by construction and the proptest would be pinning a difference
+that has no consensus meaning — nothing in the sortition arithmetic subtracts past
+zero.

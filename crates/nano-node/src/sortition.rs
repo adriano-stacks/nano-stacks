@@ -482,6 +482,10 @@ impl nano_sync::BurnView for SortitionTracker {
     fn derived(&self, consensus_hash: ConsensusHash, bitcoin_spent: u64) -> Option<bool> {
         (bitcoin_spent < self.tip().total_burn).then(|| self.holds_consensus_hash(consensus_hash))
     }
+
+    fn height_of(&self, consensus_hash: ConsensusHash) -> Option<u64> {
+        self.height_of_consensus_hash(consensus_hash)
+    }
 }
 
 /// The seed every eligible commitment in a burn block carries, when they agree.
