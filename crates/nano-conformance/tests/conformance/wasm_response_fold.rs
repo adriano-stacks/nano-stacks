@@ -165,32 +165,11 @@ fn both(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
     both_in(FOLDER, function, arguments)
 }
 
-fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, String) {
-    let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
-    wasm.begin_block(None, [0x41; 32]).expect("begin");
-    wasm.deploy_contract(
-        id("f"),
-        ClarityVersion::Clarity3,
-        source,
-        LimitedCostTracker::new_free(),
-    )
-    .expect("deploy under the compiler");
-
-    let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
-    store.begin(None, [0x42; 32]).expect("begin");
-    nano_oracle::deploy_contract(
-        &mut store,
-        id("f"),
-        ClarityVersion::Clarity3,
-        source,
-        LimitedCostTracker::new_free(),
-    )
-    .expect("deploy under the interpreter");
-
-    // The consensus serialization goes in beside the value, because that is what
-    // a receipt carries and what a contract-call boundary hands on: two values
-    // that print the same and serialize differently are still a divergence.
-    let describe = |outcome: Result<nano_vm::ContractCallOutcome, _>| match outcome {
+/// The consensus serialization goes in beside the value, because that is what a
+/// receipt carries and what a contract-call boundary hands on: two values that
+/// print the same and serialize differently are still a divergence.
+fn describe<E: std::fmt::Display>(outcome: Result<nano_vm::ContractCallOutcome, E>) -> String {
+    match outcome {
         Ok(
             nano_vm::ContractCallOutcome::Success(result)
             | nano_vm::ContractCallOutcome::AbortedByResponse(result),
@@ -203,28 +182,101 @@ fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, Stri
                 .map_or_else(String::new, |value| to_hex(&serialized(value))),
             result.events
         ),
-        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => format!("failed: {error}"),
+        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+            format!("failed: {error}")
+        }
         Err(error) => format!("error: {error}"),
-    };
+    }
+}
+
+fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, String) {
+    both_across(&[("f", source)], function, arguments)
+}
+
+/// Deploy the named contracts in order into both engines and describe what each
+/// answered for a call on the last one. A single contract is the ordinary case;
+/// a pair is what a `contract-call?` between them needs.
+fn both_across(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Vec<u8>],
+) -> (String, String) {
+    let (mut wasm, mut store) = deployed(contracts);
+    let (last, _) = *contracts.last().expect("at least one contract");
 
     let compiled = describe(wasm.execute_contract_call_outcome(
-        id("f").issuer.into(),
+        id(last).issuer.into(),
         None,
-        id("f"),
+        id(last),
         function,
         arguments,
         &LimitedCostTracker::new_free(),
     ));
     let interpreted = describe(nano_oracle::execute_contract_call_outcome(
         &mut store,
-        id("f").issuer.into(),
+        id(last).issuer.into(),
         None,
-        id("f"),
+        id(last),
         function,
         arguments,
         LimitedCostTracker::new_free(),
     ));
     (compiled, interpreted)
+}
+
+/// What each engine said about the *deployment*, which is where a static
+/// rejection lands and where nothing has a value to lay out yet.
+fn both_deploy(source: &str) -> (String, String) {
+    let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
+    wasm.begin_block(None, [0x41; 32]).expect("begin");
+    let compiled = wasm
+        .deploy_contract(
+            id("f"),
+            ClarityVersion::Clarity3,
+            source,
+            LimitedCostTracker::new_free(),
+        )
+        .map_or_else(|error| format!("error: {error}"), |_| "deployed".to_owned());
+
+    let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
+    store.begin(None, [0x42; 32]).expect("begin");
+    let interpreted = nano_oracle::deploy_contract(
+        &mut store,
+        id("f"),
+        ClarityVersion::Clarity3,
+        source,
+        LimitedCostTracker::new_free(),
+    )
+    .map_or_else(|error| format!("error: {error}"), |_| "deployed".to_owned());
+
+    (compiled, interpreted)
+}
+
+fn deployed(contracts: &[(&str, &str)]) -> (Vm, MarfStore) {
+    let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
+    wasm.begin_block(None, [0x41; 32]).expect("begin");
+    let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
+    store.begin(None, [0x42; 32]).expect("begin");
+
+    for (name, source) in contracts {
+        wasm.deploy_contract(
+            id(name),
+            ClarityVersion::Clarity3,
+            source,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy under the compiler");
+        nano_oracle::deploy_contract(
+            &mut store,
+            id(name),
+            ClarityVersion::Clarity3,
+            source,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy under the interpreter");
+    }
+
+    (wasm, store)
 }
 
 #[test]
@@ -262,7 +314,9 @@ fn proof_bytes(count: usize) -> Vec<u8> {
         &Value::buff_from(
             (0..count)
                 .flat_map(|hash| {
-                    (0..20).map(move |byte| u8::try_from((hash * 20 + byte) % 251 + 1).expect("a byte"))
+                    (0..20).map(move |byte| {
+                        u8::try_from((hash * 20 + byte) % 251 + 1).expect("a byte")
+                    })
                 })
                 .collect(),
         )
@@ -403,11 +457,9 @@ fn some_entry(soft: bool, full: bool) -> Value {
 }
 
 fn principal(text: &str) -> Vec<u8> {
-    serialized(
-        &Value::Principal(
-            clarity::vm::types::PrincipalData::parse(text).expect("a principal literal"),
-        ),
-    )
+    serialized(&Value::Principal(
+        clarity::vm::types::PrincipalData::parse(text).expect("a principal literal"),
+    ))
 }
 
 /// The shape mainnet block 8,667,509 stops on: a `default-to` whose default
@@ -511,14 +563,16 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
     let alice = "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7";
     for function in ["soft-of", "full-of"] {
         for who in [alice, "ST000000000000000000002AMW42H"] {
-            let (compiled, interpreted) =
-                both_in(NARROWING_DEFAULT, function, &[principal(who)]);
+            let (compiled, interpreted) = both_in(NARROWING_DEFAULT, function, &[principal(who)]);
             assert_eq!(compiled, interpreted, "{function} of {who}");
         }
     }
     for full in [true, false] {
-        let (compiled, interpreted) =
-            both_in(NARROWING_DEFAULT, "record", &[principal(alice), boolean(full)]);
+        let (compiled, interpreted) = both_in(
+            NARROWING_DEFAULT,
+            "record",
+            &[principal(alice), boolean(full)],
+        );
         assert!(
             !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
             "record with full={full} answered nothing: {compiled}"
@@ -577,19 +631,57 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
 ///
 /// `blacklist-susdh-v1` reads every one of its `default-to`s through `get`, so
 /// mainnet block 8,667,509 does not depend on which value comes back, and no
-/// shape found on the chain so far does. Ignored rather than deleted: no choice
-/// inside clar2wasm closes it — see
-/// `the_reference_answer_here_has_no_single_static_layout` below, which measures
-/// why — and a red suite teaches people to ignore red suites.
+/// shape found on the chain so far does.
+///
+/// Asserted rather than `#[ignore]`d, and asserted on *both* engines. An ignored
+/// equality is a divergence nobody measures; the same divergence pinned in both
+/// directions is one that cannot move — in either engine — without turning this
+/// red. The `none` branch must agree, because there the value *is* its analysed
+/// type; the `some` branch must disagree exactly as written above, because no
+/// single static layout can reproduce a shape that follows the branch taken (see
+/// `the_reference_answer_here_has_no_single_static_layout`).
 #[test]
-#[ignore = "the reference's answer has no static type: its shape follows the branch taken, and clar2wasm lays a value out from one static type"]
-fn a_narrowed_default_agrees_wherever_it_escapes_a_get() {
+fn a_narrowed_default_parts_from_the_reference_only_where_it_must() {
+    // The `none` branch: the default's own value, so both engines lay out the
+    // type the expression was analysed as, and every escape agrees.
     for function in ESCAPES {
-        for entry in [some_entry(true, true), Value::none()] {
-            let (compiled, interpreted) =
-                both_in(NARROWING_DEFAULT, function, &[serialized(&entry)]);
-            assert_eq!(compiled, interpreted, "{function} of {entry}");
-        }
+        let (compiled, interpreted) =
+            both_in(NARROWING_DEFAULT, function, &[serialized(&Value::none())]);
+        assert_eq!(compiled, interpreted, "{function} of none");
+    }
+
+    // The `some` branch: the payload's own value, which is wider than the
+    // analysed type. Every escape parts, and each one is pinned by what the
+    // reference — the oracle — answers, so a change there is caught even if
+    // clar2wasm never moves.
+    let entry = serialized(&some_entry(true, true));
+    let expectations: [(&str, &str, &str); 5] = [
+        (
+            "whole",
+            "0c0000000104736f667403",
+            "0c000000020466756c6c0304736f667403",
+        ),
+        ("store", "Some(Response", "TypeValueError"),
+        ("same", "Some(Bool(true))", "Some(Bool(false))"),
+        ("shown", "soft", "full"),
+        ("passed", "0c0000000104736f667403", "TypeValueError"),
+    ];
+    for (function, in_compiled, in_interpreted) in expectations {
+        let (compiled, interpreted) =
+            both_in(NARROWING_DEFAULT, function, std::slice::from_ref(&entry));
+        assert_ne!(
+            compiled, interpreted,
+            "{function} of the wide payload is the known divergence; if it has closed, \
+             close the accounting in tasks/mainnet/068 with it"
+        );
+        assert!(
+            compiled.contains(in_compiled),
+            "{function} under clarity-wasm should still narrow: {compiled}"
+        );
+        assert!(
+            interpreted.contains(in_interpreted),
+            "{function} under the reference should still carry the branch: {interpreted}"
+        );
     }
 }
 
@@ -714,9 +806,164 @@ fn a_default_to_with_nothing_to_narrow_is_unchanged() {
         ),
         ("or-nothing", &Value::none()),
     ] {
-        let (compiled, interpreted) =
-            both_in(NARROWING_DEFAULT, function, &[serialized(argument)]);
+        let (compiled, interpreted) = both_in(NARROWING_DEFAULT, function, &[serialized(argument)]);
         assert_eq!(compiled, interpreted, "{function} of {argument}");
+    }
+}
+
+/// The other operand order, which never reaches run time at all.
+///
+/// `least_supertype_v2_1`'s tuple arm walks `a`'s fields and *errors*
+/// `TypeMismatch` on one `b` does not have, while silently dropping the ones `b`
+/// has and `a` does not (`clarity-types/src/types/signatures.rs`). So the
+/// asymmetry has exactly two sides, and only one of them is a divergence: with
+/// the narrower operand first the wider value escapes at run time, and with the
+/// wider operand first the contract does not deploy.
+///
+/// Asserted on both engines because the analyser is shared: whichever engine runs
+/// the block, this shape is refused before either gets a value to lay out. That
+/// is what bounds the problem to a single direction.
+const WIDER_FIRST: &str = "
+(define-read-only (default-wider (entry (optional { soft: bool })))
+  (default-to { soft: false, full: false } entry))
+";
+
+const WIDER_ARM_FIRST: &str = "
+(define-read-only (arm-wider (narrow bool))
+  (if narrow { a: u10, b: u20 } { a: u10 }))
+";
+
+#[test]
+fn the_wider_operand_first_is_refused_before_it_runs() {
+    for source in [WIDER_FIRST, WIDER_ARM_FIRST] {
+        let (compiled, interpreted) = both_deploy(source);
+        assert!(
+            compiled.starts_with("error:") && interpreted.starts_with("error:"),
+            "the wider operand first has no least supertype at all:\ncompiled: {compiled}\ninterpreted: {interpreted}"
+        );
+    }
+}
+
+/// Where the narrowed value can get to, which is the inventory the divergence has
+/// to be sized against.
+///
+/// `special_contract_call` sanitizes its result against `type_of(&result)` — the
+/// value's *own* type, not the callee's analysed return type — so field dropping
+/// is a no-op there and the wide tuple crosses a `contract-call?` intact. The
+/// boundary that could have normalised it does not, so every escape in `ESCAPES`
+/// is reachable from another contract as well as from a transaction.
+const THROUGH_A_CALL: &str = "
+(define-read-only (whole-of (entry (optional { soft: bool, full: bool })))
+  (contract-call? .f whole entry))
+(define-read-only (same-of (entry (optional { soft: bool, full: bool })))
+  (is-eq (contract-call? .f whole entry) { soft: true }))
+";
+
+#[test]
+fn a_contract_call_does_not_normalise_the_narrowed_value() {
+    let interpreted = |function: &str, entry: &Value| {
+        both_across(
+            &[("f", NARROWING_DEFAULT), ("g", THROUGH_A_CALL)],
+            function,
+            &[serialized(entry)],
+        )
+        .1
+    };
+
+    // The oracle's half, which is the half that must not move: the callee's wide
+    // answer arrives at the caller still wide, and compares unequal to the narrow
+    // literal there just as it does at home.
+    let wide = interpreted("whole-of", &some_entry(true, true));
+    assert!(
+        wide.contains(" 0c000000020466756c6c0304736f667403 "),
+        "a contract-call hands the wide tuple on unchanged: {wide}"
+    );
+    assert!(
+        interpreted("whole-of", &Value::none()).contains(" 0c0000000104736f667404 "),
+        "and hands the default's own tuple on when the branch produced that"
+    );
+    assert!(
+        interpreted("same-of", &some_entry(true, true)).starts_with("Some(Bool(false))"),
+        "so a comparison across the boundary parts the same way it does within one contract"
+    );
+}
+
+/// The same asymmetry with something other than a `bool` in the dropped field —
+/// nested tuples, an optional and a response — so the accounting is not resting
+/// on one shape that happens to be one byte wide.
+const NARROWING_KINDS: &str = "
+(define-read-only (nested (entry (optional { inner: { x: uint, y: uint }, tail: uint })))
+  (default-to { inner: { x: u0 }, tail: u0 } entry))
+(define-read-only (optional-field (entry (optional { held: (optional uint), tail: uint })))
+  (default-to { held: none } entry))
+(define-read-only (response-field (entry (optional { got: (response uint uint), tail: uint })))
+  (default-to { got: (ok u0) } entry))
+";
+
+/// Each of the three, measured on both branches. The `some` branch is where the
+/// engines part; the `none` branch is where they must not.
+#[test]
+fn every_narrowing_kind_parts_on_the_some_branch_only() {
+    let nested = Value::Tuple(
+        TupleData::from_data(vec![
+            (
+                ClarityName::from_literal("inner"),
+                Value::Tuple(
+                    TupleData::from_data(vec![
+                        (ClarityName::from_literal("x"), Value::UInt(1)),
+                        (ClarityName::from_literal("y"), Value::UInt(2)),
+                    ])
+                    .expect("a tuple"),
+                ),
+            ),
+            (ClarityName::from_literal("tail"), Value::UInt(3)),
+        ])
+        .expect("a tuple"),
+    );
+    let held = Value::Tuple(
+        TupleData::from_data(vec![
+            (
+                ClarityName::from_literal("held"),
+                Value::some(Value::UInt(4)).expect("an optional"),
+            ),
+            (ClarityName::from_literal("tail"), Value::UInt(5)),
+        ])
+        .expect("a tuple"),
+    );
+    let got = Value::Tuple(
+        TupleData::from_data(vec![
+            (
+                ClarityName::from_literal("got"),
+                Value::okay(Value::UInt(6)).expect("a response"),
+            ),
+            (ClarityName::from_literal("tail"), Value::UInt(7)),
+        ])
+        .expect("a tuple"),
+    );
+
+    for (function, payload) in [
+        ("nested", nested),
+        ("optional-field", held),
+        ("response-field", got),
+    ] {
+        let (compiled, interpreted) =
+            both_in(NARROWING_KINDS, function, &[serialized(&Value::none())]);
+        assert_eq!(
+            compiled, interpreted,
+            "{function} on the none branch answers the default's own value in both"
+        );
+
+        let entry = serialized(&Value::some(payload).expect("an optional"));
+        let (compiled, interpreted) = both_in(NARROWING_KINDS, function, &[entry]);
+        assert_ne!(
+            compiled, interpreted,
+            "{function} on the some branch is the known divergence; if it has closed, \
+             close the accounting in tasks/mainnet/068 with it"
+        );
+        assert!(
+            interpreted.contains("047461696c"),
+            "the reference keeps the field the analysed type dropped: {interpreted}"
+        );
     }
 }
 
