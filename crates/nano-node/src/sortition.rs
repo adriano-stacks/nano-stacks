@@ -398,14 +398,18 @@ impl SortitionTracker {
             return Ok((Some(height), walk));
         }
         let room = burnchain_tip.saturating_sub(self.tip().bitcoin_height);
-        self.walk(
-            &mut block_at,
-            payouts,
-            limit.min(room),
-            &mut walk,
-            |tip| tip.consensus_hash == view,
-        )?;
-        let found = (self.tip().consensus_hash == view).then(|| self.tip().bitcoin_height);
+        // Walked to where Bitcoin ends rather than stopped at the view asked for.
+        // Every burn block above it elects a tenure this node is about to want, so
+        // the downloads are not extra work brought forward but the same work done
+        // in one round instead of one per round — and stopping at the first match
+        // is what held a catching-up node to a single sortition a round, which
+        // bounded it to a handful of executed blocks while hundreds sat staged.
+        //
+        // The walk cannot outrun the lookup behind it: it advances at most `limit`
+        // blocks and `height_of_consensus_hash` looks back over the same window, so
+        // a view found on the way is still addressable when the walk stops.
+        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| false)?;
+        let found = self.height_of_consensus_hash(view);
         Ok((found, walk))
     }
 
