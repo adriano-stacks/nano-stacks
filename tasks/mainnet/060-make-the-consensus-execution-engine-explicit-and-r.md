@@ -76,13 +76,19 @@ node may invoke.
 - [ ] Resolve the asymmetric `least_supertype` tuple case where the interpreter
       returns a taken branch's wider tuple but wasm exposes the narrowed layout.
       Keep the minimized ignored test until both engines agree on the complete
-      returned value, not only on fields read through `get`.
+      returned value, not only on fields read through `get`; the implementation
+      and cross-boundary oracle are tracked in
+      [[068-resolve-asymmetric-tuple-least-supertype-semantics]].
 - [x] Resolve `match` branch bindings that shadow an enclosing local: wasm
       currently accepts a shape the reference interpreter rejects with
       `NameAlreadyUsed`. Pin both the taken and untaken branch behavior.
 - [ ] Account for every ignored Clarity semantic differential in the release
       report. A known engine disagreement may not be waived merely because it
       has not appeared in the replayed mainnet window.
+- [ ] Reject a contract call through a constant during top-level deployment with
+      the reference `ContractCallExpectName` result under
+      [[067-reject-contract-call-through-a-constant-while-depl]], and remove its
+      ignored differential.
 
 ## Acceptance Criteria
 
@@ -97,6 +103,8 @@ node may invoke.
   results, costs, events and state roots under clarity-wasm.
 - The known tuple-supertype and enclosing-local `match` binding cases match the
   reference semantics and are no longer ignored differentials.
+- A constant-target contract call during deployment matches the reference error,
+  costs and no-write behavior and is no longer an ignored differential.
 - Restarting preserves the same clarity-wasm state and root without migration.
 - The pristine compiler-only replay matches every captured mainnet root and
   receipt in the release slice.
@@ -1181,7 +1189,6 @@ The regression is `conformance/block_info_tenure_height.rs`, which builds the
 smallest chain that can tell the two defects apart: tenure heights advancing at half
 the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
 time that is never a Stacks timestamp. Both engines are asked, and they now agree.
-||||||| Stash base
 
 ## The `match` shadowing item: the premise was wrong, and one map over is right
 
@@ -1314,5 +1321,7 @@ asked of stacks-core.
 that no block in the replayed window reaches it. `blacklist-susdh-v1` reads all
 three of its `default-to`s through `get`; a contract that returns such an `if` or
 `default-to` whole, across a contract-call or into a receipt, would diverge on
-nano today. It is the one known open Clarity semantic differential, and it belongs
-in the release report as such.
+nano today. It is one known open Clarity semantic differential, tracked in
+[[068-resolve-asymmetric-tuple-least-supertype-semantics]]; the deployment-time
+constant-target call in [[067-reject-contract-call-through-a-constant-while-depl]]
+is the other. Both belong in the release report until their ignored tests are gone.

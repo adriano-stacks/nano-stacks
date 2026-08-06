@@ -66,6 +66,11 @@ steady-state operation may require a hosted Stacks API.
       `stacks-node`, including inventory and block exchange in both directions
       and transaction relay. Reference-codec socket tests remain necessary but
       are not this acceptance run.
+- [ ] Route signer-role StackerDB replication and proposal recovery through the
+      discovered peer pool under
+      [[071-fail-over-signer-role-replication-across-peers]]. A chain sync that
+      needs no Hiro while the hosted signer remains pinned to Hiro is not full
+      node independence.
 
 ## Acceptance Criteria
 
@@ -86,6 +91,9 @@ steady-state operation may require a hosted Stacks API.
   Stacks API for synchronization, propagation or consensus inputs.
 - Rebuilding the maturity window and filling required historical headers
   completes with hosted HTTP APIs disabled.
+- The retained run records the serving peer for every fetched tenure and every
+  signer-role replication/recovery request, and demonstrates failover rather
+  than only concurrent open connections.
 
 ## The first slice: nano talks to mainnet
 
@@ -1026,9 +1034,12 @@ Conformance is **223 passed, 5 ignored**, from 219: four tests added.
 
 ### The two live items, and what actually stands between them and closed
 
-Neither is closed, and neither is blocked on writing code in this crate. What follows is
-what the running mainnet node's own log and configuration show, because a checkbox on a
-weaker claim is worth less than a recorded dead end.
+Neither is closed. Most transport work is present, but the whole-sync claim still
+needs per-tenure serving-peer instrumentation and the signer roles still need the
+peer-pool work tracked in
+[[071-fail-over-signer-role-replication-across-peers]]. What follows is what the
+running mainnet node's own log and configuration show, because a checkbox on a weaker
+claim is worth less than a recorded dead end.
 
 **The whole-sync run with hosted APIs removed.** `/home/aldur/mainnet-wasm/config.toml`
 line 14 is `peers = ["https://api.mainnet.hiro.so", "https://api.hiro.so"]`, and the

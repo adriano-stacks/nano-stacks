@@ -41,7 +41,9 @@ execution.
 - [x] Exercise an event observer against the binary and retain delivered
       `new_block`, burn-block and proposal-response payloads.
 - [ ] Run a stock `stacks-signer` against the binary without a compatibility
-      shim on a chain where nano derives the active PoX-5 signer set.
+      shim on a chain where nano derives the active PoX-5 signer set, and have
+      it accept and sign a proposal nano validated with checkpointed leader-key
+      history under [[070-carry-leader-key-history-into-proposal-validation]].
 - [ ] Submit a valid transaction through the public RPC and observe the same
       transaction admitted, mined, executed and emitted in `new_block`.
 - [ ] Finish `/v3/stacker_set`: preserve `stacked_amt`, serve the current
@@ -53,13 +55,24 @@ execution.
       `new_block`, then compare receipts, costs and events with an independent
       stacks-core observer for the same executed blocks.
 - [x] Exercise a stock `stacks-signer`, transaction submitter and event observer
-      against the binary.
+      against the binary far enough to validate RPC shapes, signer registration,
+      StackerDB writes, transaction admission and observer payloads. This does
+      not claim the signer accepted a block or the transaction was mined.
+- [ ] Fail StackerDB replication over between discovered peers under
+      [[071-fail-over-signer-role-replication-across-peers]]; one initially
+      selected HTTP client must not remain load-bearing for the hosted signer.
 
 ## Acceptance Criteria
 
 - A stock signer runs against nano without an RPC compatibility shim.
+- The signer accepts and signs a valid proposal through nano; registration and
+  accepted StackerDB chunks alone are not sufficient.
+- A submitted transaction appears in an accepted, executed block and its
+  `new_block` event; a `200` admission response alone is not sufficient.
 - Transaction submission, block proposal/upload, reward-set and StackerDB routes
   are live rather than `Unavailable` or empty defaults.
+- Signer-role replication survives loss or rate limiting of its initially
+  selected peer.
 - An observer receives receipt-equivalent payloads for the same executed blocks
   as stacks-core.
 - No RPC endpoint advertises or mutates state newer than the executed tip.
@@ -608,12 +621,14 @@ execution; this says it does, 632 times.
   window a follower holds. This is the same hole as before, localized: it is not
   "056 or a shared validator" but *the checkpoint not carrying `leader-keys.json`
   and the snapshots that seed a tracker*, plus wiring that tracker into the
-  proposal validator the way it is wired into the executor.
+  proposal validator the way it is wired into the executor. It is tracked in
+  [[070-carry-leader-key-history-into-proposal-validation]].
 - **nano's follower stopped on a state-root mismatch** at height 931 of that chain
   (`expected f90f06c9…, got e939a724…`, two transfers, not a tenure start), so its
   executed tip froze and `/v3/sortitions/latest_and_last` then answered `503` — a
   stale executed chain cannot name the sortition before its tip. A divergence on a
-  pox-5 hacknet chain is a replay finding of its own and is not this task's.
+  pox-5 hacknet chain is a replay finding of its own and is tracked in
+  [[069-resolve-the-pox-5-follower-state-root-divergence]].
 - The chain was **not** kept running on nano's signature alone. Hacknet needs all
   three, and a signer that rejects stalls it; the runs above therefore kept the
   stock signer available and switched it off only in bounded windows. What

@@ -35,8 +35,9 @@ never from fetched, staged or peer-reported height.
 - [x] Replay forward and report the first divergence with the field that
       diverged.
 - [~] Work the divergence point forward until it stops moving for a real reason
-      or reaches the tip. **39,967 consecutive blocks** as of 2026-08-06, from
-      8,665,601 to 8,705,568, and still moving at 100 a minute — see below.
+      or reaches the tip. A targeted/resumed run reached **44,181 consecutive
+      blocks**, from 8,665,601 through 8,709,782, after the trait-reference fix.
+      This is a useful compiler frontier, not the pristine release frontier.
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
@@ -50,7 +51,9 @@ never from fetched, staged or peer-reported height.
 - [~] Replay from a pristine checkpoint entirely with clarity-wasm after
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
-      production evidence.
+      production evidence. The latest fresh attempt resumed an imported state
+      without a ledger or saved sortitions and mismatched at the first tenure
+      start, 8,665,722; diagnose or replace that run before calling this closed.
 - [x] Run the production replay with a node artifact that contains no
       interpreter execution path. Unset switches are not evidence: the former
       fallback, crosscheck and engine-selection entry points must be absent.
@@ -70,6 +73,15 @@ never from fetched, staged or peer-reported height.
 - The replay runs offline from captured fixtures.
 - The reported production depth is clarity-wasm-only and uses the same
   configuration the mainnet release enables by default.
+- The release frontier comes from a newly initialized state directory whose
+  checkpoint provenance, ledger, saved sortitions and compiler identity are
+  recorded before execution starts. Reflink experiments and resumed divergence
+  directories remain diagnostic evidence only.
+- One uninterrupted or restart-tested run reaches the contemporaneous tip from
+  that clean state. A targeted resume beyond an old divergence cannot substitute
+  for the complete run.
+- The report distinguishes the highest compiler-fix frontier, the highest clean
+  replay frontier and the current network tip.
 
 ## Audited frontier and next oracle
 
@@ -1205,3 +1217,27 @@ Before the fix it reproduces the mainnet error exactly —
 tuple. That is also the confirmation the coordinator asked for and I did not want to
 assume: **the interpreter is untroubled**, so the state is not corrupt and this is a
 compiler gap.
+
+## Reassessment: the targeted frontier is not the clean frontier
+
+With the Epoch2_05 trait-reference fix, the reflinked/resumed production run
+executed four more batches — 500, 500, 500 and 436 blocks — and reached
+**8,709,782** without another reported mismatch. That raises the compiler-fix
+frontier to 44,181 blocks after the 8,665,601 anchor.
+
+It does not close this task. The separate `mainnet-fresh` attempt started from a
+directory with the imported checkpoint but no committed ledger and no saved
+sortitions. It advanced through 8,665,721 and then repeatedly sealed the wrong
+root at the first tenure start, 8,665,722. Because its bootstrap inputs were
+internally incomplete, that result is not yet evidence of a new consensus bug;
+because it failed, it is also not clean replay evidence. The next run must either
+reproduce that mismatch with a fully exported checkpoint or demonstrate that a
+complete checkpoint crosses it.
+
+The task therefore carries three separate numbers until release:
+
+- **targeted diagnostic frontier:** 8,709,782;
+- **clean checkpoint frontier:** not yet established beyond the failed fresh
+  attempt;
+- **network tip at the run time:** recorded by the release report, never copied
+  from an older note in this file.

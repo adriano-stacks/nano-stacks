@@ -120,7 +120,7 @@ struct Answer {
 impl Answer {
     /// Whether this is the refusal stacks-core produces, by error identity
     /// rather than by message.
-    fn refused_at_block(&self) -> bool {
+    const fn refused_at_block(&self) -> bool {
         matches!(
             &self.failure,
             Some(VmExecutionError::RuntimeCheck(

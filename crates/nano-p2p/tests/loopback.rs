@@ -587,10 +587,7 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     assert_eq!(published.len(), 3);
     assert!(published.iter().all(|claim| claim.tenures.get(0) == Some(true)));
     assert_eq!(
-        nano_p2p::assign_tenures(&published, &[0])
-            .into_iter()
-            .map(|(_, endpoint)| endpoint)
-            .count(),
+        nano_p2p::assign_tenures(&published, &[0]).len(),
         1,
         "one wanted tenure is one assignment, spread over the peers that claim it"
     );

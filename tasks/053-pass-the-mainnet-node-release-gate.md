@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064"]
+dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -50,9 +50,22 @@ and steady state, with evidence tied to the durable executed chain.
       chain state.
 - [x] Run an event observer against the executed chain and retain delivered
       block, burn-block and proposal-response payloads.
-- [ ] Run the stock signer and a valid client transaction end to end against the
+- [ ] Run a stock signer and a valid client transaction end to end against the
+      same executed chain: the signer accepts and signs a proposal validated by
+      nano, and the submitted transaction appears in an accepted block and its
+      `new_block` event.
 - [x] Run the stock signer/client-facing RPC and an event observer against the
-      same executed chain.
+      same executed chain far enough to validate request and payload shapes.
+      This checked item does not imply proposal acceptance or transaction mining.
+- [ ] Close every known clarity-wasm semantic differential, including
+      [[067-reject-contract-call-through-a-constant-while-depl]] and
+      [[068-resolve-asymmetric-tuple-least-supertype-semantics]]; an ignored
+      crosscheck is a failed release gate.
+- [ ] Reproduce and close the PoX-5 follower root mismatch under
+      [[069-resolve-the-pox-5-follower-state-root-divergence]] before using that
+      signer run as interoperability evidence.
+- [ ] Run the signer-set and signer-weight mainnet gates in reward cycle 141 or
+      later; `NANO_REQUIRE_MAINNET` must report that they ran rather than skipped.
 - [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
       conformance report.
@@ -73,12 +86,20 @@ and steady state, with evidence tied to the durable executed chain.
   other hosted Stacks HTTP API.
 - The no-hosted-API claim is demonstrated by a complete checkpoint-to-tip run,
   not only discovery, a short tenure sample or a run that also configured Hiro.
+- The clean replay begins from a newly initialized, internally complete state
+  directory. A reflinked divergence parent, targeted resume or checkpoint import
+  missing its ledger or saved sortitions is diagnostic evidence only.
 - No contract's semantic epoch is selected by trying compiler versions or
   epochs until one accepts it.
 - The release node executes all Clarity work through clarity-wasm and has no
   interpreter path under any network, configuration, environment, role, build
   profile or failure condition. A compiler divergence cannot be hidden by a
   retry, crosscheck, fallback, healing step or emergency switch.
+- Every known semantic differential is closed and unignored, whether or not the
+  current mainnet window is known to exercise it.
+- Signer-facing replication and proposal recovery continue after the initially
+  selected peer is removed; chain synchronization alone is not the full
+  no-hosted-API claim.
 
 ## A skipped gate can no longer report itself green
 
@@ -555,17 +576,22 @@ gate asks to be recorded is what the node said.
 ## What is still open, and what each one waits on
 
 - **A stock signer accepting a block through nano** — the plumbing is done and the
-  verdict is not: see the section below. Needs the checkpoint to carry a sortition
-  history and `leader-keys.json`, and the proposal validator to read them.
+  verdict is not: see the section below and
+  [[070-carry-leader-key-history-into-proposal-validation]].
+- **The PoX-5 Hacknet execution mismatch** — the RPC run froze at height 931;
+  [[069-resolve-the-pox-5-follower-state-root-divergence]] owns the clean
+  reproduction and root/receipt oracle.
+- **The clean checkpoint-to-tip replay** — the 8,709,782 frontier is a targeted
+  resume. The fresh attempt failed at 8,665,722 from an incomplete bootstrap, so
+  neither result is the complete release run.
 - **Holding mainnet tip for 24 hours** — not attempted and not claimed. It needs
   wall-clock and a node at the tip; the pristine run is a catch-up.
-- **A stock `stacks-signer` against the binary** — cycle 140 has no waterfall
-  set because it was prepared under pox-4. Epoch 4.0 and pox-5 are active, and
-  pox-5's first mainnet reward cycle is 141; run this gate there after [[052]]'s
-  signer-facing fields are complete.
-- **A stock `stacks-signer` against the binary** — done on a pox-5 chain, and not
-  on mainnet. See below; the mainnet half of it is still blocked on mainnet being
-  on pox-4, which is not a nano condition and will not be one.
+- **The mainnet signer gates** — cycle 140 has no waterfall set because it was
+  prepared under PoX-4 even though epoch 4.0 and PoX-5 are now active. Run the
+  signer-set and weight gates in cycle 141 or later instead of counting skips.
+- **No-hosted-API operation for every role** — ordinary sync uses discovered
+  peers, but [[071-fail-over-signer-role-replication-across-peers]] still owns
+  the single-client signer replication and proposal-recovery paths.
 - **Recording every executed height and verified root on mainnet** — the offline
   run above records every height it executed; the mainnet run still prints a root
   every 500 blocks.

@@ -66,7 +66,10 @@ fn collect(root: &Path, directory: &Path, found: &mut Vec<(String, PathBuf)>) ->
             }
             collect(root, &path, found)?;
         } else {
-            if name.ends_with(".wasm") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+            {
                 continue;
             }
             let relative = path.strip_prefix(root).ok()?.to_str()?.to_owned();

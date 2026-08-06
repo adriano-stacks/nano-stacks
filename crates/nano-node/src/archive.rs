@@ -122,6 +122,7 @@ impl Archive {
             "DELETE FROM executed WHERE height <= ?1 - ?2",
             params![block.header.chain_length, self.kept],
         )?;
+        drop(connection);
         Ok(())
     }
 
@@ -136,19 +137,25 @@ impl Archive {
     }
 
     /// How many blocks are kept.
-    pub fn len(&self) -> Result<u64, ArchiveError> {
+    pub fn kept(&self) -> Result<u64, ArchiveError> {
         Ok(self
             .connection()?
             .query_row("SELECT count(*) FROM executed", [], |row| row.get(0))?)
     }
 
-    fn stored(&self, block_id: StacksBlockId) -> Result<Option<(Vec<u8>, Vec<u8>, u64)>, ArchiveError> {
+    fn stored(&self, block_id: StacksBlockId) -> Result<Option<StoredBlock>, ArchiveError> {
         Ok(self
             .connection()?
             .query_row(
                 "SELECT bytes, consensus_hash, height FROM executed WHERE block_id = ?1",
                 params![block_id.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(StoredBlock {
+                        bytes: row.get(0)?,
+                        consensus_hash: row.get(1)?,
+                        height: row.get(2)?,
+                    })
+                },
             )
             .optional()?)
     }
@@ -175,8 +182,18 @@ impl Archive {
                 bytes,
             ));
         }
+        drop(statement);
+        drop(connection);
         Ok(blocks)
     }
+}
+
+/// One block as the archive holds it: its bytes, the tenure it belongs to and
+/// the height it was executed at.
+struct StoredBlock {
+    bytes: Vec<u8>,
+    consensus_hash: Vec<u8>,
+    height: u64,
 }
 
 /// Reading fails only where the store itself is broken, and a route that cannot
@@ -185,7 +202,7 @@ impl Archive {
 impl nano_rpc::ExecutedBlocks for Archive {
     fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>> {
         match self.stored(block_id) {
-            Ok(stored) => stored.map(|(bytes, _, _)| bytes),
+            Ok(stored) => stored.map(|stored| stored.bytes),
             Err(error) => {
                 eprintln!("cannot read the executed block {block_id}: {error}");
                 None
@@ -194,10 +211,10 @@ impl nano_rpc::ExecutedBlocks for Archive {
     }
 
     fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>> {
-        let Ok(Some((_, consensus_hash, height))) = self.stored(start_block_id) else {
+        let Ok(Some(start)) = self.stored(start_block_id) else {
             return Vec::new();
         };
-        match self.tenure_from(&consensus_hash, height) {
+        match self.tenure_from(&start.consensus_hash, start.height) {
             Ok(blocks) => blocks
                 .into_iter()
                 .take_while(|(id, _)| Some(*id) != stop)
@@ -283,11 +300,11 @@ mod tests {
         // carrying the consensus hash of the sortition that elected it, and a
         // one-block tenure would prove nothing about ordering or stopping.
         let mut tenures: Vec<Vec<&NakamotoBlock>> = Vec::new();
-        for consensus_hash in blocks
+        let consensus_hashes: std::collections::BTreeSet<_> = blocks
             .iter()
             .map(|block| block.header.consensus_hash)
-            .collect::<std::collections::BTreeSet<_>>()
-        {
+            .collect();
+        for consensus_hash in consensus_hashes {
             tenures.push(
                 blocks
                     .iter()
@@ -335,7 +352,7 @@ mod tests {
         for block in &blocks {
             archive.keep(block).expect("keep");
         }
-        assert_eq!(archive.len().expect("count"), 4);
+        assert_eq!(archive.kept().expect("count"), 4);
         let newest = blocks.last().expect("a newest block");
         assert!(archive.block(newest.block_id()).is_some());
         assert!(

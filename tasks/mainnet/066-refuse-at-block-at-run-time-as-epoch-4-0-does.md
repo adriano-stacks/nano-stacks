@@ -1,14 +1,14 @@
 ---
 id: "066"
 title: "Refuse at-block at run time, as epoch 4.0 does"
-status: pending
+status: completed
 priority: high
 effort: medium
 type: bug
 group: mainnet
-dependencies: ["064"]
 tags: ["mainnet", "vm", "clarity", "consensus"]
 created_at: 2026-08-06
+completed_at: 2026-08-06
 ---
 
 # Refuse at-block at run time, as epoch 4.0 does
@@ -59,6 +59,10 @@ whose only difference is a refused read seals the root an untouched block seals.
       `functions/database.rs:113` and is the same pattern one word across.
 - [x] Crosscheck a contract deployed with `at-block` and called in 4.0 against
       the interpreter, asserting the error and the cost dimensions.
+- [x] Split the non-epoch-gated constant-target contract-call disagreement found
+      by the audit into
+      [[067-reject-contract-call-through-a-constant-while-depl]] instead of
+      keeping this completed `at-block` fix open for a different bug.
 
 ## Acceptance Criteria
 
@@ -201,7 +205,8 @@ A deployment whose top level calls a contract through a constant succeeds here a
 fails on the chain — a **state root** divergence, since the reference's failed deploy
 writes nothing. It is `#[ignore]`d as
 `a_constant_contract_call_while_deploying_agrees` in `words/contract.rs` with that
-reason, and accounted for on [[060]]: the fix is a runtime branch inside the module
+reason, and tracked in
+[[067-reject-contract-call-through-a-constant-while-depl]]: the fix is a runtime branch inside the module
 on a flag the host would have to publish, which is more than a mapping change and
 wants its own measurement against mainnet.
 

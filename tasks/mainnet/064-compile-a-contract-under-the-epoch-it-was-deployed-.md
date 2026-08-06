@@ -56,9 +56,14 @@ old contract keeps working without any epoch being inferred at call time.
       either input.
 - [x] Make a contract whose deploy epoch is unavailable reject the block rather
       than execute under a guessed epoch, per [[060]]'s boundary.
-- [ ] Pin it: a contract using a removed word, deployed before its removal,
-      called after it, with the receipt and cost dimensions asserted against the
-      network's.
+- [x] Pin the semantic/runtime-epoch separation with a contract using a removed
+      word, deployed before its removal and called after it. The planted
+      stacks-core snapshot in
+      [[066-refuse-at-block-at-run-time-as-epoch-4-0-does]] asserts the exact
+      error and all five cost dimensions.
+- [ ] Confirm the same behavior with a real captured network receipt from an old
+      mainnet contract after the removal epoch. The population of 881 possible
+      contracts is not evidence that the replay window exercised one.
 
 ## Acceptance Criteria
 
@@ -69,6 +74,8 @@ old contract keeps working without any epoch being inferred at call time.
 - Costs charged for executing an old contract are the current epoch's.
 - The mainnet replay reports how many contracts this affected and none of them is
   still executed under a guessed epoch.
+- The release report distinguishes the reference snapshot from an observed
+  mainnet receipt and does not mark the latter green until one is captured.
 
 ## Where this came from
 

@@ -1761,6 +1761,45 @@ impl ChainState {
         )
     }
 
+    /// Run everything the block carries, and everything the pool offers a block
+    /// this node is assembling.
+    ///
+    /// The two are one step because they are one question — what this block's
+    /// transactions cost and what they receipted — and because the answer to
+    /// "is the block empty" is only meaningful once both have had their turn: a
+    /// candidate is *born* empty and is filled from the mempool here, while a
+    /// followed block that arrived empty was refused before any of this ran.
+    fn run_transactions(
+        &mut self,
+        block: &mut NakamotoBlock,
+        candidates: &[Transaction],
+        assembled: bool,
+    ) -> Result<(ExecutionCost, Vec<TransactionReceipt>), ChainStateError> {
+        let mut execution_cost = ExecutionCost::ZERO;
+        let mut receipts = Vec::with_capacity(block.transactions.len());
+        for transaction in &block.transactions {
+            transaction.verify_authorization().map_err(|error| {
+                ChainStateError::InvalidTransaction(format!(
+                    "transaction authorization failed: {error}"
+                ))
+            })?;
+            let receipt = self.execute_transaction(transaction, &execution_cost)?;
+            execution_cost.add(&receipt.result.cost).map_err(|error| {
+                ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))
+            })?;
+            receipts.push(receipt);
+        }
+        self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
+        // Refused here rather than after sealing, so a miner whose pool offered
+        // nothing admissible leaves no state behind.
+        if assembled && block.transactions.is_empty() {
+            return Err(ChainStateError::InvalidTransaction(
+                ConsensusError::EmptyBlock.to_string(),
+            ));
+        }
+        Ok((execution_cost, receipts))
+    }
+
     /// Execute one block, optionally rejecting it before it is sealed when the
     /// state it produces does not match the root its header commits to.
     fn execute_nakamoto_block(
@@ -1827,30 +1866,8 @@ impl ChainState {
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             let reward_set =
                 signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
-            let mut execution_cost = ExecutionCost::ZERO;
-            let mut receipts = Vec::with_capacity(block.transactions.len());
-            for transaction in &block.transactions {
-                transaction.verify_authorization().map_err(|error| {
-                    ChainStateError::InvalidTransaction(format!(
-                        "transaction authorization failed: {error}"
-                    ))
-                })?;
-                let receipt = self.execute_transaction(transaction, &execution_cost)?;
-                execution_cost.add(&receipt.result.cost).map_err(|error| {
-                    ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))
-                })?;
-                receipts.push(receipt);
-            }
-            self.admit_candidates(block, candidates, &mut execution_cost, &mut receipts);
-            // Now that the pool has had its turn: a candidate is allowed to arrive
-            // empty and a *block* is not, and this is the first moment the two can
-            // be told apart. Refused here rather than after sealing, so a miner
-            // whose pool offered nothing admissible leaves no state behind.
-            if assembled && block.transactions.is_empty() {
-                return Err(ChainStateError::InvalidTransaction(
-                    ConsensusError::EmptyBlock.to_string(),
-                ));
-            }
+            let (mut execution_cost, mut receipts) =
+                self.run_transactions(block, candidates, assembled)?;
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             ledger
                 .accounting

@@ -589,6 +589,120 @@ struct Follower {
     submitted: tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
 }
 
+/// What arrived other than by following: what this node's own API admitted, and
+/// what peers pushed at it.
+struct AdmittedInputs<'a> {
+    offered: &'a mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    submitted: &'a mut tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    executor: Option<&'a SharedExecutor>,
+    mempool: &'a Arc<Mutex<nano_mempool::Mempool>>,
+    relay: &'a nano_p2p::Relay,
+    staging: &'a Staging,
+}
+
+/// Take everything that arrived other than by following, before the round that
+/// executes it.
+///
+/// Blocks the public API admitted go into the same store the peer's do — nothing
+/// about them is special from here on, which is the point — and so does
+/// everything peers pushed, so a block pushed a moment ago is executed in the
+/// round that follows rather than the one after it.
+async fn take_admitted(inputs: AdmittedInputs<'_>) {
+    let AdmittedInputs {
+        offered,
+        submitted,
+        executor,
+        mempool,
+        relay,
+        staging,
+    } = inputs;
+    stage_admitted_blocks(offered, staging, relay);
+    relay_admitted_transactions(submitted, relay);
+    if let Some(executor) = executor {
+        check_relayed(executor, mempool, relay, staging).await;
+    }
+}
+
+/// The store staged blocks wait in, or the role's own failure.
+fn open_staging(config: &Config) -> Result<Staging, Role> {
+    Staging::open(&config.chainstate_dir(NODE_CHAINSTATE).join("staging.sqlite"))
+        .map_err(|error| Err(format!("cannot open the staging store: {error}")))
+}
+
+/// What the follow loop carries from one round to the next.
+///
+/// One value rather than eight locals because they move together: which peer this
+/// round follows, how long it has been followed, whether it let a round down, and
+/// the two heights that decide whether this node is catching up or keeping up.
+struct Rounds {
+    /// Which peer this round follows. Re-chosen from everything this node knows
+    /// of — the endpoints the operator configured and the ones p2p discovery
+    /// found — so that a peer which stalls, falls behind or starts refusing costs
+    /// one round rather than the node's liveness.
+    peer: SyncClient,
+    node: Node,
+    /// Rounds this peer has been followed for.
+    on_this_peer: u32,
+    /// Whether the current peer let the last round down, which re-weighs the pool
+    /// without waiting for its turn.
+    failed: bool,
+    peer_height: u64,
+    executed_height: u64,
+    published: RewardCyclePublication,
+    /// Bulk history comes from every peer known, which is not the same question as
+    /// which peer this round *follows*: following is a fork choice and has to land
+    /// on one answer, while fetching history is work to be spread.
+    history: BulkHistory,
+}
+
+impl Rounds {
+    fn new(peer: SyncClient) -> Self {
+        Self {
+            node: Node::new(peer.clone()),
+            history: BulkHistory::new(peer.clone()),
+            peer,
+            // Starting at the reselection point rather than at zero, so the
+            // *first* round weighs the pool instead of keeping whichever peer
+            // answered `reachable_peer` first. That peer was chosen for being
+            // reachable, which is all a node can ask before it has opened its
+            // state.
+            on_this_peer: RESELECT_ROUNDS,
+            failed: false,
+            peer_height: u64::MAX,
+            executed_height: 0,
+            published: RewardCyclePublication::default(),
+        }
+    }
+
+    /// Re-weigh the pool on a timer, or immediately after the current peer let a
+    /// round down.
+    ///
+    /// Every round would be two requests per peer per second for an answer that
+    /// moves on the order of a tenure; never would be the single-peer node task
+    /// 027 set out to remove.
+    async fn choose_peer(
+        &mut self,
+        config: &Config,
+        discovered: Option<&Discovered>,
+        executor: Option<&SharedExecutor>,
+        pox: &PoxInfo,
+        state: Option<&RpcState>,
+    ) {
+        self.on_this_peer = self.on_this_peer.saturating_add(1);
+        if !self.failed && self.on_this_peer < RESELECT_ROUNDS {
+            return;
+        }
+        self.on_this_peer = 0;
+        self.failed = false;
+        if let Some(chosen) =
+            better_peer(&self.peer, config, discovered, executor, pox, state).await
+        {
+            self.node = Node::new(chosen.clone());
+            self.peer = chosen;
+        }
+    }
+}
+
 /// Follow the peer, publishing what it validated and executing along it.
 async fn follow(follower: Follower) -> Role {
     let Follower {
@@ -606,11 +720,10 @@ async fn follow(follower: Follower) -> Role {
         mut offered,
         mut submitted,
     } = follower;
-    let directory = config.chainstate_dir(NODE_CHAINSTATE);
     let interval = Duration::from_secs(config.node.poll_interval_secs);
-    let staging = match Staging::open(&directory.join("staging.sqlite")) {
+    let staging = match open_staging(&config) {
         Ok(staging) => staging,
-        Err(error) => return Err(format!("cannot open the staging store: {error}")),
+        Err(role) => return role,
     };
     let budget = CatchUpBudget {
         // Bounded so that a round ends and execution gets its turn: an
@@ -621,106 +734,64 @@ async fn follow(follower: Follower) -> Role {
     };
     let mut pox = pox;
     prepare_to_follow(executor.as_ref(), &config, &peer, &pox, source).await;
-    let mut peer_height = u64::MAX;
-    let mut executed_height = 0;
-    let mut published = RewardCyclePublication::default();
-    // Which peer this round follows. Re-chosen from everything this node knows of —
-    // the endpoints the operator configured and the ones p2p discovery found — so
-    // that a peer which stalls, falls behind or starts refusing costs one round
-    // rather than the node's liveness. That was the open half of task 027: the
-    // choosing already existed, and nothing called it.
-    let mut peer = peer;
-    let mut node = Node::new(peer.clone());
-    // Starting at the reselection point rather than at zero, so the *first* round
-    // weighs the pool instead of keeping whichever peer answered `reachable_peer`
-    // first. That peer was chosen for being reachable, which is all a node can ask
-    // before it has opened its state — and a node that then stayed with it for the
-    // next sixty rounds would be following a peer nothing had weighed for the first
-    // minute of every start.
-    let mut rounds_on_this_peer = RESELECT_ROUNDS;
-    let mut peer_failed = false;
-    // Bulk history comes from every peer known, which is not the same question as
-    // which peer this round *follows*: following is a fork choice and has to land on
-    // one answer, while fetching history is work to be spread.
-    let mut history = BulkHistory::new(peer.clone());
+    let mut rounds = Rounds::new(peer);
     loop {
-        history.refresh(&config, discovered.as_ref());
-        // Re-weigh on a timer, or immediately after the current peer let a round
-        // down. Every round would be two requests per peer per second for an answer
-        // that moves on the order of a tenure; never would be the single-peer node
-        // this task set out to remove.
-        rounds_on_this_peer = rounds_on_this_peer.saturating_add(1);
-        if peer_failed || rounds_on_this_peer >= RESELECT_ROUNDS {
-            rounds_on_this_peer = 0;
-            peer_failed = false;
-            if let Some(chosen) = better_peer(
-                &peer,
-                &config,
-                discovered.as_ref(),
-                executor.as_ref(),
-                &pox,
-                state.as_ref(),
-            )
-            .await
-            {
-                peer = chosen;
-                node = Node::new(peer.clone());
-            }
-        }
-        // Blocks the public API admitted go into the same store the peer's do,
-        // before the round that executes it: nothing about them is special from
-        // here on, which is the point.
-        stage_admitted_blocks(&mut offered, &staging, &relay);
-        relay_admitted_transactions(&mut submitted, &relay);
-        // Everything peers pushed, through the same boundary. Before the round that
-        // executes, so a block a peer pushed a moment ago is executed in the round
-        // that follows rather than the one after it.
-        if let Some(executor) = executor.as_ref() {
-            check_relayed(executor, &mempool, &relay, &staging).await;
-        }
+        rounds.history.refresh(&config, discovered.as_ref());
+        rounds
+            .choose_peer(&config, discovered.as_ref(), executor.as_ref(), &pox, state.as_ref())
+            .await;
+        take_admitted(
+            AdmittedInputs {
+                offered: &mut offered,
+                submitted: &mut submitted,
+                executor: executor.as_ref(),
+                mempool: &mempool,
+                relay: &relay,
+                staging: &staging,
+            },
+        )
+        .await;
         // Following the peer's current tenure is pointless while this node is
         // far from it — the tenure descends from blocks it has not executed, so
         // the walk fails every round — and the requests it spends are the ones
         // catching up needs. A node this far back has nothing to serve anyway.
-        let catching_up = peer_height.saturating_sub(executed_height) > FOLLOW_WHEN_WITHIN;
-        peer_failed |= track_peer(
-            &mut node,
-            &peer,
+        let catching_up =
+            rounds.peer_height.saturating_sub(rounds.executed_height) > FOLLOW_WHEN_WITHIN;
+        rounds.failed |= track_peer(
+            &mut rounds.node,
+            &rounds.peer,
             state.as_ref(),
             &mut pox,
-            &mut peer_height,
+            &mut rounds.peer_height,
             catching_up,
         )
         .await;
         if let Some(executor) = executor.as_ref() {
-            let round = execute_round(
-                executor,
-                RoundInputs {
-                    peer: &peer,
-                    history: &mut history.source,
-                    pox: &pox,
-                    staging: &staging,
-                    budget,
-                    advertised: &advertised,
-                    claims: discovered.as_ref().map(Discovered::claims).unwrap_or_default(),
-                },
-            )
-            .await;
-            executed_height = round.executed_height;
-            peer_failed |= round.peer_failed;
+            let inputs = RoundInputs {
+                peer: &rounds.peer,
+                history: &mut rounds.history.source,
+                pox: &pox,
+                staging: &staging,
+                budget,
+                advertised: &advertised,
+                claims: discovered.as_ref().map(Discovered::claims).unwrap_or_default(),
+            };
+            let round = execute_round(executor, inputs).await;
+            rounds.executed_height = round.executed_height;
+            rounds.failed |= round.peer_failed;
             let sealed = round.sealed;
             if let Some(state) = state.as_ref() {
                 state.publish_executed(sealed).await;
-                publish_reward_cycle(
+                publish_reward_cycle(RewardCycleInputs {
                     state,
                     executor,
                     network,
-                    bitcoin_context(&config, &pox),
-                    &last_sortition_winners(node.view().as_ref()),
-                    &mut published,
-                    &peer,
-                    config.node.pox_5_sbtc_registry_contract.as_deref(),
-                )
+                    context: bitcoin_context(&config, &pox),
+                    winners: &last_sortition_winners(rounds.node.view().as_ref()),
+                    published: &mut rounds.published,
+                    peer: &rounds.peer,
+                    registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
+                })
                 .await;
             }
         }
@@ -980,6 +1051,22 @@ struct RewardCyclePublication {
     miner_writers: Option<Vec<nano_primitives::Hash160>>,
 }
 
+/// What publishing a cycle reads, as one value for the same reason
+/// [`RoundInputs`] is one: eight positional arguments hide which is which.
+struct RewardCycleInputs<'a> {
+    state: &'a RpcState,
+    executor: &'a SharedExecutor,
+    network: Network,
+    context: nano_chainstate::BitcoinBlockContext,
+    /// Who won the recent sortitions, which is who may write to `.miners`.
+    winners: &'a [nano_primitives::Hash160],
+    published: &'a mut RewardCyclePublication,
+    peer: &'a SyncClient,
+    /// Where this chain's sBTC registry is deployed, which decides whether the
+    /// document can carry a waterfall payout address at all.
+    registry: Option<&'a str>,
+}
+
 /// Publish the reward set the executed state derives, and configure the
 /// `StackerDB` contracts that cycle's signers write to.
 ///
@@ -987,19 +1074,17 @@ struct RewardCyclePublication {
 /// is the whole difference between serving a reward set and relaying one. The
 /// document nano writes here is the one `SyncClient` parses, so a node's own
 /// `/v3/stacker_set` can attest another node's checkpoint.
-///
-/// `registry` is where this chain's sBTC registry is deployed, which decides
-/// whether the document can carry a waterfall payout address at all.
-async fn publish_reward_cycle(
-    state: &RpcState,
-    executor: &SharedExecutor,
-    network: Network,
-    mut context: nano_chainstate::BitcoinBlockContext,
-    winners: &[nano_primitives::Hash160],
-    published: &mut RewardCyclePublication,
-    peer: &SyncClient,
-    registry: Option<&str>,
-) {
+async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
+    let RewardCycleInputs {
+        state,
+        executor,
+        network,
+        mut context,
+        winners,
+        published,
+        peer,
+        registry,
+    } = inputs;
     context.height = executor.lock().await.bitcoin_height();
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
         return;
@@ -1033,12 +1118,12 @@ async fn publish_reward_cycle(
     // registry state. Without it the document cannot claim the 4.0 shape, so a
     // chain whose registry nano cannot read is served the version every reader
     // accepts and the reason is said once.
-    let sbtc_address = match executor
+    let payout = executor
         .lock()
         .await
         .chainstate_mut()
-        .sbtc_payout_address(registry)
-    {
+        .sbtc_payout_address(registry);
+    let sbtc_address = match payout {
         Ok(address) => Some(address),
         Err(error) => {
             if published.complained != Some(cycle) {
@@ -2910,6 +2995,7 @@ mod tests {
             fetched: 40,
             executed,
             staged: 9,
+            scheduled: 0,
             rate_limited,
         };
 

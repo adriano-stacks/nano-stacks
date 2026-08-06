@@ -45,7 +45,7 @@ fn fixtures() -> PathBuf {
 /// A coinbase and a tenure change are the miner's own and are refused by name
 /// (`NoCoinbaseViaMempool`, `NoTenureChangeViaMempool`), so a block whose only
 /// transactions are those is no use here.
-fn comes_via_the_mempool(transaction: &Transaction) -> bool {
+const fn comes_via_the_mempool(transaction: &Transaction) -> bool {
     !matches!(
         transaction.payload().data(),
         nano_codec::TransactionPayloadData::NakamotoCoinbase { .. }
@@ -94,42 +94,62 @@ fn published_receipt(block: &NakamotoBlock, txid: Sha256Sum) -> Option<serde_jso
         .cloned()
 }
 
+/// Post a transaction to `/v2/transactions` over a real socket.
+///
+/// A served listener rather than the router in process, because "posted to the
+/// public RPC" is the claim and a client is what makes it.
+async fn post_to_the_rpc(state: RpcState, transaction: &Transaction) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the RPC");
+    let address = listener.local_addr().expect("an address");
+    let served = tokio::spawn(async move { nano_rpc::serve(listener, state).await });
+    let answer = reqwest::Client::new()
+        .post(format!("http://{address}/v2/transactions"))
+        .header("content-type", "application/octet-stream")
+        .body(transaction.encode())
+        .send()
+        .await
+        .expect("the route answers");
+    assert_eq!(answer.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        answer.json::<serde_json::Value>().await.ok(),
+        Some(serde_json::json!(transaction.txid().to_string())),
+        "the route did not answer with the transaction identifier"
+    );
+    served.abort();
+}
+
 /// The accounts a mempool has to be able to ask about, read out of the state.
 fn tip_accounts(chainstate: &mut ChainState, transaction: &Transaction) -> HashMap<nano_address::StacksAddress, Account> {
     let mut accounts = HashMap::new();
-    for address in transaction.origin_address().into_iter() {
-        if let Ok(principal) = clarity::vm::types::PrincipalData::parse(&address.to_string())
-            && let Ok(entry) = chainstate.account(&principal)
-        {
-            accounts.insert(
-                address,
-                Account {
-                    nonce: entry.nonce,
-                    balance: Some(entry.balance),
-                },
-            );
-        }
+    if let Some(address) = transaction.origin_address()
+        && let Ok(principal) = clarity::vm::types::PrincipalData::parse(&address.to_string())
+        && let Ok(entry) = chainstate.account(&principal)
+    {
+        accounts.insert(
+            address,
+            Account {
+                nonce: entry.nonce,
+                balance: Some(entry.balance),
+            },
+        );
     }
     accounts
 }
 
-#[tokio::test]
-async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
-    let fixtures = fixtures();
-    let Some((position, dropped)) = first_mempool_block() else {
-        nano_conformance::skip_gate("the capture holds no mid-tenure block of mempool transactions");
-        return;
-    };
-    let Ok((mut chainstate, source)) = nano_conformance::replay_chainstate(&fixtures) else {
+/// The chain replayed to just below the block being replaced, so the state the
+/// transaction is judged and executed against is the state the network judged it
+/// against.
+fn replay_below(fixtures: &Path, position: usize) -> Option<ChainState> {
+    let Ok((mut chainstate, source)) = nano_conformance::replay_chainstate(fixtures) else {
         nano_conformance::skip_gate("the captured checkpoint does not open");
-        return;
+        return None;
     };
-    // Everything below the block being replaced, so the state the transaction is
-    // judged and executed against is the state the network judged it against.
     let depth = nano_conformance::replay_into(
         &mut chainstate,
         source,
-        &fixtures,
+        fixtures,
         FixtureManifest {
             mode: FixtureMode::Captured,
             replay_blocks: position as u64,
@@ -143,6 +163,19 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         "the replay stopped early: {:?}",
         depth.first_divergence
     );
+    Some(chainstate)
+}
+
+#[tokio::test]
+async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
+    let fixtures = fixtures();
+    let Some((position, dropped)) = first_mempool_block() else {
+        nano_conformance::skip_gate("the capture holds no mid-tenure block of mempool transactions");
+        return;
+    };
+    let Some(mut chainstate) = replay_below(&fixtures, position) else {
+        return;
+    };
     let transaction = dropped
         .transactions
         .iter()
@@ -162,28 +195,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         .with_chain(shared.clone() as Arc<Mutex<dyn ChainAccess>>)
         .with_mempool(mempool.clone());
 
-    // Admitted: over HTTP, on a real socket, through the real route, into the pool
-    // a miner reads. A served listener rather than the router in process, because
-    // "posted to the public RPC" is the claim and a client is what makes it.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the RPC");
-    let address = listener.local_addr().expect("an address");
-    let served = tokio::spawn(async move { nano_rpc::serve(listener, state).await });
-    let answer = reqwest::Client::new()
-        .post(format!("http://{address}/v2/transactions"))
-        .header("content-type", "application/octet-stream")
-        .body(transaction.encode())
-        .send()
-        .await
-        .expect("the route answers");
-    assert_eq!(answer.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        answer.json::<serde_json::Value>().await.ok(),
-        Some(serde_json::json!(txid.to_string())),
-        "the route did not answer with the transaction identifier"
-    );
-    served.abort();
+    post_to_the_rpc(state, &transaction).await;
     assert!(
         mempool.lock().await.contains(txid),
         "the route answered but the pool the miner reads does not hold it"
@@ -230,7 +242,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         Some(dropped.header.parent_block_id),
         "the replay did not stop on the parent of the block being replaced"
     );
-    let (mined, applied) = chainstate
+    let (built, applied) = chainstate
         .assemble_nakamoto_block_selecting(
             context,
             &[],
@@ -243,7 +255,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     drop(chainstate);
 
     assert!(
-        mined.transactions.iter().any(|held| held.txid() == txid),
+        built.transactions.iter().any(|held| held.txid() == txid),
         "the assembled block does not carry the transaction the pool offered"
     );
 
@@ -263,7 +275,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
 
     // Emitted: the payload an observer is sent names it, with the result and the
     // cost stacks-core published for the same execution.
-    let payload = nano_rpc::new_block_payload(&mined, &applied, &nano_rpc::BlockEventContext::default());
+    let payload = nano_rpc::new_block_payload(&built, &applied, &nano_rpc::BlockEventContext::default());
     let emitted = payload["transactions"]
         .as_array()
         .expect("the payload lists its transactions")

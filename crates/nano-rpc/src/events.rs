@@ -437,20 +437,24 @@ pub fn stacker_set_payload(
             })
         })
         .collect::<Vec<_>>();
-    match sbtc_address.and_then(waterfall_address) {
-        Some(sbtc_address) => json!({
-            "reward_set_version": 1,
-            "sbtc_address": sbtc_address,
-            "signers": entries,
-            "pox_ustx_threshold": microstx(pox_ustx_threshold),
-        }),
-        None => json!({
-            "signers": entries,
-            "pox_ustx_threshold": microstx(pox_ustx_threshold),
-            "rewarded_addresses": Vec::<Value>::new(),
-            "start_cycle_state": { "missed_reward_slots": Vec::<Value>::new() },
-        }),
-    }
+    sbtc_address.and_then(waterfall_address).map_or_else(
+        || {
+            json!({
+                "signers": &entries,
+                "pox_ustx_threshold": microstx(pox_ustx_threshold),
+                "rewarded_addresses": Vec::<Value>::new(),
+                "start_cycle_state": { "missed_reward_slots": Vec::<Value>::new() },
+            })
+        },
+        |sbtc_address| {
+            json!({
+                "reward_set_version": 1,
+                "sbtc_address": sbtc_address,
+                "signers": &entries,
+                "pox_ustx_threshold": microstx(pox_ustx_threshold),
+            })
+        },
+    )
 }
 
 /// A waterfall payout address as stacks-core's derived serde writes it.

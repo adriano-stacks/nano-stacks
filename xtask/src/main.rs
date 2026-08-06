@@ -4554,16 +4554,16 @@ fn compiler_identity(arguments: &[String]) -> ExitCode {
             println!("{}", nano_vm::COMPILER_IDENTITY);
             ExitCode::SUCCESS
         }
-        [directory] => match nano_vm::compiler_identity_of(Path::new(directory)) {
-            Some(identity) => {
-                println!("{identity}");
-                ExitCode::SUCCESS
-            }
-            None => {
+        [directory] => nano_vm::compiler_identity_of(Path::new(directory)).map_or_else(
+            || {
                 eprintln!("{directory} is not a readable clarity-wasm source tree");
                 ExitCode::FAILURE
-            }
-        },
+            },
+            |identity| {
+                println!("{identity}");
+                ExitCode::SUCCESS
+            },
+        ),
         _ => {
             eprintln!("usage: cargo xtask compiler-identity [<clarity-wasm-dir>]");
             ExitCode::from(2)
