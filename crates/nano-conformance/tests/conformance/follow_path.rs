@@ -160,6 +160,21 @@ impl BitcoinSource for MovableBurnchain {
             .map(|block| block.hash)
             .ok_or_else(|| format!("no captured Bitcoin block at height {height}"))
     }
+
+    /// The highest captured block, which is where this burnchain ends.
+    ///
+    /// A fixture has a tip like any other burnchain, and the node's walk forward is
+    /// bounded by it: without one the walk would read past the capture and read a
+    /// missing block as a burnchain failure.
+    fn tip_height(&self) -> Result<u64, Self::Error> {
+        self.blocks
+            .lock()
+            .expect("the burnchain is not poisoned")
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or_else(|| "the captured burnchain is empty".to_owned())
+    }
 }
 
 /// How a peer behaves badly, in the three ways a real one does.
@@ -214,6 +229,21 @@ impl Policy {
         self.visible = Arc::new(AtomicUsize::new(visible));
         self.reveal_every = Some(every);
         self
+    }
+
+    /// How many times this peer was asked for a sortition, at all.
+    ///
+    /// The counter [[049]]'s first acceptance criterion is about: a node with a
+    /// burnchain of its own derives the burn view a block stands on, so this is zero
+    /// however the peer would have answered. Counted over every request rather than
+    /// the answered ones, because a refused request is still a request made.
+    pub fn sortitions_asked(&self) -> usize {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with("/v3/sortitions"))
+            .count()
     }
 
     /// How many of them it answered with a 429.
@@ -279,6 +309,12 @@ pub struct Served {
     pub snapshots: Vec<Snapshot>,
     /// How it misbehaves while serving them.
     pub policy: Policy,
+    /// Whether `/v3/sortitions/...` exists on this peer at all.
+    ///
+    /// Not a rate limit and not a lie: the route answers 404, which is what a peer
+    /// that does not serve it looks like. [[049]]'s first acceptance criterion is that
+    /// taking it away does not stop a node with a Bitcoin source of its own.
+    sortitions: bool,
 }
 
 impl Served {
@@ -288,6 +324,7 @@ impl Served {
             blocks,
             snapshots,
             policy: Policy::default(),
+            sortitions: true,
         }
     }
 
@@ -295,6 +332,13 @@ impl Served {
     #[must_use]
     pub fn under(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// The same peer, with no sortition routes.
+    #[must_use]
+    pub const fn without_sortitions(mut self) -> Self {
+        self.sortitions = false;
         self
     }
 
@@ -536,6 +580,7 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 let found = state
                     .snapshots
                     .iter()
+                    .filter(|_| state.sortitions)
                     .find(|snapshot| snapshot.consensus_hash == hash)
                     .map(|snapshot| state.sortition(snapshot));
                 found.map_or_else(
@@ -550,6 +595,7 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 let found = state
                     .snapshots
                     .iter()
+                    .filter(|_| state.sortitions)
                     .find(|snapshot| snapshot.block_height == height)
                     .map(|snapshot| state.sortition(snapshot));
                 found.map_or_else(
@@ -1044,6 +1090,227 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     );
 
     task.abort();
+}
+
+/// Close a gap round by round until the tip reaches `target`, and say how much was
+/// executed.
+///
+/// The loop a running node runs, bounded so a stall fails the test instead of hanging
+/// it. A round that fetches without executing is ordinary — a descent walks the gap
+/// from the peer's tip downwards and only the round that reaches this node's own tip
+/// can execute anything — so the loop is not stopped by one.
+async fn close_the_gap(
+    executor: &mut CheckpointExecutor<MovableBurnchain>,
+    client: &SyncClient,
+    history: &mut TenureSource,
+    staging: &Staging,
+    budget: CatchUpBudget,
+    target: u64,
+) -> usize {
+    let mut executed = 0;
+    for _ in 0..ROUNDS {
+        let round = executor
+            .catch_up(client, history, &pox(), staging, budget)
+            .await
+            .expect("a round commits what it executed");
+        executed += round.executed;
+        if executor.tip().header.chain_length >= target {
+            break;
+        }
+    }
+    executed
+}
+
+/// How many rounds a gap is given before it is called stuck.
+const ROUNDS: usize = 64;
+
+/// The reward cycle length the captured chain was produced under.
+const CYCLE: u64 = 20;
+
+/// The burn height a captured snapshot gives a block's tenure.
+fn burn_height_of(rows: &[Snapshot], block: &NakamotoBlock) -> u64 {
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.consensus_hash == block.header.consensus_hash.to_string())
+    else {
+        panic!("no captured snapshot for {}", block.header.consensus_hash)
+    };
+    row.block_height
+}
+
+/// The second distinct burn view a chain stands on.
+///
+/// The first is the checkpoint's own, and a chain seeded below it would have to
+/// derive across the block that opens the reward cycle.
+fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBlock) -> u64) -> u64 {
+    let mut views: Vec<u64> = chain.iter().map(burn_of).collect();
+    views.dedup();
+    *views.get(1).expect("the capture holds two burn views")
+}
+
+
+/// was never asked for, which is the stronger half: a node that asked and quietly
+/// carried on when refused would pass the first claim while still letting a
+/// reachable peer choose its burn heights.
+///
+/// The chain is derived rather than quoted, and the served prefix stays inside one
+/// reward cycle. Both are the same limit: a checkpoint-seeded chain cannot derive
+/// across a cycle boundary, because the consensus hash mixes one bit per cycle and
+/// whether a new cycle chose an anchor block is not knowable from the burnchain
+/// alone. That is a real property of such a chain, recorded in [[049]], and not
+/// something to work around here.
+/// Close the same gap against a peer that *does* serve sortitions.
+///
+/// The control, and the whole test rests on it: without a run that reached the same
+/// tip through the ordinary path there is no root to compare the blind run's against,
+/// and "it executed something" would pass.
+async fn reference_roots(
+    served: &[NakamotoBlock],
+    target: u64,
+    budget: CatchUpBudget,
+) -> ([u8; 32], nano_primitives::TrieHash, Option<nano_primitives::TrieHash>) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (honest, task) = serve(Served::honest(served.to_vec(), snapshots())).await;
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain);
+    let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
+    let mut history = TenureSource::only(honest.clone());
+    close_the_gap(&mut executor, &honest, &mut history, &staging, budget, target).await;
+    let tip = executor.tip().clone();
+    assert_eq!(
+        tip.header.chain_length, target,
+        "the reference run did not reach the peer's tip, so there is nothing to compare against"
+    );
+    let roots = (
+        *tip.block_id().as_bytes(),
+        tip.header.state_index_root,
+        executor
+            .chainstate_mut()
+            .state_content_root(*tip.block_id().as_bytes()),
+    );
+    task.abort();
+    roots
+}
+
+/// A gap closes with the peer's `/v3/sortitions` routes gone entirely.
+///
+/// [[049]]'s first acceptance criterion, and the one thing the rest of this file
+/// could not show: every burn view a block executes under is named by this node's own
+/// snapshot chain, walked forward from its own Bitcoin source, so a peer that does
+/// not serve sortitions at all is a peer a follower can still follow.
+///
+/// Two claims and neither is enough alone. The gap closes — the node reaches the
+/// peer's tip and seals the same roots as one that had the route — **and** the route
+
+#[tokio::test]
+async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
+    let chain = captured_chain();
+    let rows = snapshots();
+    let burn_of = |block: &NakamotoBlock| burn_height_of(&rows, block);
+    // The second burn view the chain holds. The first is the checkpoint's own, and a
+    // chain seeded below it would have to walk the block that opens the cycle.
+    let seed = second_burn_view(&chain, &burn_of);
+    let boundary = (seed / CYCLE + 1) * CYCLE;
+    let served: Vec<NakamotoBlock> = chain
+        .iter()
+        .take_while(|block| burn_of(block) < boundary)
+        .cloned()
+        .collect();
+    let upto_seed = served
+        .iter()
+        .take_while(|block| burn_of(block) <= seed)
+        .count();
+    assert!(
+        served.len() > upto_seed,
+        "the served prefix ends at the seed's own burn view, so nothing above it would \
+         have to be located locally"
+    );
+    let target = served.last().expect("a served tip").header.chain_length;
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 8,
+    };
+
+    let reference_closed = reference_roots(&served, target, budget).await;
+
+    // The node under test. It executes up to the seed's burn view against a peer that
+    // does serve sortitions — a node has to reach the burn block its chain is seeded
+    // at before it can be seeded there — and everything above that against one that
+    // does not.
+    let directory = tempfile::tempdir().expect("a directory");
+    let staging_path = directory.path().join("staging.sqlite");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain.clone());
+    let staging = Staging::open(&staging_path).expect("staging opens");
+    let (client, task) = serve(Served::honest(
+        served[..upto_seed].to_vec(),
+        snapshots(),
+    ))
+    .await;
+    let mut history = TenureSource::only(client.clone());
+    close_the_gap(
+        &mut executor,
+        &client,
+        &mut history,
+        &staging,
+        budget,
+        served[..upto_seed].last().expect("a prefix tip").header.chain_length,
+    )
+    .await;
+    assert_eq!(
+        executor.bitcoin_height(),
+        seed,
+        "the node did not reach the burn view its sortition chain is about to be seeded at"
+    );
+    task.abort();
+
+    let tracker = derived_chain(seed, seed, &burnchain, &directory.path().join("capture"));
+    executor.track_sortitions(tracker, directory.path().join("sortitions"));
+
+    // The peer's own record of what it was asked, kept here: a `Policy` is shared
+    // through `Arc`, so this is the same log the served peer writes into.
+    let asked = Policy::default();
+    let (blind, blind_task) = serve(
+        Served::honest(served.clone(), snapshots())
+            .under(asked.clone())
+            .without_sortitions(),
+    )
+    .await;
+    let mut history = TenureSource::only(blind.clone());
+    let executed =
+        close_the_gap(&mut executor, &blind, &mut history, &staging, budget, target).await;
+    assert!(
+        executed > 0,
+        "nothing was executed with the peer's sortitions gone, so the claim is untested"
+    );
+    let tip = executor.tip().clone();
+    assert_eq!(
+        tip.header.chain_length, target,
+        "the node stopped at height {} of the peer's {target} with the sortition route gone",
+        tip.header.chain_length
+    );
+    assert_eq!(
+        (
+            *tip.block_id().as_bytes(),
+            tip.header.state_index_root,
+            executor
+                .chainstate_mut()
+                .state_content_root(*tip.block_id().as_bytes()),
+        ),
+        reference_closed,
+        "the node that derived its own burn views sealed a different chain from the one \
+         that was told them"
+    );
+    // The stronger half. A node that asked and carried on when refused would have
+    // reached the tip too, and would still be one reachable peer away from having its
+    // burn heights chosen for it.
+    assert_eq!(
+        asked.sortitions_asked(),
+        0,
+        "the node asked the peer for a sortition {} times while deriving its own",
+        asked.sortitions_asked()
+    );
+    blind_task.abort();
 }
 
 /// The burn heights a set of tenures was elected at, in the order given.

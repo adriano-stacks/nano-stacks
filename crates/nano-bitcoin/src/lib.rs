@@ -67,6 +67,23 @@ pub trait BitcoinSource {
     /// One block's header hash, without decoding its transactions.
     fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error>;
 
+    /// The height Bitcoin's own chain currently ends at.
+    ///
+    /// What bounds a walk forward. A node derives its own sortitions rather than
+    /// asking a peer which burn block a consensus hash names, so a burn view it
+    /// has not reached yet is located by walking this chain until it derives that
+    /// hash — and a walk with no bound reads past the tip, where a source answers
+    /// with a failure that is indistinguishable from the burnchain being
+    /// unreachable. With the tip in hand, "that view is above this node's own
+    /// burnchain" is something the node can say rather than something it has to
+    /// infer from a read error.
+    ///
+    /// Required rather than defaulted, unlike [`Self::invalidate_from`]: there is
+    /// no answer a source that cannot say is entitled to give. A fixture holding a
+    /// window of blocks knows where its window ends, and a source that reported
+    /// zero would silently stop every walk before it started.
+    fn tip_height(&self) -> Result<u64, Self::Error>;
+
     /// Forget everything read at or above a height, after a reorganization.
     ///
     /// Both real sources walk forward incrementally and carry a `PreStx` window
@@ -169,6 +186,11 @@ impl BitcoinRpcSource {
         Ok(bitcoin_hash_bytes(
             self.client.get_block_hash(height)?.to_byte_array(),
         ))
+    }
+
+    /// The height Bitcoin Core's own best chain ends at.
+    pub fn tip_height(&self) -> Result<u64, BitcoinRpcSourceError> {
+        Ok(self.client.get_block_count()?)
     }
 
     /// Forget every block read at or above a Bitcoin height.
@@ -297,6 +319,18 @@ impl BitcoinRestSource {
             .ok_or_else(|| BitcoinRpcSourceError::Rest(format!("unreadable block hash {text:?}")))
     }
 
+    /// The height Esplora reports for its own tip.
+    ///
+    /// `/blocks/tip/height` is plain text, and it is the one question about the
+    /// burnchain that is not about a particular block.
+    pub fn tip_height(&self) -> Result<u64, BitcoinRpcSourceError> {
+        let text = String::from_utf8(self.get("blocks/tip/height")?)
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+        text.trim()
+            .parse()
+            .map_err(|_| BitcoinRpcSourceError::Rest(format!("unreadable tip height {text:?}")))
+    }
+
     pub fn invalidate_from(&mut self, height: u64) {
         self.pre_stx.invalidate_from(height);
         self.last_block = self.last_block.take().filter(|block| block.height < height);
@@ -365,6 +399,10 @@ impl BitcoinSource for BitcoinRestSource {
         Self::block_hash_at(self, height)
     }
 
+    fn tip_height(&self) -> Result<u64, Self::Error> {
+        Self::tip_height(self)
+    }
+
     fn invalidate_from(&mut self, height: u64) {
         Self::invalidate_from(self, height);
     }
@@ -391,6 +429,10 @@ impl BitcoinSource for BitcoinRpcSource {
 
     fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
         Self::block_hash_at(self, height)
+    }
+
+    fn tip_height(&self) -> Result<u64, Self::Error> {
+        Self::tip_height(self)
     }
 
     fn invalidate_from(&mut self, height: u64) {

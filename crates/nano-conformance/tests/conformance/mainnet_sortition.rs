@@ -220,10 +220,19 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         sortition_hash: SortitionHash::from_bytes(
             <[u8; 32]>::try_from(decode(&genesis.sortition_hash).as_slice()).expect("32 bytes"),
         ),
-        winner_txid: None,
+        // The seed's own winner, as the archive states it. Read for one reason: the
+        // last burn block that elected somebody is where a tenure's accumulated
+        // coinbase is measured from, and for the first tenures above a checkpoint
+        // that block *is* the seed. The `sortition` column discriminates rather than
+        // the value, since a capture writes all zeroes for a block that elected
+        // nobody. Nothing hashed depends on it.
+        winner_txid: (genesis.sortition != 0).then(|| {
+            <[u8; 32]>::try_from(decode(&genesis.winning_block_txid).as_slice()).expect("32 bytes")
+        }),
         winner_vrf_seed: None,
         winner_vrf_public_key: None,
         winner_signing_key_hash: None,
+        burn_spends: None,
         pox_id: mainnet_pox_id(),
     }
 }
@@ -709,7 +718,7 @@ fn the_node_tracker_derives_the_same_window() {
             u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW).expect("window fits u64"),
         )
         .expect("the mining window fills from behind the seed");
-    for snapshot in captured.iter().skip(1) {
+    for (index, snapshot) in captured.iter().enumerate().skip(1) {
         let block = blocks
             .get(&snapshot.block_height)
             .expect("every captured snapshot has its Bitcoin block");
@@ -717,7 +726,35 @@ fn the_node_tracker_derives_the_same_window() {
             .advance(block, payouts)
             .expect("the tracker advances")
             .clone();
-        assert_snapshot_derives(&derived, tracker.burn_spends(), snapshot);
+        assert_snapshot_derives(&derived, snapshot);
+        // The same snapshot, read back by *height* rather than as the tip. That is
+        // how a follower reads it: the chain is walked forward until it names the
+        // burn view a staged block stands on, so the tip has usually moved on by the
+        // time the blocks under an earlier view execute. A window that answered with
+        // the wrong block would hand a contract another burn block's header hash,
+        // time and miner spends.
+        assert_eq!(
+            tracker.snapshot_at(snapshot.block_height),
+            Some(&derived),
+            "the window answers for burn {} by height",
+            snapshot.block_height
+        );
+        // And the height a tenure's accumulated coinbase is measured from, which is
+        // the last burn block at or below the parent that elected somebody. The
+        // archive's own `sortition` column states it. This is *minted*, so it is the
+        // one field moved off a peer here whose wrongness a state root would not
+        // merely refuse — it would seal a different balance.
+        let expected = captured[..index]
+            .iter()
+            .filter(|earlier| earlier.sortition != 0)
+            .map(|earlier| earlier.block_height)
+            .max();
+        assert_eq!(
+            tracker.previous_sortition_height(snapshot.block_height),
+            expected,
+            "the last burn block before {} that elected somebody",
+            snapshot.block_height
+        );
         winners += 1;
         checked += 1;
     }
@@ -733,11 +770,8 @@ fn the_node_tracker_derives_the_same_window() {
 /// Its own function because the walk above is a walk and this is the comparison:
 /// the consensus, sortition and burn totals are what the network committed to, the
 /// winner is who it elected, and the two burn spends are what Clarity reads back.
-fn assert_snapshot_derives(
-    derived: &nano_sortition::SortitionSnapshot,
-    spends: Option<nano_sortition::BurnSpends>,
-    snapshot: &Captured,
-) {
+fn assert_snapshot_derives(derived: &nano_sortition::SortitionSnapshot, snapshot: &Captured) {
+    let spends = derived.burn_spends;
     for (field, ours, theirs) in [
         (
             "consensus hash",
@@ -900,6 +934,24 @@ fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
 
     let mut resumed = nano_node::sortition::SortitionTracker::from_capture(saved.path())
         .expect("the saved chain seeds a new one");
+    // Before it advances at all, because the first tenure a resumed node executes
+    // stands on the seed's own burn view. The height a tenure's accumulated coinbase
+    // is measured from is the last burn block that elected somebody, and a chain
+    // resumed *here* holds no snapshot with a winner in it — so this is the second
+    // field a saved chain has to state rather than derive, and it is minted. The
+    // archive's `sortition` column says which block that is.
+    let last_sortition = captured
+        .iter()
+        .filter(|snapshot| snapshot.sortition != 0 && snapshot.block_height <= pause)
+        .map(|snapshot| snapshot.block_height)
+        .max();
+    assert_eq!(
+        resumed.previous_sortition_height(pause + 1),
+        last_sortition,
+        "a chain resumed at burn {pause}, which elected nobody, cannot say which burn \
+         block last did — so the tenure above it would mint a coinbase accumulated \
+         from nowhere"
+    );
     resumed
         .catch_up(read, next, payouts, window + 1)
         .expect("the resumed chain advances");
@@ -908,6 +960,13 @@ fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
         Some(hex::encode(expected)),
         "a chain resumed at burn {pause}, which elected nobody, must name the same winner \
          at burn {next} as one that never stopped"
+    );
+    // And its own burn spends, which come out of the primed commitment window rather
+    // than out of anything the saved form carries.
+    assert!(
+        resumed.tip().burn_spends.is_some(),
+        "burn {next} elected somebody, so a resumed chain has to state what its miners \
+         spent: `get-tenure-info? miner-spend-total` reads it back"
     );
     println!(
         "resumed at burn {pause} with no sortition and named the same winner at burn {next}"

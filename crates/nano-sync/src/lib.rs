@@ -1148,22 +1148,9 @@ impl SyncClient {
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Ok(response.error_for_status()?);
             }
-            // Honour the peer's own answer when it gives one — and honour it
-            // *as given*. Capping `Retry-After` at the ceiling meant a peer
-            // asking for a minute was asked again in two seconds, which earns
-            // another 429 and keeps earning them: the ceiling is a bound on
-            // what this node invents for itself, not on what it was told.
-            //
             // Its own guess stays bounded, because a peer that says nothing
             // should not be able to stall a catch-up either.
-            let told = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(std::time::Duration::from_secs)
-                .map(|told| told.min(RETRY_AFTER_CEILING));
-            tokio::time::sleep(told.unwrap_or(wait)).await;
+            tokio::time::sleep(retry_after(response.headers()).unwrap_or(wait)).await;
             wait = wait.saturating_mul(2).min(RATE_LIMIT_CEILING);
         }
         Ok(self
@@ -1884,6 +1871,24 @@ impl TenureFollower {
     }
 }
 
+/// How long a peer's own `Retry-After` asks this node to wait.
+///
+/// Honoured *as given*, up to [`RETRY_AFTER_CEILING`]. Capping it at the backoff
+/// this node invents for itself meant a peer asking for a minute was asked again
+/// two seconds later, which earns another 429 and keeps earning them — a mainnet
+/// accounting rebuild ran 1h45m against one rate-limited peer with six seconds of
+/// CPU to show for it. The ceiling is therefore a bound on a hostile or broken
+/// header rather than on a real one, and it is a separate function so that bound
+/// can be checked without waiting two minutes for it.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .map(|told| told.min(RETRY_AFTER_CEILING))
+}
+
 fn validate_tenure(
     start_block_id: StacksBlockId,
     blocks: &[NakamotoBlock],
@@ -2146,11 +2151,11 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RATE_LIMIT_RETRIES, BlockUploadWire, BurnView, CandidateTip, Signer, SignerSet,
-        StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
+        RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, BlockUploadWire, BurnView, CandidateTip, Signer,
+        SignerSet, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
         choose_canonical_tip,
         parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
-        parse_stacker_set, validate_tenure, validate_tenure_transition,
+        parse_stacker_set, retry_after, validate_tenure, validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -2276,6 +2281,45 @@ mod tests {
         assert!(limited.is_rate_limited(), "{limited}");
         let missing = client.node_info().await.expect_err("the peer said 404");
         assert!(!missing.is_rate_limited(), "{missing}");
+    }
+
+    /// The bound on what a peer may ask for, checked without waiting for it.
+    ///
+    /// A peer's `Retry-After` is honoured as given, which cannot be shown by
+    /// waiting: a peer asking for an hour and a peer asking for two minutes are
+    /// indistinguishable to an assertion that has to return. So the arithmetic is
+    /// asserted directly, and it says both halves — a real header as given, an
+    /// absurd one capped, so a hostile peer cannot park a catch-up for an hour.
+    #[test]
+    fn a_peers_retry_after_is_honoured_up_to_a_bound() {
+        let asking = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a header value"),
+            );
+            retry_after(&headers)
+        };
+        assert_eq!(
+            asking("30"),
+            Some(std::time::Duration::from_secs(30)),
+            "a peer asking for half a minute is waited for as asked"
+        );
+        assert_eq!(
+            asking(" 45 "),
+            Some(std::time::Duration::from_secs(45)),
+            "and the whitespace a header may carry is not a parse failure"
+        );
+        assert_eq!(
+            asking("3600"),
+            Some(RETRY_AFTER_CEILING),
+            "a peer asking for an hour cannot park a catch-up for one"
+        );
+        // An HTTP-date `Retry-After` is legal and is not parsed, which is
+        // deliberate: this node's own bounded backoff is a better answer than a
+        // date it may have mis-parsed into hours.
+        assert_eq!(asking("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
     }
 
     /// A pool with every peer throttled asks its caller to wait, not to stop.

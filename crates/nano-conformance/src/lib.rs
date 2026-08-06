@@ -1738,6 +1738,14 @@ mod tests {
         fn block_hash_at(&self, _height: u64) -> Result<[u8; 32], Self::Error> {
             unimplemented!("this source is only asked for blocks")
         }
+
+        fn tip_height(&self) -> Result<u64, Self::Error> {
+            self.blocks
+                .keys()
+                .next_back()
+                .copied()
+                .ok_or_else(|| "this source holds no Bitcoin blocks".to_owned())
+        }
 }
     use stacks_common::{
         deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize,

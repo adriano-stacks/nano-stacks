@@ -221,6 +221,44 @@ impl SortitionTracker {
             .and_then(|back| tip.checked_sub(u64::try_from(back).ok()?))
     }
 
+    /// Whether the six burn blocks behind the seed have been read.
+    ///
+    /// Asked by a caller that wants to answer from the history *without* touching the
+    /// burnchain: the seed's own burn spends and the mining window every later winner
+    /// is weighed over come out of those blocks, so a chain that has not read them
+    /// yet has to, even for a view its history already names.
+    #[must_use]
+    pub const fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    /// The snapshot this chain derived for a Bitcoin height.
+    ///
+    /// What a block being executed reads, and the reason the chain keeps a window
+    /// rather than only its tip: the chain is walked ahead until it *names* the burn
+    /// view a staged block stands on, so by the time that block executes the tip may
+    /// already be several burn blocks further on. See
+    /// [`nano_sortition::SnapshotChain::snapshot_at`].
+    #[must_use]
+    pub fn snapshot_at(&self, bitcoin_height: u64) -> Option<&SortitionSnapshot> {
+        self.engine.snapshots().snapshot_at(bitcoin_height)
+    }
+
+    /// The last burn height below this one that elected somebody.
+    ///
+    /// A tenure collects the coinbase of every burn block since that height, so this
+    /// is what makes a tenure-start block's reward derivable — and the answer is
+    /// *minted*, which is why `None` means "this chain cannot say" and must not be
+    /// read as "there was none": that would mint zero and seal a root nobody else
+    /// computes. Two peer requests per tenure-start block before this existed.
+    #[must_use]
+    pub fn previous_sortition_height(&self, bitcoin_height: u64) -> Option<u64> {
+        let parent = bitcoin_height.checked_sub(1)?;
+        self.engine
+            .snapshots()
+            .last_sortition_at_or_below(parent)
+    }
+
     /// Where this chain and Bitcoin's own history part company, if they do.
     ///
     /// One lookup when nothing moved: the walk stops at the first agreement and
@@ -316,7 +354,77 @@ impl SortitionTracker {
         if !self.primed {
             self.prime(&mut block_at, payouts, &mut walk)?;
         }
-        while self.tip().bitcoin_height < target && walk.advanced < limit {
+        self.walk(&mut block_at, payouts, limit, &mut walk, |tip| {
+            tip.bitcoin_height >= target
+        })?;
+        Ok(walk)
+    }
+
+    /// The burn height a consensus hash names, walking the burnchain to find out.
+    ///
+    /// This is what breaks the circle the production path stood in. The height of a
+    /// burn view used to come from a peer, because the only thing that advanced this
+    /// chain was the block being executed — so the chain's tip was always *exactly*
+    /// the view being executed, a view arriving for the first time was always at
+    /// least one block ahead of the history, and [`Self::height_of_consensus_hash`]
+    /// could never answer for it.
+    ///
+    /// So the chain is walked forward instead, one Bitcoin block at a time, until one
+    /// of them derives the hash asked about. Nothing is skipped and nothing is
+    /// searched: a consensus hash mixes the ones behind it, so the block that derives
+    /// it is the block it names. Two bounds, and they mean different things —
+    /// `burnchain_tip` is where this node's own Bitcoin source ends, so stopping
+    /// there says "that view is not on my burnchain yet" rather than reading past the
+    /// end of a chain; `limit` is what one round may spend, since each step is a full
+    /// Bitcoin block download.
+    ///
+    /// `None` is therefore not "the peer is lying": it is one of three things, all of
+    /// which the caller reports rather than works around — the burnchain has not
+    /// reached that block, the round ran out of walk, or the view belongs to a
+    /// different chain of Bitcoin blocks than the one this node reads.
+    pub fn locate_view<E: Display>(
+        &mut self,
+        view: ConsensusHash,
+        mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
+        burnchain_tip: u64,
+        payouts: PayoutSchedule,
+        limit: u64,
+    ) -> Result<(Option<u64>, CatchUp), TrackerError> {
+        let mut walk = CatchUp::default();
+        if !self.primed {
+            self.prime(&mut block_at, payouts, &mut walk)?;
+        }
+        if let Some(height) = self.height_of_consensus_hash(view) {
+            return Ok((Some(height), walk));
+        }
+        let room = burnchain_tip.saturating_sub(self.tip().bitcoin_height);
+        self.walk(
+            &mut block_at,
+            payouts,
+            limit.min(room),
+            &mut walk,
+            |tip| tip.consensus_hash == view,
+        )?;
+        let found = (self.tip().consensus_hash == view).then(|| self.tip().bitcoin_height);
+        Ok((found, walk))
+    }
+
+    /// Read burn blocks and derive their sortitions until `done`, or the bound runs
+    /// out.
+    ///
+    /// `done` is asked about the tip before anything is read, so a chain already
+    /// standing where it needs to be costs nothing — which is why deriving sortitions
+    /// is not a per-Stacks-block cost: many Stacks blocks stand on one burn block and
+    /// only the first of them walks.
+    fn walk<E: Display>(
+        &mut self,
+        block_at: &mut impl FnMut(u64) -> Result<BitcoinBlock, E>,
+        payouts: PayoutSchedule,
+        limit: u64,
+        walk: &mut CatchUp,
+        mut done: impl FnMut(&SortitionSnapshot) -> bool,
+    ) -> Result<(), TrackerError> {
+        while !done(self.tip()) && walk.advanced < limit {
             let height = self
                 .tip()
                 .bitcoin_height
@@ -330,7 +438,7 @@ impl SortitionTracker {
             walk.deriving += derive.elapsed();
             walk.advanced += 1;
         }
-        Ok(walk)
+        Ok(())
     }
 
     /// Read the mining window behind the seed, which the seed itself is not in.
@@ -378,7 +486,7 @@ impl SortitionTracker {
             }
             let commitments =
                 commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
-            self.engine.prime(commitments);
+            self.engine.prime(height, commitments);
         }
         self.primed = true;
         Ok(())
@@ -445,27 +553,6 @@ impl SortitionTracker {
         Ok(loaded)
     }
 
-    /// What the miners of the burn block at the tip spent on its sortition.
-    ///
-    /// Clarity reads both back as `miner-spend-total` and `miner-spend-winner`, so
-    /// this is a consensus answer and not a diagnostic. See
-    /// [`nano_sortition::BurnSpends`].
-    #[must_use]
-    pub fn burn_spends(&self) -> Option<nano_sortition::BurnSpends> {
-        self.engine.burn_spends()
-    }
-
-    /// Whether the derived burn total is the one a signed header states.
-    ///
-    /// A Nakamoto header's `bitcoin_spent` is the burn view's running total and
-    /// carries threshold signer weight, so this is the one check that puts the
-    /// locally derived distribution against something the network signed. A
-    /// disagreement means every consensus hash from here on is derived from a
-    /// wrong total, so it is not a difference to log and continue past.
-    #[must_use]
-    pub fn agrees_with_header(&self, bitcoin_spent: u64) -> bool {
-        self.tip().total_burn == bitcoin_spent
-    }
 }
 
 /// What this chain says about a tip a peer is offering, for the fork choice.
@@ -604,6 +691,19 @@ struct CapturedSnapshot {
     /// won. See [`nano_sortition::SnapshotChain::effective_winner_seed`].
     #[serde(default)]
     winner_vrf_seed: Option<String>,
+    /// The last burn height at or below this one that elected somebody.
+    ///
+    /// nano's own field rather than one of the archive's columns, and it exists for
+    /// the same reason `winner_vrf_seed` does: a chain resumed at a burn block that
+    /// elected nobody holds no snapshot with a winner in it, so it cannot walk back
+    /// to the height a tenure's accumulated coinbase is measured from. That coinbase
+    /// is minted, so the alternative to writing this down is minting a guess.
+    ///
+    /// Absent in a chain saved before this existed, and then the first tenure on the
+    /// seed's own burn view cannot have its reward derived — which is refused rather
+    /// than guessed, and the chain re-derived from the checkpoint.
+    #[serde(default)]
+    last_sortition_height: Option<u64>,
 }
 
 impl SortitionTracker {
@@ -705,6 +805,13 @@ impl SortitionTracker {
                 .snapshots()
                 .effective_winner_seed()
                 .map(hex::encode),
+            // The other one. Where the tip itself elected somebody this is the tip's
+            // own height and the resumed chain would find it anyway; where it did
+            // not, this is the only thing that can name it.
+            last_sortition_height: self
+                .engine
+                .snapshots()
+                .last_sortition_at_or_below(tip.bitcoin_height),
         }];
         let history = History {
             hashes: self
@@ -765,6 +872,13 @@ impl SortitionTracker {
                 ))
             })?;
         let mut tracker = Self::new(seed_snapshot(seed)?, history)?;
+        // Where the last sortition at or below the seed was, for a seed that did not
+        // itself elect anybody. A capture's rows do not carry it and do not need to:
+        // a captured seed is refused above unless its own block had a sortition.
+        tracker
+            .engine
+            .snapshots_mut()
+            .seed_sortition_below_window(seed.last_sortition_height);
         tracker.load_leader_keys(directory)?;
         Ok(tracker)
     }
@@ -877,6 +991,9 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         // after it resolves them from the carried registry.
         winner_vrf_public_key: None,
         winner_signing_key_hash: None,
+        // Filled by `prime`, which reads the seed's own burn block: the two spends
+        // come out of the commitment window, not out of a captured row.
+        burn_spends: None,
         pox_id,
     })
 }
@@ -906,6 +1023,7 @@ mod tests {
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
             winner_signing_key_hash: None,
+            burn_spends: None,
             pox_id: PoxId::initial(),
         };
         let history = vec![behind, seed.consensus_hash];

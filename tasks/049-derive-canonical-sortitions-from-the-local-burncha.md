@@ -36,7 +36,7 @@ never validation inputs.
       and both Clarity-visible burn spends are locally available. The remaining
       production path still asks a peer for `/v3/sortitions` before resolving a
       block's already-known consensus hash to its local burn-view height.
-- [ ] Resolve every known consensus hash and burn-view height from the local
+- [x] Resolve every known consensus hash and burn-view height from the local
       snapshot history before making any peer request. A peer sortition response
       may diagnose or help locate data, but must not supply execution context or
       be required for progress.
@@ -793,3 +793,29 @@ node did not execute, and the height that view sits at. Both are checked rather
 than trusted: the pool's answer must carry the consensus hash it was asked for, the
 tracker derives the consensus hash at the height it walked to, and a header whose
 cumulative burn disagrees with the derived total stops the round.
+
+## A gap closes with the peer's sortitions gone
+
+The chicken-and-egg the previous note left open — `local_sortition` was the only
+thing advancing the chain, and it advanced it toward the view being executed, so a
+*new* view was always one block ahead of the history and could never be found
+locally — is broken by walking the chain forward from the node's own Bitcoin source
+to *find* the view, and by keeping a bounded window of snapshots so a view behind the
+tip can still be answered. `ExecutedView` replaced `nano_sync::SortitionInfo` in the
+execution path, so the peer's type is no longer in it at all, and the coinbase walk
+that used to cost two peer requests per tenure-start block is local knowledge now.
+
+The test is the task's first acceptance criterion and nothing weaker:
+`follow_path::a_gap_closes_with_the_peers_sortitions_unavailable` closes a gap
+against a peer whose `/v3/sortitions` routes answer **404**, and compares the block
+identifier, the state root and the state content root against a reference run that
+closed the same gap through the ordinary path. Both claims are asserted, because
+either alone would pass something weaker: that the gap closes, and that the route was
+never asked for.
+
+Two limits are the chain's own rather than the test's, and are recorded rather than
+worked around: a checkpoint-seeded chain cannot derive across a reward-cycle boundary
+whose anchor block it has not resolved, so the served prefix stays inside one cycle;
+and a node has to *reach* the burn block its chain is seeded at before it can be
+seeded there, which is why the run before the seed uses a peer that does serve
+sortitions.

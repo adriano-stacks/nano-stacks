@@ -24,6 +24,22 @@ pub const MINING_COMMITMENT_WINDOW: usize = 6;
 /// the window covers every retraction [`SortitionEngine::retract_above`] admits.
 const RETAINED_COMMITMENT_BLOCKS: usize = MINING_COMMITMENT_WINDOW * 2;
 
+/// How many snapshots a chain keeps behind its tip.
+///
+/// The chain runs ahead of the blocks being executed under it, so a snapshot has to
+/// outlive the moment it was derived — and keeping all of them is a leak that grows
+/// with the burnchain. This is the deepest reader plus margin, which is how
+/// `nano_chainstate`'s `EARNINGS_KEPT` is chosen too: what a node can still be
+/// asked about.
+///
+/// The deepest readers are the burn view of a block about to be executed, which is
+/// at or just below the tip; the fork point of a Bitcoin reorganization, refused
+/// beyond [`MINING_COMMITMENT_WINDOW`]; and the last burn block that elected
+/// somebody, a handful back on any live chain. 144 burn blocks is a day of Bitcoin
+/// and the same bound a catch-up round walks, so nothing a round can produce falls
+/// outside it. Twenty-odd kilobytes.
+const SNAPSHOTS_KEPT: usize = 144;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpsHash([u8; 32]);
 
@@ -878,6 +894,19 @@ pub struct SortitionSnapshot {
     /// has one — only 101 of mainnet's 2,477 do — so its absence is ordinary and
     /// says the rule cannot run rather than that it failed.
     pub winner_signing_key_hash: Option<[u8; 20]>,
+    /// What this burn block's miners spent on its sortition, and the winner's
+    /// share, which Clarity reads back as `miner-spend-total`/`miner-spend-winner`.
+    ///
+    /// Carried here for the same reason [`Self::bitcoin_timestamp`] is: it is a fact
+    /// about *this* burn block, and a chain that has walked past it still has to
+    /// answer for the blocks a follower is executing under. Reading it off the
+    /// engine's commitment window instead answered only for the window's last
+    /// block, which is the chain's tip and not the view being executed.
+    ///
+    /// `None` at a burn block that elected nobody, and on a chain whose mining
+    /// window has not been primed. See [`BurnSpends`] for why the pair never
+    /// splits.
+    pub burn_spends: Option<BurnSpends>,
     pub pox_id: PoxId,
 }
 
@@ -898,6 +927,7 @@ impl SortitionSnapshot {
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
             winner_signing_key_hash: None,
+            burn_spends: None,
             pox_id: PoxId::initial(),
         }
     }
@@ -977,6 +1007,9 @@ pub struct SnapshotChain {
     /// hashes rather than the snapshots keeps that history to twenty bytes a
     /// block — six megabytes for the whole of mainnet.
     consensus_hashes: Vec<ConsensusHash>,
+    /// The last burn height at or below the oldest snapshot still held that
+    /// elected somebody. See [`Self::last_sortition_at_or_below`].
+    sortition_below_window: Option<u64>,
 }
 
 impl SnapshotChain {
@@ -985,6 +1018,7 @@ impl SnapshotChain {
         Self {
             consensus_hashes: vec![genesis.consensus_hash],
             snapshots: vec![genesis],
+            sortition_below_window: None,
         }
     }
 
@@ -1000,6 +1034,7 @@ impl SnapshotChain {
         Some(Self {
             snapshots: vec![genesis],
             consensus_hashes: history,
+            sortition_below_window: None,
         })
     }
 
@@ -1193,11 +1228,110 @@ impl SnapshotChain {
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             winner_vrf_public_key: winner.and_then(|winner| winner.vrf_public_key),
             winner_signing_key_hash: winner.and_then(|winner| winner.signing_key_hash),
+            // Filled by whoever holds the commitment window this sortition was
+            // weighed over, which is `SortitionEngine::append`: this chain is given
+            // a total burn and a winner and never sees a commitment.
+            burn_spends: None,
             pox_id,
         };
         self.consensus_hashes.push(snapshot.consensus_hash);
         self.snapshots.push(snapshot);
+        self.forget_snapshots_nothing_can_ask_for();
         Ok(self.tip())
+    }
+
+    /// Record what the tip's burn block spent, once its window is known.
+    ///
+    /// Separate from the append because the commitment window belongs to
+    /// [`SortitionEngine`] and this chain is handed only the answers derived from
+    /// it. Both halves or neither: see [`BurnSpends`].
+    pub fn record_tip_burn_spends(&mut self, spends: Option<BurnSpends>) {
+        if let Some(tip) = self.snapshots.last_mut() {
+            tip.burn_spends = spends;
+        }
+    }
+
+    /// Drop snapshots no execution, no retraction and no walk can still read.
+    ///
+    /// The chain runs ahead of execution — it is walked forward from this node's own
+    /// Bitcoin source until it names the burn view a staged block stands on — so it
+    /// has to hold the snapshot for a view *behind* its tip, and holding all of them
+    /// is a leak that grows with the burnchain forever.
+    ///
+    /// [`SNAPSHOTS_KEPT`] is what the deepest reader needs plus margin, in the same
+    /// terms `nano_chainstate`'s `EARNINGS_KEPT` is: what a node can still be asked
+    /// about. Three readers reach below the tip — the burn view of a block about to
+    /// be executed, the fork point of a Bitcoin reorganization (refused beyond
+    /// [`MINING_COMMITMENT_WINDOW`]), and the walk back to the last burn block that
+    /// elected somebody, which the accumulated coinbase is computed over. The
+    /// consensus-hash history is *not* bounded and cannot be: the skip-list mixes
+    /// hashes at power-of-two offsets, and a truncated history derives a different
+    /// hash from there on.
+    fn forget_snapshots_nothing_can_ask_for(&mut self) {
+        while self.snapshots.len() > SNAPSHOTS_KEPT {
+            let dropped = self.snapshots.remove(0);
+            // The one fact a dropped snapshot still has to answer for. A tenure
+            // collects the coinbase of every burn block since the last sortition,
+            // and that height can fall below the window on a chain resumed at a
+            // burn block that elected nobody — which mainnet leaves four of in
+            // every fifteen. Monotonic, because the walk only ever asks for the
+            // *last* one.
+            if dropped.winner_txid.is_some() {
+                self.sortition_below_window = Some(dropped.bitcoin_height);
+            }
+        }
+    }
+
+    /// The snapshot this chain derived for a Bitcoin height.
+    ///
+    /// Snapshots are contiguous in height, so the index is a subtraction and nothing
+    /// is searched. `None` is a height above the tip — a view this chain has not
+    /// walked to yet — or one below the retained window, and the two are different
+    /// answers to the caller: the first closes with one more Bitcoin block, the
+    /// second never will.
+    #[must_use]
+    pub fn snapshot_at(&self, bitcoin_height: u64) -> Option<&SortitionSnapshot> {
+        let back = usize::try_from(self.tip().bitcoin_height.checked_sub(bitcoin_height)?).ok()?;
+        self.snapshots.get(self.snapshots.len().checked_sub(back + 1)?)
+    }
+
+    /// The last burn height at or below this one that elected somebody.
+    ///
+    /// What a tenure's accumulated coinbase is measured from: every burn block since
+    /// then contributes its emission to the tenure that finally wins one. That makes
+    /// this consensus-visible in the strongest sense — the answer is *minted* — so a
+    /// height the window cannot reach is reported as unknown rather than as "none",
+    /// which would mint zero and seal a root nobody else computes.
+    ///
+    /// `None` is "this chain cannot say", never "there was none": a chain seeded at
+    /// a checkpoint has thousands of sortitions behind its root and can only see the
+    /// ones it walked or was handed. The caller must treat it as a missing answer.
+    #[must_use]
+    pub fn last_sortition_at_or_below(&self, bitcoin_height: u64) -> Option<u64> {
+        self.snapshots
+            .iter()
+            .rev()
+            .skip_while(|snapshot| snapshot.bitcoin_height > bitcoin_height)
+            .find_map(|snapshot| snapshot.winner_txid.map(|_| snapshot.bitcoin_height))
+            // The walk reached the oldest snapshot held without finding one. The
+            // hint left behind by whatever fell out of the window — or recorded
+            // when the chain was seeded — is then the only thing that can answer.
+            .or_else(|| self.sortition_below_window.filter(|height| *height <= bitcoin_height))
+    }
+
+    /// The last sortition at or below this chain's oldest retained snapshot.
+    ///
+    /// Written down when a chain is saved, because a chain resumed at a burn block
+    /// that elected nobody has no snapshot with a winner in it at all and cannot
+    /// walk further back. See [`Self::last_sortition_at_or_below`].
+    #[must_use]
+    pub const fn sortition_below_window(&self) -> Option<u64> {
+        self.sortition_below_window
+    }
+
+    /// Adopt that hint, for a chain being seeded from what a previous run saved.
+    pub const fn seed_sortition_below_window(&mut self, bitcoin_height: Option<u64>) {
+        self.sortition_below_window = bitcoin_height;
     }
 
     fn previous_consensus_hashes(&self) -> Vec<ConsensusHash> {
@@ -1286,10 +1420,19 @@ impl SortitionEngine {
     /// sortition at all.
     ///
     /// Feed the blocks oldest first, ending with the snapshot's own burn block.
-    pub fn prime(&mut self, commitments: CommitmentWindowBlock) {
+    ///
+    /// The height is what lets the last of those blocks fill in the seed's own burn
+    /// spends: a chain resumed from a checkpoint executes the tenure standing on its
+    /// seed's burn view before it advances once, and the two spends are Clarity's to
+    /// read at that block like any other.
+    pub fn prime(&mut self, bitcoin_height: u64, commitments: CommitmentWindowBlock) {
         self.commitment_window.push(commitments);
         if self.commitment_window.len() > RETAINED_COMMITMENT_BLOCKS {
             self.commitment_window.remove(0);
+        }
+        if bitcoin_height == self.snapshots.tip().bitcoin_height {
+            let spends = self.spends_at_tip();
+            self.snapshots.record_tip_burn_spends(spends);
         }
     }
 
@@ -1319,12 +1462,17 @@ impl SortitionEngine {
         &self.snapshots
     }
 
+    /// The chain, for the two facts a resumed one is *told* rather than derives.
+    pub const fn snapshots_mut(&mut self) -> &mut SnapshotChain {
+        &mut self.snapshots
+    }
+
     #[must_use]
     pub fn commitment_window(&self) -> &[CommitmentWindowBlock] {
         &self.commitment_window
     }
 
-    /// What the miners of the burn block at the tip spent on its sortition.
+    /// Derive the tip's spends from the commitment window that weighed it.
     ///
     /// The tip's own burn block is the last entry of the commitment window —
     /// [`Self::append`] puts it there, and [`Self::prime`] ends with it for a chain
@@ -1337,8 +1485,7 @@ impl SortitionEngine {
     /// blocks in every fifteen — and no tenure stands on one, so nothing that could
     /// have an answer is denied one. See [`BurnSpends`] for why the pair is never
     /// split.
-    #[must_use]
-    pub fn burn_spends(&self) -> Option<BurnSpends> {
+    fn spends_at_tip(&self) -> Option<BurnSpends> {
         let block = self.commitment_window.last()?;
         let winner = self.snapshots.tip().winner_txid?;
         let winner = block
@@ -1456,7 +1603,13 @@ impl SortitionEngine {
             total_burn,
             pox_id,
             winner,
-        )
+        )?;
+        // Derived here, where the window that weighed this block is the window's
+        // last entry, and kept on the snapshot: by the time a follower executes
+        // under this burn view the chain may stand several blocks further on.
+        let spends = self.spends_at_tip();
+        self.snapshots.record_tip_burn_spends(spends);
+        Ok(self.snapshots.tip())
     }
 }
 

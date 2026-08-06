@@ -309,7 +309,7 @@ fn the_derived_burn_spends_are_the_archives() {
                 schedule,
             )
             .expect("the chain extends");
-        let spends = chain.burn_spends();
+        let spends = chain.tip().burn_spends;
         if snapshot.sortition == 0 {
             assert!(
                 spends.is_none(),

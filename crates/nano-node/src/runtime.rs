@@ -1649,6 +1649,13 @@ impl nano_bitcoin::BitcoinSource for BurnchainSource {
         }
     }
 
+    fn tip_height(&self) -> Result<u64, Self::Error> {
+        match self {
+            Self::Rpc(source) => source.tip_height(),
+            Self::Rest(source) => source.tip_height(),
+        }
+    }
+
     fn invalidate_from(&mut self, height: u64) {
         match self {
             Self::Rpc(source) => source.invalidate_from(height),
