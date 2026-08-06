@@ -6,9 +6,7 @@ use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
 use clarity::vm::costs::{constants as cost_constants, CostTracker};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
-use clarity::vm::errors::{
-    RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError,
-};
+use clarity::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 #[cfg(any())]
 use clarity::vm::functions::crypto::{pubkey_to_address_v1, pubkey_to_address_v2};
 #[cfg(any())]
@@ -25,8 +23,8 @@ use clarity_types::types::ResponseData;
 use stacks_common::address::{
     AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
-use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::consts::CHAIN_ID_TESTNET;
+use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::ed25519::ed25519_verify;
@@ -346,6 +344,7 @@ pub fn link_host_functions(
     link_get_burn_block_info_header_hash_property_fn(linker)?;
     link_get_burn_block_info_pox_addrs_property_fn(linker)?;
     link_contract_call_fn(linker)?;
+    link_check_constant_call_target_fn(linker)?;
     link_contract_hash_fn(linker)?;
     link_begin_public_call_fn(linker)?;
     link_begin_read_only_call_fn(linker)?;
@@ -1251,7 +1250,13 @@ fn link_block_height_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                             .get_current_block_height(),
                     )
                 } else {
-                    u128::from(caller.data_mut().global_context.database.get_tenure_height()?)
+                    u128::from(
+                        caller
+                            .data_mut()
+                            .global_context
+                            .database
+                            .get_tenure_height()?,
+                    )
                 };
                 Ok((height as i64, 0i64))
             },
@@ -4155,13 +4160,7 @@ fn check_block_info_height_valid(
         write_block_info_none(caller, memory, return_offset)?;
         return Ok(None);
     };
-    check_height_valid(
-        caller,
-        memory,
-        i64::from(height_value),
-        0,
-        return_offset,
-    )
+    check_height_valid(caller, memory, i64::from(height_value), 0, return_offset)
 }
 
 /// Link host interface function, `get_block_info_time`, into the Wasm module.
@@ -4183,9 +4182,13 @@ fn link_get_block_info_time_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     // The *burn* block time, not the Stacks block's own
                     // timestamp: `get-block-info? time` is the pre-Nakamoto
                     // word and kept its pre-Nakamoto meaning, so it is
@@ -4240,9 +4243,13 @@ fn link_get_block_info_vrf_seed_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let vrf_seed = caller
                         .data_mut()
                         .global_context
@@ -4299,9 +4306,13 @@ fn link_get_block_info_header_hash_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let header_hash = caller
                         .data_mut()
                         .global_context
@@ -4358,9 +4369,13 @@ fn link_get_block_info_burnchain_header_hash_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let burnchain_header_hash = caller
                         .data_mut()
                         .global_context
@@ -4417,9 +4432,13 @@ fn link_get_block_info_identity_header_hash_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let id_header_hash = caller
                         .data_mut()
                         .global_context
@@ -4476,9 +4495,13 @@ fn link_get_block_info_miner_address_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let miner_address = caller
                         .data_mut()
                         .global_context
@@ -4529,9 +4552,13 @@ fn link_get_block_info_miner_spend_winner_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let winner_spend = caller
                         .data_mut()
                         .global_context
@@ -4581,9 +4608,13 @@ fn link_get_block_info_miner_spend_total_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let total_spend = caller
                         .data_mut()
                         .global_context
@@ -4633,9 +4664,13 @@ fn link_get_block_info_block_reward_property_fn(
                     .and_then(|export| export.into_memory())
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
-                if let Some(height_value) =
-                    check_block_info_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
-                {
+                if let Some(height_value) = check_block_info_height_valid(
+                    &mut caller,
+                    memory,
+                    height_lo,
+                    height_hi,
+                    return_offset,
+                )? {
                     let block_reward_opt = caller
                         .data_mut()
                         .global_context
@@ -5844,6 +5879,47 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "contract_call".into(),
                 error,
+            ))
+        })
+}
+
+/// Link host interface function, `check_constant_call_target`, into the Wasm
+/// module. The compiler emits a call to it before every `contract-call?` whose
+/// dispatch target it resolved through a `define-constant`.
+///
+/// `special_contract_call` (`clarity/src/vm/functions/database.rs`) treats a
+/// constant as a static target only when the contract's Clarity version
+/// `supports_callables()`, the *executing* epoch `supports_call_with_constant()`,
+/// and the contract is not deploying; otherwise the atom is neither a callable
+/// constant nor a callable variable and the call ends as
+/// `ContractCallExpectName`. None of the three can be settled where the module is
+/// built: a contract keeps the version and analysis it was published with while
+/// the chain moves under it, and the same compiled function body runs once during
+/// the deploy and any number of times after it.
+fn link_check_constant_call_target_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "check_constant_call_target",
+            |caller: Caller<'_, ClarityWasmContext>| {
+                let epoch = caller.data().global_context.epoch_id;
+                let contract_context = caller.data().contract_context();
+                if !contract_context.get_clarity_version().supports_callables()
+                    || !epoch.supports_call_with_constant()
+                    || contract_context.is_deploying
+                {
+                    return Err(RuntimeCheckErrorKind::ContractCallExpectName.into());
+                }
+                Ok(())
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "check_constant_call_target".to_string(),
+                e,
             ))
         })
 }
@@ -7301,7 +7377,9 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         Ok(())
     })?;
 
-    linker.func_wrap("clarity", "principal_depth", |_: Caller<'_, ()>| Ok((0i32, 0i32)))?;
+    linker.func_wrap("clarity", "principal_depth", |_: Caller<'_, ()>| {
+        Ok((0i32, 0i32))
+    })?;
 
     linker.func_wrap(
         "clarity",
@@ -7843,6 +7921,11 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
             Ok(())
         },
     )?;
+
+    linker.func_wrap("clarity", "check_constant_call_target", || {
+        println!("check_constant_call_target");
+        Ok(())
+    })?;
 
     linker.func_wrap(
         "clarity",

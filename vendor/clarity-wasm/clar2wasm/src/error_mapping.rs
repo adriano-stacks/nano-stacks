@@ -215,13 +215,17 @@ fn clone_runtime_check_error(error: &RuntimeCheckErrorKind) -> Option<RuntimeChe
         // `is_acceptable_runtime_failure` refuses, which stops the node on a
         // block the network accepted.
         //
-        // `ContractCallExpectName` (`linker.rs`) is the other unit variant a host
-        // function raises and is still mangled that way. Left alone deliberately:
-        // correcting it turns a refused block into a failed transaction, which is
-        // a consensus-visible change and wants its own oracle rather than a
-        // guess made while passing.
         RuntimeCheckErrorKind::AtBlockUnavailable => {
             Some(RuntimeCheckErrorKind::AtBlockUnavailable)
+        }
+        // The other unit variant a host function raises: a `contract-call?`
+        // whose target is neither a contract name nor a dispatchable callable
+        // (`check_constant_call_target` and the two allowance readers in
+        // `linker.rs`). It is not `rejectable()` either, so stacks-core fails the
+        // transaction and accepts the block — where `Expect` below would stop the
+        // node on a block the network took.
+        RuntimeCheckErrorKind::ContractCallExpectName => {
+            Some(RuntimeCheckErrorKind::ContractCallExpectName)
         }
         _ => None,
     }

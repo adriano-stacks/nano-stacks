@@ -287,6 +287,8 @@
                                                            (param $return_offset i32)
                                                            (param $return_length i32)))
 
+    (import "clarity" "check_constant_call_target" (func $stdlib.check_constant_call_target))
+
     (import "clarity" "contract_hash" (func $stdlib.contract_hash (param $contract_id_offset i32)
                                                            (param $contract_id_length i32)
                                                            (param $return_offset i32)

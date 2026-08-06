@@ -537,12 +537,18 @@ impl TestEnvironment {
             .insert_contract_hash(&contract_id, snippet)
             .expect("Failed to insert contract hash.");
 
+        // `Contract::initialize_from_ast` brackets `eval_all` with this, and a
+        // deploy is the only thing that ever raises it. Without it the oracle
+        // dispatches a `contract-call?` through a constant that the chain
+        // refuses, which is the wrong half of the comparison to be lenient on.
+        contract_context.is_deploying = true;
         let result = eval_all(
             &contract_analysis.expressions,
             &mut contract_context,
             &mut global_context,
             None,
         )?;
+        contract_context.is_deploying = false;
 
         global_context
             .database
@@ -1137,7 +1143,8 @@ pub fn cost_crosscheck(
     );
     (
         CostMeter::from(compiled_env.cost_tracker.get_total()).saturating_sub(compiled_before),
-        CostMeter::from(interpreted_env.cost_tracker.get_total()).saturating_sub(interpreted_before),
+        CostMeter::from(interpreted_env.cost_tracker.get_total())
+            .saturating_sub(interpreted_before),
     )
 }
 

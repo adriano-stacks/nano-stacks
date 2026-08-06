@@ -743,6 +743,9 @@ impl ComplexWord for ContractCall {
 
         let function_name = args.get_name(1)?;
         let contract_expr = args.get_expr(0)?;
+        // Whether the target was resolved through a `define-constant`, which is
+        // the only one of the three static forms the reference gates at run time.
+        let mut target_is_constant = false;
         if let SymbolicExpressionType::LiteralValue(Value::Principal(PrincipalData::Contract(
             ref contract_identifier,
         ))) = contract_expr.expr
@@ -757,18 +760,26 @@ impl ComplexWord for ContractCall {
             builder
                 .i32_const(id_offset as i32)
                 .i32_const(id_length as i32);
-        } else if let Some(TypeSignature::CallableType(CallableSubtype::Principal(
-            contract_identifier,
-        ))) = contract_expr
+        } else if let Some((
+            TypeSignature::CallableType(CallableSubtype::Principal(contract_identifier)),
+            from_constant,
+        )) = contract_expr
             .match_atom()
             .and_then(|name| generator.constants.get(name.as_str()))
-            .or_else(|| generator.get_expr_type(contract_expr))
-            .cloned()
+            .map(|ty| (ty, true))
+            .or_else(|| generator.get_expr_type(contract_expr).map(|ty| (ty, false)))
+            .map(|(ty, from_constant)| (ty.clone(), from_constant))
         {
             // A name that resolves to a contract principal — a constant, most
             // often — is as static a call as a literal is. Only the literal
             // form was recognised, so `(contract-call? SOME_CONSTANT f)` was
             // taken for a trait dispatch and refused for not being one.
+            //
+            // A `let`-bound or parameter-bound callable reaches the same branch
+            // through its analysed type, and the reference dispatches through
+            // those unconditionally — so only the constant carries the run-time
+            // gate below.
+            target_is_constant = from_constant;
             builder.i32_const(0).i32_const(0);
             let (id_offset, id_length) = generator.add_literal(&contract_identifier.into())?;
             builder
@@ -881,6 +892,14 @@ impl ComplexWord for ContractCall {
 
         // Push the return offset and size to the data stack
         builder.local_get(return_offset).i32_const(return_size);
+
+        // After the arguments and before the callee, where the reference decides
+        // it: `special_contract_call` evaluates every argument — charging their
+        // costs, which land in the receipt of the failing transaction — and only
+        // then asks whether the atom names a dispatchable target.
+        if target_is_constant {
+            builder.call(generator.func_by_name("stdlib.check_constant_call_target"));
+        }
 
         // Call the host interface function, `contract_call`
         builder.call(generator.func_by_name("stdlib.contract_call"));
@@ -3462,47 +3481,159 @@ mod tests {
         }
     }
 
-    /// A constant naming a contract, called while the contract is *deploying*.
+    /// A constant naming a contract as a `contract-call?` dispatch target.
     ///
-    /// `special_contract_call` accepts a constant as a static dispatch target
-    /// only when three things hold (`clarity/src/vm/functions/database.rs:100`):
-    /// the Clarity version `supports_callables()`, the epoch
-    /// `supports_call_with_constant()` — and `!contract_context.is_deploying`.
-    /// The third is a *runtime* property, not a syntactic one: the same function
-    /// body refuses when a deploy's top level reaches it and dispatches when a
-    /// later transaction calls it.
+    /// `special_contract_call` accepts one only when three things hold
+    /// (`clarity/src/vm/functions/database.rs:100`): the Clarity version
+    /// `supports_callables()`, the *executing* epoch
+    /// `supports_call_with_constant()`, and `!contract_context.is_deploying`.
+    /// Miss any one and the atom is neither a callable constant nor a callable
+    /// variable, and the call ends as `ContractCallExpectName`.
     ///
-    /// clar2wasm has no counterpart. Measured, at the executing epoch:
+    /// None of the three can be settled where the module is built. A contract
+    /// keeps the version and the analysis it was published with while the chain
+    /// moves under it — the same reason `at-block` is checked twice — and the same
+    /// compiled function body runs once during the deploy and any number of times
+    /// after it. clar2wasm had no counterpart at all and dispatched in every case,
+    /// which is a *state root* divergence and not only a receipt one: the
+    /// reference's refused deploy publishes nothing.
     ///
-    /// ```text
-    /// compiled     Ok(Some(Response { committed: true, data: UInt(1) }))
-    /// interpreted  Err(RuntimeCheck(ContractCallExpectName))
-    /// ```
-    ///
-    /// So a deployment whose top level calls a contract through a constant
-    /// succeeds here and fails on the chain — a *state root* divergence and not
-    /// only a receipt one, since the reference's deploy transaction writes
-    /// nothing. It is `#[ignore]`d rather than fixed because the fix is a runtime
-    /// branch inside the module on a flag the host would have to publish, which
-    /// is more than a mapping change and wants its own measurement against
-    /// mainnet. Accounted for in tasks/060 as a known engine disagreement.
-    #[test]
-    #[ignore = "clar2wasm dispatches a constant contract-call while deploying, which the reference refuses with ContractCallExpectName"]
-    fn a_constant_contract_call_while_deploying_agrees() {
-        crosscheck_multi_contract(
-            &[
-                (
-                    ContractName::from_literal("callee"),
-                    "(define-public (foo) (ok u1))",
-                ),
-                (
-                    ContractName::from_literal("caller"),
-                    "(define-constant target .callee) (contract-call? target foo)",
-                ),
-            ],
-            Err(clarity::vm::errors::VmExecutionError::RuntimeCheck(
-                clarity::vm::errors::RuntimeCheckErrorKind::ContractCallExpectName,
-            )),
-        );
+    /// `initialize_contract` now brackets `.top-level` with the flag as
+    /// `Contract::initialize_from_ast` does, and the compiler emits
+    /// `check_constant_call_target` ahead of the host call — after the arguments,
+    /// where the reference decides it. A literal `.callee` and a `let`- or
+    /// parameter-bound callable reach other branches of the same word and are
+    /// left ungated, exactly as the reference leaves them.
+    mod constant_call_targets {
+        use clarity::types::StacksEpochId;
+        use clarity::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+        use clarity::vm::ClarityVersion;
+
+        use super::*;
+
+        const CALLEE: &str = "(define-public (foo) (ok u1))";
+
+        fn refused() -> Result<Option<Value>, VmExecutionError> {
+            Err(VmExecutionError::RuntimeCheck(
+                RuntimeCheckErrorKind::ContractCallExpectName,
+            ))
+        }
+
+        fn dispatched() -> Result<Option<Value>, VmExecutionError> {
+            Ok(Some(Value::okay(Value::UInt(1)).unwrap()))
+        }
+
+        /// Deployed in order, at an epoch and version named rather than inherited:
+        /// two of the three conditions *are* the epoch and the version, so a
+        /// default would hide which one answered.
+        fn deploy(
+            epoch: StacksEpochId,
+            version: ClarityVersion,
+            contracts: &[(&'static str, &'static str)],
+            expected: Result<Option<Value>, VmExecutionError>,
+        ) {
+            let named: Vec<_> = contracts
+                .iter()
+                .map(|(name, source)| (ContractName::from_literal(name), *source))
+                .collect();
+            crosscheck_multi_contract_with_env(
+                &named,
+                expected,
+                TestEnvironment::new(epoch, version),
+            );
+        }
+
+        #[test]
+        fn refused_while_the_contract_is_deploying() {
+            deploy(
+                StacksEpochId::Epoch40,
+                ClarityVersion::Clarity6,
+                &[
+                    ("callee", CALLEE),
+                    (
+                        "caller",
+                        "(define-constant target .callee) (contract-call? target foo)",
+                    ),
+                ],
+                refused(),
+            );
+        }
+
+        /// The flag belongs to the contract, not to its top level, so the refusal
+        /// follows the constant into a function the deploy calls.
+        #[test]
+        fn refused_inside_a_function_the_deploy_calls() {
+            deploy(
+                StacksEpochId::Epoch40,
+                ClarityVersion::Clarity6,
+                &[
+                    ("callee", CALLEE),
+                    (
+                        "caller",
+                        "(define-constant target .callee)
+                         (define-private (go) (contract-call? target foo))
+                         (go)",
+                    ),
+                ],
+                refused(),
+            );
+        }
+
+        /// The same constant in the same function, reached once the deploy that
+        /// defined it has finished. This is the half that says the gate is a
+        /// run-time one and not a refusal of the syntax.
+        #[test]
+        fn dispatched_once_the_deploy_has_finished() {
+            deploy(
+                StacksEpochId::Epoch40,
+                ClarityVersion::Clarity6,
+                &[
+                    ("callee", CALLEE),
+                    (
+                        "middle",
+                        "(define-constant target .callee)
+                         (define-public (go) (contract-call? target foo))",
+                    ),
+                    ("caller", "(contract-call? .middle go)"),
+                ],
+                dispatched(),
+            );
+        }
+
+        /// The epoch half, which is the one the original measurement was taken at:
+        /// before 3.4 a constant is not a dispatch target even outside a deploy.
+        #[test]
+        fn refused_before_the_epoch_that_allows_it() {
+            deploy(
+                StacksEpochId::Epoch33,
+                ClarityVersion::Clarity4,
+                &[
+                    ("callee", CALLEE),
+                    (
+                        "middle",
+                        "(define-constant target .callee)
+                         (define-public (go) (contract-call? target foo))",
+                    ),
+                    ("caller", "(contract-call? .middle go)"),
+                ],
+                refused(),
+            );
+        }
+
+        /// A contract name written out, in the place the constant was refused. The
+        /// reference's first match arm takes a literal without consulting the
+        /// epoch, the version or the flag, so the gate must not reach it.
+        #[test]
+        fn a_written_out_name_is_never_gated() {
+            deploy(
+                StacksEpochId::Epoch40,
+                ClarityVersion::Clarity6,
+                &[
+                    ("callee", CALLEE),
+                    ("caller", "(contract-call? .callee foo)"),
+                ],
+                dispatched(),
+            );
+        }
     }
 }

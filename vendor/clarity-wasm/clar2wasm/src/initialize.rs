@@ -383,6 +383,13 @@ pub fn initialize_contract(
     let mut call_stack = CallStack::new();
     let epoch = global_context.epoch_id;
     let clarity_version = *contract_context.get_clarity_version();
+    // A deploy's top level runs with this raised and every later call to the
+    // same contract runs with it lowered, exactly as `Contract::initialize_from_ast`
+    // brackets `eval_all` with it. It is what `contract-call?` through a constant
+    // consults: the constant's value is not frozen until the deploy that defines
+    // it has finished, so the reference refuses to dispatch through one here and
+    // dispatches through the same one afterwards.
+    contract_context.is_deploying = true;
     // One engine for every module the cache holds: a module can only be
     // instantiated in a store belonging to the engine that built it.
     let engine = module_cache.engine().clone();
@@ -430,6 +437,11 @@ pub fn initialize_contract(
         .map_err(|e| {
             error_mapping::resolve_error(e, instance, &mut store, &epoch, &clarity_version)
         })?;
+
+    // Lowered only once the top level has succeeded, as the reference lowers it:
+    // a failed deploy publishes no contract at all, so the flag it left behind is
+    // unobservable.
+    store.data_mut().contract_context_mut()?.is_deploying = false;
 
     // Get the type of the last top-level expression with a return value
     // or default to `None`.
@@ -732,9 +744,10 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
                 .data_map
                 .iter()
                 .map(|(name, value)| {
-                    let expected = tuple_type
-                        .field_type(name)
-                        .map_or_else(|| value.clone(), |field| implicit_contract_cast(field, value));
+                    let expected = tuple_type.field_type(name).map_or_else(
+                        || value.clone(),
+                        |field| implicit_contract_cast(field, value),
+                    );
                     (name.clone(), expected)
                 })
                 .collect();
