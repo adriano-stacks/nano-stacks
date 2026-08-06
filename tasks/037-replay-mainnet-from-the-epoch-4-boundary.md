@@ -36,10 +36,10 @@ never from fetched, staged or peer-reported height.
       diverged.
 - [ ] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip.
-- [ ] At a matching-receipts root divergence, capture the exact ordered
+- [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
-- [ ] Feed one identical journal through nano's MARF and the pinned stacks-core
+- [x] Feed one identical journal through nano's MARF and the pinned stacks-core
       MARF, including rewrites, forks and the imported mainnet checkpoint, to
       separate execution differences from trie differences.
 - [x] In a separately built conformance harness, compare compiler and
@@ -889,3 +889,140 @@ it is worth being precise about which:
 The remaining items are the ones only a longer run can close, and the divergence
 point is still moving — which is the honest reading of "until it stops moving for a
 real reason".
+
+## The write journal, and the blocker that was one flag
+
+The oracle this task kept asking for exists, and it runs against mainnet.
+
+A **journal recorder** now sits on `MarfStore`: an `Option<Box<WriteJournal>>` that
+a harness installs and a shipped node never does, so a write costs one branch
+rather than the `env::var_os` lookup the trace print beside it still takes. It
+records, per block and in order:
+
+- the MARF's own five height keys, which `begin` writes before anything else and
+  which `nano_marf::height_keys` now hands out rather than restating;
+- every Clarity write, with the **serialized value** beside the 40 bytes the trie
+  holds, so a journal can be read as well as replayed;
+- and nothing a rolled-back Clarity transaction wrote — `rollback_transaction`
+  truncates the journal to where `begin_transaction` marked it, because the MARF
+  restores its snapshot to the same point and a journal carrying a rolled-back
+  write would replay a trie the block never had.
+
+`begin` records the identifier the block *executes* under and `seal_to` records
+the one it *seals* under, which are different and both consensus.
+`nanos_execution_state_is_the_one_stacks_core_appends_under` pins the first
+against stacks-core: nano's `temporary_state_id()` is
+`StacksBlockId::new(&MINER_BLOCK_CONSENSUS_HASH, &MINER_BLOCK_HEADER_HASH)` to the
+byte, which it has to be, because the height keys name it.
+
+### What the journal oracle can falsify
+
+`write_journal` drives one recorded journal through `nano-marf` and through the
+pinned stacks-core MARF, comparing the root after **every** block, in four shapes:
+from a sentinel parent; forked two ways and each branch extended; over an
+**imported checkpoint**, where the ancestry arrives as back-pointers with
+`back_block` annotations rather than as blocks the process wrote; and with the
+writes perturbed. The journals are real — 48 captured blocks, 324 writes, 302
+rewrites of keys an ancestor holds and 65 rewrites inside one block, with
+`block_time`, `tenure_height`, `vm-account::` balances and nonces and
+`ustx_liquid_supply` all asserted present, so no native effect is missing from
+what is being compared.
+
+Over the imported checkpoint it asserts more than agreement: stacks-core, handed
+nano's journal and nothing else, seals the root each **block header committed
+to**. That is what makes the journal *complete* rather than self-consistent — a
+missing write, an extra write or a wrong value would not reach the chain's root,
+and `the_oracle_sees_a_dropped_write_and_a_changed_value` confirms each of those
+three moves it.
+
+What it cannot falsify: anything about *why* execution wrote what it wrote. The
+journal is the boundary. If the two MARFs agree and neither matches the chain, the
+journal is wrong and the fault is above the trie; if they disagree, it is the trie.
+It also says nothing about the side store — metadata, which nano keeps out of the
+MARF exactly as stacks-core does, is not in the trie and so not in this journal.
+
+### It found no MARF divergence, and one thing worth more
+
+`nano-marf` and stacks-core agree on every root, in every shape, on real data.
+The suspicion this plan recorded — "the interpreter is a way to carry a replay
+forward … a MARF packs a node's pointers in the order its keys were first
+written, so two runs reaching the same values by writing them in a different
+order seal different roots" — is now measurably **not** the explanation for a
+mainnet block of this shape:
+
+Reversing the order of a real block's writes does not change its root. In both
+implementations, identically. The reason is structural and narrows the whole
+class: a MARF's root is a `Node256`, indexed by path byte rather than packed in
+insertion order, so two writes are only ordered with respect to each other if
+they descend into the same node — and every write in the window's busiest block
+starts at a distinct path byte, because the paths are `Sha512_256` of the key. On
+top of that, 302 of 324 writes are rewrites, and a rewrite lands in a pointer slot
+whichever block first wrote the key already packed.
+
+Ordering *is* consensus where writes share a path prefix, and
+`ordering_is_consensus_for_writes_that_share_a_path_prefix` proves the oracle sees
+it there by constructing a colliding pair and sealing both orders. But for "a
+mismatched root with matching receipts" the reading changes: unless the block
+introduces keys that collide on a path prefix, **write order is not the
+explanation, and a missing or extra key is.**
+
+### The mainnet oracle was never actually closed
+
+This file recorded the general oracle as blocked: "stacks-core will not open the
+archive's MARF to read it … an open path that seeks in a SQLite blob where the
+trie is in the flat file beside it, read-only and `external_blobs` alike."
+
+It is one flag, and the wrong way round. `MARFOpenOpts::default()` leaves
+`external_blobs` **off**, so stacks-core reads `marf_data.data` — which a
+`stacks-core-marf-sqlite-v2` capture leaves empty, because the trie is in
+`marf.sqlite.blobs` beside it. Every read then comes back absent, which reads as
+"cannot open". With `MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true)`,
+stacks-core opens the 153 GB mainnet checkpoint and reports its published root:
+
+```
+stacks-core reads a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d
+             as 67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec
+```
+
+`mainnet_checkpoint`'s three gates were opening it the old way, so they were
+answering about an empty table rather than about the checkpoint; they are fixed,
+and `stacks_core_finds_the_contract_nano_cannot` now asserts the answer this file
+already established — `native-pool-v1` is absent at 8,665,600 because it was
+deployed at 8,665,687 — instead of the hypothesis it was written under.
+
+### Run against mainnet, from a pristine parent
+
+`replay-blocks <capture> <state-dir> <n> <journal>` installs the recorder on the
+production execution path and writes the journal out. Pointed at a reflink copy of
+the pristine 8,665,601 state and the mainnet capture, it recorded six real mainnet
+blocks. Fed to stacks-core over a copy of the mainnet checkpoint trimmed to the
+journal's own parent:
+
+```
+8665602  e5bf86db14b24d15e3e8329666f5b51f2d21fbf2bc23ad7fda19b16452c8eac5
+8665603  22ba1b7ae747af7871ee74fcd21b96ea620cdbb895c3ef0087b472281490a07e
+8665604  15ea2177c3e94dc114b65cb3945b418c529ed827bef9286aba45d4669073843d
+8665605  8fbb3eeee4b290e259a1fd9abe2eb5129d4ec032269ee09072252c88f481b2ea
+8665606  10aba44ed3d3556ba9864c6da79eac1224cc45318deb20b1c8e57582927170bf
+8665607  f41a3c25394d442c7b3944a47b3a2b8c591ac1991fe013d9d19002431de71af7
+```
+
+stacks-core's own MARF, over mainnet's own ancestry, handed nano's journal and
+nothing else, seals the root every one of those headers committed to.
+
+Two operational notes, both measured: the checkpoint copy is free on btrfs
+(`cp --reflink=always` of 153 GB + 229 GB takes 17 ms), and trimming the 6,183
+`marf_data` rows the archive holds past the checkpoint takes three seconds — so
+the four-and-a-half-hour import is not on this loop at all.
+
+### What is still open here
+
+There is no *current* matching-receipts root divergence to point this at. The
+frontier is 27,849 blocks past the checkpoint and moving, and the item was written
+when 8,665,780 was stuck. So the journal oracle is in the tree ahead of the
+divergence it was built for, which is the right order: the next one is diagnosed
+in minutes rather than reasoned about.
+
+`write_journal`'s six offline tests run on every commit against the captured
+fixture; the two mainnet ones are `skip_gate`d on `NANO_MAINNET_MARF` and
+`NANO_MAINNET_JOURNAL` and fail rather than skip under `NANO_REQUIRE_MAINNET`.

@@ -2975,7 +2975,21 @@ fn block_starts_new_tenure(block: &NakamotoBlock) -> bool {
     })
 }
 
-fn temporary_state_id() -> [u8; 32] {
+/// The state a followed block executes under, before it is sealed under its own
+/// identifier.
+///
+/// A block's real identifier contains the state root being computed, so nothing
+/// can execute under it. stacks-core runs `append_block` against
+/// `MINER_BLOCK_CONSENSUS_HASH` / `MINER_BLOCK_HEADER_HASH` — `[1u8; 20]` and
+/// `[1u8; 32]`, hashed as an index block hash — and commits to the real block
+/// afterwards, and this has to be the same 32 bytes: the MARF's height keys name
+/// it, and they are ordinary leaves in the root.
+///
+/// Public so a conformance harness can drive stacks-core's own MARF the way nano
+/// drives its own, and so that the identity above is a test rather than a
+/// comment.
+#[must_use]
+pub fn temporary_state_id() -> [u8; 32] {
     *sha512_256(&[1; 52]).as_bytes()
 }
 
