@@ -501,13 +501,17 @@ impl WasmGenerator {
     /// error branch it does not reach, and the chain answers `(ok u390)` — while
     /// the compiler would not build the contract at all, so every call into it
     /// failed.
+    ///
+    /// `already_used` is the caller's answer to `binding_name_already_used`,
+    /// taken *before* the branch's own binding is in scope.
     pub(crate) fn block_from_bound_expr(
         &mut self,
         builder: &mut InstrSeqBuilder,
         expr: &SymbolicExpression,
         binding: &ClarityName,
+        already_used: bool,
     ) -> Result<InstrSeqId, GeneratorError> {
-        if !self.is_reserved_name(binding) {
+        if !already_used {
             return self.block_from_expr(builder, expr);
         }
 
@@ -522,6 +526,26 @@ impl WasmGenerator {
         generate_name_already_used_error(self, &mut block, binding)?;
 
         Ok(block.id())
+    }
+
+    /// Returns `true` if binding `name` here is what the interpreter calls
+    /// `NameAlreadyUsed`.
+    ///
+    /// Mirrors `eval_with_new_binding` (`clarity/src/vm/functions/options.rs`),
+    /// which is the only place a name is checked where it binds rather than where
+    /// it is defined: a reserved word, one of the contract's own functions, or an
+    /// enclosing local. The analyzer's `check_special_match` checks a narrower
+    /// set — it misses reserved words other than `block-height`, and it misses
+    /// *read-only* functions, which are absent from the map it consults — so a
+    /// contract carrying either shape deploys and the disagreement is only
+    /// visible when the branch runs.
+    pub(crate) fn binding_name_already_used(&self, name: &ClarityName) -> bool {
+        let analysis = &self.contract_analysis;
+        self.is_reserved_name(name)
+            || analysis.private_function_types.contains_key(name)
+            || analysis.public_function_types.contains_key(name)
+            || analysis.read_only_function_types.contains_key(name)
+            || self.bindings.contains(name)
     }
 
     /// Returns `true` if `name` is already claimed by another contract-level definition.

@@ -45,6 +45,37 @@ const SHADOWED: &str = "
 (define-read-only (unwrapped-some) (unwrapped (some u5)))
 ";
 
+/// The same rule reached through a name that is not reserved at all: a
+/// *read-only* function's.
+///
+/// The analyzer's `match` check is `check_name_used`, which lists
+/// `private_function_types` and `public_function_types` and **not**
+/// `read_only_function_types` — so this deploys. The interpreter's runtime check
+/// is `contract_context.lookup_function`, which has all three, so the branch
+/// that binds the name raises `NameAlreadyUsed` when it runs and only then.
+/// Same shape as 8,668,096's reserved `err`, one map over, and the only other
+/// way a name can pass analysis and still be taken.
+const SHADOWS_A_READ_ONLY: &str = "
+(define-read-only (fee) u107)
+(define-private (charged (r (response uint uint)))
+  (match r amount (ok (+ amount u1)) fee (err fee)))
+(define-read-only (charged-ok) (charged (ok u389)))
+(define-read-only (charged-err) (charged (err u7)))
+";
+
+/// A binding that shadows an enclosing local, which neither engine ever runs.
+///
+/// `check_special_match` checks `inner_context.lookup_variable_type` as well, so
+/// the analyzer refuses the contract and the branch is unreachable. Kept because
+/// reading only the interpreter's `eval_with_new_binding` suggests a divergence
+/// here, and the deploy path is where that reading is settled.
+const SHADOWS_AN_ENCLOSING_LOCAL: &str = "
+(define-private (claim (r (response uint uint)))
+  (let ((claimed u1))
+    (match r claimed (ok (+ claimed u1)) e (err e))))
+(define-read-only (claim-ok) (claim (ok u389)))
+";
+
 fn id(name: &str) -> QualifiedContractIdentifier {
     QualifiedContractIdentifier::parse(&format!("ST000000000000000000002AMW42H.{name}"))
         .expect("a contract identifier")
@@ -52,12 +83,16 @@ fn id(name: &str) -> QualifiedContractIdentifier {
 
 /// Both engines' answers for a call, described the same way so they compare.
 fn both(function: &str) -> (String, String) {
+    both_in(SHADOWED, function)
+}
+
+fn both_in(source: &str, function: &str) -> (String, String) {
     let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
     wasm.begin_block(None, [0x41; 32]).expect("begin");
     wasm.deploy_contract(
         id("f"),
         ClarityVersion::Clarity3,
-        SHADOWED,
+        source,
         LimitedCostTracker::new_free(),
     )
     .expect("mainnet accepted this shape, so the compiler has to build it");
@@ -68,7 +103,7 @@ fn both(function: &str) -> (String, String) {
         &mut store,
         id("f"),
         ClarityVersion::Clarity3,
-        SHADOWED,
+        source,
         LimitedCostTracker::new_free(),
     )
     .expect("deploy under the interpreter");
@@ -134,6 +169,69 @@ fn the_branch_that_binds_a_reserved_name_fails_in_both() {
         assert!(
             interpreted.starts_with("failed:") || interpreted.starts_with("error:"),
             "{function} should have been rejected under the interpreter: {interpreted}"
+        );
+    }
+}
+
+/// The read-only function's name, the other name analysis lets through.
+#[test]
+fn a_binding_shadowing_a_read_only_function_is_rejected_only_where_it_binds() {
+    let (compiled, interpreted) = both_in(SHADOWS_A_READ_ONLY, "charged-ok");
+    assert_eq!(compiled, interpreted, "charged-ok");
+    assert!(
+        compiled.contains(&format!("{:?}", Value::UInt(390))),
+        "charged-ok answered {compiled}"
+    );
+
+    let (compiled, interpreted) = both_in(SHADOWS_A_READ_ONLY, "charged-err");
+    assert!(
+        compiled.starts_with("failed:") || compiled.starts_with("error:"),
+        "charged-err should have been rejected under the compiler: {compiled}"
+    );
+    assert!(
+        interpreted.starts_with("failed:") || interpreted.starts_with("error:"),
+        "charged-err should have been rejected under the interpreter: {interpreted}"
+    );
+}
+
+/// A binding that shadows an enclosing local never reaches a branch at all: the
+/// analyzer both engines share refuses the deployment.
+#[test]
+fn a_binding_shadowing_an_enclosing_local_is_refused_by_analysis() {
+    let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
+    wasm.begin_block(None, [0x41; 32]).expect("begin");
+    let compiled = wasm
+        .deploy_contract(
+            id("f"),
+            ClarityVersion::Clarity3,
+            SHADOWS_AN_ENCLOSING_LOCAL,
+            LimitedCostTracker::new_free(),
+        )
+        .expect_err("analysis refuses it")
+        .to_string();
+
+    let mut store = MarfStore::new(Network::TESTNET).expect("create the interpreter store");
+    store.begin(None, [0x42; 32]).expect("begin");
+    let interpreted = nano_oracle::deploy_contract(
+        &mut store,
+        id("f"),
+        ClarityVersion::Clarity3,
+        SHADOWS_AN_ENCLOSING_LOCAL,
+        LimitedCostTracker::new_free(),
+    )
+    .expect_err("analysis refuses it")
+    .to_string();
+
+    // `StaticCheckErrorKind::NameAlreadyUsed("claimed")`, which is the analyzer
+    // both engines run and not either engine's own judgement. The two deploy
+    // paths render it differently -- one through `Display`, one through `Debug`
+    // -- so both spellings count.
+    for (engine, refusal) in [("compiler", &compiled), ("interpreter", &interpreted)] {
+        assert!(
+            refusal.contains("claimed")
+                && (refusal.contains("conflicts with previous value")
+                    || refusal.contains("NameAlreadyUsed")),
+            "{engine} refused it for another reason: {refusal}"
         );
     }
 }

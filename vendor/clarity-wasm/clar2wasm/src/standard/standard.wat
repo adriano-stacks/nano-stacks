@@ -2478,7 +2478,13 @@
         )
     )
 
-    (func $stdlib.string-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
+    ;; The digits of an unsigned integer, with no sign of its own.
+    ;;
+    ;; `string-to-int?` and `string-to-uint?` are `i128::from_str` and
+    ;; `u128::from_str`, which strip exactly one leading '+' or '-' and then
+    ;; parse digits -- so the sign belongs to the caller and `"-+5"` is not a
+    ;; number.
+    (func $stdlib.digits-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
         (local $lo i64) (local $hi i64) (local $loaded i64)
         ;; a string is automatically invalid if its size is 0 or
         ;; bigger than 39, the max number of digits of a u128
@@ -2541,13 +2547,26 @@
             )
         )
         ;; we have to return if we have no more digits, otherwise it means that we have
-        ;; a result between (u128::MAX - 5)..u128::MAX or an overflow
+        ;; a result between (u128::MAX - 5)..u128::MAX or an overflow.
+        ;;
+        ;; The loop stops as soon as the result reaches u128::MAX/10, which it can
+        ;; *overshoot* -- any 38 digits above that quotient do -- so a last digit
+        ;; under 6 only lands in the top of the range when the result is that
+        ;; quotient exactly. Checking the digit alone answered u128::MAX for
+        ;; "999999999999999999999999999999999999995", which overflows and which
+        ;; the reference parses as none.
         (if (result i32 i64 i64)
             (i32.eqz (local.get $len))
             (then (i32.const 1) (local.get $lo) (local.get $hi))
             (else
                 (if (result i32 i64 i64)
-                    (i64.le_u (local.tee $loaded (i64.sub (i64.load8_u (local.get $offset)) (i64.const 48))) (i64.const 5))
+                    (i32.and
+                        (i32.and
+                            (i64.eq (local.get $hi) (i64.const 1844674407370955161))
+                            (i64.eq (local.get $lo) (i64.const -7378697629483820647))
+                        )
+                        (i64.le_u (local.tee $loaded (i64.sub (i64.load8_u (local.get $offset)) (i64.const 48))) (i64.const 5))
+                    )
                     (then (i32.const 1) (i64.add (i64.const -6) (local.get $loaded)) (i64.const -1))
                     (else (i32.const 0) (i64.const 0) (i64.const 0))
                 )
@@ -2555,7 +2574,27 @@
         )
     )
 
-    (func $stdlib.utf8-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
+    (func $stdlib.string-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
+        ;; `u128::from_str` strips one optional leading '+' before it counts a
+        ;; single digit, so the sign comes off before the 39-digit budget:
+        ;; "+340282366920938463463374607431768211455" is 40 characters and is
+        ;; u128::MAX. It strips no '-': that is a digit error, not a negative.
+        (if (i32.ne (local.get $len) (i32.const 0))
+            (then
+                (if (i32.eq (i32.load8_u (local.get $offset)) (i32.const 43)) ;; '+'
+                    (then
+                        (local.set $offset (i32.add (local.get $offset) (i32.const 1)))
+                        (local.set $len (i32.sub (local.get $len) (i32.const 1)))
+                    )
+                )
+            )
+        )
+        (call $stdlib.digits-to-uint (local.get $offset) (local.get $len))
+    )
+
+    ;; The digits of an unsigned integer written as UTF-8 scalars, with no sign.
+    ;; See `$stdlib.digits-to-uint`.
+    (func $stdlib.utf8-digits-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
         (local $lo i64) (local $hi i64) (local $loaded i64)
         ;; a string is automatically invalid if its size is 0 or
         ;; bigger than 39 (*4 bytes), the max number of digits of a u128
@@ -2621,14 +2660,22 @@
             )
         )
         ;; we have to return if we have no more digits, otherwise it means that we have
-        ;; a result between (u128::MAX - 5)..u128::MAX or an overflow
+        ;; a result between (u128::MAX - 5)..u128::MAX or an overflow. See
+        ;; `$stdlib.digits-to-uint`: the quotient has to be exact, not merely
+        ;; reached.
         (if (result i32 i64 i64)
             (i32.eqz (local.get $len))
             (then (i32.const 1) (local.get $lo) (local.get $hi))
             (else
                 (i32.and
-                    (i64.eqz (i64.and (local.tee $loaded (i64.load32_u (local.get $offset))) (i64.const 0xffffff)))
-                    (i64.le_u (local.tee $loaded (i64.sub (i64.shr_u (local.get $loaded) (i64.const 24)) (i64.const 48))) (i64.const 5))
+                    (i32.and
+                        (i64.eq (local.get $hi) (i64.const 1844674407370955161))
+                        (i64.eq (local.get $lo) (i64.const -7378697629483820647))
+                    )
+                    (i32.and
+                        (i64.eqz (i64.and (local.tee $loaded (i64.load32_u (local.get $offset))) (i64.const 0xffffff)))
+                        (i64.le_u (local.tee $loaded (i64.sub (i64.shr_u (local.get $loaded) (i64.const 24)) (i64.const 48))) (i64.const 5))
+                    )
                 )
                 (if (result i32 i64 i64)
                     (then (i32.const 1) (i64.add (i64.const -6) (local.get $loaded)) (i64.const -1))
@@ -2638,16 +2685,44 @@
         )
     )
 
+    (func $stdlib.utf8-to-uint (param $offset i32) (param $len i32) (result i32 i64 i64)
+        ;; One optional leading '+', as `$stdlib.string-to-uint` strips it. A
+        ;; UTF-8 scalar is four bytes in big-endian order, so '+' loads as
+        ;; 0x2b000000.
+        (if (i32.ne (local.get $len) (i32.const 0))
+            (then
+                (if (i32.eq (i32.load (local.get $offset)) (i32.const 721420288)) ;; '+'
+                    (then
+                        (local.set $offset (i32.add (local.get $offset) (i32.const 4)))
+                        (local.set $len (i32.sub (local.get $len) (i32.const 4)))
+                    )
+                )
+            )
+        )
+        (call $stdlib.utf8-digits-to-uint (local.get $offset) (local.get $len))
+    )
+
     (func $stdlib.string-to-int (param $offset i32) (param $len i32) (result i32 i64 i64)
         (local $neg i32) (local $lo i64) (local $hi i64)
 
-        ;; Save in neg if the number starts with "-"
-        (local.set $neg (i32.eq (i32.load8_u (local.get $offset)) (i32.const 45)))
-
-        (call $stdlib.string-to-uint
-            (i32.add (local.get $offset) (local.get $neg))
-            (i32.sub (local.get $len) (local.get $neg))
+        ;; `i128::from_str` strips one optional leading '+' or '-'. Stripping it
+        ;; here rather than in `$stdlib.string-to-uint` is what keeps "-+5" from
+        ;; parsing: the reference strips one sign, and then wants digits.
+        (if (i32.ne (local.get $len) (i32.const 0))
+            (then
+                (local.set $neg (i32.eq (i32.load8_u (local.get $offset)) (i32.const 45))) ;; '-'
+                (if (i32.or
+                        (local.get $neg)
+                        (i32.eq (i32.load8_u (local.get $offset)) (i32.const 43))) ;; '+'
+                    (then
+                        (local.set $offset (i32.add (local.get $offset) (i32.const 1)))
+                        (local.set $len (i32.sub (local.get $len) (i32.const 1)))
+                    )
+                )
+            )
         )
+
+        (call $stdlib.digits-to-uint (local.get $offset) (local.get $len))
         (local.set $hi)
         (local.set $lo)
 
@@ -2684,18 +2759,28 @@
     (func $stdlib.utf8-to-int (param $offset i32) (param $len i32) (result i32 i64 i64)
         (local $neg i32) (local $lo i64) (local $hi i64)
 
-        ;; Save in neg if the number starts with "-" (as 4 for the number of bytes)
-        (local.set $neg (i32.shl (i32.eq (i32.load (local.get $offset)) (i32.const 754974720)) (i32.const 2)))
-
-        (call $stdlib.utf8-to-uint
-            (i32.add (local.get $offset) (local.get $neg))
-            (i32.sub (local.get $len) (local.get $neg))
+        ;; One optional leading sign, as `$stdlib.string-to-int` strips it: '-'
+        ;; loads as 0x2d000000 and '+' as 0x2b000000.
+        (if (i32.ne (local.get $len) (i32.const 0))
+            (then
+                (local.set $neg (i32.eq (i32.load (local.get $offset)) (i32.const 754974720))) ;; '-'
+                (if (i32.or
+                        (local.get $neg)
+                        (i32.eq (i32.load (local.get $offset)) (i32.const 721420288))) ;; '+'
+                    (then
+                        (local.set $offset (i32.add (local.get $offset) (i32.const 4)))
+                        (local.set $len (i32.sub (local.get $len) (i32.const 4)))
+                    )
+                )
+            )
         )
+
+        (call $stdlib.utf8-digits-to-uint (local.get $offset) (local.get $len))
         (local.set $hi)
         (local.set $lo)
 
         ;; edge case i127::MIN
-        (if (i32.and (i32.ne (local.get $neg) (i32.const 0)) (i32.and (i64.eqz (local.get $lo)) (i64.eq (local.get $hi) (i64.const -9223372036854775808))))
+        (if (i32.and (local.get $neg) (i32.and (i64.eqz (local.get $lo)) (i64.eq (local.get $hi) (i64.const -9223372036854775808))))
             (then
                 (i32.const 1)
                 (i64.const 0)

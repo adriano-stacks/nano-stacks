@@ -522,11 +522,13 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
 /// more common way to reach it than a `print` under an `if`.
 /// `blacklist-susdh-v1` reads every one of its `default-to`s through `get`, so
 /// mainnet block 8,667,509 does not depend on which value comes back, and no
-/// shape found on the chain so far does. Ignored rather than deleted: it needs a
-/// decision at the analysis layer, and a red suite teaches people to ignore red
-/// suites.
+/// shape found on the chain so far does. Ignored rather than deleted: closing it
+/// needs a decision at the analysis layer — see
+/// `the_reference_answer_here_has_no_single_static_layout` below, which measures
+/// why no choice inside clar2wasm closes it — and a red suite teaches people to
+/// ignore red suites.
 #[test]
-#[ignore = "narrowing a tuple by its static type answers differently from the interpreter, which keeps the taken value's own type"]
+#[ignore = "the reference's answer has no static type: its shape follows the branch taken, and clar2wasm lays a value out from one static type"]
 fn a_narrowed_default_handed_back_whole_agrees() {
     let entry = Value::some(Value::Tuple(
         clarity::vm::types::TupleData::from_data(vec![
@@ -544,6 +546,56 @@ fn a_narrowed_default_handed_back_whole_agrees() {
     .expect("an optional");
     let (compiled, interpreted) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&entry)]);
     assert_eq!(compiled, interpreted);
+}
+
+/// Why the differential above cannot be closed by choosing differently inside
+/// clar2wasm.
+///
+/// `default-to` in the reference returns whichever value its branch produced,
+/// unconverted, so the *shape* of the answer follows the branch: the `some`
+/// branch hands back the optional's own two-field tuple and the `none` branch
+/// hands back the default's one-field tuple. The value's type is therefore not
+/// the expression's analysed type — `least_supertype` gave that the narrow one —
+/// and it is not any other single type either.
+///
+/// clar2wasm fixes a value's representation from one static type. Narrowing,
+/// which is what it does, reproduces the `none` branch and loses a field on the
+/// `some` branch; widening would reproduce the `some` branch and have to invent
+/// a field on the other. Neither is the reference, so the disagreement is not a
+/// choice clar2wasm gets to make — it is `least_supertype` handing an expression
+/// a type its value need not have. Only the reference's own analysis or a
+/// sanitized return closes it; a shipped node can do neither.
+///
+/// Measured, and only on the interpreter, so it states the fact without freezing
+/// what clar2wasm answers.
+#[test]
+fn the_reference_answer_here_has_no_single_static_layout() {
+    let entry = Value::some(Value::Tuple(
+        clarity::vm::types::TupleData::from_data(vec![
+            (
+                clarity::vm::ClarityName::from_literal("soft"),
+                Value::Bool(true),
+            ),
+            (
+                clarity::vm::ClarityName::from_literal("full"),
+                Value::Bool(true),
+            ),
+        ])
+        .expect("a tuple"),
+    ))
+    .expect("an optional");
+
+    let (_, wide) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&entry)]);
+    let (_, narrow) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&Value::none())]);
+
+    assert!(
+        wide.contains("\"full\""),
+        "the some branch should hand back the optional's own tuple: {wide}"
+    );
+    assert!(
+        !narrow.contains("\"full\""),
+        "the none branch should hand back the default's own tuple: {narrow}"
+    );
 }
 
 #[test]

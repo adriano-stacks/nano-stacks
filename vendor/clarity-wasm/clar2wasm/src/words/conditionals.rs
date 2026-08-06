@@ -353,6 +353,10 @@ impl ComplexWord for Match {
         // save the current set of named locals, for later restoration
         let saved_bindings = generator.bindings.clone();
 
+        // Asked before the branch's own binding is in scope, or every branch
+        // would look like it shadows itself.
+        let success_name_used = generator.binding_name_already_used(success_binding);
+
         generator.traverse_expr(builder, match_on)?;
         generator.bindings.enter_scope()?;
 
@@ -371,8 +375,12 @@ impl ComplexWord for Match {
                     .bindings
                     .insert(success_binding.clone(), *inner_type, some_locals);
 
-                let some_block =
-                    generator.block_from_bound_expr(builder, success_body, success_binding)?;
+                let some_block = generator.block_from_bound_expr(
+                    builder,
+                    success_body,
+                    success_binding,
+                    success_name_used,
+                )?;
 
                 // we can restore early, since the none branch does not bind anything
                 generator.bindings = saved_bindings;
@@ -396,14 +404,20 @@ impl ComplexWord for Match {
                 // Workaround: set type on err body
                 generator.set_expr_type(err_body, expr_ty)?;
 
+                let err_name_used = generator.binding_name_already_used(err_binding);
+
                 let err_locals = generator.save_to_locals(builder, err_ty, true);
                 let ok_locals = generator.save_to_locals(builder, ok_ty, true);
 
                 generator
                     .bindings
                     .insert(success_binding.clone(), ok_ty.clone(), ok_locals);
-                let ok_block =
-                    generator.block_from_bound_expr(builder, success_body, success_binding)?;
+                let ok_block = generator.block_from_bound_expr(
+                    builder,
+                    success_body,
+                    success_binding,
+                    success_name_used,
+                )?;
 
                 // restore named locals
                 generator.bindings.clone_from(&saved_bindings);
@@ -413,7 +427,12 @@ impl ComplexWord for Match {
                     .bindings
                     .insert(err_binding.clone(), err_ty.clone(), err_locals);
 
-                let err_block = generator.block_from_bound_expr(builder, err_body, err_binding)?;
+                let err_block = generator.block_from_bound_expr(
+                    builder,
+                    err_body,
+                    err_binding,
+                    err_name_used,
+                )?;
 
                 // restore named locals again
                 generator.bindings = saved_bindings;
@@ -1037,7 +1056,7 @@ mod tests {
     use clarity::vm::types::ResponseData;
     use clarity::vm::Value;
 
-    use crate::tools::{crosscheck, crosscheck_expect_failure, evaluate};
+    use crate::tools::{crosscheck, crosscheck_expect_failure, evaluate, interpret};
 
     #[test]
     fn trivial() {
@@ -1337,6 +1356,59 @@ mod tests {
 
         crosscheck(&format!("{ERR} (test none)"), Ok(Some(Value::Int(107))));
         crosscheck_expect_failure(&format!("{ERR} (test (some 115))"));
+    }
+
+    /// A *read-only* function's name is the one function name the analyzer's
+    /// `match` check does not consult.
+    ///
+    /// `check_name_used` lists `private_function_types` and
+    /// `public_function_types` and not `read_only_function_types`, so this
+    /// contract passes analysis and deploys; the interpreter's runtime check is
+    /// `contract_context.lookup_function`, which has all three, so it raises
+    /// `NameAlreadyUsed` on the branch that binds the name. Same shape as
+    /// mainnet 8,668,096's reserved `err`, one map over.
+    #[test]
+    fn clar_match_read_only_function_name_binds_only_on_its_own_branch() {
+        const SHADOW: &str = "
+(define-read-only (total) 107)
+(define-private (test (x (response int int)))
+ (match x
+   val (+ val 10)
+   total (+ total 107)))";
+
+        crosscheck(
+            &format!("{SHADOW} (test (ok 115))"),
+            Ok(Some(Value::Int(125))),
+        );
+        crosscheck_expect_failure(&format!("{SHADOW} (test (err 18))"));
+    }
+
+    /// A binding that shadows an enclosing local never reaches either engine.
+    ///
+    /// The interpreter checks it at run time, but the analyzer checks it too --
+    /// `inner_context.lookup_variable_type` in `check_special_match` -- so the
+    /// contract does not deploy and the branch is never taken. Recorded as a
+    /// test because reading only the interpreter suggests a divergence that the
+    /// deploy path makes unreachable.
+    #[test]
+    fn clar_match_shadowing_an_enclosing_local_is_refused_by_analysis() {
+        const SHADOW: &str = "
+(define-private (test (x (response int int)))
+ (let ((val 1))
+  (match x
+    val (+ val 10)
+    e (+ e 107))))";
+
+        for taken in ["(test (ok 115))", "(test (err 18))"] {
+            crosscheck_expect_failure(&format!("{SHADOW} {taken}"));
+        }
+        let refused = interpret(&format!("{SHADOW} (test (ok 115))"))
+            .expect_err("analysis refuses the contract")
+            .to_string();
+        assert!(
+            refused.contains("NameAlreadyUsed") || refused.contains("Name already used"),
+            "refused for another reason: {refused}"
+        );
     }
 
     #[test]

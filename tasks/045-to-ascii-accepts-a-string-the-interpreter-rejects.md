@@ -96,7 +96,7 @@ those changes stashed and with `words/` checked out from before them.
       then change the compiled path.
 - [x] Keep the reduced case as a unit test, so it does not depend on a
       gitignored seed file.
-- [ ] Check the neighbouring conversions — `to-utf8?`, `string-to-int?`,
+- [x] Check the neighbouring conversions — `to-utf8?`, `string-to-int?`,
       `string-to-uint?` — for the same leniency.
 
 ## Acceptance Criteria
@@ -104,3 +104,63 @@ those changes stashed and with `words/` checked out from before them.
 - `cargo test -p clar2wasm --test wasm-generation` is green with the seed file
   present and with it deleted.
 - The reduced input is a checked-in unit test.
+
+## The neighbours: one that does not exist, two that were wrong both ways
+
+`to-utf8?` is not a Clarity word. `clarity/src/vm/functions/mod.rs` has
+`ToAscii("to-ascii?", Clarity4)` and no counterpart; the conversions actually
+next door are `string-to-int?`, `string-to-uint?`, `int-to-ascii`,
+`int-to-utf8` and the four `buff-to-*`. Recorded because looking for it is
+otherwise a few minutes of grepping the wrong crate.
+
+`int-to-ascii` and `int-to-utf8` cannot have this bug: they build a decimal
+string, every byte of which is a digit or `-`, so no input is rejected and there
+is no rule to be lenient about. The `buff-to-*` four take a `(buff 16)` the
+analyzer already bounds.
+
+`string-to-int?` and `string-to-uint?` are `i128::from_str` and `u128::from_str`
+(`native_string_to_int_generic` hands the flattened bytes straight to
+`str::parse`). Two divergences, and — as with `to-ascii?` — one in each
+direction:
+
+**A leading `+`. The compiler was too strict.** `from_str_radix` strips one
+optional `+` for both signed and unsigned, and one `-` for signed only. The
+compiled path looked for `-`, and only in `string-to-int`:
+
+```
+(string-to-uint? "+5")   compiled none            interpreted (some u5)
+```
+
+The sign also comes off *before* any digit budget, so
+`"+340282366920938463463374607431768211455"` is 40 characters and is u128::MAX.
+Stripping it in `$stdlib.string-to-uint` rather than in the shared digit loop is
+what keeps `"-+5"` from parsing: the reference strips one sign and then wants
+digits, so the loop is now `$stdlib.digits-to-uint` and has no sign of its own.
+
+**Thirty-nine digits that overflow. The compiler was too lenient.** The digit
+loop stops as soon as the accumulated value *reaches* u128::MAX/10, and the tail
+then admitted any final digit under 6 — reconstructing the top of the range from
+the digit alone. But the loop can overshoot that quotient: any 38 digits above it
+do.
+
+```
+(string-to-uint? "999999999999999999999999999999999999995")
+  compiled (some u340282366920938463463374607431768211455)   interpreted none
+```
+
+The tail now requires the quotient exactly. The `string-to-int?` path masked this
+one by accident — u128::MAX has its high bit set, so the signed wrapper rejected
+it anyway — which is worth noting because "the int form agrees" was not evidence.
+
+Both are pinned in `words/conversion.rs` as
+`a_leading_plus_parses_as_the_reference_does` and
+`thirty_nine_digits_that_overflow_are_none`, ASCII and UTF-8, and both fail with
+`standard.wat` checked out from before the fix. The tables include the exact top
+of the range (`…211455`, `…211450`, i128::MIN) because a fix that made the
+overflow case `none` by narrowing the range would be a new bug.
+
+**What this does not prove.** Nothing about `to-ascii?` on a principal, a buffer
+or a bool, which are total and were never in question, and nothing about cost:
+these are `crosscheck` value comparisons, not `crosscheck_cost`. No mainnet block
+in the replayed window calls either word with a sign or a 39-digit literal, so
+this is a conformance fix ahead of a divergence rather than behind one.

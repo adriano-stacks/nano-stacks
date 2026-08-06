@@ -77,7 +77,7 @@ node may invoke.
       returns a taken branch's wider tuple but wasm exposes the narrowed layout.
       Keep the minimized ignored test until both engines agree on the complete
       returned value, not only on fields read through `get`.
-- [ ] Resolve `match` branch bindings that shadow an enclosing local: wasm
+- [x] Resolve `match` branch bindings that shadow an enclosing local: wasm
       currently accepts a shape the reference interpreter rejects with
       `NameAlreadyUsed`. Pin both the taken and untaken branch behavior.
 - [ ] Account for every ignored Clarity semantic differential in the release
@@ -1181,3 +1181,138 @@ The regression is `conformance/block_info_tenure_height.rs`, which builds the
 smallest chain that can tell the two defects apart: tenure heights advancing at half
 the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
 time that is never a Stacks timestamp. Both engines are asked, and they now agree.
+||||||| Stash base
+
+## The `match` shadowing item: the premise was wrong, and one map over is right
+
+The item says wasm accepts a `match` binding that shadows an enclosing local
+where the reference raises `NameAlreadyUsed`. Measured, it does not, because
+neither engine ever reaches the branch: the *analyzer* refuses the contract.
+
+`check_special_match`'s binding check
+(`clarity/src/vm/analysis/type_checker/v2_1/natives/options.rs:309-313`) is two
+things, not one:
+
+```rust
+checker.contract_context.check_name_used(&bind_name)?;
+if inner_context.lookup_variable_type(&bind_name).is_some() {
+    return Err(StaticCheckErrorKind::NameAlreadyUsed(bind_name.into()).into());
+}
+```
+
+The second line is exactly the enclosing-local case, at deploy time. So
+`(let ((claimed u1)) (match r claimed … e …))` never deploys under either
+engine, and the earlier note — which read the interpreter's
+`eval_with_new_binding` and inferred the rest — was reading only half the
+reference. Pinned as `a_binding_shadowing_an_enclosing_local_is_refused_by_analysis`
+in `wasm_match_binding_name`, both engines, same analysis error.
+
+**What the reference does let through is one map over.** Compare the two lists:
+
+| | analyzer's `check_name_used` | interpreter's `eval_with_new_binding` |
+|---|---|---|
+| reserved words | only `block-height`, Clarity 3+ | all of them |
+| private functions | yes | yes |
+| public functions | yes | yes |
+| **read-only functions** | **no** | **yes** (`lookup_function` has all three) |
+| constants, vars, maps, tokens, traits | yes | no |
+| enclosing locals | yes | yes |
+
+Two rows disagree in the direction that matters — a name that passes analysis and
+is then rejected when the branch runs. The first is the reserved word, which is
+8,668,096 and is fixed. The second is a **read-only function's name**, which
+`check_name_used` simply does not consult, and which had the same shape of bug:
+
+```clarity
+(define-read-only (fee) u107)
+(define-private (charged (r (response uint uint)))
+  (match r amount (ok (+ amount u1)) fee (err fee)))
+```
+
+deploys, and the error branch answered `(err u107)` under the compiler where the
+interpreter raises `NameAlreadyUsed("fee")`. This one is the opposite direction
+from 8,668,096: accepting what the network refuses, rather than refusing what it
+accepts.
+
+The fix reuses what 8,668,096 built. `block_from_bound_expr` compiled a branch to
+a runtime `NameAlreadyUsed` when the name was reserved; it now takes the answer to
+a predicate, `binding_name_already_used`, that mirrors all three of the
+interpreter's clauses — reserved, any of the contract's own functions, an
+enclosing local — asked *before* the branch's own binding is in scope. The
+enclosing-local clause can never fire in production, because analysis got there
+first; it is in the predicate because the predicate's job is to be the same
+sentence the reference is, not a list of cases seen so far.
+
+Gates: `clar_match_read_only_function_name_binds_only_on_its_own_branch` and
+`clar_match_shadowing_an_enclosing_local_is_refused_by_analysis` in
+`words/conditionals.rs`, and
+`a_binding_shadowing_a_read_only_function_is_rejected_only_where_it_binds` in
+`wasm_match_binding_name` — taken branch and untaken branch, both engines. The
+read-only test fails with the predicate reduced back to `is_reserved_name`; the
+shadowing test passes either way, which is itself the evidence that it was never
+a divergence.
+
+**What it does not prove.** No mainnet block in the replayed window binds a
+read-only function's name in a `match`, so this is conformance ahead of a
+divergence. And the predicate reads the contract's *analysis*, which holds every
+function the contract defines — where the interpreter's `contract_context` during
+a top-level expression at deploy time holds only the ones above it. A top-level
+`match` binding the name of a function defined further down the same contract
+would be refused a branch the reference would allow. Deliberate: it is one
+obscure shape against the whole of the ordinary call path, where the analysis view
+and the runtime view are the same set.
+
+## The tuple supertype asymmetry cannot be closed inside clar2wasm
+
+The item asks to make both engines agree on the *complete* value a narrowed
+`default-to` or `if` returns, not only on the fields read through `get`. It stays
+open, and the reason is not that nobody has picked the right layout — it is that
+there is no layout to pick.
+
+Measured on the interpreter alone
+(`the_reference_answer_here_has_no_single_static_layout` in
+`wasm_response_fold`), `(default-to { soft: false } entry)` over an
+`(optional { soft: bool, full: bool })` answers:
+
+```
+entry = (some { soft: true, full: true })   { "full": bool, "soft": bool }
+entry = none                                { "soft": bool }
+```
+
+Two different **shapes**, from one expression, chosen at run time. `default-to`
+returns whichever value its branch produced, unconverted, so the answer's type is
+not the expression's analysed type — `least_supertype` walks the *default's*
+fields and drops the rest, giving the narrow one — and it is not any other single
+type either.
+
+clar2wasm fixes a value's representation from one static type. Narrowing, which
+is what it does today, reproduces the `none` branch exactly and loses `full` on
+the `some` branch. Widening would reproduce the `some` branch and have to invent
+a `full` for the other, which no conversion can do. A discriminant carried beside
+the value would work and would infect every consumer of every such expression.
+So the choice is between two wrong answers, and today's is the one that agrees
+with the reference on the branch that has nothing to convert.
+
+That places the fix outside a shipped node. What closes it is the reference
+itself: either `least_supertype` refusing the asymmetric pair the way it already
+refuses the reverse one, or sanitizing a value to its analysed type when it is
+returned. `Value::sanitize_value` already exists and already does exactly this
+narrowing — epochs ≥ 2.4 apply it to function *arguments*
+(`callables.rs:303`, `sanitize_in_function_invocation`) and to values read out of
+the datastore, and not to returns. `special_contract_call` carries a
+`type_returns_constraint` only for dynamic trait dispatch, and checks it with
+`admits` rather than sanitizing. So a wide tuple does cross a static
+contract-call boundary and does land in a receipt.
+
+The differential stays `#[ignore]`d with that reason rather than deleted, and
+the measurement above is *not* ignored, so the claim keeps being checked. Written
+up because the previous note left it as "needs a decision at the analysis layer",
+which reads like an unfinished afternoon rather than a question that has to be
+asked of stacks-core.
+
+**What none of this proves.** That the shape is unreachable on mainnet — only
+that no block in the replayed window reaches it. `blacklist-susdh-v1` reads all
+three of its `default-to`s through `get`; a contract that returns such an `if` or
+`default-to` whole, across a contract-call or into a receipt, would diverge on
+nano today. It is the one known open Clarity semantic differential, and it belongs
+in the release report as such.

@@ -120,7 +120,7 @@ impl Bindings {
         self.depth
     }
 
-    pub(crate) fn contains(&mut self, name: &ClarityName) -> bool {
+    pub(crate) fn contains(&self, name: &ClarityName) -> bool {
         self.values.contains_key(name)
     }
 

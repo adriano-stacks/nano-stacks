@@ -306,6 +306,94 @@ mod tests {
             );
         }
 
+        /// `string-to-int?` and `string-to-uint?` are Rust's `from_str`, which
+        /// strips one optional leading sign before it looks at a digit.
+        ///
+        /// The compiled path recognised only `-`, and only for the signed form,
+        /// so it answered `none` where the reference answers a number. Stripping
+        /// the sign before the 39-digit budget matters too: with the sign the
+        /// reference still accepts u128::MAX, at 40 characters.
+        #[test]
+        fn a_leading_plus_parses_as_the_reference_does() {
+            for (snippet, expected) in [
+                (r#"(string-to-uint? "+5")"#, Value::some(Value::UInt(5))),
+                (r#"(string-to-uint? "+0")"#, Value::some(Value::UInt(0))),
+                (
+                    r#"(string-to-uint? "+340282366920938463463374607431768211455")"#,
+                    Value::some(Value::UInt(u128::MAX)),
+                ),
+                (r#"(string-to-int? "+5")"#, Value::some(Value::Int(5))),
+                (
+                    r#"(string-to-int? "+170141183460469231731687303715884105727")"#,
+                    Value::some(Value::Int(i128::MAX)),
+                ),
+                (r#"(string-to-int? u"+5")"#, Value::some(Value::Int(5))),
+                (r#"(string-to-uint? u"+5")"#, Value::some(Value::UInt(5))),
+            ] {
+                crosscheck(snippet, Ok(Some(expected.unwrap())));
+            }
+
+            // A sign is stripped once, and what follows has to be digits.
+            for snippet in [
+                r#"(string-to-uint? "+")"#,
+                r#"(string-to-uint? "++5")"#,
+                r#"(string-to-uint? "-5")"#,
+                r#"(string-to-uint? "5+")"#,
+                r#"(string-to-int? "+")"#,
+                r#"(string-to-int? "-+5")"#,
+                r#"(string-to-int? "+-5")"#,
+                r#"(string-to-int? u"-+5")"#,
+                r#"(string-to-int? u"+-5")"#,
+            ] {
+                crosscheck(snippet, Ok(Some(Value::none())));
+            }
+        }
+
+        /// Thirty-nine digits fit a u128's *width* but can still overflow it.
+        ///
+        /// The digit loop stops as soon as the result reaches u128::MAX/10 and
+        /// the tail then admitted any last digit under 6 — so 38 nines followed
+        /// by a 5 came back as u128::MAX where the reference answers `none`. The
+        /// exact top of the range has to keep working, which is the second half
+        /// of this table.
+        #[test]
+        fn thirty_nine_digits_that_overflow_are_none() {
+            for snippet in [
+                r#"(string-to-uint? "999999999999999999999999999999999999995")"#,
+                r#"(string-to-uint? "340282366920938463463374607431768211456")"#,
+                r#"(string-to-uint? "999999999999999999999999999999999999999")"#,
+                r#"(string-to-uint? u"999999999999999999999999999999999999995")"#,
+                r#"(string-to-int? "999999999999999999999999999999999999995")"#,
+            ] {
+                crosscheck(snippet, Ok(Some(Value::none())));
+            }
+
+            for (snippet, expected) in [
+                (
+                    r#"(string-to-uint? "340282366920938463463374607431768211455")"#,
+                    Value::some(Value::UInt(u128::MAX)),
+                ),
+                (
+                    r#"(string-to-uint? "340282366920938463463374607431768211450")"#,
+                    Value::some(Value::UInt(u128::MAX - 5)),
+                ),
+                (
+                    r#"(string-to-uint? u"340282366920938463463374607431768211455")"#,
+                    Value::some(Value::UInt(u128::MAX)),
+                ),
+                (
+                    r#"(string-to-int? "-170141183460469231731687303715884105728")"#,
+                    Value::some(Value::Int(i128::MIN)),
+                ),
+                (
+                    r#"(string-to-int? u"-170141183460469231731687303715884105728")"#,
+                    Value::some(Value::Int(i128::MIN)),
+                ),
+            ] {
+                crosscheck(snippet, Ok(Some(expected.unwrap())));
+            }
+        }
+
         #[test]
         fn negative_int_to_utf8() {
             crosscheck(
