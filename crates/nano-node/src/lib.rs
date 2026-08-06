@@ -70,18 +70,21 @@ pub struct CheckpointExecutor<S> {
 
 /// What this node derived for the burn block a Stacks block executes under.
 ///
-/// The first three are validation inputs and nothing else: `check_tenure_vrf`
-/// reads them and no Clarity word does, so filling them from the local burnchain
-/// rather than from a peer moves no state root. Taking them from the peer would
-/// mean trusting the peer for the input that decides whether a tenure is the one
-/// the network elected, which is the whole point of deriving sortitions here.
+/// Two kinds of thing, and the distinction is worth keeping in view. The
+/// sortition hash and the winner's registration are **validation** inputs:
+/// `check_tenure_vrf` reads them and no Clarity word does, so where they come from
+/// moves no state root — but taking them from a peer would mean trusting that peer
+/// for the input deciding whether a tenure is the one the network elected.
 ///
-/// `burn_spends` is the opposite kind of thing and travels here because it comes
-/// from the same arithmetic: `get-block-info? miner-spend-total` and
-/// `miner-spend-winner` read it, it lands in the header this node writes down, and
-/// so it *does* move state roots.
+/// Everything else here is **Clarity-visible** and therefore does move state
+/// roots: `burn-block-time`, `get-burn-block-info? header-hash`, `vrf-seed`, and
+/// `miner-spend-total`/`miner-spend-winner`. All of them are the sortition
+/// arithmetic's own answers, so a node holding a burnchain has no reason to ask a
+/// stranger — and a stranger's wrong answer would seal a root the block's own
+/// header refuses, which is how a substitution this deep can be made at all.
 #[derive(Clone, Copy, Debug)]
 struct LocalSortition {
+    bitcoin_height: u64,
     sortition_hash: [u8; 32],
     /// The winning commitment's leader-key VRF public key, when this node can
     /// name the winner without leaning on the burn distribution.
@@ -91,15 +94,34 @@ struct LocalSortition {
     winner_signing_key_hash: Option<[u8; 20]>,
     /// What the sortition's miners spent, and the winner's share.
     burn_spends: Option<nano_sortition::BurnSpends>,
+    /// The burn block's own header hash and time, from this node's burnchain.
+    burn_header_hash: [u8; 32],
+    burn_block_time: u64,
+    /// The winning commitment's new seed, which `get-block-info? vrf-seed` answers.
+    ///
+    /// `None` at a burn block that elected nobody, where there is no seed to state
+    /// and no tenure stands to ask.
+    winner_vrf_seed: Option<[u8; 32]>,
 }
 
 impl LocalSortition {
-    /// Put the sortition's burn spends into the context a block executes under.
+    /// Fill in everything a block's execution reads from its burn block.
     ///
-    /// Left alone when the derivation has no answer, which is a burn block that
-    /// elected nobody — and no tenure stands on one, so nothing that could have
-    /// been answered is left at zero by this.
-    fn record_burn_spends(self, bitcoin_context: &mut BitcoinBlockContext) {
+    /// A field the derivation has no answer for is left as it was rather than
+    /// zeroed: the peer's answer stands until this node can better it, and a zero
+    /// would be a wrong answer offered to a contract rather than a missing one.
+    fn record(self, bitcoin_context: &mut BitcoinBlockContext) {
+        bitcoin_context.sortition_hash = self.sortition_hash;
+        bitcoin_context.winner_vrf_public_key = self.winner_vrf_public_key;
+        bitcoin_context.winner_signing_key_hash = self.winner_signing_key_hash;
+        bitcoin_context.height = self.bitcoin_height;
+        bitcoin_context.burn_header_hash = self.burn_header_hash;
+        if self.burn_block_time > 0 {
+            bitcoin_context.burn_block_time = self.burn_block_time;
+        }
+        if let Some(seed) = self.winner_vrf_seed {
+            bitcoin_context.vrf_seed = seed;
+        }
         if let Some(spends) = self.burn_spends {
             bitcoin_context.burn_spend_total = u128::from(spends.total);
             bitcoin_context.burn_spend_winner = u128::from(spends.winner);
@@ -211,6 +233,30 @@ pub fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> 
     }))
 }
 
+/// Say what one round of catching up the sortition chain did.
+///
+/// The split, and not a total, because a total here was read as a per-Stacks-block
+/// cost once and it is not one: a sortition belongs to a burn block, and many
+/// Stacks blocks stand on one, so this is printed once per burn block. Reading is
+/// the burnchain, deriving is the hashes, and priming is the six blocks behind a
+/// fresh seed that a start pays for once — the largest single item in the phase,
+/// and it used to print nothing at all because no sortition came out of it.
+fn report_sortition_walk(walk: &crate::sortition::CatchUp, standing_on: u64) {
+    println!(
+        "derived {} sortitions locally, now standing on burn {standing_on} \
+         ({:.2}s reading {} burn blocks{}, {:.3}s deriving)",
+        walk.advanced,
+        walk.reading.as_secs_f64(),
+        walk.advanced + walk.primed,
+        if walk.primed > 0 {
+            format!(", {} of them priming the mining window", walk.primed)
+        } else {
+            String::new()
+        },
+        walk.deriving.as_secs_f64(),
+    );
+}
+
 /// Say where a locally derived sortition and the peer's answer part company.
 ///
 /// Reported rather than enforced while the derivation is being brought up, and
@@ -232,6 +278,23 @@ fn report_disagreements(local: &nano_sortition::SortitionSnapshot, peer: &nano_s
             peer.bitcoin_height,
             local.winner_vrf_seed.map(hex::encode),
             hex::encode(seed)
+        );
+    }
+    // The two remaining execution inputs, which are now taken from here rather than
+    // from the answer they are compared against. Said out loud for the same reason
+    // the seed is: a difference names which of the two chains of Bitcoin blocks is
+    // not the network's, and the state root that refuses the block afterwards does
+    // not say which field caused it.
+    if local.bitcoin_header_hash != peer.bitcoin_block_hash {
+        eprintln!(
+            "locally derived burn header hash at burn {} is {} where the peer says {}",
+            peer.bitcoin_height, local.bitcoin_header_hash, peer.bitcoin_block_hash
+        );
+    }
+    if local.bitcoin_timestamp != peer.bitcoin_timestamp {
+        eprintln!(
+            "locally derived burn header time at burn {} is {} where the peer says {}",
+            peer.bitcoin_height, local.bitcoin_timestamp, peer.bitcoin_timestamp
         );
     }
 }
@@ -638,10 +701,7 @@ where
             .first()
             .map_or(0, |block| block.header.bitcoin_spent);
         if let Some(local) = self.local_sortition(pox, &tenure.sortition, bitcoin_spent)? {
-            bitcoin_context.sortition_hash = local.sortition_hash;
-            bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
-            bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
-            local.record_burn_spends(&mut bitcoin_context);
+            local.record(&mut bitcoin_context);
         }
         self.seed_burn_headers(tenure.sortition.bitcoin_height);
         let current_tip = self.tip.block_id();
@@ -1200,26 +1260,7 @@ where
             // — the largest single item in this phase, and it used to print
             // nothing at all because no sortition came out of it.
             Ok(walk) if walk.advanced > 0 || walk.primed > 0 => {
-                // The split, and not a total, because a total here was read as
-                // a per-Stacks-block cost once and it is not one: a sortition
-                // belongs to a burn block, and this line is printed once per
-                // burn block. Reading is the burnchain, deriving is the hashes,
-                // and priming is the six blocks behind a fresh seed that a
-                // start pays for once.
-                println!(
-                    "derived {} sortitions locally, now standing on burn {} \
-                     ({:.2}s reading {} burn blocks{}, {:.3}s deriving)",
-                    walk.advanced,
-                    tracker.tip().bitcoin_height,
-                    walk.reading.as_secs_f64(),
-                    walk.advanced + walk.primed,
-                    if walk.primed > 0 {
-                        format!(", {} of them priming the mining window", walk.primed)
-                    } else {
-                        String::new()
-                    },
-                    walk.deriving.as_secs_f64(),
-                );
+                report_sortition_walk(&walk, tracker.tip().bitcoin_height);
                 walk.advanced
             }
             Ok(walk) => walk.advanced,
@@ -1265,10 +1306,14 @@ where
         // no winner while carrying commitments is ordinary — mainnet's 960,222
         // is one — so the count is a report on the tracker and not a condition.
         let local = LocalSortition {
+            bitcoin_height: tip.bitcoin_height,
             sortition_hash: *tip.sortition_hash.as_bytes(),
             winner_vrf_public_key: tip.winner_vrf_public_key,
             winner_signing_key_hash: tip.winner_signing_key_hash,
             burn_spends: tracker.burn_spends(),
+            burn_header_hash: *tip.bitcoin_header_hash.as_bytes(),
+            burn_block_time: tip.bitcoin_timestamp,
+            winner_vrf_seed: tip.winner_vrf_seed,
         };
         // Rejected rather than reported. A Nakamoto header's `bitcoin_spent` is
         // the running burn total of its view and carries threshold signer weight,
@@ -1602,15 +1647,7 @@ where
             // rule it could not run and why, which is the honest state; filled
             // from the peer, it would be checking the peer against itself.
             if let Some(local) = local? {
-                bitcoin_context.sortition_hash = local.sortition_hash;
-                bitcoin_context.winner_vrf_public_key = local.winner_vrf_public_key;
-                bitcoin_context.winner_signing_key_hash = local.winner_signing_key_hash;
-                // Clarity-visible, unlike the three above, and the reason this
-                // whole derivation had to be right before it could be filled in:
-                // a wrong non-zero answer to `miner-spend-total` is harder to
-                // find than the zero this used to leave, and the offline replay
-                // that verifies every state root does not run this path.
-                local.record_burn_spends(&mut bitcoin_context);
+                local.record(&mut bitcoin_context);
             }
             let phase = std::time::Instant::now();
             self.seed_burn_headers(sortition.bitcoin_height);

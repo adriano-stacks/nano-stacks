@@ -18,6 +18,13 @@ use nano_address::PoxAddress;
 pub struct BitcoinBlock {
     pub height: u64,
     pub hash: [u8; 32],
+    /// The header's `nTime`, which Clarity reads back as `burn-block-time`.
+    ///
+    /// A property of the block rather than of the operations in it, and the one
+    /// Clarity-visible burn field a node could otherwise only get from a peer: the
+    /// header hash it already reads for itself, and the winning commitment's seed
+    /// its own sortition derives.
+    pub timestamp: u64,
     pub operations: Vec<BitcoinOperation>,
 }
 
@@ -790,6 +797,7 @@ pub fn decode_block_with_pre_stx(
     Ok(BitcoinBlock {
         height,
         hash: bitcoin_hash_bytes(block.block_hash().to_byte_array()),
+        timestamp: u64::from(block.header.time),
         operations,
     })
 }
@@ -1033,6 +1041,7 @@ mod tests {
         source.last_block = Some(BitcoinBlock {
             height: 123,
             hash: [0x42; 32],
+            timestamp: 0,
             operations: Vec::new(),
         });
         source.pre_stx.senders.insert([0x01; 32], (sender, 120));

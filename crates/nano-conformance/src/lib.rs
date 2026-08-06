@@ -2065,16 +2065,17 @@ mod tests {
         let mut chainstate = captured_chainstate(&fixture);
         let mut bitcoin = FixtureBitcoinSource {
             blocks: [
-                (first_context.height, &first.header.consensus_hash),
-                (second_context.height, &second.header.consensus_hash),
+                (&first_context, &first.header.consensus_hash),
+                (&second_context, &second.header.consensus_hash),
             ]
             .into_iter()
-            .map(|(height, consensus_hash)| {
+            .map(|(context, consensus_hash)| {
                 (
-                    height,
+                    context.height,
                     BitcoinBlock {
-                        height,
+                        height: context.height,
                         hash: [0; 32],
+                        timestamp: context.burn_block_time,
                         operations: bitcoin_operations
                             .get(&consensus_hash.to_string())
                             .expect("Bitcoin operations")
@@ -2133,16 +2134,17 @@ mod tests {
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let bitcoin = FixtureBitcoinSource {
             blocks: [
-                (first_context.height, &first.header.consensus_hash),
-                (second_context.height, &second.header.consensus_hash),
+                (&first_context, &first.header.consensus_hash),
+                (&second_context, &second.header.consensus_hash),
             ]
             .into_iter()
-            .map(|(height, consensus_hash)| {
+            .map(|(context, consensus_hash)| {
                 (
-                    height,
+                    context.height,
                     BitcoinBlock {
-                        height,
+                        height: context.height,
                         hash: [0; 32],
+                        timestamp: context.burn_block_time,
                         operations: bitcoin_operations
                             .get(&consensus_hash.to_string())
                             .expect("Bitcoin operations")
@@ -2740,6 +2742,7 @@ mod tests {
         let block = nano_bitcoin::BitcoinBlock {
             height,
             hash: [9; 32],
+            timestamp: 0,
             operations: vec![commit(1, on_time), commit(2, (on_time + 1) % 5)],
         };
 
@@ -4177,6 +4180,7 @@ mod tests {
             let block = nano_bitcoin::BitcoinBlock {
                 height,
                 hash,
+                timestamp: 0,
                 operations: Vec::new(),
             };
             let winner_vrf_seed = (height % 3 == 0).then_some(hash);

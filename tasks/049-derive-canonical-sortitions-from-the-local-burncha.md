@@ -754,3 +754,36 @@ Restarted with both, the same state resumed and executed 80–195 blocks a minut
 against the same peer set. The lesson is the one already written on
 [[047-make-mainnet-synchronization-monotonic-and-restart]]: sample the process
 before believing any story about where time goes.
+
+## All three remaining execution inputs come from this node's own burnchain
+
+`vrf_seed`, `burn_block_time` and the burn header hash were the three
+Clarity-visible fields the note above left with the peer. They come from the
+locally derived snapshot now, along with the two burn spends, and one thing had to
+be added to make it possible: a Bitcoin block carries its header time and nothing
+was reading it. `BitcoinBlock::timestamp`, `SortitionSnapshot::bitcoin_timestamp`,
+and the capture's own `burn_header_timestamp` column for a chain's seed — which a
+resumed chain has to state, because the tenure standing on the seed's own burn view
+is executed before the chain advances once.
+
+**Why this can be switched over rather than compared forever.** A wrong answer to
+any of the five does not corrupt state: it changes the root the block seals, the
+header the network signed states a different one, and the block is refused with
+nothing committed. That is the opposite of the position the *validation* inputs are
+in, where a wrong answer is invisible — and it is why the sortition hash and the
+winner's registration were derived locally months before these were.
+
+The oracles are the archive's own columns, per burn block, in
+`mainnet_sortition::the_node_tracker_derives_the_same_window`: consensus hash,
+sortition hash, running burn total, winner, burn header hash, **burn header time**
+and the two spends, for every block of the captured mainnet window. The peer's
+answer is still fetched and still compared — `report_disagreements` names any of
+the four fields that parts company — because a difference tells an operator which
+of two chains of Bitcoin blocks is not the network's, and the state root that
+refuses the block afterwards does not say which field caused it.
+
+What the peer still supplies is the burn *view* of a block whose tenure change this
+node did not execute, and the height that view sits at. Both are checked rather
+than trusted: the pool's answer must carry the consensus hash it was asked for, the
+tracker derives the consensus hash at the height it walked to, and a header whose
+cumulative burn disagrees with the derived total stops the round.
