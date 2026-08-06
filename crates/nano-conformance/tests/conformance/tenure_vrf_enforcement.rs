@@ -86,15 +86,30 @@ fn captured_tenure() -> Option<Tenure> {
 /// rejections do not depend on this.
 fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
     let fixture = capture();
-    candidate_keys(&fixture).into_iter().find(|key| {
+    let keys = candidate_keys(&fixture);
+    let found = keys.iter().copied().find(|key| {
         nano_chainstate::verify_coinbase_vrf_proof(
             &tenure.target.block,
             key,
             &tenure.target.context.sortition_hash,
         )
         .is_ok()
-    })
+    });
+    if found.is_none() {
+        eprintln!(
+            "no candidate key verifies block {} (burn {}): {} candidates, proof {}, \
+             sortition hash {}",
+            tenure.target.block.header.chain_length,
+            tenure.target.context.height,
+            keys.len(),
+            nano_chainstate::coinbase_vrf_proof(&tenure.target.block)
+                .map_or_else(|| "absent".to_owned(), |proof| hex::encode(&proof[..8])),
+            hex::encode(tenure.target.context.sortition_hash),
+        );
+    }
+    found
 }
+
 
 fn capture() -> std::path::PathBuf {
     nano_conformance::capture_root(&Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
@@ -148,7 +163,8 @@ fn candidate_keys(fixture: &Path) -> Vec<[u8; 32]> {
 fn winning_registration(tenure: &Tenure) -> Option<nano_bitcoin::BitcoinOperation> {
     let fixture = capture();
     let key = winning_key(tenure)?;
-    nano_conformance::captured_bitcoin_operations(&fixture)?
+    let inside_the_window = nano_conformance::captured_bitcoin_operations(&fixture)
+        .unwrap_or_default()
         .values()
         .flatten()
         .find(|operation| {
@@ -160,7 +176,49 @@ fn winning_registration(tenure: &Tenure) -> Option<nano_bitcoin::BitcoinOperatio
                 } if vrf_public_key == key
             )
         })
-        .cloned()
+        .cloned();
+    // The registration is usually *not* in the captured Bitcoin window -- a leader
+    // key is registered once and named for years -- so the checkpoint's registry is
+    // the other place to build it from. The two fields these gates read are the ones
+    // the registry keeps: the VRF key that produced the proof, and the block-signing
+    // hash the miner signs its headers under.
+    inside_the_window.or_else(|| registered_in_the_registry(&fixture, key))
+}
+
+/// The registration the checkpoint's registry holds for a VRF key.
+///
+/// Rebuilt rather than replayed: a registry row is the four columns stacks-core's
+/// `leader_keys` table keeps, not a Bitcoin transaction, so the operation carries a
+/// zero txid and no outputs. Nothing these gates check reads either -- they read the
+/// VRF key and the signing hash, which is exactly what the row states.
+fn registered_in_the_registry(
+    fixture: &Path,
+    key: [u8; 32],
+) -> Option<nano_bitcoin::BitcoinOperation> {
+    let registry = fixture
+        .join("sortition")
+        .join(nano_node::sortition::LEADER_KEY_FILE);
+    let records: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(registry).ok()?).ok()?;
+    records.iter().find_map(|record| {
+        let public_key = record.get("public_key")?.as_str()?;
+        let vrf_public_key = <[u8; 32]>::try_from(hex::decode(public_key).ok()?.as_slice()).ok()?;
+        if vrf_public_key != key {
+            return None;
+        }
+        let memo = hex::decode(record.get("memo")?.as_str()?).unwrap_or_default();
+        Some(nano_bitcoin::BitcoinOperation {
+            txid: [0; 32],
+            transaction_index: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            kind: nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                consensus_hash: [0; 20],
+                vrf_public_key,
+                block_signing_key_hash: <[u8; 20]>::try_from(memo.as_slice()).ok(),
+                memo: Vec::new(),
+            },
+        })
+    })
 }
 
 /// Execute one tenure-start block against a fresh checkpoint and say whether it

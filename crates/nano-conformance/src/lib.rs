@@ -49,6 +49,15 @@ struct CapturedBitcoinSnapshot {
     /// rather than re-deriving it means the replay's oracle for that field is the
     /// archive rather than nano's own arithmetic.
     pox_payouts: String,
+    /// The tenure's sortition hash, which a coinbase VRF proof is over.
+    ///
+    /// Read from the archive rather than re-derived, like `pox_payouts` above and
+    /// for the same reason: it is the oracle. Leaving it out left every captured
+    /// context's hash at zero, which no VRF proof can verify against -- so the five
+    /// `tenure_vrf_enforcement` gates skipped themselves on *every* capture and
+    /// reported it as a missing leader key.
+    #[serde(default)]
+    sortition_hash: String,
 }
 
 /// The payout outputs and the total burn a snapshot's `pox_payouts` states.
@@ -1591,6 +1600,11 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                     context.vrf_seed = vrf_seed;
                     context.burn_spend_total = burn_spend_total;
                     context.burn_spend_winner = burn_spend_winner;
+                    // Validation only, and absent from a capture written before it
+                    // was recorded: zero then, which reads as "cannot check" at the
+                    // rule rather than as a wrong answer.
+                    context.sortition_hash =
+                        decode_hash(&snapshot.sortition_hash).unwrap_or_default();
                     context
                 },
             ))
