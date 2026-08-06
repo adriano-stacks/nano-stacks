@@ -59,7 +59,7 @@ steady-state operation may require a hosted Stacks API.
       hosted Stacks APIs removed, including maturity reconstruction and missing
       historical-header acquisition. Record which discovered peer served every
       tenure and show that no one peer is load-bearing.
-- [ ] Make exchanged Nakamoto inventories drive a bounded forward download
+- [x] Make exchanged Nakamoto inventories drive a bounded forward download
       schedule instead of only prioritizing peers during the backward
       parent-walk.
 - [ ] Complete a live whole-sync interoperability run with a stock
@@ -873,3 +873,222 @@ inbound queue, whose contents have to survive `ChainState::authenticate_block`
 before anything happens to them, while a block this node mined was assembled on
 its own tip and had its state root sealed here. There is nothing to authenticate it
 against that it did not already pass.
+
+## The fifth slice: an inventory decides what to fetch, not only who to ask
+
+One item closed and two left open, and the two are open for reasons worth writing
+down rather than for want of a run.
+
+### What the previous four slices did with an inventory, and what they could not
+
+`Swarm::exchange_inventories` asked every peer about the cycle being walked and
+published the endpoints of those claiming any of it; the descent put those first.
+That is a shortlist. `assign_tenures` — the scheduler, unit tested since the second
+slice — stayed uncalled, and the third slice recorded the reason honestly: it spreads
+a *set* of wanted tenures over the peers claiming them, and a downloader that walks
+parent links backwards from a peer's tip never has a set. It always knows the single
+tenure it wants next, because the identifier of that tenure is inside the answer to
+the last one.
+
+The cost of that is not a round trip here and there. **Nothing can execute until the
+whole gap has been downloaded**, because the chain a backward descent stages is not
+contiguous with this node's tip until the descent reaches it. From the mainnet
+checkpoint that is twenty thousand blocks of downloading before the first one runs,
+and it is why `catch_up` needs `descent_resumes_at` and a `ROUND_FETCH` of 4,000 at
+all.
+
+### A tenure can be addressed by the burn view that elected it
+
+That is the whole unlock, and it is an endpoint that was already on nano's wire.
+`GET /v3/tenures/fork_info/:start/:stop` answers one `TenureForkingInfo` per sortition
+in a range, and each carries `nakamoto_blocks`: the whole tenure, consensus-serialized
+and hex-encoded through `prefix_opt_hex_codec`. Nano's client fetched that endpoint for
+fork detection and threw the field away.
+
+With `start == stop` it is exactly one tenure. `get_tenures_fork_info` pushes the stop
+snapshot and then walks parents *while the cursor is not the start*, so a request naming
+one view twice never enters the walk and never reaches the `NotInSameFork` check inside
+it. Read from the source and then confirmed against a discovered mainnet peer:
+
+```
+GET http://150.136.127.40:20443/v3/tenures/fork_info/da8c…67cd/da8c…67cd
+200, 122,015 bytes: 1 entry, burn 961290, was_sortition true,
+  first_block_mined 0x0bed…cd30, nakamoto_blocks 0x00000018… (24 blocks)
+```
+
+A consensus hash is derivable ahead of time — `SortitionTracker` names every burn
+block this node has walked, 294,442 of them on the running mainnet node — so a tenure
+addressed this way can be asked for before anything above it is known. That is a
+forward order, and it is what `assign_tenures` needed.
+
+### The schedule, and what each half is allowed to decide
+
+`CheckpointExecutor::schedule_tenures` is a pure function of local state and peer
+claims, and `fetch_scheduled` is the I/O. Split that way for two reasons: the
+scheduling is the part with a policy in it and no network, and a shared borrow of the
+executor held across an await makes the whole future non-`Send` — the same wall
+`&Swarm` hit in the second slice.
+
+Two answers make each entry and neither comes from the other side. The burn view is
+`SortitionTracker::consensus_hash_at` for that Bitcoin height, because a consensus hash
+taken from a peer would make that peer's burnchain the thing nano's own requests are
+keyed on. The endpoint is the peer whose inventory claimed *that* tenure.
+
+Burn blocks that elected nobody leave the wanted list for free, and that is the neatest
+part. The wanted list is every offset of the cycle above what this node holds — nano's
+hash history keeps consensus hashes and not snapshots, so it cannot say which of those
+burn blocks had a sortition — and `assign_tenures` drops every offset no peer claims. A
+burn block with no tenure is claimed by nobody, so the inventory answers a question the
+local history cannot.
+
+`Discovered` now publishes the claims themselves and not only the endpoint shortlist.
+Claims from peers with no HTTP endpoint are kept: `assign_tenures` drops them because
+there is nowhere to fetch from, and dropping them earlier would make "how many peers
+claimed this tenure" unanswerable.
+
+### Three bugs the tests found, and one the running node had already had
+
+**A tenure fetched by burn view is not self-verifying.** A block asked for by
+identifier is — the identifier is the hash of what comes back, which is what
+`SyncClient::block`'s comparison rests on and what makes spreading a repair over
+strangers safe. A tenure named by the view that elected it is not, so
+`SyncClient::tenure_at` refuses an answer any of whose blocks state a different
+`consensus_hash`. Without it any peer in a pool could answer a scheduled tenure with
+somebody else's blocks.
+
+**Stopping at the first tenure nobody serves reads frugal and is useless.** Nothing
+above a gap can execute until it closes, so not fetching past one looks right. But most
+"gaps" in the wanted list are burn blocks that elected nobody, and on mainnet the next
+one is never more than a few away — the offline gate showed a round that scheduled
+exactly one tenure and gave up. Skipping is correct and costs nothing, because staging
+is durable and a block above a gap is executed by the round that closes it. Only every
+peer rate limiting ends the run.
+
+**Anchoring the schedule at the executed tip made it re-download.** A tip advances by a
+tenure a round while the window is thirty-two tenures long, so each round asked again
+for what the last one had already staged and paid for it again. `Staging::highest` is
+what it anchors at now — the furthest block this node has *acquired* rather than run —
+and the offline gate asserts no burn view is asked for more than twice across a whole
+run. It would have been sixty-four.
+
+**`TenureSource::prefer` had never once worked on mainnet.** It compared a peer's
+advertised `data_url`, `http://34.150.184.50:20443`, against the client's
+`base_url().to_string()`, which a `Url` normalises to `http://34.150.184.50:20443/`.
+Never equal, so the third slice's "ask the peers the inventory says hold this cycle
+first" was a no-op for the life of the running node. Both it and the schedule's endpoint
+lookup compare parsed `Url`s now.
+
+And one more, on the same path and found while reading it: **`parse_hex` refused the
+`0x` prefix**, while `/v3/tenures/fork_info` states every hash prefixed — stacks-core
+through `prefix_hex`, and nano's own RPC through `TenureForkInfoWire`. So
+`SyncClient::tenure_fork_info` could not parse a single real answer from either
+implementation, and the only fork check that ever parsed was the one against a test peer
+that happened to serve them bare. The parser is prefix-tolerant now, with the length
+still checked against the hash rather than the string.
+
+### The gates
+
+`tests/conformance/inventory_schedule.rs`, three tests, offline over the captured chain:
+
+| Test | The claim |
+|---|---|
+| an inventory drives a forward download the first round executes | the first scheduled round executes blocks where the backward descent under the same budget executes none, both close on the same tip, signed root and content root, and no burn view is asked for more than twice |
+| a peer that claimed nothing is asked only for absent tenures | every tenure the claiming peer holds went to it; the other peer is asked only for views neither holds |
+| a tenure answered for another burn view is refused | `UnexpectedTenure`, against a fixture peer that substitutes another tenure's blocks |
+
+The middle one is stated that way because the stronger version is false, and the
+difference matters: a claim **shortlists and never excludes**. `TenureSource` falls back
+to the rest of the pool when the named peer cannot serve, and removing that would mean a
+peer's inventory could stop nano fetching a tenure — the one thing a claim must not be
+able to do.
+
+`p2p_discovery.rs::mainnet_inventories_schedule_a_forward_download`, gated on
+`NANO_P2P_MAINNET`, is the same code against mainnet from the four seeds and nothing
+else:
+
+```
+4 endpoints to fetch from: 3.122.176.89, 34.150.184.50, 52.77.118.154, 54.91.222.127
+cycle opens at burn 960051, named ccab792c6601847829a51c700a1af658c37d6b71
+4 peers answered, 4 claiming tenures of it
+4 of 6 scheduled tenures fetched, 126 blocks, over 3 peers
+```
+
+It also measured something only a real peer could teach: **the newest few tenures
+answer empty.** `TenureForkingInfo::from_snapshot` reads a tenure's blocks against the
+serving node's own Stacks tip, so a sortition whose tenure that node has not processed
+yet answers `was_sortition: true` with a zero-length block vector. Asked for the six
+highest offsets every peer claimed, three came back empty from all four peers and their
+burn heights were the top of the burnchain. It costs nothing in production — a catching
+-up node wants the older end, and the follow path covers the tip — and it would have
+made the gate flaky, so the gate leaves the newest four alone and says why.
+
+Conformance is **223 passed, 5 ignored**, from 219: four tests added.
+
+### The two live items, and what actually stands between them and closed
+
+Neither is closed, and neither is blocked on writing code in this crate. What follows is
+what the running mainnet node's own log and configuration show, because a checkbox on a
+weaker claim is worth less than a recorded dead end.
+
+**The whole-sync run with hosted APIs removed.** `/home/aldur/mainnet-wasm/config.toml`
+line 14 is `peers = ["https://api.mainnet.hiro.so", "https://api.hiro.so"]`, and the
+node's own log shows both in the pool it fetches history from:
+
+```
+fetching history from 9 peers: https://api.mainnet.hiro.so/, https://api.hiro.so/,
+  http://108.130.44.244:20443/, http://150.136.127.40:20443/, http://152.53.22.28:20443/,
+  http://172.96.141.17:20443/, http://172.96.141.52:20443/, http://195.201.62.107:20443/,
+  http://217.182.95.183:20443/
+```
+
+Seven of the nine were discovered over p2p, which is the transport half and is what
+`p2p_discovery.rs` already gates. But the criterion says the configuration for the run
+must contain no hosted endpoint, and this one does. The node is also not at tip: every
+round for the last several hours ends
+
+```
+executing the peer's chain failed: node execution failed: checkpoint execution failed:
+  state storage error: MARF error: MARF version already exists
+```
+
+which is an execution fault and not a p2p one.
+
+Three things would close it, and they are separable. A configuration with `peers = []`
+and `p2p_seeds` only — which `config.rs` already accepts, and
+`a_mainnet_node_needs_no_configured_http_peer` already tests — run to mainnet tip. That
+MARF fault fixed, since a node that cannot execute cannot reach a tip whatever it
+downloads. And a **per-tenure record of which peer served it**, which does not exist:
+`TenureSource::served_by()` counts distinct peers and nothing writes down the mapping,
+so "record which discovered peer served every tenure" cannot be answered from what the
+node keeps today. That is a small addition — a log line per tenure, or a counter per
+endpoint — but it is an addition, not a run.
+
+**The live whole-sync interoperability run with a stock node.** Half of it is already
+happening live and the log says so:
+
+```
+peers pushed 4 blocks this node accepted and 0 it refused, and 0 transactions it will mine
+p2p: relayed 1 accepted items to peers in 7 pushes
+p2p: 34 messages peers sent unprompted, 28 of them for a role nano serves over HTTP
+p2p: 8 connected (1 new, 1 lost, 0 isolated), 0 addresses learned, 7 claiming this cycle
+```
+
+Stock mainnet nodes push blocks to nano and nano authenticates and accepts them; nano
+relays what it accepted back to seven peers; nano asks seven stock nodes for inventories
+and they answer. That is inventory exchange in one direction, block exchange in one
+direction, and relay outbound, against stock nodes, live.
+
+What is missing is the other direction, and the reason is configuration rather than
+code. The running node has **no `p2p_bind`**, so it runs no inbound listener and no
+stock node can dial it; and `rpc_bind = "127.0.0.1:20460"` is loopback-only, so the
+`data_url` nano advertises to its peers is unreachable from any of them. A stock node
+therefore cannot fetch a block or an inventory *from* nano on this deployment, however
+well the handlers work — and `p2p_inbound.rs` and `p2p_relay.rs` show they work with the
+reference implementation on the other end of a real socket.
+
+What would close it: a nano node with a routable `p2p_bind` and `rpc_bind`, reachable
+from a stock `stacks-node` that has nano in its `bootstrap_node` list, and three
+observations from the stock node's own log — it completed the handshake, it fetched a
+tenure or an inventory from nano, and it accepted a transaction nano relayed. None of
+that needs anything in `nano-p2p`; it needs a host with an open port and a stock node
+pointed at it.

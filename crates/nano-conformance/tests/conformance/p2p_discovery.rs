@@ -276,3 +276,189 @@ async fn bulk_history_comes_from_several_mainnet_peers() {
     );
     println!("{} distinct peers served history", history.served_by());
 }
+
+/// Real inventories drive a real forward download over real peers.
+///
+/// The offline gate in `inventory_schedule` pins the *rule* — a schedule that executes
+/// on the first round, only claiming peers asked, an answer for another burn view
+/// refused — against a fixture peer. This is the same code against mainnet, and it
+/// exists because two things about the schedule are only true if stacks-core really
+/// behaves as its source says:
+///
+/// * `GET /v3/tenures/fork_info/:ch/:ch` — the same view twice — has to answer with
+///   that one sortition. `get_tenures_fork_info` pushes the stop snapshot and then
+///   walks parents *while the cursor is not the start*, so a request naming one view
+///   twice never enters the walk; that is a reading of the source until a peer agrees.
+/// * its `nakamoto_blocks` has to carry the whole tenure, since that is what makes a
+///   tenure addressable by the burn view that elected it at no cost beyond the request
+///   the schedule was going to make anyway.
+///
+/// One thing here is *not* what production does, and it matters: the burn view of each
+/// scheduled offset is taken from a peer's `/v3/sortitions`. Production derives it from
+/// its own `SortitionTracker`, because a cycle identifier taken from a peer would make
+/// that peer's burnchain the thing nano's own requests are keyed on. What is under test
+/// is the download, and this test has no derived sortition chain to key it from.
+#[tokio::test]
+async fn mainnet_inventories_schedule_a_forward_download() {
+    /// Enough tenures to tell a schedule from a favourite, few enough to stay a test.
+    const TENURES: usize = 6;
+    /// How many of the newest claimed tenures to leave alone. See the comment below.
+    const NEWEST_UNSERVED: usize = 4;
+    if std::env::var_os("NANO_P2P_MAINNET").is_none() {
+        println!("skipped: set NANO_P2P_MAINNET=1 to reach mainnet");
+        return;
+    }
+    let mut swarm = Swarm::new(
+        PeerDb::in_memory().expect("a peer table"),
+        LocalPeer::quiet(StacksPrivateKey::from_seed(b"nano-p2p schedule"), 20444),
+        Protocol::mainnet(),
+        SwarmLimits {
+            outbound: 8,
+            dials_per_round: 8,
+            timeout: Duration::from_secs(20),
+        },
+    );
+    for seed in MAINNET_SEEDS {
+        swarm.seed(seed).await.expect("record the bootstrap peer");
+    }
+    let discovered = swarm.discovered();
+    swarm.maintain(fresh_node_view(), None).await;
+    let endpoints = discovered.endpoints();
+    check_endpoints(&endpoints);
+
+    let pool = PeerPool::from_endpoints(&endpoints);
+    let (_, chosen) = pool
+        .choose_source(None, None)
+        .await
+        .expect("a discovered peer serves a tip");
+    let (cycle_start, length, naming) = name_the_cycle(&chosen).await;
+    println!("cycle opens at burn {cycle_start}, named {naming}");
+
+    let claims = swarm
+        .tenure_claims(naming, &mut nano_p2p::Round::default())
+        .await;
+    let claiming = claims
+        .iter()
+        .filter(|claim| {
+            claim.endpoint.is_some()
+                && (0..claim.tenures.len()).any(|bit| claim.tenures.get(bit) == Some(true))
+        })
+        .count();
+    println!("{} peers answered, {claiming} claiming tenures of it", claims.len());
+    assert!(
+        claiming >= 2,
+        "only {claiming} peer(s) claimed any of the cycle, so no schedule can be spread"
+    );
+
+    // The tenures nano would want next: the recent end of the cycle, which is where a
+    // node that has just caught up to it sits — but not the *newest* few, and that is a
+    // property of the endpoint worth recording. `TenureForkingInfo::from_snapshot` reads
+    // a tenure's blocks against the serving node's own Stacks tip, so a sortition whose
+    // tenure that node has not processed yet answers `was_sortition: true` with no
+    // blocks at all. Measured: asked for the six highest offsets every peer claimed,
+    // three came back empty, and their burn heights were the top of the burnchain. A
+    // catching-up node wants the older end and its follow path covers the tip, so this
+    // costs nothing in production; it would have made this test flaky.
+    let mut wanted: Vec<u16> = (0..u16::try_from(length).expect("a cycle fits in u16"))
+        .filter(|bit| {
+            claims
+                .iter()
+                .any(|claim| claim.tenures.get(*bit) == Some(true))
+        })
+        .collect();
+    wanted.reverse();
+    wanted.drain(..NEWEST_UNSERVED.min(wanted.len()));
+    wanted.truncate(TENURES);
+    let schedule = nano_p2p::assign_tenures(&claims, &wanted);
+    assert_eq!(
+        schedule.len(),
+        wanted.len(),
+        "the scheduler dropped tenures that peers claim"
+    );
+
+    let mut history = nano_sync::TenureSource::new(pool.into_clients());
+    let (fetched, blocks) = fetch_the_schedule(&chosen, &mut history, cycle_start, &schedule).await;
+    println!(
+        "{fetched} of {} scheduled tenures fetched, {blocks} blocks, over {} peers",
+        schedule.len(),
+        history.served_by()
+    );
+    assert!(
+        fetched >= 3,
+        "only {fetched} scheduled tenures came back, so nothing was measured"
+    );
+    assert!(
+        history.served_by() >= 2,
+        "every scheduled tenure came from {} peer(s), so the schedule is not spread",
+        history.served_by()
+    );
+}
+
+/// The reward cycle a node following this peer would be walking, and its name.
+///
+/// The boundary comes from `payout_schedule`, which is the production rule and is
+/// waterfall-aware: a cycle opens at offset 0 once the waterfall is on and at offset 1
+/// before it, so a node that decided from where its tip happened to sit would move the
+/// boundary part-way through a prepare phase and name a cycle no peer recognises.
+///
+/// The consensus hash naming it comes from the peer, which production would not do —
+/// see the caller. What is under test here is the download.
+async fn name_the_cycle(peer: &nano_sync::SyncClient) -> (u64, u64, nano_primitives::ConsensusHash) {
+    let pox = peer.pox_info().await.expect("a peer states the calendar");
+    let payouts = nano_node::payout_schedule(&pox).expect("a payout schedule");
+    let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+    let cycle_start = (0..=length)
+        .filter_map(|back| pox.bitcoin_height.checked_sub(back))
+        .find(|height| payouts.starts_reward_cycle(*height))
+        .expect("the cycle the peer's burn tip sits in opens somewhere");
+    let naming = peer
+        .sortition_at_height(cycle_start)
+        .await
+        .expect("the cycle's first sortition")
+        .consensus_hash;
+    (cycle_start, length, naming)
+}
+
+/// Fetch every scheduled tenure from the peer the inventory named for it.
+///
+/// Returns how many came back and how many blocks they carried. A tenure that does not
+/// is printed and skipped rather than failing: the wanted list is bit indices, and an
+/// offset whose burn block elected nobody has no tenure for anybody to hold.
+async fn fetch_the_schedule(
+    naming: &nano_sync::SyncClient,
+    history: &mut nano_sync::TenureSource,
+    cycle_start: u64,
+    schedule: &[(u16, String)],
+) -> (usize, usize) {
+    let mut fetched = 0;
+    let mut blocks = 0;
+    for (offset, endpoint) in schedule {
+        let view = match naming
+            .sortition_at_height(cycle_start + u64::from(*offset))
+            .await
+        {
+            Ok(sortition) => sortition.consensus_hash,
+            Err(error) => {
+                println!("offset {offset} has no sortition to name: {error}");
+                continue;
+            }
+        };
+        match history.tenure_at(Some(endpoint), view).await {
+            Ok(tenure) => {
+                // The check that makes a fetch by burn view safe over strangers,
+                // asserted here as well as inside the client: an answer is only this
+                // tenure if every block's own header says so.
+                assert!(
+                    tenure
+                        .iter()
+                        .all(|block| block.header.consensus_hash == view),
+                    "a mainnet peer answered the tenure of {view} with another view's blocks"
+                );
+                blocks += tenure.len();
+                fetched += 1;
+            }
+            Err(error) => println!("offset {offset} at {view} came back empty: {error}"),
+        }
+    }
+    (fetched, blocks)
+}

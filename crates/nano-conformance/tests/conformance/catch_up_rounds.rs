@@ -292,7 +292,7 @@ async fn close_the_gap(run: Run<'_>) -> (Progress, Closed) {
         }
         let before = executor.tip().header.chain_length;
         let outcome = executor
-            .catch_up(&client, &mut history, &pox(), &staging, budget)
+            .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -415,7 +415,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     };
 
     let first = executor
-        .catch_up(&client, &mut history, &pox(), &staging, budget)
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("the first round executes");
     assert!(
@@ -431,7 +431,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     policy.refusing.store(true, Ordering::SeqCst);
     let refused_before = policy.refusals();
     let refused_round = executor
-        .catch_up(&client, &mut history, &pox(), &staging, budget)
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect(
             "a round a peer refused outright came back as an error, which is the mainnet \
@@ -482,7 +482,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     let mut executed = first.executed + refused_round.executed;
     for round in 0..ROUND_LIMIT {
         let outcome = executor
-            .catch_up(&client, &mut history, &pox(), &staging, budget)
+            .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
             .await
             .unwrap_or_else(|error| panic!("round {round} after the refusal failed: {error}"));
         executed += outcome.executed;
@@ -541,7 +541,7 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
 
     policy.refusing_tenures.store(true, Ordering::SeqCst);
     let throttled = executor
-        .catch_up(&client, &mut history, &pox(), &staging, budget)
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
         .await
         .expect("a peer that will not serve history is not a failed round");
     assert!(
@@ -564,7 +564,7 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
     let mut executed = 0;
     for round in 0..ROUND_LIMIT {
         let outcome = executor
-            .catch_up(&client, &mut history, &pox(), &staging, budget)
+            .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
             .await
             .unwrap_or_else(|error| panic!("round {round} after the throttle failed: {error}"));
         if round == 0 {

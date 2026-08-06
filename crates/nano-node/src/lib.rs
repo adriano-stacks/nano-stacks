@@ -28,6 +28,16 @@ const TENURE_WALK_LIMIT: usize = 512;
 /// An sBTC sweep is confirmed within a few, and a Bitcoin header is cheap.
 const BURN_HEADER_WINDOW: u64 = 32;
 
+/// How many tenures one round may take from the inventory schedule.
+///
+/// The bound the forward download is bounded *by*, and it is a count of tenures
+/// rather than of blocks because that is the unit a request buys: a mainnet tenure
+/// is tens of blocks, so this is between several hundred and a couple of thousand
+/// blocks a round, of the same order as the fetch budget the descent works under.
+/// Small enough that a round ends and execution gets its turn, which is the mistake
+/// an unbounded schedule would repeat.
+const SCHEDULED_TENURES: usize = 32;
+
 #[derive(Debug)]
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
@@ -395,6 +405,13 @@ pub struct CatchUpRound {
     pub reorganized: Option<[u8; 32]>,
     pub fetched: usize,
     pub executed: usize,
+    /// Tenures this round took from the inventory schedule rather than from the
+    /// backward parent-walk.
+    ///
+    /// Its own counter because it is the measurement the schedule exists for: a round
+    /// that fetched blocks and scheduled no tenures did all of its work by walking
+    /// parents from a peer's tip, whatever the peers claimed.
+    pub scheduled: usize,
     /// Blocks fetched but not yet executed.
     pub staged: u64,
     /// Whether the peer asked this node to slow down, which ends a round
@@ -978,6 +995,104 @@ where
         Some((start, tracker.consensus_hash_at(start)?, tenures))
     }
 
+    /// The tenures of the cycle this node is walking that it has yet to execute,
+    /// forward from its own tip.
+    ///
+    /// Every offset from the tip's own burn block upward, which is the whole of the
+    /// derivation and is deliberately not the complement of
+    /// [`Self::tenure_inventory`]: that vector reaches only `REORG_REACH` blocks back,
+    /// so most of a cycle reads unexecuted in it even where this node ran it, and
+    /// wanting those would send a round backwards. Above the tip nothing has been
+    /// executed by definition, so no lookup is needed to know it is wanted.
+    ///
+    /// The tip's *own* offset is included, because its tenure is the one still growing:
+    /// this node has executed some of it and the rest is exactly what a forward
+    /// schedule should ask for first.
+    ///
+    /// Burn blocks that elected nobody are in here too and are dropped by the
+    /// scheduler, not by this: a bit set in no peer's inventory is a tenure no peer has
+    /// — which is what a burn block with no sortition looks like from the wire, and
+    /// which is a fact this node's hash history cannot answer on its own, since it
+    /// keeps consensus hashes and not snapshots.
+    ///
+    /// `from` is the burn view of the furthest block this node has *acquired* rather
+    /// than executed, when there is one. The two are far apart while catching up, and
+    /// anchoring at the executed tip made every round re-derive nearly the window the
+    /// last one had: a tip advances by a tenure while the window is dozens of tenures
+    /// long, so a round asked again for the tenures it had already staged and paid for
+    /// them again. Its own tenure is still included, because a tenure straddling the
+    /// furthest block is one this node holds only part of.
+    fn wanted_tenures(
+        &self,
+        pox: &PoxInfo,
+        from: Option<nano_primitives::ConsensusHash>,
+        bound: usize,
+    ) -> Option<(u64, Vec<u16>)> {
+        let start = self.cycle_start_height(pox)?;
+        let length = u16::try_from(
+            u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length),
+        )
+        .ok()?;
+        let acquired = from
+            .and_then(|view| self.sortition.as_ref()?.height_of_consensus_hash(view))
+            .unwrap_or_default()
+            .max(self.bitcoin_height());
+        let first = u16::try_from(acquired.checked_sub(start)?).ok()?;
+        Some((start, (first..length).take(bound).collect()))
+    }
+
+    /// Where to ask for each tenure this node wants next, and of whom.
+    ///
+    /// The half of inventory sync that was missing for four slices, and it is a pure
+    /// function of what this node knows plus what its peers said. Two answers make
+    /// each entry, and neither comes from the other side: the burn view is
+    /// [`crate::sortition::SortitionTracker`]'s own derivation for that Bitcoin
+    /// height, and the endpoint is the peer whose inventory claimed *that* tenure.
+    ///
+    /// Three things about it are the point:
+    ///
+    /// * **A forward order exists at all.** The backward parent-walk cannot start
+    ///   anywhere but a peer's tip, because a block's identifier lives in the answer
+    ///   above it — so from a checkpoint twenty thousand blocks behind mainnet, all
+    ///   twenty thousand have to be downloaded before the first can execute. A burn
+    ///   view is derivable ahead of time, so the tenure directly above the executed
+    ///   tip can be asked for first and a round is progress rather than a step.
+    /// * **Only peers that claimed a tenure are asked for it**, which is
+    ///   [`nano_p2p::assign_tenures`] and is what an inventory is *for*. A tenure no
+    ///   peer claims is absent rather than guessed at, and that is also how the burn
+    ///   blocks that elected nobody leave the wanted list — no peer has a tenure for
+    ///   them, so no bit is set.
+    /// * **Nothing here decides anything.** What comes back goes into the same staging
+    ///   store the descent's does and through the same authenticated execution, so
+    ///   which peer an inventory named cannot change what this node accepts. What
+    ///   makes it safe to ask a stranger for a tenure *by name* is that
+    ///   [`SyncClient::tenure_at`] refuses an answer carrying another view's blocks.
+    fn schedule_tenures(
+        &self,
+        pox: &PoxInfo,
+        claims: &[nano_p2p::TenureClaim],
+        acquired: Option<nano_primitives::ConsensusHash>,
+    ) -> Vec<(nano_primitives::ConsensusHash, String)> {
+        if claims.is_empty() {
+            return Vec::new();
+        }
+        let Some((tracker, (start, wanted))) = self
+            .sortition
+            .as_ref()
+            .zip(self.wanted_tenures(pox, acquired, SCHEDULED_TENURES))
+        else {
+            return Vec::new();
+        };
+        nano_p2p::assign_tenures(claims, &wanted)
+            .into_iter()
+            .filter_map(|(offset, endpoint)| {
+                tracker
+                    .consensus_hash_at(start + u64::from(offset))
+                    .map(|view| (view, endpoint))
+            })
+            .collect()
+    }
+
     /// Ask a peer for something, waiting out the limits it answers with.
     ///
     /// A node writing down the headers it is missing cannot execute anything
@@ -1085,6 +1200,7 @@ where
         pox: &PoxInfo,
         staging: &Staging,
         budget: CatchUpBudget,
+        claims: &[nano_p2p::TenureClaim],
     ) -> Result<CatchUpRound, NodeExecutionError> {
         let mut round = CatchUpRound::default();
         // A throttle is set aside for a *round*, and this is the round. Without
@@ -1111,6 +1227,18 @@ where
             block_id: executed_tip,
             height: executed_height,
         };
+        // Forward first, and the order is the whole gain. The descent below has to
+        // reach this node's tip before a single staged block can execute, so from a
+        // checkpoint far behind the network it spends round after round downloading
+        // history nothing can yet run. The schedule starts at the tip and works up, so
+        // the first tenure it stages is the next one the executor wants.
+        let acquired = staging
+            .highest()?
+            .map(|block| block.header.consensus_hash);
+        let schedule = self.schedule_tenures(pox, claims, acquired);
+        let scheduled =
+            Self::fetch_scheduled(history, staging, &schedule, stop, budget.fetch, &mut round)
+                .await?;
         let peer_tip = match node.tenure_info().await {
             Ok(info) => Some(info.tip_block_id),
             Err(error) if error.is_rate_limited() => {
@@ -1119,9 +1247,18 @@ where
             }
             Err(error) => return Err(error.into()),
         };
+        round.fetched = scheduled;
         if let Some(peer_tip) = peer_tip {
-            let mut fetched =
-                Self::descend(history, staging, peer_tip, stop, budget.fetch, &mut round).await?;
+            let mut fetched = scheduled
+                + Self::descend(
+                    history,
+                    staging,
+                    peer_tip,
+                    stop,
+                    budget.fetch.saturating_sub(scheduled),
+                    &mut round,
+                )
+                .await?;
             // The descent itself continues from the furthest it has reached,
             // which is what makes a rate-limited round cost nothing but time.
             //
@@ -1188,6 +1325,74 @@ where
         }
         round.staged = staging.len()?;
         Ok(round)
+    }
+
+    /// Fetch a schedule and stage what comes back, in the order it was scheduled.
+    ///
+    /// The I/O half of [`Self::schedule_tenures`], separated because the schedule is a
+    /// pure function of local state and this is not — and because a shared borrow of
+    /// the executor held across an await makes the whole future non-`Send`, which is
+    /// the same wall `&Swarm` hit in `nano-p2p`.
+    ///
+    /// A tenure nobody serves is skipped rather than ending the run, and it took a test
+    /// to settle that. Stopping at the first gap reads as the frugal choice — nothing
+    /// above a gap can execute until it closes — but most gaps here are not gaps at all:
+    /// the wanted list is every burn *block* of the cycle above the tip, and a burn
+    /// block that elected nobody has no tenure for any peer to hold. On mainnet the next
+    /// such block is never more than a few away, so a run that stopped at one scheduled
+    /// a single tenure and gave up. Nothing is wasted by carrying on, either, because
+    /// staging is durable and a block above a gap is executed by the round that closes
+    /// it.
+    ///
+    /// The one thing that does end the run is every peer rate limiting, which is the
+    /// signal that means wait. A peer that claimed a tenure and could not serve it is
+    /// not penalised anywhere: an inventory that has moved on is far commoner than a
+    /// lie, and scoring for it would repeat the mistake of isolating the busiest peers.
+    async fn fetch_scheduled(
+        history: &mut TenureSource,
+        staging: &Staging,
+        schedule: &[(nano_primitives::ConsensusHash, String)],
+        until: Stop,
+        budget: usize,
+        round: &mut CatchUpRound,
+    ) -> Result<usize, NodeExecutionError> {
+        let mut fetched = 0;
+        for (view, endpoint) in schedule {
+            if fetched >= budget {
+                break;
+            }
+            match history.tenure_at(Some(endpoint), *view).await {
+                Ok(blocks) => {
+                    for block in &blocks {
+                        staging.put(block)?;
+                    }
+                    // Only what is above the executed tip counts against the budget,
+                    // and the reason is a stall this measured. The schedule starts at
+                    // the tip's *own* burn block, because a tenure straddling the tip
+                    // is the one the executor wants next and only this can ask for it —
+                    // but its blocks are mostly ones this node has already run. Counting
+                    // those, a tenure as long as the budget bought a round that fetched
+                    // its own history and stopped: on the captured chain, whose longest
+                    // tenure is twelve blocks, the schedule sat on that tenure for
+                    // sixty-four rounds and the tip never moved. The budget bounds
+                    // progress, and the tenure count bounds requests.
+                    fetched += blocks
+                        .iter()
+                        .filter(|block| block.header.chain_length > until.height)
+                        .count();
+                    round.scheduled += 1;
+                }
+                Err(error) if error.is_rate_limited() && history.exhausted() => {
+                    round.rate_limited = true;
+                    break;
+                }
+                Err(SyncError::EmptyTenure) => {}
+                Err(error) => {
+                    eprintln!("no peer served the scheduled tenure at burn view {view}: {error}");
+                }
+            }
+        }
+        Ok(fetched)
     }
 
     /// Walk back from `from`, staging each block, until this node's tip or a

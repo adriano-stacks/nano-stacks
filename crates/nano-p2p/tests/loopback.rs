@@ -577,6 +577,23 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     let mut claiming = discovered.claiming();
     claiming.sort();
     assert_eq!(claiming, endpoints);
+    // The claims themselves, not only who made them. This is what a forward download
+    // schedules from: an endpoint shortlist says which peers to ask, and only the bit
+    // vectors say which peer for which tenure. All three peers are here, including the
+    // one with no HTTP endpoint — `assign_tenures` drops that one because there is
+    // nowhere to fetch from, and dropping it here would make "how many peers claimed
+    // this tenure" unanswerable.
+    let published = discovered.claims();
+    assert_eq!(published.len(), 3);
+    assert!(published.iter().all(|claim| claim.tenures.get(0) == Some(true)));
+    assert_eq!(
+        nano_p2p::assign_tenures(&published, &[0])
+            .into_iter()
+            .map(|(_, endpoint)| endpoint)
+            .count(),
+        1,
+        "one wanted tenure is one assignment, spread over the peers that claim it"
+    );
 
     // Every peer answers the same inventory question, because one peer's inventory
     // is one peer's claim.

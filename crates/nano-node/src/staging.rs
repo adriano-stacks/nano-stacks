@@ -136,6 +136,26 @@ impl Staging {
             }))
     }
 
+    /// The highest staged block, which is the furthest this node has *acquired*.
+    ///
+    /// Asked by the forward download schedule, and the distinction from the executed
+    /// tip is what keeps it from re-downloading. A schedule anchored at the executed
+    /// tip re-derives almost the same window every round — the tip moves by a tenure
+    /// while the window is dozens long — so it would ask for the tenures it fetched
+    /// last round and throw the answers on top of themselves. Anchored here it asks
+    /// for what comes next.
+    pub fn highest(&self) -> Result<Option<NakamotoBlock>, StagingError> {
+        self.connection()?
+            .query_row(
+                "SELECT bytes FROM staged ORDER BY height DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|bytes| NakamotoBlock::decode(&bytes).map_err(StagingError::Block))
+            .transpose()
+    }
+
     /// The staged block whose parent is `parent`, if it is here.
     pub fn child_of(&self, parent: StacksBlockId) -> Result<Option<NakamotoBlock>, StagingError> {
         let bytes = self

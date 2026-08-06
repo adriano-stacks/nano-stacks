@@ -491,6 +491,17 @@ pub enum SyncError {
         asked: ConsensusHash,
         answered: ConsensusHash,
     },
+    /// A peer answered a tenure request with a block from another tenure.
+    ///
+    /// The check that makes a *forward* download safe to spread over strangers. A
+    /// backward walk is self-checking, because the identifier asked for is the hash
+    /// of the block that comes back; a tenure asked for by the burn view that
+    /// elected it is not, so the answer has to be compared against the view — which
+    /// every Nakamoto block header carries.
+    UnexpectedTenure {
+        asked: ConsensusHash,
+        answered: ConsensusHash,
+    },
 }
 
 impl SyncError {
@@ -527,6 +538,10 @@ impl fmt::Display for SyncError {
             Self::UnexpectedSortition { asked, answered } => write!(
                 formatter,
                 "a peer answered the request for the sortition of burn view {asked} with {answered}"
+            ),
+            Self::UnexpectedTenure { asked, answered } => write!(
+                formatter,
+                "a peer answered the request for the tenure of burn view {asked} with a block of {answered}"
             ),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
             Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
@@ -580,7 +595,8 @@ impl std::error::Error for SyncError {
             | Self::NoPeer
             | Self::Throttled
             | Self::UnexpectedBlock { .. }
-            | Self::UnexpectedSortition { .. } => None,
+            | Self::UnexpectedSortition { .. }
+            | Self::UnexpectedTenure { .. } => None,
         }
     }
 }
@@ -1006,6 +1022,58 @@ impl SyncClient {
             .collect()
     }
 
+    /// Every block of the tenure a burn view elected, asked for by that view.
+    ///
+    /// The primitive a **forward** download needs, and the reason it is this endpoint
+    /// rather than `/v3/tenures/:id`. A tenure fetched by block identifier can only be
+    /// asked for once its blocks are already known, which is why every descent so far
+    /// has had to walk parent links *backwards* from a tip: the identifier of the next
+    /// thing to ask for is inside the answer to the last one. A consensus hash is
+    /// derivable ahead of time — this node's own sortition chain names every burn block
+    /// it has walked — so a tenure addressed this way can be asked for before anything
+    /// above it is known, which is what makes an inventory's bit indices into a
+    /// schedule.
+    ///
+    /// `start == stop` is one sortition: `get_tenures_fork_info` pushes the stop
+    /// snapshot, then walks parents while the cursor is not the start, so a request
+    /// naming the same view twice never enters the walk. The body it answers with is
+    /// `get_nakamoto_blocks_in_tenure`, which is the whole tenure and not a page.
+    ///
+    /// Every block is checked against the view asked for. That check is what
+    /// `SyncClient::block`'s content-address comparison is for a backward walk: the
+    /// answer here is not addressed by its own hash, so without it any peer in a pool
+    /// could answer a scheduled tenure with somebody else's blocks.
+    pub async fn tenure_at(
+        &self,
+        consensus_hash: ConsensusHash,
+    ) -> Result<Vec<NakamotoBlock>, SyncError> {
+        let wire: Vec<ForkInfoWire> = self
+            .get(&format!(
+                "v3/tenures/fork_info/{consensus_hash}/{consensus_hash}"
+            ))
+            .await?;
+        let encoded = wire
+            .into_iter()
+            .find(|entry| {
+                parse_consensus_hash(&entry.consensus_hash).is_ok_and(|hash| hash == consensus_hash)
+            })
+            .and_then(|entry| entry.nakamoto_blocks)
+            .ok_or(SyncError::EmptyTenure)?;
+        let blocks = decode_tenure_blocks(&encoded)?;
+        if blocks.is_empty() {
+            return Err(SyncError::EmptyTenure);
+        }
+        for block in &blocks {
+            if block.header.consensus_hash != consensus_hash {
+                return Err(SyncError::UnexpectedTenure {
+                    asked: consensus_hash,
+                    answered: block.header.consensus_hash,
+                });
+            }
+        }
+        Ok(blocks)
+    }
+
     /// Download and validate all Nakamoto blocks in a tenure.
     pub async fn tenure(
         &self,
@@ -1262,13 +1330,17 @@ impl TenureSource {
     /// Used to honour what an inventory said: a peer that claims the cycle being
     /// walked is a better first guess than one that does not, and the inventory
     /// exists to avoid the round trip that finds out the hard way.
+    /// A peer's `data_url` is compared *as a URL* and not as a string, which is the
+    /// bug this had until it was measured: a handshake advertises
+    /// `http://34.150.184.50:20443` while the client built from it holds
+    /// `http://34.150.184.50:20443/`, so every comparison was false and preferring a
+    /// claiming peer had no effect at all on the live node.
     pub fn prefer(&mut self, endpoints: &[String]) {
         // Stable, so peers the inventory said nothing about keep their order rather
         // than being shuffled by whichever claim arrived first.
-        let preferred: BTreeSet<&String> = endpoints.iter().collect();
-        self.peers.sort_by_key(|peer| {
-            u8::from(!preferred.contains(&peer.base_url().to_string()))
-        });
+        let preferred: BTreeSet<Url> = endpoints.iter().filter_map(|url| Url::parse(url).ok()).collect();
+        self.peers
+            .sort_by_key(|peer| u8::from(!preferred.contains(peer.base_url())));
         self.next = 0;
         self.throttled.clear();
         self.failed.clear();
@@ -1283,14 +1355,36 @@ impl TenureSource {
     /// loop and not a call: a live mainnet catch-up stalled for fifty minutes on
     /// one discovered peer whose HTTP port stopped answering, with 28,458 blocks
     /// already downloaded and every round abandoning them.
-    async fn spread<T, A, F>(&mut self, mut ask: A) -> Result<T, SyncError>
+    async fn spread<T, A, F>(&mut self, ask: A) -> Result<T, SyncError>
     where
         A: FnMut(SyncClient) -> F,
         F: Future<Output = Result<T, SyncError>>,
     {
+        self.spread_from(None, ask).await
+    }
+
+    /// The same, starting at a named endpoint rather than at the round-robin cursor.
+    ///
+    /// What an inventory buys once it drives a schedule: the peer that claimed *this*
+    /// tenure is asked for it, rather than whoever the cursor happens to be pointing
+    /// at. The fallback is deliberate and is the whole reason this is the same loop —
+    /// a claim is a claim, so a peer that named a tenure and cannot serve it costs one
+    /// request and the rest of the pool is still asked.
+    ///
+    /// An endpoint that is not in the pool leaves the cursor alone, which is the right
+    /// answer for a peer discovery found and this pool was not rebuilt from yet.
+    async fn spread_from<T, A, F>(&mut self, first: Option<&str>, mut ask: A) -> Result<T, SyncError>
+    where
+        A: FnMut(SyncClient) -> F,
+        F: Future<Output = Result<T, SyncError>>,
+    {
+        let start = first
+            .and_then(|endpoint| Url::parse(endpoint).ok())
+            .and_then(|url| self.peers.iter().position(|peer| *peer.base_url() == url))
+            .unwrap_or(self.next);
         let mut last = None;
         for offset in 0..self.peers.len() {
-            let index = (self.next + offset) % self.peers.len();
+            let index = (start + offset) % self.peers.len();
             if self.throttled.contains(&index) || self.failed.contains(&index) {
                 continue;
             }
@@ -1329,6 +1423,24 @@ impl TenureSource {
     ) -> Result<Vec<NakamotoBlock>, SyncError> {
         self.spread(|peer| async move { peer.blocks_of_tenure(tip).await })
             .await
+    }
+
+    /// Fetch the tenure a burn view elected, asking the peer that claimed it first.
+    ///
+    /// The forward half of bulk history. [`SyncClient::tenure_at`] is what makes it
+    /// possible to ask at all — a tenure addressed by the consensus hash this node
+    /// derived, rather than by a block identifier that only the answer above it
+    /// carries — and `from` is the endpoint a peer's inventory named for this
+    /// particular tenure.
+    pub async fn tenure_at(
+        &mut self,
+        from: Option<&str>,
+        consensus_hash: ConsensusHash,
+    ) -> Result<Vec<NakamotoBlock>, SyncError> {
+        self.spread_from(from, |peer| async move {
+            peer.tenure_at(consensus_hash).await
+        })
+        .await
     }
 
     /// Why nothing came back when no peer was even asked.
@@ -2030,6 +2142,32 @@ struct ForkInfoWire {
     consensus_hash: String,
     was_sortition: bool,
     first_block_mined: Option<String>,
+    /// The whole tenure, consensus-serialized as one length-prefixed vector and
+    /// hex-encoded — `prefix_opt_hex_codec` on stacks-core's side.
+    ///
+    /// Already on the wire of every `fork_info` answer a fork check makes, and
+    /// discarded until now. That is what makes addressing a tenure by its burn view
+    /// cost nothing beyond the request that a forward schedule needs anyway.
+    nakamoto_blocks: Option<String>,
+}
+
+/// Read a length-prefixed, hex-encoded block vector out of a `fork_info` answer.
+fn decode_tenure_blocks(encoded: &str) -> Result<Vec<NakamotoBlock>, SyncError> {
+    let bytes = decode_hex(encoded.strip_prefix("0x").unwrap_or(encoded))?;
+    let (count, mut offset) = bytes
+        .get(..4)
+        .and_then(|prefix| <[u8; 4]>::try_from(prefix).ok())
+        .map(|prefix| (u32::from_be_bytes(prefix), 4))
+        .ok_or(SyncError::InvalidHash)?;
+    let mut blocks = Vec::new();
+    for _ in 0..count {
+        let (block, consumed) =
+            NakamotoBlock::decode_prefix(bytes.get(offset..).ok_or(SyncError::InvalidHash)?)
+                .map_err(SyncError::Block)?;
+        offset = offset.checked_add(consumed).ok_or(SyncError::InvalidHash)?;
+        blocks.push(block);
+    }
+    Ok(blocks)
 }
 
 /// Wire tag for a mempool query that lists the transactions already known
@@ -2131,7 +2269,17 @@ fn parse_prefixed_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], 
     parse_hex(value.strip_prefix("0x").ok_or(SyncError::InvalidHash)?)
 }
 
+/// Read a fixed-length hash, with or without the `0x` a JSON API may prefix.
+///
+/// Tolerant on purpose, and it had to become so: `/v3/tenures/fork_info` states every
+/// hash prefixed — stacks-core through `prefix_hex`, and nano's own RPC through
+/// `TenureForkInfoWire` — while `/v3/sortitions` on the same peer does not. A parser
+/// that insisted on the bare form rejected every real `fork_info` answer, so the
+/// only fork check that ever passed was the one against a test peer that happened to
+/// serve the bare form. The prefix carries no information; refusing it only decided
+/// which peers nano could read.
 fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
     if value.len() != LENGTH * 2 {
         return Err(SyncError::InvalidHash);
     }
@@ -2141,6 +2289,19 @@ fn parse_hex<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], SyncError
             .map_err(|_| SyncError::InvalidHash)?;
     }
     Ok(bytes)
+}
+
+/// The same for a body whose length is whatever the peer sent.
+fn decode_hex(value: &str) -> Result<Vec<u8>, SyncError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(SyncError::InvalidHash);
+    }
+    (0..value.len() / 2)
+        .map(|index| {
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| SyncError::InvalidHash)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2202,6 +2363,70 @@ mod tests {
             &[0xaa; 20]
         );
         assert!(parse_prefixed_hash160("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+    }
+
+    /// A hash reads the same whether or not the peer prefixed it.
+    ///
+    /// Not a nicety. `/v3/tenures/fork_info` states every hash `0x`-prefixed — both
+    /// stacks-core, through `prefix_hex`, and nano's own RPC — while `/v3/sortitions` on
+    /// the same peer states them bare. A parser that insisted on the bare form rejected
+    /// every real `fork_info` answer, which meant the only fork check that ever parsed
+    /// was the one against a test peer that happened to serve them bare.
+    #[test]
+    fn a_hash_reads_with_or_without_the_prefix_a_json_api_puts_on_it() {
+        let bare = "da8c25d9d380c2f083193535594bb127186e67cd";
+        assert_eq!(
+            parse_consensus_hash(bare).expect("a bare consensus hash"),
+            parse_consensus_hash(&format!("0x{bare}")).expect("a prefixed consensus hash")
+        );
+        // The length is still checked against the hash and not against the string, so a
+        // prefix does not buy an extra byte either way.
+        assert!(parse_consensus_hash(&format!("0x{bare}00")).is_err());
+        assert!(parse_consensus_hash(&bare[2..]).is_err());
+    }
+
+    /// A tenure asked for by burn view is refused if it answers for another one.
+    ///
+    /// The check that makes a *forward* download safe to spread over strangers. A block
+    /// fetched by identifier is self-verifying, because the identifier is the hash of
+    /// what comes back; a tenure named by the burn view that elected it is not, so the
+    /// only thing that can refuse a substitution is the view each block's own header
+    /// states. Decoded here from the same length-prefixed hex vector the endpoint sends.
+    #[test]
+    fn a_scheduled_tenure_is_read_back_against_the_view_it_was_asked_for() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/nakamoto/blocks");
+        let path = fs::read_dir(directory)
+            .expect("read fixture blocks")
+            .map(|entry| entry.expect("fixture block").path())
+            .min()
+            .expect("a fixture block");
+        let block = NakamotoBlock::decode(&fs::read(path).expect("read fixture block"))
+            .expect("decode fixture block");
+        let view = block.header.consensus_hash;
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend(block.encode());
+        let encoded = bytes
+            .iter()
+            .fold("0x".to_owned(), |mut hex, byte| {
+                use std::fmt::Write;
+
+                write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+                hex
+            });
+        let decoded = super::decode_tenure_blocks(&encoded).expect("the block vector decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].header.consensus_hash, view);
+        assert_eq!(decoded[0].block_id(), block.block_id());
+        // An empty vector is what a peer answers for a burn block that elected nobody,
+        // and it decodes rather than failing: the caller turns it into `EmptyTenure` and
+        // skips the offset, because a burn block with no sortition is not a gap.
+        assert!(
+            super::decode_tenure_blocks("0x00000000")
+                .expect("an empty vector decodes")
+                .is_empty()
+        );
+        assert!(super::decode_tenure_blocks("0x0000000101").is_err());
     }
 
     #[test]

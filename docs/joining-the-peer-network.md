@@ -246,6 +246,7 @@ p2p: 8 connected (4 new, 0 lost, 0 isolated), 2 addresses learned, 5 claiming th
 p2p: 40 messages peers sent unprompted, 12 of them for a role nano serves over HTTP
 p2p: relayed 3 accepted items to peers in 21 pushes
 peers pushed 3 blocks this node accepted and 0 it refused, and 7 transactions it will mine
+executed 500 blocks, 8703285 to 8703785, 6684 staged, state root 5a99…, 9 tenures the inventory scheduled
 ```
 
 * **`connected` well below 8 and `isolated` above 0** — the peers nano can reach
@@ -256,6 +257,11 @@ peers pushed 3 blocks this node accepted and 0 it refused, and 7 transactions it
   private peers; suspicious on mainnet.
 * **`claiming this cycle` at 0 with peers connected** — nano is asking about a cycle
   its peers do not recognise, which usually means its own burnchain view is behind.
+* **`tenures the inventory scheduled` absent while catching up** — the round did all
+  of its downloading by walking parent links back from one peer's tip, which is slower
+  and executes nothing until the walk reaches this node's tip. It needs three things
+  at once: peers `claiming this cycle`, a derived sortition chain (`sortition` in
+  `[checkpoint]`), and this node's own burn view inside a cycle its peers hold.
 * **`0 it refused` never moving while `accepted` does** — healthy. The reverse, all
   refused, means nano cannot yet derive the reward set for the tenures being pushed;
   it clears once the cycle is reconstructed.
