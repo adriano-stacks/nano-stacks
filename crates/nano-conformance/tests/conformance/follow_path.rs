@@ -81,7 +81,7 @@ pub fn captured_chain() -> Vec<NakamotoBlock> {
 /// Read through `decode_block_with_pre_stx` in height order, because a `PreStx`
 /// output authorises an operation up to six blocks later and a block decoded on
 /// its own would drop those pairings.
-fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
+pub fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
     let mut rows = snapshots();
     rows.sort_by_key(|snapshot| snapshot.block_height);
     let mut cache = nano_bitcoin::PreStxCache::new();
@@ -113,12 +113,12 @@ fn captured_burnchain() -> BTreeMap<u64, BitcoinBlock> {
 /// is exactly what a node sees: Bitcoin does not announce a reorganization, it
 /// answers differently at a height it answered before.
 #[derive(Clone, Debug)]
-struct MovableBurnchain {
+pub struct MovableBurnchain {
     blocks: Arc<std::sync::Mutex<BTreeMap<u64, BitcoinBlock>>>,
 }
 
 impl MovableBurnchain {
-    fn new(blocks: BTreeMap<u64, BitcoinBlock>) -> Self {
+    pub fn new(blocks: BTreeMap<u64, BitcoinBlock>) -> Self {
         Self {
             blocks: Arc::new(std::sync::Mutex::new(blocks)),
         }
@@ -189,9 +189,16 @@ pub struct Pressure {
     ///
     /// `None` is all of it. Raising it mid-round is a tip that moved.
     pub visible: std::sync::Mutex<Option<usize>>,
+    /// How many blocks this peer gains each time it is asked for a tenure.
+    ///
+    /// A tip that moves *because* the node asked, which is deterministic where a
+    /// background task moving it would not be, and is also what a real peer does:
+    /// it gains blocks while a descent walks it.
+    pub growth: usize,
     /// What was actually done to the node.
     pub limited: std::sync::atomic::AtomicUsize,
     pub shortened: std::sync::atomic::AtomicUsize,
+    pub grew: std::sync::atomic::AtomicUsize,
 }
 
 impl Pressure {
@@ -245,13 +252,29 @@ impl Served {
         &self.blocks[..visible.unwrap_or(self.blocks.len()).min(self.blocks.len())]
     }
 
-    /// Admit to holding `blocks` of the chain, as a peer that just gained some.
-    pub fn move_tip_to(&self, blocks: usize) {
-        *self
-            .pressure
-            .visible
-            .lock()
-            .expect("the visible tip is not poisoned") = Some(blocks);
+    /// Gain the blocks this peer gains per tenure asked for, if any.
+    fn grow(&self) {
+        if self.pressure.growth == 0 {
+            return;
+        }
+        let grew = {
+            let mut visible = self
+                .pressure
+                .visible
+                .lock()
+                .expect("the visible tip is not poisoned");
+            let held = visible.unwrap_or(self.blocks.len());
+            let gained = held < self.blocks.len();
+            if gained {
+                *visible = Some((held + self.pressure.growth).min(self.blocks.len()));
+            }
+            gained
+        };
+        if grew {
+            self.pressure
+                .grew
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn block(&self, id: &str) -> Option<Vec<u8>> {
@@ -266,6 +289,7 @@ impl Served {
     /// This is what `/v3/tenures/:id` answers, and it is what makes a descent one
     /// request per tenure rather than one per block.
     fn tenure(&self, id: &str) -> Option<Vec<u8>> {
+        self.grow();
         let chain = self.chain();
         let named = chain
             .iter()
