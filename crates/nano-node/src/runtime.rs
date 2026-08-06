@@ -239,6 +239,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             executor,
             dispatcher,
             mempool: mempool.clone(),
+            relay: relay.clone(),
         };
         roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
     }

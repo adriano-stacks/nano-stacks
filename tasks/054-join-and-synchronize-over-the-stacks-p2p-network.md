@@ -846,3 +846,16 @@ to read the five `p2p:` log lines.
   eight times. Each message carries its own sequence number and so its own signature; the
   saving is one copy of a block per peer against a second signing path nothing else in the
   crate needs.
+
+## The miner announces its own block now
+
+The last gap the relay work left. A miner that pushes its block to one HTTP peer
+depends on that peer to spread it — which is the dependency the whole p2p effort
+exists to remove — and nano relays *everybody else's* blocks, so not relaying its
+own was the one hole in that.
+
+`announce` rather than `offer`, and the distinction is the point: `offer` is the
+inbound queue, whose contents have to survive `ChainState::authenticate_block`
+before anything happens to them, while a block this node mined was assembled on
+its own tip and had its state root sealed here. There is nothing to authenticate it
+against that it did not already pass.
