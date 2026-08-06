@@ -24,15 +24,22 @@
 //! exactly the inventory answer it holds. A file whose worst failure is a peer asking
 //! somebody else does not belong in the store whose worst failure is a fork.
 //!
-//! ## Only bits the ledger asserted
+//! ## Only bits the ledger asserted, and only for the fork it is on
 //!
 //! Nothing is recorded that the executed ledger did not report in the round that
 //! recorded it, so a bit here was true of nano's canonical chain when it was written.
-//! A tenure could in principle be reorged away afterwards, which would leave a bit
-//! nano cannot honour — but the ledger only reports tenures it has *sealed*, and a
-//! reorg deeper than the window nano itself can reorganize is one this node would not
-//! survive either. The cost of the residual case is a peer's failed fetch, which is
-//! the same cost as any peer that has pruned.
+//!
+//! A row is keyed by the cycle's **first burn height**, not by the consensus hash that
+//! names it, and that is what makes a reorganization survivable. A cycle is identified
+//! on the wire by the consensus hash of its first sortition, so a reorg across that
+//! boundary renames the cycle — and a store keyed by the hash would keep the old row
+//! forever, leaving nano telling peers it has tenures on a fork it has abandoned. Keyed
+//! by height, the reorg *replaces* the row, and the abandoned claims go with it. Asking
+//! for the old hash is then nacked, which is exactly right: nano no longer knows that
+//! cycle.
+//!
+//! The residual case is a tenure reorged away without the cycle boundary moving, which
+//! costs a peer one failed fetch — the same cost as any peer that has pruned.
 
 use std::path::Path;
 
@@ -61,7 +68,8 @@ impl ServedTenures {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS served_tenures (
-                 cycle_start BLOB PRIMARY KEY,
+                 cycle_height INTEGER PRIMARY KEY,
+                 cycle_start BLOB NOT NULL,
                  tenures BLOB NOT NULL
              );",
         )?;
@@ -77,18 +85,51 @@ impl ServedTenures {
     /// window.
     pub fn record(
         &self,
+        cycle_height: u64,
         cycle_start: ConsensusHash,
         tenures: &BitVec<2100>,
     ) -> Result<u16, PeerDbError> {
-        let merged = self
-            .inventory(cycle_start)?
-            .map_or_else(|| tenures.clone(), |known| union(&known, tenures));
+        // Merged with what is recorded for this *cycle* only when the cycle is still
+        // named the same way. A reorganization that renames the cycle's first
+        // sortition invalidates every bit under the old name, because the tenures they
+        // stood for are no longer on the chain nano follows.
+        let merged = match self.recorded(cycle_height)? {
+            Some((known, tenures_known)) if known == cycle_start => {
+                union(&tenures_known, tenures)
+            }
+            _ => tenures.clone(),
+        };
         self.connection.execute(
-            "INSERT INTO served_tenures (cycle_start, tenures) VALUES (?1, ?2)
-             ON CONFLICT (cycle_start) DO UPDATE SET tenures = ?2",
-            params![&cycle_start.as_bytes()[..], merged.wire_bytes()],
+            "INSERT INTO served_tenures (cycle_height, cycle_start, tenures) VALUES (?1, ?2, ?3)
+             ON CONFLICT (cycle_height) DO UPDATE SET cycle_start = ?2, tenures = ?3",
+            params![
+                i64::try_from(cycle_height).unwrap_or(i64::MAX),
+                &cycle_start.as_bytes()[..],
+                merged.wire_bytes()
+            ],
         )?;
         Ok(claimed(&merged))
+    }
+
+    /// What is recorded for one cycle, by the height it begins at.
+    fn recorded(
+        &self,
+        cycle_height: u64,
+    ) -> Result<Option<(ConsensusHash, BitVec<2100>)>, PeerDbError> {
+        let stored: Option<(Vec<u8>, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT cycle_start, tenures FROM served_tenures WHERE cycle_height = ?1",
+                params![i64::try_from(cycle_height).unwrap_or(i64::MAX)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(stored.and_then(|(start, tenures)| {
+            Some((
+                ConsensusHash::from_bytes(<[u8; 20]>::try_from(start.as_slice()).ok()?),
+                BitVec::<2100>::from_wire_bytes(&tenures).ok()?,
+            ))
+        }))
     }
 
     /// What this node has recorded for a cycle, or `None` for one it has never seen.
@@ -153,6 +194,8 @@ mod tests {
     use super::*;
 
     const CYCLE: ConsensusHash = ConsensusHash::from_bytes([0x2c; 20]);
+    /// The burn height the cycle above opens at, which is what a row is keyed by.
+    const AT: u64 = 906_000;
 
     fn tenures(set: &[u16]) -> BitVec<2100> {
         let mut tenures = BitVec::<2100>::zeros(2100).expect("a cycle-length vector");
@@ -178,9 +221,12 @@ mod tests {
     #[test]
     fn what_the_window_saw_is_not_forgotten_when_it_slides() {
         let served = ServedTenures::in_memory().expect("a store");
-        assert_eq!(served.record(CYCLE, &tenures(&[0, 1, 2])).expect("record"), 3);
+        assert_eq!(
+            served.record(AT, CYCLE, &tenures(&[0, 1, 2])).expect("record"),
+            3
+        );
         // The next round's window has moved on and no longer mentions 0..=2.
-        assert_eq!(served.record(CYCLE, &tenures(&[3, 4])).expect("record"), 5);
+        assert_eq!(served.record(AT, CYCLE, &tenures(&[3, 4])).expect("record"), 5);
         let answer = served.inventory(CYCLE).expect("a query").expect("recorded");
         for index in 0..5 {
             assert_eq!(answer.get(index), Some(true), "tenure {index} was run");
@@ -195,7 +241,7 @@ mod tests {
         let path = directory.path().join("served.sqlite");
         {
             let served = ServedTenures::open(&path).expect("a store");
-            served.record(CYCLE, &tenures(&[7, 2099])).expect("record");
+            served.record(AT, CYCLE, &tenures(&[7, 2099])).expect("record");
         }
         let reopened = ServedTenures::open(&path).expect("the same store");
         let answer = reopened.inventory(CYCLE).expect("a query").expect("recorded");
@@ -210,8 +256,8 @@ mod tests {
     fn one_cycles_tenures_are_not_anothers() {
         let served = ServedTenures::in_memory().expect("a store");
         let other = ConsensusHash::from_bytes([0x77; 20]);
-        served.record(CYCLE, &tenures(&[1])).expect("record");
-        served.record(other, &tenures(&[2])).expect("record");
+        served.record(AT, CYCLE, &tenures(&[1])).expect("record");
+        served.record(AT + 2100, other, &tenures(&[2])).expect("record");
         assert_eq!(
             served.inventory(CYCLE).expect("a query").expect("recorded").get(2),
             Some(false)
@@ -221,5 +267,35 @@ mod tests {
             Some(false)
         );
         assert_eq!(served.cycles().expect("a count"), 2);
+    }
+
+    /// A reorganization that renames a cycle takes its claims with it.
+    ///
+    /// The cycle is named on the wire by the consensus hash of its first sortition, so
+    /// a reorg across that boundary gives the same cycle a new name. Every bit recorded
+    /// under the old name stood for a tenure on a fork this node has abandoned, and
+    /// keeping them would leave nano offering peers blocks it no longer follows. Being
+    /// nacked for the old name is the correct answer: nano does not know that cycle.
+    #[test]
+    fn a_renamed_cycle_forgets_what_the_old_fork_claimed() {
+        let served = ServedTenures::in_memory().expect("a store");
+        served.record(AT, CYCLE, &tenures(&[3, 4, 5])).expect("record");
+        let after_reorg = ConsensusHash::from_bytes([0xb1; 20]);
+        assert_eq!(
+            served.record(AT, after_reorg, &tenures(&[9])).expect("record"),
+            1,
+            "the new fork's claims start from what it has run"
+        );
+        assert!(
+            served.inventory(CYCLE).expect("a query").is_none(),
+            "the abandoned fork's cycle is no longer known"
+        );
+        let answer = served
+            .inventory(after_reorg)
+            .expect("a query")
+            .expect("recorded");
+        assert_eq!(answer.get(9), Some(true));
+        assert_eq!(answer.get(3), Some(false), "and none of the old fork's");
+        assert_eq!(served.cycles().expect("a count"), 1, "one cycle, renamed");
     }
 }

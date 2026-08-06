@@ -1847,8 +1847,9 @@ struct LocalAnnouncement {
     bitcoin_height: u64,
     /// The consensus hash naming the reward cycle being walked, when derivable.
     cycle_start: Option<nano_primitives::ConsensusHash>,
-    /// Which tenures of that cycle this node has executed, and so will serve.
-    inventory: Option<(nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)>,
+    /// The burn height the cycle opens at, the hash naming it, and which of its
+    /// tenures this node has executed and so will serve.
+    inventory: Option<(u64, nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)>,
 }
 
 impl Advertised {
@@ -1876,10 +1877,10 @@ impl Advertised {
         // Recorded before the snapshot so that the durable answer is never behind the
         // live one: a peer reading between the two would otherwise be told about a
         // tenure whose bit had not been written down yet.
-        if let (Some(served), Some((cycle_start, tenures))) =
+        if let (Some(served), Some((cycle_height, cycle_start, tenures))) =
             (self.served.as_ref(), announcement.inventory.as_ref())
             && let Ok(served) = served.lock()
-            && let Err(error) = served.record(*cycle_start, tenures)
+            && let Err(error) = served.record(*cycle_height, *cycle_start, tenures)
         {
             eprintln!("cannot record the tenures this node serves: {error}");
         }
@@ -1911,7 +1912,7 @@ impl Advertised {
         {
             return Some(tenures);
         }
-        let (known, tenures) = self.read()?.inventory?;
+        let (_, known, tenures) = self.read()?.inventory?;
         (known == cycle_start).then_some(tenures)
     }
 }
