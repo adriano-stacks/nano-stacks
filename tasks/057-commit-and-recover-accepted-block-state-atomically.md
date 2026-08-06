@@ -246,3 +246,24 @@ it, and the two existing call sites become correct without changing them
 is outside this task's files: `nano-node/src/runtime.rs::recover_ledger` has to run
 `check_maturity_window` on the recovered accounting, the way the file path does.
 Filling the hole itself is [[048]]'s.
+
+## One state directory holds one node
+
+An operator restarted the live mainnet node before the running one had finished
+stopping, and for a few seconds two processes executed forward on the same
+directory. Each had read the sealed tip once at startup, so the second one began
+blocks the first had already sealed and every round after that failed with `MARF
+version already exists` — 24 rounds of it, no progress, and nothing in the message
+naming the cause.
+
+What this task built held: the state was **not** corrupted. Both nodes committed
+ledger and MARF in one transaction each, so a single node restarted afterwards
+recovered at 8,702,145 with a complete ledger and executed on. That was the design
+working, not luck — but the accident is trivially repeatable and the failure it
+produces is unreadable, so the directory is held now.
+
+`hold_state_directory` takes an exclusive advisory lock on `node.lock` before
+anything else in `run`. An advisory lock and not a pid file, because a killed node
+must leave nothing to clean up: the kernel releases it with the descriptor, and the
+test asserts both halves — a second node is refused while the first holds it, and
+the directory is takeable straight after the holder goes.

@@ -2684,6 +2684,7 @@ dependencies = [
  "bitcoincore-rpc",
  "clap",
  "clarity",
+ "fs2",
  "hex",
  "nano-address",
  "nano-bitcoin",
