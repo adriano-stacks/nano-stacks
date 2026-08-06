@@ -44,19 +44,60 @@ replay and must be localized before signer or PoX-5 release results can count.
       the root check runs first. The write trace (`NANO_TRACE_WRITES`) is captured
       and localizes the block's native effects; see *What 931 turns out to be*. The
       ordered stacks-core journal for this block is the remaining half.
-- [ ] Use the identical-journal MARF oracle if receipts and writes agree, and
-      the clarity-wasm differential oracle if they do not. Needs stacks-core's own
-      journal over block 931, which `NANO_MAINNET_JOURNAL` and
-      `write_journal::a_recorded_mainnet_journal_seals_the_chains_root` consume —
-      the recording step is what is left.
-- [ ] Fix the owning layer and add the smallest fixture that fails before the
-      fix; do not paper over the block with a checkpoint advance or a skipped
-      root check.
-- [ ] Replay from the original checkpoint through height 931 and at least 100
+- [x] Use the identical-journal MARF oracle if receipts and writes agree, and
+      the clarity-wasm differential oracle if they do not. **Neither was needed.**
+      The write trace named four keys, and the *live stacks-core node* answered
+      whether it had written them: `/v2/data_var/…/signers/last-set-cycle` is uint
+      **19** and `/v2/map_entry/…/cycle-set-height` for cycle 20 is `none`. nano
+      wrote cycle 20's signer set at 931 and stacks-core never wrote it at all.
+- [~] Fix the owning layer and add the smallest fixture that fails before the
+      fix. **The owning layer is named and the fix is measured, and it is not
+      landed** — see *The fix, and why it is not in the tree yet*.
+- [~] Replay from the original checkpoint through height 931 and at least 100
       later blocks, including the next tenure boundary, with roots and receipts
-      matching.
+      matching. With the fix applied the capture replays **100/100 — roots,
+      receipts and all five cost dimensions** — from the checkpoint at 900 through
+      931 and 69 blocks beyond. It contains no *later* tenure boundary to cross:
+      the chain's sortitions stopped at burn 393, which is why 931 exists at all,
+      so that half needs a capture from a chain still electing miners.
 
-## What 931 turns out to be
+## The cause, named
+
+`check_and_handle_prepare_phase_start` is driven in stacks-core from
+`tenure_block_snapshot.block_height` — the burn block that elected the block's
+**tenure** (`setup_block`, `stackslib/src/chainstate/nakamoto/mod.rs:4438`). nano
+drives it from the block's Clarity **burn view**.
+
+The two are the same block until a tenure is extended. At 931 they part by seven:
+tenure at burn 392, view at burn 399, which is inside cycle 19's prepare phase. So
+nano set cycle 20's signer set where stacks-core set nothing, and the live chain
+agrees with stacks-core — `last-set-cycle` there is still 19. Four keys of
+difference, identical receipts, identical costs, and the roots parted.
+
+## The fix, and why it is not in the tree yet
+
+Carrying the tenure's own burn height beside the view's in `BitcoinBlockContext`
+and reading *that* in `prepare_phase_reward_cycle` takes the pox-5 capture from
+30/100 to **100/100**, and leaves the in-tree 340-block replay at 340/340. That is
+the fix, measured on both.
+
+It is reverted rather than landed because it is a consensus rule whose input has to
+be correct on **every** path that builds a burn context, and it is not yet:
+`binary_restart` and `execution_stall` stop the node at `reward cycle 24 has no
+signer set: nothing stacked for it`. On the in-tree hacknet capture the node's burn
+*views* reach 479 — inside cycle 23's prepare phase — while its blocks' tenures do
+not, so the set those tests rely on stops being written. Four context-building sites
+were wired (`at_height`, the two followed-tenure sites, `LocalSortition::record`)
+and it still reproduced, so at least one more path leaves the tenure height stale.
+
+Landing half of it would leave a node whose prepare-phase rule reads a field some
+paths do not set, which is worse than the divergence it fixes. The remaining work
+is exactly: audit every writer of `BitcoinBlockContext::height` in the production
+path, then land the field, the rule and the regression together.
+
+
+
+## What 931 turns out to be (superseded by *The cause, named* above)
 
 Height 931 is not an ordinary mid-tenure block. It is the block where the
 **Clarity burn view jumps seven burn blocks in one step**:
