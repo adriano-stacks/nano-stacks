@@ -3789,6 +3789,28 @@ mod tests {
             if right != [0; 4] {
                 prop_assert_eq!(uint_to_words(ours_left / ours_right), (reference_left / reference_right).0);
             }
+            // Subtraction and the big-endian conversion, which the two
+            // implementations disagree about in opposite directions if either is
+            // wrong: `primitive_types` refuses an underflow where stacks-core's own
+            // `Uint256` wraps, and a byte order is only ever visible against
+            // somebody else's.
+            if ours_left >= ours_right {
+                let (ours_difference, _) = ours_left.overflowing_sub(ours_right);
+                prop_assert_eq!(
+                    uint_to_words(ours_difference),
+                    (reference_left - reference_right).0
+                );
+            }
+            // `to_u8_slice` is stacks-core's *little*-endian conversion and
+            // `to_u8_slice_be` the big-endian one; asking the wrong one of the pair
+            // is how this assertion first failed, on nano's correct answer.
+            let ours_big_endian = ours_left.to_big_endian();
+            prop_assert_eq!(ours_big_endian, reference_left.to_u8_slice_be());
+            prop_assert_eq!(ours_left.to_little_endian(), reference_left.to_u8_slice());
+            prop_assert_eq!(
+                uint_to_words(nano_primitives::Uint256::from_big_endian(&ours_big_endian)),
+                left
+            );
         }
 
         #[test]

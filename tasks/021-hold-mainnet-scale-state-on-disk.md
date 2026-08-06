@@ -37,8 +37,9 @@ of gigabytes and grows every tenure.
       `BTreeMap` and a copied `SQLite` connection.
 - [x] Share unchanged subtries between versions rather than cloning per block.
 - [x] Bound the read path so a lookup does not walk the chain linearly.
-- [ ] Persist sortition snapshots, tenure accounting and headers. These live in
-      `nano-sortition` and `nano-chainstate`, which this change did not touch.
+- [x] Persist sortition snapshots, tenure accounting and headers. These live in
+      `nano-sortition` and `nano-chainstate`, which this change did not touch —
+      all three are durable now, by the three tasks named below.
 - [x] Import a checkpoint without holding its blobs in memory.
 - [x] Recover the tip from disk on start, and replay only what is missing.
 
@@ -61,3 +62,32 @@ left is a chainstate directory in the node's configuration, which belongs to
 Sortition snapshots, tenure accounting and the header index are still memory
 only; they live in `nano-sortition` and `nano-chainstate`. So is
 `BitcoinContext.headers`, which grows a record per executed block.
+
+## All three are durable, and none of it was done here
+
+The item is closed by what came after it rather than by anything in this task, so
+it is worth naming which is which:
+
+- **Sortition snapshots.** `SortitionTracker::save` writes the tip and the whole
+  consensus-hash history in the capture's own format, as the chain advances rather
+  than at shutdown, through a rename so a torn history cannot be left behind. On
+  [[049-derive-canonical-sortitions-from-the-local-burncha]]. Without it a node
+  re-derived from the checkpoint's burn anchor on every start, one Bitcoin block
+  download per burn block.
+- **Tenure accounting.** The whole ledger — executed chain, tenure start heights,
+  earnings, reorganization reach, parent tenure proof — is written in the *same
+  transaction* that seals the block's state root, so a hard kill leaves either the
+  complete parent or the complete child. On
+  [[057-commit-and-recover-accepted-block-state-atomically]], with the maturity
+  window validated on recovery per [[048-carry-complete-mainnet-tenure-accounting]].
+- **Headers.** `record_burn_header` and `backfill_block_header` write what Clarity
+  reads back through `get-burn-block-info?` and `get-block-info?`, outside any
+  block's commit for the burn headers because a Bitcoin fact is true before the
+  block that reads it exists. On
+  [[022-answer-the-clarity-headers-database]] and
+  [[055-answer-block-info-for-blocks-before-the-checkpoint]].
+
+What proves it rather than asserts it is the restart suite: twenty scattered
+`SIGKILL`s and eight aimed at tenure transitions, each reopening with a ledger whose
+executed suffix ends exactly at the tip that has state, replaying forward to the
+same final root as an uninterrupted run.
