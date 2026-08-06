@@ -109,7 +109,7 @@ impl ComplexWord for DefaultTo {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::evaluate;
+    use crate::tools::{crosscheck_compare_only, evaluate};
 
     #[test]
     fn default_to_less_than_two_args() {
@@ -129,5 +129,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("expecting 2 arguments, got 3"));
+    }
+
+    /// The tuple-supertype asymmetry, in the word that reaches it.
+    ///
+    /// `least_supertype` walks the *default's* fields and drops the payload's
+    /// extras, so `(default-to { soft: false } entry)` over an `(optional {
+    /// soft: bool, full: bool })` analyses as the one-field tuple.
+    /// `native_default_to` then hands back whichever value its branch produced,
+    /// unconverted — so on the `some` branch the answer's shape is the payload's
+    /// and not the expression's analysed type, and on the `none` branch it is the
+    /// default's. One expression, two runtime shapes.
+    ///
+    /// `traverse` above converts the payload to the analysed type instead,
+    /// because a wasm value's representation is fixed by one static type. There
+    /// is no third choice: narrowing reproduces the `none` branch and loses a
+    /// field on the `some` branch, and widening would reproduce the `some` branch
+    /// and have to invent a field for the other.
+    ///
+    /// Measured on `(some { soft: true, full: true })`, consensus serialization
+    /// included:
+    ///
+    /// ```text
+    /// returned  compiled    0c0000000104736f667403
+    ///           interpreted 0c000000020466756c6c0304736f667403
+    /// var-set   compiled    (ok { soft: true }), the var written
+    ///           interpreted RuntimeCheck(TypeValueError), nothing written
+    /// argument  compiled    { soft: true }
+    ///           interpreted RuntimeCheck(TypeValueError)
+    /// ```
+    ///
+    /// The last two are *state* divergences and not only receipt ones: both a
+    /// narrow `define-data-var` and a narrow function parameter type-check at run
+    /// time and refuse a differing field count, so the reference aborts the
+    /// transaction where this commits a write and carries on. The parameter check
+    /// is `clarity2_implicit_cast`, whose own comment calls the case "unreachable
+    /// if the type-checker has already run successfully" — which is as close as
+    /// the reference comes to saying that this type should not have been handed
+    /// out. Closing it needs the reference's own analysis —
+    /// `least_supertype` refusing the asymmetric pair the way it already refuses
+    /// the reverse one, or sanitizing a value to its analysed type on return — so
+    /// it is `#[ignore]`d here rather than papered over. Accounted for in
+    /// nano-stacks task 060 as a known engine disagreement.
+    #[test]
+    #[ignore = "the reference's default-to answers with its branch's own tuple, which has no single static layout"]
+    fn clar_default_to_narrowing_answers_with_the_branch_the_reference_took() {
+        crosscheck_compare_only(
+            "(define-read-only (whole (entry (optional { soft: bool, full: bool })))
+               (default-to { soft: false } entry))
+             (whole (some { soft: true, full: true }))",
+        );
+        // The reference refuses these two outright, so the harness reports them
+        // as "Interpreted snippet failed" beside a compiled run that succeeded.
+        crosscheck_compare_only(
+            "(define-data-var last { soft: bool } { soft: false })
+             (define-public (store (entry (optional { soft: bool, full: bool })))
+               (begin (var-set last (default-to { soft: false } entry)) (ok (var-get last))))
+             (store (some { soft: true, full: true }))",
+        );
+        crosscheck_compare_only(
+            "(define-private (echo (t { soft: bool })) t)
+             (define-read-only (passed (entry (optional { soft: bool, full: bool })))
+               (echo (default-to { soft: false } entry)))
+             (passed (some { soft: true, full: true }))",
+        );
     }
 }

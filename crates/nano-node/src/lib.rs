@@ -1370,8 +1370,18 @@ where
             if fetched >= budget {
                 break;
             }
-            match history.tenure_at(Some(endpoint), *view).await {
+            let served = history.tenure_at(Some(endpoint), *view).await;
+            match served {
                 Ok(blocks) => {
+                    // Which peer served this tenure, said as it happens rather than
+                    // counted at the end. "Several peers were open" and "several peers
+                    // served the history" are different claims, and only a record kept
+                    // per tenure can tell them apart afterwards.
+                    println!(
+                        "burn view {view}: {} blocks from {}",
+                        blocks.len(),
+                        history.last_served().unwrap_or("an unnamed peer")
+                    );
                     for block in &blocks {
                         staging.put(block)?;
                     }

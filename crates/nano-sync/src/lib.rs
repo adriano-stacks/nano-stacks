@@ -1274,6 +1274,11 @@ pub struct TenureSource {
     /// Peers that have actually served a tenure, which is what makes "spread over the
     /// pool" a measurement rather than an intention.
     served: BTreeSet<usize>,
+    /// Which peer answered the last request, so a caller can say who served the
+    /// thing it just got. A set of indices says the pool was spread; this says
+    /// over what, tenure by tenure, which is what a run has to retain to show
+    /// that no one peer was load bearing.
+    last_served: Option<usize>,
 }
 
 impl TenureSource {
@@ -1286,6 +1291,7 @@ impl TenureSource {
             throttled: BTreeSet::new(),
             failed: BTreeSet::new(),
             served: BTreeSet::new(),
+            last_served: None,
         }
     }
 
@@ -1312,6 +1318,14 @@ impl TenureSource {
     #[must_use]
     pub fn served_by(&self) -> usize {
         self.served.len()
+    }
+
+    /// The peer that answered the last request, by endpoint.
+    #[must_use]
+    pub fn last_served(&self) -> Option<&str> {
+        self.last_served
+            .and_then(|index| self.peers.get(index))
+            .map(|peer| peer.base_url().as_str())
     }
 
     /// Whether every peer has rate-limited, so there is nobody left to ask.
@@ -1395,6 +1409,7 @@ impl TenureSource {
                 Ok(answer) => {
                     self.next = index + 1;
                     self.served.insert(index);
+                    self.last_served = Some(index);
                     return Ok(answer);
                 }
                 Err(error) if error.is_rate_limited() => {

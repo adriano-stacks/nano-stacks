@@ -20,13 +20,13 @@
 //! The interpreter is the oracle and nothing else: clarity-wasm has to be the
 //! engine that runs mainnet, so a disagreement is a compiler bug to fix.
 
-use clarity::vm::ClarityVersion;
-use clarity::vm::Value;
 use clarity::vm::costs::LimitedCostTracker;
-use clarity::vm::types::QualifiedContractIdentifier;
+use clarity::vm::types::{QualifiedContractIdentifier, TupleData};
+use clarity::vm::{ClarityName, ClarityVersion, Value};
 use nano_primitives::Network;
 use nano_vm::{MarfStore, Vm};
 use stacks_common::codec::StacksMessageCodec;
+use stacks_common::util::hash::to_hex;
 
 /// `write-feeds`' shape, and the accumulator literals around it.
 const FOLDER: &str = "
@@ -187,11 +187,22 @@ fn both_in(source: &str, function: &str, arguments: &[Vec<u8>]) -> (String, Stri
     )
     .expect("deploy under the interpreter");
 
+    // The consensus serialization goes in beside the value, because that is what
+    // a receipt carries and what a contract-call boundary hands on: two values
+    // that print the same and serialize differently are still a divergence.
     let describe = |outcome: Result<nano_vm::ContractCallOutcome, _>| match outcome {
         Ok(
             nano_vm::ContractCallOutcome::Success(result)
             | nano_vm::ContractCallOutcome::AbortedByResponse(result),
-        ) => format!("{:?}", result.value),
+        ) => format!(
+            "{:?} {} {:?}",
+            result.value,
+            result
+                .value
+                .as_ref()
+                .map_or_else(String::new, |value| to_hex(&serialized(value))),
+            result.events
+        ),
         Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => format!("failed: {error}"),
         Err(error) => format!("error: {error}"),
     };
@@ -378,6 +389,19 @@ fn boolean(value: bool) -> Vec<u8> {
     serialized(&Value::Bool(value))
 }
 
+/// `(some { soft: <soft>, full: <full> })`: the optional whose payload carries a
+/// field the `{ soft: … }` default does not name.
+fn some_entry(soft: bool, full: bool) -> Value {
+    Value::some(Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("soft"), Value::Bool(soft)),
+            (ClarityName::from_literal("full"), Value::Bool(full)),
+        ])
+        .expect("a tuple"),
+    ))
+    .expect("an optional")
+}
+
 fn principal(text: &str) -> Vec<u8> {
     serialized(
         &Value::Principal(
@@ -450,11 +474,37 @@ const NARROWING_DEFAULT: &str = "
 (define-read-only (or-seven (n (optional uint))) (default-to u7 n))
 (define-read-only (or-nothing (n (optional (optional uint)))) (default-to none n))
 
-;; The narrowed tuple handed back whole instead of read through `get`, which is
-;; the one shape the two engines still answer differently.
+;; The narrowed value used anywhere other than through `get`, which is the one
+;; shape the two engines still answer differently. Five ways out, and every one
+;; of them is consensus-visible: returned into a receipt, stored into a var,
+;; compared against a literal, printed into an event, passed to a function.
 (define-read-only (whole (entry (optional { soft: bool, full: bool })))
   (default-to { soft: false } entry))
+
+(define-data-var last { soft: bool } { soft: false })
+(define-public (store (entry (optional { soft: bool, full: bool })))
+  (begin
+    (var-set last (default-to { soft: false } entry))
+    (ok (var-get last))))
+
+;; The default is what the literal compares equal to, so the `none` branch
+;; answers `true` in both engines and only the branch carrying a field the
+;; default does not name can part them.
+(define-read-only (same (entry (optional { soft: bool, full: bool })))
+  (is-eq (default-to { soft: true } entry) { soft: true }))
+
+(define-public (shown (entry (optional { soft: bool, full: bool })))
+  (ok (print (default-to { soft: false } entry))))
+
+;; Handed to a function whose parameter names only the fields the default did,
+;; which is the position the reference declares unreachable.
+(define-private (echo (t { soft: bool })) t)
+(define-read-only (passed (entry (optional { soft: bool, full: bool })))
+  (echo (default-to { soft: false } entry)))
 ";
+
+/// Every way the narrowed value leaves the expression that narrowed it.
+const ESCAPES: [&str; 5] = ["whole", "store", "same", "shown", "passed"];
 
 #[test]
 fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
@@ -482,70 +532,65 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
     );
     assert_eq!(compiled, interpreted, "hold");
 
-    for entry in [
-        Value::none(),
-        Value::some(Value::Tuple(
-            clarity::vm::types::TupleData::from_data(vec![
-                (
-                    clarity::vm::ClarityName::from_literal("soft"),
-                    Value::Bool(true),
-                ),
-                (
-                    clarity::vm::ClarityName::from_literal("full"),
-                    Value::Bool(false),
-                ),
-            ])
-            .expect("a tuple"),
-        ))
-        .expect("an optional"),
-    ] {
+    for entry in [Value::none(), some_entry(true, false)] {
         let (compiled, interpreted) =
             both_in(NARROWING_DEFAULT, "soft-of-bound", &[serialized(&entry)]);
         assert_eq!(compiled, interpreted, "soft-of-bound of {entry}");
     }
 }
 
-/// The supertype asymmetry, now reachable through `default-to`.
+/// The supertype asymmetry, now reachable through `default-to`, in every
+/// position the narrowed value can reach.
 ///
-/// `least_supertype` walks the default's fields and drops the rest, so
-/// `(default-to { soft: false } entry)` analyses as `{ soft: bool }`. clar2wasm
-/// lays every value out for its static type and so answers with the narrowed
-/// tuple; the interpreter carries the taken value and answers with the wide one.
-/// Nothing sanitizes a contract-call return, so the two receipts differ:
+/// `least_supertype` walks the default's fields and looks each one up in the
+/// optional's payload, dropping the payload's extra fields
+/// (`clarity-types/src/types/signatures.rs`, the `TupleType` arm of
+/// `least_supertype_v2_1`), so `(default-to { soft: false } entry)` over an
+/// `(optional { soft: bool, full: bool })` analyses as `{ soft: bool }`. The
+/// interpreter's `native_default_to` hands back whichever value its branch
+/// produced, unconverted; clar2wasm lays every value out for its static type and
+/// converts the payload to it in `words/default_to.rs`, where `need_ducktyping`
+/// then `duck_type` drop the field the target does not name
+/// (`duck_type.rs`, the `TupleType`/`TupleType` arm of `duck_type_stack`).
+///
+/// Measured on `(some { soft: true, full: true })`, consensus serialization and
+/// all — five escapes, five consensus-visible disagreements:
 ///
 /// ```text
-/// compiled     { "soft": bool }               { soft: true }
-/// interpreted  { "full": bool, "soft": bool } { full: true, soft: true }
+/// whole  returned    compiled    0c0000000104736f667403
+///                    interpreted 0c000000020466756c6c0304736f667403
+/// store  var-set     compiled    (ok { soft: true }), the var written
+///                    interpreted RuntimeCheck(TypeValueError), nothing written
+/// same   is-eq       compiled    true   (03)
+///                    interpreted false  (04)
+/// shown  print       compiled    event value { soft: true }
+///                    interpreted event value { full: true, soft: true }
+/// passed argument    compiled    { soft: true }
+///                    interpreted RuntimeCheck(TypeValueError)
 /// ```
 ///
-/// The same asymmetry the `if` narrowing left open, and `default-to` is a far
-/// more common way to reach it than a `print` under an `if`.
+/// `store` and `passed` are the ones that matter most: both type-check at run
+/// time — `ClarityDatabase::set_variable` and `clarity2_implicit_cast` — so the
+/// reference *aborts the transaction* where nano commits a write and carries on.
+/// That is a state-root divergence, not only a receipt one, and it needs no
+/// exotic contract to reach.
+///
 /// `blacklist-susdh-v1` reads every one of its `default-to`s through `get`, so
 /// mainnet block 8,667,509 does not depend on which value comes back, and no
-/// shape found on the chain so far does. Ignored rather than deleted: closing it
-/// needs a decision at the analysis layer — see
+/// shape found on the chain so far does. Ignored rather than deleted: no choice
+/// inside clar2wasm closes it — see
 /// `the_reference_answer_here_has_no_single_static_layout` below, which measures
-/// why no choice inside clar2wasm closes it — and a red suite teaches people to
-/// ignore red suites.
+/// why — and a red suite teaches people to ignore red suites.
 #[test]
 #[ignore = "the reference's answer has no static type: its shape follows the branch taken, and clar2wasm lays a value out from one static type"]
-fn a_narrowed_default_handed_back_whole_agrees() {
-    let entry = Value::some(Value::Tuple(
-        clarity::vm::types::TupleData::from_data(vec![
-            (
-                clarity::vm::ClarityName::from_literal("soft"),
-                Value::Bool(true),
-            ),
-            (
-                clarity::vm::ClarityName::from_literal("full"),
-                Value::Bool(true),
-            ),
-        ])
-        .expect("a tuple"),
-    ))
-    .expect("an optional");
-    let (compiled, interpreted) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&entry)]);
-    assert_eq!(compiled, interpreted);
+fn a_narrowed_default_agrees_wherever_it_escapes_a_get() {
+    for function in ESCAPES {
+        for entry in [some_entry(true, true), Value::none()] {
+            let (compiled, interpreted) =
+                both_in(NARROWING_DEFAULT, function, &[serialized(&entry)]);
+            assert_eq!(compiled, interpreted, "{function} of {entry}");
+        }
+    }
 }
 
 /// Why the differential above cannot be closed by choosing differently inside
@@ -570,31 +615,90 @@ fn a_narrowed_default_handed_back_whole_agrees() {
 /// what clar2wasm answers.
 #[test]
 fn the_reference_answer_here_has_no_single_static_layout() {
-    let entry = Value::some(Value::Tuple(
-        clarity::vm::types::TupleData::from_data(vec![
-            (
-                clarity::vm::ClarityName::from_literal("soft"),
-                Value::Bool(true),
-            ),
-            (
-                clarity::vm::ClarityName::from_literal("full"),
-                Value::Bool(true),
-            ),
-        ])
-        .expect("a tuple"),
-    ))
-    .expect("an optional");
-
-    let (_, wide) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&entry)]);
+    let (_, wide) = both_in(
+        NARROWING_DEFAULT,
+        "whole",
+        &[serialized(&some_entry(true, true))],
+    );
     let (_, narrow) = both_in(NARROWING_DEFAULT, "whole", &[serialized(&Value::none())]);
 
     assert!(
-        wide.contains("\"full\""),
-        "the some branch should hand back the optional's own tuple: {wide}"
+        wide.contains(" 0c000000020466756c6c0304736f667403 "),
+        "the some branch should hand back the optional's own two-field tuple: {wide}"
     );
     assert!(
-        !narrow.contains("\"full\""),
-        "the none branch should hand back the default's own tuple: {narrow}"
+        narrow.contains(" 0c0000000104736f667404 "),
+        "the none branch should hand back the default's own one-field tuple: {narrow}"
+    );
+}
+
+/// The reference cannot even hand the value it produced to a function, which is
+/// the measurement that decides whose bug this is.
+///
+/// `DefinedFunction::execute_apply` casts every argument to its declared
+/// parameter type first, and `clarity2_implicit_cast`'s tuple arm walks the
+/// *value's* fields and raises `TypeValueError` for one the parameter type does
+/// not name — under the comment "This should be unreachable if the type-checker
+/// has already run successfully" (`clarity/src/vm/callables.rs`). The sanitizer
+/// two lines below it would have dropped the field quite happily; the cast never
+/// lets it get there.
+///
+/// So the wide tuple `least_supertype` allows into existence is a value the
+/// reference's own runtime calls impossible: it can be returned, printed and
+/// compared, and it aborts the transaction as soon as it is passed anywhere.
+/// nano hands the narrowed tuple over and the call succeeds — measured in the
+/// ignored differential above, which covers this escape too.
+#[test]
+fn the_reference_refuses_to_pass_the_wide_tuple_to_a_function() {
+    let passed = |entry: &Value| both_in(NARROWING_DEFAULT, "passed", &[serialized(entry)]).1;
+
+    let wide = passed(&some_entry(true, true));
+    assert!(
+        wide.contains("TypeValueError"),
+        "a parameter naming fewer fields must refuse the wide tuple: {wide}"
+    );
+    assert!(
+        passed(&Value::none()).contains(" 0c0000000104736f667404 "),
+        "the default's own tuple passes, being exactly the parameter's type"
+    );
+}
+
+/// What the reference does with that shapeless value once it leaves the
+/// `default-to`, which is what makes the differential above a consensus concern
+/// rather than a curiosity about a printed value.
+///
+/// A `define-data-var` type-checks its assignment at *run* time
+/// (`ClarityDatabase::set_variable` → `TypeSignature::admits`, and
+/// `TupleTypeSignature::admits` refuses a differing field count outright), so
+/// the wide tuple aborts the transaction and writes nothing. And `is-eq`
+/// compares `TupleData`, type signature included, so the wide tuple is not equal
+/// to the narrow literal the `none` branch matches exactly.
+///
+/// nano answers `(ok { soft: true })` with the var written, and `true`, to those
+/// two — measured in the ignored differential above. Only the reference's half
+/// is asserted here: it is the oracle, so it is the half that must not move.
+#[test]
+fn the_reference_carries_the_branch_into_state_and_into_a_comparison() {
+    let stored = |entry: &Value| both_in(NARROWING_DEFAULT, "store", &[serialized(entry)]).1;
+    let compared = |entry: &Value| both_in(NARROWING_DEFAULT, "same", &[serialized(entry)]).1;
+
+    let wide = stored(&some_entry(true, true));
+    assert!(
+        wide.contains("TypeValueError"),
+        "a narrow var must refuse the wide tuple: {wide}"
+    );
+    assert!(
+        stored(&Value::none()).starts_with("Some(Response"),
+        "the default's own tuple is what the var is declared to hold"
+    );
+
+    assert!(
+        compared(&some_entry(true, true)).starts_with("Some(Bool(false))"),
+        "the wide tuple is not equal to the narrow literal"
+    );
+    assert!(
+        compared(&Value::none()).starts_with("Some(Bool(true))"),
+        "the default is the literal, so the none branch compares equal"
     );
 }
 
