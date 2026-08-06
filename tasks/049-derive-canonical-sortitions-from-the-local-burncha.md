@@ -1,7 +1,7 @@
 ---
 id: "049"
 title: "Derive canonical sortitions from the local burnchain"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["026"]
 tags: ["mainnet", "burnchain", "consensus"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Derive canonical sortitions from the local burnchain
@@ -31,15 +32,10 @@ never validation inputs.
 - [x] Derive consensus hash, sortition hash, winning commit transaction and
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
-- [~] Hand the local snapshot to block validation and execution. Consensus
-      hash, sortition hash, winner, total burn, burn header hash/time, VRF seed
-      and both Clarity-visible burn spends are locally available. The remaining
-      production path still asks a peer for `/v3/sortitions` before resolving a
-      block's already-known consensus hash to its local burn-view height.
-- [x] Resolve every known consensus hash and burn-view height from the local
-      snapshot history before making any peer request. A peer sortition response
-      may diagnose or help locate data, but must not supply execution context or
-      be required for progress.
+- [x] Hand the local snapshot to block validation and execution: the consensus
+      hash, sortition hash, winner, total burn, burn header hash and time, VRF
+      seed and both Clarity-visible burn spends all come from it, and the peer
+      is not asked for the burn view at all.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
 - [x] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain

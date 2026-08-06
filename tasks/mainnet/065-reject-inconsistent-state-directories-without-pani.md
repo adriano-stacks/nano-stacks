@@ -1,7 +1,7 @@
 ---
 title: "Reject inconsistent state directories without panicking"
 id: "065"
-status: pending
+status: completed
 priority: high
 effort: small
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["057"]
 tags: ["storage", "recovery", "operations"]
 created_at: "2026-08-06"
+completed_at: 2026-08-06
 ---
 
 # Reject inconsistent state directories without panicking

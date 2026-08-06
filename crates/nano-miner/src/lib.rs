@@ -257,6 +257,29 @@ impl BitcoinWallet {
         })
     }
 
+    /// Whether this wallet can actually fund a commitment, and what it holds.
+    ///
+    /// A miner needs two things of its wallet and the failure modes are different:
+    /// the wallet has to *exist* (`connect` says so, because Bitcoin Core answers a
+    /// missing wallet with an error on every call), and it has to hold a spendable
+    /// output — which it does not if the miner's address was never imported
+    /// watch-only, the standing trap in hacknet's own setup notes.
+    ///
+    /// Asked at start-up rather than at the first commitment, because a miner that
+    /// discovers this mid-tenure has already taken a signer slot for the cycle and
+    /// its operator's mistake is indistinguishable from a consensus fault
+    /// ([[039-keep-the-node-alive-when-one-role-fails]]).
+    pub fn spendable_sats(&self) -> Result<u64, MinerError> {
+        let outputs = self.rpc.list_unspent(Some(1), None, None, None, None)?;
+        if outputs.is_empty() {
+            return Err(MinerError::MissingInputs);
+        }
+        Ok(outputs
+            .iter()
+            .map(|output| output.amount.to_sat())
+            .sum())
+    }
+
     /// Locate a confirmed transaction by the Bitcoin block and position that contain it.
     pub fn confirmed_position(&self, transaction_id: Txid) -> Result<(u64, u32), MinerError> {
         let transaction = self.rpc.get_raw_transaction_info(&transaction_id, None)?;

@@ -1,7 +1,7 @@
 ---
 id: "047"
 title: "Make mainnet synchronization monotonic and restart-safe"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["046", "048", "056", "057"]
 tags: ["mainnet", "sync", "persistence"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Make mainnet synchronization monotonic and restart-safe

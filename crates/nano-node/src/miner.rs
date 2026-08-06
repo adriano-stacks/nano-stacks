@@ -125,8 +125,12 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         mempool,
         tenure: None,
     };
+    let funded = state.funded_wallet(&wallet)?;
     state.leader_key = state.registered_key(&wallet).await?;
-    println!("mining as {miner_hash} from the state on disk");
+    println!(
+        "mining as {miner_hash} from the state on disk, wallet {} holding {funded} sats",
+        state.miner.bitcoin_wallet
+    );
 
     let interval = Duration::from_secs(state.config.node.poll_interval_secs);
     let staging = Staging::open(
@@ -243,6 +247,28 @@ struct State {
 }
 
 impl State {
+    /// Refuse a wallet that cannot pay for a commitment, before the loop.
+    ///
+    /// Both halves of a miner's Bitcoin identity are checked at start-up rather than
+    /// at the first tenure it wins — this one and the leader-key registration below
+    /// — because a miner that discovers either missing mid-tenure has already held a
+    /// signer slot for the cycle, and on a network whose threshold needs every signer
+    /// the operator's mistake is indistinguishable from a consensus fault.
+    ///
+    /// The usual cause is a miner address funded but never imported watch-only, which
+    /// is the standing trap in hacknet's own setup notes: the wallet exists, answers
+    /// every call, and holds nothing.
+    fn funded_wallet(&self, wallet: &BitcoinWallet) -> Result<u64, Box<dyn Error>> {
+        wallet.spendable_sats().map_err(|error| {
+            format!(
+                "the miner's Bitcoin wallet {} holds no spendable output ({error}); fund the \
+                 miner address and import it watch-only before mining",
+                self.miner.bitcoin_wallet
+            )
+            .into()
+        })
+    }
+
     /// Locate the leader-key registration once Bitcoin has confirmed it.
     ///
     /// A miner is usually started right after registering its key, so the

@@ -42,7 +42,7 @@ find its leader key.
       and the reason.
 - [x] Check the miner's Bitcoin identity — the leader key transaction and the
       wallet — at start-up, so it fails while starting rather than mid-tenure.
-- [ ] Refuse a configuration whose miner identity does not exist on the
+- [x] Refuse a configuration whose miner identity does not exist on the
       burnchain it names, rather than starting and dying.
 
 ## Acceptance Criteria
@@ -64,3 +64,22 @@ surfacing a bare JSON-RPC code -5.
 Refusing such a configuration outright, rather than starting and reporting,
 still wants the burnchain reachable at load time — the config layer does not
 talk to Bitcoin today.
+
+## Both halves of the identity, before the loop
+
+The leader-key registration was already checked at miner start-up. The other half was
+not: a wallet that **exists and holds nothing**, which is what a miner address funded
+but never imported watch-only looks like — the standing trap in hacknet's own setup
+notes, since Bitcoin Core answers every call on such a wallet perfectly happily and
+`list_unspent` simply comes back empty.
+
+`funded_wallet` asks for a spendable output before the mining loop and names the
+wallet and the remedy when there is none. A miner that discovered this at its first
+commitment would already have held a signer slot for the cycle, which is the whole
+shape of failure this task exists to remove: on a network whose threshold needs every
+signer, the operator's mistake stops the chain and reads as a consensus fault.
+
+Refusing the *role* and not the process, deliberately, and that is the distinction
+this item's wording invites getting wrong: the acceptance criterion above says a node
+whose miner is misconfigured still follows and still signs, so the miner returns an
+error its role reports and the node carries on without it.

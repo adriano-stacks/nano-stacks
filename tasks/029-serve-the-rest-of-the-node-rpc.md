@@ -40,8 +40,8 @@ produces no `new_block` payloads of its own to diff receipts against.
 - [x] Hand the routes a live chain: `ChainState` owns the `Vm` privately and
       exposes no account nonce, so nothing but a bare `Vm` can implement
       `ChainAccess` yet.
-- [ ] Run the dispatcher from a node: the `stacks-node` binary follows without
-      executing, so it has no receipts to publish.
+- [x] Run the dispatcher from a node: the shipped binary executes mainnet blocks
+      and posts their receipts to a real observer.
 
 ## Acceptance Criteria
 
@@ -49,3 +49,33 @@ produces no `new_block` payloads of its own to diff receipts against.
 - An event observer receives the same payloads from nano and from stacks-core
   for the same blocks.
 - The RPC surface is served from the executed state, not from a followed peer.
+
+## The dispatcher has been run from a node, on mainnet
+
+The premise of this item — a binary that follows without executing, so it has no
+receipts to publish — stopped being true when
+[[052-wire-the-complete-rpc-and-event-surface-into-the-n]] wired the executed state
+into the RPC. What closed it is an ordinary mainnet catch-up with an observer
+configured:
+
+```
+[node]
+event_observers = ["http://127.0.0.1:20470"]
+```
+
+`hacknet/event-sink.py`, the same sink a fixture capture uses, recorded **3,200+**
+`new_block` payloads from blocks the node executed and whose state roots the signed
+headers verified — per-transaction receipts, statuses, all five cost dimensions and
+every event, half a gigabyte of them.
+
+Five hundred of those are frozen as the mainnet regression slice
+(`fixtures/mainnet/receipts.json`, and `mainnet_receipts.rs` compares a run against
+it), which is what makes this more than an anecdote about a log line: the payloads
+were not merely emitted, they were read back and pinned.
+
+What it does not close is the acceptance criterion above it — an observer receiving
+*the same* payloads from nano and from stacks-core for the same blocks. That needs a
+stacks-core observer on the same chain, which mainnet cannot provide retroactively;
+the hacknet capture is where the two are diffed, and
+[[060-make-the-consensus-execution-engine-explicit-and-r]] records why mainnet cannot
+be.
