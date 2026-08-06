@@ -721,6 +721,25 @@ come back round and is dropped rather than re-checked.
 which is the same replication by the same rules over the transport nano's block fetching
 already uses; a second path would be two implementations of one thing.
 
+### What was being dropped, measured on the running node
+
+The mainnet node's own log, on the code before this slice:
+
+```
+p2p: 55 messages peers sent unprompted, 55 of them pushed data
+p2p: 39 messages peers sent unprompted, 39 of them pushed data
+p2p: 103 messages peers sent unprompted, 103 of them pushed data
+p2p: 8 connected (1 new, 1 lost, 0 isolated), 0 addresses learned, 4 claiming this cycle
+p2p: 189 messages peers sent unprompted, 189 of them pushed data
+```
+
+39 to 189 pushed items per round, all discarded, across eight peers with none isolated
+— so the transport and the scoring were doing their jobs and everything they collected
+was being thrown away. That is the volume the boundary now sees. It also sizes the
+queue: 1024 is between five and twenty-five rounds of mainnet's output at the old
+fifty-second interval, and on the new one-second-per-tick clock the same traffic
+arrives in tenths.
+
 ### The discovery loop got a second clock
 
 Relay shares the peer-facing task, because both need `&mut Swarm` and a swarm holds a
