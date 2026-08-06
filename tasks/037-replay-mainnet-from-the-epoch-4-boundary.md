@@ -1144,3 +1144,29 @@ The regression is `conformance/block_info_tenure_height.rs`, which builds the
 smallest chain that can tell the two defects apart: tenure heights advancing at half
 the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
 time that is never a Stacks timestamp. Both engines are asked, and they now agree.
+
+## 8,707,846, and the next stop is a trait reference in a stored analysis
+
+The tenure-height fix moved the frontier from 8,706,193 to **8,707,846** — 42,245
+consecutive mainnet blocks from the checkpoint — and it stopped again, on the other
+kind of failure this task tracks.
+
+Not a wrong answer this time but no answer: reading
+`SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-bid-v5`'s **stored analysis**
+back fails, because a serialized type signature in it holds a *sugared* trait
+reference — `.nft-trait.nft-trait`, an implicit-issuer contract identifier with a
+trait name after it — and the type parser wants a fully qualified one. It is the
+"trait lists and contract-analysis types" divergence the W6 spec named as expected
+and nobody had reached until now.
+
+The node refuses the block rather than sealing it, which is the rule
+[[060-make-the-consensus-execution-engine-explicit-and-r]] added after this exact
+distinction cost a week: a compile refusal at a *call* writes nothing and would
+otherwise seal the root an untouched block seals, so it would be invisible in the
+state root and visible only in a receipt.
+
+Two things about the loop are worth recording, because they are what makes this a
+day's work rather than a week's. The state sealed at the divergence's parent is a
+reflink copy taken in eleven seconds, so the fix is worked against the real parent.
+And the *receipts* are what localize it: the failing transaction is named in the log
+with the contract and the reason, before any state is inspected.
