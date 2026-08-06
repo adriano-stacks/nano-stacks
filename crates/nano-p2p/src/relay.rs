@@ -111,7 +111,7 @@ impl Offer {
     }
 
     #[must_use]
-    pub fn transaction(from: Option<Hash160>, transaction: Box<Transaction>) -> Self {
+    pub const fn transaction(from: Option<Hash160>, transaction: Box<Transaction>) -> Self {
         Self {
             from,
             data: Pushed::Transaction(transaction),
@@ -144,23 +144,22 @@ struct Queues {
 }
 
 impl Relay {
-    /// Offer something a peer pushed, and say whether it is new to this node.
+    /// Offer something a peer pushed.
     ///
-    /// `false` means it has already been accepted and relayed, in which case there
-    /// is nothing to check and nothing to forward.
-    pub fn offer(&self, offer: Offer) -> bool {
+    /// An item this node has already accepted and relayed is dropped here rather than
+    /// queued: there is nothing left to check and nothing left to forward, and that is
+    /// what keeps a block eight peers push from costing eight authentications.
+    pub fn offer(&self, offer: Offer) {
         self.with(|queues| {
             if queues.accepted.contains(&offer.data.id()) {
-                return false;
+                return;
             }
             if queues.offered.len() >= MAX_QUEUED_OFFERS {
                 queues.offered.pop_front();
                 queues.dropped = queues.dropped.saturating_add(1);
             }
             queues.offered.push_back(offer);
-            true
-        })
-        .unwrap_or(false)
+        });
     }
 
     /// Take everything waiting to be checked.
@@ -170,16 +169,15 @@ impl Relay {
             .unwrap_or_default()
     }
 
-    /// Put something this node has accepted on its way out, and say whether it is
-    /// the first time.
+    /// Put something this node has accepted on its way out.
     ///
-    /// `false` means nano has already relayed it, which is what keeps a block pushed
-    /// by eight peers from being pushed back eight times.
-    pub fn announce(&self, offer: Offer) -> bool {
+    /// Once each: an item already relayed is dropped, which is what keeps a block
+    /// eight peers pushed from being pushed back eight times.
+    pub fn announce(&self, offer: Offer) {
         self.with(|queues| {
             let id = offer.data.id();
             if !queues.accepted.insert(id) {
-                return false;
+                return;
             }
             queues.remembered.push_back(id);
             while queues.remembered.len() > MAX_REMEMBERED {
@@ -192,9 +190,7 @@ impl Relay {
                 queues.dropped = queues.dropped.saturating_add(1);
             }
             queues.announcing.push_back(offer);
-            true
-        })
-        .unwrap_or(false)
+        });
     }
 
     /// Take everything waiting to go out.
@@ -264,14 +260,14 @@ mod tests {
     fn an_offer_goes_in_and_an_acceptance_comes_out() {
         let relay = Relay::default();
         let from = Some(Hash160::from_bytes([7; 20]));
-        assert!(relay.offer(Offer::transaction(from, transaction(0))));
+        relay.offer(Offer::transaction(from, transaction(0)));
         let taken = relay.take_offered();
         assert_eq!(taken.len(), 1);
         assert!(relay.take_offered().is_empty(), "taking drains");
         assert_eq!(taken[0].from, from);
         assert_eq!(taken[0].data.name(), "transaction");
 
-        assert!(relay.announce(taken[0].clone()));
+        relay.announce(taken[0].clone());
         assert_eq!(relay.take_announcing().len(), 1);
     }
 
@@ -280,23 +276,28 @@ mod tests {
     fn an_accepted_item_is_neither_re_offered_nor_re_announced() {
         let relay = Relay::default();
         let offer = Offer::transaction(None, transaction(1));
-        assert!(relay.offer(offer.clone()));
+        relay.offer(offer.clone());
         drop(relay.take_offered());
-        assert!(relay.announce(offer.clone()), "the first acceptance goes out");
-        assert!(!relay.announce(offer.clone()), "the second does not");
+        relay.announce(offer.clone());
+        relay.announce(offer.clone());
+        assert_eq!(
+            relay.take_announcing().len(),
+            1,
+            "the second acceptance does not go out again"
+        );
+        relay.offer(offer);
         assert!(
-            !relay.offer(offer),
+            relay.take_offered().is_empty(),
             "and a peer pushing it again costs no second check"
         );
-        assert!(relay.take_offered().is_empty());
     }
 
     /// Two different transactions are two items, so the identifier is doing work.
     #[test]
     fn different_items_are_told_apart() {
         let relay = Relay::default();
-        assert!(relay.announce(Offer::transaction(None, transaction(2))));
-        assert!(relay.announce(Offer::transaction(None, transaction(3))));
+        relay.announce(Offer::transaction(None, transaction(2)));
+        relay.announce(Offer::transaction(None, transaction(3)));
         assert_eq!(relay.take_announcing().len(), 2);
     }
 
@@ -321,8 +322,10 @@ mod tests {
             relay.announce(Offer::transaction(None, transaction(nonce)));
         }
         drop(relay.take_announcing());
-        assert!(
-            relay.announce(first),
+        relay.announce(first);
+        assert_eq!(
+            relay.take_announcing().len(),
+            1,
             "the oldest acceptance has been forgotten"
         );
     }

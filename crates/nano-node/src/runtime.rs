@@ -4,7 +4,10 @@
 //! and mining are three tasks over one configuration rather than three
 //! programs over three command lines.
 
-use std::{error::Error, fs, future::Future, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, error::Error, fs, future::Future, path::Path, sync::Arc,
+    time::Duration,
+};
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource};
 use nano_crypto::StacksPublicKey;
@@ -144,7 +147,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut roles: JoinSet<(Job, Role)> = JoinSet::new();
     // Written by the follow loop once there is a chain to describe, and read by the
     // discovery loop that starts before there is one.
-    let advertised = Advertised::default();
+    let advertised = Advertised::open(&config.node.working_dir);
+    // Where a peer's pushed blocks and transactions wait for the loop that can check
+    // them. Created here rather than inside the transport because the follow loop is
+    // the other end of it, and neither half is the owner.
+    let relay = nano_p2p::Relay::default();
     // The p2p transport comes up first, because its whole point is to be a way in
     // that does not depend on a configured HTTP peer. It needs the chain identifier
     // up front — on this protocol the network id *is* the chain id and it is the
@@ -152,7 +159,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // to be discovered gets no transport, and falls back to what it always did.
     let phase = Phase::start("joining the peer network");
     let discovered = match config.network() {
-        Some(network) => start_transport(&config, network, &advertised, &mut roles).await,
+        Some(network) => {
+            start_transport(&config, network, &advertised, &relay, &mut roles).await
+        }
         None => None,
     };
     drop(phase);
@@ -244,6 +253,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             peer,
             discovered,
             advertised,
+            relay,
+            mempool,
             pox,
             source,
             state,
@@ -440,6 +451,12 @@ struct Follower {
     /// loop starts before there is a chain to describe, so this is how it eventually
     /// gets one.
     advertised: Advertised,
+    /// Blocks and transactions peers pushed, waiting for the only loop that can
+    /// check them, and where what passed goes back out.
+    relay: nano_p2p::Relay,
+    /// Where a relayed transaction is admitted, on this node's own rules against its
+    /// own view of the accounts.
+    mempool: Arc<Mutex<nano_mempool::Mempool>>,
     pox: PoxInfo,
     source: [u8; 32],
     state: Option<RpcState>,
@@ -456,6 +473,8 @@ async fn follow(follower: Follower) -> Role {
         peer,
         discovered,
         advertised,
+        relay,
+        mempool,
         pox,
         source,
         state,
@@ -523,7 +542,13 @@ async fn follow(follower: Follower) -> Role {
         // Blocks the public API admitted go into the same store the peer's do,
         // before the round that executes it: nothing about them is special from
         // here on, which is the point.
-        stage_admitted_blocks(&mut offered, &staging);
+        stage_admitted_blocks(&mut offered, &staging, &relay);
+        // Everything peers pushed, through the same boundary. Before the round that
+        // executes, so a block a peer pushed a moment ago is executed in the round
+        // that follows rather than the one after it.
+        if let Some(executor) = executor.as_ref() {
+            check_relayed(executor, &mempool, &relay, &staging).await;
+        }
         // Following the peer's current tenure is pointless while this node is
         // far from it — the tenure descends from blocks it has not executed, so
         // the walk fails every round — and the requests it spends are the ones
@@ -577,9 +602,15 @@ async fn follow(follower: Follower) -> Role {
 /// it runs it. Draining the channel rather than awaiting it keeps this on the
 /// round's own clock — an upload is visible within one poll interval, and a burst
 /// of them cannot starve the peer.
+///
+/// Having passed that boundary, an uploaded block is also relayed. A node that
+/// accepted a block and told nobody is a hole in the network's propagation, and the
+/// only thing that made these blocks special — that they arrived over HTTP — stops
+/// being true the moment they are authenticated.
 fn stage_admitted_blocks(
     offered: &mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
     staging: &Staging,
+    relay: &nano_p2p::Relay,
 ) {
     while let Ok(block) = offered.try_recv() {
         match staging.put(&block) {
@@ -593,7 +624,169 @@ fn stage_admitted_blocks(
                 block.block_id()
             ),
         }
+        relay.announce(nano_p2p::Offer::block(None, block));
     }
+}
+
+/// Put everything peers pushed through this node's own checks, and relay what
+/// passes.
+///
+/// This is the boundary the whole of task 054's relay item turns on, and the reason
+/// it is *here* is that here is where the chainstate is.
+/// `ChainState::authenticate_block` enforces the signer weight against the reward set
+/// nano derived, the miner signature against the sortition winner, the coinbase VRF
+/// proof, the seed the winning commit committed to, and the header's cumulative burn
+/// against nano's own burnchain — all before any of the block runs. A block that
+/// passes it is staged, and from that point it is indistinguishable from one this node
+/// fetched itself; a block that fails it is dropped, and the state root check at
+/// execution is still in front of everything that survives.
+///
+/// A rejected push is *not* a penalty. A block can fail because this node cannot yet
+/// derive the cycle's reward set, or has not executed the tenure it builds on, and
+/// scoring a peer for that would repeat the third slice's bug of isolating the peers
+/// that were working hardest.
+async fn check_relayed(
+    executor: &SharedExecutor,
+    mempool: &Arc<Mutex<nano_mempool::Mempool>>,
+    relay: &nano_p2p::Relay,
+    staging: &Staging,
+) {
+    let offers = relay.take_offered();
+    if offers.is_empty() {
+        return;
+    }
+    let mut transactions = Vec::new();
+    let mut accepted = 0_usize;
+    let mut rejected = 0_usize;
+    {
+        let mut executor = executor.lock().await;
+        for offer in offers {
+            let (from, block) = match offer.data {
+                nano_p2p::Pushed::Block(block) => (offer.from, block),
+                // Held back rather than handled here: admission wants the mempool's
+                // lock as well, and taking it under the executor's would invert the
+                // order `/v2/transactions` takes them in.
+                nano_p2p::Pushed::Transaction(transaction) => {
+                    transactions.push((offer.from, transaction));
+                    continue;
+                }
+            };
+            // The same call the public API's uploads go through, which is the point:
+            // a node that admitted from a peer what it would refuse from its own API
+            // is forkable through whichever of the two is laxer.
+            match nano_rpc::BlockAdmission::authenticate(&mut *executor, &block) {
+                Ok(()) => {
+                    if let Err(error) = staging.put(&block) {
+                        eprintln!("staging a relayed block failed: {error}");
+                        continue;
+                    }
+                    accepted += 1;
+                    relay.announce(nano_p2p::Offer::block(from, *block));
+                }
+                Err(error) => {
+                    rejected += 1;
+                    eprintln!(
+                        "a pushed block {} at height {} did not authenticate: {error}",
+                        block.block_id(),
+                        block.header.chain_length
+                    );
+                }
+            }
+        }
+    }
+    let admitted = admit_relayed(executor, mempool, relay, transactions).await;
+    if accepted > 0 || rejected > 0 || admitted > 0 {
+        println!(
+            "peers pushed {accepted} blocks this node accepted and {rejected} it refused, \
+             and {admitted} transactions it will mine"
+        );
+    }
+}
+
+/// Admit the transactions peers relayed, and pass on the ones the pool kept.
+///
+/// Separated from the block half only because of the locks: admission needs the
+/// mempool's as well as the executor's, and it takes them in the order
+/// `/v2/transactions` takes them, because two loops taking the same pair in opposite
+/// orders is a deadlock waiting for load.
+async fn admit_relayed(
+    executor: &SharedExecutor,
+    mempool: &Arc<Mutex<nano_mempool::Mempool>>,
+    relay: &nano_p2p::Relay,
+    transactions: Vec<(Option<nano_primitives::Hash160>, Box<nano_codec::Transaction>)>,
+) -> usize {
+    if transactions.is_empty() {
+        return 0;
+    }
+    // Admitted first, relayed after: the announcement is a queue write that does not
+    // need either lock, and holding the executor's while doing it would put an inbound
+    // push in front of the loop that executes blocks.
+    let mut kept = Vec::new();
+    let mut mempool = mempool.lock().await;
+    let mut executor = executor.lock().await;
+    let accounts = ExecutedAccounts::new(&mut *executor);
+    let now = now_unix();
+    for (from, transaction) in transactions {
+        let admission = mempool.submit((*transaction).clone(), &accounts, now);
+        if matches!(
+            admission,
+            Ok(nano_mempool::Admission::Added | nano_mempool::Admission::Replaced(_))
+        ) {
+            kept.push((from, transaction));
+        }
+    }
+    drop(accounts);
+    drop(executor);
+    drop(mempool);
+    for (from, transaction) in &kept {
+        relay.announce(nano_p2p::Offer::transaction(*from, transaction.clone()));
+    }
+    kept.len()
+}
+
+/// This node's own account view, for admitting a transaction a peer relayed.
+///
+/// Nano's executed state rather than the sending peer's answer about it: a relayed
+/// transaction is a transaction, and the rules it has to pass are the ones
+/// `/v2/transactions` applies. Accounts are read as the pool asks for them, because
+/// which of the origin, payer and recipient it needs is the pool's business.
+struct ExecutedAccounts<'a> {
+    chain: std::cell::RefCell<&'a mut dyn ChainAccess>,
+    accounts: std::cell::RefCell<HashMap<nano_address::StacksAddress, nano_mempool::Account>>,
+}
+
+impl<'a> ExecutedAccounts<'a> {
+    fn new(chain: &'a mut dyn ChainAccess) -> Self {
+        Self {
+            chain: std::cell::RefCell::new(chain),
+            accounts: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl nano_mempool::ChainTip for ExecutedAccounts<'_> {
+    fn account(&self, address: &nano_address::StacksAddress) -> nano_mempool::Account {
+        if let Some(account) = self.accounts.borrow().get(address) {
+            return *account;
+        }
+        let account = clarity::vm::types::PrincipalData::parse(&address.to_string())
+            .ok()
+            .and_then(|principal| self.chain.borrow_mut().account(&principal).ok())
+            .map_or_else(nano_mempool::Account::default, |entry| {
+                nano_mempool::Account {
+                    nonce: entry.nonce,
+                    balance: Some(entry.balance),
+                }
+            });
+        self.accounts.borrow_mut().insert(*address, account);
+        account
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Which reward cycle this node has already answered for, so a walk of the
@@ -1636,6 +1829,15 @@ fn advertised_view(
 #[derive(Clone, Default)]
 pub struct Advertised {
     inner: Arc<std::sync::Mutex<Option<LocalAnnouncement>>>,
+    /// The inventory that outlives the process, when there is a working directory to
+    /// keep it in.
+    ///
+    /// Behind the same kind of mutex as the snapshot and for the same reason: this is
+    /// written by the follow loop once a round and read by an inbound reply, both of
+    /// which are sub-millisecond sqlite operations. What it deliberately never takes
+    /// is the *executor's* lock, because a reply that could block on execution is a
+    /// reply that lets one inbound peer stall the loop that executes blocks.
+    served: Option<Arc<std::sync::Mutex<nano_p2p::ServedTenures>>>,
 }
 
 /// What the follow loop knows and the peer-facing loops need.
@@ -1650,7 +1852,37 @@ struct LocalAnnouncement {
 }
 
 impl Advertised {
+    /// Keep the inventory this node serves under `working_dir`, so a restart can
+    /// still answer for the cycles it has walked.
+    ///
+    /// A store that cannot be opened is not fatal: the node then answers from the
+    /// round's own window exactly as it did before, which is smaller and still
+    /// truthful.
+    fn open(working_dir: &Path) -> Self {
+        let served = match nano_p2p::ServedTenures::open(&working_dir.join("served.sqlite")) {
+            Ok(served) => Some(Arc::new(std::sync::Mutex::new(served))),
+            Err(error) => {
+                eprintln!("cannot keep the served inventory across restarts: {error}");
+                None
+            }
+        };
+        Self {
+            inner: Arc::default(),
+            served,
+        }
+    }
+
     fn publish(&self, announcement: LocalAnnouncement) {
+        // Recorded before the snapshot so that the durable answer is never behind the
+        // live one: a peer reading between the two would otherwise be told about a
+        // tenure whose bit had not been written down yet.
+        if let (Some(served), Some((cycle_start, tenures))) =
+            (self.served.as_ref(), announcement.inventory.as_ref())
+            && let Ok(served) = served.lock()
+            && let Err(error) = served.record(*cycle_start, tenures)
+        {
+            eprintln!("cannot record the tenures this node serves: {error}");
+        }
         if let Ok(mut held) = self.inner.lock() {
             *held = Some(announcement);
         }
@@ -1664,10 +1896,21 @@ impl Advertised {
 
     /// Answer a peer's inventory request, or `None` for a cycle this node cannot
     /// speak to — which becomes a `Nack`, and is the honest answer.
+    ///
+    /// The durable store answers first, because it knows strictly more: it holds every
+    /// bit the live window has ever reported for that cycle, including the ones from
+    /// before the last restart. The live snapshot is the fallback for a node whose
+    /// store would not open, and for the first round after a cycle rolls over.
     fn tenure_inventory(
         &self,
         cycle_start: nano_primitives::ConsensusHash,
     ) -> Option<nano_primitives::BitVec<2100>> {
+        if let Some(served) = self.served.as_ref()
+            && let Ok(served) = served.lock()
+            && let Ok(Some(tenures)) = served.inventory(cycle_start)
+        {
+            return Some(tenures);
+        }
         let (known, tenures) = self.read()?.inventory?;
         (known == cycle_start).then_some(tenures)
     }
@@ -1717,6 +1960,7 @@ async fn start_transport(
     config: &Config,
     network: Network,
     advertised: &Advertised,
+    relay: &nano_p2p::Relay,
     roles: &mut JoinSet<(Job, Role)>,
 ) -> Option<Discovered> {
     let seeds = config.node.bootstrap_seeds();
@@ -1768,6 +2012,7 @@ async fn start_transport(
         Ok(table) => Arc::new(PeerService {
             peers: std::sync::Mutex::new(table),
             advertised: advertised.clone(),
+            relay: relay.clone(),
         }),
         Err(error) => {
             eprintln!("cannot open the peer table for serving: {error}");
@@ -1802,12 +2047,17 @@ async fn start_transport(
         discovered.endpoints().len()
     );
 
-    let interval = Duration::from_secs(config.node.poll_interval_secs.max(1) * 10);
+    // The tick is the node's own poll interval and discovery happens every tenth of
+    // them. Two things want the shorter clock: relay, which is pointless if it is
+    // minutes late, and reading each peer's socket, which is what keeps a busy peer's
+    // announcements out of the receive buffer.
+    let tick = Duration::from_secs(config.node.poll_interval_secs.max(1));
     let advertised = advertised.clone();
+    let relay = relay.clone();
     roles.spawn(async move {
         (
             Job::Peers,
-            peer_discovery(swarm, bitcoin, advertised, interval).await,
+            peer_discovery(swarm, bitcoin, advertised, relay, tick).await,
         )
     });
 
@@ -1817,21 +2067,51 @@ async fn start_transport(
     Some(discovered)
 }
 
-/// Keep the peer set at strength for as long as the node runs.
+/// How many ticks between neighbour walks and inventory exchanges.
+///
+/// A ping and a dial round per tick would be two requests per peer per second for an
+/// answer that moves on the order of a tenure; relay, which shares this loop, has to
+/// be far more prompt than that.
+const DISCOVERY_TICKS: u64 = 10;
+
+/// Keep the peer set at strength, and carry what this node accepted back out to it.
+///
+/// One loop for both because both need `&mut Swarm`, and a swarm holds a
+/// `rusqlite::Connection` that is `Send` but not `Sync` — two tasks sharing it is not
+/// a thing the borrow checker will allow, and a mutex around it would make a relay
+/// push wait behind a neighbour walk.
 async fn peer_discovery(
     mut swarm: nano_p2p::Swarm,
     bitcoin: BurnchainSource,
     advertised: Advertised,
-    interval: Duration,
+    relay: nano_p2p::Relay,
+    tick: Duration,
 ) -> Role {
+    let mut ticks = 0_u64;
     loop {
-        sleep(interval).await;
+        sleep(tick).await;
+        ticks = ticks.wrapping_add(1);
         let published = advertised.read();
         let view = advertised_view(&bitcoin, published.as_ref());
         // `None` before there is a chain to name a cycle, and a peer is then not
         // asked at all rather than asked about a guess.
         let cycle_start = published.and_then(|announced| announced.cycle_start);
-        let round = swarm.maintain(view, cycle_start).await;
+        let mut round = if ticks.is_multiple_of(DISCOVERY_TICKS) {
+            swarm.maintain(view, cycle_start).await
+        } else {
+            nano_p2p::Round::default()
+        };
+        // What the follow loop authenticated, on its way to every peer that did not
+        // send it. This is the whole of relay's outbound half: the checks ran where
+        // the chainstate is, and what arrives here has already passed them.
+        let announcing = relay.take_announcing();
+        let sent = swarm.relay(&announcing, &mut round).await;
+        if sent > 0 {
+            println!(
+                "p2p: relayed {} accepted items to peers in {sent} pushes",
+                announcing.len()
+            );
+        }
         if round.dialled > 0 || round.dropped > 0 || round.isolated > 0 {
             println!(
                 "p2p: {} connected ({} new, {} lost, {} isolated), {} addresses learned, \
@@ -1850,14 +2130,15 @@ async fn peer_discovery(
         // signer chunks, at up to 0.8 a second per peer — and counting enough of them
         // as misbehaviour is what was isolating four peers in seven.
         //
-        // Pushed blocks and transactions are still dropped here, because acting on
-        // one means putting it through staging and the authenticated selection
-        // boundary, and doing it from this loop would be the one place that trusted a
-        // peer. That is the relay item in task 054.
-        let pushed = swarm.take_pushed().len();
+        // Pushed blocks and transactions no longer arrive here at all: a session with
+        // a `Service` hands them to it, and this node's `Service` puts them on the
+        // relay queue. What `take_pushed` still returns is the signer and StackerDB
+        // chunks, which nano replicates over HTTP.
+        let carried = swarm.take_pushed().len();
         if round.collected > 0 {
             println!(
-                "p2p: {} messages peers sent unprompted, {pushed} of them pushed data",
+                "p2p: {} messages peers sent unprompted, {carried} of them for a role \
+                 nano serves over HTTP",
                 round.collected
             );
         }
@@ -1956,6 +2237,10 @@ struct PeerService {
     peers: std::sync::Mutex<nano_p2p::PeerDb>,
     /// What the follow loop last published about this node's own chain.
     advertised: Advertised,
+    /// Where a pushed block or transaction goes: onto a bounded queue, and nowhere
+    /// near a decision. This runs on the listener's task and has no chainstate, so
+    /// the most it can honestly do is write down who said what.
+    relay: nano_p2p::Relay,
 }
 
 impl nano_p2p::Service for PeerService {
@@ -1987,6 +2272,29 @@ impl nano_p2p::Service for PeerService {
         // executor: a reply that took the executor's lock would let one inbound peer
         // stall the loop that executes blocks.
         self.advertised.tenure_inventory(cycle_start)
+    }
+
+    /// Queue what a peer pushed, and nothing else.
+    ///
+    /// Every check that matters — the signer weight, the miner signature, the
+    /// coinbase VRF proof, the committed seed, the header's cumulative burn against
+    /// nano's own burnchain, and then the state root at execution — runs in the follow
+    /// loop, where there is a chainstate to run them against. What happens here is a
+    /// bounded write to a queue, because a listener that could reject a block is a
+    /// listener that could accept one.
+    fn offer_blocks(&self, from: nano_primitives::Hash160, blocks: Vec<NakamotoBlock>) {
+        for block in blocks {
+            self.relay.offer(nano_p2p::Offer::block(Some(from), block));
+        }
+    }
+
+    fn offer_transaction(
+        &self,
+        from: nano_primitives::Hash160,
+        transaction: Box<nano_codec::Transaction>,
+    ) {
+        self.relay
+            .offer(nano_p2p::Offer::transaction(Some(from), transaction));
     }
 
     fn neighbors(&self) -> Vec<nano_p2p::NeighborAddress> {

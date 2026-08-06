@@ -80,10 +80,9 @@ impl ServedTenures {
         cycle_start: ConsensusHash,
         tenures: &BitVec<2100>,
     ) -> Result<u16, PeerDbError> {
-        let merged = match self.inventory(cycle_start)? {
-            Some(known) => union(&known, tenures),
-            None => tenures.clone(),
-        };
+        let merged = self
+            .inventory(cycle_start)?
+            .map_or_else(|| tenures.clone(), |known| union(&known, tenures));
         self.connection.execute(
             "INSERT INTO served_tenures (cycle_start, tenures) VALUES (?1, ?2)
              ON CONFLICT (cycle_start) DO UPDATE SET tenures = ?2",
