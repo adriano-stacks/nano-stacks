@@ -1111,3 +1111,36 @@ run in 11 seconds (btrfs, 61 GB apparent, no extra disk), so the fix is being wo
 against the real parent rather than against a reconstruction. That is the loop the
 earlier note asked for and could not have: a 4.5-hour import per experiment is what
 made this expensive before.
+
+## `get-block-info?` was reading a Stacks height where the chain reads a tenure height
+
+The divergence at 8,706,194 was two defects in one host function, both in
+clarity-wasm and both right in the interpreter:
+
+- **The height is a tenure height from epoch 3.0 on.** `get-block-info?` predates
+  Nakamoto, so a Clarity 1 or Clarity 2 contract passing `(- block-height u1)` is
+  passing a *tenure* height — the same switch `block-height` itself made, so that
+  the idiom keeps meaning what it meant. stacks-core translates it in
+  `special_get_block_info` before its range check; clarity-wasm passed the number
+  straight to the Stacks-height reads, which on mainnet names a block from about
+  twenty months earlier. Classic primary testnet is excluded, there and now here.
+- **`time` is the burn block time**, not the Nakamoto header's own timestamp.
+  `get-stacks-block-info? time` is the one that reads the timestamp;
+  clarity-wasm called that for both.
+
+`age009-token-lock::get-tokens-many` compares
+`(unwrap-panic (get-block-info? time (- block-height u1)))` against a vesting
+timestamp forty times over. Against a time twenty months stale, twenty-three of the
+forty took the other branch, returned the contract's own
+`ERR-BLOCK-HEIGHT-NOT-REACHED`, and did half the writes — a transaction both engines
+called a success, with the value, the write count and the root as the only evidence.
+
+**Verified against the chain, not against a reconstruction.** The production binary,
+standing on the reflink-copied state sealed at 8,706,193, executes 8,706,194 and
+seals `c081728eee3693c80147983ccc72e486082fe3f80cfc488acca46639bbe51ee6` — the root
+the signed header commits to — and 32 blocks after it with no mismatch of any kind.
+
+The regression is `conformance/block_info_tenure_height.rs`, which builds the
+smallest chain that can tell the two defects apart: tenure heights advancing at half
+the rate of Stacks heights, so no tenure height is ever a Stacks height, and a burn
+time that is never a Stacks timestamp. Both engines are asked, and they now agree.
