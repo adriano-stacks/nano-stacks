@@ -37,9 +37,10 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
 pub use events::{
     BlockEventContext, DEFAULT_DISPATCH_ATTEMPTS, EventDispatcher, EventKind, MaturedReward,
-    ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner, derived_signers,
-    matured_rewards, mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
-    proposal_response_payload, stackerdb_chunks_payload, stacker_set_payload,
+    MaturedRewardSource, ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner,
+    derived_signers, matured_rewards, mined_nakamoto_block_payload, new_block_payload,
+    new_burn_block_payload, proposal_response_payload, stacker_set_payload,
+    stackerdb_chunks_payload,
 };
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
@@ -437,11 +438,17 @@ pub fn router(state: RpcState) -> Router {
             get(stackerdb_chunk_at_version),
         )
         .route("/v3/sortitions", get(latest_sortition))
-        .route("/v3/sortitions/latest_and_last", get(latest_and_last_sortition))
+        .route(
+            "/v3/sortitions/latest_and_last",
+            get(latest_and_last_sortition),
+        )
         .route("/v3/sortitions/consensus/{consensus_hash}", get(sortition))
         .route("/v3/stacker_set/{cycle}", get(stacker_set))
         .route("/v3/tenures/info", get(tenure_info))
-        .route("/v3/tenures/fork_info/{start}/{stop}", get(tenure_fork_info))
+        .route(
+            "/v3/tenures/fork_info/{start}/{stop}",
+            get(tenure_fork_info),
+        )
         .route(
             "/v3/tenures/tip_metadata/{consensus_hash}",
             get(tenure_tip_metadata),
@@ -474,10 +481,7 @@ async fn trace(request: axum::extract::Request, next: axum::middleware::Next) ->
     if !*TRACE_REQUESTS {
         return next.run(request).await;
     }
-    let (method, path) = (
-        request.method().clone(),
-        request.uri().path().to_owned(),
-    );
+    let (method, path) = (request.method().clone(), request.uri().path().to_owned());
     let response = next.run(request).await;
     println!("rpc {method} {path} -> {}", response.status().as_u16());
     response
@@ -615,7 +619,9 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
 /// Nothing in the Stacks API says how far behind its own peer a node is, so a
 /// node that cannot execute looks identical to one at tip. This route is
 /// nano's own, and exists so that catching up is measurable.
-async fn sync_status(State(state): State<RpcState>) -> Result<axum::Json<SyncStatusWire>, RpcError> {
+async fn sync_status(
+    State(state): State<RpcState>,
+) -> Result<axum::Json<SyncStatusWire>, RpcError> {
     let followed = *state.followed_height.read().await;
     let selected = state.selected.read().await.clone();
     let tip = state
@@ -810,7 +816,10 @@ async fn latest_and_last_sortition(
         sortitions.push(last.clone());
     }
     Ok(axum::Json(
-        sortitions.into_iter().map(SortitionInfoWire::from).collect(),
+        sortitions
+            .into_iter()
+            .map(SortitionInfoWire::from)
+            .collect(),
     ))
 }
 
@@ -1257,11 +1266,9 @@ async fn block_proposal(
             tokio::spawn(async move {
                 let started = SystemTime::now();
                 let answer = answered.await;
-                let elapsed = started
-                    .elapsed()
-                    .map_or(0, |elapsed| {
-                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-                    });
+                let elapsed = started.elapsed().map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
                 announced.dispatch(
                     EventKind::ProposalResponse,
                     &proposal_response_payload(digest, &resolve(answer, size, elapsed)),
@@ -1283,9 +1290,7 @@ async fn judge_proposal(
     proposal: &BlockProposalWire,
     block: &NakamotoBlock,
 ) -> Verdict {
-    let rejected = |reason: String, code| {
-        Verdict::Now(ProposalOutcome::Rejected { reason, code })
-    };
+    let rejected = |reason: String, code| Verdict::Now(ProposalOutcome::Rejected { reason, code });
     // The chain identifier is in the request rather than in the block, and a
     // proposal for another chain is not a proposal at all.
     if let Some(chain_id) = proposal.chain_id
@@ -1385,7 +1390,10 @@ enum Verdict {
 /// not have to execute, which is how a signer reads it
 /// (`stacks-signer/src/v0/signer.rs:1569`).
 fn resolve(
-    answer: Result<Result<(), (String, ProposalRejectCode)>, tokio::sync::oneshot::error::RecvError>,
+    answer: Result<
+        Result<(), (String, ProposalRejectCode)>,
+        tokio::sync::oneshot::error::RecvError,
+    >,
     size: u64,
     elapsed: u64,
 ) -> ProposalOutcome {
@@ -1685,7 +1693,9 @@ impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
             committed_block_hash: sortition
                 .committed_block_hash
                 .map(|hash| format!("0x{hash}")),
-            vrf_seed: sortition.vrf_seed.map(|seed| format!("0x{}", hex::encode(seed))),
+            vrf_seed: sortition
+                .vrf_seed
+                .map(|seed| format!("0x{}", hex::encode(seed))),
         }
     }
 }
@@ -1744,11 +1754,11 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use nano_sync::{Node, NodeView};
     use nano_primitives::{
         BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash,
     };
     use nano_sync::{FollowedTenure, NodeInfo, PoxInfo, SortitionInfo, SyncClient, TenureInfo};
+    use nano_sync::{Node, NodeView};
     use reqwest::Url;
     use tower::ServiceExt;
 
@@ -1860,7 +1870,8 @@ mod tests {
             unlock_height: 42,
             nonce: 7,
         };
-        let app = router(RpcState::new(NETWORK).with_chain(chain(&[(address(&sender), entry)], None)));
+        let app =
+            router(RpcState::new(NETWORK).with_chain(chain(&[(address(&sender), entry)], None)));
 
         let response = app
             .oneshot(
@@ -2309,7 +2320,9 @@ mod tests {
                 consensus_hash,
                 parent_block_id: parent,
                 transaction_merkle_root: nano_primitives::Sha256Sum::default(),
-                state_index_root: TrieHash::from_bytes([u8::try_from(height % 256).unwrap_or(0); 32]),
+                state_index_root: TrieHash::from_bytes(
+                    [u8::try_from(height % 256).unwrap_or(0); 32],
+                ),
                 timestamp: 1_700_000_000 + height,
                 miner_signature: nano_crypto::MessageSignature::from_bytes([0; 65]),
                 signer_signatures: Vec::new(),
@@ -2398,11 +2411,7 @@ mod tests {
         );
 
         // And the tenure stream stops there too.
-        let stream = get(
-            format!("/v3/tenures/{}", blocks[0].block_id()),
-            app.clone(),
-        )
-        .await;
+        let stream = get(format!("/v3/tenures/{}", blocks[0].block_id()), app.clone()).await;
         let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
             .await
             .expect("read tenure");
@@ -2432,7 +2441,10 @@ mod tests {
             start_block_id: StacksBlockId,
             stop: Option<StacksBlockId>,
         ) -> Vec<Vec<u8>> {
-            let Some(start) = self.0.iter().find(|block| block.block_id() == start_block_id)
+            let Some(start) = self
+                .0
+                .iter()
+                .find(|block| block.block_id() == start_block_id)
             else {
                 return Vec::new();
             };
@@ -2456,8 +2468,8 @@ mod tests {
     #[tokio::test]
     async fn the_blocks_this_node_executed_are_served_without_a_peer_view() {
         let (_, blocks) = view_with_blocks(3);
-        let state = RpcState::new(NETWORK)
-            .with_executed_blocks(Arc::new(KeptBlocks(blocks.clone())));
+        let state =
+            RpcState::new(NETWORK).with_executed_blocks(Arc::new(KeptBlocks(blocks.clone())));
         // No followed view at all, and an executed tip the view could not have
         // reached: exactly the node that used to serve nothing.
         state.publish_executed(sealed_at(&blocks[2])).await;
@@ -2475,7 +2487,12 @@ mod tests {
 
         for block in &blocks {
             let response = get(format!("/v3/blocks/{}", block.block_id()), app.clone()).await;
-            assert_eq!(response.status(), StatusCode::OK, "block {}", block.block_id());
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "block {}",
+                block.block_id()
+            );
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("read the block");
@@ -2507,7 +2524,11 @@ mod tests {
         assert_eq!(bytes.as_ref(), two.as_slice());
 
         // A block this node never executed is still not served.
-        let response = get(format!("/v3/blocks/{}", StacksBlockId::from_bytes([9; 32])), app).await;
+        let response = get(
+            format!("/v3/blocks/{}", StacksBlockId::from_bytes([9; 32])),
+            app,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2715,9 +2736,8 @@ mod tests {
             for _ in 0..100 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let posts = self.received.lock().expect("record");
-                if let Some((_, payload)) = posts
-                    .iter()
-                    .find(|(event, _)| event == "proposal_response")
+                if let Some((_, payload)) =
+                    posts.iter().find(|(event, _)| event == "proposal_response")
                 {
                     let payload = payload.clone();
                     drop(posts);
@@ -2738,7 +2758,10 @@ mod tests {
         // No token, no proposal: unauthenticated, this route lets anyone make a
         // node execute a block of their choosing.
         let unauthorized = node
-            .propose(json!({ "block": hex::encode(node.blocks[2].encode()) }), None)
+            .propose(
+                json!({ "block": hex::encode(node.blocks[2].encode()) }),
+                None,
+            )
             .await;
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
@@ -2836,8 +2859,7 @@ mod tests {
     /// on, which is the one thing stacks-core refuses outright.
     #[tokio::test]
     async fn a_proposal_is_refused_when_no_observer_can_be_told_the_result() {
-        let state = RpcState::new(NETWORK)
-            .with_proposal_token("t0ken".to_owned());
+        let state = RpcState::new(NETWORK).with_proposal_token("t0ken".to_owned());
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -2952,11 +2974,12 @@ mod tests {
         let address = listener.local_addr().expect("an address");
         tokio::spawn(async move { super::serve(listener, state).await });
 
-        let client = SyncClient::new(
-            Url::parse(&format!("http://{address}/")).expect("a URL"),
-        )
-        .expect("a client");
-        let served = client.stacker_set(140).await.expect("the served reward set");
+        let client = SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a URL"))
+            .expect("a client");
+        let served = client
+            .stacker_set(140)
+            .await
+            .expect("the served reward set");
         assert_eq!(served.pox_ustx_threshold, 50_000_000_000);
         assert_eq!(served.signer_set.signers().len(), 2);
         assert_eq!(served.signer_set.weights(), vec![4, 4]);

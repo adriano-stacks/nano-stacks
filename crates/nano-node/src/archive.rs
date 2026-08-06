@@ -143,6 +143,49 @@ impl Archive {
             .query_row("SELECT count(*) FROM executed", [], |row| row.get(0))?)
     }
 
+    /// The block this node executed at a Stacks height, when it kept exactly one.
+    ///
+    /// Asked by name rather than served over [`nano_rpc::ExecutedBlocks`], because
+    /// no route asks a height: this is how the node reads back a tenure-start block
+    /// a hundred tenures below its tip to name the rewards it matured, and the
+    /// alternative was carrying that provenance in the ledger it serializes with
+    /// every block.
+    ///
+    /// Nothing when two blocks share the height. A retracted fork's block sits at a
+    /// height the chain has since re-executed and `retract_from` is what normally
+    /// takes it back, so a height with two under it is one where that did not
+    /// happen — and naming either of them would be a guess.
+    #[must_use]
+    pub fn block_at_height(&self, height: u64) -> Option<NakamotoBlock> {
+        let kept = match self.at_height(height) {
+            Ok(kept) => kept,
+            Err(error) => {
+                eprintln!("cannot read the executed block at height {height}: {error}");
+                return None;
+            }
+        };
+        let [bytes] = kept.as_slice() else {
+            return None;
+        };
+        NakamotoBlock::decode(bytes).ok()
+    }
+
+    /// The blocks kept at one height, at most two of them: the count is the whole
+    /// question, so reading a third would be reading for nothing.
+    fn at_height(&self, height: u64) -> Result<Vec<Vec<u8>>, ArchiveError> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT bytes FROM executed WHERE height = ?1 LIMIT 2")?;
+        let rows = statement.query_map(params![height], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut blocks = Vec::new();
+        for row in rows {
+            blocks.push(row?);
+        }
+        drop(statement);
+        drop(connection);
+        Ok(blocks)
+    }
+
     fn stored(&self, block_id: StacksBlockId) -> Result<Option<StoredBlock>, ArchiveError> {
         Ok(self
             .connection()?
@@ -338,7 +381,53 @@ mod tests {
             archive.tenure(first.block_id(), Some(stop.block_id())),
             vec![first.encode()]
         );
-        assert!(archive.tenure(StacksBlockId::from_bytes([9; 32]), None).is_empty());
+        assert!(
+            archive
+                .tenure(StacksBlockId::from_bytes([9; 32]), None)
+                .is_empty()
+        );
+    }
+
+    /// A block is found by its height, and an ambiguous height answers nothing.
+    ///
+    /// The height lookup is how the node reads a tenure-start block back to name
+    /// the rewards it matured, and it is only sound while one block holds the
+    /// height. A retracted fork's block sits at a height the chain has since
+    /// re-executed, so this is the case where naming a block would name the wrong
+    /// one — and the second block here is exactly that: the same height, a
+    /// different identifier.
+    #[test]
+    fn a_block_is_found_by_its_height_unless_two_blocks_share_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let archive = Archive::open(&directory.path().join("archive.sqlite")).expect("open");
+        let blocks = fixtures();
+        for block in &blocks {
+            archive.keep(block).expect("keep");
+        }
+
+        for block in &blocks {
+            let found = archive
+                .block_at_height(block.header.chain_length)
+                .expect("the block is kept");
+            assert_eq!(found.block_id(), block.block_id());
+        }
+        assert!(archive.block_at_height(0).is_none());
+
+        // The same height under a second identifier, which is what a fork the chain
+        // has left leaves behind when nothing retracted it.
+        let mut forked = blocks[0].clone();
+        forked.header.timestamp += 1;
+        assert_ne!(forked.block_id(), blocks[0].block_id());
+        archive.keep(&forked).expect("keep the fork's block too");
+        assert!(
+            archive
+                .block_at_height(forked.header.chain_length)
+                .is_none(),
+            "an ambiguous height named one of two blocks"
+        );
+        // By identifier both are still there: that question has one answer each.
+        assert!(archive.block(forked.block_id()).is_some());
+        assert!(archive.block(blocks[0].block_id()).is_some());
     }
 
     /// The window is a bound: the oldest blocks leave as newer ones arrive, and a

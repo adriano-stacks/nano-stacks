@@ -1704,29 +1704,10 @@ impl CaptureConfig {
         Ok(())
     }
 
-    fn write_capture(
-        &self,
-        staging: &Path,
-        blocks: &[CapturedBlock],
-        blocks_db: &Path,
-        sortition_db: &Path,
-        node_root: &Path,
-    ) -> Result<(), String> {
-        // Only the burn window the captured blocks sit in, and only the
-        // canonical snapshot at each height. A chain with forks has more than
-        // one row per height, and a chain with a million burn blocks does not
-        // want all of them in a fixture.
-        let (first_burn, last_burn) = Self::burn_span(sortition_db, blocks)?;
-        let snapshot_query = format!(
-            "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
-        );
-        let snapshot_query = snapshot_query.as_str();
-        let snapshots = sqlite_json(sortition_db, snapshot_query)?;
-        let bitcoin_blocks = Self::bitcoin_blocks(&snapshots)?;
-
-        self.write_blocks(staging, blocks, blocks_db)?;
-
-        for bitcoin_block in bitcoin_blocks {
+    /// Every burn block the snapshots name, as bitcoind hands it over: the raw
+    /// consensus bytes, which is the only form the ingest reads.
+    fn write_bitcoin_blocks(&self, staging: &Path, snapshots: &str) -> Result<(), String> {
+        for bitcoin_block in Self::bitcoin_blocks(snapshots)? {
             let burn_hash = bitcoin_block.hash;
             let encoded = if let Some(rest) = self.bitcoin_rest.as_ref() {
                 let raw = http_get(&format!("{}/block/{burn_hash}/raw", rest.trim_end_matches('/')))?;
@@ -1748,6 +1729,29 @@ impl CaptureConfig {
                 encoded.as_bytes(),
             )?;
         }
+        Ok(())
+    }
+
+    fn write_capture(
+        &self,
+        staging: &Path,
+        blocks: &[CapturedBlock],
+        blocks_db: &Path,
+        sortition_db: &Path,
+        node_root: &Path,
+    ) -> Result<(), String> {
+        // Only the burn window the captured blocks sit in, and only the
+        // canonical snapshot at each height. A chain with forks has more than
+        // one row per height, and a chain with a million burn blocks does not
+        // want all of them in a fixture.
+        let (first_burn, last_burn) = Self::burn_span(sortition_db, blocks)?;
+        let snapshot_query = format!(
+            "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
+        );
+        let snapshot_query = snapshot_query.as_str();
+        let snapshots = sqlite_json(sortition_db, snapshot_query)?;
+        self.write_blocks(staging, blocks, blocks_db)?;
+        self.write_bitcoin_blocks(staging, &snapshots)?;
 
         write_file(
             &staging.join("sortition/snapshots.json"),

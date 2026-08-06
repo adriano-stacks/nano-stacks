@@ -115,14 +115,7 @@ impl TenureEarnings {
     /// signed it (`nakamoto/tenure.rs`, `make_scheduled_miner_reward`).
     #[must_use]
     pub fn from_tenure_start(block: &NakamotoBlock, coinbase: u128) -> Option<Self> {
-        let transaction = block.transactions.iter().find(|transaction| {
-            matches!(
-                transaction.payload().data(),
-                TransactionPayloadData::NakamotoCoinbase { .. }
-                    | TransactionPayloadData::CoinbaseToAltRecipient { .. }
-                    | TransactionPayloadData::Coinbase { .. }
-            )
-        })?;
+        let transaction = tenure_coinbase(block)?;
         let named = match transaction.payload().data() {
             TransactionPayloadData::NakamotoCoinbase { recipient, .. } => recipient.clone(),
             TransactionPayloadData::CoinbaseToAltRecipient { recipient, .. } => {
@@ -140,6 +133,30 @@ impl TenureEarnings {
             fees: 0,
         })
     }
+}
+
+/// The coinbase transaction a tenure-start block carries, in any of its forms.
+fn tenure_coinbase(block: &NakamotoBlock) -> Option<&Transaction> {
+    block.transactions.iter().find(|transaction| {
+        matches!(
+            transaction.payload().data(),
+            TransactionPayloadData::NakamotoCoinbase { .. }
+                | TransactionPayloadData::CoinbaseToAltRecipient { .. }
+                | TransactionPayloadData::Coinbase { .. }
+        )
+    })
+}
+
+/// The miner that signed a tenure's coinbase, which is not always who it pays.
+///
+/// `miner_address` in a matured miner reward, and the one field of one that a
+/// credit cannot be read backwards into: stacks-core takes it from the coinbase's
+/// origin while the *recipient* is whoever the coinbase named, falling back to the
+/// same origin when it named nobody (`make_scheduled_miner_reward`). A coinbase
+/// paying an alternate recipient is where the two part company.
+#[must_use]
+pub fn tenure_miner_address(block: &NakamotoBlock) -> Option<nano_address::StacksAddress> {
+    tenure_coinbase(block)?.origin_address()
 }
 
 /// The coinbase a sortition emits, which the burnchain schedule fixes.
@@ -1866,7 +1883,7 @@ impl ChainState {
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             let reward_set =
                 signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
-            let (mut execution_cost, mut receipts) =
+            let (execution_cost, mut receipts) =
                 self.run_transactions(block, candidates, assembled)?;
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             ledger

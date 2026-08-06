@@ -65,6 +65,30 @@ pub struct MaturedReward {
     pub from_index_consensus_hash: StacksBlockId,
 }
 
+/// Which tenure a block's matured payouts were earned in, and by whom.
+///
+/// Both payouts name **one** block: stacks-core reads its `MinerRewardInfo` out of
+/// the maturing tenure's payment schedule alone and reports it against every entry
+/// (`event_dispatcher.rs`, `mature_rewards_info`). `miner_address` is the one field
+/// that differs between them, because the two payouts are two tenures' — the
+/// coinbase is the maturing tenure's and the fees are the tenure before it's, so
+/// each names its own miner.
+///
+/// A miner that cannot be named is the empty string rather than a zero address: a
+/// node whose kept blocks do not reach a hundred tenures back — one that started
+/// from a checkpoint, and every node for its first hundred tenures — has the
+/// credits and not the block that scheduled them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaturedRewardSource {
+    /// The maturing tenure's start block, by its own hash and by its identifier.
+    pub from_stacks_block_hash: BlockHeaderHash,
+    pub from_index_consensus_hash: StacksBlockId,
+    /// The miner of the maturing tenure, whose coinbase the first payout is.
+    pub coinbase_miner: String,
+    /// The miner of the tenure before it, whose fees the second payout is.
+    pub fee_miner: String,
+}
+
 /// The rewards a tenure-start block matured, as an observer reads them.
 ///
 /// stacks-core publishes two entries and they are not symmetric: the maturing
@@ -75,14 +99,22 @@ pub struct MaturedReward {
 /// in exactly that order, so the mapping is positional and is written down here
 /// rather than in the node.
 ///
-/// `miner_address` and the two `from_` fields are the ones nano cannot fill:
-/// they name the tenure a payout matured *from*, and reaching it needs a durable
-/// tenure-to-start-block index that nano's state does not keep — for a
-/// checkpointed node the earliest hundred tenures are below its history
-/// altogether, and a checkpoint carries their credits and nothing else. Left at
-/// their zero rather than guessed.
+/// That order is also why the source is one value rather than one per credit: the
+/// two entries share a block and differ only in whose tenure they are. A caller
+/// with no source at all — anything replaying blocks without the executed history
+/// behind them — leaves those fields at their zero, which is the honest answer for
+/// a payout whose tenure is below this node's history.
 #[must_use]
-pub fn matured_rewards(credits: &[nano_chainstate::NativeStxCredit]) -> Vec<MaturedReward> {
+pub fn matured_rewards(
+    credits: &[nano_chainstate::NativeStxCredit],
+    source: Option<&MaturedRewardSource>,
+) -> Vec<MaturedReward> {
+    let (from_block_hash, from_block_id) = source.map_or_else(Default::default, |source| {
+        (
+            source.from_stacks_block_hash,
+            source.from_index_consensus_hash,
+        )
+    });
     credits
         .iter()
         .enumerate()
@@ -90,8 +122,17 @@ pub fn matured_rewards(credits: &[nano_chainstate::NativeStxCredit]) -> Vec<Matu
             let coinbase = position == 0;
             MaturedReward {
                 recipient: credit.recipient.to_string(),
+                miner_address: source.map_or_else(String::new, |source| {
+                    if coinbase {
+                        source.coinbase_miner.clone()
+                    } else {
+                        source.fee_miner.clone()
+                    }
+                }),
                 coinbase: if coinbase { credit.amount } else { 0 },
                 tx_fees_streamed_produced: if coinbase { 0 } else { credit.amount },
+                from_stacks_block_hash: from_block_hash,
+                from_index_consensus_hash: from_block_id,
                 ..MaturedReward::default()
             }
         })
@@ -157,8 +198,7 @@ pub fn derived_signers(
 ///
 /// These come from the sortition and the header index rather than from
 /// execution, so the node supplies them alongside the executed block.
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BlockEventContext {
     pub parent_block_hash: BlockHeaderHash,
     pub bitcoin_block_hash: BitcoinHeaderHash,
@@ -1070,7 +1110,10 @@ mod tests {
         assert_eq!(received[0].payload, json!({ "kind": "new_block" }));
         // One stream per observer, numbered without gaps while nothing is dropped.
         assert_eq!(
-            received.iter().map(|post| post.sequence).collect::<Vec<_>>(),
+            received
+                .iter()
+                .map(|post| post.sequence)
+                .collect::<Vec<_>>(),
             [0, 1, 2, 3, 4]
         );
         assert!(received.iter().all(|post| post.dropped == 0));

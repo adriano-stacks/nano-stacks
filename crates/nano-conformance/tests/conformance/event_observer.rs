@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 use nano_chainstate::{AppliedBlock, NakamotoBlock, starts_new_tenure};
 use nano_conformance::replay_captured_blocks;
 use nano_primitives::{BitcoinHeaderHash, BlockHeaderHash, Sha256Sum};
-use nano_rpc::{
-    BlockEventContext, RewardSetEvent, RewardSetSigner, new_block_payload,
-};
+use nano_rpc::{BlockEventContext, RewardSetEvent, RewardSetSigner, new_block_payload};
 use serde_json::Value;
 
 /// How deep the payload diff replays, which is the whole capture.
@@ -90,8 +88,16 @@ fn context(
         pox_5_activation_height: height("pox_v4_unlock_height"),
         // nano's own, out of the block it just executed: the credits its tenure
         // accounting matured, and the set its prepare-phase walk of pox-5 wrote.
-        matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards),
-        reward_set: applied.reward_set.as_ref().map(RewardSetEvent::from_derived),
+        // No source for them: naming the tenure a payout matured *from* means
+        // reading its start block back, and that tenure is a hundred tenures below
+        // the block being replayed — outside this capture altogether, and below the
+        // checkpoint it starts at. `a_matured_payout_names_the_tenure_that_earned_it`
+        // is where the rule the node fills them by is checked instead.
+        matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards, None),
+        reward_set: applied
+            .reward_set
+            .as_ref()
+            .map(RewardSetEvent::from_derived),
     }
 }
 
@@ -102,9 +108,15 @@ fn context(
 /// carrying them.
 fn costs_are_reported(payload: &Value) -> bool {
     let dimensions = |cost: &Value| {
-        ["read_count", "read_length", "runtime", "write_count", "write_length"]
-            .iter()
-            .all(|dimension| cost.get(dimension).is_some_and(Value::is_u64))
+        [
+            "read_count",
+            "read_length",
+            "runtime",
+            "write_count",
+            "write_length",
+        ]
+        .iter()
+        .all(|dimension| cost.get(dimension).is_some_and(Value::is_u64))
     };
     dimensions(&payload["anchored_cost"])
         && payload["transactions"]
@@ -116,12 +128,14 @@ fn costs_are_reported(payload: &Value) -> bool {
 
 /// The three fields of a matured reward that name the tenure it matured *from*.
 ///
-/// nano cannot fill them: reaching that tenure's start block needs a durable
-/// tenure-to-block index its state does not keep, and for a checkpointed node the
-/// tenures maturing over its first hundred are below its history entirely — the
-/// checkpoint carries their credits and nothing else. Taken out of the comparison
-/// rather than quietly compared as zeros, so that the amounts and the recipients
-/// either side of them are compared for real.
+/// A replaying node cannot fill them, and that is a property of the replay rather
+/// than of the payload: the tenure a payout matured from is a hundred tenures
+/// below the block being replayed, so it is below this capture's checkpoint and
+/// there is no start block to read back. The node fills them from the blocks it
+/// kept — `CheckpointExecutor::matured_reward_source` — which is a window this
+/// replay does not have. Taken out of the comparison rather than
+/// quietly compared as zeros, so that the amounts and the recipients either side
+/// of them are compared for real.
 const UNKNOWN_PROVENANCE: [&str; 3] = [
     "miner_address",
     "from_stacks_block_hash",
@@ -179,9 +193,8 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
         let event = captured_event(&root, block);
         // Both of these nano derives itself once replay is under way; the
         // capture only seeds the block replay starts from.
-        let parent_block_hash = parent.unwrap_or_else(|| {
-            BlockHeaderHash::from_bytes(bytes32(&event["parent_block_hash"]))
-        });
+        let parent_block_hash = parent
+            .unwrap_or_else(|| BlockHeaderHash::from_bytes(bytes32(&event["parent_block_hash"])));
         tenure_height = match parent {
             None => event["tenure_height"].as_u64().expect("tenure height"),
             Some(_) if starts_new_tenure(block) => tenure_height + 1,
@@ -235,6 +248,145 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
     assert!(reward_sets > 0, "no derived reward set was compared");
 }
 
+/// The payouts one captured event reports, in the order it reports them.
+fn matured_rewards_of(event: &Value) -> &[Value] {
+    event["matured_miner_rewards"]
+        .as_array()
+        .expect("matured rewards")
+}
+
+/// Every captured event that matured a payout, by the tenure it started.
+fn maturing_events(root: &Path) -> Vec<(u64, Value)> {
+    let mut events: Vec<(u64, Value)> = Vec::new();
+    for entry in std::fs::read_dir(root.join("events/new_block")).expect("read the capture") {
+        let path = entry.expect("a captured event").path();
+        let event: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read it")).expect("decode it");
+        if !matured_rewards_of(&event).is_empty() {
+            events.push((
+                event["tenure_height"].as_u64().expect("tenure height"),
+                event,
+            ));
+        }
+    }
+    events.sort_by_key(|(tenure, _)| *tenure);
+    events
+}
+
+/// Which tenure each matured payout names, read off stacks-core's own stream.
+///
+/// The three fields the replay above takes out are not arbitrary — they follow a
+/// rule, and the rule is what the node fills them by: **both** payouts of one
+/// event name the maturing tenure's start block, while `miner_address` is each
+/// payout's own tenure's miner. The capture settles the rule without reaching a
+/// hundred tenures back for it, because consecutive maturing events overlap — the
+/// fees maturing with tenure N are the fees of the tenure whose coinbase matured
+/// with N−1, so the miner they name is that event's coinbase miner.
+#[test]
+fn a_matured_payout_names_the_tenure_that_earned_it() {
+    let events = maturing_events(&fixtures());
+    assert!(
+        events.len() > 1,
+        "the capture matured no payouts to read a rule off"
+    );
+
+    let mut overlaps = 0;
+    for (tenure, event) in &events {
+        // One block for the whole event, whichever tenure each payout belongs to.
+        let rewards = matured_rewards_of(event);
+        assert_eq!(
+            rewards.len(),
+            2,
+            "tenure {tenure} matured other than two payouts"
+        );
+        assert_eq!(
+            rewards[0]["from_stacks_block_hash"], rewards[1]["from_stacks_block_hash"],
+            "tenure {tenure} names two different blocks"
+        );
+        assert_eq!(
+            rewards[0]["from_index_consensus_hash"], rewards[1]["from_index_consensus_hash"],
+            "tenure {tenure} names two different block identifiers"
+        );
+        // The coinbase is the first entry and the fees the second, which is the
+        // order nano's credits arrive in.
+        assert_ne!(
+            rewards[0]["coinbase_amount"], "0",
+            "tenure {tenure} matured no coinbase"
+        );
+        assert_eq!(rewards[1]["coinbase_amount"], "0");
+
+        // The fees are the previous tenure's, and so is the miner they are paid to.
+        let Some((_, previous)) = events.iter().find(|(earlier, _)| *earlier + 1 == *tenure) else {
+            continue;
+        };
+        let previous = matured_rewards_of(previous);
+        assert_eq!(
+            rewards[1]["miner_address"], previous[0]["miner_address"],
+            "the fees maturing at tenure {tenure} name a miner other than the previous tenure's"
+        );
+        assert_eq!(rewards[1]["recipient"], previous[0]["recipient"]);
+        overlaps += 1;
+    }
+    assert!(
+        overlaps > 0,
+        "no two consecutive maturing tenures were compared"
+    );
+}
+
+/// nano's builder on that same rule, which is the half the capture cannot show.
+///
+/// The credits are what nano's tenure accounting produces, in its order; the
+/// source is what the node reads back out of the blocks it kept. This says the two
+/// are put together the way the stream above is written — and that a node without
+/// the history leaves the miner plainly absent rather than reporting a zero
+/// address, which would read as a real principal.
+#[test]
+fn a_matured_payout_is_built_from_the_tenures_that_earned_it() {
+    let matured: Vec<nano_chainstate::NativeStxCredit> = [
+        ("ST2FW15NGB4H76FMVXKHYYSM865YVS6V3SA1GNABC", 1_020_400_000),
+        ("ST2MES40ZEXTX9M4YXW9QSWHRVC9HYT419S198VPM", 3_000_300),
+    ]
+    .into_iter()
+    .map(|(recipient, amount)| nano_chainstate::NativeStxCredit {
+        recipient: clarity::vm::types::PrincipalData::parse(recipient).expect("a principal"),
+        amount,
+    })
+    .collect();
+    let source = nano_rpc::MaturedRewardSource {
+        from_stacks_block_hash: BlockHeaderHash::from_bytes([1; 32]),
+        from_index_consensus_hash: nano_primitives::StacksBlockId::from_bytes([2; 32]),
+        coinbase_miner: "ST22RBMZ4CMXYAVBED3KTMZEWRMA0ST6XSGBSX10H".to_owned(),
+        fee_miner: "ST4DZ2J4VWYBEQC0319V7CN8JDYE2WMESPSWMGDE".to_owned(),
+    };
+
+    let built = nano_rpc::matured_rewards(&matured, Some(&source));
+    let [coinbase, fees] = built.as_slice() else {
+        panic!("two payouts were built, not {}", built.len())
+    };
+    assert_eq!(
+        coinbase.recipient,
+        "ST2FW15NGB4H76FMVXKHYYSM865YVS6V3SA1GNABC"
+    );
+    assert_eq!(coinbase.miner_address, source.coinbase_miner);
+    assert_eq!(coinbase.coinbase, 1_020_400_000);
+    assert_eq!(coinbase.tx_fees_streamed_produced, 0);
+    assert_eq!(fees.recipient, "ST2MES40ZEXTX9M4YXW9QSWHRVC9HYT419S198VPM");
+    assert_eq!(fees.miner_address, source.fee_miner);
+    assert_eq!(fees.coinbase, 0);
+    assert_eq!(fees.tx_fees_streamed_produced, 3_000_300);
+    for reward in &built {
+        assert_eq!(reward.from_stacks_block_hash, source.from_stacks_block_hash);
+        assert_eq!(
+            reward.from_index_consensus_hash,
+            source.from_index_consensus_hash
+        );
+    }
+
+    let without = nano_rpc::matured_rewards(&matured, None);
+    assert!(without.iter().all(|reward| reward.miner_address.is_empty()));
+    assert_eq!(without[0].coinbase, 1_020_400_000);
+}
+
 /// nano's `proposal_response` payloads against stacks-core's own type.
 ///
 /// A signer branches on this payload — it decides whether to sign — and it
@@ -282,16 +434,34 @@ fn a_proposal_verdict_is_read_back_by_stacks_cores_own_reader() {
     // code it cannot parse would make the whole verdict unreadable, so this
     // walks all of them rather than the one the routes happen to use today.
     for (code, expected) in [
-        (nano_rpc::ProposalRejectCode::BadBlockHash, ValidateRejectCode::BadBlockHash),
-        (nano_rpc::ProposalRejectCode::BadTransaction, ValidateRejectCode::BadTransaction),
-        (nano_rpc::ProposalRejectCode::InvalidBlock, ValidateRejectCode::InvalidBlock),
-        (nano_rpc::ProposalRejectCode::ChainstateError, ValidateRejectCode::ChainstateError),
-        (nano_rpc::ProposalRejectCode::UnknownParent, ValidateRejectCode::UnknownParent),
+        (
+            nano_rpc::ProposalRejectCode::BadBlockHash,
+            ValidateRejectCode::BadBlockHash,
+        ),
+        (
+            nano_rpc::ProposalRejectCode::BadTransaction,
+            ValidateRejectCode::BadTransaction,
+        ),
+        (
+            nano_rpc::ProposalRejectCode::InvalidBlock,
+            ValidateRejectCode::InvalidBlock,
+        ),
+        (
+            nano_rpc::ProposalRejectCode::ChainstateError,
+            ValidateRejectCode::ChainstateError,
+        ),
+        (
+            nano_rpc::ProposalRejectCode::UnknownParent,
+            ValidateRejectCode::UnknownParent,
+        ),
         (
             nano_rpc::ProposalRejectCode::NonCanonicalTenure,
             ValidateRejectCode::NonCanonicalTenure,
         ),
-        (nano_rpc::ProposalRejectCode::NoSuchTenure, ValidateRejectCode::NoSuchTenure),
+        (
+            nano_rpc::ProposalRejectCode::NoSuchTenure,
+            ValidateRejectCode::NoSuchTenure,
+        ),
         (
             nano_rpc::ProposalRejectCode::InvalidTransactionReplay,
             ValidateRejectCode::InvalidTransactionReplay,
@@ -300,12 +470,18 @@ fn a_proposal_verdict_is_read_back_by_stacks_cores_own_reader() {
             nano_rpc::ProposalRejectCode::InvalidParentBlock,
             ValidateRejectCode::InvalidParentBlock,
         ),
-        (nano_rpc::ProposalRejectCode::InvalidTimestamp, ValidateRejectCode::InvalidTimestamp),
+        (
+            nano_rpc::ProposalRejectCode::InvalidTimestamp,
+            ValidateRejectCode::InvalidTimestamp,
+        ),
         (
             nano_rpc::ProposalRejectCode::NetworkChainMismatch,
             ValidateRejectCode::NetworkChainMismatch,
         ),
-        (nano_rpc::ProposalRejectCode::NotFoundError, ValidateRejectCode::NotFoundError),
+        (
+            nano_rpc::ProposalRejectCode::NotFoundError,
+            ValidateRejectCode::NotFoundError,
+        ),
         (
             nano_rpc::ProposalRejectCode::ProblematicTransaction,
             ValidateRejectCode::ProblematicTransaction,

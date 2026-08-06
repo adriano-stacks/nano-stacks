@@ -282,11 +282,11 @@ impl ExecutionTiming {
 pub fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> {
     let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
     let waterfall = pox.pox_5_activation_height.map(|activation| {
-        pox.first_bitcoin_height
-            + (pox.reward_cycle(u64::from(activation)) + 1) * length
+        pox.first_bitcoin_height + (pox.reward_cycle(u64::from(activation)) + 1) * length
     });
     let cycles =
-        nano_sortition::RewardCycleSchedule::new(pox.first_bitcoin_height, length, waterfall).ok()?;
+        nano_sortition::RewardCycleSchedule::new(pox.first_bitcoin_height, length, waterfall)
+            .ok()?;
     let schedule =
         nano_sortition::PayoutSchedule::new(cycles, u64::from(pox.prepare_phase_length)).ok()?;
     // Where epoch 4.0 begins collapses the mining window for the six blocks after
@@ -330,7 +330,10 @@ fn report_sortition_walk(walk: &crate::sortition::CatchUp, standing_on: u64) {
 /// per field, because which field disagrees names which arithmetic is wrong: the
 /// consensus hash covers the operation set, the burn total and the `PoX` history
 /// together, while the VRF seed is the winning commitment's alone.
-fn report_disagreements(local: &nano_sortition::SortitionSnapshot, peer: &nano_sync::SortitionInfo) {
+fn report_disagreements(
+    local: &nano_sortition::SortitionSnapshot,
+    peer: &nano_sync::SortitionInfo,
+) {
     if local.consensus_hash != peer.consensus_hash {
         eprintln!(
             "locally derived consensus hash at burn {} is {} where the peer says {}",
@@ -472,7 +475,10 @@ impl fmt::Display for NodeExecutionError {
         match self {
             Self::Sync(error) => write!(formatter, "node synchronization failed: {error}"),
             Self::Descent { tenure, error } => {
-                write!(formatter, "descending through tenure {tenure} failed: {error}")
+                write!(
+                    formatter,
+                    "descending through tenure {tenure} failed: {error}"
+                )
             }
             Self::Execution(error) => write!(formatter, "node execution failed: {error}"),
             Self::Staging(error) => write!(formatter, "node staging failed: {error}"),
@@ -936,7 +942,10 @@ where
     /// its tip happens to sit would move the boundary part-way through a prepare
     /// phase and name a cycle no peer recognises.
     #[must_use]
-    pub fn cycle_start_consensus_hash(&self, pox: &PoxInfo) -> Option<nano_primitives::ConsensusHash> {
+    pub fn cycle_start_consensus_hash(
+        &self,
+        pox: &PoxInfo,
+    ) -> Option<nano_primitives::ConsensusHash> {
         self.sortition
             .as_ref()?
             .consensus_hash_at(self.cycle_start_height(pox)?)
@@ -984,13 +993,18 @@ where
     pub fn tenure_inventory(
         &self,
         pox: &PoxInfo,
-    ) -> Option<(u64, nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)> {
+    ) -> Option<(
+        u64,
+        nano_primitives::ConsensusHash,
+        nano_primitives::BitVec<2100>,
+    )> {
         let tracker = self.sortition.as_ref()?;
         let start = self.cycle_start_height(pox)?;
         let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
         let executed: std::collections::HashSet<nano_primitives::ConsensusHash> =
             self.chainstate.executed_tenures().into_iter().collect();
-        let mut tenures = nano_primitives::BitVec::<2100>::zeros(u16::try_from(length).ok()?).ok()?;
+        let mut tenures =
+            nano_primitives::BitVec::<2100>::zeros(u16::try_from(length).ok()?).ok()?;
         // Walked by offset rather than by searching the history for each executed
         // tenure: the history is a quarter of a million hashes long, and the cycle is
         // two thousand.
@@ -1038,10 +1052,9 @@ where
         bound: usize,
     ) -> Option<(u64, Vec<u16>)> {
         let start = self.cycle_start_height(pox)?;
-        let length = u16::try_from(
-            u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length),
-        )
-        .ok()?;
+        let length =
+            u16::try_from(u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length))
+                .ok()?;
         let acquired = from
             .and_then(|view| self.sortition.as_ref()?.height_of_consensus_hash(view))
             .unwrap_or_default()
@@ -1085,10 +1098,10 @@ where
         if claims.is_empty() {
             return Vec::new();
         }
-        let Some((tracker, (start, wanted))) = self
-            .sortition
-            .as_ref()
-            .zip(self.wanted_tenures(pox, acquired, SCHEDULED_TENURES))
+        let Some((tracker, (start, wanted))) =
+            self.sortition
+                .as_ref()
+                .zip(self.wanted_tenures(pox, acquired, SCHEDULED_TENURES))
         else {
             return Vec::new();
         };
@@ -1169,10 +1182,10 @@ where
         for block in walk.iter().rev() {
             let sortition =
                 match Self::wait_out_limits(|| node.sortition(block.header.consensus_hash)).await {
-                Ok(sortition) => sortition,
-                Err(error) if error.is_rate_limited() => break,
-                Err(error) => return Err(error.into()),
-            };
+                    Ok(sortition) => sortition,
+                    Err(error) if error.is_rate_limited() => break,
+                    Err(error) => return Err(error.into()),
+                };
             let mut bitcoin_context = pox.bitcoin_context();
             bitcoin_context.height = sortition.bitcoin_height;
             bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
@@ -1241,9 +1254,7 @@ where
         // checkpoint far behind the network it spends round after round downloading
         // history nothing can yet run. The schedule starts at the tip and works up, so
         // the first tenure it stages is the next one the executor wants.
-        let acquired = staging
-            .highest()?
-            .map(|block| block.header.consensus_hash);
+        let acquired = staging.highest()?.map(|block| block.header.consensus_hash);
         let schedule = self.schedule_tenures(pox, claims, acquired);
         let scheduled =
             Self::fetch_scheduled(history, staging, &schedule, stop, budget.fetch, &mut round)
@@ -1511,7 +1522,15 @@ where
         let parent = self
             .chainstate
             .recorded_header(*block.header.parent_block_id.as_bytes());
-        let sealed = self.chainstate.recorded_header(*block.block_id().as_bytes());
+        let sealed = self
+            .chainstate
+            .recorded_header(*block.block_id().as_bytes());
+        let tenure_height = sealed.map_or(0, |header| header.tenure_height);
+        let matured_source = if applied.matured_rewards.is_empty() {
+            None
+        } else {
+            self.matured_reward_source(tenure_height)
+        };
         let event = nano_rpc::BlockEventContext {
             parent_block_hash: nano_primitives::BlockHeaderHash::from_bytes(
                 parent.map_or_else(<[u8; 32]>::default, |header| header.block_header_hash),
@@ -1536,12 +1555,15 @@ where
                     .and_then(|snapshot| snapshot.winner_txid)
                     .unwrap_or_default(),
             ),
-            tenure_height: sealed.map_or(0, |header| u64::from(header.tenure_height)),
+            tenure_height: u64::from(tenure_height),
             v1_unlock_height: context.v1_unlock_height,
             v2_unlock_height: context.v2_unlock_height,
             v3_unlock_height: context.v3_unlock_height,
             pox_5_activation_height: context.pox_5_activation_height,
-            matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards),
+            matured_rewards: nano_rpc::matured_rewards(
+                &applied.matured_rewards,
+                matured_source.as_ref(),
+            ),
             reward_set: applied
                 .reward_set
                 .as_ref()
@@ -1554,6 +1576,65 @@ where
             nano_rpc::EventKind::NewBlock,
             &nano_rpc::new_block_payload(block, applied, &event),
         );
+    }
+
+    /// Which tenure the rewards this block matured were earned in, and by whom.
+    ///
+    /// The three fields of a matured reward that a credit cannot be read backwards
+    /// into: the tenure-start block that scheduled the payout, and the miner that
+    /// signed its coinbase — who is not the recipient whenever the coinbase named
+    /// one. What answers them is that block itself, and a node that keeps the
+    /// blocks it executed still has it a hundred tenures later.
+    ///
+    /// Read back rather than remembered. Carrying provenance forward in the tenure
+    /// accounting would work too, and it is the wrong place: that ledger is
+    /// serialized with **every** block and holds two hundred tenures, so it would
+    /// roughly double in size per block for a field no consensus rule reads.
+    ///
+    /// A node whose archive does not reach back that far — one started from a
+    /// checkpoint, for its first hundred tenures — answers nothing, which is the
+    /// truth: a checkpoint carries what is owed and not where it was earned.
+    fn matured_reward_source(&self, tenure_height: u32) -> Option<nano_rpc::MaturedRewardSource> {
+        let archive = self.archive.as_ref()?;
+        let matured =
+            u64::from(tenure_height).checked_sub(nano_chainstate::MINER_REWARD_MATURITY)?;
+        let start = self.tenure_start_block(archive, matured)?;
+        // The fees are the tenure *before* the maturing one's, and so is the miner
+        // they are paid to. A chain that does not reach it names the coinbase's
+        // miner and leaves the other absent rather than reporting one twice.
+        let previous = matured
+            .checked_sub(1)
+            .and_then(|tenure| self.tenure_start_block(archive, tenure));
+        let miner = |block: &NakamotoBlock| {
+            nano_chainstate::tenure_miner_address(block)
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string)
+        };
+        Some(nano_rpc::MaturedRewardSource {
+            from_stacks_block_hash: start.header.block_hash(),
+            from_index_consensus_hash: start.block_id(),
+            coinbase_miner: miner(&start),
+            fee_miner: previous.as_ref().map_or_else(String::new, miner),
+        })
+    }
+
+    /// The block a tenure started with, as this node executed and kept it.
+    ///
+    /// Refused unless it really does start a tenure. The durable map answers with
+    /// the first block of a tenure that this node *executed*, which for the tenure
+    /// it began mid-way through — at a checkpoint, or at a restart — is not that
+    /// tenure's start block at all. Naming that block would be a confidently wrong
+    /// `from_stacks_block_hash` rather than an absent one.
+    fn tenure_start_block(
+        &self,
+        archive: &crate::archive::Archive,
+        tenure_height: u64,
+    ) -> Option<NakamotoBlock> {
+        let height = self
+            .chainstate
+            .tenure_start_height(u32::try_from(tenure_height).ok()?)?;
+        let block = archive.block_at_height(u64::from(height))?;
+        nano_chainstate::starts_new_tenure(&block).then_some(block)
     }
 
     /// Announce every block this node executes to these observers.
@@ -1983,7 +2064,9 @@ where
         {
             eprintln!("the retracted sortition chain could not be written down: {error}");
         }
-        let Some(resume) = retraction.resume_from.filter(|_| !retraction.discarded.is_empty())
+        let Some(resume) = retraction
+            .resume_from
+            .filter(|_| !retraction.discarded.is_empty())
         else {
             println!(
                 "{} sortitions were retracted and no block this node executed stood on any \
@@ -2160,8 +2243,7 @@ where
         let peer = match local_view {
             LocalView::NoChain => {
                 let phase = std::time::Instant::now();
-                let Some(sortition) =
-                    ended_by_a_rate_limit(self.sortition_for(peers, view).await)?
+                let Some(sortition) = ended_by_a_rate_limit(self.sortition_for(peers, view).await)?
                 else {
                     return Ok(None);
                 };
@@ -2181,7 +2263,9 @@ where
         };
         let bitcoin_height = match local_view {
             LocalView::At(height) => height,
-            _ => peer.as_ref().map_or(0, |sortition| sortition.bitcoin_height),
+            _ => peer
+                .as_ref()
+                .map_or(0, |sortition| sortition.bitcoin_height),
         };
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.height = bitcoin_height;
@@ -2277,7 +2361,8 @@ where
             );
             return Ok(None);
         };
-        bitcoin_context.accumulated_coinbase = schedule.accumulated_at(bitcoin_height, Some(previous));
+        bitcoin_context.accumulated_coinbase =
+            schedule.accumulated_at(bitcoin_height, Some(previous));
         Ok(Some(bitcoin_context))
     }
 

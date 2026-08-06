@@ -173,7 +173,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         nano_conformance::skip_gate("the capture holds no mid-tenure block of mempool transactions");
         return;
     };
-    let Some(mut chainstate) = replay_below(&fixtures, position) else {
+    let Some(chainstate) = replay_below(&fixtures, position) else {
         return;
     };
     let transaction = dropped
