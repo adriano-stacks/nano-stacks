@@ -78,13 +78,20 @@ fn the_frozen_mainnet_slice_names_its_compiler() {
         );
         return;
     };
+    // The shape `compiler_identity_of` produces, and the one shape it does *not*:
+    // a build with no vendored compiler beside it stamps `unknown: ...` rather than
+    // naming a tree nobody can produce, and a slice frozen by such a build names no
+    // compiler either.
+    let digest = compiler
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| panic!("a compiler identity is `sha256:<hex>`, not {compiler:?}"));
     assert_eq!(
-        compiler.len(),
+        digest.len(),
         64,
-        "a compiler identity is a 32-byte hash of the sources that were compiled, not {compiler:?}"
+        "a compiler identity hashes the sources that were compiled, so {compiler:?} is not one"
     );
     assert!(
-        compiler.chars().all(|character| character.is_ascii_hexdigit()),
+        digest.chars().all(|character| character.is_ascii_hexdigit()),
         "a compiler identity is hexadecimal, not {compiler:?}"
     );
     if compiler != nano_vm::COMPILER_IDENTITY {

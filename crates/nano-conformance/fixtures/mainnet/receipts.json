@@ -3501,6 +3501,7 @@
       "transactions": 2
     }
   ],
+  "compiler": "sha256:1813d530c829662e55f5405352897cc2e0a727855d3cc27275b1363d2d1016dc",
   "first_height": 8702046,
   "last_height": 8702592,
   "source": "nano-stacks event observer, blocks whose state root the chain verified"

@@ -1636,10 +1636,65 @@ impl CaptureConfig {
 
     /// The burn heights the captured blocks span, widened by the window a
     /// commitment can reach back over.
-    fn burn_span(sortition_db: &Path, blocks: &[CapturedBlock]) -> Result<(u64, u64), String> {
-        let hashes = blocks
+    /// The burn views the captured blocks actually execute under.
+    ///
+    /// A block's own `consensus_hash` names the sortition that elected its
+    /// *tenure*, and for a tenure that outlives that burn block it is not the view
+    /// the block runs in: a tenure **extend** moves the Clarity burn view forward
+    /// while the tenure's name stays put, and `burn-block-height`,
+    /// `get-burn-block-info?` and the seed all follow the view.
+    ///
+    /// Taking the span from the tenure names alone therefore truncated any capture
+    /// containing an extend, and truncated it silently -- the replay stopped at the
+    /// first block whose view was past the end with "block Bitcoin view is absent
+    /// from captured Bitcoin snapshots", which reads like a divergence and is a
+    /// missing fixture. Measured on a live pox-5 hacknet: block 931's tenure is burn
+    /// 392 and its view is burn 399, seven blocks outside what the old span kept.
+    ///
+    /// `nakamoto_block_headers.burn_view` is stacks-core's own answer for this, so
+    /// the union of the two columns is read rather than the blocks being decoded.
+    fn burn_views(index_db: &Path, blocks: &[CapturedBlock]) -> Vec<String> {
+        let ids = blocks
             .iter()
-            .map(|block| format!("'{}'", block.consensus_hash))
+            .map(|block| format!("'{}'", block.index_block_hash))
+            .collect::<Vec<_>>()
+            .join(",");
+        sqlite(
+            index_db,
+            &format!(
+                "select distinct burn_view from nakamoto_block_headers \
+                 where index_block_hash in ({ids}) and burn_view is not null"
+            ),
+        )
+        .map(|output| {
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        // A node whose index cannot be read leaves the span as the tenure names
+        // give it, which is what it was before: the replay then says which view it
+        // is missing, and that is better than refusing to capture at all.
+        .unwrap_or_default()
+    }
+
+    fn burn_span(
+        sortition_db: &Path,
+        index_db: &Path,
+        blocks: &[CapturedBlock],
+    ) -> Result<(u64, u64), String> {
+        let mut names: Vec<String> = blocks
+            .iter()
+            .map(|block| block.consensus_hash.clone())
+            .collect();
+        names.extend(Self::burn_views(index_db, blocks));
+        names.sort();
+        names.dedup();
+        let hashes = names
+            .iter()
+            .map(|name| format!("'{name}'"))
             .collect::<Vec<_>>()
             .join(",");
         let output = sqlite(
@@ -1744,7 +1799,8 @@ impl CaptureConfig {
         // canonical snapshot at each height. A chain with forks has more than
         // one row per height, and a chain with a million burn blocks does not
         // want all of them in a fixture.
-        let (first_burn, last_burn) = Self::burn_span(sortition_db, blocks)?;
+        let (first_burn, last_burn) =
+            Self::burn_span(sortition_db, &node_root.join("chainstate/vm/index.sqlite"), blocks)?;
         let snapshot_query = format!(
             "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
         );
