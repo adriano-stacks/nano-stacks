@@ -13,6 +13,7 @@ bitcoin_rpc = "http://hacknet:hacknet@127.0.0.1:18443"
 stacks_rpc = "http://127.0.0.1:20443"
 first_block_hash = "623dd8384f286c2d3af85e2e2b99771811e345cbfbea2c54ada542fdea53a5e1"
 first_consensus_hash = "567f4551f17e8fbe1c9aa3d68058bf9a7afcb74e"
+sbtc_registry_contract = "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-registry"
 pox_first_bitcoin_height = 0
 pox_prepare_phase_length = 5
 pox_reward_phase_length = 15

@@ -14,6 +14,7 @@ use std::{
 };
 
 use clarity::vm::costs::ExecutionCost;
+use nano_address::{PoxAddress, PoxAddressType32};
 use nano_chainstate::{AppliedBlock, NakamotoBlock, TransactionReceipt, TransactionStatus};
 use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Sha256Sum, StacksBlockId,
@@ -52,7 +53,7 @@ impl EventKind {
 }
 
 /// One matured tenure reward, as an observer reads it back.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaturedReward {
     pub recipient: String,
     pub miner_address: String,
@@ -62,6 +63,39 @@ pub struct MaturedReward {
     pub tx_fees_streamed_produced: u128,
     pub from_stacks_block_hash: BlockHeaderHash,
     pub from_index_consensus_hash: StacksBlockId,
+}
+
+/// The rewards a tenure-start block matured, as an observer reads them.
+///
+/// stacks-core publishes two entries and they are not symmetric: the maturing
+/// tenure's coinbase goes to its own recipient, and the fees of the tenure
+/// *before* it go to that tenure's recipient under
+/// `tx_fees_streamed_produced` — `calculate_miner_reward` gives a Nakamoto miner
+/// the share `(0, parent_fees, 0)`. nano's accounting credits exactly that pair
+/// in exactly that order, so the mapping is positional and is written down here
+/// rather than in the node.
+///
+/// `miner_address` and the two `from_` fields are the ones nano cannot fill:
+/// they name the tenure a payout matured *from*, and reaching it needs a durable
+/// tenure-to-start-block index that nano's state does not keep — for a
+/// checkpointed node the earliest hundred tenures are below its history
+/// altogether, and a checkpoint carries their credits and nothing else. Left at
+/// their zero rather than guessed.
+#[must_use]
+pub fn matured_rewards(credits: &[nano_chainstate::NativeStxCredit]) -> Vec<MaturedReward> {
+    credits
+        .iter()
+        .enumerate()
+        .map(|(position, credit)| {
+            let coinbase = position == 0;
+            MaturedReward {
+                recipient: credit.recipient.to_string(),
+                coinbase: if coinbase { credit.amount } else { 0 },
+                tx_fees_streamed_produced: if coinbase { 0 } else { credit.amount },
+                ..MaturedReward::default()
+            }
+        })
+        .collect()
 }
 
 /// One signer of the reward set a block anchored.
@@ -79,6 +113,44 @@ pub struct RewardSetEvent {
     pub signers: Vec<RewardSetSigner>,
     /// Absent under waterfall, which has no per-slot threshold.
     pub pox_ustx_threshold: Option<u128>,
+}
+
+impl RewardSetEvent {
+    /// The set a prepare-phase block computed, as that block announces it.
+    ///
+    /// `pox_ustx_threshold` is left absent on purpose: the captured stream shows
+    /// stacks-core publishing `null` here for a waterfall cycle whose
+    /// `/v3/stacker_set` document carries the threshold, so the event says less
+    /// than the route does and this says the same less.
+    #[must_use]
+    pub fn from_derived(derived: &nano_chainstate::signers::DerivedRewardSet) -> Self {
+        Self {
+            cycle_number: derived.reward_cycle,
+            signers: derived_signers(derived),
+            pox_ustx_threshold: None,
+        }
+    }
+}
+
+/// The signers of a derived set, with what each stacked beside its weight.
+///
+/// One conversion for the event payload and the `/v3/stacker_set` document
+/// both, because they report the same three facts about the same signers.
+#[must_use]
+pub fn derived_signers(
+    derived: &nano_chainstate::signers::DerivedRewardSet,
+) -> Vec<RewardSetSigner> {
+    derived
+        .signers
+        .signers()
+        .iter()
+        .zip(&derived.stacked)
+        .map(|(signer, stacked)| RewardSetSigner {
+            signing_key: signer.public_key.to_bytes_compressed(),
+            stacked_amount: *stacked,
+            weight: signer.weight,
+        })
+        .collect()
 }
 
 /// What a `new_block` payload reports that the block itself does not carry.
@@ -333,40 +405,75 @@ pub fn proposal_response_payload(
 
 /// Build the `/v3/stacker_set` document for a reward cycle this node derived.
 ///
-/// Shared with the event payload's `reward_set` rather than shaped twice: they
-/// are the same set of signers, and nano's own `SyncClient` parses this document
-/// back, which is what makes a served reward set usable as another node's
-/// checkpoint attestation.
+/// The amounts are JSON numbers, as stacks-core writes them and as both its own
+/// reader and nano's `SyncClient` read them back.
 ///
-/// The amounts are JSON numbers, as stacks-core writes them and as nano's own
-/// `SyncClient` reads them back.
+/// Two shapes, and the difference is a field nano either has or has not.
+/// stacks-core's `RewardSet` is deserialized by reading `reward_set_version` out
+/// of a flat object: absent or `0` is `RewardSetV0`, `1` is the 4.0
+/// `WaterfallCycleSet`, whose `sbtc_address` is required — a version 1 document
+/// without it does not deserialize at all. So a node that has derived the
+/// waterfall payout address serves version 1, and one that has not serves the
+/// version every reader accepts rather than claiming one it cannot fill.
 ///
-/// The shape is `RewardSetV0`'s, which is the one a document with no
-/// `reward_set_version` is read as. The 4.0 `Waterfall` shape requires
-/// `sbtc_address`, and nano does not derive it: it comes from the sBTC registry's
-/// aggregate public key through the taproot derivation, which nothing reads yet.
-/// A version 1 document without it would not deserialize at all, so this serves
-/// the version every reader accepts rather than claiming a version it cannot
-/// fill.
+/// `rewarded_addresses` and `start_cycle_state` are V0's and are written only
+/// there. A waterfall cycle pays one sBTC output rather than a set of reward
+/// addresses, so it has no addresses and misses no slots.
 #[must_use]
-pub fn stacker_set_payload(signers: &[RewardSetSigner], pox_ustx_threshold: u128) -> Value {
-    json!({
-        "signers": signers
-            .iter()
-            .map(|signer| json!({
+pub fn stacker_set_payload(
+    signers: &[RewardSetSigner],
+    pox_ustx_threshold: u128,
+    sbtc_address: Option<&PoxAddress>,
+) -> Value {
+    let entries = signers
+        .iter()
+        .map(|signer| {
+            json!({
                 // Bare hex, no `0x`: stacks-core writes the key type straight
                 // out, and its own reader is not prefix-tolerant.
                 "signing_key": hex::encode(signer.signing_key),
                 "stacked_amt": microstx(signer.stacked_amount),
                 "weight": signer.weight,
-            }))
-            .collect::<Vec<_>>(),
-        "pox_ustx_threshold": microstx(pox_ustx_threshold),
-        // Empty under waterfall, which pays one sBTC output rather than a set of
-        // reward addresses, and so misses no slots either.
-        "rewarded_addresses": Vec::<Value>::new(),
-        "start_cycle_state": { "missed_reward_slots": Vec::<Value>::new() },
-    })
+            })
+        })
+        .collect::<Vec<_>>();
+    match sbtc_address.and_then(waterfall_address) {
+        Some(sbtc_address) => json!({
+            "reward_set_version": 1,
+            "sbtc_address": sbtc_address,
+            "signers": entries,
+            "pox_ustx_threshold": microstx(pox_ustx_threshold),
+        }),
+        None => json!({
+            "signers": entries,
+            "pox_ustx_threshold": microstx(pox_ustx_threshold),
+            "rewarded_addresses": Vec::<Value>::new(),
+            "start_cycle_state": { "missed_reward_slots": Vec::<Value>::new() },
+        }),
+    }
+}
+
+/// A waterfall payout address as stacks-core's derived serde writes it.
+///
+/// `PoxAddress` there is an externally tagged enum of tuple variants, so the
+/// body is an array — the network flag, the address type by name, and the
+/// thirty-two bytes as numbers rather than hex. Only `Addr32` is a waterfall
+/// payout; anything else is not one and is reported as absent rather than
+/// coerced into a document a reader would then believe.
+fn waterfall_address(address: &PoxAddress) -> Option<Value> {
+    let PoxAddress::Addr32 {
+        mainnet,
+        address_type,
+        bytes,
+    } = address
+    else {
+        return None;
+    };
+    let name = match address_type {
+        PoxAddressType32::P2tr => "P2TR",
+        PoxAddressType32::P2wsh => "P2WSH",
+    };
+    Some(json!({ "Addr32": [mainnet, name, bytes.to_vec()] }))
 }
 
 /// A microSTX quantity as a JSON number.

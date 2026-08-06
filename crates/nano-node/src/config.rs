@@ -78,6 +78,15 @@ pub struct NodeConfig {
     /// their choosing, so there is no default: a node that was not given a token
     /// answers `503` rather than inventing one.
     pub block_proposal_token: Option<String>,
+    /// Where this chain's sBTC registry is deployed, as `<address>.<name>`.
+    ///
+    /// The single output a waterfall reward cycle pays is derived from that
+    /// contract's current aggregate key, so a node that cannot name it cannot
+    /// serve the 4.0 reward-set shape. Mainnet's registry is fixed and this is
+    /// ignored there; everywhere else it is a deployment nothing can be guessed
+    /// from — the captured hacknet chain's is not at the address stacks-core
+    /// defaults a testnet to.
+    pub pox_5_sbtc_registry_contract: Option<String>,
     #[serde(default = "one")]
     pub poll_interval_secs: u64,
     /// Blocks this node will download to reach the peer's tip before it

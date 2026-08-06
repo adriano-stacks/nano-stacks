@@ -6,19 +6,26 @@
 //! receipts and diffing them is the strongest offline check there is that an
 //! observer cannot tell the two nodes apart.
 //!
-//! What the capture supplies as context — the sortition that elected the
-//! block, its parent's burn view, the rewards that matured under it, the
-//! reward set it anchored — nano's chain state does not expose to the RPC yet.
-//! Everything else, including every transaction receipt and every Clarity
-//! event, is nano's own.
+//! What the capture still supplies as context is the burn block: the sortition
+//! that elected the block, its identifier and time, and the parent's. Those come
+//! from a burnchain and a sortition chain that a replay of block bytes does not
+//! stand up — the node reads them from its own, and `mainnet_sortition` is where
+//! that reading is checked.
+//!
+//! Everything else is nano's own, and two of them are the point of this file:
+//! **the rewards a block matured** and **the reward set it computed** come out of
+//! `AppliedBlock`, which is to say out of the tenure accounting and the pox-5
+//! walk this node ran. So this compares nano's answer about who was paid what,
+//! and who may sign the next cycle, against the answer stacks-core published for
+//! the same 340 blocks.
 
 use std::path::{Path, PathBuf};
 
 use nano_chainstate::{AppliedBlock, NakamotoBlock, starts_new_tenure};
 use nano_conformance::replay_captured_blocks;
-use nano_primitives::{BitcoinHeaderHash, BlockHeaderHash, Sha256Sum, StacksBlockId};
+use nano_primitives::{BitcoinHeaderHash, BlockHeaderHash, Sha256Sum};
 use nano_rpc::{
-    BlockEventContext, MaturedReward, RewardSetEvent, RewardSetSigner, new_block_payload,
+    BlockEventContext, RewardSetEvent, RewardSetSigner, new_block_payload,
 };
 use serde_json::Value;
 
@@ -42,14 +49,6 @@ fn bytes32(value: &Value) -> [u8; 32] {
         .expect("32-byte hash")
 }
 
-fn amount(value: &Value) -> u128 {
-    value
-        .as_str()
-        .expect("amount")
-        .parse()
-        .expect("decimal amount")
-}
-
 /// The `new_block` event the capture recorded for this block.
 fn captured_event(root: &Path, block: &NakamotoBlock) -> Value {
     let name = format!(
@@ -62,54 +61,12 @@ fn captured_event(root: &Path, block: &NakamotoBlock) -> Value {
         .unwrap_or_else(|_| panic!("decode {name}"))
 }
 
-fn matured_rewards(event: &Value) -> Vec<MaturedReward> {
-    event["matured_miner_rewards"]
-        .as_array()
-        .expect("matured rewards")
-        .iter()
-        .map(|reward| MaturedReward {
-            recipient: reward["recipient"].as_str().expect("recipient").to_owned(),
-            miner_address: reward["miner_address"].as_str().expect("miner").to_owned(),
-            coinbase: amount(&reward["coinbase_amount"]),
-            tx_fees_anchored: amount(&reward["tx_fees_anchored"]),
-            tx_fees_streamed_confirmed: amount(&reward["tx_fees_streamed_confirmed"]),
-            tx_fees_streamed_produced: amount(&reward["tx_fees_streamed_produced"]),
-            from_stacks_block_hash: BlockHeaderHash::from_bytes(bytes32(
-                &reward["from_stacks_block_hash"],
-            )),
-            from_index_consensus_hash: StacksBlockId::from_bytes(bytes32(
-                &reward["from_index_consensus_hash"],
-            )),
-        })
-        .collect()
-}
-
-fn reward_set(event: &Value) -> Option<RewardSetEvent> {
-    let set = event["reward_set"].as_object()?;
-    Some(RewardSetEvent {
-        cycle_number: event["cycle_number"].as_u64().expect("cycle number"),
-        signers: set["signers"]
-            .as_array()
-            .expect("signers")
-            .iter()
-            .map(|signer| RewardSetSigner {
-                signing_key: hex::decode(signer["signing_key"].as_str().expect("signing key"))
-                    .expect("hexadecimal signing key")
-                    .try_into()
-                    .expect("33-byte signing key"),
-                stacked_amount: amount(&signer["stacked_amt"]),
-                weight: u32::try_from(signer["weight"].as_u64().expect("weight")).expect("weight"),
-            })
-            .collect(),
-        pox_ustx_threshold: set["pox_ustx_threshold"].as_str().map(|threshold| {
-            threshold
-                .parse()
-                .expect("decimal proof-of-transfer threshold")
-        }),
-    })
-}
-
-fn context(event: &Value, parent_block_hash: BlockHeaderHash, tenure_height: u64) -> BlockEventContext {
+fn context(
+    event: &Value,
+    applied: &AppliedBlock,
+    parent_block_hash: BlockHeaderHash,
+    tenure_height: u64,
+) -> BlockEventContext {
     let height = |name: &str| u32::try_from(event[name].as_u64().expect(name)).expect(name);
     BlockEventContext {
         parent_block_hash,
@@ -131,8 +88,10 @@ fn context(event: &Value, parent_block_hash: BlockHeaderHash, tenure_height: u64
         v2_unlock_height: height("pox_v2_unlock_height"),
         v3_unlock_height: height("pox_v3_unlock_height"),
         pox_5_activation_height: height("pox_v4_unlock_height"),
-        matured_rewards: matured_rewards(event),
-        reward_set: reward_set(event),
+        // nano's own, out of the block it just executed: the credits its tenure
+        // accounting matured, and the set its prepare-phase walk of pox-5 wrote.
+        matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards),
+        reward_set: applied.reward_set.as_ref().map(RewardSetEvent::from_derived),
     }
 }
 
@@ -155,6 +114,20 @@ fn costs_are_reported(payload: &Value) -> bool {
             .all(|transaction| dimensions(&transaction["execution_cost"]))
 }
 
+/// The three fields of a matured reward that name the tenure it matured *from*.
+///
+/// nano cannot fill them: reaching that tenure's start block needs a durable
+/// tenure-to-block index its state does not keep, and for a checkpointed node the
+/// tenures maturing over its first hundred are below its history entirely — the
+/// checkpoint carries their credits and nothing else. Taken out of the comparison
+/// rather than quietly compared as zeros, so that the amounts and the recipients
+/// either side of them are compared for real.
+const UNKNOWN_PROVENANCE: [&str; 3] = [
+    "miner_address",
+    "from_stacks_block_hash",
+    "from_index_consensus_hash",
+];
+
 /// Put a payload in the shape both nodes agree on.
 ///
 /// stacks-core builds its event list out of a `HashSet` of event indices, so
@@ -175,6 +148,17 @@ fn normalize(payload: &mut Value) {
                 .remove("execution_cost");
         }
     }
+    if let Some(rewards) = object
+        .get_mut("matured_miner_rewards")
+        .and_then(Value::as_array_mut)
+    {
+        for reward in rewards {
+            let reward = reward.as_object_mut().expect("a matured reward object");
+            for field in UNKNOWN_PROVENANCE {
+                reward.remove(field);
+            }
+        }
+    }
 }
 
 #[test]
@@ -185,6 +169,11 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
     let mut divergences: Vec<String> = Vec::new();
     let mut transactions = 0;
     let mut events = 0;
+    // The two payload fields nano now derives rather than reads. Counted because
+    // a capture window without a maturing payout or a prepare phase in it would
+    // compare neither and agree about both.
+    let mut matured = 0;
+    let mut reward_sets = 0;
 
     let compare = |block: &NakamotoBlock, applied: &AppliedBlock| {
         let event = captured_event(&root, block);
@@ -199,8 +188,13 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
             Some(_) => tenure_height,
         };
 
-        let mut payload =
-            new_block_payload(block, applied, &context(&event, parent_block_hash, tenure_height));
+        let mut payload = new_block_payload(
+            block,
+            applied,
+            &context(&event, applied, parent_block_hash, tenure_height),
+        );
+        matured += applied.matured_rewards.len();
+        reward_sets += usize::from(applied.reward_set.is_some());
         transactions += applied.receipts.len();
         events += payload["events"].as_array().map_or(0, Vec::len);
         assert!(
@@ -237,6 +231,8 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
     // A payload stream with nothing in it would agree with anything.
     assert!(transactions > 0, "no receipts were compared");
     assert!(events > 0, "no Clarity events were compared");
+    assert!(matured > 0, "no matured miner reward was compared");
+    assert!(reward_sets > 0, "no derived reward set was compared");
 }
 
 /// nano's `proposal_response` payloads against stacks-core's own type.
@@ -338,7 +334,11 @@ fn a_proposal_verdict_is_read_back_by_stacks_cores_own_reader() {
 ///
 /// `/v3/stacker_set` is how a signer learns its own weight and how a node learns
 /// whose signatures to count, and the document is hand-written here too. So the
-/// check is that stacks-core's own `RewardSet` reader takes it.
+/// check is that stacks-core's own `RewardSet` reader takes it — and takes it as
+/// the *shape* nano meant, which is the part a field-by-field eye cannot see:
+/// the variant is chosen by a `reward_set_version` key read out of a flat object,
+/// so a document that merely looks like a waterfall set is read as a V0 one and
+/// its `sbtc_address` silently ignored.
 #[test]
 fn a_served_reward_set_is_read_back_by_stacks_cores_own_reader() {
     use blockstack_lib::chainstate::stacks::boot::RewardSet;
@@ -352,9 +352,26 @@ fn a_served_reward_set_is_read_back_by_stacks_cores_own_reader() {
             weight: u32::from(seed),
         })
         .collect();
-    let document = nano_rpc::stacker_set_payload(&signers, 50_000_000_000);
+    let payout = nano_address::PoxAddress::Addr32 {
+        mainnet: false,
+        address_type: nano_address::PoxAddressType32::P2tr,
+        bytes: [9; 32],
+    };
+    let document = nano_rpc::stacker_set_payload(&signers, 50_000_000_000, Some(&payout));
 
     let read: RewardSet = serde_json::from_value(document).expect("stacks-core reads the set");
+    let waterfall = match &read {
+        RewardSet::Waterfall(set) => set,
+        RewardSet::V0(set) => panic!("read as a version 0 set: {set:?}"),
+    };
+    assert_eq!(
+        waterfall.sbtc_address,
+        blockstack_lib::chainstate::stacks::address::PoxAddress::Addr32(
+            false,
+            blockstack_lib::chainstate::stacks::address::PoxAddressType32::P2TR,
+            [9; 32],
+        )
+    );
     let entries = read.signers().expect("the set names its signers").clone();
     assert_eq!(entries.len(), 3);
     assert_eq!(read.pox_ustx_threshold(), Some(50_000_000_000));
@@ -363,6 +380,14 @@ fn a_served_reward_set_is_read_back_by_stacks_cores_own_reader() {
         assert_eq!(entry.weight, signer.weight);
         assert_eq!(entry.stacked_amt, signer.stacked_amount);
     }
+
+    // Without the payout address there is no waterfall document to serve, and the
+    // version every reader accepts is served instead of a version 1 one that
+    // would not deserialize at all.
+    let v0 = nano_rpc::stacker_set_payload(&signers, 50_000_000_000, None);
+    let read: RewardSet = serde_json::from_value(v0).expect("stacks-core reads the set");
+    assert!(matches!(read, RewardSet::V0(_)), "{read:?}");
+    assert_eq!(read.signers().map(Vec::len), Some(3));
 }
 
 /// The three payloads a hosted signer's event listener reads, against its reader.

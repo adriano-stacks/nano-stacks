@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod config;
 pub mod hosting;
 pub mod miner;
@@ -66,6 +67,12 @@ pub struct CheckpointExecutor<S> {
     /// belongs on the executor rather than beside it: a `new_block` sent from
     /// anywhere else would announce a block that had only been downloaded.
     observers: Option<nano_rpc::EventDispatcher>,
+    /// Where the blocks this node executes are kept, so it can serve them.
+    ///
+    /// Beside the observers and for the same reason: only the executor knows a
+    /// block was executed rather than downloaded, and it is the executed ones a
+    /// node answers `/v3/blocks` and `/v3/tenures` with.
+    archive: Option<std::sync::Arc<crate::archive::Archive>>,
     bitcoin: S,
 }
 
@@ -758,6 +765,7 @@ where
             bitcoin_view: None,
             sortition_view: None,
             observers: None,
+            archive: None,
             bitcoin,
         })
     }
@@ -780,6 +788,7 @@ where
             bitcoin_view: None,
             sortition_view: None,
             observers: None,
+            archive: None,
             bitcoin,
         }
     }
@@ -1264,10 +1273,17 @@ where
 
     /// Tell the observers what this node just executed.
     ///
-    /// Only the fields a follower can answer from what it holds are filled in;
-    /// the rest are left at their defaults rather than invented, since an
-    /// observer comparing nano with stacks-core is better served by a field that
-    /// is plainly absent than by one that is confidently wrong.
+    /// Every field here is one this node holds an answer for, and the answers
+    /// come from three places: the block's own header, the header the parent left
+    /// in the store when it sealed, and the sortition this node derived for the
+    /// burn view. Nothing is taken from a peer, and a field with no answer is
+    /// left at its default rather than invented — an observer comparing nano
+    /// against stacks-core is better served by a field that is plainly absent
+    /// than by one that is confidently wrong.
+    ///
+    /// The parent's recorded header is why this runs after the seal: the block's
+    /// `parent_block_hash` is the parent's *block hash*, which its identifier is
+    /// not, and its burn view is the one the parent executed under.
     fn announce_block(
         &self,
         block: &NakamotoBlock,
@@ -1277,20 +1293,44 @@ where
         let Some(observers) = self.observers.as_ref() else {
             return;
         };
+        let parent = self
+            .chainstate
+            .recorded_header(*block.header.parent_block_id.as_bytes());
+        let sealed = self.chainstate.recorded_header(*block.block_id().as_bytes());
         let event = nano_rpc::BlockEventContext {
             parent_block_hash: nano_primitives::BlockHeaderHash::from_bytes(
-                *block.header.parent_block_id.as_bytes(),
+                parent.map_or_else(<[u8; 32]>::default, |header| header.block_header_hash),
             ),
             bitcoin_block_hash: nano_primitives::BitcoinHeaderHash::from_bytes(
                 context.burn_header_hash,
             ),
             bitcoin_height: context.height,
-
+            bitcoin_timestamp: context.burn_block_time,
+            parent_bitcoin_block_hash: nano_primitives::BitcoinHeaderHash::from_bytes(
+                parent.map_or_else(<[u8; 32]>::default, |header| header.burn_header_hash),
+            ),
+            parent_bitcoin_height: parent.map_or(0, |header| u64::from(header.burn_block_height)),
+            parent_bitcoin_timestamp: parent.map_or(0, |header| header.burn_block_time),
+            // The commitment that won this tenure's sortition, out of the chain
+            // this node derived from Bitcoin itself. A node deriving no
+            // sortitions has no answer and says nothing.
+            miner_txid: nano_primitives::Sha256Sum::from_bytes(
+                self.sortition
+                    .as_ref()
+                    .and_then(|tracker| tracker.snapshot_at(context.height))
+                    .and_then(|snapshot| snapshot.winner_txid)
+                    .unwrap_or_default(),
+            ),
+            tenure_height: sealed.map_or(0, |header| u64::from(header.tenure_height)),
             v1_unlock_height: context.v1_unlock_height,
             v2_unlock_height: context.v2_unlock_height,
             v3_unlock_height: context.v3_unlock_height,
             pox_5_activation_height: context.pox_5_activation_height,
-            ..Default::default()
+            matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards),
+            reward_set: applied
+                .reward_set
+                .as_ref()
+                .map(nano_rpc::RewardSetEvent::from_derived),
         };
         // Queued rather than posted: `dispatch` hands the payload to the
         // observer's own drain task, so an observer that is slow or gone costs
@@ -1308,6 +1348,15 @@ where
     /// announcing a block that had only been downloaded.
     pub fn announce_to(&mut self, observers: nano_rpc::EventDispatcher) {
         self.observers = Some(observers);
+    }
+
+    /// Keep every block this node executes in this store.
+    ///
+    /// Sealing a block already forgets it from staging; this is the other half,
+    /// and it is what lets a node serve a block it executed rather than one a peer
+    /// has just told it about.
+    pub fn keep_executed_blocks(&mut self, archive: std::sync::Arc<crate::archive::Archive>) {
+        self.archive = Some(archive);
     }
 
     /// Take over a derived sortition chain, and say where to keep it.
@@ -1632,6 +1681,13 @@ where
         self.bitcoin_view = None;
         self.sortition_view = None;
         self.bitcoin_height = 0;
+        // And the blocks kept for serving, which are a claim about what this node
+        // executed: everything above the block it now stands on it no longer did.
+        if let Some(archive) = self.archive.as_ref()
+            && let Err(error) = archive.retract_from(self.tip.header.chain_length + 1)
+        {
+            eprintln!("cannot give back the blocks this node retracted: {error}");
+        }
         Ok(())
     }
 
@@ -2072,6 +2128,19 @@ where
             self.announce_block(&block, &applied, bitcoin_context);
             timing.dispatch += phase.elapsed();
             let phase = std::time::Instant::now();
+            // Kept where it is forgotten from: the two halves of "this block is
+            // executed now" belong in one place. A store that will not take it is
+            // said and stepped over — nothing here is consensus, and a node that
+            // stopped executing over an archive write would be trading the chain
+            // for a convenience.
+            if let Some(archive) = self.archive.as_ref()
+                && let Err(error) = archive.keep(&block)
+            {
+                eprintln!(
+                    "cannot keep the executed block {} for serving: {error}",
+                    block.block_id()
+                );
+            }
             staging.remove(block.block_id())?;
             timing.staging += phase.elapsed();
             executed += 1;
