@@ -214,7 +214,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     };
     drop(phase);
     let phase = Phase::start("reaching a peer");
-    let peer = reachable_peer(&config, discovered.as_ref()).await?;
+    let peer = awaited_peer(&config, discovered.as_ref()).await?;
     drop(phase);
     let network = match config.network() {
         Some(network) => network,
@@ -2289,6 +2289,46 @@ async fn reachable_peer(
         || Box::<dyn Error>::from("no peer to follow"),
         |error| Box::new(error) as Box<dyn Error>,
     ))
+}
+
+/// Wait for a peer that answers, because none answering *yet* is not a reason to
+/// stop.
+///
+/// Discovery is still running while this waits: the swarm keeps handshaking and
+/// learning addresses, so the set `reachable_peer` is offered grows between
+/// attempts. Measured on a live mainnet follower, which is the only place this
+/// shows: one start was handed seven peers and ran, and the next was handed four
+/// that all refused HTTP within the same minute -- and the node exited on a
+/// condition that had cleared by the time anybody read the log.
+///
+/// Bounded by `startup_peer_wait_secs` rather than forever, so a genuinely
+/// unroutable configuration still fails instead of hanging. Each round says what it
+/// is waiting for, because a silent wait and a hang look identical.
+async fn awaited_peer(
+    config: &Config,
+    discovered: Option<&Discovered>,
+) -> Result<SyncClient, Box<dyn Error>> {
+    let deadline = Duration::from_secs(config.node.startup_peer_wait_secs);
+    let began = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        // The failure becomes its own text before the wait: a `Box<dyn Error>` is not
+        // `Send`, and holding one across an await would make the whole startup future
+        // unspawnable.
+        let refused = match reachable_peer(config, discovered).await {
+            Ok(client) => return Ok(client),
+            Err(error) if began.elapsed() >= deadline => return Err(error),
+            Err(error) => error.to_string(),
+        };
+        attempt += 1;
+        let known = discovered.map_or(0, |found| found.endpoints().len());
+        eprintln!(
+            "no peer answered on attempt {attempt} ({refused}); {known} discovered so far, waiting \
+             for one within {}s of startup",
+            deadline.as_secs()
+        );
+        sleep(Duration::from_secs(config.node.poll_interval_secs.max(1))).await;
+    }
 }
 
 /// Every peer this node could follow: the ones configured, and the ones p2p found.

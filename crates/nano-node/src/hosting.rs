@@ -350,6 +350,18 @@ pub fn replicated(network: Network, cycle: u64) -> Vec<StackerDbContract> {
 /// this node assigned the slot, inside `put`, so a peer reached by failover can no
 /// more forge a chunk than the first one could.
 pub struct Replicas {
+    /// The endpoint list exactly as the caller gave it, so a round can tell whether
+    /// discovery has actually moved.
+    ///
+    /// Compared against the *given* strings and not against `endpoints`, which hold
+    /// `Url`-normalised ones: a peer's handshake advertises
+    /// `http://34.150.184.50:20443` and the client built from it holds
+    /// `http://34.150.184.50:20443/`, so comparing the two forms made every round
+    /// look like a change. The pool was then rebuilt every poll, which reset the
+    /// cursor to the front and meant the rotation this type exists for never
+    /// happened -- measured on a live mainnet follower, sixteen rebuilds of the same
+    /// two peers.
+    requested: Vec<String>,
     peers: Vec<SyncClient>,
     /// One client per peer, so a round does not build a connection pool per request.
     clients: Vec<StackerDbClient>,
@@ -380,6 +392,7 @@ impl Replicas {
             .filter(|peer| StackerDbClient::new(peer.base_url().clone()).is_ok())
             .collect::<Vec<_>>();
         Self {
+            requested: endpoints.to_vec(),
             endpoints: peers.iter().map(|peer| peer.base_url().to_string()).collect(),
             peers,
             clients,
@@ -461,7 +474,7 @@ impl Replicas {
     /// The cursor follows the endpoint it was pointing at rather than the index, so
     /// a pool that grew does not silently send the next round back to the front.
     pub fn refresh(&mut self, endpoints: &[String]) {
-        if endpoints == self.endpoints.as_slice() || endpoints.is_empty() {
+        if endpoints == self.requested.as_slice() || endpoints.is_empty() {
             return;
         }
         let serving = self.serving().map(ToOwned::to_owned);

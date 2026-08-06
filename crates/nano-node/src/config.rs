@@ -93,6 +93,15 @@ pub struct NodeConfig {
     /// demands a nearer checkpoint.
     #[serde(default = "max_sync_blocks")]
     pub max_sync_blocks: usize,
+    /// How long startup waits for a peer that answers before giving up.
+    ///
+    /// Discovery keeps running while it waits, so the set of peers to try grows
+    /// between attempts -- which is the whole reason to wait rather than exit: a
+    /// live mainnet start was handed seven peers and ran, and the next was handed
+    /// four that all refused HTTP within the same minute. Bounded so an unroutable
+    /// configuration still fails rather than hanging.
+    #[serde(default = "startup_peer_wait_secs")]
+    pub startup_peer_wait_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -193,6 +202,13 @@ pub struct MinerConfig {
 
 const fn one() -> u64 {
     1
+}
+
+/// Ten minutes: long enough for a peer set to turn over on mainnet, short enough
+/// that a wrong `burnchain` or an unroutable host is reported while somebody is
+/// still watching.
+const fn startup_peer_wait_secs() -> u64 {
+    600
 }
 
 const fn max_sync_blocks() -> usize {
