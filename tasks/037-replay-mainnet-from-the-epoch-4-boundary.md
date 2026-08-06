@@ -1076,3 +1076,38 @@ because the previous eight divergences all were:
   which is a page cache the replay was not getting. Not a code change, but it is
   the second time a measurement here was wrong because of something outside the
   process.
+
+## The divergence point stopped moving at 8,706,194, for a real reason
+
+**40,592 consecutive mainnet blocks**, 8,665,601 through 8,706,193, and then a state
+root mismatch at 8,706,194: the header commits to `c081728e…` and nano seals
+`e3ba858b…`.
+
+The receipts oracle localized it before any state was inspected, which is the
+argument for having one. Two of the block's six transactions call
+`SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.age009-token-lock::get-tokens-many`, and
+both diverge identically:
+
+| | mainnet | nano |
+|---|---|---|
+| result | `(ok (list (err u3) …))`, uniformly `err u3` | `(err u3)` ×17, then `(err u1002)` ×23 |
+| read_count | 785 | 596 |
+| write_count | 152 | 68 |
+| runtime | 5,017,505 | 4,843,401 |
+
+Both engines call the transaction a **success**, so a status check sees nothing. From
+the eighteenth list element on nano takes another branch and does half the writes,
+which is what moves the root. This is the shape the receipts gate exists for and the
+reason [[060-make-the-consensus-execution-engine-explicit-and-r]] insists a root
+alone is not evidence.
+
+A second, smaller disagreement sits in the same block and is being treated as its own
+defect rather than folded into this one: `pox-5::stake` returns the byte-identical
+value with identical read and write dimensions and **runtime 1,533,155 against
+mainnet's 1,533,104** — 51 units.
+
+The state sealed at the divergence's parent was reflink-copied out of the production
+run in 11 seconds (btrfs, 61 GB apparent, no extra disk), so the fix is being worked
+against the real parent rather than against a reconstruction. That is the loop the
+earlier note asked for and could not have: a 4.5-hour import per experiment is what
+made this expensive before.
