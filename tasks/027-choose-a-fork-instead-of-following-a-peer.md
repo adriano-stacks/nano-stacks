@@ -43,10 +43,10 @@ strands it.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
 - [x] Exercise two simultaneous peers through the production runtime: one
       stale, withholding or invalid, and one serving the canonical chain.
-- [ ] Differentially pin the exact stacks-core tie-break for two equally long,
-      equally weighted valid tips. Nano's block-id tie-break is deterministic,
-      but determinism alone does not prove it selects the same tip as
-      stacks-core.
+- [x] Differentially pin the exact stacks-core tie-break for two equally long,
+      equally weighted valid tips. It was **not** the same rule: nano compared
+      block identifiers where stacks-core compares the burn height of each tip's
+      own sortition.
 
 ## Acceptance Criteria
 
@@ -301,3 +301,47 @@ land on the same block). Nothing in the ladder settles what stacks-core does the
 and inventing an answer here would be worse than saying so. It wants either
 stacks-core's own fork-choice call as an in-process oracle, or a live chain that
 produces the tie. The status stays open on that alone.
+
+## The tie-break was a different rule, and the suspicion was right
+
+stacks-core decides it in exactly one place, `SortitionDB::set_stacks_block_accepted_at_tip`:
+
+```text
+if cur_height < stacks_block_height       -> replace
+else if cur_height > stacks_block_height  -> keep
+else if cur_ch == consensus_hash          -> keep            // same tenure
+else  // "break ties by going with the latter-signed block"
+  replace iff sn_current.block_height < sn_accepted.block_height
+```
+
+So a tie between two equally high tips in different tenures goes to the one whose
+**sortition sits at the higher burn height**. Nano compared block identifiers. Both
+are deterministic, which is why nothing caught it: two nodes could stand on
+different tips of the same length and each be behaving exactly as designed. That is
+the whole content of this item's warning that "determinism alone does not prove it
+selects the same tip", and it was justified.
+
+`choose_canonical_tip` now compares length, then the sortition height of the
+candidate's own burn view — which the node already derives and which `BurnView`
+answers — and only then falls back to the identifier.
+
+**The last branch is where stacks-core has no answer to agree with.** At equal
+length in the same tenure, or between two sortitions this node cannot place, it
+keeps whichever block it happened to see first: arrival order, not a function of the
+two tips. A deterministic rule is strictly better there than a coin toss, and it is
+the one place where nano deliberately does not match.
+
+**Transcribed rather than called, and precisely why.** The rule lives in a
+`&mut SortitionHandleTx` method that reads two snapshots out of a sortition database
+and writes the winner back; there is no pure function to hand two headers to, which
+is what "differentially" would need. What *is* checked against stacks-core is the
+input the rule consumes — the burn height of a consensus hash — which
+`mainnet_sortition` asserts nano derives identically for every block of the captured
+mainnet window.
+
+One more thing the test found, worth recording because it means the item as written
+can never be fully satisfied offline: **two equally long, equally weighted, genuinely
+signed tips cannot be built from a capture.** A header's chain length is inside its
+signature preimage, so making two real tips equally long invalidates both signatures.
+The comparator is pinned with refusal out of the picture, and refusal has its own
+tests either side of it.

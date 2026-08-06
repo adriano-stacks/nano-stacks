@@ -235,6 +235,16 @@ impl std::error::Error for TipRejection {}
 /// `Sync` because [`PeerPool::choose_source`] holds one across the request that
 /// gathers the candidate tips, and that future is spawned as a task.
 pub trait BurnView: Sync {
+    /// The Bitcoin height a burn view sits at, where this node derived it.
+    ///
+    /// stacks-core breaks a fork-choice tie between two equally high tips on this
+    /// number: "break ties by going with the latter-signed block", which it
+    /// implements as `sn_current.block_height < sn_accepted.block_height` over the
+    /// two tips' *sortitions* (`SortitionDB::set_stacks_block_accepted_at_tip`).
+    /// `None` where this node has not derived that view, and then it has no opinion
+    /// to bring to the tie.
+    fn height_of(&self, consensus_hash: ConsensusHash) -> Option<u64>;
+
     /// Whether the burn view a candidate names is one this node derived.
     ///
     /// `None` means *this node cannot judge*, which is the ordinary case while
@@ -328,6 +338,13 @@ pub fn choose_canonical_tip<'a>(
     signers: Option<&nano_chainstate::SignerWeights>,
     burn: Option<&dyn BurnView>,
 ) -> Option<&'a CandidateTip> {
+    // The burn height of a tip's own sortition, which is what stacks-core breaks a
+    // tie on. Unknown views compare equal to each other and below known ones: a
+    // node with no opinion about where a view sits must not prefer it to one it
+    // derived, and must not order two it knows nothing about.
+    let sortition_height = |candidate: &CandidateTip| {
+        burn.and_then(|burn| burn.height_of(candidate.header.consensus_hash))
+    };
     candidates
         .iter()
         .filter(|candidate| refuse_tip(candidate, signers, burn).is_none())
@@ -335,6 +352,20 @@ pub fn choose_canonical_tip<'a>(
             left.header
                 .chain_length
                 .cmp(&right.header.chain_length)
+                // stacks-core's tie-break, transcribed from
+                // `SortitionDB::set_stacks_block_accepted_at_tip`: at equal height
+                // and different tenures it "break[s] ties by going with the
+                // latter-signed block", meaning the tip whose sortition is at the
+                // higher burn height. This used to be nano's block-id comparison,
+                // which is deterministic and *different*, so two nodes could stand
+                // on different tips of the same length and both be behaving as
+                // designed.
+                .then_with(|| sortition_height(left).cmp(&sortition_height(right)))
+                // Last, and only where the two are in the same tenure or in
+                // sortitions this node cannot place. stacks-core keeps whichever it
+                // saw first here, which is arrival order and not a function of the
+                // two tips at all -- so there is nothing to agree with, and a
+                // deterministic rule is strictly better than a coin toss.
                 .then_with(|| right.header.block_id().cmp(&left.header.block_id()))
         })
 }
@@ -2443,6 +2474,13 @@ mod tests {
                 .get(consensus_hash.as_bytes())
                 .copied()
                 .unwrap_or(None)
+        }
+
+        /// Nothing, which is what these tests want: the tie-break is pinned in
+        /// `nano-conformance` against the captured chain, and a stub answering here
+        /// would order candidates by numbers this file made up.
+        fn height_of(&self, _consensus_hash: ConsensusHash) -> Option<u64> {
+            None
         }
     }
 

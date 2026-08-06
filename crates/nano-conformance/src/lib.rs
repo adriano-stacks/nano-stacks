@@ -3074,6 +3074,143 @@ mod tests {
         );
     }
 
+    /// A burn view whose height this test states, so a tie can be placed.
+    struct StatedBurnView(std::collections::BTreeMap<String, u64>);
+
+    impl nano_sync::BurnView for StatedBurnView {
+        fn derived(&self, _: nano_primitives::ConsensusHash, _: u64) -> Option<bool> {
+            // Nothing about *this* test: the tie-break is what is under test, and a
+            // rejection would decide the question before it was asked.
+            None
+        }
+
+        fn height_of(&self, consensus_hash: nano_primitives::ConsensusHash) -> Option<u64> {
+            self.0.get(&consensus_hash.to_string()).copied()
+        }
+    }
+
+    /// The tie between two equally high tips goes the way stacks-core's goes.
+    ///
+    /// Transcribed from `SortitionDB::set_stacks_block_accepted_at_tip`, which is
+    /// the only place in stacks-core that decides it:
+    ///
+    /// ```text
+    /// if cur_height < stacks_block_height  -> replace
+    /// else if cur_height > stacks_block_height -> keep
+    /// else if cur_ch == consensus_hash     -> keep      // same tenure
+    /// else  // "break ties by going with the latter-signed block"
+    ///   replace iff sn_current.block_height < sn_accepted.block_height
+    /// ```
+    ///
+    /// So the tie-break is the burn height of each tip's **own sortition**, later
+    /// wins. Nano compared block identifiers, which is deterministic and *not this
+    /// rule* — two nodes could stand on different tips of the same length, each
+    /// behaving as designed. That is what this task suspected and what this pins.
+    ///
+    /// It is transcribed rather than called, and the reason is worth being exact
+    /// about: the rule lives inside a `&mut SortitionHandleTx` method that reads two
+    /// snapshots out of a sortition database and writes the winner back. There is no
+    /// pure function to hand two headers to. What *is* checked against stacks-core
+    /// here is the input the rule consumes — the burn height of a consensus hash,
+    /// which `mainnet_sortition` already asserts nano derives identically for every
+    /// block of the captured mainnet window.
+    #[test]
+    fn the_fork_choice_tie_break_is_the_later_sortition() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signers = captured_signer_set(&fixture)
+            .signing_weights()
+            .expect("the captured reward set is well formed");
+        let blocks: Vec<NanoNakamotoBlock> = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .filter(|block| nano_sync::weigh_tip(&block.header, &signers).is_ok())
+            .collect();
+        // Two tips of equal length in *different* tenures, which is the only branch
+        // of the rule that compares anything.
+        let mut tenures: Vec<&NanoNakamotoBlock> = Vec::new();
+        for block in &blocks {
+            if !tenures
+                .iter()
+                .any(|kept| kept.header.consensus_hash == block.header.consensus_hash)
+            {
+                tenures.push(block);
+            }
+        }
+        assert!(
+            tenures.len() >= 2,
+            "the capture holds only {} signed tenures, so no tie between different \
+             sortitions can be built",
+            tenures.len()
+        );
+        let (earlier, later) = (tenures[0], tenures[1]);
+        let candidate = |block: &NanoNakamotoBlock, peer: usize, height: u64| {
+            let mut header = block.header.clone();
+            // Equal length is the premise; the tie-break is what decides.
+            header.chain_length = height;
+            nano_sync::CandidateTip {
+                peer,
+                info: nano_sync::TenureInfo {
+                    consensus_hash: header.consensus_hash,
+                    tenure_start_block_id: block.block_id(),
+                    parent_consensus_hash: header.consensus_hash,
+                    parent_tenure_start_block_id: header.parent_block_id,
+                    tip_block_id: block.block_id(),
+                    tip_height: height,
+                    reward_cycle: 0,
+                },
+                header,
+            }
+        };
+        let view = StatedBurnView(
+            [
+                (earlier.header.consensus_hash.to_string(), 100),
+                (later.header.consensus_hash.to_string(), 101),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let candidates = vec![candidate(earlier, 0, 500), candidate(later, 1, 500)];
+        // The weight rule is deliberately out of this test, and it has to be: a
+        // header's chain length is inside its signature preimage, so *making* two
+        // real captured tips equally long invalidates both signatures. Two equally
+        // long, equally weighted, genuinely signed tips cannot be built from a
+        // capture at all -- only mined -- so what is pinned here is the comparator
+        // that runs after refusal, and refusal has its own tests either side of
+        // this one.
+        let chosen = nano_sync::choose_canonical_tip(&candidates, None, Some(&view))
+            .expect("one of two tips is canonical");
+        assert_eq!(
+            chosen.header.consensus_hash,
+            later.header.consensus_hash,
+            "the tip whose sortition is at the higher burn height wins the tie, as \
+             stacks-core's `sn_current.block_height < sn_accepted.block_height` does"
+        );
+        // And the other way round, so the answer is the rule rather than the order.
+        let swapped = vec![candidate(later, 0, 500), candidate(earlier, 1, 500)];
+        assert_eq!(
+            nano_sync::choose_canonical_tip(&swapped, None, Some(&view))
+                .map(|tip| tip.header.consensus_hash),
+            Some(later.header.consensus_hash),
+        );
+        // A longer chain still wins outright: the tie-break is a tie-break.
+        let longer = vec![candidate(earlier, 0, 501), candidate(later, 1, 500)];
+        assert_eq!(
+            nano_sync::choose_canonical_tip(&longer, None, Some(&view))
+                .map(|tip| tip.header.consensus_hash),
+            Some(earlier.header.consensus_hash),
+        );
+        // With no burn view to place them, the deterministic identifier decides --
+        // which is where stacks-core keeps whichever block it happened to see first,
+        // so there is no answer of its own to agree with.
+        assert!(
+            nano_sync::choose_canonical_tip(&candidates, None, None).is_some(),
+            "a tie this node cannot place still resolves"
+        );
+    }
+
     /// A reorganization takes the tenures it invalidated off the executed chain.
     ///
     /// The burnchain side retracts snapshots; this is the other half, which
