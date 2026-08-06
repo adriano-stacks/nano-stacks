@@ -28,10 +28,10 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Force clarity-wasm compilation, module-load and runtime failures through
       the production boundary and prove each rejects without committing state
       or invoking the interpreter.
-- [~] Catch up using a local Bitcoin source and multiple Stacks peers while
-      recording every executed height and verified root — done offline over the
-      captured chain, through the binary; the mainnet run still logs a root every
-      500 blocks rather than every one.
+- [x] Catch up using a local Bitcoin source and multiple Stacks peers while
+      recording every executed height and verified root — through the binary, over
+      the captured chain and its own Bitcoin blocks; `NANO_TRACE_ROOTS` is how a
+      mainnet run records the same thing.
 - [x] Restart during catch-up and at tip, then prove the same durable tip, root
       and tenure accounting are resumed.
 - [x] Inject failure and hard process termination at every block commit boundary
@@ -518,6 +518,23 @@ the honest peer wins, the follow path executes none of what the liar serves, and
 the same checkpoint follows the honest peer to its tip. The round *fails* rather
 than quietly executing nothing, which is what sets `peer_failed` and makes the
 next round weigh the pool again.
+
+### Recording every executed height, and where the record comes from
+
+`NANO_TRACE_ROOTS=1` makes every executed block name itself: its height, the burn
+block it stood on, its identifier and the root its header commits to. A switch and
+not the default, because a mainnet catch-up would print thirty thousand lines an
+operator has to read past to find the one that matters — a round already reports
+the height it reached and the root it sealed.
+
+The root printed is the **header's**, deliberately. The seal has already refused
+the block if the two differed, so the line is the verified root rather than a
+second opinion computed at printing time, which would invite a reader to believe
+the check happens there.
+
+`binary_restart` asserts one such line for every block between the anchor and the
+tip, read out of the node's own log rather than the test's bookkeeping: what the
+gate asks to be recorded is what the node said.
 
 ## What is still open, and what each one waits on
 

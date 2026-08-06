@@ -108,6 +108,34 @@ struct ExecutionTiming {
 /// How often a timed round says where its seconds went.
 const TIMING_INTERVAL: usize = 25;
 
+/// Whether every executed block is to name itself.
+///
+/// A round already reports the height it reached and the root it sealed, which on
+/// mainnet is one line per twenty thousand blocks — enough to see that a catch-up
+/// is moving and not enough to be the record [[053]]'s release gate asks for. This
+/// is that record, and it is a switch rather than the default because a mainnet
+/// catch-up would otherwise print thirty thousand lines an operator has to read
+/// past to find the one that matters.
+static TRACE_ROOTS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("NANO_TRACE_ROOTS").is_some());
+
+/// Name a block this node executed and the root its header commits to.
+///
+/// The header's root and not a separately computed one, deliberately: the seal
+/// already refused the block if the two differed, so this line *is* the verified
+/// root — printing something computed here again would invite the reader to
+/// believe the check happens at the printing.
+fn trace_executed_block(block: &NakamotoBlock, bitcoin_height: u64) {
+    if *TRACE_ROOTS {
+        println!(
+            "executed {} at burn {bitcoin_height}, block {}, verified root {}",
+            block.header.chain_length,
+            block.block_id(),
+            block.header.state_index_root
+        );
+    }
+}
+
 impl ExecutionTiming {
     fn report(&self, executed: usize) {
         if executed == 0 || std::env::var_os("NANO_TIMING").is_none() {
@@ -1566,6 +1594,7 @@ where
             let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
             timing.execution += phase.elapsed();
+            trace_executed_block(&block, sortition.bitcoin_height);
             let phase = std::time::Instant::now();
             if announce_burn && let Some(observers) = self.observers.as_ref() {
                 let payload = nano_rpc::new_burn_block_payload(

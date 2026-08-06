@@ -275,6 +275,11 @@ impl Running {
         let child = Command::new(artifact())
             .args(["start", "--config"])
             .arg(config)
+            // Every executed height and the root its header committed to, which is
+            // the record the release gate asks for. A switch rather than the
+            // default because a mainnet catch-up would print thirty thousand of
+            // these.
+            .env("NANO_TRACE_ROOTS", "1")
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(errors))
             .spawn()
@@ -361,9 +366,64 @@ fn durable_tip(directory: &Path) -> Option<[u8; 32]> {
     chainstate.tip()
 }
 
-/// Kill the shipped binary at every block boundary and start it again.
-#[tokio::test]
-async fn the_binary_resumes_the_same_chain_after_a_kill_at_every_block() {
+/// What one kill and the restart after it has to leave behind.
+///
+/// Separated from the loop because each of the three is a different claim, and a
+/// failure has to name which: the state opens, its tip is a block of the canonical
+/// chain, and that tip is the height the node reported or the one below it — the
+/// parent-or-child shape a crash between the ledger write and the MARF seal leaves.
+fn check_durable_state(directory: &Path, served: &[NakamotoBlock], kill: usize, reached: u64) {
+    let tip = durable_tip(directory).expect("the state is sealed at a block");
+    let sealed = served
+        .iter()
+        .find(|block| *block.block_id().as_bytes() == tip)
+        .unwrap_or_else(|| {
+            panic!(
+                "after kill {kill} at height {reached} the durable tip {} is not a block of \
+                 the chain the peers serve",
+                hex::encode(tip)
+            )
+        });
+    let sealed_height = sealed.header.chain_length;
+    assert!(
+        sealed_height + 1 >= reached,
+        "after kill {kill} the node had reported height {reached} and its state is sealed \
+         at {sealed_height}, which is more than one block behind"
+    );
+}
+
+/// Every height the node executed, with the root its header commits to.
+///
+/// Read out of the node's own log rather than out of the test's bookkeeping: what
+/// the release gate asks to be recorded is what the node said. The root is the
+/// header's, and the seal had already refused the block for differing from it — so
+/// the line *is* the verified root rather than a second opinion about it.
+fn check_every_height_recorded(log: &Path, served: &[NakamotoBlock]) {
+    let recorded = fs::read_to_string(log).expect("the node's log reads");
+    for block in served.iter().skip(1) {
+        let line = format!("executed {} at burn ", block.header.chain_length);
+        let root = block.header.state_index_root.to_string();
+        assert!(
+            recorded
+                .lines()
+                .any(|printed| printed.starts_with(&line) && printed.ends_with(&root)),
+            "no run recorded executing height {} with root {root}",
+            block.header.chain_length
+        );
+    }
+}
+
+/// The whole offline environment: two Stacks peers, a burnchain, a configuration.
+struct Environment {
+    config: PathBuf,
+    log: PathBuf,
+    rpc: u16,
+    served: Vec<NakamotoBlock>,
+    directory: tempfile::TempDir,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn stand_up() -> Environment {
     let chain = captured_chain();
     let served: Vec<_> = chain[..SERVED_BLOCKS].to_vec();
     let anchor = served.first().expect("the capture has blocks").clone();
@@ -372,10 +432,6 @@ async fn the_binary_resumes_the_same_chain_after_a_kill_at_every_block() {
         .find(|row| row.consensus_hash == anchor.header.consensus_hash.to_string())
         .map(|row| row.block_height)
         .expect("the anchor's own burn block");
-    let canonical: Vec<[u8; 32]> = served
-        .iter()
-        .map(|block| *block.block_id().as_bytes())
-        .collect();
 
     // Two peers over the same chain, and a burnchain of this chain's own Bitcoin
     // blocks. The peers are honest here on purpose: `follow_path` is where a peer
@@ -396,79 +452,70 @@ async fn the_binary_resumes_the_same_chain_after_a_kill_at_every_block() {
     let rpc = free_port().await;
     let config = write_config(
         directory.path(),
-        &[
-            first.base_url().to_string(),
-            second.base_url().to_string(),
-        ],
+        &[first.base_url().to_string(), second.base_url().to_string()],
         &burnchain,
         rpc,
         &anchor,
         anchor_bitcoin_height,
     );
-    let log = directory.path().join("node.log");
+    Environment {
+        log: directory.path().join("node.log"),
+        config,
+        rpc,
+        served,
+        directory,
+        tasks: vec![first_task, second_task, burnchain_task],
+    }
+}
+
+/// Kill the shipped binary at every block boundary and start it again.
+#[tokio::test]
+async fn the_binary_resumes_the_same_chain_after_a_kill_at_every_block() {
+    let environment = stand_up().await;
+    let Environment {
+        config,
+        log,
+        rpc,
+        served,
+        directory,
+        tasks,
+    } = &environment;
+    let anchor = served.first().expect("an anchor");
 
     let mut highest = anchor.header.chain_length;
     let mut executed_heights = Vec::new();
     for kill in 0..KILLS {
-        let mut node = Running::start(&config, rpc, log.clone());
+        let mut node = Running::start(config, *rpc, log.clone());
         let reached = node.wait_for(highest + 1).await;
         node.kill();
-        executed_heights.push(reached);
         assert!(
             reached > highest,
-            "kill {kill}: the node reported height {reached} having already been at {highest},              so this kill interrupted nothing"
+            "kill {kill}: the node reported height {reached} having already been at \
+             {highest}, so this kill interrupted nothing"
         );
+        executed_heights.push(reached);
         highest = reached;
-
-        let tip = durable_tip(directory.path()).expect("the state is sealed at a block");
-        assert!(
-            canonical.contains(&tip),
-            "after kill {kill} at height {reached} the durable tip {} is not a block of the \
-             chain the peers serve",
-            hex::encode(tip)
-        );
-        // The durable tip is the reported height or the one below it: a kill
-        // between the ledger write and the seal leaves the parent, which is the
-        // shape recovery exists for and the one `kill_during_replay` pins.
-        let sealed_height = served
-            .iter()
-            .find(|block| *block.block_id().as_bytes() == tip)
-            .map(|block| block.header.chain_length)
-            .expect("the tip is a served block");
-        assert!(
-            sealed_height + 1 >= reached,
-            "the node reported height {reached} and its state is sealed at {sealed_height}, \
-             which is more than one block behind"
-        );
+        check_durable_state(directory.path(), served, kill, reached);
     }
 
     // And it finishes: started once more, it reaches the tip the peers serve.
-    let mut node = Running::start(&config, rpc, log.clone());
-    let tip_height = served.last().expect("a tip").header.chain_length;
-    node.wait_for(tip_height).await;
+    let tip = served.last().expect("a tip");
+    let mut node = Running::start(config, *rpc, log.clone());
+    node.wait_for(tip.header.chain_length).await;
     node.kill();
     assert_eq!(
         durable_tip(directory.path()),
-        Some(*served.last().expect("a tip").block_id().as_bytes()),
+        Some(*tip.block_id().as_bytes()),
         "the node did not end on the tip its peers serve"
     );
-    // Every height between the anchor and the tip was executed by *some* run, and
-    // each state root was checked as it went: the executor refuses a block whose
-    // root differs from its header, so a chain that reached the tip verified the
-    // root of every block below it.
     assert_eq!(
         executed_heights.len(),
         KILLS,
         "a kill did not produce a reported height"
     );
-    assert!(
-        executed_heights
-            .windows(2)
-            .all(|pair| pair[1] >= pair[0]),
-        "the executed heights across restarts are not monotonic: {executed_heights:?}"
-    );
+    check_every_height_recorded(log, served);
 
-    first_task.abort();
-    second_task.abort();
-    burnchain_task.abort();
+    for task in tasks {
+        task.abort();
+    }
 }
