@@ -1,7 +1,7 @@
 ---
 id: "055"
 title: "Answer block info for blocks before the checkpoint"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["019"]
 tags: ["mainnet", "checkpoint", "vm"]
 created_at: 2026-08-02
+completed_at: 2026-08-06
 ---
 
 # Answer block info for blocks before the checkpoint
@@ -59,7 +60,7 @@ executed, is never written down, and a restart loses it.
 - [x] Recover and oracle-check every consensus-visible field, including miner
       address, block reward, burn spends, tenure height and tenure start, for a
       representative pre-checkpoint window.
-- [ ] Replay across a block whose transactions read pre-checkpoint history and
+- [x] Replay across a block whose transactions read pre-checkpoint history and
       compare state roots.
 
 ## Acceptance Criteria
@@ -1641,3 +1642,32 @@ instead — one call, no signature change. Until it does, the node's automatic p
 backfill still records those zeros as answers. `HeaderFields::PEER_BURN_CONTEXT`
 exists precisely so that change is a one-liner, and `xtask backfill-header`
 already records partially, so the mechanism is exercised.
+
+## The block that reads pre-checkpoint history is behind us
+
+This item could not be closed when the header work landed: measured under
+`NANO_TRACE_WRITES`, the whole conformance suite makes **zero** reads of a header
+this node lacks, so no captured block exercises the path. The block that does is
+**8,669,750** — the epoch lookup — about 4,000 blocks past any state that existed
+then.
+
+The pristine mainnet replay has since executed it. Depth is past 8,693,400, and
+8,669,750 is not among the six heights that have ever diverged (8,665,719,
+8,665,722, 8,666,585, 8,667,509, 8,668,096, 8,673,846). It executed and its state
+root matched the chain's, with the exported headers in place and no peer asked.
+
+That is the criterion: a block whose transactions read pre-checkpoint history,
+replayed, matching the chain. It is live evidence rather than a fixture, and the
+distinction matters — the offline oracle
+(`pre_checkpoint_headers::…`) proves nano answers all thirteen fields the way
+stacks-core's own `HeadersDB` does for sixteen blocks from height 1 to the anchor,
+and this proves a real contract reading one of them produces the root the network
+produced.
+
+**What the two together do not cover**, and it is worth naming: the *exactness* of
+`block_reward` for the ~100 tenures immediately below the checkpoint, where
+`matured_rewards` has not been written yet and the export declares the field
+absent. A contract reading one gets a loud stop rather than a wrong number, which
+is the decision this task made — but no mainnet block in the replayed range has
+asked, so the *decision* is proved and its consequence for a contract that does ask
+is not.

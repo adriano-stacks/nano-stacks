@@ -7,6 +7,14 @@
 //! `UnknownTenure` — after the node has already run for hours.
 //!
 //! Point `NANO_MAINNET_CHECKPOINT` at the checkpoint directory to run it.
+//!
+//! This checks the *artifact*. `xtask capture-fixtures` refuses to write a short
+//! or holed one in the first place — contiguity rather than a count, because a
+//! count is what it used to check and a count cannot see the failure that
+//! happened: the live ledger held 193 tenures spanning 201 heights with eight
+//! missing in the middle, so its outer bounds said complete and long. That
+//! refusal needs the 505 GB stacks-core archive to exercise and so has no test
+//! here; this file is what catches an artifact that got past it.
 
 use std::{env, fs, path::PathBuf};
 
@@ -42,6 +50,25 @@ fn the_mainnet_checkpoint_owes_a_full_maturity_window() {
             "tenure {coinbase_height} is missing from the seeded window"
         );
     }
+
+    // The schedule has to name the network the entries were exported for. Without
+    // it a node cannot price the coinbase of a tenure it executes itself, and
+    // priced against the *wrong* network it prices every one of them wrongly:
+    // mainnet and testnet have different emission intervals and a different first
+    // burn height, so the first tenure start past the checkpoint diverges and
+    // nothing says why.
+    let schedule = accounting
+        .schedule()
+        .expect("the checkpoint carries a coinbase schedule");
+    assert!(
+        schedule.mainnet,
+        "a mainnet checkpoint carries a schedule that says it is not mainnet"
+    );
+    assert_eq!(
+        schedule.first_bitcoin_height,
+        666_050,
+        "mainnet's first burn block is what every emission interval is measured from"
+    );
 
     // Every tenure the node executes before its own mature must derive a payout
     // from what the checkpoint carries, and none may fail.

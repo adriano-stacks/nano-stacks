@@ -1949,13 +1949,7 @@ impl CaptureConfig {
                 "fees": following.anchored,
             }));
         }
-        let covered = u64::try_from(tenures.len()).unwrap_or(0);
-        if covered <= MINER_REWARD_MATURITY {
-            return Err(format!(
-                "the archive holds {covered} of the {} tenures a checkpoint at coinbase height                  {last} needs: every tenure executed before nano's own mature pays out one of                  them, so a short window fails at the first payout it cannot derive",
-                MINER_REWARD_MATURITY + 1
-            ));
-        }
+        refuse_a_short_earnings_window(&tenures, last)?;
         // Without the schedule a node cannot price the coinbase of a tenure it
         // executes itself, so the first tenure start past the checkpoint pays
         // nothing and its state root diverges.
@@ -2291,6 +2285,59 @@ fn parse_u128(field: &str, value: Option<&str>) -> Result<u128, String> {
         .ok_or_else(|| format!("{field} is missing"))?
         .parse()
         .map_err(|error| format!("invalid {field}: {error}"))
+}
+
+/// Refuse an earnings window a node could not pay from.
+///
+/// Contiguity, not a count. A count is what this used to check, and a count
+/// cannot see the failure that actually happened: the live mainnet ledger
+/// held 193 tenures spanning 201 heights with eight missing in the middle,
+/// so by its outer bounds the window looked complete and long, and the
+/// first payout it could not make was 27 tenures away — hours of execution,
+/// all of it thrown away. The `continue`s above are how a hole gets in:
+/// a tenure the archive cannot answer for is skipped rather than refused.
+            /// `last` is the deepest tenure the captured blocks belong to, and the
+            /// window has to reach it: a checkpoint whose earnings stop short of
+            /// its own tip owes nothing for the tenures between.
+fn refuse_a_short_earnings_window(
+    tenures: &[serde_json::Value],
+    last: u64,
+) -> Result<(), String> {
+    let heights: Vec<u64> = tenures
+        .iter()
+        .filter_map(|tenure| tenure.get("coinbase_height")?.as_u64())
+        .collect();
+    let (Some(&lowest), Some(&highest)) = (heights.first(), heights.last()) else {
+        return Err(format!(
+            "the archive holds no tenure earnings at all for a checkpoint at coinbase \
+             height {last}, so its first payout has nothing to derive from"
+        ));
+    };
+    if let Some(missing) = (lowest..=highest).find(|height| !heights.contains(height)) {
+        return Err(format!(
+            "the archive has no scheduled payment for tenure {missing}, which is inside \
+             the window {lowest}..{highest} this checkpoint would carry. A hole is not a \
+             shorter window, it is a delayed failure: the tenures either side of it make \
+             the window look complete, and the node stops at the one payout it cannot \
+             derive, having sealed everything before it"
+        ));
+    }
+    if highest + 1 < last {
+        return Err(format!(
+            "the earnings window ends at tenure {highest} and this checkpoint's blocks \
+             reach tenure {last}, so the tenures between them would owe nothing"
+        ));
+    }
+    let covered = highest - lowest + 1;
+    if covered <= MINER_REWARD_MATURITY {
+        return Err(format!(
+            "the archive holds {covered} of the {} tenures a checkpoint at coinbase height \
+             {last} needs: every tenure executed before nano's own mature pays out one of \
+             them, so a short window fails at the first payout it cannot derive",
+            MINER_REWARD_MATURITY + 1
+        ));
+    }
+    Ok(())
 }
 
 fn sqlite(database: &Path, query: &str) -> Result<String, String> {
