@@ -59,6 +59,13 @@ pub struct Runtime {
     pub peer: SyncClient,
     pub executor: SharedExecutor,
     pub dispatcher: EventDispatcher,
+    /// Where a block this node mined is announced to the peer network.
+    ///
+    /// A miner that only pushes its block to one HTTP peer depends on that peer
+    /// to spread it, which is the dependency the p2p work exists to remove — and
+    /// nano relays everybody else's blocks, so not relaying its own would be the
+    /// one gap in that.
+    pub relay: nano_p2p::Relay,
     /// The pool the RPC admits transactions into, so they are the same ones.
     pub mempool: Arc<Mutex<Mempool>>,
 }
@@ -80,6 +87,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         peer,
         executor,
         dispatcher,
+        relay,
     } = runtime;
     let miner_key = miner.block_signing_private_key()?;
     let vrf_key = miner.vrf_private_key()?;
@@ -103,6 +111,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         pox,
         peer,
         dispatcher,
+        relay,
         miner_key,
         vrf_key,
         miner_hash,
@@ -214,6 +223,8 @@ struct State {
     pox: PoxInfo,
     peer: SyncClient,
     dispatcher: EventDispatcher,
+    /// Where a block this node mined is announced to the peer network.
+    relay: nano_p2p::Relay,
     miner_key: StacksPrivateKey,
     vrf_key: VrfPrivateKey,
     miner_hash: Hash160,
@@ -567,7 +578,15 @@ impl State {
                 .finalize_and_submit(&proposal, &reward_set.signer_set, &self.peer)
                 .await
             {
-                Ok(block) => return Ok(block),
+                Ok(block) => {
+                    // Announced, not offered: `announce` is the outbound queue,
+                    // and a block this node mined needs no authenticating against
+                    // itself — it was assembled on this node's own tip and its
+                    // state root was sealed here.
+                    self.relay
+                        .announce(nano_p2p::Offer::block(None, block.clone()));
+                    return Ok(block);
+                }
                 Err(ProposalError::SignerSet(SignerSetError::InsufficientWeight))
                     if Instant::now() < deadline =>
                 {

@@ -10,8 +10,10 @@
 //!
 //! [`wire`] is the message codec, [`session`] one authenticated conversation,
 //! [`swarm`] a bounded set of them with scoring and neighbour discovery,
-//! [`inbound`] the reply side that lets another node handshake *with* nano, and
-//! [`peers`] the durable peer table.
+//! [`inbound`] the reply side that lets another node handshake *with* nano,
+//! [`peers`] the durable peer table, [`relay`] the bounded hand-off between the
+//! peers that push data and the loop that can check it, and [`served`] what this
+//! node will still tell a peer it has after a restart.
 //!
 //! ## Blocks come over HTTP, and that is not a shortcut
 //!
@@ -47,12 +49,16 @@
 
 pub mod inbound;
 pub mod peers;
+pub mod relay;
+pub mod served;
 pub mod session;
 pub mod swarm;
 pub mod wire;
 
 pub use inbound::{InboundLimits, Listener, Served, Service, serve_peer};
 pub use peers::{KnownPeer, MAX_KNOWN_PEERS, PeerDb, PeerDbError};
+pub use relay::{MAX_QUEUED_OFFERS, Offer, Pushed, Relay, relayed_by};
+pub use served::ServedTenures;
 pub use session::{LocalPeer, Protocol, Session, SessionError, nack_is_transient};
 pub use swarm::{Discovered, Round, Swarm, SwarmLimits, TenureClaim, assign_tenures};
 pub use wire::{

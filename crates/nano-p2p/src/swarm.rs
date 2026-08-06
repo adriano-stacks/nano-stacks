@@ -601,6 +601,56 @@ impl Swarm {
         });
     }
 
+    /// Push what this node has accepted to the peers that did not send it, and read
+    /// whatever they have said since.
+    ///
+    /// Cheap enough to run on the node's own poll interval rather than the discovery
+    /// interval: one write per peer per item and no round trip, because a push is an
+    /// announcement and the peer is not expected to answer it. Running it often is
+    /// also what keeps a peer's own pushes out of the socket, which is why it collects
+    /// on the way out.
+    ///
+    /// A peer that fails a write is retired exactly as it would be for a failed
+    /// request — a broken pipe is a peer that has gone, not a peer that lied.
+    pub async fn relay(&mut self, offers: &[crate::relay::Offer], round: &mut Round) -> usize {
+        let mut sent = 0;
+        let mut faults: Vec<(usize, SessionError)> = Vec::new();
+        for offer in offers {
+            for (index, peer) in self.connected.iter_mut().enumerate() {
+                // One fault per peer per round: a peer whose socket has closed would
+                // otherwise be penalised once for every item in the batch.
+                if faults.iter().any(|(failed, _)| *failed == index) {
+                    continue;
+                }
+                // Never back where it came from. The peer already has it, and a node
+                // that echoes is a node its neighbours stop listening to.
+                if offer.from == Some(peer.session.public_key_hash()) {
+                    continue;
+                }
+                // Cloned per peer because each message carries its own sequence
+                // number and so its own signature. Encoding the frame once and
+                // signing it per peer would save the copy, at the cost of a
+                // second signing path that nothing else in the crate needs.
+                let payload = match &offer.data {
+                    crate::relay::Pushed::Block(block) => {
+                        crate::wire::Payload::NakamotoBlocks(vec![(**block).clone()])
+                    }
+                    crate::relay::Pushed::Transaction(transaction) => {
+                        crate::wire::Payload::Transaction(transaction.clone())
+                    }
+                };
+                match peer.session.push(payload).await {
+                    Ok(()) => sent += 1,
+                    Err(error) => faults.push((index, error)),
+                }
+            }
+        }
+        self.retire(&faults, round);
+        round.collected += self.collect(round).await;
+        round.connected = self.connected.len();
+        sent
+    }
+
     /// Take the blocks and transactions peers pushed while we were asking them
     /// things, so a caller can put them through its own checks.
     ///

@@ -1949,13 +1949,7 @@ impl CaptureConfig {
                 "fees": following.anchored,
             }));
         }
-        let covered = u64::try_from(tenures.len()).unwrap_or(0);
-        if covered <= MINER_REWARD_MATURITY {
-            return Err(format!(
-                "the archive holds {covered} of the {} tenures a checkpoint at coinbase height                  {last} needs: every tenure executed before nano's own mature pays out one of                  them, so a short window fails at the first payout it cannot derive",
-                MINER_REWARD_MATURITY + 1
-            ));
-        }
+        refuse_a_short_earnings_window(&tenures, last)?;
         // Without the schedule a node cannot price the coinbase of a tenure it
         // executes itself, so the first tenure start past the checkpoint pays
         // nothing and its state root diverges.
@@ -2291,6 +2285,59 @@ fn parse_u128(field: &str, value: Option<&str>) -> Result<u128, String> {
         .ok_or_else(|| format!("{field} is missing"))?
         .parse()
         .map_err(|error| format!("invalid {field}: {error}"))
+}
+
+/// Refuse an earnings window a node could not pay from.
+///
+/// Contiguity, not a count. A count is what this used to check, and a count
+/// cannot see the failure that actually happened: the live mainnet ledger
+/// held 193 tenures spanning 201 heights with eight missing in the middle,
+/// so by its outer bounds the window looked complete and long, and the
+/// first payout it could not make was 27 tenures away — hours of execution,
+/// all of it thrown away. The `continue`s above are how a hole gets in:
+/// a tenure the archive cannot answer for is skipped rather than refused.
+            /// `last` is the deepest tenure the captured blocks belong to, and the
+            /// window has to reach it: a checkpoint whose earnings stop short of
+            /// its own tip owes nothing for the tenures between.
+fn refuse_a_short_earnings_window(
+    tenures: &[serde_json::Value],
+    last: u64,
+) -> Result<(), String> {
+    let heights: Vec<u64> = tenures
+        .iter()
+        .filter_map(|tenure| tenure.get("coinbase_height")?.as_u64())
+        .collect();
+    let (Some(&lowest), Some(&highest)) = (heights.first(), heights.last()) else {
+        return Err(format!(
+            "the archive holds no tenure earnings at all for a checkpoint at coinbase \
+             height {last}, so its first payout has nothing to derive from"
+        ));
+    };
+    if let Some(missing) = (lowest..=highest).find(|height| !heights.contains(height)) {
+        return Err(format!(
+            "the archive has no scheduled payment for tenure {missing}, which is inside \
+             the window {lowest}..{highest} this checkpoint would carry. A hole is not a \
+             shorter window, it is a delayed failure: the tenures either side of it make \
+             the window look complete, and the node stops at the one payout it cannot \
+             derive, having sealed everything before it"
+        ));
+    }
+    if highest + 1 < last {
+        return Err(format!(
+            "the earnings window ends at tenure {highest} and this checkpoint's blocks \
+             reach tenure {last}, so the tenures between them would owe nothing"
+        ));
+    }
+    let covered = highest - lowest + 1;
+    if covered <= MINER_REWARD_MATURITY {
+        return Err(format!(
+            "the archive holds {covered} of the {} tenures a checkpoint at coinbase height \
+             {last} needs: every tenure executed before nano's own mature pays out one of \
+             them, so a short window fails at the first payout it cannot derive",
+            MINER_REWARD_MATURITY + 1
+        ));
+    }
+    Ok(())
 }
 
 fn sqlite(database: &Path, query: &str) -> Result<String, String> {
@@ -2774,8 +2821,11 @@ fn describe_stored_value(value: &str) {
 fn rebuild_accounting(arguments: &[String]) -> ExitCode {
     let [state, peer, tip, tenure_height] = arguments else {
         eprintln!(
-            "usage: cargo xtask rebuild-accounting <state-dir> <peer-url> <tip-block-id> \
-             <tip-tenure-height>"
+            "usage: cargo xtask rebuild-accounting <state-dir> <peer-urls> <tip-block-id> \
+             <tip-tenure-height>\n\
+             <peer-urls> may be a comma-separated list; a repair of a few hundred tenures \
+             is thousands of requests, and one endpoint's rate limit is the whole of its \
+             speed"
         );
         return ExitCode::FAILURE;
     };
@@ -2858,13 +2908,30 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
 
 /// Walk back from `tip`, summing each tenure's transaction fees.
 fn count_fees(
-    peer: &str,
+    peers: &str,
     tip: [u8; 32],
     tenure_height: u64,
     oldest: u64,
 ) -> Result<std::collections::BTreeMap<u64, u64>, String> {
-    let url = peer.parse().map_err(|_| format!("{peer} is not a URL"))?;
-    let client = nano_sync::SyncClient::new(url).map_err(|error| format!("{error}"))?;
+    // Over the pool rather than one client. A walk of a few hundred tenures is
+    // thousands of block requests, and sent down one connection to a hosted API the
+    // rate limit *is* the repair's speed — one run was left going for 1h45m. The
+    // spreading is `TenureSource`'s: consecutive requests go to different peers, a
+    // throttled peer is set aside, and a peer that cannot serve one block costs a
+    // request rather than the walk. It is safe over strangers because a block is
+    // content-addressed and `SyncClient::block` refuses an answer that is not the
+    // block asked for.
+    let endpoints: Vec<String> = peers
+        .split(',')
+        .map(|peer| peer.trim().to_owned())
+        .filter(|peer| !peer.is_empty())
+        .collect();
+    let pool = nano_sync::PeerPool::from_endpoints(&endpoints);
+    if pool.is_empty() {
+        return Err(format!("none of {peers} is a usable peer URL"));
+    }
+    println!("counting fees over {} peers", pool.len());
+    let mut source = nano_sync::TenureSource::new(pool.into_clients());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| format!("{error}"))?;
 
     let mut fees = std::collections::BTreeMap::new();
@@ -2873,12 +2940,12 @@ fn count_fees(
     let mut consensus = None;
     runtime.block_on(async {
         while height >= oldest {
-            // A public peer rate-limits a walk this long, and being turned away
-            // is not a reason to give up on a repair that has to be complete to
-            // be worth anything.
+            // Being turned away by every peer at once is not a reason to give up on a
+            // repair that has to be complete to be worth anything: the throttles are
+            // forgiven and the walk carries on, which is what a rate limit asks for.
             let mut block = Err(String::new());
             for attempt in 0..8u32 {
-                match client.block(block_id).await {
+                match source.block(block_id).await {
                     Ok(fetched) => {
                         block = Ok(fetched);
                         break;
@@ -2889,6 +2956,7 @@ fn count_fees(
                             2 + attempt * 3,
                         )))
                         .await;
+                        source.forgive_throttles();
                     }
                 }
             }
@@ -2907,9 +2975,10 @@ fn count_fees(
                 // hours, and without this it is indistinguishable from a hang —
                 // which is exactly how one run was left going for 1h45m.
                 println!(
-                    "tenure {height}: {} counted, {} to go",
+                    "tenure {height}: {} counted, {} to go, over {} peers",
                     fees.len(),
-                    height.saturating_sub(oldest)
+                    height.saturating_sub(oldest),
+                    source.served_by()
                 );
             }
             consensus = Some(this);

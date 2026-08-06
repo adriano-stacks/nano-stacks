@@ -172,6 +172,28 @@ impl LocalPeer {
             data_url: self.data_url.clone(),
         }
     }
+
+    /// How this node names itself in the relayer list of something it forwards.
+    ///
+    /// The key hash rather than the key, because that is what the wire carries and
+    /// what a peer's loop check compares against.
+    #[must_use]
+    pub fn relay_data(&self, seq: u32) -> crate::wire::RelayData {
+        crate::wire::RelayData {
+            peer: crate::wire::NeighborAddress {
+                address: self.address,
+                port: self.port,
+                public_key_hash: self.public_key_hash(),
+            },
+            seq,
+        }
+    }
+
+    /// The `Hash160` of this node's own key, which is how peers name it.
+    #[must_use]
+    pub fn public_key_hash(&self) -> Hash160 {
+        hash160(&self.private_key.public_key().to_bytes_compressed())
+    }
 }
 
 /// Errors a session raises. All of them are per-peer: none is a reason to stop
@@ -377,11 +399,25 @@ impl Framed {
     /// The sequence number is the caller's, because a reply has to carry the
     /// sequence number of the request it answers rather than one of its own.
     pub(crate) async fn send(&mut self, seq: u32, payload: Payload) -> Result<(), SessionError> {
-        let message = Message::sign(
+        self.send_relayed(seq, Vec::new(), payload).await
+    }
+
+    /// Sign and send a message this node is passing on rather than originating.
+    ///
+    /// The relayer list is part of the signed frame, so this cannot be a matter of
+    /// forwarding the bytes that arrived.
+    pub(crate) async fn send_relayed(
+        &mut self,
+        seq: u32,
+        relayers: Vec<crate::wire::RelayData>,
+        payload: Payload,
+    ) -> Result<(), SessionError> {
+        let message = Message::relay(
             self.protocol.peer_version,
             self.protocol.network_id,
             &self.view,
             seq,
+            relayers,
             payload,
             &self.local.private_key,
         )?;
@@ -532,8 +568,42 @@ impl Framed {
         if let Some(reply) = reply {
             return self.send(seq, reply).await;
         }
-        self.buffer_push(message);
+        self.keep_push(message);
         Ok(())
+    }
+
+    /// Hand a pushed block or transaction to whatever can check it, or hold it for
+    /// a caller that will ask.
+    ///
+    /// The same [`crate::inbound::Service`] the listener offers to, so a block
+    /// pushed on a connection *nano* opened and one pushed by a peer that dialled
+    /// nano end up in exactly one place. They used to differ: the listener offered
+    /// and the swarm buffered, which meant the connections nano opened — most of
+    /// them, on a node behind a NAT — carried relay traffic that only got counted.
+    fn keep_push(&mut self, message: Message) {
+        let Some(service) = self.service.clone() else {
+            self.buffer_push(message);
+            return;
+        };
+        // Nano puts itself in the relayer list of everything it forwards and copies
+        // nothing from upstream, so seeing itself there means this item has already
+        // been round the loop through this node.
+        if crate::relay::relayed_by(&message, self.local.public_key_hash()) {
+            return;
+        }
+        let Some(from) = self
+            .peer_key
+            .as_ref()
+            .map(|key| hash160(&key.to_bytes_compressed()))
+        else {
+            self.buffer_push(message);
+            return;
+        };
+        match message.payload {
+            Payload::NakamotoBlocks(blocks) => service.offer_blocks(from, blocks),
+            Payload::Transaction(transaction) => service.offer_transaction(from, transaction),
+            _ => self.buffer_push(message),
+        }
     }
 
     /// Take one whole message out of the buffer, if there is one.
@@ -780,6 +850,20 @@ impl Session {
     #[must_use]
     pub fn take_pushed(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.framed.pushed)
+    }
+
+    /// Push a block or transaction this node has accepted to this peer.
+    ///
+    /// Nothing is awaited but the write: a push is an announcement, the peer is not
+    /// expected to answer it, and waiting for an answer that is not coming would make
+    /// relay cost a round trip per peer per item.
+    ///
+    /// The relayer list names this node and nothing else — see
+    /// [`crate::relay`] for why nano does not pass on a stranger's list.
+    pub async fn push(&mut self, payload: Payload) -> Result<(), SessionError> {
+        let seq = self.framed.next_seq();
+        let relayers = vec![self.framed.local.relay_data(seq)];
+        self.framed.send_relayed(seq, relayers, payload).await
     }
 
     /// Collect what the peer has sent since we last looked, without waiting.

@@ -217,6 +217,7 @@ pub async fn serve_peer<S: Service + ?Sized>(
         // once, so a stale one would eventually be refused.
         framed.view = service.chain_view();
         let seq = message.preamble.seq;
+        let ours_already = crate::relay::relayed_by(&message, local.public_key_hash());
         let reply = match message.payload {
             Payload::Handshake(ref handshake) => {
                 // The key a handshake announces has to be the key that signed it.
@@ -277,18 +278,22 @@ pub async fn serve_peer<S: Service + ?Sized>(
             // Pushed data is handed on and never answered. The peer is not waiting
             // for a reply, and this node has no opinion until its own checks have
             // run — which happen somewhere with a chainstate, not here.
+            //
+            // Except for what this node itself relayed: nano names only itself in a
+            // relayer list, so its own hash appearing there means the item has come
+            // back round, and re-checking it would be work a loop chose for us.
             Payload::NakamotoBlocks(blocks) => {
                 served.blocks_offered = served
                     .blocks_offered
                     .saturating_add(blocks.len().try_into().unwrap_or(u64::MAX));
-                if let Some(peer) = served.peer {
+                if let Some(peer) = served.peer.filter(|_| !ours_already) {
                     service.offer_blocks(peer, blocks);
                 }
                 None
             }
             Payload::Transaction(transaction) => {
                 served.transactions_offered = served.transactions_offered.saturating_add(1);
-                if let Some(peer) = served.peer {
+                if let Some(peer) = served.peer.filter(|_| !ours_already) {
                     service.offer_transaction(peer, transaction);
                 }
                 None

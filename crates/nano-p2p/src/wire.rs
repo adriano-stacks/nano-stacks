@@ -495,7 +495,24 @@ impl Message {
     ) -> Result<Self, WireError> {
         // An originated message has no relayers, so the frame opens with a
         // zero-length vector rather than being able to skip the field.
-        let frame = encode_frame(&[], &payload)?;
+        Self::relay(peer_version, network_id, view, seq, Vec::new(), payload, private_key)
+    }
+
+    /// Build and sign a message this node is passing on.
+    ///
+    /// The relayer list is inside the frame the signature covers, which is why a
+    /// relayed message has to be re-encoded and re-signed rather than forwarded
+    /// verbatim: appending ourselves changes the bytes the previous sender signed.
+    pub fn relay(
+        peer_version: u32,
+        network_id: u32,
+        view: &ChainView,
+        seq: u32,
+        relayers: Vec<RelayData>,
+        payload: Payload,
+        private_key: &StacksPrivateKey,
+    ) -> Result<Self, WireError> {
+        let frame = encode_frame(&relayers, &payload)?;
         let payload_len =
             u32::try_from(frame.len()).map_err(|_| WireError::PayloadTooLong(frame.len()))?;
         if payload_len > MAX_PAYLOAD_LEN {
@@ -516,7 +533,7 @@ impl Message {
         preamble.signature = private_key.sign(&preamble.digest(&frame));
         Ok(Self {
             preamble,
-            relayers: Vec::new(),
+            relayers,
             payload,
             frame,
         })

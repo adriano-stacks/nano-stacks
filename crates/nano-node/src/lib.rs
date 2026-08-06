@@ -749,18 +749,22 @@ where
     /// peer nothing, while a set bit it could not honour would cost that peer a failed
     /// fetch. It is the conservative direction on purpose.
     ///
-    /// It says *much* less than the node knows, and the reason is worth recording:
-    /// the executed ledger reaches `REORG_REACH` blocks back, so the honest answer
-    /// covers the recent end of the cycle and nothing older. Answering fully needs a
-    /// durable consensus-hash-to-tenure index, which is a chainstate change and not
-    /// this one — but answering *partially and truthfully* is already strictly better
-    /// than the `Nack` that came before it, because a nack tells a peer to give up on
-    /// nano for the whole cycle.
+    /// One round of it says *much* less than the node knows, and the reason is worth
+    /// recording: the executed ledger reaches `REORG_REACH` blocks back, so a round's
+    /// answer covers the recent end of the cycle and nothing older. What closes the gap
+    /// is that the rounds accumulate — `nano_p2p::ServedTenures` folds each one into a
+    /// durable row per cycle, so a node that has walked a cycle can answer for the
+    /// cycle, and can still do so after a restart.
+    ///
+    /// The burn height the cycle opens at comes back with the answer because that is
+    /// what the durable store keys a row by: a reorganization renames the cycle's first
+    /// sortition, and a store keyed by the name would keep claiming tenures on the fork
+    /// nano abandoned.
     #[must_use]
     pub fn tenure_inventory(
         &self,
         pox: &PoxInfo,
-    ) -> Option<(nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)> {
+    ) -> Option<(u64, nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)> {
         let tracker = self.sortition.as_ref()?;
         let start = self.cycle_start_height(pox)?;
         let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
@@ -777,7 +781,7 @@ where
                 tenures.set(u16::try_from(offset).ok()?, true).ok()?;
             }
         }
-        Some((tracker.consensus_hash_at(start)?, tenures))
+        Some((start, tracker.consensus_hash_at(start)?, tenures))
     }
 
     /// Ask a peer for something, waiting out the limits it answers with.

@@ -433,6 +433,15 @@ pub enum SyncError {
     InvalidAccount,
     /// Every peer in the pool has been asked and none could answer.
     NoPeer,
+    /// A peer answered a block request with a different block.
+    ///
+    /// Its own kind rather than a generic failure because it is the one thing a peer
+    /// can do to a content-addressed fetch, and a caller spreading a walk over a pool
+    /// needs to be able to say which peer did it.
+    UnexpectedBlock {
+        expected: StacksBlockId,
+        found: StacksBlockId,
+    },
 }
 
 impl SyncError {
@@ -450,6 +459,10 @@ impl fmt::Display for SyncError {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
             Self::NoPeer => formatter.write_str("no peer left to ask"),
+            Self::UnexpectedBlock { expected, found } => write!(
+                formatter,
+                "a peer answered the request for block {expected} with block {found}"
+            ),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
             Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
             Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
@@ -499,7 +512,8 @@ impl std::error::Error for SyncError {
             | Self::Fork
             | Self::InvalidMempool
             | Self::InvalidAccount
-            | Self::NoPeer => None,
+            | Self::NoPeer
+            | Self::UnexpectedBlock { .. } => None,
         }
     }
 }
@@ -845,6 +859,18 @@ impl SyncClient {
         }
         let bytes = self.bytes(&format!("v3/blocks/{block_id}")).await?;
         let block = NakamotoBlock::decode(&bytes).map_err(SyncError::Block)?;
+        // A block is content-addressed by the identifier that was asked for, so the
+        // one check that makes "which peer answered" irrelevant is that the answer is
+        // the block asked for. Without it, spreading a walk over a pool would let any
+        // peer in the pool substitute a block of its choosing at any step, and the
+        // caller — a repair counting fees, a descent following parent links — would
+        // carry on from the substitute.
+        if block.block_id() != block_id {
+            return Err(SyncError::UnexpectedBlock {
+                expected: block_id,
+                found: block.block_id(),
+            });
+        }
         if let Ok(mut blocks) = self.blocks.lock() {
             blocks.put(block_id, block.clone());
         }
@@ -1208,6 +1234,61 @@ impl TenureSource {
             }
         }
         Err(last.unwrap_or(SyncError::NoPeer))
+    }
+
+    /// Fetch one block, from whichever peer is next and willing.
+    ///
+    /// The same three properties as [`TenureSource::blocks_of_tenure`], for the repairs
+    /// that walk the chain a block at a time rather than a tenure at a time —
+    /// `rebuild-accounting` counts a few hundred tenures' fees block by block, which
+    /// against one hosted endpoint is thousands of requests through one rate limit and
+    /// was measured taking 1h45m. Spread over the peers p2p discovery found, the same
+    /// walk is somebody's rate limit divided by the size of the pool.
+    ///
+    /// A block is content-addressed by the identifier asked for, so which peer answers
+    /// cannot change the answer: `block()` on a `SyncClient` checks that the block it
+    /// got back is the block it asked for. That is what makes spreading a repair over
+    /// strangers safe in a way spreading a *choice* over them would not be.
+    pub async fn block(&mut self, id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
+        let mut last = None;
+        for offset in 0..self.peers.len() {
+            let index = (self.next + offset) % self.peers.len();
+            if self.throttled.contains(&index) {
+                continue;
+            }
+            let Some(peer) = self.peers.get(index) else {
+                continue;
+            };
+            match peer.block(id).await {
+                Ok(block) => {
+                    self.next = index + 1;
+                    self.served.insert(index);
+                    return Ok(block);
+                }
+                Err(error) if error.is_rate_limited() => {
+                    self.throttled.insert(index);
+                    last = Some(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(SyncError::NoPeer))
+    }
+
+    /// Let every peer that had rate-limited be asked again.
+    ///
+    /// A throttle is set aside for a *round*, and a walk of a few hundred tenures is
+    /// long enough that "the round" stops meaning anything: without this a repair that
+    /// touched every peer's limit once would run out of peers and stop, when waiting a
+    /// moment and starting again is exactly what a rate limit asks for.
+    pub fn forgive_throttles(&mut self) {
+        self.throttled.clear();
+    }
+
+    /// Whether any peer has rate-limited since the last forgiveness.
+    #[must_use]
+    pub fn throttled(&self) -> usize {
+        self.throttled.len()
     }
 }
 
