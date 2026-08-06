@@ -34,12 +34,15 @@
 //! refusing it is nano declining to answer from the engine the chain does not
 //! run on.
 
+use clarity::vm::analysis::{AnalysisDatabase, ContractAnalysis};
 use clarity::vm::contexts::ContractContext;
 use clarity::vm::costs::LimitedCostTracker;
+use clarity::vm::database::ClaritySerializable;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::{ClarityVersion, Value};
 use nano_primitives::Network;
 use nano_vm::{ContractCallOutcome, MarfStore, Vm};
+use stacks_common::types::StacksEpochId;
 
 /// A source the compiler refuses: `no-such-word` resolves to nothing.
 const UNRESOLVED: &str = "(define-public (f) (ok (no-such-word u1)))";
@@ -95,10 +98,27 @@ fn pending(vm: &Vm) -> [u8; 32] {
 /// This is the state a node meets after a checkpoint import, or after any block
 /// it did not execute itself: a contract the network accepted, sitting in the
 /// MARF, whose module this build of the compiler will not produce. It is written
-/// through the same three database writes a deployment makes, so what a call
+/// through the same four database writes a deployment makes, so what a call
 /// finds is indistinguishable from a deployed contract — which is the point,
 /// since a deployment through this boundary would have been refused.
+///
+/// The fourth is the contract analysis, and it is here because [[064]] made the
+/// epoch a rebuild compiles under a fact read off the chain rather than one the
+/// compiler picks by trying epochs. A contract with no stored analysis is now
+/// refused outright, and rightly: stacks-core writes the analysis and the
+/// contract in one transaction and a checkpoint copies the whole metadata table,
+/// so half a deploy is a state no chain produces. The analysis planted here is
+/// deliberately not this source's — an empty one naming epoch 4.0 — because what
+/// a call needs from it is the epoch it was judged in, and the whole premise of
+/// this file is that the source beside it cannot be built.
 fn plant(vm: &mut Vm, contract: &QualifiedContractIdentifier, source: &str) {
+    let analysis = ContractAnalysis::new(
+        contract.clone(),
+        Vec::new(),
+        LimitedCostTracker::new_free(),
+        StacksEpochId::Epoch40,
+        ClarityVersion::Clarity6,
+    );
     let mut database = vm.clarity_db();
     database.begin();
     database
@@ -113,6 +133,13 @@ fn plant(vm: &mut Vm, contract: &QualifiedContractIdentifier, source: &str) {
     database
         .set_contract_data_size(contract, 0)
         .expect("record the data size");
+    database
+        .set_metadata(
+            contract,
+            AnalysisDatabase::storage_key(),
+            &analysis.serialize(),
+        )
+        .expect("record the analysis the chain wrote when it accepted this contract");
     database.commit().expect("commit the planted contract");
 }
 

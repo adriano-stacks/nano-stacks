@@ -1258,8 +1258,7 @@ async fn start_rpc(
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
-    let mut state = RpcState::new()
-        .on(network)
+    let mut state = RpcState::new(network)
         .with_mempool(mempool)
         .with_block_sink(blocks);
     if let Some(executor) = executor {

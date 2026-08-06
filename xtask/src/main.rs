@@ -17,6 +17,45 @@ use nano_chainstate::{MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet};
 use nano_primitives::Network;
 use serde_json::json;
 
+/// The chain a state directory on disk belongs to.
+///
+/// Read from the state rather than named here. Every one of these subcommands
+/// opens somebody's chainstate, and a network is not a formatting preference:
+/// it picks the boot address inside every principal and the identifier
+/// `(chain-id)` reads, so naming the wrong one does not fail, it answers.
+///
+/// A state created before that was recorded says nothing, and mainnet is the
+/// assumption those tools were written under; `NANO_NETWORK` overrides it with a
+/// chain identifier for anything else.
+fn state_network(chainstate: &Path) -> Network {
+    if let Some(recorded) = nano_vm::recorded_network(chainstate) {
+        return recorded;
+    }
+    env::var("NANO_NETWORK")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim();
+            let parsed = value
+                .strip_prefix("0x")
+                .map_or_else(|| value.parse::<u32>().ok(), |hex| u32::from_str_radix(hex, 16).ok());
+            if parsed.is_none() {
+                eprintln!("NANO_NETWORK={value} is not a chain identifier; assuming mainnet");
+            }
+            parsed
+        })
+        .map_or(Network::MAINNET, Network::from_chain_id)
+}
+
+/// Open a state directory's VM as the chain the state itself names.
+fn open_state_vm(chainstate: &Path) -> Result<nano_vm::Vm, nano_vm::MarfStoreError> {
+    nano_vm::Vm::open(state_network(chainstate), chainstate)
+}
+
+/// Open a state directory's Clarity store as the chain the state itself names.
+fn open_state_store(chainstate: &Path) -> Result<nano_vm::MarfStore, nano_vm::MarfStoreError> {
+    nano_vm::MarfStore::open(state_network(chainstate), chainstate)
+}
+
 fn main() -> ExitCode {
     let command = env::args().nth(1);
     match command.as_deref() {
@@ -137,7 +176,7 @@ fn eval_in_state(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let mut store = match nano_vm::MarfStore::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut store = match open_state_store(&Path::new(state).join("chainstate")) {
         Ok(store) => store,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -210,7 +249,7 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
         }
     };
 
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -334,7 +373,7 @@ fn block_info(arguments: &[String]) -> ExitCode {
         eprintln!("{height} is not a height");
         return ExitCode::FAILURE;
     };
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error}");
@@ -456,7 +495,7 @@ fn import_headers(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error}");
@@ -1027,7 +1066,7 @@ fn probe_header(arguments: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let chainstate = Path::new(state).join("chainstate");
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, &chainstate) {
+    let mut vm = match open_state_vm(&chainstate) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -2608,7 +2647,7 @@ fn check_module(arguments: &[String]) -> ExitCode {
         eprintln!("{contract} is not a contract identifier");
         return ExitCode::FAILURE;
     };
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -2798,8 +2837,7 @@ fn state_value(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let store = match nano_vm::MarfStore::open(Network::MAINNET, Path::new(state).join("chainstate"))
-    {
+    let store = match open_state_store(&Path::new(state).join("chainstate")) {
         Ok(store) => store,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -3330,7 +3368,10 @@ fn call_both(arguments: &[String]) -> ExitCode {
 fn open_state_as_the_node_left_it(
     directory: &Path,
 ) -> Result<nano_chainstate::ChainState, String> {
-    let mut chain = nano_chainstate::ChainState::open(Network::MAINNET, directory)
+    // The chain the state names, not an assumption: a diagnostic opened as the
+    // wrong network reads different boot principals and answers a different
+    // `(chain-id)`, which is exactly the confusion these tools exist to remove.
+    let mut chain = nano_chainstate::ChainState::open(state_network(directory), directory)
         .map_err(|error| format!("cannot open the state: {error:?}"))?;
     if let Some(tip) = chain.tip() {
         chain
@@ -3538,7 +3579,7 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
                    the node must not be running: it holds the state open");
         return ExitCode::FAILURE;
     };
-    let mut vm = match nano_vm::Vm::open(Network::MAINNET, Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");

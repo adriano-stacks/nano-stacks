@@ -129,9 +129,15 @@ pub struct NodeEvent {
 }
 
 impl RpcState {
-    /// Construct initially unavailable public state.
+    /// Construct initially unavailable public state for a named chain.
+    ///
+    /// The network is an argument rather than a default because every default is
+    /// wrong somewhere: it decides the boot principals `/v2/pox` and
+    /// `/v2/contracts/call-read` name and the chain identifier a proposal is
+    /// checked against, and a node that quietly served mainnet's answers for a
+    /// hacknet chain would be believed.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(network: Network) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             followed: Arc::new(RwLock::new(None)),
@@ -141,7 +147,7 @@ impl RpcState {
             chain: None,
             admission: None,
             mempool: None,
-            network: Network::MAINNET,
+            network,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
             stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
             blocks: None,
@@ -155,13 +161,6 @@ impl RpcState {
     #[must_use]
     pub fn stackerdb(&self) -> Arc<RwLock<StackerDbStore>> {
         self.stackerdb.clone()
-    }
-
-    /// Say which chain this node is on.
-    #[must_use]
-    pub const fn on(mut self, network: Network) -> Self {
-        self.network = network;
-        self
     }
 
     /// Serve accounts and read-only calls from this executed Clarity state.
@@ -286,12 +285,6 @@ fn executed_chain(tenures: Vec<FollowedTenure>, tip: &SealedTip) -> Vec<Followed
             Some(tenure)
         })
         .collect()
-}
-
-impl Default for RpcState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl NodeEvent {
@@ -1322,7 +1315,7 @@ mod tests {
             unlock_height: 42,
             nonce: 7,
         };
-        let app = router(RpcState::new().with_chain(chain(&[(address(&sender), entry)], None)));
+        let app = router(RpcState::new(NETWORK).with_chain(chain(&[(address(&sender), entry)], None)));
 
         let response = app
             .oneshot(
@@ -1347,7 +1340,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_only_call_reports_its_value_and_its_cause() {
-        let app = router(RpcState::new().with_chain(chain(&[], Some(Value::UInt(3)))));
+        let app = router(RpcState::new(NETWORK).with_chain(chain(&[], Some(Value::UInt(3)))));
         let call = |uri: &str, app: Router| {
             let uri = uri.to_owned();
             async move {
@@ -1377,7 +1370,7 @@ mod tests {
             json!({ "okay": true, "result": "0x0100000000000000000000000000000003" })
         );
 
-        let failed = router(RpcState::new().with_chain(chain(&[], None)));
+        let failed = router(RpcState::new(NETWORK).with_chain(chain(&[], None)));
         let response = call(
             "/v2/contracts/call-read/ST000000000000000000002AMW42H/pox-5/get-cycle",
             failed,
@@ -1400,7 +1393,7 @@ mod tests {
         };
         let mempool = Arc::new(Mutex::new(Mempool::new(NETWORK)));
         let app = router(
-            RpcState::new()
+            RpcState::new(NETWORK)
                 .with_chain(chain(&[(address(&sender), funded)], None))
                 .with_mempool(mempool.clone()),
         );
@@ -1434,7 +1427,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reward_set_is_served_once_the_node_derived_it() {
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         let app = router(state.clone());
         let missing = app
             .clone()
@@ -1469,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn a_signer_writes_a_chunk_and_reads_it_back() {
         let writer = key(b"signer");
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state.stackerdb().write().await.configure(
             "ST000000000000000000002AMW42H.signers-0-1",
             vec![nano_primitives::hash160(
@@ -1586,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_requests_until_the_node_has_a_validated_view() {
-        let app = router(RpcState::new());
+        let app = router(RpcState::new(NETWORK));
 
         let response = app
             .oneshot(
@@ -1610,7 +1603,7 @@ mod tests {
     /// invisible from every endpoint it served.
     #[tokio::test]
     async fn the_served_tip_is_the_executed_one_not_the_followed_one() {
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         // The peer is at 12; this node has executed nothing beyond 4.
         state.publish(captured_view()).await;
         let sealed = SealedTip {
@@ -1659,7 +1652,7 @@ mod tests {
     /// Stacks tip at all, rather than answering with the peer's.
     #[tokio::test]
     async fn a_node_that_executed_nothing_serves_no_tip() {
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state.publish(captured_view()).await;
 
         let response = router(state)
@@ -1677,7 +1670,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_one_event_per_new_tip() {
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         let mut events = state.events.subscribe();
         state.publish(captured_view()).await;
         let event = events.try_recv().expect("new tip event");
@@ -1751,7 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn no_route_serves_a_block_the_node_has_not_executed() {
         let (view, blocks) = view_with_blocks(3);
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state.publish(view).await;
         state.publish_executed(sealed_at(&blocks[1])).await;
         let app = router(state);
@@ -1815,7 +1808,7 @@ mod tests {
     #[tokio::test]
     async fn a_tip_outside_the_followed_view_serves_no_blocks() {
         let (view, blocks) = view_with_blocks(3);
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state.publish(view).await;
         state
             .publish_executed(sealed_at(&synthetic_block(
@@ -1911,7 +1904,7 @@ mod tests {
             refusal: Some("unsupported Nakamoto block version 3".to_owned()),
         };
         let (blocks_out, mut offered) = mpsc::unbounded_channel();
-        let state = RpcState::new()
+        let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(refusing.clone())))
             .with_block_sink(blocks_out);
         state.publish(view.clone()).await;
@@ -1943,7 +1936,7 @@ mod tests {
         // — and a block already executed is neither accepted again nor offered.
         let accepting = RecordingAdmission::default();
         let (blocks_out, mut offered) = mpsc::unbounded_channel();
-        let state = RpcState::new()
+        let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(accepting)))
             .with_block_sink(blocks_out);
         state.publish(view).await;
@@ -1977,8 +1970,7 @@ mod tests {
         let (view, blocks) = view_with_blocks(3);
         let (url, received) = recording_observer().await;
         let (blocks_out, offered) = mpsc::unbounded_channel();
-        let state = RpcState::new()
-            .on(NETWORK)
+        let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(RecordingAdmission::default())))
             .with_block_sink(blocks_out)
             .with_observers(EventDispatcher::new(vec![url]))
@@ -2135,8 +2127,7 @@ mod tests {
     /// on, which is the one thing stacks-core refuses outright.
     #[tokio::test]
     async fn a_proposal_is_refused_when_no_observer_can_be_told_the_result() {
-        let state = RpcState::new()
-            .on(NETWORK)
+        let state = RpcState::new(NETWORK)
             .with_proposal_token("t0ken".to_owned());
         let response = router(state)
             .oneshot(
@@ -2159,7 +2150,7 @@ mod tests {
     async fn an_accepted_chunk_is_announced_and_a_refused_one_is_not() {
         let writer = key(b"signer");
         let (url, received) = recording_observer().await;
-        let state = RpcState::new().with_observers(EventDispatcher::new(vec![url]));
+        let state = RpcState::new(NETWORK).with_observers(EventDispatcher::new(vec![url]));
         state.stackerdb().write().await.configure(
             "ST000000000000000000002AMW42H.signers-0-1",
             vec![nano_primitives::hash160(
@@ -2238,7 +2229,7 @@ mod tests {
                 weight: 4,
             })
             .collect();
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state
             .publish_stacker_set(
                 140,
@@ -2283,7 +2274,7 @@ mod tests {
             .sortition
             .consensus_hash
             .to_string();
-        let state = RpcState::new();
+        let state = RpcState::new(NETWORK);
         state.publish(node.view().expect("node view")).await;
         let app = router(state);
 

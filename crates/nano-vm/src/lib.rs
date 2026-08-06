@@ -555,16 +555,6 @@ fn decode_block_header(bytes: &[u8]) -> Option<BlockHeader> {
     Some(header)
 }
 
-/// The epochs a stored contract may be rebuilt under, oldest first.
-const ACCEPTING_EPOCHS: [StacksEpochId; 6] = [
-    StacksEpochId::Epoch20,
-    StacksEpochId::Epoch21,
-    StacksEpochId::Epoch25,
-    StacksEpochId::Epoch30,
-    StacksEpochId::Epoch33,
-    StacksEpochId::Epoch34,
-];
-
 /// Where mainnet's epochs begin, by Bitcoin height.
 ///
 /// Transcribed from `stackslib::core`, and pinned against it by a test rather
@@ -630,6 +620,12 @@ pub fn null_context() -> &'static (impl ChainContext + 'static) {
 }
 
 /// A context that knows no chain, for evaluating programs that read none.
+///
+/// `mainnet: false` here names no network. The field's only reader is
+/// [`epoch_at_burn_height`], where it asks whether *mainnet's* epoch boundaries
+/// apply to a burn height; for a context with no burn chain behind it they do
+/// not, and every height answers with the epoch this node runs. A store's own
+/// network is carried as a [`Network`] value and is never read from here.
 static NULL_CONTEXT: BitcoinContext = BitcoinContext {
     missing_headers: Mutex::new(Vec::new()),
     mainnet: false,
@@ -2028,6 +2024,11 @@ pub enum MarfStoreError {
     /// stopped early -- and the message has to be actionable rather than a
     /// backtrace.
     IncoherentState(String),
+    /// A state directory opened as a chain other than the one it was created
+    /// for. Refused, because executing on it would fork: the boot address sits
+    /// inside every principal a block writes and the identifier is what
+    /// `(chain-id)` reads.
+    WrongNetwork { stored: Network, opened: Network },
 }
 
 impl std::fmt::Display for MarfStoreError {
@@ -2049,6 +2050,14 @@ impl std::fmt::Display for MarfStoreError {
             Self::MalformedHeaderExport => {
                 formatter.write_str("the checkpoint's header export holds a row that is not a header")
             }
+            Self::WrongNetwork { stored, opened } => write!(
+                formatter,
+                "this state was created for chain {:#010x} ({}) and was opened as chain {:#010x} ({})",
+                stored.chain_id(),
+                stored.boot_address(),
+                opened.chain_id(),
+                opened.boot_address(),
+            ),
         }
     }
 }
@@ -2096,6 +2105,7 @@ impl MarfStore {
         UnfinishedImport::refuse(directory)?;
         let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
         let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
+        reconcile_network(&side_store, network)?;
         // Asked once, here, and the answer decides whether this directory is one a
         // node may run on. Every read after it treats storage failure as impossible,
         // which is correct for a store that was whole when it opened and wrong for
@@ -2805,6 +2815,17 @@ CREATE TABLE IF NOT EXISTS burn_header (
     height INTEGER PRIMARY KEY,
     hash BLOB NOT NULL
 ) WITHOUT ROWID;
+-- The chain this state belongs to, written once when it is created.
+--
+-- Nothing in the state says it. The boot address is inside every principal a
+-- block writes and the chain identifier is what `(chain-id)` reads, so a state
+-- opened as the wrong chain does not fail -- it executes, and forks. This is the
+-- row that makes that loud, and the one a tool reads instead of assuming.
+CREATE TABLE IF NOT EXISTS chain_identity (
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 0),
+    chain_id INTEGER NOT NULL,
+    mainnet INTEGER NOT NULL
+) WITHOUT ROWID;
 ";
 
 /// How many blocks of ledger history the side store keeps.
@@ -2817,6 +2838,67 @@ fn create_side_store() -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open_in_memory()?;
     connection.execute_batch(SIDE_STORE_SCHEMA)?;
     Ok(connection)
+}
+
+/// The chain a side store says it belongs to, if it has been told.
+///
+/// Absent for a state created before this was recorded, which is why a mismatch
+/// rather than an absence is what gets refused.
+fn stored_network(connection: &rusqlite::Connection) -> Option<Network> {
+    connection
+        .query_row(
+            "SELECT chain_id, mainnet FROM chain_identity WHERE only_row = 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .ok()
+        .and_then(|(chain_id, mainnet)| {
+            let chain_id = u32::try_from(chain_id).ok()?;
+            Some(if mainnet {
+                Network::MAINNET
+            } else {
+                Network::testnet_with_chain_id(chain_id)
+            })
+        })
+}
+
+/// Refuse a state that belongs to another chain, and claim an unclaimed one.
+///
+/// A state created before this row existed is adopted rather than refused: the
+/// alternative is that every state on disk has to be imported again to gain a
+/// fact its own files already imply. From the first open onwards it is checked.
+fn reconcile_network(
+    connection: &rusqlite::Connection,
+    network: Network,
+) -> Result<(), MarfStoreError> {
+    if let Some(stored) = stored_network(connection) {
+        if stored != network {
+            return Err(MarfStoreError::WrongNetwork {
+                stored,
+                opened: network,
+            });
+        }
+        return Ok(());
+    }
+    connection.execute(
+        "INSERT INTO chain_identity (only_row, chain_id, mainnet) VALUES (0, ?1, ?2)",
+        rusqlite::params![i64::from(network.chain_id()), i64::from(network.is_mainnet())],
+    )?;
+    Ok(())
+}
+
+/// The chain a state directory belongs to, without opening it for execution.
+///
+/// For tooling: naming a network to open a state directory *with* is the bug
+/// this answers, because the wrong answer is not an error but a fork.
+#[must_use]
+pub fn recorded_network(directory: &Path) -> Option<Network> {
+    let connection = rusqlite::Connection::open_with_flags(
+        directory.join(CLARITY_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    stored_network(&connection)
 }
 
 /// Import a checkpoint into an empty state directory, marked while it runs.
@@ -3359,7 +3441,19 @@ fn collect_contracts(
     }
 }
 
-/// Compile a stored contract's source under one epoch.
+/// Compile a stored contract's source: deploy epoch for meaning, 4.0 for charge.
+///
+/// The two are separate arguments to `clar2wasm::compile_for_cost_epoch` and mean
+/// different things. `epoch` is the *semantic* epoch — it drives the parser and
+/// the type checker, so it decides which words exist and which rules judged them,
+/// and it must be the epoch the chain analyzed this contract under. The cost
+/// epoch is what the emitted module charges against, and that is the epoch the
+/// chain is executing *now*, because an old contract called today is billed at
+/// today's schedule.
+///
+/// Passing `epoch` for both would charge a 2021 contract 2021's prices. It reads
+/// like a detail because costs are not in a state root, but they are in receipts
+/// and they decide when a block hits its limit.
 fn compile_under(
     store: &mut MarfStore,
     contract: &QualifiedContractIdentifier,
@@ -3398,15 +3492,12 @@ fn compile_under(
 
 /// The epoch a contract of this Clarity version was first deployable in.
 ///
-/// Recompiling on demand has to reconstruct what the network already accepted,
-/// not re-judge it. Compiling everything as epoch 4.0 rejects any contract
-/// using a word later epochs removed — `at-block`, which 3.4 dropped and which
-/// mainnet contracts written before it still use and still run, because
-/// stacks-core stores the analysis rather than redoing it.
-///
-/// The cost table this bakes in is the deploy epoch's rather than the current
-/// one's. Costs are not in a block's state root, so a replay still matches;
-/// receipts for such contracts may not.
+/// Not a deploy epoch and not usable as one — [`deploy_epoch`] reads that off the
+/// chain. This is the most permissive epoch a source of this version could have
+/// been written for, and it exists for the two readers that want to parse a
+/// source without judging it: the scan for the contracts a source names, whose
+/// only effect is which modules get built early, and the diagnostic interpreter
+/// in `nano-oracle`, which is not a node execution path.
 #[must_use]
 pub const fn epoch_for_version(version: ClarityVersion) -> StacksEpochId {
     match version {
@@ -3954,39 +4045,60 @@ fn ensure_wasm_module(
     }
 
     let (source, version) = contract_source(store, bitcoin_context, contract)?;
-    // The current epoch first, so the costs baked in are the ones the chain
-    // charges now. Only a contract it rejects — one using a word a later epoch
-    // removed — is rebuilt under the epoch it was deployable in.
+    // One compilation, under the epoch the chain says this contract was analyzed
+    // in. Which epoch that is has to be a fact about the chain and nothing else:
+    // it decides which words exist and which type rules applied, and a node whose
+    // answer came from asking its own compiler what it would accept would change
+    // its receipts every time the compiler improved.
+    let epoch = deploy_epoch(store, contract)?;
     let engine = modules.engine().clone();
-    let compiled = match compile_under(store, contract, &source, version, StacksEpochId::Epoch40)
-        .and_then(|compiled| loadable(contract, compiled, &engine))
-    {
-        Ok(compiled) => compiled,
-        Err(rejected) => {
-            // Worth saying: a contract built under an older epoch is charged
-            // that epoch's costs, and its receipts will not match the network's.
-            // Newest first: a contract keeps the semantics of the epoch it was
-            // written for, and the newest epoch that still accepts it is the
-            // closest guess at that — where the oldest its version allows sends
-            // a Clarity 1 contract back to epoch 2.0, whose code paths are the
-            // least exercised in the compiler.
-            let (epoch, compiled) = ACCEPTING_EPOCHS
-                .iter()
-                .rev()
-                .filter(|epoch| **epoch >= epoch_for_version(version))
-                .find_map(|epoch| {
-                    compile_under(store, contract, &source, version, *epoch)
-                        .and_then(|compiled| loadable(contract, compiled, &engine))
-                        .ok()
-                        .map(|compiled| (*epoch, compiled))
-                })
-                .ok_or(rejected)?;
-            eprintln!("{contract} does not compile under epoch 4.0, rebuilt as {epoch:?}");
-            compiled
-        }
-    };
+    let compiled = compile_under(store, contract, &source, version, epoch)
+        .and_then(|compiled| loadable(contract, compiled, &engine))?;
     modules.insert(contract.clone(), compiled);
     Ok(())
+}
+
+/// The epoch a deployed contract was analyzed under, as the chain recorded it.
+///
+/// stacks-core analyzes a contract once, at deploy time, under the epoch and
+/// Clarity version then in force, and stores the result; nothing re-judges it
+/// later. That stored `ContractAnalysis` carries the epoch, so a node rebuilding
+/// a module from source has the answer on disk and never has to infer one.
+///
+/// It matters most for a word a later epoch withdrew. `at-block` is the live
+/// case: `supports_at_block()` is `< Epoch34`, so the analysis of a contract
+/// deployed before 3.4 accepted it and stays accepted, while epoch 4.0 would
+/// reject the same source outright.
+///
+/// A contract with no stored analysis is refused rather than guessed at, which
+/// stops the block. There is no honest fallback: any epoch this function chose
+/// for itself would be nano's opinion standing in for the chain's record, which
+/// is the whole failure this exists to remove.
+fn deploy_epoch(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+) -> Result<StacksEpochId, VmExecutionError> {
+    let mut analysis = AnalysisDatabase::new(store);
+    let stored = analysis
+        .execute::<_, _, StaticCheckError>(|analysis_db| {
+            Ok(analysis_db
+                .load_contract_non_canonical(contract)?
+                .map(|analysis| analysis.epoch))
+        })
+        .map_err(|error: StaticCheckError| {
+            VmExecutionError::from(VmInternalError::Expect(error.to_string()))
+        })?;
+    stored.ok_or_else(|| {
+        // Deliberately not marked as an analysis failure: that turns a compile
+        // problem into a transaction receipt and lets the block carry on, and a
+        // contract whose deploy epoch this node cannot read is a hole in the
+        // state rather than a bad transaction.
+        VmInternalError::Expect(format!(
+            "{contract} is deployed but this state holds no contract analysis for it, so the \
+             epoch it was analyzed under is unknown and no module can be built for it"
+        ))
+        .into()
+    })
 }
 
 /// Reject a module the runtime would refuse to load.
@@ -4466,6 +4578,14 @@ mod tests {
 
     use super::{ContractCallOutcome, MarfStore, Vm};
     use clarity::vm::costs::LimitedCostTracker;
+
+    use clar2wasm::NativeModuleStore;
+    use rusqlite::params;
+
+    use super::{
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, StaticCheckError, compile_under,
+        ensure_wasm_module, recorded_network, reports_analysis_failure,
+    };
 
     /// Read a Clarity expression the only way this node evaluates anything:
     /// through a deployed contract, compiled and run by clarity-wasm.
@@ -5448,6 +5568,482 @@ mod tests {
         assert!(
             matches!(result, Ok(ref result) if matches!(result.value, Some(Value::UInt(_))),),
             "{result:?}"
+        );
+    }
+
+    /// A state directory belongs to one chain, and says which.
+    ///
+    /// Nothing else in the state does. The boot address is inside every
+    /// principal a block writes and the chain identifier is what `(chain-id)`
+    /// reads, so a state opened as the wrong chain does not fail — it executes,
+    /// and every root from there on is a fork of the chain it came from. Hacknet
+    /// against the public testnet is the near miss that matters: both are
+    /// non-mainnet, so the boot address is the same and only the identifier
+    /// differs.
+    #[test]
+    fn a_state_directory_refuses_to_be_opened_as_another_chain() {
+        for (created, wrong) in [
+            (Network::TESTNET, Network::MAINNET),
+            (Network::MAINNET, Network::TESTNET),
+            (
+                Network::testnet_with_chain_id(0x8000_0005),
+                Network::TESTNET,
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("a directory");
+            drop(Vm::open(created, directory.path()).expect("create the state"));
+
+            assert_eq!(
+                recorded_network(directory.path()),
+                Some(created),
+                "the state records the chain it was created for"
+            );
+            let refused = Vm::open(wrong, directory.path());
+            let message = match refused {
+                Err(MarfStoreError::WrongNetwork { stored, opened }) => {
+                    assert_eq!(stored, created);
+                    assert_eq!(opened, wrong);
+                    MarfStoreError::WrongNetwork { stored, opened }.to_string()
+                }
+                other => panic!(
+                    "a state created for {:#010x} opened as {:#010x}: {other:?}",
+                    created.chain_id(),
+                    wrong.chain_id()
+                ),
+            };
+            assert!(
+                message.contains(&format!("{:#010x}", created.chain_id()))
+                    && message.contains(&format!("{:#010x}", wrong.chain_id())),
+                "the refusal names both chains: {message}"
+            );
+            // And the chain it belongs to still opens, so this is a check and
+            // not a state directory that can only be opened once.
+            drop(Vm::open(created, directory.path()).expect("reopen as its own chain"));
+        }
+    }
+
+    /// A state created before the chain was recorded is adopted, not refused.
+    ///
+    /// Every state directory already on disk is one of those, and the
+    /// alternative is importing a 380 GB checkpoint again to gain a fact its own
+    /// files already imply. It is checked from the first open onwards, which is
+    /// what the previous test asserts.
+    #[test]
+    fn a_state_that_names_no_chain_is_claimed_by_the_first_open() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(Vm::open(Network::TESTNET, directory.path()).expect("create the state"));
+        let connection = rusqlite::Connection::open(directory.path().join(CLARITY_FILE))
+            .expect("open the side store");
+        connection
+            .execute("DELETE FROM chain_identity", [])
+            .expect("forget the chain, as a state written before this did");
+        drop(connection);
+
+        assert_eq!(recorded_network(directory.path()), None);
+        drop(Vm::open(Network::MAINNET, directory.path()).expect("adopt the unclaimed state"));
+        assert_eq!(
+            recorded_network(directory.path()),
+            Some(Network::MAINNET),
+            "and it is claimed from then on"
+        );
+        assert!(matches!(
+            Vm::open(Network::TESTNET, directory.path()),
+            Err(MarfStoreError::WrongNetwork { .. })
+        ));
+    }
+
+    /// A contract that uses a word epoch 4.0 withdrew, as mainnet holds 881 of.
+    ///
+    /// `at-block` is the case: `supports_at_block()` is `< Epoch34`, so a
+    /// contract analyzed before 3.4 was accepted with it and stays accepted,
+    /// while the same source offered to epoch 4.0 is rejected outright.
+    const USES_AT_BLOCK: &str = "(define-data-var total uint u7)
+         (define-read-only (total-at (block uint))
+           (at-block (unwrap! (get-block-info? id-header-hash block) (err u1))
+             (ok (var-get total))))";
+
+    /// A source every epoch accepts, so a deploy can establish real state for it.
+    const PLAIN: &str = "(define-data-var total uint u7)
+         (define-read-only (total-now) (ok (var-get total)))";
+
+    /// Publish a contract properly, then make the state say what an imported one
+    /// would say: this source, analyzed in that epoch.
+    ///
+    /// A deploy here is always analyzed under epoch 4.0, because that is the
+    /// epoch nano runs, so the state a checkpoint import produces — an analysis
+    /// written years ago, naming an epoch that no longer exists to deploy in —
+    /// cannot be reached by deploying. Both edits land in `metadata_table`,
+    /// which is not the MARF, so no state root moves: the same reason
+    /// [`MarfStore::replace_contract_definition`] is safe.
+    fn imported_as(
+        vm: &mut Vm,
+        contract: &QualifiedContractIdentifier,
+        source: &str,
+        epoch: StacksEpochId,
+    ) {
+        let analysis_key = format!("clr-meta::{contract}::analysis");
+        let stored: String = vm
+            .store
+            .side_store
+            .query_row(
+                "SELECT value FROM metadata_table WHERE key = ?1 LIMIT 1",
+                params![analysis_key],
+                |row| row.get(0),
+            )
+            .expect("the deploy stored a contract analysis");
+        // The last `epoch`, which is the top-level field `ContractAnalysis`
+        // deserializes; the earlier copy inside `contract_interface` is
+        // descriptive and is left alone.
+        const MARKER: &str = r#""epoch":""#;
+        let field = stored
+            .rfind(MARKER)
+            .expect("the stored analysis names an epoch");
+        let value = field + MARKER.len();
+        let closing = value
+            + stored[value..]
+                .find('"')
+                .expect("the epoch field is a string");
+        let rewritten = format!("{}{MARKER}{epoch:?}{}", &stored[..field], &stored[closing..]);
+        assert!(
+            rewritten.ends_with(&format!(
+                r#"{MARKER}{epoch:?}","clarity_version":"Clarity2"}}"#
+            )),
+            "the top-level epoch, and nothing after it, was rewritten: {rewritten}"
+        );
+        vm.store
+            .side_store
+            .execute(
+                "UPDATE metadata_table SET value = ?2 WHERE key = ?1",
+                params![analysis_key, rewritten],
+            )
+            .expect("record the epoch the chain analyzed it in");
+        vm.store
+            .side_store
+            .execute(
+                "UPDATE metadata_table SET value = ?2 WHERE key = ?1",
+                params![
+                    format!("clr-meta::{contract}::vm-metadata::9::contract-src"),
+                    source
+                ],
+            )
+            .expect("record the source the chain holds");
+        // Nothing may be answered from the module built at deploy time: a
+        // rebuild from the stored source is the path under test, and it is the
+        // path any restarted node takes for a contract it did not deploy.
+        vm.modules = ModuleCache::default();
+    }
+
+    /// A state holding a contract as an import would, ready to be rebuilt.
+    fn imported_contract(
+        directory: &Path,
+        source: &str,
+        epoch: StacksEpochId,
+    ) -> (Vm, QualifiedContractIdentifier) {
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.reserve")
+            .expect("valid contract identifier");
+        let mut vm = Vm::open(Network::TESTNET, directory).expect("open the state");
+        vm.begin_block(None, [1; 32]).expect("begin block");
+        vm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity2,
+            PLAIN,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy a contract every epoch accepts");
+        vm.seal_block().expect("seal the deploy");
+        imported_as(&mut vm, &contract, source, epoch);
+        vm.begin_block(Some([1; 32]), [2; 32])
+            .expect("begin the block that calls it");
+        (vm, contract)
+    }
+
+    /// The epoch a rebuild uses is the one the chain recorded, not one the
+    /// compiler was asked to pick.
+    ///
+    /// This is the whole of the fix: a contract using `at-block` builds, and it
+    /// builds because the stored analysis says epoch 2.4 — offered to epoch 4.0
+    /// the same source is refused, which the second assertion checks so that the
+    /// first one cannot pass for the wrong reason.
+    #[test]
+    fn a_rebuild_uses_the_epoch_the_chain_recorded() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut vm, contract) =
+            imported_contract(directory.path(), USES_AT_BLOCK, StacksEpochId::Epoch24);
+
+        ensure_wasm_module(&mut vm.store, &vm.context, &mut vm.modules, &contract)
+            .expect("the recorded epoch accepts it");
+        let built = vm
+            .modules
+            .get(&contract)
+            .expect("a module was built")
+            .wasm
+            .clone();
+
+        assert!(
+            compile_under(
+                &mut vm.store,
+                &contract,
+                USES_AT_BLOCK,
+                ClarityVersion::Clarity2,
+                StacksEpochId::Epoch40,
+            )
+            .is_err(),
+            "epoch 4.0 has to refuse this source, or the rest of this proves nothing"
+        );
+        // The module is the one 2.4 builds, byte for byte.
+        let recorded = compile_under(
+            &mut vm.store,
+            &contract,
+            USES_AT_BLOCK,
+            ClarityVersion::Clarity2,
+            StacksEpochId::Epoch24,
+        )
+        .expect("2.4 accepts it")
+        .wasm;
+        assert_eq!(built, recorded, "the module is the recorded epoch's");
+        // Measured, and the reason this test is not the one that catches a
+        // search: 3.3 — the epoch a search reached instead, since the list it
+        // walked held no 2.4 at all — builds the *same bytes* for this source.
+        // So on this contract the old guess and the chain's answer agreed, and
+        // what was wrong with the guess was never these bytes but where the
+        // answer came from. `a_contract_its_recorded_epoch_refuses_is_not_
+        // rebuilt_under_another` is the assertion a search fails.
+        assert_eq!(
+            recorded,
+            compile_under(
+                &mut vm.store,
+                &contract,
+                USES_AT_BLOCK,
+                ClarityVersion::Clarity2,
+                StacksEpochId::Epoch33,
+            )
+            .expect("3.3 accepts it too, which is what made the search look sound")
+            .wasm
+        );
+    }
+
+    /// A contract its recorded epoch refuses is refused, not tried elsewhere.
+    ///
+    /// The state here is one only a search could rescue: a source using
+    /// `at-block` whose recorded analysis epoch withdrew it. mainnet cannot hold
+    /// that combination — the deploy-time analysis would have rejected it — and
+    /// that is the point. Trying epochs until one accepts finds 3.3 and runs;
+    /// reading the epoch off the chain refuses. So this is the assertion that
+    /// fails if the search comes back, and it fails for no other reason.
+    #[test]
+    fn a_contract_its_recorded_epoch_refuses_is_not_rebuilt_under_another() {
+        for recorded in [StacksEpochId::Epoch34, StacksEpochId::Epoch40] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let (mut vm, contract) = imported_contract(directory.path(), USES_AT_BLOCK, recorded);
+
+            let refused = ensure_wasm_module(&mut vm.store, &vm.context, &mut vm.modules, &contract)
+                .expect_err("the recorded epoch refuses it, and no other is tried");
+
+            // An older epoch does accept it, which is what a search would have
+            // found and used.
+            assert!(
+                compile_under(
+                    &mut vm.store,
+                    &contract,
+                    USES_AT_BLOCK,
+                    ClarityVersion::Clarity2,
+                    StacksEpochId::Epoch33,
+                )
+                .is_ok(),
+                "epoch 3.3 accepts this source, so a search would have succeeded"
+            );
+            assert!(
+                reports_analysis_failure(&refused),
+                "a source its own epoch rejects is the contract's fault: {refused:?}"
+            );
+        }
+    }
+
+    /// A deployed contract whose analysis this state does not hold stops the
+    /// block instead of being executed under a guessed epoch.
+    ///
+    /// [[060]]'s boundary: the refusal must not be reported as an analysis
+    /// failure, because that becomes a transaction receipt and the block carries
+    /// on. A contract present in the state whose analysis is missing is a hole in
+    /// the state, and a node that cannot say which rules judged it cannot say
+    /// what calling it means.
+    #[test]
+    fn a_contract_with_no_recorded_analysis_stops_the_block() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut vm, contract) =
+            imported_contract(directory.path(), PLAIN, StacksEpochId::Epoch40);
+        vm.store
+            .side_store
+            .execute(
+                "DELETE FROM metadata_table WHERE key = ?1",
+                params![format!("clr-meta::{contract}::analysis")],
+            )
+            .expect("lose the analysis");
+        vm.modules = ModuleCache::default();
+
+        let refused = ensure_wasm_module(&mut vm.store, &vm.context, &mut vm.modules, &contract)
+            .expect_err("a contract with no recorded analysis cannot be built");
+
+        assert!(
+            !reports_analysis_failure(&refused),
+            "this must stop the block rather than become a receipt: {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("no contract analysis"),
+            "the refusal says what is missing: {refused}"
+        );
+    }
+
+    /// An old contract is charged the current epoch's schedule, not its own.
+    ///
+    /// The semantic epoch and the charging epoch are separate arguments to
+    /// `clar2wasm::compile_for_cost_epoch` and the module bakes the second one
+    /// in, so this is decided at compile time and is visible as module bytes.
+    /// Three assertions, because the interesting one is worthless alone: the
+    /// charging epoch does change the module, the production path's module is
+    /// the one charging at 4.0, and it is *not* the one charging at the deploy
+    /// epoch.
+    #[test]
+    fn an_old_contract_is_charged_the_current_epochs_costs() {
+        let deployed_in = StacksEpochId::Epoch21;
+        let mut store = MarfStore::new(Network::TESTNET).expect("create a store");
+        store.begin(None, [1; 32]).expect("begin a state");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.priced")
+            .expect("valid contract identifier");
+
+        let charging_at = |store: &mut MarfStore, cost_epoch| {
+            let mut analysis = AnalysisDatabase::new(store);
+            analysis
+                .execute::<_, _, StaticCheckError>(|analysis_db| {
+                    Ok(clar2wasm::compile_for_cost_epoch(
+                        PLAIN,
+                        &contract,
+                        LimitedCostTracker::new_free(),
+                        ClarityVersion::Clarity2,
+                        deployed_in,
+                        cost_epoch,
+                        analysis_db,
+                        true,
+                    )
+                    .map(clar2wasm::CompileResult::into_compiled_contract)
+                    .expect("the source compiles")
+                    .wasm)
+                })
+                .expect("compile for a cost epoch")
+        };
+        let charging_now = charging_at(&mut store, StacksEpochId::Epoch40);
+        let charging_then = charging_at(&mut store, deployed_in);
+        let built = compile_under(
+            &mut store,
+            &contract,
+            PLAIN,
+            ClarityVersion::Clarity2,
+            deployed_in,
+        )
+        .expect("the production path compiles it")
+        .wasm;
+
+        assert_ne!(
+            charging_now, charging_then,
+            "the charging epoch has to reach the module, or the rest of this test is vacuous"
+        );
+        assert_eq!(
+            built, charging_now,
+            "a contract analyzed in {deployed_in:?} is charged epoch 4.0's schedule"
+        );
+        assert_ne!(
+            built, charging_then,
+            "and not the schedule of the epoch it was deployed in"
+        );
+    }
+
+    /// A cached native module cannot outlive the epoch or the compiler that
+    /// built it, and this is why rather than a tag that has to be remembered.
+    ///
+    /// `NativeModuleCache` keys an entry on the wasm, not on the contract. The
+    /// wasm is the compiler's entire output for one
+    /// (source, Clarity version, semantic epoch, charging epoch) under one build
+    /// of clar2wasm, and that output is deterministic. Two consequences, and
+    /// together they are the whole argument: inputs that change the module change
+    /// the key, so no entry is reachable from inputs that would build something
+    /// else; and inputs that leave the module identical share an entry that is
+    /// byte-identical to what either would have built, which is not a stale hit.
+    ///
+    /// The second half is not hypothetical, which is the part worth writing down:
+    /// **the semantic epoch is frequently absent from the module bytes.** Under a
+    /// fixed charging epoch this source compiles to the same module in 2.1 as in
+    /// 4.0, so an explicit epoch in the cache key would only have partitioned
+    /// entries that are the same code. The charging epoch does reach the bytes,
+    /// and is checked here so the reasoning rests on a measurement.
+    ///
+    /// What it does not cover: clar2wasm's host functions in `linker.rs` are not
+    /// in the wasm and are not cached — they are linked from the running binary
+    /// at instantiation — so a change to one takes effect immediately rather than
+    /// being outlived by an entry.
+    #[test]
+    fn a_cached_native_module_cannot_outlive_the_inputs_that_built_it() {
+        let mut store = MarfStore::new(Network::TESTNET).expect("create a store");
+        store.begin(None, [1; 32]).expect("begin a state");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.aged")
+            .expect("valid contract identifier");
+        let under = |store: &mut MarfStore, epoch| {
+            compile_under(store, &contract, PLAIN, ClarityVersion::Clarity2, epoch)
+                .expect("the source compiles under every epoch here")
+                .wasm
+        };
+
+        // Deterministic: the same inputs are the same bytes, so an entry's name
+        // is a function of its inputs and not of when it was built.
+        let old = under(&mut store, StacksEpochId::Epoch21);
+        assert_eq!(old, under(&mut store, StacksEpochId::Epoch21));
+        // And the semantic epoch alone leaves this module unchanged.
+        assert_eq!(
+            old,
+            under(&mut store, StacksEpochId::Epoch40),
+            "if this ever differs the cache separates them of its own accord; the comment above \
+             is what needs correcting, not the key"
+        );
+
+        // The charging epoch does reach the bytes, and a differing module is a
+        // miss under the real cache rather than a hit on the other epoch's code.
+        let charging_at = |store: &mut MarfStore, cost_epoch| {
+            let mut analysis = AnalysisDatabase::new(store);
+            analysis
+                .execute::<_, _, StaticCheckError>(|analysis_db| {
+                    Ok(clar2wasm::compile_for_cost_epoch(
+                        PLAIN,
+                        &contract,
+                        LimitedCostTracker::new_free(),
+                        ClarityVersion::Clarity2,
+                        StacksEpochId::Epoch21,
+                        cost_epoch,
+                        analysis_db,
+                        true,
+                    )
+                    .map(clar2wasm::CompileResult::into_compiled_contract)
+                    .expect("the source compiles")
+                    .wasm)
+                })
+                .expect("compile for a cost epoch")
+        };
+        let charging_then = charging_at(&mut store, StacksEpochId::Epoch21);
+        assert_ne!(old, charging_then);
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let cache = nano_wasm_cache::NativeModuleCache::open(directory.path())
+            .expect("open a native module cache");
+        let engine = wasmtime::Engine::default();
+        cache.store(
+            &charging_then,
+            &wasmtime::Module::new(&engine, &charging_then).expect("compile native code"),
+        );
+        assert!(
+            NativeModuleStore::load(&cache, &engine, &charging_then).is_some(),
+            "the entry it was stored under answers"
+        );
+        assert!(
+            NativeModuleStore::load(&cache, &engine, &old).is_none(),
+            "and the module built for another charging epoch is a miss, not that entry"
         );
     }
 }
