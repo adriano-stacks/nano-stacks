@@ -1914,6 +1914,32 @@ mod tests {
 
     use crate::tools::{crosscheck, crosscheck_compare_only, evaluate, interpret};
 
+    /// `map` over an empty sequence beside a longer one, at the executing epoch.
+    ///
+    /// `StacksEpochId::fixes_map_off_by_one()` is a runtime predicate on the
+    /// *executing* epoch: before 4.0, `special_map_v200` pushes an argument tuple
+    /// one step past the shortest sequence and applies the function with too few
+    /// arguments; from 4.0, `special_map_v400` applies it exactly `min_len` times.
+    /// nano executes only at 4.0, so the fixed behaviour is the only one it can
+    /// need — and this is the assertion that the compiler has it rather than the
+    /// legacy one, in the epoch it will run in.
+    ///
+    /// The empty sequence arrives as an argument because a `(list)` literal in
+    /// the `map` itself would be typed `(list 0 NoType)` and take a different
+    /// path through analysis.
+    #[test]
+    fn map_stops_at_the_shortest_sequence() {
+        let snippet = "(define-private (zip (a (list 5 int)) (b (list 5 int))) (map + a b))
+             (zip (list 1 2 3) (list))";
+        crosscheck_compare_only(snippet);
+        crosscheck(
+            snippet,
+            Ok(Some(
+                Value::cons_list_unsanitized(vec![]).expect("an empty list"),
+            )),
+        );
+    }
+
     #[test]
     fn fold_less_than_three_args() {
         let result = evaluate("(fold + (list 1 2 3))");

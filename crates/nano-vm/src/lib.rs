@@ -40,6 +40,21 @@ use stacks_common::types::{
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
+/// How the compiler a build contains is named. See the file's own header for the
+/// algorithm and for why it is a content hash rather than a git revision.
+mod compiler_identity;
+
+pub use compiler_identity::compiler_identity_of;
+
+/// The clarity-wasm this binary contains, by content.
+///
+/// Stamped by `build.rs` from the vendored sources it compiled — see
+/// `compiler_identity` for what it covers and why it is not a git revision. Every
+/// claim that rests on the compiler is bound to this: the state a node writes
+/// records it, the release report prints it, and a frozen receipt slice names the
+/// one that produced it.
+pub const COMPILER_IDENTITY: &str = env!("NANO_COMPILER_IDENTITY");
+
 /// The consensus execution-cost limit for an Epoch 4 block.
 ///
 /// Epoch 4 doubles what a block may read and leaves writing and runtime where
@@ -2106,6 +2121,7 @@ impl MarfStore {
         let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
         let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
         reconcile_network(&side_store, network)?;
+        record_engine_identity(&side_store)?;
         // Asked once, here, and the answer decides whether this directory is one a
         // node may run on. Every read after it treats storage failure as impossible,
         // which is correct for a store that was whole when it opened and wrong for
@@ -2826,6 +2842,22 @@ CREATE TABLE IF NOT EXISTS chain_identity (
     chain_id INTEGER NOT NULL,
     mainnet INTEGER NOT NULL
 ) WITHOUT ROWID;
+-- Every clarity-wasm build that has opened this state for writing.
+--
+-- A state is not only data: the contract definitions and the values in it were
+-- written by whichever engine executed the blocks that produced them, and every
+-- root beyond the checkpoint is that engine's arithmetic. So `[[060]]` asks that
+-- provenance name the compiler, and this is where a state answers.
+--
+-- A list rather than one row, and appended rather than checked, on purpose. A
+-- compiler fix is an ordinary event and must not make a state unopenable; what
+-- a release needs to know is *which* builds contributed to it, and a state with
+-- two entries is one whose roots two compilers produced. That is a fact worth
+-- reporting and not one worth refusing.
+CREATE TABLE IF NOT EXISTS engine_identity (
+    identity TEXT PRIMARY KEY,
+    first_seen INTEGER NOT NULL
+) WITHOUT ROWID;
 ";
 
 /// How many blocks of ledger history the side store keeps.
@@ -2885,6 +2917,52 @@ fn reconcile_network(
         rusqlite::params![i64::from(network.chain_id()), i64::from(network.is_mainnet())],
     )?;
     Ok(())
+}
+
+/// Record that this build's compiler has opened the state.
+///
+/// Appended, never refused: see the `engine_identity` table's own comment. A
+/// build with no vendored compiler beside it still writes a row, saying so, since
+/// "which compiler wrote this" has an answer either way and "no row" would read
+/// as a state from before this existed.
+fn record_engine_identity(connection: &rusqlite::Connection) -> Result<(), MarfStoreError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    connection.execute(
+        "INSERT OR IGNORE INTO engine_identity (identity, first_seen) VALUES (?1, ?2)",
+        rusqlite::params![COMPILER_IDENTITY, i64::try_from(now).unwrap_or(0)],
+    )?;
+    Ok(())
+}
+
+/// Every clarity-wasm build that has opened this state directory for writing,
+/// oldest first.
+///
+/// Empty for a state written before this was recorded, which is a different thing
+/// from a state whose compiler is unknown and reads as such in the report.
+#[must_use]
+pub fn recorded_engine_identities(directory: &Path) -> Vec<(String, u64)> {
+    let Ok(connection) = rusqlite::Connection::open_with_flags(
+        directory.join(CLARITY_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = connection
+        .prepare("SELECT identity, first_seen FROM engine_identity ORDER BY first_seen, identity")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.unsigned_abs(),
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
 }
 
 /// The chain a state directory belongs to, without opening it for execution.

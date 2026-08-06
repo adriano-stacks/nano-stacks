@@ -13,12 +13,17 @@ nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
 nano-wasm-cache = { path = "../nano-wasm-cache" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+sha2 = "0.10"
 # `default-features = false` and the list spelled out: `stacks-common`'s own
 # default adds `ctrlc-handler`, which drags in `nix` and installs nothing nano
 # calls, and a future default could add more without anyone here choosing it.
 # `developer-mode` is chosen on purpose -- it keeps source spans on AST nodes, so
 # a stock mainnet node has it and nano's parser must report the same way.
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", default-features = false, features = ["developer-mode", "rand"] }
+
+[build-dependencies]
+hex = "0.4.3"
+sha2 = "0.10"
 
 [lints]
 workspace = true

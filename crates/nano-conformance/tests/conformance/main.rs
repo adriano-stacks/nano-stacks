@@ -21,6 +21,7 @@
 
 mod as_contract_codegen;
 mod as_contract_sender;
+mod at_block_refusal;
 mod binary_restart;
 mod block_authentication;
 mod block_height_keyword;

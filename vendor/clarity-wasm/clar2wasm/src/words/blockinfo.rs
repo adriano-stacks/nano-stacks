@@ -185,6 +185,26 @@ impl ComplexWord for AtBlock {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
+        // The epoch this module will execute in, which is not the one it was
+        // built for: a contract published before 3.4 keeps a stored analysis
+        // that accepted `at-block`, and the chain it runs on has since taken
+        // the word away. `special_at_block`
+        // (`clarity/src/vm/functions/database.rs`) refuses on
+        // `supports_at_block()` *before* the argument count, before the
+        // `AtBlock` cost and before evaluating the block hash — so a refusal
+        // charges nothing for the word and nothing for its argument, and both
+        // are in the receipt. Emitting the refusal here rather than in
+        // `enter_at_block` is what puts it in that order: the host gate fires
+        // only after the argument has been evaluated, which charges the
+        // argument's cost and, when the argument short-returns, answers with
+        // its value instead of refusing at all.
+        if generator
+            .executing_epoch()
+            .is_some_and(|epoch| !epoch.supports_at_block())
+        {
+            return refuse_at_block(generator, builder);
+        }
+
         let ty = generator.get_expr_type(expr).cloned().ok_or_else(|| {
             GeneratorError::TypeError("at-block expression should be typed".to_owned())
         })?;
@@ -252,6 +272,41 @@ impl ComplexWord for AtBlock {
 
         Ok(())
     }
+}
+
+/// Raise `AtBlockUnavailable` where an `at-block` expression would have been.
+///
+/// Nothing of the expression is emitted: not the block hash, not the body, not
+/// the `AtBlock` cost. That is the order `special_at_block` refuses in, and the
+/// order is observable — a hash argument like `reserve-v1`'s
+/// `(unwrap! (get-block-info? id-header-hash block) (err ERR_BLOCK_INFO))`
+/// charges a database read and can return from the function on its own, so
+/// evaluating it first turns a refusal into an ordinary answer.
+///
+/// The refusal is the host's `enter_at_block`, called with an offset and a
+/// length it never reads: it checks the epoch before it touches memory, so zeros
+/// are what "the argument was never evaluated" looks like in wasm. Reusing the
+/// host gate keeps one statement of the rule and one error identity —
+/// `RuntimeCheckErrorKind::AtBlockUnavailable` — instead of a second spelling in
+/// the error map.
+///
+/// This raises only where control reaches it. `(if flag (at-block …) u1)` with a
+/// false `flag` still answers `u1`, as it does in the interpreter, because the
+/// refusal sits inside the branch's own block.
+fn refuse_at_block(
+    generator: &mut WasmGenerator,
+    builder: &mut walrus::InstrSeqBuilder,
+) -> Result<(), GeneratorError> {
+    builder
+        .i32_const(0)
+        .i32_const(0)
+        .call(generator.func_by_name("stdlib.enter_at_block"))
+        // The host always errors, so nothing after this runs. Telling the
+        // validator so is what lets the surrounding block keep its declared
+        // result type with no value produced, the same way
+        // `generate_name_already_used_error` does.
+        .unreachable();
+    Ok(())
 }
 
 #[derive(Debug)]

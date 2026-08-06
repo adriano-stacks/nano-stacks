@@ -2840,6 +2840,7 @@ dependencies = [
  "nano-primitives",
  "nano-wasm-cache",
  "rusqlite",
+ "sha2 0.10.9",
  "stacks-common",
  "tempfile",
  "wasmtime",
