@@ -56,6 +56,28 @@ pub trait BlockAdmission: Send {
     fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String>;
 }
 
+/// The blocks a node kept because it executed them.
+///
+/// `/v3/blocks/:id` and `/v3/tenures/:id` used to be answered out of the peer
+/// view bounded at the executed tip, which meant a node could not serve a block
+/// it had executed unless a peer had recently told it about the same block —
+/// so 36,876 blocks behind mainnet, with a perfectly good executed tip, it
+/// answered `404` for that very tip. Nothing kept the blocks: staging drops each
+/// one the moment it seals.
+///
+/// A trait rather than a type because the store is the node's, and the node
+/// depends on this crate. Answers bytes rather than blocks: both routes serve the
+/// consensus serialization, and decoding a block to re-encode it is work with a
+/// way to be wrong in it.
+pub trait ExecutedBlocks: Send + Sync {
+    /// The block this identifier names.
+    fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>>;
+
+    /// The blocks of the tenure that starts at this block, lowest first, and
+    /// stopping before `stop` when it is named.
+    fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>>;
+}
+
 /// A block waiting to be vouched for, and where the verdict goes.
 ///
 /// Authentication does not look at a state root, so a node that answered `Ok` on
@@ -118,6 +140,9 @@ pub struct RpcState {
     events: broadcast::Sender<NodeEvent>,
     /// The executed Clarity state, when the node runs one.
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
+    /// The blocks this node kept because it executed them, which is what
+    /// `/v3/blocks/:id` and `/v3/tenures/:id` answer from when it has them.
+    archive: Option<Arc<dyn ExecutedBlocks>>,
     /// The validator an uploaded block or a proposal has to pass.
     admission: Option<Arc<Mutex<dyn BlockAdmission>>>,
     /// Where a proposal goes to be executed and answered for.
@@ -182,6 +207,7 @@ impl RpcState {
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
+            archive: None,
             admission: None,
             proposals: None,
             chunks: None,
@@ -207,6 +233,13 @@ impl RpcState {
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<Mutex<dyn ChainAccess>>) -> Self {
         self.chain = Some(chain);
+        self
+    }
+
+    /// Serve executed blocks and tenures out of this store.
+    #[must_use]
+    pub fn with_executed_blocks(mut self, archive: Arc<dyn ExecutedBlocks>) -> Self {
+        self.archive = Some(archive);
         self
     }
 
@@ -1381,11 +1414,34 @@ struct TenureQuery {
     stop: Option<String>,
 }
 
+/// A block identifier as a route spells it, `0x`-prefixed or bare.
+fn block_id(value: &str) -> Option<StacksBlockId> {
+    let bytes: [u8; 32] = hex::decode(value.trim_start_matches("0x"))
+        .ok()?
+        .try_into()
+        .ok()?;
+    Some(StacksBlockId::from_bytes(bytes))
+}
+
+/// Stream a tenure, from the durable store if this node kept it.
+///
+/// The store is asked first because it is the node's own record of what it
+/// executed; the followed view is the fallback for a node that keeps no archive,
+/// and for blocks executed before it had one.
 async fn tenure(
     State(state): State<RpcState>,
     Path(start_block_id): Path<String>,
     Query(query): Query<TenureQuery>,
 ) -> Result<RawBlockStream, RpcError> {
+    if let Some(archive) = state.archive.as_ref()
+        && let Some(start) = block_id(&start_block_id)
+    {
+        let stop = query.stop.as_deref().and_then(block_id);
+        let kept = archive.tenure(start, stop);
+        if !kept.is_empty() {
+            return Ok(RawBlockStream(kept.concat()));
+        }
+    }
     let tenure = executed(&state)
         .await?
         .chain
@@ -1408,14 +1464,19 @@ async fn tenure(
 
 async fn block(
     State(state): State<RpcState>,
-    Path(block_id): Path<String>,
+    Path(block_id_path): Path<String>,
 ) -> Result<RawBlockStream, RpcError> {
+    if let Some(archive) = state.archive.as_ref()
+        && let Some(kept) = block_id(&block_id_path).and_then(|id| archive.block(id))
+    {
+        return Ok(RawBlockStream(kept));
+    }
     let block = executed(&state)
         .await?
         .chain
         .into_iter()
         .flat_map(|tenure| tenure.blocks)
-        .find(|block| block.block_id().to_string() == block_id)
+        .find(|block| block.block_id().to_string() == block_id_path)
         .ok_or(RpcError::NotFound)?;
     Ok(RawBlockStream(block.encode()))
 }
@@ -2353,6 +2414,101 @@ mod tests {
         let pox = body_json(get("/v2/pox".to_owned(), app).await).await;
         assert_eq!(pox["prepare_phase_block_length"], json!(5));
         assert_eq!(pox["current_burnchain_block_height"], json!(11));
+    }
+
+    /// A store of the blocks this node executed, as the node keeps one.
+    struct KeptBlocks(Vec<NakamotoBlock>);
+
+    impl super::ExecutedBlocks for KeptBlocks {
+        fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>> {
+            self.0
+                .iter()
+                .find(|block| block.block_id() == block_id)
+                .map(NakamotoBlock::encode)
+        }
+
+        fn tenure(
+            &self,
+            start_block_id: StacksBlockId,
+            stop: Option<StacksBlockId>,
+        ) -> Vec<Vec<u8>> {
+            let Some(start) = self.0.iter().find(|block| block.block_id() == start_block_id)
+            else {
+                return Vec::new();
+            };
+            self.0
+                .iter()
+                .filter(|block| block.header.consensus_hash == start.header.consensus_hash)
+                .skip_while(|block| block.block_id() != start_block_id)
+                .take_while(|block| Some(block.block_id()) != stop)
+                .map(NakamotoBlock::encode)
+                .collect()
+        }
+    }
+
+    /// A node serves the blocks it executed, whether or not a peer has just
+    /// mentioned them.
+    ///
+    /// This is what the followed view could not do. Bounded at the executed tip it
+    /// is honest, but it only ever holds what a peer *said*, so a node far enough
+    /// behind that the tenure walk fails answered `404` for its own tip — with the
+    /// state for it sealed on disk. The store answers from what this node ran.
+    #[tokio::test]
+    async fn the_blocks_this_node_executed_are_served_without_a_peer_view() {
+        let (_, blocks) = view_with_blocks(3);
+        let state = RpcState::new(NETWORK)
+            .with_executed_blocks(Arc::new(KeptBlocks(blocks.clone())));
+        // No followed view at all, and an executed tip the view could not have
+        // reached: exactly the node that used to serve nothing.
+        state.publish_executed(sealed_at(&blocks[2])).await;
+        let app = router(state);
+        let get = |uri: String, app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        };
+
+        for block in &blocks {
+            let response = get(format!("/v3/blocks/{}", block.block_id()), app.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK, "block {}", block.block_id());
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read the block");
+            assert_eq!(bytes.as_ref(), block.encode().as_slice());
+        }
+
+        // The whole tenure, from its first block, in the order it was executed.
+        let stream = get(format!("/v3/tenures/{}", blocks[0].block_id()), app.clone()).await;
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
+            .await
+            .expect("read the tenure");
+        let whole: Vec<u8> = blocks.iter().flat_map(NakamotoBlock::encode).collect();
+        assert_eq!(bytes.as_ref(), whole.as_slice());
+
+        // And stopping before a block the caller already holds.
+        let stream = get(
+            format!(
+                "/v3/tenures/{}?stop={}",
+                blocks[0].block_id(),
+                blocks[2].block_id()
+            ),
+            app.clone(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
+            .await
+            .expect("read the tenure");
+        let two: Vec<u8> = blocks[..2].iter().flat_map(NakamotoBlock::encode).collect();
+        assert_eq!(bytes.as_ref(), two.as_slice());
+
+        // A block this node never executed is still not served.
+        let response = get(format!("/v3/blocks/{}", StacksBlockId::from_bytes([9; 32])), app).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A tip the peer's view does not reach leaves nothing to serve, which is the

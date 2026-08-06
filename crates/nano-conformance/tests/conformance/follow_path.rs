@@ -707,7 +707,7 @@ pub fn node(
 /// key the reward set does not hold. That is not a weakness of the fixture — it
 /// is the reason a wrong chain is refusable at all, and an attacker faces
 /// exactly this.
-fn alternative_history(chain: &[NakamotoBlock], from: usize) -> Vec<NakamotoBlock> {
+pub(crate) fn alternative_history(chain: &[NakamotoBlock], from: usize) -> Vec<NakamotoBlock> {
     let mut branch = chain[..from].to_vec();
     let mut parent = branch.last().expect("a fork point").block_id();
     for block in &chain[from..] {

@@ -65,7 +65,7 @@ const SERVED_BLOCKS: usize = 12;
 const KILLS: usize = 9;
 
 /// How long to wait for a height before calling the node stuck.
-const PATIENCE: Duration = Duration::from_mins(1);
+pub(crate) const PATIENCE: Duration = Duration::from_mins(1);
 
 /// Build the shipped binary and say where it landed.
 ///
@@ -73,7 +73,7 @@ const PATIENCE: Duration = Duration::from_mins(1);
 /// the same reason `one_engine_in_the_artifact` asks: a `CARGO_TARGET_DIR`, a
 /// `--target` triple or a workspace `build.target-dir` each move it, and a test
 /// that ran a stale path would report on a binary nobody built.
-fn artifact() -> &'static Path {
+pub(crate) fn artifact() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY.get_or_init(|| {
         let output = Command::new(env!("CARGO"))
@@ -135,7 +135,7 @@ fn burnchain_files() -> (BTreeMap<u64, String>, BTreeMap<String, Vec<u8>>) {
 }
 
 /// Serve the captured Bitcoin blocks the way Esplora does.
-async fn serve_burnchain() -> (String, tokio::task::JoinHandle<()>) {
+pub(crate) async fn serve_burnchain() -> (String, tokio::task::JoinHandle<()>) {
     type Burnchain = Arc<(BTreeMap<u64, String>, BTreeMap<String, Vec<u8>>)>;
     let (hashes, bodies) = burnchain_files();
     let state: Burnchain = Arc::new((hashes, bodies));
@@ -174,7 +174,7 @@ async fn serve_burnchain() -> (String, tokio::task::JoinHandle<()>) {
 /// There is a race here and it is the smallest one available: nothing else in
 /// this binary binds a fixed port, and the alternative — a port written down —
 /// collides with whatever else the machine is running.
-async fn free_port() -> u16 {
+pub(crate) async fn free_port() -> u16 {
     tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind a loopback port")
@@ -189,7 +189,7 @@ async fn free_port() -> u16 {
 /// node that followed only the first would not be exercising the pool. No
 /// `[miner]` and no `[signer]`: this is the follower, and the roles are switched
 /// on by their tables being present.
-fn write_config(
+pub(crate) fn write_config(
     directory: &Path,
     peers: &[String],
     burnchain: &str,
@@ -258,14 +258,14 @@ tenure_accounting = "{accounting}"
 }
 
 /// A running node, and where it writes.
-struct Running {
+pub(crate) struct Running {
     child: Child,
-    rpc: u16,
-    log: PathBuf,
+    pub(crate) rpc: u16,
+    pub(crate) log: PathBuf,
 }
 
 impl Running {
-    fn start(config: &Path, rpc: u16, log: PathBuf) -> Self {
+    pub(crate) fn start(config: &Path, rpc: u16, log: PathBuf) -> Self {
         let output = fs::File::options()
             .create(true)
             .append(true)
@@ -292,7 +292,7 @@ impl Running {
     ///
     /// `/v2/info`'s `stacks_tip_height` is published from the executed tip rather
     /// than from the peer's, which is the distinction the release gate turns on.
-    async fn executed_height(&self) -> Option<u64> {
+    pub(crate) async fn executed_height(&self) -> Option<u64> {
         let body = reqwest::get(format!("http://127.0.0.1:{}/v2/info", self.rpc))
             .await
             .ok()?
@@ -335,7 +335,7 @@ impl Running {
     ///
     /// `SIGKILL`, not `SIGTERM`: a clean shutdown is a different test, and the
     /// one that matters is the one the node has no chance to prepare for.
-    fn kill(mut self) {
+    pub(crate) fn kill(mut self) {
         self.stop();
     }
 

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod config;
 pub mod hosting;
 pub mod miner;
@@ -66,6 +67,12 @@ pub struct CheckpointExecutor<S> {
     /// belongs on the executor rather than beside it: a `new_block` sent from
     /// anywhere else would announce a block that had only been downloaded.
     observers: Option<nano_rpc::EventDispatcher>,
+    /// Where the blocks this node executes are kept, so it can serve them.
+    ///
+    /// Beside the observers and for the same reason: only the executor knows a
+    /// block was executed rather than downloaded, and it is the executed ones a
+    /// node answers `/v3/blocks` and `/v3/tenures` with.
+    archive: Option<std::sync::Arc<crate::archive::Archive>>,
     bitcoin: S,
 }
 
@@ -758,6 +765,7 @@ where
             bitcoin_view: None,
             sortition_view: None,
             observers: None,
+            archive: None,
             bitcoin,
         })
     }
@@ -780,6 +788,7 @@ where
             bitcoin_view: None,
             sortition_view: None,
             observers: None,
+            archive: None,
             bitcoin,
         }
     }
@@ -1341,6 +1350,15 @@ where
         self.observers = Some(observers);
     }
 
+    /// Keep every block this node executes in this store.
+    ///
+    /// Sealing a block already forgets it from staging; this is the other half,
+    /// and it is what lets a node serve a block it executed rather than one a peer
+    /// has just told it about.
+    pub fn keep_executed_blocks(&mut self, archive: std::sync::Arc<crate::archive::Archive>) {
+        self.archive = Some(archive);
+    }
+
     /// Take over a derived sortition chain, and say where to keep it.
     ///
     /// A chain that is not written down is re-derived from the checkpoint's burn
@@ -1663,6 +1681,13 @@ where
         self.bitcoin_view = None;
         self.sortition_view = None;
         self.bitcoin_height = 0;
+        // And the blocks kept for serving, which are a claim about what this node
+        // executed: everything above the block it now stands on it no longer did.
+        if let Some(archive) = self.archive.as_ref()
+            && let Err(error) = archive.retract_from(self.tip.header.chain_length + 1)
+        {
+            eprintln!("cannot give back the blocks this node retracted: {error}");
+        }
         Ok(())
     }
 
@@ -2103,6 +2128,19 @@ where
             self.announce_block(&block, &applied, bitcoin_context);
             timing.dispatch += phase.elapsed();
             let phase = std::time::Instant::now();
+            // Kept where it is forgotten from: the two halves of "this block is
+            // executed now" belong in one place. A store that will not take it is
+            // said and stepped over — nothing here is consensus, and a node that
+            // stopped executing over an archive write would be trading the chain
+            // for a convenience.
+            if let Some(archive) = self.archive.as_ref()
+                && let Err(error) = archive.keep(&block)
+            {
+                eprintln!(
+                    "cannot keep the executed block {} for serving: {error}",
+                    block.block_id()
+                );
+            }
             staging.remove(block.block_id())?;
             timing.staging += phase.elapsed();
             executed += 1;

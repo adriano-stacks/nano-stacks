@@ -242,7 +242,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // miner cannot see accepts them and never mines them, which is worse than
     // refusing them.
     let mempool = Arc::new(Mutex::new(nano_mempool::Mempool::new(network)));
-    let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone());
+    // The blocks this node executes, kept so it can serve them. Opened here
+    // because both halves need it: the executor writes what it seals and the RPC
+    // reads what a caller asks for, and a node that keeps blocks nothing serves
+    // is only using disk.
+    let archive = keep_executed_blocks(&config, executor.as_ref()).await;
+    let (wiring, api_to_loop, hosted) =
+        ApiWiring::new(executor.clone(), mempool.clone(), archive);
     let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
@@ -323,6 +329,39 @@ async fn supervise(roles: &mut JoinSet<(Job, Role)>) -> Result<(), Box<dyn Error
     }
 }
 
+/// Open the store the executed blocks are kept in, and tell the executor to use
+/// it.
+///
+/// A node with no chain of its own — a signer-only or RPC-only configuration —
+/// executes nothing, so it has nothing to keep and nothing to serve. A store that
+/// will not open is reported and left out: the blocks are the one thing a node can
+/// always fetch again, so this is a served route lost and not a chain.
+async fn keep_executed_blocks(
+    config: &Config,
+    executor: Option<&SharedExecutor>,
+) -> Option<Arc<crate::archive::Archive>> {
+    let executor = executor?;
+    let directory = config.chainstate_dir(NODE_CHAINSTATE);
+    if let Err(error) = fs::create_dir_all(&directory) {
+        eprintln!("cannot make room for the executed blocks: {error}");
+        return None;
+    }
+    match crate::archive::Archive::open(&directory.join("archive.sqlite")) {
+        Ok(archive) => {
+            let archive = Arc::new(archive);
+            executor.lock().await.keep_executed_blocks(archive.clone());
+            Some(archive)
+        }
+        Err(error) => {
+            eprintln!(
+                "cannot keep the blocks this node executes, so /v3/blocks and /v3/tenures \
+                 will answer only for what a peer has recently told it about: {error}"
+            );
+            None
+        }
+    }
+}
+
 /// Publish what this node is sealed at before it follows anything, so a node
 /// that never manages to execute reports the height it is really on rather than
 /// nothing at all.
@@ -378,15 +417,42 @@ fn round_report(from: u64, round: &CatchUpRound, tip: &NakamotoBlock) -> String 
     } else {
         ""
     };
-    if round.executed == 0 {
-        format!(
-            "executed nothing: sealed at {from}, {} staged, {} fetched{limited}",
+    batch_report(
+        from,
+        round.executed,
+        tip,
+        &format!(
+            ", {} staged, {} fetched{limited}",
             round.staged, round.fetched
-        )
+        ),
+    )
+}
+
+/// Say where a round that failed got to, which its error does not.
+///
+/// A round that stops partway has still sealed everything up to where it
+/// stopped. Reporting only the successful ones left a node that had executed
+/// eighty-three blocks claiming twenty-two — and left a node executing *nothing*,
+/// round after round, saying so only in an error whose wording is about the peer.
+fn failed_round_report(from: u64, tip: &NakamotoBlock) -> String {
+    let executed = usize::try_from(tip.header.chain_length.saturating_sub(from)).unwrap_or(usize::MAX);
+    batch_report(from, executed, tip, ", then the round failed")
+}
+
+/// The one sentence an execution batch is reported in.
+///
+/// A batch that executed something names where it started, where it ended, how
+/// many blocks that was and the root it sealed; a batch that executed nothing says
+/// *that* first and has no root to name, because there is no new one. Two shapes
+/// rather than one with a zero in it: they are read by a person deciding whether a
+/// node is moving.
+fn batch_report(from: u64, executed: usize, tip: &NakamotoBlock, detail: &str) -> String {
+    if executed == 0 {
+        format!("executed nothing: sealed at {from}{detail}")
     } else {
         format!(
-            "executed {} blocks, {from} to {}, {} staged, state root {}{limited}",
-            round.executed, tip.header.chain_length, round.staged, tip.header.state_index_root
+            "executed {executed} blocks, {from} to {}, state root {}{detail}",
+            tip.header.chain_length, tip.header.state_index_root
         )
     }
 }
@@ -441,6 +507,9 @@ async fn execute_round(
         // twenty-two, and left its accounting behind its own chain.
         Err(error) => {
             eprintln!("executing the peer's chain failed: {error}");
+            // And where that leaves this node, in the sentence every other batch
+            // is reported in. The error names the peer's chain; this names ours.
+            println!("{}", failed_round_report(from, executor.tip()));
             backfill_missing_header(&mut executor, peer, &error.to_string()).await;
             peer_failed = true;
         }
@@ -1367,6 +1436,9 @@ async fn resume_from(
 struct ApiWiring {
     executor: Option<SharedExecutor>,
     mempool: Arc<Mutex<nano_mempool::Mempool>>,
+    /// The blocks this node kept because it executed them, which is what
+    /// `/v3/blocks/:id` and `/v3/tenures/:id` answer from.
+    archive: Option<Arc<crate::archive::Archive>>,
     /// Where a block admitted over the public API is handed to the executor,
     /// drained by the follow loop into the same staging store the peer's blocks
     /// land in — so an upload and a followed block are the same thing from the
@@ -1394,6 +1466,7 @@ impl ApiWiring {
     fn new(
         executor: Option<SharedExecutor>,
         mempool: Arc<Mutex<nano_mempool::Mempool>>,
+        archive: Option<Arc<crate::archive::Archive>>,
     ) -> (Self, FollowedChannels, HostedChannels) {
         let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
         let (proposals, proposed) = tokio::sync::mpsc::unbounded_channel();
@@ -1403,6 +1476,7 @@ impl ApiWiring {
             Self {
                 executor,
                 mempool,
+                archive,
                 blocks,
                 proposals,
                 chunks,
@@ -1425,6 +1499,7 @@ async fn start_rpc(
     let ApiWiring {
         executor,
         mempool,
+        archive,
         blocks,
         proposals,
         chunks,
@@ -1442,6 +1517,9 @@ async fn start_rpc(
     // end would have the route promise a verdict that never arrives.
     if config.signer.is_none() && config.node.block_proposal_token.is_some() {
         state = state.with_proposal_validator(proposals);
+    }
+    if let Some(archive) = archive {
+        state = state.with_executed_blocks(archive as Arc<dyn nano_rpc::ExecutedBlocks>);
     }
     if let Some(executor) = executor {
         // The same mutex behind two trait objects, so an account read and a block
@@ -2787,7 +2865,7 @@ mod tests {
         assert_eq!(
             moved,
             format!(
-                "executed 100 blocks, 1100 to 1200, 9 staged, state root {}",
+                "executed 100 blocks, 1100 to 1200, state root {}, 9 staged, 40 fetched",
                 tip.header.state_index_root
             )
         );
@@ -2801,6 +2879,21 @@ mod tests {
         // The peer asking a node to slow down is not the node failing to move.
         assert!(
             super::round_report(1_100, &round(0, true), &tip).ends_with(", peer rate limiting")
+        );
+
+        // A round that *failed* is reported the same way, because its error is
+        // about the peer's chain and says nothing about where this node is: a node
+        // whose every round fails would otherwise never state its own height.
+        assert_eq!(
+            super::failed_round_report(1_200, &tip),
+            "executed nothing: sealed at 1200, then the round failed"
+        );
+        assert_eq!(
+            super::failed_round_report(1_150, &tip),
+            format!(
+                "executed 50 blocks, 1150 to 1200, state root {}, then the round failed",
+                tip.header.state_index_root
+            )
         );
     }
 
