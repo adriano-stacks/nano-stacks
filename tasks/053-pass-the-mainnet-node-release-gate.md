@@ -623,3 +623,28 @@ neither is an RPC condition:
   replay gates, but it is what froze the executed tip during this run and what made
   `/v3/sortitions/latest_and_last` answer `503` afterwards — a stale executed chain
   cannot name the sortition before its own tip.
+
+## Two gates that cannot pass until the chain crosses cycle 141
+
+Running the suite with every mainnet input supplied — the capture, a state directory,
+the observer's receipts, the checkpoint — turned every skipping gate green except two,
+and the two say something about the chain rather than about nano:
+
+`signer_weight_enforcement::mainnet_blocks_pass_the_check_against_mainnet_state` and
+`the_mainnet_state_carries_the_signer_set_mainnet_published` both need the state to
+record a signer set for the cycle it stands in. **Mainnet cycle 140 has none and
+cannot**: it was stacked under pox-4, so the block that wrote its `.signers` entries
+is below the checkpoint. `check_signer_signatures` reports that absence and accepts,
+deliberately, because rejecting would refuse every block of the chain the network is
+on — and every block replayed so far is inside cycle 140. Cycle 141 opens at burn
+962,150, about 880 Bitcoin blocks past the tip this was written at.
+
+They `skip_gate` with that reason now instead of failing on an assertion that reads
+like nano's fault. `NANO_REQUIRE_MAINNET` still turns them into failures, which is the
+point: a release run may not claim these green while the chain it stands on cannot
+answer them.
+
+What the same run *did* close, with the inputs supplied rather than absent: the
+receipt slice reproduced against the observer's 4,982 payloads, the checkpoint's
+maturity window, the envelope and weight checks against captured mainnet blocks, and
+the sortition window field for field.
