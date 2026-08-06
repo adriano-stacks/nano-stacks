@@ -1707,6 +1707,18 @@ impl Vm {
         (&mut self.store, &self.context)
     }
 
+    /// Record the ordered writes of every block this VM executes from here on.
+    ///
+    /// A conformance harness installs this; a shipped node never does.
+    pub fn record_writes(&mut self) {
+        self.store.record_writes();
+    }
+
+    /// Take the recorded journals, leaving the recorder installed and empty.
+    pub fn take_journal(&mut self) -> Vec<BlockJournal> {
+        self.store.take_journal()
+    }
+
     /// Transfer STX between principals in the active block state.
     pub fn transfer_stx(
         &mut self,
@@ -1876,6 +1888,88 @@ impl Vm {
     }
 }
 
+/// One write a block made, in the order it made it.
+///
+/// Order is the whole content of this type. A MARF packs a node's pointers in
+/// the order its children were first written, so two runs that reach the same
+/// values by writing them in a different order seal different roots — and a root
+/// is consensus. A journal that sorted its entries would be a different trie.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalWrite {
+    pub key: String,
+    /// The serialized Clarity value whose hash the MARF holds, when the write
+    /// had one. The MARF's own height keys hold an encoded height or a block
+    /// hash directly, so they have none.
+    pub value: Option<String>,
+    /// The 40 bytes the trie actually stores.
+    pub marf_value: [u8; 40],
+}
+
+impl JournalWrite {
+    fn clarity(key: &str, value: &str, marf_value: MarfValue) -> Self {
+        Self {
+            key: key.to_owned(),
+            value: Some(value.to_owned()),
+            marf_value: *marf_value.as_bytes(),
+        }
+    }
+
+    const fn height(key: String, marf_value: MarfValue) -> Self {
+        Self {
+            key,
+            value: None,
+            marf_value: *marf_value.as_bytes(),
+        }
+    }
+}
+
+/// The ordered `(key, serialized value)` writes of one block.
+///
+/// Enough to seal the block again from a pristine parent in any MARF, which is
+/// what separates an execution difference from a trie difference: feed one
+/// journal to two implementations and a root that still differs is the trie's.
+#[derive(Clone, Debug)]
+pub struct BlockJournal {
+    /// The temporary state the block executed under, which is what its height
+    /// keys name — stacks-core executes a followed Nakamoto block under
+    /// `MINER_BLOCK_CONSENSUS_HASH`/`MINER_BLOCK_HEADER_HASH` for the same
+    /// reason, and commits it to the real identifier afterwards.
+    pub executed_as: [u8; 32],
+    pub parent: Option<[u8; 32]>,
+    pub height: u32,
+    /// The MARF's own height keys, written by `begin` before anything else.
+    ///
+    /// Kept apart from the writes because both implementations generate them
+    /// themselves: a replay that fed them back would write them twice.
+    pub height_keys: Vec<JournalWrite>,
+    /// Everything execution wrote, in order — every transaction's Clarity
+    /// writes and every native effect — with the writes of a rolled-back
+    /// Clarity transaction removed exactly as the MARF removes them.
+    pub writes: Vec<JournalWrite>,
+    /// The identifier the block sealed under, absent if it never sealed.
+    pub sealed_as: Option<[u8; 32]>,
+    /// The root it sealed, absent if it never sealed.
+    pub root: Option<[u8; 32]>,
+}
+
+/// A journal being recorded.
+///
+/// Nothing installs one in a shipped node: `MarfStore::journal` is `None` there,
+/// so a write costs one branch.
+#[derive(Debug, Default)]
+struct WriteJournal {
+    blocks: Vec<BlockJournal>,
+    /// How many writes the open block had made when the current Clarity
+    /// transaction began, so a rollback drops what the MARF's snapshot drops.
+    transaction: Option<usize>,
+}
+
+impl WriteJournal {
+    fn open(&mut self) -> Option<&mut BlockJournal> {
+        self.blocks.last_mut().filter(|block| block.root.is_none())
+    }
+}
+
 /// A versioned Clarity key/value store whose state roots are committed by the MARF.
 ///
 /// Values live in the MARF and its side store, so nothing a sealed block wrote
@@ -1892,6 +1986,8 @@ pub struct MarfStore {
     read_block: Option<[u8; 32]>,
     active: Option<ActiveStore>,
     transaction: Option<StoreTransaction>,
+    /// Installed by a conformance harness and by nothing else.
+    journal: Option<Box<WriteJournal>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2052,7 +2148,25 @@ impl MarfStore {
             read_block,
             active: None,
             transaction: None,
+            journal: None,
         }
+    }
+
+    /// Record the ordered writes of every block from here on.
+    ///
+    /// Off in a shipped node, and not switchable from the environment: this is a
+    /// diagnostic oracle, and a node that could be asked for one at run time
+    /// would carry the cost of asking.
+    pub fn record_writes(&mut self) {
+        self.journal = Some(Box::default());
+    }
+
+    /// Take what has been recorded, leaving the recorder installed and empty.
+    pub fn take_journal(&mut self) -> Vec<BlockJournal> {
+        self.journal
+            .as_mut()
+            .map(|journal| std::mem::take(&mut journal.blocks))
+            .unwrap_or_default()
     }
 
     /// The deepest sealed state, which is where a reopened store resumes.
@@ -2088,6 +2202,25 @@ impl MarfStore {
         let height = parent
             .and_then(|parent| self.height_of(parent))
             .map_or(0, |height| height + 1);
+        // The MARF's own height, not the store's: the height keys the trie holds
+        // were derived from that one, and a recorder that computed a different
+        // answer would record keys nothing wrote.
+        let marf_height = self.marf.active_height().unwrap_or(height);
+        if let Some(journal) = self.journal.as_mut() {
+            journal.transaction = None;
+            journal.blocks.push(BlockJournal {
+                executed_as: block,
+                parent,
+                height: marf_height,
+                height_keys: nano_marf::height_keys(parent, block, marf_height)
+                    .into_iter()
+                    .map(|(key, value)| JournalWrite::height(key, value))
+                    .collect(),
+                writes: Vec::new(),
+                sealed_as: None,
+                root: None,
+            });
+        }
         self.metadata.clear();
         self.active = Some(ActiveStore {
             block,
@@ -2116,15 +2249,25 @@ impl MarfStore {
             read_block: self.read_block,
             active: self.active,
         });
+        if let Some(journal) = self.journal.as_mut() {
+            journal.transaction = journal.open().map(|block| block.writes.len());
+        }
         Ok(())
     }
 
     /// Commit the active transaction's writes to the current block state.
     pub fn commit_transaction(&mut self) -> Result<(), MarfStoreError> {
-        self.transaction
+        let committed = self
+            .transaction
             .take()
             .map(|_| ())
-            .ok_or(MarfStoreError::NoTransaction)
+            .ok_or(MarfStoreError::NoTransaction);
+        if committed.is_ok()
+            && let Some(journal) = self.journal.as_mut()
+        {
+            journal.transaction = None;
+        }
+        committed
     }
 
     /// Restore the active block state to its state before the transaction began.
@@ -2137,6 +2280,14 @@ impl MarfStore {
         self.metadata = transaction.metadata;
         self.read_block = transaction.read_block;
         self.active = transaction.active;
+        // The MARF just forgot these, so the journal has to as well: a journal
+        // carrying a rolled-back write would seal a trie the block never had.
+        if let Some(journal) = self.journal.as_mut()
+            && let Some(started) = journal.transaction.take()
+            && let Some(block) = journal.open()
+        {
+            block.writes.truncate(started);
+        }
         Ok(())
     }
 
@@ -2151,6 +2302,13 @@ impl MarfStore {
             println!("write {key} = {}", marf_value_key(value_hash));
         }
         self.marf.insert(key.as_bytes(), value_hash)?;
+        if let Some(journal) = self.journal.as_mut()
+            && let Some(block) = journal.open()
+        {
+            block
+                .writes
+                .push(JournalWrite::clarity(key, value, value_hash));
+        }
         self.write_value(value_hash, value)
     }
 
@@ -2349,9 +2507,20 @@ impl MarfStore {
         // so the caller can still abort it.
         let root = self.marf.seal_to(block)?;
         self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.close_journal(block, root);
         self.flush_metadata(block)?;
         self.read_block = Some(block);
         Ok(StateRoot(*root.as_bytes()))
+    }
+
+    /// Note what the open journal entry sealed as, which closes it.
+    fn close_journal(&mut self, block: [u8; 32], root: TrieHash) {
+        if let Some(journal) = self.journal.as_mut()
+            && let Some(entry) = journal.open()
+        {
+            entry.sealed_as = Some(block);
+            entry.root = Some(*root.as_bytes());
+        }
     }
 
     /// Seal the active state under `block`, with everything that describes it.
@@ -2379,6 +2548,7 @@ impl MarfStore {
         // still abort it.
         let root = self.marf.seal_to(block)?;
         self.active.take().ok_or(MarfStoreError::NoActiveState)?;
+        self.close_journal(block, root);
         self.metadata.clear();
         self.read_block = Some(block);
         Ok(StateRoot(*root.as_bytes()))
@@ -2440,6 +2610,14 @@ impl MarfStore {
     pub fn abort(&mut self) -> Result<(), MarfStoreError> {
         let active = self.active.take().ok_or(MarfStoreError::NoActiveState)?;
         self.marf.abort()?;
+        // A block that never sealed wrote nothing, and a journal of it would
+        // replay a trie no chain holds.
+        if let Some(journal) = self.journal.as_mut()
+            && journal.open().is_some()
+        {
+            journal.blocks.pop();
+            journal.transaction = None;
+        }
         self.metadata.clear();
         self.read_block = active.parent;
         Ok(())

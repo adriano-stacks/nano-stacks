@@ -1,9 +1,9 @@
 ---
 id: "060"
 title: "Make clarity-wasm the conformant production execution engine"
-status: pending
+status: in-progress
 priority: critical
-effort: medium
+effort: large
 type: bug
 group: mainnet
 tags: ["mainnet", "vm", "clarity", "conformance", "release"]
@@ -66,11 +66,23 @@ node may invoke.
       bounded mainnet compiler regression slice; a missing fixture must fail the
       release gate.
 - [x] Record the clarity-wasm and compiler revisions in the report produced by
-      [[053-pass-the-mainnet-node-release-gate]]. Still open for checkpoint
-      provenance itself.
+      [[053-pass-the-mainnet-node-release-gate]].
+- [ ] Bind checkpoint provenance and every reusable compiler fixture to the
+      exact clarity-wasm/compiler revision that produced it; a fixture from an
+      unknown compiler build cannot satisfy the release gate.
 - [x] Tell a compile refusal at a *call* apart from one at a deploy. The first
       can only ever be a compiler gap; the second is a transaction the network
       also failed. Conflating them makes a gap invisible in the state root.
+- [ ] Resolve the asymmetric `least_supertype` tuple case where the interpreter
+      returns a taken branch's wider tuple but wasm exposes the narrowed layout.
+      Keep the minimized ignored test until both engines agree on the complete
+      returned value, not only on fields read through `get`.
+- [ ] Resolve `match` branch bindings that shadow an enclosing local: wasm
+      currently accepts a shape the reference interpreter rejects with
+      `NameAlreadyUsed`. Pin both the taken and untaken branch behavior.
+- [ ] Account for every ignored Clarity semantic differential in the release
+      report. A known engine disagreement may not be waived merely because it
+      has not appeared in the replayed mainnet window.
 
 ## Acceptance Criteria
 
@@ -83,6 +95,8 @@ node may invoke.
   commits no state and invokes no second execution engine.
 - The known principal-routing and compiler-refusal cases match stacks-core's
   results, costs, events and state roots under clarity-wasm.
+- The known tuple-supertype and enclosing-local `match` binding cases match the
+  reference semantics and are no longer ignored differentials.
 - Restarting preserves the same clarity-wasm state and root without migration.
 - The pristine compiler-only replay matches every captured mainnet root and
   receipt in the release slice.

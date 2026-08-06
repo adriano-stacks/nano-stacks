@@ -41,7 +41,7 @@ const fn manifest(blocks: u64) -> FixtureManifest {
 /// `nano-node` does; only a directory with nothing sealed takes the checkpoint's
 /// accounting. Nothing is carried across by hand, which is the point: it used to
 /// be, and the three fields nobody thought to carry were lost on every restart.
-fn open(directory: &Path) -> (ChainState, [u8; 32]) {
+pub fn open(directory: &Path) -> (ChainState, [u8; 32]) {
     let fixtures = fixtures();
     let checkpoint = fixtures.join("chainstate/checkpoint-H");
     let manifest = fs::read_to_string(checkpoint.join("checkpoint.toml"))
@@ -61,7 +61,7 @@ fn open(directory: &Path) -> (ChainState, [u8; 32]) {
     let root = nano_primitives::TrieHash::from_bytes(decode(&field("published_state_index_root")));
 
     let mut chainstate = ChainState::open_from_checkpoint(
-        nano_primitives::Network::TESTNET,
+        nano_conformance::captured_network(&fixtures),
         directory,
         checkpoint.join("marf.sqlite"),
         source,
@@ -230,7 +230,7 @@ fn a_replay_stopped_halfway_resumes_to_the_same_state() {
 /// commits, and a tenure-start height that survived its tenure is a wrong answer
 /// to `get-tenure-info?` for every block of the branch that follows.
 #[derive(Debug, Eq, PartialEq)]
-struct Canonical {
+pub struct Canonical {
     executed: Vec<[u8; 32]>,
     accounting: Vec<u8>,
     parent_tenure_proof: Option<[u8; 80]>,
@@ -241,7 +241,7 @@ struct Canonical {
     tenure_starts: Vec<(u32, Option<u32>, Option<u32>)>,
 }
 
-fn canonical(chainstate: &mut ChainState, tenures: &[u32]) -> Canonical {
+pub fn canonical(chainstate: &mut ChainState, tenures: &[u32]) -> Canonical {
     Canonical {
         executed: chainstate.executed_blocks(),
         accounting: chainstate

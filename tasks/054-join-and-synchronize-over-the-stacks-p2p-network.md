@@ -1,7 +1,7 @@
 ---
 id: "054"
 title: "Join and synchronize over the Stacks P2P network"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 type: feature
@@ -9,7 +9,6 @@ group: mainnet
 dependencies: ["027"]
 tags: ["mainnet", "p2p", "sync", "networking"]
 created_at: 2026-08-02
-completed_at: 2026-08-06
 ---
 
 # Join and synchronize over the Stacks P2P network
@@ -56,11 +55,25 @@ steady-state operation may require a hosted Stacks API.
       tests, including restart, reorganization and one malicious peer.
 - [x] Document seed configuration, advertised/listen addresses, resource
       limits, peer database recovery and the optional HTTP fallback.
+- [ ] Run the full attested-checkpoint-to-mainnet-tip synchronization with all
+      hosted Stacks APIs removed, including maturity reconstruction and missing
+      historical-header acquisition. Record which discovered peer served every
+      tenure and show that no one peer is load-bearing.
+- [ ] Make exchanged Nakamoto inventories drive a bounded forward download
+      schedule instead of only prioritizing peers during the backward
+      parent-walk.
+- [ ] Complete a live whole-sync interoperability run with a stock
+      `stacks-node`, including inventory and block exchange in both directions
+      and transaction relay. Reference-codec socket tests remain necessary but
+      are not this acceptance run.
 
 ## Acceptance Criteria
 
 - Starting from the attested checkpoint, nano catches up to and holds mainnet
   tip with all hosted Stacks HTTP APIs disabled.
+- The production configuration and selected peer set for that run contain no
+  Hiro or other hosted API endpoint; discovering several peers beside a hosted
+  fallback does not satisfy this criterion.
 - Removing, stalling or lying through one peer does not stall synchronization,
   select a different canonical chain or corrupt durable state.
 - A stock `stacks-node` can complete the handshake with nano, exchange

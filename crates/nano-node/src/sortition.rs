@@ -196,6 +196,31 @@ impl SortitionTracker {
             .contains(&consensus_hash)
     }
 
+    /// The Bitcoin height a burn view sits at, from this chain's own history.
+    ///
+    /// A consensus hash names a burn block, and the history is that naming in
+    /// order, so this is the reverse of [`Self::consensus_hash_at`] and the answer
+    /// a node otherwise had to ask a peer for. Searched from the tip backwards
+    /// because a follower's views arrive in ascending order and the newest is
+    /// almost always the one being asked about; the walk is bounded by the same
+    /// window a catch-up is, since a view further back than that belongs to a chain
+    /// this node is not executing.
+    ///
+    /// `None` where the history does not hold it: the view is ahead of this chain,
+    /// which one round of catching up may close, or it belongs to a burnchain this
+    /// node is not on, which no amount of walking will.
+    #[must_use]
+    pub fn height_of_consensus_hash(&self, consensus_hash: ConsensusHash) -> Option<u64> {
+        let history = self.engine.snapshots().history();
+        let tip = self.tip().bitcoin_height;
+        history
+            .iter()
+            .rev()
+            .take(usize::try_from(CATCH_UP_LIMIT).unwrap_or(usize::MAX))
+            .position(|hash| *hash == consensus_hash)
+            .and_then(|back| tip.checked_sub(u64::try_from(back).ok()?))
+    }
+
     /// Where this chain and Bitcoin's own history part company, if they do.
     ///
     /// One lookup when nothing moved: the walk stops at the first agreement and
@@ -420,6 +445,16 @@ impl SortitionTracker {
         Ok(loaded)
     }
 
+    /// What the miners of the burn block at the tip spent on its sortition.
+    ///
+    /// Clarity reads both back as `miner-spend-total` and `miner-spend-winner`, so
+    /// this is a consensus answer and not a diagnostic. See
+    /// [`nano_sortition::BurnSpends`].
+    #[must_use]
+    pub fn burn_spends(&self) -> Option<nano_sortition::BurnSpends> {
+        self.engine.burn_spends()
+    }
+
     /// Whether the derived burn total is the one a signed header states.
     ///
     /// A Nakamoto header's `bitcoin_spent` is the burn view's running total and
@@ -526,6 +561,16 @@ impl CapturedLeaderKey {
 struct CapturedSnapshot {
     block_height: u64,
     burn_header_hash: String,
+    /// The burn block's header time, as stacks-core's own column spells it.
+    ///
+    /// Clarity reads it back as `burn-block-time`, so a chain seeded here has to
+    /// state it for its seed the way it states the seed's burn total: the tenure
+    /// standing on the seed's own burn view is executed before this chain has
+    /// advanced once. Absent in a chain saved before this field existed, and then
+    /// the seed's own answer is unavailable rather than wrong — every block after
+    /// it derives from the Bitcoin header.
+    #[serde(default)]
+    burn_header_timestamp: u64,
     sortition_id: String,
     consensus_hash: String,
     sortition_hash: String,
@@ -534,6 +579,18 @@ struct CapturedSnapshot {
     /// spells it. Absent in a chain saved before this field existed.
     #[serde(default)]
     sortition: Option<i64>,
+    /// The txid of the commitment that won, as stacks-core's own column spells it.
+    ///
+    /// Read for one reason: the two Clarity-visible burn spends of a sortition are
+    /// the eligible commitments' payout burn and the *winner's* share of it, so the
+    /// seed has to name its winner or a node standing on the seed's own burn view —
+    /// which is every node for the first tenure after a restart — has half the
+    /// answer and offers a contract a winner's spend of zero.
+    ///
+    /// A capture writes all zeroes for a block that elected nobody, so the
+    /// `sortition` column above is what discriminates rather than the value.
+    #[serde(default)]
+    winning_block_txid: Option<String>,
     /// The winning VRF seed the next sampling has to mix — the most recent
     /// winner's, not necessarily this block's.
     ///
@@ -633,9 +690,11 @@ impl SortitionTracker {
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
             sortition_id: hex::encode(tip.sortition_id.as_bytes()),
             consensus_hash: tip.consensus_hash.to_string(),
+            burn_header_timestamp: tip.bitcoin_timestamp,
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
             sortition: Some(i64::from(tip.winner_txid.is_some())),
+            winning_block_txid: tip.winner_txid.map(hex::encode),
             // The one field a resumed chain cannot derive and must not guess.
             winner_vrf_seed: self
                 .engine
@@ -771,6 +830,7 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
     Ok(SortitionSnapshot {
         bitcoin_height: seed.block_height,
         bitcoin_header_hash,
+        bitcoin_timestamp: seed.burn_header_timestamp,
         sortition_id,
         parent_sortition_id: nano_primitives::SortitionId::from_bytes([0; 32]),
         // Never read: only the hash of a block *after* the seed is derived.
@@ -787,7 +847,16 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             &seed.sortition_hash,
             "sortition hash",
         )?),
-        winner_txid: None,
+        // Named where the seed's block elected somebody, because the winner's own
+        // payout burn is a Clarity answer for every tenure standing on that burn
+        // view. The `sortition` column decides it rather than the value, since a
+        // capture writes all zeroes for a block that elected nobody.
+        winner_txid: match (seed.sortition, seed.winning_block_txid.as_deref()) {
+            (Some(sortition), Some(txid)) if sortition != 0 => {
+                Some(thirty_two(txid, "winning block txid")?)
+            }
+            _ => None,
+        },
         // The seed the sampling of the block after this one mixes. A chain this
         // node saved states it, exactly, because it derived it. A capture does
         // not, and then it is recovered from the seed's own burn block by
@@ -822,6 +891,7 @@ mod tests {
         let seed = SortitionSnapshot {
             bitcoin_height: 100,
             bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+            bitcoin_timestamp: 0,
             sortition_id: nano_primitives::SortitionId::from_bytes([2; 32]),
             parent_sortition_id: nano_primitives::SortitionId::from_bytes([3; 32]),
             operations_hash: OpsHash::from_txids(&[]),

@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062"]
+dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -41,7 +41,16 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Remove and lie through one Stacks peer and prove neither event changes the
       canonical executed result.
 - [x] Exercise a Bitcoin reorganization and a Stacks fork switch.
-- [ ] Run the stock signer/client-facing RPC and an event observer against the
+- [ ] Repeat the pristine checkpoint-to-tip catch-up with every Hiro and other
+      hosted Stacks HTTP endpoint absent from configuration and the selected
+      peer set. Retain the discovered endpoints and per-tenure serving peer so
+      the run proves distribution rather than merely having several peers open.
+- [ ] Eliminate compiler-chosen historical epochs under [[064-compile-a-contract-under-the-epoch-it-was-deployed-]]
+      and prove every rebuilt historical contract uses semantic epoch data from
+      chain state.
+- [x] Run an event observer against the executed chain and retain delivered
+      block, burn-block and proposal-response payloads.
+- [ ] Run the stock signer and a valid client transaction end to end against the
       same executed chain.
 - [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
@@ -61,6 +70,10 @@ and steady state, with evidence tied to the durable executed chain.
 - RPC responses and events describe the same durable executed state.
 - Synchronization, propagation and consensus inputs do not require Hiro or any
   other hosted Stacks HTTP API.
+- The no-hosted-API claim is demonstrated by a complete checkpoint-to-tip run,
+  not only discovery, a short tenure sample or a run that also configured Hiro.
+- No contract's semantic epoch is selected by trying compiler versions or
+  epochs until one accepts it.
 - The release node executes all Clarity work through clarity-wasm and has no
   interpreter path under any network, configuration, environment, role, build
   profile or failure condition. A compiler divergence cannot be hidden by a
@@ -376,7 +389,9 @@ The distinction this task exists to make, applied to itself.
   a difference between a node that can be diagnosed and one that cannot. A hard
   kill of the node's own process leaves a consistent directory, which is what
   `kill_during_replay` proves; a torn copy of somebody else's is a separate case
-  and nothing handles it deliberately. Recorded for whoever owns `nano-marf`.
+  and nothing handles it deliberately. Tracked separately in
+  [[065-reject-inconsistent-state-directories-without-pani]]; it does not
+  invalidate the real crash-recovery evidence in [[057]].
 
   So the binary-level restart needs either a state directory nothing is writing —
   a fresh import, which is hours — or a node stopped cleanly first, which the
@@ -384,10 +399,10 @@ The distinction this task exists to make, applied to itself.
 - **A Bitcoin reorganization and a Stacks fork switch** — [[026]] and
   `fork_retraction.rs` cover the retraction; the live event has not happened
   under a nano node.
-- **A stock `stacks-signer` against the binary** — blocked on a pox-5 chain, not
-  on nano: mainnet is on pox-4, so nano derives no waterfall reward set for the
-  current cycle, no `signers-*` contract is configured, and no signer can hold a
-  slot. Same blocker as [[050]]'s signer-weight check. See [[052]].
+- **A stock `stacks-signer` against the binary** — cycle 140 was prepared under
+  pox-4, so nano derives no waterfall reward set for that cycle even though
+  Epoch 4.0 and pox-5 are active. Pox-5's first mainnet reward cycle is 141;
+  run the gate there and close the remaining signer-facing fields in [[052]].
 - **Recording every executed height and verified root during catch-up** — the run
   logs a root every 500 blocks, not every block.
 
@@ -540,10 +555,10 @@ gate asks to be recorded is what the node said.
 
 - **Holding mainnet tip for 24 hours** — not attempted and not claimed. It needs
   wall-clock and a node at the tip; the pristine run is a catch-up.
-- **A stock `stacks-signer` against the binary** — blocked on a pox-5 chain rather
-  than on nano: mainnet is on pox-4, so no waterfall reward set exists for the
-  current cycle, no `signers-*` contract is configured and no signer can hold a
-  slot. Same blocker as [[050]]'s and [[052]]'s.
+- **A stock `stacks-signer` against the binary** — cycle 140 has no waterfall
+  set because it was prepared under pox-4. Epoch 4.0 and pox-5 are active, and
+  pox-5's first mainnet reward cycle is 141; run this gate there after [[052]]'s
+  signer-facing fields are complete.
 - **Recording every executed height and verified root on mainnet** — the offline
   run above records every height it executed; the mainnet run still prints a root
   every 500 blocks.

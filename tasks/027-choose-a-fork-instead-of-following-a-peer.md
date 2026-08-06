@@ -1,14 +1,13 @@
 ---
 id: "027"
 title: "Choose a fork instead of following a peer"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 type: improvement
 dependencies: ["026", "049", "050"]
 tags: ["mainnet", "sync"]
 created_at: 2026-07-30
-completed_at: 2026-08-06
 ---
 
 # Choose a fork instead of following a peer
@@ -44,11 +43,17 @@ strands it.
 - [x] Use `/v3/tenures/fork_info` to find where a candidate diverged.
 - [x] Exercise two simultaneous peers through the production runtime: one
       stale, withholding or invalid, and one serving the canonical chain.
+- [ ] Differentially pin the exact stacks-core tie-break for two equally long,
+      equally weighted valid tips. Nano's block-id tie-break is deterministic,
+      but determinism alone does not prove it selects the same tip as
+      stacks-core.
 
 ## Acceptance Criteria
 
 - A peer that reorganizes does not stall nano.
 - Given two candidate forks, nano selects the one stacks-core selects.
+- Equal-length, equal-weight valid forks select the same winner as a
+  stacks-core fork-choice oracle; this case may not be closed by argument alone.
 - No single peer can withhold the canonical tip from a node with other peers.
 
 ## Remaining

@@ -31,10 +31,15 @@ never validation inputs.
 - [x] Derive consensus hash, sortition hash, winning commit transaction and
       total burn locally, checked against a captured mainnet window.
 - [x] Match the captured mainnet sortition window field for field.
-- [~] Hand the local snapshot to block validation and execution — validation
-      takes the sortition hash from it; execution's Clarity-visible inputs
-      (`vrf_seed`, `burn_block_time`, the burn header hash) still come from the
-      peer, because they move state roots.
+- [~] Hand the local snapshot to block validation and execution. Consensus
+      hash, sortition hash, winner, total burn, burn header hash/time, VRF seed
+      and both Clarity-visible burn spends are locally available. The remaining
+      production path still asks a peer for `/v3/sortitions` before resolving a
+      block's already-known consensus hash to its local burn-view height.
+- [ ] Resolve every known consensus hash and burn-view height from the local
+      snapshot history before making any peer request. A peer sortition response
+      may diagnose or help locate data, but must not supply execution context or
+      be required for progress.
 - [x] Persist snapshots and resume without trusting a peer's current burn view.
 - [x] Name the winner when several commitments compete: all fourteen.
 - [x] Apply [[026-survive-a-bitcoin-reorganization]] to the production burnchain
@@ -45,6 +50,8 @@ never validation inputs.
 ## Acceptance Criteria
 
 - Removing `/v3/sortitions` access does not stop a node with a Bitcoin source.
+- A regression makes `/v3/sortitions` unavailable and proves a block on a known
+  local burn view validates and executes without attempting that request.
 - Tampered peer sortition data cannot change the selected or executed chain.
 - Mainnet captures match stacks-core for every consensus-visible snapshot field.
 - A Bitcoin reorganization selects the same surviving snapshot and Stacks fork
@@ -681,3 +688,108 @@ already computes has both, per block, for the same window `total_burn` comes fro
 Left unfixed here on purpose — it changes what a production node writes into a
 header, which is a state-root decision and wants its own measurement against the
 mainnet replay rather than a change made in passing.
+
+## The two burn spends are derived now, and what settled the payout count
+
+Both fields the note above left at zero are filled from the sortition tracker's own
+commitment window: `SortitionEngine::burn_spends` sums every eligible commitment's
+payout burn in the tip's burn block and picks the winner's out of it, reading the
+same window the distribution was weighed over rather than the burnchain again. They
+travel together or not at all — the Clarity documentation promises the winner's is a
+positive number no larger than the total, and half an invariant offered to a
+contract is worse than an absence — and `None` is a burn block that elected nobody,
+which no tenure stands on.
+
+**The payout-output count is not the size of the reward set.** That was the standing
+suspicion recorded here, and it is wrong in a way stacks-core is explicit about: a
+short reward set is *padded with burn addresses* to the full count
+(`RewardSetInfo::into_commit_outs`, and `check_pox_pre_waterfall`'s "if the number
+of recipients in the set was odd, we need to pad with a burn address"), so a
+one-stacker cycle still pays two outputs and the count never moves with the
+recipients. `get_num_pox_payouts` is a function of the height alone. The captured
+hacknet chain pays *one* because it is past the waterfall, which nano already knew
+how to answer; what it had never been told is where the waterfall began.
+
+Three oracles say so, cheapest first, in `conformance/burn_spends.rs`:
+
+- `RewardSetInfo::commit_outs_for` — stacks-core's own "single source of truth
+  shared by the miner and the parser" — is a pure function and is *called*, for a
+  one-recipient set, a full set, a prepare phase and the waterfall.
+- the archive's `pox_payouts` column states the count for every captured burn
+  block, and `amount × addresses.len()` equals the running `total_burn`'s own step
+  at every block that elected somebody — on mainnet's reward phase (×2) and on the
+  hacknet capture's waterfall (×1) alike.
+- the tracker's derived spends equal that column, on the capture whose window used
+  to derive nothing at all, and per block inside `mainnet_sortition`'s window walk.
+
+The conformance harness had the same trap one layer up: its `burn_spend_total`
+oracle summed *every* output of every commitment, change included, which on mainnet
+reads a 30,000-sat commitment as the 16–23 million behind it. It takes the payout
+count from the archive now, so the replay's oracle for that field is the archive
+rather than nano's own arithmetic.
+
+## Fifty minutes at SYN-SENT, and the peer a round could not get past
+
+The live mainnet catch-up stopped at 8,699,006 with 28,458 blocks already staged and
+executed none of them for fifty minutes, printing `executing the peer's chain
+failed: ... error sending request for url (http://<peer>:20443/v3/sortitions/consensus/<ch>)`
+once a round. Sampling the process found it at 1 tick of CPU per 20 seconds and one
+socket in `SYN-SENT`.
+
+Two things were wrong and both are this task's, because both are the node asking a
+peer for a sortition it derives itself:
+
+- **`execute_staged` asked one peer.** The pool that `catch_up` already threads
+  through the descent — `TenureSource`, which round-robins, sets a rate-limited peer
+  aside and spreads the work — was not used for the sortition lookup or for the
+  coinbase walk behind it, so one unreachable peer failed the round, and a failed
+  round abandons everything staged. It asks the pool now. The three duplicated
+  round-robin bodies became one `spread`, and the sortition lookup refuses an answer
+  that does not carry the consensus hash it asked for: that is the one field of a
+  sortition a peer must not choose, since every other one is checked by the state
+  root the block's own header commits to under threshold signer weight.
+- **A peer that cannot be reached was waited on for thirty seconds, per request.**
+  Discovery learns a peer's *p2p* port and its HTTP port is an assumption about the
+  port beside it, so a pool of strangers holds several addresses whose 20443 never
+  answers. `connect_timeout` is four seconds now, and a peer that fails to connect
+  or times out is set aside for the rest of the round like a throttled one — but
+  only for unreachability: a 404 is an ordinary answer in a walk over strangers, and
+  setting those aside would empty the pool within one descent.
+
+Restarted with both, the same state resumed and executed 80–195 blocks a minute
+against the same peer set. The lesson is the one already written on
+[[047-make-mainnet-synchronization-monotonic-and-restart]]: sample the process
+before believing any story about where time goes.
+
+## All three remaining execution inputs come from this node's own burnchain
+
+`vrf_seed`, `burn_block_time` and the burn header hash were the three
+Clarity-visible fields the note above left with the peer. They come from the
+locally derived snapshot now, along with the two burn spends, and one thing had to
+be added to make it possible: a Bitcoin block carries its header time and nothing
+was reading it. `BitcoinBlock::timestamp`, `SortitionSnapshot::bitcoin_timestamp`,
+and the capture's own `burn_header_timestamp` column for a chain's seed — which a
+resumed chain has to state, because the tenure standing on the seed's own burn view
+is executed before the chain advances once.
+
+**Why this can be switched over rather than compared forever.** A wrong answer to
+any of the five does not corrupt state: it changes the root the block seals, the
+header the network signed states a different one, and the block is refused with
+nothing committed. That is the opposite of the position the *validation* inputs are
+in, where a wrong answer is invisible — and it is why the sortition hash and the
+winner's registration were derived locally months before these were.
+
+The oracles are the archive's own columns, per burn block, in
+`mainnet_sortition::the_node_tracker_derives_the_same_window`: consensus hash,
+sortition hash, running burn total, winner, burn header hash, **burn header time**
+and the two spends, for every block of the captured mainnet window. The peer's
+answer is still fetched and still compared — `report_disagreements` names any of
+the four fields that parts company — because a difference tells an operator which
+of two chains of Bitcoin blocks is not the network's, and the state root that
+refuses the block afterwards does not say which field caused it.
+
+What the peer still supplies is the burn *view* of a block whose tenure change this
+node did not execute, and the height that view sits at. Both are checked rather
+than trusted: the pool's answer must carry the consensus hash it was asked for, the
+tracker derives the consensus hash at the height it walked to, and a header whose
+cumulative burn disagrees with the derived total stops the round.

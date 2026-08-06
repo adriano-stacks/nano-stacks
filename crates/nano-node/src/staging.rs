@@ -108,24 +108,32 @@ impl Staging {
             .is_some())
     }
 
-    /// The parent of the lowest staged block, which is where a descent resumes.
+    /// The parent of the lowest staged block, which is where a descent resumes,
+    /// and that block's own height.
     ///
     /// Staged blocks descend from one chain, so the lowest is the furthest the
     /// walk has reached and its parent is the next block to ask for.
-    pub fn descent_resumes_at(&self) -> Result<Option<StacksBlockId>, StagingError> {
-        self.connection()?
+    ///
+    /// The height comes back with it because the parent alone cannot say whether
+    /// there is anything left to fetch. A tenure arrives whole, so the answer that
+    /// reached the executed tip staged blocks below it too, and the lowest of
+    /// those points at a tenure this node has already sealed — which a caller
+    /// would then ask for again on every round.
+    pub fn descent_resumes_at(&self) -> Result<Option<(StacksBlockId, u64)>, StagingError> {
+        Ok(self
+            .connection()?
             .query_row(
-                "SELECT parent_block_id FROM staged ORDER BY height ASC LIMIT 1",
+                "SELECT parent_block_id, height FROM staged ORDER BY height ASC LIMIT 1",
                 [],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)),
             )
             .optional()?
-            .map(|bytes| {
-                Ok(StacksBlockId::from_bytes(
-                    bytes.try_into().unwrap_or([0; 32]),
-                ))
-            })
-            .transpose()
+            .map(|(bytes, height)| {
+                (
+                    StacksBlockId::from_bytes(bytes.try_into().unwrap_or([0; 32])),
+                    height,
+                )
+            }))
     }
 
     /// The staged block whose parent is `parent`, if it is here.
@@ -250,7 +258,7 @@ mod tests {
             .expect("a lowest block");
         assert_eq!(
             staging.descent_resumes_at().expect("resume"),
-            Some(lowest.header.parent_block_id)
+            Some((lowest.header.parent_block_id, lowest.header.chain_length))
         );
 
         for block in &blocks {

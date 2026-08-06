@@ -7,6 +7,12 @@
 //! the source never had it under that name. They need opposite fixes, and
 //! stacks-core reading its own checkpoint settles which.
 //!
+//! It was the third thing — the contract did not exist yet — and these stay as
+//! the way to ask a checkpoint what it holds. They only ever worked with
+//! `external_blobs` on: a `stacks-core-marf-sqlite-v2` capture keeps its trie in
+//! `marf.sqlite.blobs`, and `MARFOpenOpts::default()` reads `marf_data.data`
+//! instead, which is empty, so every key looks absent.
+//!
 //! Point `NANO_MAINNET_MARF` at the checkpoint's `marf.sqlite` and
 //! `NANO_MAINNET_BLOCK` at the state identifier it was taken at:
 //!
@@ -19,6 +25,7 @@
 use std::env;
 
 use blockstack_lib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts};
+use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use stacks_common::types::chainstate::StacksBlockId;
 
 /// The contract whose absence stopped a mainnet replay.
@@ -153,8 +160,16 @@ fn stacks_core_finds_the_contract_nano_cannot() {
     };
     let block = StacksBlockId::from_hex(&block).expect("the block identifier is hexadecimal");
 
-    let mut marf: MARF<StacksBlockId> =
-        MARF::from_path(&path, MARFOpenOpts::default()).expect("open the checkpoint");
+    // With external blobs: a `stacks-core-marf-sqlite-v2` capture holds its trie
+    // in `marf.sqlite.blobs`, and `MARFOpenOpts::default()` leaves the flag off,
+    // so stacks-core reads `marf_data.data` — which is empty, and the read comes
+    // back as though the checkpoint held nothing. That was recorded in [[037]] as
+    // stacks-core being unable to open an archive's MARF at all; it is one flag.
+    let mut marf: MARF<StacksBlockId> = MARF::from_path(
+        &path,
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true),
+    )
+    .expect("open the checkpoint");
     let key = format!("clarity-contract::{CONTRACT}");
     // `get_with_proof` is the public read that does not need a storage handle;
     // the proof is discarded, only presence is in question.
@@ -169,9 +184,16 @@ fn stacks_core_finds_the_contract_nano_cannot() {
         "stacks-core {} {key} at {block}",
         if found { "finds" } else { "does not find" }
     );
+    // Absent, and rightly so. This asked whether nano's import had dropped the
+    // key, and the answer turned out to be neither the import nor the lookup:
+    // `native-pool-v1` was deployed at height 8,665,687, eighty-seven blocks
+    // *after* the checkpoint, so a checkpoint that held it would be the fault.
+    // The real bug was nano's error classification, which made a deployment
+    // naming a contract that does not exist yet fatal rather than a failed
+    // transaction. Kept, with the answer in it: an import that started inventing
+    // pre-checkpoint contracts would show up here.
     assert!(
-        found,
-        "the source checkpoint has no {key}, so nano's import did not drop it \
-         and the key nano looks up is the thing to question"
+        !found,
+        "the checkpoint at 8,665,600 cannot hold {key}, which was deployed at 8,665,687"
     );
 }

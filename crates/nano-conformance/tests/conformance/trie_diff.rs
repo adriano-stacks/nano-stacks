@@ -29,10 +29,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 use nano_marf::{MarfValue, VersionedMarf};
 
-/// The placeholder a block is executed under before it is sealed.
-fn temporary_state_id() -> [u8; 32] {
-    *nano_primitives::sha512_256(&[1; 52]).as_bytes()
-}
+use nano_chainstate::temporary_state_id;
 
 fn setting(name: &str) -> Option<String> {
     env::var(name).ok()

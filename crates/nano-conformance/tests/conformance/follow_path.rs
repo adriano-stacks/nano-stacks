@@ -29,12 +29,15 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
-use axum::{Router, extract::State, http::StatusCode, routing::get};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use nano_bitcoin::{BitcoinBlock, BitcoinSource};
-use nano_chainstate::{ChainState, NakamotoBlock};
+use nano_chainstate::NakamotoBlock;
 use nano_node::{CatchUpBudget, CheckpointExecutor, staging::Staging};
 use nano_primitives::ConsensusHash;
 use nano_sync::{PeerPool, PoxInfo, SyncClient, TenureSource};
@@ -159,69 +162,114 @@ impl BitcoinSource for MovableBurnchain {
     }
 }
 
-/// Deterministic pressure a peer puts on a round.
+/// How a peer behaves badly, in the three ways a real one does.
 ///
-/// Everything here is something a real peer does and a fixture normally does not:
-/// a public endpoint answers 429 when asked too often, bounds the body it will put
-/// in one response, and gains blocks while a round is walking it. The live mainnet
-/// run meets all three constantly; nothing offline did, which is what [[047]]'s
-/// last open item is about.
-///
-/// Counted rather than merely configured, so a test can assert the pressure was
-/// *applied*. A knob that silently did nothing would leave every assertion below
-/// it passing for the wrong reason.
-#[derive(Debug, Default)]
-pub struct Pressure {
-    /// How many 429s this peer will still hand out, and what `Retry-After` it
-    /// asks for.
+/// Every field is deterministic and counted from the requests the node actually
+/// makes, so a scenario is reproducible without a clock, a sleep or a random
+/// number: the same node makes the same requests in the same order and meets the
+/// same refusals. Shared through `Arc` so a test keeps a handle on the policy it
+/// gave a peer and can move the peer's tip or start refusing between rounds.
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    /// Answer 429 to every *n*th request. `Some(1)` refuses everything.
+    refuse_every: Option<usize>,
+    /// Answer 429 to everything while this is set.
+    pub refusing: Arc<AtomicBool>,
+    /// Answer 429 to tenure requests only, while this is set.
     ///
-    /// Bounded so the round eventually gets its answer: a peer that refuses
-    /// forever is a peer that is down, which is a different test.
-    pub rate_limits: std::sync::atomic::AtomicUsize,
-    pub retry_after: Option<u64>,
-    /// The most blocks one `/v3/tenures/:id` response will carry.
-    ///
-    /// `blocks_of_tenure` only requires the block it asked for to be among the
-    /// answers, so a short page ends a descent step inside a tenure and the next
-    /// step resumes from the lowest block it got.
-    pub page: Option<usize>,
-    /// How much of the chain this peer admits to holding.
-    ///
-    /// `None` is all of it. Raising it mid-round is a tip that moved.
-    pub visible: std::sync::Mutex<Option<usize>>,
-    /// How many blocks this peer gains each time it is asked for a tenure.
-    ///
-    /// A tip that moves *because* the node asked, which is deterministic where a
-    /// background task moving it would not be, and is also what a real peer does:
-    /// it gains blocks while a descent walks it.
-    pub growth: usize,
-    /// What was actually done to the node.
-    pub limited: std::sync::atomic::AtomicUsize,
-    pub shortened: std::sync::atomic::AtomicUsize,
-    pub grew: std::sync::atomic::AtomicUsize,
+    /// A peer that still says where its tip is and will not serve the history
+    /// below it, which is what a rate limit keyed by cost looks like — and the
+    /// only way to drive a descent into the throttle bookkeeping, since a peer
+    /// that refuses everything is never asked for a tenure at all.
+    pub refusing_tenures: Arc<AtomicBool>,
+    /// At most this many blocks in one `/v3/tenures/:id` answer.
+    page: Option<usize>,
+    /// How many of the served blocks are visible. Zero means all of them.
+    visible: Arc<AtomicUsize>,
+    /// Make one more block visible every *n*th request, so the tip moves while a
+    /// round is in flight rather than only between rounds.
+    reveal_every: Option<usize>,
+    /// Every path this peer was asked for, in order, and whether it answered.
+    asked: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
-impl Pressure {
-    /// Whether this request is being refused, and for how long the peer asks.
-    fn refuse(&self) -> Option<u64> {
-        // Spent one at a time rather than by a modulus over a request counter:
-        // two peers and a retrying client make the request count depend on
-        // timing, and a budget does not.
-        let spent = self
-            .rate_limits
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |left| left.checked_sub(1),
-            )
-            .is_ok();
-        if !spent {
-            return None;
-        }
-        self.limited
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Some(self.retry_after.unwrap_or_default())
+impl Policy {
+    /// Refuse every *n*th request with a 429.
+    #[must_use]
+    pub const fn refusing_every(mut self, requests: usize) -> Self {
+        self.refuse_every = Some(requests);
+        self
     }
+
+    /// Never answer a tenure with more than this many blocks.
+    #[must_use]
+    pub const fn paged(mut self, blocks: usize) -> Self {
+        self.page = Some(blocks);
+        self
+    }
+
+    /// Start with `visible` blocks and admit one more every *n*th request.
+    #[must_use]
+    pub fn revealing(mut self, visible: usize, every: usize) -> Self {
+        self.visible = Arc::new(AtomicUsize::new(visible));
+        self.reveal_every = Some(every);
+        self
+    }
+
+    /// How many of them it answered with a 429.
+    pub fn refusals(&self) -> usize {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(_, admitted)| !admitted)
+            .count()
+    }
+
+    /// The tenures this peer actually answered, in order, as the block asked for.
+    ///
+    /// Answered rather than asked: the client retries a 429 on its own, so a
+    /// refused request appears several times over and would look like a caller
+    /// that walked the same history twice.
+    pub fn tenures_served(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(_, admitted)| *admitted)
+            .filter_map(|(path, _)| tenure_asked_for(path))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Record a request and say whether this one is refused.
+    fn admits(&self, path: &str) -> bool {
+        let mut asked = self.asked.lock().expect("the log is not poisoned");
+        let count = asked.len() + 1;
+        // The tip moves off the node's own requests rather than off a clock, so a
+        // round is interrupted at the same point on every run.
+        if self.reveal_every.is_some_and(|every| count.is_multiple_of(every)) {
+            self.visible.fetch_add(1, Ordering::SeqCst);
+        }
+        let refused = self.refusing.load(Ordering::SeqCst)
+            || (self.refusing_tenures.load(Ordering::SeqCst) && tenure_asked_for(path).is_some())
+            || self
+                .refuse_every
+                .is_some_and(|every| count.is_multiple_of(every));
+        let admitted = !refused;
+        asked.push((path.to_owned(), admitted));
+        admitted
+    }
+}
+
+/// The block a request asks for the tenure of, if that is what it asks.
+///
+/// `/v3/tenures/info` travels the same prefix and is a question about the peer
+/// rather than about a tenure, so it is told apart by the block identifier's
+/// length rather than by the route.
+fn tenure_asked_for(path: &str) -> Option<&str> {
+    path.strip_prefix("/v3/tenures/")
+        .filter(|block| block.len() == 64)
 }
 
 /// What one fake peer serves.
@@ -229,56 +277,44 @@ pub struct Served {
     /// The chain it offers, lowest first. Its last block is its tip.
     pub blocks: Vec<NakamotoBlock>,
     pub snapshots: Vec<Snapshot>,
-    pub pressure: Pressure,
+    /// How it misbehaves while serving them.
+    pub policy: Policy,
 }
 
 impl Served {
-    /// A peer that answers everything it holds, immediately and in full.
+    /// A peer that answers everything it holds, as fast as it is asked.
     pub fn honest(blocks: Vec<NakamotoBlock>, snapshots: Vec<Snapshot>) -> Self {
         Self {
             blocks,
             snapshots,
-            pressure: Pressure::default(),
+            policy: Policy::default(),
         }
     }
 
-    /// How much of the chain this peer is currently admitting to.
-    fn chain(&self) -> &[NakamotoBlock] {
-        let visible = *self
-            .pressure
-            .visible
-            .lock()
-            .expect("the visible tip is not poisoned");
-        &self.blocks[..visible.unwrap_or(self.blocks.len()).min(self.blocks.len())]
+    /// The same peer, misbehaving.
+    #[must_use]
+    pub fn under(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
     }
 
-    /// Gain the blocks this peer gains per tenure asked for, if any.
-    fn grow(&self) {
-        if self.pressure.growth == 0 {
-            return;
-        }
-        let grew = {
-            let mut visible = self
-                .pressure
-                .visible
-                .lock()
-                .expect("the visible tip is not poisoned");
-            let held = visible.unwrap_or(self.blocks.len());
-            let gained = held < self.blocks.len();
-            if gained {
-                *visible = Some((held + self.pressure.growth).min(self.blocks.len()));
-            }
-            gained
+    /// The blocks this peer is currently willing to admit it has.
+    ///
+    /// A prefix rather than the whole chain, because that is what a tip moving
+    /// looks like from outside: the peer answered for fewer blocks a moment ago
+    /// and answers for more now, and nothing else about it changed.
+    fn visible(&self) -> &[NakamotoBlock] {
+        let visible = self.policy.visible.load(Ordering::SeqCst);
+        let upto = if visible == 0 {
+            self.blocks.len()
+        } else {
+            visible.min(self.blocks.len())
         };
-        if grew {
-            self.pressure
-                .grew
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        &self.blocks[..upto]
     }
 
     fn block(&self, id: &str) -> Option<Vec<u8>> {
-        self.chain()
+        self.visible()
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)
             .map(NakamotoBlock::encode)
@@ -288,49 +324,38 @@ impl Served {
     ///
     /// This is what `/v3/tenures/:id` answers, and it is what makes a descent one
     /// request per tenure rather than one per block.
+    ///
+    /// A `page` cuts the answer to the named block and the ones just below it,
+    /// which is the shape a bounded response has: a peer that will not serve a
+    /// whole tenure in one body serves the top of it and leaves the rest to be
+    /// asked for again from lower down.
     fn tenure(&self, id: &str) -> Option<Vec<u8>> {
-        self.grow();
-        let chain = self.chain();
-        let named = chain
+        let blocks = self.visible();
+        let named = blocks
             .iter()
             .find(|block| hex::encode(block.block_id()) == id)?;
-        let mut of_tenure: Vec<&NakamotoBlock> = chain
+        let tenure: Vec<&NakamotoBlock> = blocks
             .iter()
             .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
+            .filter(|block| block.header.chain_length <= named.header.chain_length)
             .collect();
-        // A bounded body keeps the block that was *asked for* and drops the
-        // oldest, which is the direction a peer serving a tenure backwards from a
-        // named block truncates in — and the direction that leaves a descent
-        // something to resume from.
-        if let Some(page) = self.pressure.page
-            && of_tenure.len() > page
-        {
-            let keep = of_tenure
-                .iter()
-                .position(|block| block.block_id() == named.block_id())
-                .unwrap_or(0);
-            let from = keep.saturating_sub(page.saturating_sub(1));
-            of_tenure = of_tenure[from..=keep].to_vec();
-            self.pressure
-                .shortened
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        let page = self.policy.page.unwrap_or(tenure.len()).max(1);
         Some(
-            of_tenure
-                .into_iter()
-                .flat_map(NakamotoBlock::encode)
+            tenure[tenure.len().saturating_sub(page)..]
+                .iter()
+                .flat_map(|block| block.encode())
                 .collect(),
         )
     }
 
     fn tip(&self) -> &NakamotoBlock {
-        self.chain().last().expect("a served chain has a tip")
+        self.visible().last().expect("a served chain has a tip")
     }
 
     fn info(&self) -> serde_json::Value {
         let tip = self.tip();
         let start = self
-            .chain()
+            .visible()
             .iter()
             .find(|block| block.header.consensus_hash == tip.header.consensus_hash)
             .unwrap_or(tip);
@@ -449,38 +474,36 @@ fn found(body: Option<Vec<u8>>) -> (StatusCode, Vec<u8>) {
     )
 }
 
-/// Answer 429 while this peer still has refusals to spend.
+/// One place every request passes through, so a policy applies to all of them.
 ///
-/// In front of every route rather than inside one, because what a rate limit
-/// interrupts is not chosen: a round asks for tenure info, tenures, blocks,
-/// sortitions and a burn view, and the interesting failure is the one that lands
-/// wherever the budget runs out.
-async fn throttle(
+/// A rate limit is not a property of an endpoint — a throttled peer refuses the
+/// sortition a block needs as readily as the tenure above it — so refusing per
+/// route would only exercise the descent and never execution.
+///
+/// `Retry-After: 0` is answered deliberately: `SyncClient` honours what it is
+/// told as given, so this keeps the client's own three retries in the test
+/// without making the suite wait seconds for each one. What that costs is that
+/// the wait itself is not what is being pinned here; `nano-sync`'s own tests
+/// cover the honouring.
+async fn gate(
     State(state): State<Arc<Served>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    match state.pressure.refuse() {
-        Some(seconds) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                axum::http::header::RETRY_AFTER,
-                seconds.to_string(),
-            )],
-        )
-            .into_response(),
-        None => next.run(request).await,
+    if state.policy.admits(request.uri().path()) {
+        return next.run(request).await;
     }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "0")],
+        Vec::new(),
+    )
+        .into_response()
 }
 
 /// Start a peer on loopback and hand back a client pointed at it.
 pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
-    serve_shared(Arc::new(served)).await
-}
-
-/// The same, over a peer the test keeps a handle on so it can move its tip.
-pub async fn serve_shared(state: Arc<Served>) -> (SyncClient, tokio::task::JoinHandle<()>) {
+    let state = Arc::new(served);
     let router = Router::new()
         .route(
             "/v2/info",
@@ -546,7 +569,7 @@ pub async fn serve_shared(state: Arc<Served>) -> (SyncClient, tokio::task::JoinH
         )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
-            throttle,
+            gate,
         ))
         .with_state(state);
     // Port zero: several of these run inside one test binary and a fixed port
@@ -568,6 +591,16 @@ pub async fn serve_shared(state: Arc<Served>) -> (SyncClient, tokio::task::JoinH
 pub const CHAIN_ID: u32 = 2_147_483_648;
 
 /// The stacking calendar the captured chain was produced under.
+///
+/// `pox_5_activation_height` is the chain's own `pox_v4_unlock_height`, which every
+/// captured `new_block` event states. It was `None` here, and that is not a
+/// harmless omission: the waterfall opens with the reward cycle after the one
+/// pox-5 activates in, and under the waterfall a commitment pays **one** output
+/// where a classic reward phase pays two. Without it `payout_schedule` counted two
+/// on a chain that pays one, so every candidate's burn read as its own change, no
+/// sortition was elected at any block of this capture and its running burn total
+/// never moved. `/v2/pox` states the field on a live chain, so this is a fixture
+/// that was missing what production is given.
 pub const fn pox() -> PoxInfo {
     PoxInfo {
         first_bitcoin_height: 0,
@@ -576,40 +609,35 @@ pub const fn pox() -> PoxInfo {
         reward_phase_length: 15,
         reward_slots: 30,
         rejection_fraction: None,
-        pox_5_activation_height: None,
+        pox_5_activation_height: Some(POX_5_ACTIVATION_HEIGHT),
         v1_unlock_height: None,
         v2_unlock_height: None,
         v3_unlock_height: None,
     }
 }
 
+/// The captured chain's `pox_v4_unlock_height`, as its `new_block` events state it.
+///
+/// With a 20-block cycle starting at Bitcoin 0 this puts the waterfall at burn 280,
+/// and the capture's snapshots agree without being asked: their `pox_payouts`
+/// column switches from two classic reward addresses to one `Addr32` P2TR — the
+/// sBTC taproot output — at exactly 280.
+pub const POX_5_ACTIVATION_HEIGHT: u32 = 262;
+
 /// A node standing on the captured checkpoint, with the anchor block applied.
 ///
 /// Durable, in a directory of its own, because a retraction stands on the ledger
 /// the surviving block committed and an in-memory state has none to read back.
-fn node(
+/// The opener is `restart::open`, which is the one that recovers the ledger a
+/// sealed block committed — so a directory this has been pointed at twice
+/// resumes rather than starting over, and a catch-up across a restart is the
+/// same code path as a catch-up that was never interrupted.
+pub fn node(
     directory: &Path,
     burnchain: MovableBurnchain,
 ) -> (CheckpointExecutor<MovableBurnchain>, Vec<NakamotoBlock>) {
     let fixtures = fixtures();
-    let manifest = nano_node::CheckpointManifest::load(fixtures.join("chainstate/checkpoint-H"))
-        .expect("the checkpoint manifest reads");
-    let mut chainstate = ChainState::open_from_checkpoint(
-        nano_conformance::captured_network(&fixtures),
-        directory,
-        fixtures.join("chainstate/checkpoint-H/marf.sqlite"),
-        manifest.source_state_id,
-        manifest.state_index_root,
-    )
-    .expect("the checkpoint opens");
-    // The rewards the checkpoint still owes: a tenure this node executes pays out
-    // one earned before the state was exported, which only the checkpoint knows.
-    if let Some(accounting) = fs::read(fixtures.join("chainstate/checkpoint-H/native-effects.json"))
-        .ok()
-        .and_then(|contents| nano_chainstate::TenureAccounting::from_json(&contents).ok())
-    {
-        *chainstate.accounting_mut() = accounting;
-    }
+    let (chainstate, _) = crate::restart::open(directory);
     let chain = captured_chain();
     let anchor = chain.first().expect("the capture has blocks").clone();
     // The anchor's own context comes from the capture, as a configured node's
@@ -867,7 +895,10 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
             row.consensus_hash = replacement.to_string();
         }
     }
-    let (parted_client, parted_task) = serve(Served::honest(parted_view(&honest, disputed, replacement), parted))
+    let (parted_client, parted_task) = serve(Served::honest(
+        parted_view(&honest, disputed, replacement),
+        parted,
+    ))
     .await;
 
     let mut history = TenureSource::only(parted_client.clone());
@@ -1093,22 +1124,12 @@ fn derived_chain(
 
     let mut tracker = nano_node::sortition::SortitionTracker::from_capture(capture)
         .expect("the synthesized capture seeds a chain");
-    // One payout output per commitment, and this is a finding rather than a knob.
-    // `PayoutSchedule` answers two in a reward phase, because that is
-    // `OUTPUTS_PER_COMMIT`; the number a commitment actually pays is the number of
-    // *recipients the cycle's reward set holds*, capped at two. This capture's chain
-    // has one stacker, so every commitment pays one output of 20,000 sats and then
-    // its own change — and counting two makes a candidate's weight the size of its
-    // wallet, which is the trap [[049]] records for mainnet. Under the two-output
-    // rule this window derives no winner at all and the running burn total never
-    // moves; under one it derives the network's consensus hash at every block. The
-    // waterfall is how `PayoutSchedule` expresses one output today, so that is what
-    // is passed, and the missing rule is recorded on [[049]].
-    let payouts = nano_sortition::PayoutSchedule::new(
-        nano_sortition::RewardCycleSchedule::new(0, 20, Some(0)).expect("a reward cycle calendar"),
-        5,
-    )
-    .expect("a payout schedule");
+    // The node's own derivation from the node's own constants, not a schedule
+    // written out by hand here: the count of payout outputs is what decides every
+    // candidate's weight, so a test that stated it separately would be checking the
+    // tracker against a second opinion instead of against production. See `pox()`
+    // for what this capture pays and why it used to derive nothing.
+    let payouts = nano_node::payout_schedule(&pox()).expect("a payout schedule");
     let mut burnchain = burnchain.clone();
     tracker
         .catch_up(

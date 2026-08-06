@@ -38,8 +38,20 @@ execution.
       production transitions.
 - [x] Serve every route from the coherent executed snapshot established by
       [[046-distinguish-followed-and-executed-chain-tips]].
-- [ ] Exercise a stock `stacks-signer`, transaction submitter and event observer
-      against the binary.
+- [x] Exercise an event observer against the binary and retain delivered
+      `new_block`, burn-block and proposal-response payloads.
+- [ ] Run a stock `stacks-signer` against the binary without a compatibility
+      shim on a chain where nano derives the active PoX-5 signer set.
+- [ ] Submit a valid transaction through the public RPC and observe the same
+      transaction admitted, mined, executed and emitted in `new_block`.
+- [ ] Finish `/v3/stacker_set`: preserve `stacked_amt`, serve the current
+      Waterfall shape and derive its sBTC address instead of returning V0/zero
+      placeholders.
+- [ ] Serve `/v3/blocks/:id` and `/v3/tenures/:id` from the durable executed
+      chain, not only the currently followed/recent view.
+- [ ] Populate matured rewards, reward set and miner transaction id in
+      `new_block`, then compare receipts, costs and events with an independent
+      stacks-core observer for the same executed blocks.
 
 ## Acceptance Criteria
 
@@ -301,8 +313,9 @@ this node cannot derive the reward set for cycle 140 from its own state, so
 stay unconfigured: reward cycle 140 has no signer set: nothing stacked for it
 ```
 
-Nothing is stacked in pox-5 for cycle 140 because mainnet is still on pox-4.
-Reported once per cycle rather than once per round, and the route answers
+Nothing is stacked in pox-5 for cycle 140 because that reward cycle was prepared
+under pox-4. Epoch 4.0 and the pox-5 contract are active, but pox-5's first
+reward cycle is 141. Reported once per cycle rather than once per round, and the route answers
 stacks-core's own `not_available_try_again` rather than an empty set.
 
 Two shape defects the stacks-core reader caught, both of which would have made a
@@ -393,11 +406,10 @@ called, which is what the whole task was about.
 - **A stock `stacks-signer` has not been run against the binary.** The binaries
   are on this machine (`/home/aldur/stacks-core/target/debug/stacks-signer`), but
   a signer needs to be *in the reward set the node derives*, and nano derives
-  reward sets the waterfall way from pox-5. Mainnet is on pox-4, so cycle 140 has
-  no pox-5 set, so no `signers-*` contract is configured and no signer can hold a
-  slot. The same blocker as 050's signer-weight check: provable against a pox-5
-  chain (hacknet on 4.0, W13, or `api.testnet-pox5.hiro.so`), not against a
-  mainnet replay from a 3.x checkpoint. A signer would also need `.miners`
+  reward sets the waterfall way from pox-5. Mainnet's current cycle 140 was
+  prepared under pox-4, so it has no pox-5 set; pox-5's first mainnet reward
+  cycle is 141. The same blocker as 050's signer-weight check is therefore
+  time-bounded rather than an absence of Epoch 4 on mainnet. A signer would also need `.miners`
   chunks, which reach a nano node only by a miner POSTing to it — nano does not
   pull `StackerDB` chunks from its peer, and its own miner publishes to the
   peer's `.miners`, not to nano's.
@@ -428,10 +440,10 @@ against the binary" is three claims, and they are not in the same state.
   What has not happened is a wallet or `stacks-cli` posting a *valid* mainnet
   transaction and it appearing in a mined block, which needs a chain nano can
   mine on.
-- **Stock signer: blocked on the chain, not on nano.** Unchanged from above: a
-  signer must be in the reward set nano derives, nano derives waterfall sets from
-  pox-5, and mainnet is on pox-4. Provable against hacknet on 4.0 (W13) or
-  `api.testnet-pox5.hiro.so`; not against a mainnet replay from a 3.x checkpoint.
+- **Stock signer: waiting on the applicable mainnet reward cycle and nano's
+  remaining signer-facing fields.** Cycle 140 was prepared under pox-4 even
+  though Epoch 4.0 and pox-5 are active; pox-5's first mainnet reward cycle is
+  141. Run the gate there rather than treating mainnet as indefinitely pox-4.
 
 [[053-pass-the-mainnet-node-release-gate]] carries the same split for the release
 gate as a whole, under "what is proved, what is staged, and what needs

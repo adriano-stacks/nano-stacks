@@ -39,6 +39,29 @@ struct CapturedBitcoinSnapshot {
     burn_header_timestamp: u64,
     consensus_hash: String,
     winning_block_txid: String,
+    /// stacks-core's own `pox_payouts` column, verbatim: a JSON pair of the payout
+    /// addresses and the amount *per address*.
+    ///
+    /// The address list is padded to the number of payout outputs a commitment in
+    /// that block carries (`SortitionHandleTx::get_num_pox_payouts`), so its length
+    /// states that count and `amount × length` is the block's whole payout burn —
+    /// which is what Clarity reads back as `miner-spend-total`. Taking it from here
+    /// rather than re-deriving it means the replay's oracle for that field is the
+    /// archive rather than nano's own arithmetic.
+    pox_payouts: String,
+}
+
+/// The payout outputs and the total burn a snapshot's `pox_payouts` states.
+///
+/// The count comes back as well as the total because the winner's own share has to
+/// be summed over exactly that many of its outputs: everything after them is the
+/// miner's change, which on mainnet is three orders of magnitude larger than the
+/// commitment.
+fn captured_pox_payouts(encoded: &str) -> Option<(usize, u128)> {
+    let (addresses, per_output): (Vec<serde_json::Value>, u128) =
+        serde_json::from_str(encoded).ok()?;
+    let outputs = addresses.len();
+    Some((outputs, per_output.checked_mul(outputs as u128)?))
 }
 
 #[derive(Deserialize)]
@@ -1330,10 +1353,19 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
             // capture holds either in the snapshot or in the Bitcoin block.
             let commits = operations.get(&snapshot.consensus_hash);
             let winner = decode_hash(&snapshot.winning_block_txid);
+            // How many of a commitment's outputs are payouts, and the block's whole
+            // payout burn, both stated by the archive. This used to sum *every*
+            // output of every commitment, change included — which on mainnet makes
+            // a commitment of 30,000 sats read as the 16-23 million behind it, the
+            // same trap `nano_sortition::PayoutSchedule` exists to avoid one layer
+            // down.
+            let (payout_outputs, burn_spend_total) =
+                captured_pox_payouts(&snapshot.pox_payouts)?;
             let burn = |operation: &BitcoinOperation| -> u128 {
                 operation
                     .outputs
                     .iter()
+                    .take(payout_outputs)
                     .map(|output| u128::from(output.amount_sats))
                     .sum()
             };
@@ -1349,18 +1381,6 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                     })
                 })
                 .unwrap_or(([0; 32], 0));
-            let burn_spend_total = commits.map_or(0, |commits| {
-                commits
-                    .iter()
-                    .filter(|operation| {
-                        matches!(
-                            operation.kind,
-                            BitcoinOperationKind::LeaderBlockCommit { .. }
-                        )
-                    })
-                    .map(burn)
-                    .sum()
-            });
             Some((
                 snapshot.consensus_hash.clone(),
                 BitcoinBlockContext {
@@ -2045,16 +2065,17 @@ mod tests {
         let mut chainstate = captured_chainstate(&fixture);
         let mut bitcoin = FixtureBitcoinSource {
             blocks: [
-                (first_context.height, &first.header.consensus_hash),
-                (second_context.height, &second.header.consensus_hash),
+                (&first_context, &first.header.consensus_hash),
+                (&second_context, &second.header.consensus_hash),
             ]
             .into_iter()
-            .map(|(height, consensus_hash)| {
+            .map(|(context, consensus_hash)| {
                 (
-                    height,
+                    context.height,
                     BitcoinBlock {
-                        height,
+                        height: context.height,
                         hash: [0; 32],
+                        timestamp: context.burn_block_time,
                         operations: bitcoin_operations
                             .get(&consensus_hash.to_string())
                             .expect("Bitcoin operations")
@@ -2113,16 +2134,17 @@ mod tests {
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let bitcoin = FixtureBitcoinSource {
             blocks: [
-                (first_context.height, &first.header.consensus_hash),
-                (second_context.height, &second.header.consensus_hash),
+                (&first_context, &first.header.consensus_hash),
+                (&second_context, &second.header.consensus_hash),
             ]
             .into_iter()
-            .map(|(height, consensus_hash)| {
+            .map(|(context, consensus_hash)| {
                 (
-                    height,
+                    context.height,
                     BitcoinBlock {
-                        height,
+                        height: context.height,
                         hash: [0; 32],
+                        timestamp: context.burn_block_time,
                         operations: bitcoin_operations
                             .get(&consensus_hash.to_string())
                             .expect("Bitcoin operations")
@@ -2720,6 +2742,7 @@ mod tests {
         let block = nano_bitcoin::BitcoinBlock {
             height,
             hash: [9; 32],
+            timestamp: 0,
             operations: vec![commit(1, on_time), commit(2, (on_time + 1) % 5)],
         };
 
@@ -3546,8 +3569,13 @@ mod tests {
         write_file(&root.join("nakamoto/blocks/00000001.bin"), "block")?;
         write_file(&root.join("events/new_block/00000001.json"), "{}")?;
         write_file(&root.join("stacker_set/cycle-0.json"), "{}")?;
+        // `pox_payouts` is among the required inputs, and it is required rather than
+        // defaulted for the reason this test exists: a capture that does not state how
+        // many of a commitment's outputs are payouts cannot say what any commitment
+        // burned, and defaulting it would let such a capture read as a valid oracle
+        // and then answer with a miner's change.
         let snapshot = format!(
-            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"burn_header_timestamp\":0,\"consensus_hash\":\"0000000000000000000000000000000000000000\",\"winning_block_txid\":\"{bitcoin_hash}\"}}]"
+            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"burn_header_timestamp\":0,\"consensus_hash\":\"0000000000000000000000000000000000000000\",\"winning_block_txid\":\"{bitcoin_hash}\",\"pox_payouts\":\"[[\\\"burn\\\"],20000]\"}}]"
         );
         write_file(&root.join("sortition/snapshots.json"), &snapshot)?;
         write_file(
@@ -4152,6 +4180,7 @@ mod tests {
             let block = nano_bitcoin::BitcoinBlock {
                 height,
                 hash,
+                timestamp: 0,
                 operations: Vec::new(),
             };
             let winner_vrf_seed = (height % 3 == 0).then_some(hash);
