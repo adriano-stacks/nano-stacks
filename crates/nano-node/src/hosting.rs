@@ -517,6 +517,7 @@ pub async fn replicate(
         replicas.endpoints.join(", ")
     );
     let mut outbound = Vec::new();
+    let mut reported = (0, 0);
     loop {
         replicas.refresh(&crate::runtime::follow_endpoints(
             &config,
@@ -532,6 +533,21 @@ pub async fn replicate(
         match round(&mut replicas, network, &state, &outbound).await {
             Ok(()) => outbound.clear(),
             Err(refusal) => eprintln!("{refusal}"),
+        }
+        // What the run can be held to afterwards. `71` asks a no-hosted-API run to
+        // *prove* distribution rather than assert it, and a pool that was never
+        // asked twice looks identical to one peer doing all the work -- so the two
+        // numbers are said out loud whenever either moves: how many distinct peers
+        // have served a round, and how many rounds went unanswered.
+        let distribution = replicas.distribution();
+        if distribution != reported {
+            reported = distribution;
+            let (served, failures) = distribution;
+            println!(
+                "StackerDB replication has been served by {served} of {} peers, {failures} rounds \
+                 unanswered",
+                replicas.endpoints.len()
+            );
         }
         if replicas.is_empty() {
             return Err("no peer left to replicate StackerDB chunks with".to_owned());

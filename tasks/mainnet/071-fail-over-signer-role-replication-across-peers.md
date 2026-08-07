@@ -40,11 +40,23 @@ while the hosted signer silently could not.
       nothing about the rotation.
 - [x] Record which peer served each replication/recovery operation and expose a
       bounded failure counter so the no-hosted-API run can prove distribution.
-      `Replicas::distribution()` answers `(peers that served, rounds that failed)`;
-      `TenureSource::last_served()` names the peer behind each pooled request.
-- [ ] Run the hosted signer with no configured Hiro endpoint, remove its active
+      `Replicas::distribution()` answers `(peers that served, rounds that failed)`
+      and the loop now *says* it whenever either number moves -- a pool that was
+      never asked twice reads identically to one peer doing all the work, so the
+      counters have to leave the process to be evidence. `TenureSource::last_served()`
+      names the peer behind each pooled request.
+- [~] Run the hosted signer with no configured Hiro endpoint, remove its active
       peer, and show proposals and signed chunks continue through another
       discovered peer.
+      **The no-hosted-API half is done and measured.** A mainnet follower ran with
+      `peers = []` and no hosted endpoint anywhere in its configuration, joined over
+      p2p alone, and replicated StackerDB over a pool that grew from three peers to
+      five -- `108.130.44.244`, `117.52.250.3`, `152.53.22.28`, `172.96.141.17`,
+      `172.96.141.52` -- with zero rounds unanswered over the run.
+      What is left is the *removal*: no peer failed while it was watched, so the
+      rotation was never exercised in the field. Forcing it -- dropping the serving
+      peer and showing the next round go elsewhere -- is the remaining evidence, and
+      `replication_failover.rs` already pins the same behaviour offline six ways.
 
 ## What was holding one endpoint
 
