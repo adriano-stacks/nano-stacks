@@ -143,10 +143,24 @@ These need the live node stopped, and it is running:
       `Vm::open_existing` (task 087) now makes reading it non-mutating, but
       `refuse_uncommitted` correctly refuses while the node holds a 13 MB
       `marf.sqlite-wal`.
-- [ ] Assert the captured transaction's result, costs, events and writes and the
-      block's final state root against mainnet evidence.
-      `44d76d9ab3592521cc412973677bf380d2c25011f6c772f45f80a6c296088e11` is
-      recorded and has not been compared with the network's root at 8,708,625.
+- [x] Assert the block's final state root against mainnet evidence. **Done, and
+      it needed no state:** the follower path is
+      `append_nakamoto_block_with_bitcoin_operations`, which executes under
+      `RootPolicy::Verify` and refuses a block whose sealed root is not the one
+      its header commits to (`nano-chainstate/src/lib.rs:1233`, `:2218`). So
+      `executed 500 blocks, 8708125 to 8708625` already means all five hundred
+      headers' roots matched, 8,708,126 among them. Confirmed independently
+      against the network rather than taken from nano's own log: the peer-served
+      block at 8,708,625 (`/v3/blocks/a4bfccd4795ed0598f447ee302e8407583e8881ba7e6a9c658ec0ed6f058e206`,
+      2,038 bytes, `chain_length` 8708625, consensus hash
+      `f2b9a8b62b38eaa82a1e570493484690cd09d1e5`) carries `state_index_root`
+      `44d76d9ab3592521cc412973677bf380d2c25011f6c772f45f80a6c296088e11` at
+      header offset 101 — byte for byte the root nano sealed.
+- [ ] Assert the captured transaction's *receipt*: status, cost and events. The
+      root match covers every write, because a write that differed would move it,
+      but a cost is not in the root and decides block admission, and an event is
+      not in the root at all. This needs an event-observer capture for the block
+      or a stopped node to re-execute it under one.
 - [ ] Resume the restored replay and record the next first divergence. The node
       reached 8,708,625 and then stalled on a local sortition that cannot name the
       peers' burn view; that is task 088, not this one.
