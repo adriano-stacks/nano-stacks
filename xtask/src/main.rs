@@ -1524,12 +1524,26 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The board, and an exit status that agrees with it.
+///
+/// It used to return success whenever the *manifest* loaded, so a table naming a
+/// consensus divergence at block 76 exited zero and every caller that checks an
+/// exit status -- CI, a release gate, a shell -- was told the replay had passed.
 fn print_scoreboard() -> ExitCode {
     let manifest_path = fixture_root().join("manifest.toml");
     match FixtureManifest::load(&manifest_path) {
         Ok(manifest) => {
-            print!("{}", scoreboard_at(&fixture_root(), manifest));
-            ExitCode::SUCCESS
+            let (board, passed) = nano_conformance::scoreboard_result(&fixture_root(), manifest);
+            print!("{board}");
+            if passed {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!(
+                    "a required scoreboard surface diverged from its oracle, so this is not a \
+                     passing replay"
+                );
+                ExitCode::FAILURE
+            }
         }
         Err(error) => {
             eprintln!("{error}");
@@ -4756,6 +4770,15 @@ fn report_scoreboard() {
     };
     for line in String::from_utf8_lossy(&run.stdout).lines() {
         println!("  {line}");
+    }
+    // The subprocess's exit status, not the table's appearance. A report that
+    // printed a divergence and then went on to describe the artifact as though the
+    // replay had passed is the failure mode 075 is named for.
+    if !run.status.success() {
+        println!(
+            "  FAIL   a required surface diverged from its oracle: this replay does not \
+             support a release"
+        );
     }
     report_replay_diagnostics(&String::from_utf8_lossy(&run.stderr));
 }

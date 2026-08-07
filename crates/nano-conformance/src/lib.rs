@@ -457,11 +457,38 @@ pub fn scoreboard(manifest: FixtureManifest) -> String {
 /// Render the fixture replay score using the checkpoint and captured block stream.
 #[must_use]
 pub fn scoreboard_at(root: &Path, manifest: FixtureManifest) -> String {
+    scoreboard_result(root, manifest).0
+}
+
+/// The board, and whether every required surface on it passed.
+///
+/// The second half is what makes it a gate. `scoreboard` printed a table naming a
+/// consensus divergence and exited zero, because loading the manifest had
+/// succeeded -- so the command that exists to say whether nano computes the same
+/// chain as stacks-core reported failure and success at the same time, and only the
+/// half nobody parses said failure.
+///
+/// A required surface is the captured replay: roots, receipts and costs over a
+/// bounded fixture whose oracle is stacks-core's own output. A cost divergence
+/// counts, because a cost decides block admission even where the root matches.
+#[must_use]
+pub fn scoreboard_result(root: &Path, manifest: FixtureManifest) -> (String, bool) {
     let replay = match manifest.mode {
         FixtureMode::Baseline => baseline_replay(manifest),
         FixtureMode::Captured => captured_replay(root, manifest),
     };
-    render_scoreboard(manifest, &replay)
+    // A baseline tree has nothing to replay and is not a failing replay: it is the
+    // state the scoreboard starts in, before any fixture is captured.
+    let required = match manifest.mode {
+        FixtureMode::Baseline => true,
+        FixtureMode::Captured => {
+            replay.completed == replay.expected
+                && replay.first_failure.is_none()
+                && replay.first_divergence.is_none()
+                && replay.first_cost_divergence.is_none()
+        }
+    };
+    (render_scoreboard(manifest, &replay), required)
 }
 
 /// What the board can say about mainnet, which is a different question from what
@@ -2017,6 +2044,78 @@ mod tests {
             2,
             "the deepest seal is two blocks above the deepest ledger, and depth is the ledger's"
         );
+    }
+
+    /// Corrupt one expected receipt and the board must go red *and* say so.
+    ///
+    /// The gate this pins is not the table -- it is the second half of
+    /// `scoreboard_result`. `cargo xtask scoreboard` printed a divergence at block 76
+    /// and exited **zero**, because loading the manifest had succeeded, so every
+    /// caller that reads an exit status was told the replay passed. A gate that
+    /// reports failure only in prose is not a gate.
+    ///
+    /// Done by tampering rather than by constructing a `ReplayDepth`: a test that
+    /// builds the failing value itself proves the boolean and not the replay.
+    #[test]
+    fn a_tampered_expectation_makes_the_board_red_and_the_command_fail() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = FixtureManifest::load(&root.join("manifest.toml")).expect("manifest");
+        let (_, passed) = super::scoreboard_result(&root, manifest);
+        assert!(passed, "the checked-in capture has to pass before tampering means anything");
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let copy = directory.path().join("fixtures");
+        copy_tree(&root, &copy).expect("copy the fixture tree");
+
+        // One receipt, one field: the status of the first transaction of one block.
+        // Whichever event file holds it, the replay compares against it.
+        let events = copy.join("events/new_block");
+        let mut tampered = false;
+        let mut entries: Vec<_> = fs::read_dir(&events)
+            .expect("the capture has new_block events")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // A receipt's `status`, which is the field the replay compares first and
+            // the one a compiler regression moves: `success` became
+            // `abort_by_response` at block 76 on 2026-08-07.
+            let marker = "\"status\":\"success\"";
+            if let Some(at) = text.find(marker) {
+                let mut changed = text.clone();
+                changed.replace_range(at..at + marker.len(), "\"status\":\"abort_by_response\"");
+                fs::write(&path, changed).expect("write the tampered receipt");
+                tampered = true;
+                break;
+            }
+        }
+        assert!(tampered, "no receipt in the capture states a successful status to tamper with");
+
+        let manifest = FixtureManifest::load(&copy.join("manifest.toml")).expect("manifest");
+        let (board, passed) = super::scoreboard_result(&copy, manifest);
+        assert!(
+            !passed,
+            "a tampered receipt has to fail the command, not only appear in the table:\n{board}"
+        );
+    }
+
+    /// A plain recursive copy, so the tamper happens somewhere the tree is not.
+    fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
