@@ -123,6 +123,37 @@ node may invoke.
       [[067-reject-contract-call-through-a-constant-while-depl]], and remove its
       ignored differential.
 
+## A new mainnet frontier, 2026-08-07: `Unexpected principal data` at 8,708,126
+
+A restored, healthy mainnet state (`/home/aldur/mainnet-restored`, reflinked from
+`mainnet-wasm`) resumed cleanly, executed 279 blocks from 8,707,846, and stopped at
+**8,708,126** with:
+
+> Clarity execution error:
+> `Internal(InvariantViolation("Expect(\"Internal(Expect(\\\"Unexpected principal data\\\"))\")"))`
+
+The message is not vague once traced. `StandardPrincipalData::new`
+(`clarity-types/src/types/mod.rs:95`) raises it for one reason: **a version byte of
+32 or more**. A Stacks address version is a small number, so nothing legitimate
+produces one — something handed it bytes that are not a version.
+
+Two production sites construct principals from raw bytes, and both are reads at an
+offset:
+
+- `clar2wasm/src/wasm_utils.rs:464` — reads the version byte then twenty hash bytes
+  straight out of wasm linear memory at a running offset;
+- `wasm_utils.rs:1528` — splits a serialized buffer the same way.
+
+So the likely shape is a principal read from the *wrong offset*: the byte that should
+be a version is whatever happened to be there. That puts it in the same family as the
+spill and offset work under
+[[073-decide-whether-a-contract-clarity-wasm-cannot-load]] rather than in a Clarity
+semantic rule, and it is a compiler gap rather than a transaction the network also
+failed — the network executed this block.
+
+Next: identify the transaction at 8,708,126 and the value it was reading. 7,639
+blocks are staged behind it, so the state continues the moment it executes.
+
 ## Acceptance Criteria
 
 - Every production node execution, on every network and under every role or
