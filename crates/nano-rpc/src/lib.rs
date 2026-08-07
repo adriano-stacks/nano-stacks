@@ -122,6 +122,14 @@ struct Executed {
     /// The followed tenures, bounded at the tip: what this node has executed,
     /// and nothing above it.
     chain: Vec<FollowedTenure>,
+    /// The sortitions this node *derived*, anchored at the burn view it executed.
+    ///
+    /// Separate from `chain` because they answer to different authorities. A
+    /// followed tenure is a peer's account of a tenure, checked; a sortition is
+    /// arithmetic over Bitcoin blocks this node downloaded, and taking it from a
+    /// peer would let that peer choose the burn view and so the fork. So the
+    /// sortition routes read this and never `chain`.
+    sortitions: Vec<nano_sync::SortitionInfo>,
     /// The `PoX` constants, which are configuration rather than chain state, so
     /// they survive a tip the peer's view no longer reaches.
     pox: Option<PoxInfo>,
@@ -332,11 +340,16 @@ impl RpcState {
     /// The snapshot is built here, from the latest followed view bounded at this
     /// tip, and written once — so a caller reading a block and a caller reading
     /// the tip are told about the same state.
-    pub async fn publish_executed(&self, tip: SealedTip) {
+    pub async fn publish_executed(&self, tip: SealedTip, sortitions: Vec<nano_sync::SortitionInfo>) {
         let followed = self.followed.read().await.clone();
         let pox = followed.as_ref().map(|view| view.pox_info.clone());
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
-        *self.executed.write().await = Some(Executed { tip, chain, pox });
+        *self.executed.write().await = Some(Executed {
+            tip,
+            chain,
+            sortitions,
+            pox,
+        });
     }
 
     /// Say how far ahead the peer is, which is all a node this far behind knows.
@@ -820,9 +833,8 @@ async fn sortition(
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
     let sortition = executed(&state)
         .await?
-        .chain
+        .sortitions
         .into_iter()
-        .map(|tenure| tenure.sortition)
         .find(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
         .ok_or(RpcError::NotFound)?;
     Ok(axum::Json(vec![SortitionInfoWire::from(sortition)]))
@@ -838,10 +850,9 @@ async fn latest_sortition(
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
     let latest = executed(&state)
         .await?
-        .chain
-        .last()
+        .sortitions
+        .first()
         .ok_or(RpcError::Unavailable)?
-        .sortition
         .clone();
     Ok(axum::Json(vec![SortitionInfoWire::from(latest)]))
 }
@@ -854,14 +865,13 @@ async fn latest_sortition(
 async fn latest_and_last_sortition(
     State(state): State<RpcState>,
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
-    let chain = executed(&state).await?.chain;
-    let latest = chain.last().ok_or(RpcError::Unavailable)?.sortition.clone();
+    let derived = executed(&state).await?.sortitions;
+    let latest = derived.first().ok_or(RpcError::Unavailable)?.clone();
     let mut sortitions = vec![latest.clone()];
     if let Some(previous) = latest.last_sortition_consensus_hash {
-        let last = chain
+        let last = derived
             .iter()
-            .map(|tenure| &tenure.sortition)
-            .rfind(|sortition| sortition.consensus_hash == previous)
+            .find(|sortition| sortition.consensus_hash == previous)
             .ok_or(RpcError::NotFound)?;
         sortitions.push(last.clone());
     }
@@ -2183,6 +2193,103 @@ mod tests {
         }
     }
 
+    /// The sortition routes answer from what this node derived, not from its peer.
+    ///
+    /// A sortition is arithmetic over Bitcoin blocks this node downloaded. Serving
+    /// the peer's account of one would hand a stranger the burn view, and through it
+    /// the fork — the one input a follower must not take on trust. These routes read
+    /// the peer's tenures, so a node deriving a perfectly good chain of its own
+    /// answered `503` for want of a peer walk, which is the wrong answer twice over.
+    ///
+    /// The peer's view is published too, and disagrees on every field that matters:
+    /// a route reading it would pass a test that only checked for `200`.
+    #[tokio::test]
+    async fn the_sortition_routes_answer_from_the_chain_this_node_derived() {
+        let state = RpcState::new(NETWORK);
+        state.publish(captured_view()).await;
+        let derived = SortitionInfo {
+            bitcoin_block_hash: BitcoinHeaderHash::from_bytes([0xaa; 32]),
+            bitcoin_height: 11,
+            bitcoin_timestamp: 1_786_049_385,
+            sortition_id: SortitionId::from_bytes([0xbb; 32]),
+            parent_sortition_id: SortitionId::from_bytes([0xcc; 32]),
+            consensus_hash: ConsensusHash::from_bytes([0xdd; 20]),
+            was_sortition: true,
+            miner_public_key_hash: Some(nano_primitives::Hash160::from_bytes([0xee; 20])),
+            stacks_parent_consensus_hash: Some(ConsensusHash::from_bytes([0x11; 20])),
+            last_sortition_consensus_hash: Some(ConsensusHash::from_bytes([0x22; 20])),
+            committed_block_hash: Some(BlockHeaderHash::from_bytes([0x33; 32])),
+            vrf_seed: Some([0x44; 32]),
+        };
+        let previous = SortitionInfo {
+            consensus_hash: ConsensusHash::from_bytes([0x22; 20]),
+            bitcoin_height: 10,
+            last_sortition_consensus_hash: None,
+            ..derived.clone()
+        };
+        state
+            .publish_executed(
+                sealed_at(&synthetic_block(
+                    12,
+                    StacksBlockId::from_bytes([6; 32]),
+                    ConsensusHash::from_bytes([0xdd; 20]),
+                )),
+                vec![derived, previous],
+            )
+            .await;
+
+        let latest = body_json(
+            router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/v3/sortitions")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        // The peer's tenure names consensus hash `0202..` and no winner key; this
+        // node derived `dddd..` and one.
+        assert_eq!(latest[0]["consensus_hash"], json!(format!("0x{}", "dd".repeat(20))));
+        assert_eq!(latest[0]["miner_pk_hash160"], json!(format!("0x{}", "ee".repeat(20))));
+        assert_eq!(
+            latest[0]["committed_block_hash"],
+            json!(format!("0x{}", "33".repeat(32))),
+            "a derived sortition states the block its winner committed to"
+        );
+
+        // The pair, because a signer refuses a first entry whose predecessor is
+        // named and missing.
+        let pair = body_json(
+            router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/v3/sortitions/latest_and_last")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(pair.as_array().map(Vec::len), Some(2));
+        assert_eq!(pair[1]["consensus_hash"], json!(format!("0x{}", "22".repeat(20))));
+
+        // And the peer's own burn view is not served, however well formed it is.
+        let peers = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v3/sortitions/consensus/{}", "02".repeat(20)))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(peers.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn rejects_requests_until_the_node_has_a_validated_view() {
         let app = router(RpcState::new(NETWORK));
@@ -2220,7 +2327,7 @@ mod tests {
             bitcoin_height: 3,
             state_index_root: TrieHash::from_bytes([9; 32]),
         };
-        state.publish_executed(sealed.clone()).await;
+        state.publish_executed(sealed.clone(), Vec::new()).await;
 
         let info = body_json(
             router(state.clone())
@@ -2290,7 +2397,7 @@ mod tests {
                 consensus_hash: ConsensusHash::from_bytes([6; 20]),
                 bitcoin_height: 3,
                 state_index_root: TrieHash::from_bytes([7; 32]),
-            })
+            }, Vec::new())
             .await;
 
         let status = body_json(
@@ -2423,7 +2530,7 @@ mod tests {
         let (view, blocks) = view_with_blocks(3);
         let state = RpcState::new(NETWORK);
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1])).await;
+        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
             app.oneshot(
@@ -2522,7 +2629,7 @@ mod tests {
             RpcState::new(NETWORK).with_executed_blocks(Arc::new(KeptBlocks(blocks.clone())));
         // No followed view at all, and an executed tip the view could not have
         // reached: exactly the node that used to serve nothing.
-        state.publish_executed(sealed_at(&blocks[2])).await;
+        state.publish_executed(sealed_at(&blocks[2]), Vec::new()).await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
             app.oneshot(
@@ -2591,11 +2698,14 @@ mod tests {
         let state = RpcState::new(NETWORK);
         state.publish(view).await;
         state
-            .publish_executed(sealed_at(&synthetic_block(
-                9,
-                StacksBlockId::from_bytes([9; 32]),
-                ConsensusHash::from_bytes([9; 20]),
-            )))
+            .publish_executed(
+                sealed_at(&synthetic_block(
+                    9,
+                    StacksBlockId::from_bytes([9; 32]),
+                    ConsensusHash::from_bytes([9; 20]),
+                )),
+                Vec::new(),
+            )
             .await;
         let app = router(state);
 
@@ -2688,7 +2798,7 @@ mod tests {
             .with_block_admission(Arc::new(Mutex::new(refusing.clone())))
             .with_block_sink(blocks_out);
         state.publish(view.clone()).await;
-        state.publish_executed(sealed_at(&blocks[1])).await;
+        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
         let upload = |block: &NakamotoBlock, app: Router| {
             let body = block.encode();
             async move {
@@ -2720,7 +2830,7 @@ mod tests {
             .with_block_admission(Arc::new(Mutex::new(accepting)))
             .with_block_sink(blocks_out);
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1])).await;
+        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
 
         let taken = body_json(upload(&blocks[2], router(state.clone())).await).await;
         assert_eq!(taken["accepted"], json!(true));
@@ -2756,7 +2866,7 @@ mod tests {
             .with_observers(EventDispatcher::new(vec![url]))
             .with_proposal_token("t0ken".to_owned());
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1])).await;
+        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
         ProposalNode {
             app: router(state),
             blocks,

@@ -376,11 +376,14 @@ async fn keep_executed_blocks(
 /// nothing at all.
 async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedExecutor>) {
     if let (Some(state), Some(executor)) = (state, executor) {
-        let sealed = {
+        let (sealed, sortitions) = {
             let executor = executor.lock().await;
-            sealed_tip(executor.tip(), executor.bitcoin_height())
+            (
+                sealed_tip(executor.tip(), executor.bitcoin_height()),
+                executor.derived_sortitions(),
+            )
         };
-        state.publish_executed(sealed).await;
+        state.publish_executed(sealed, sortitions).await;
     }
 }
 
@@ -791,7 +794,8 @@ async fn follow(follower: Follower) -> Role {
             rounds.failed |= round.peer_failed;
             let sealed = round.sealed;
             if let Some(state) = state.as_ref() {
-                state.publish_executed(sealed).await;
+                let sortitions = executor.lock().await.derived_sortitions();
+                state.publish_executed(sealed, sortitions).await;
                 publish_reward_cycle(RewardCycleInputs {
                     state,
                     executor,

@@ -4878,6 +4878,8 @@ mod tests {
                 signing_key_hash: None,
                 txid: hash,
                 vrf_seed,
+                committed_block_hash: hash,
+                parent_bitcoin_height: height.saturating_sub(1),
             });
             let snapshot = chain
                 .append_with_winner(&block, 0, nano_sortition::PoxId::initial(), winner)
@@ -5062,12 +5064,17 @@ mod tests {
                     .find(|operation| operation.txid == winning_txid)
                     .and_then(|operation| match operation.kind {
                         nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
-                            new_seed, ..
+                            block_header_hash,
+                            new_seed,
+                            parent_block_height,
+                            ..
                         } => Some(nano_sortition::SortitionWinner {
                             vrf_public_key: None,
                             signing_key_hash: None,
                             txid: winning_txid,
                             vrf_seed: new_seed,
+                            committed_block_hash: block_header_hash,
+                            parent_bitcoin_height: u64::from(parent_block_height),
                         }),
                         _ => None,
                     })

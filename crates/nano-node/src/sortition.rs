@@ -1079,6 +1079,12 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         // after it resolves them from the carried registry.
         winner_vrf_public_key: None,
         winner_signing_key_hash: None,
+        // The same for these two: they describe the winning *commitment*, which a
+        // seed row does not carry, and every snapshot this chain derives afterwards
+        // takes them off the commitment it weighed. A route asked about the seed's
+        // own burn view answers without them rather than with a guess.
+        committed_block_hash: None,
+        parent_bitcoin_height: None,
         // Filled by `prime`, which reads the seed's own burn block: the two spends
         // come out of the commitment window, not out of a captured row.
         burn_spends: None,
@@ -1111,6 +1117,8 @@ mod tests {
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
             winner_signing_key_hash: None,
+            committed_block_hash: None,
+            parent_bitcoin_height: None,
             burn_spends: None,
             pox_id: PoxId::initial(),
         };

@@ -2672,6 +2672,88 @@ where
     pub const fn tip(&self) -> &NakamotoBlock {
         &self.tip
     }
+
+    /// The sortitions this node derived, anchored at the burn view it executed.
+    ///
+    /// What `/v3/sortitions` answers from. Anchored at the *executed* tip's burn
+    /// view rather than at the derived chain's own tip, which is usually further
+    /// ahead: the chain is walked forward to name the view a staged block stands
+    /// on, and reporting that as the node's sortition would be reporting a burn
+    /// block it has executed nothing under.
+    ///
+    /// The pair, because a signer reads its whole view of who may mine from one
+    /// route and refuses to act on a first entry whose `last_sortition_ch` names an
+    /// entry that is not there.
+    ///
+    /// Empty where this node derives no sortitions at all, which is the honest
+    /// answer and the one the route turns into a 503: the alternative was serving
+    /// the burn view a *peer* reported, which is the one input a follower must not
+    /// take from a stranger.
+    #[must_use]
+    pub fn derived_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
+        let Some(tracker) = self.sortition.as_ref() else {
+            return Vec::new();
+        };
+        let executed = self.tip.header.consensus_hash;
+        let Some(height) = tracker.height_of_consensus_hash(executed) else {
+            return Vec::new();
+        };
+        let mut sortitions = Vec::new();
+        let mut walk = Some(height);
+        // The executed view, then the last one before it that elected somebody.
+        // Two is what the route needs; anything further back is a question about
+        // history, which `/v3/sortitions/consensus` answers by walking this same
+        // chain rather than by keeping a window here.
+        while let Some(at) = walk.take() {
+            let Some(snapshot) = tracker.snapshot_at(at) else {
+                break;
+            };
+            sortitions.push(self.sortition_info(snapshot));
+            if sortitions.len() == 2 {
+                break;
+            }
+            walk = tracker.previous_sortition_height(at);
+        }
+        sortitions
+    }
+
+    /// One derived snapshot, in the shape stacks-core's own readers expect.
+    ///
+    /// The two consensus hashes are resolved through this node's *own* history:
+    /// a snapshot names the burn height its commitment built on, and the history
+    /// says what that height was called.
+    fn sortition_info(
+        &self,
+        snapshot: &nano_sortition::SortitionSnapshot,
+    ) -> nano_sync::SortitionInfo {
+        let tracker = self.sortition.as_ref();
+        let hash_at = |height: Option<u64>| {
+            height.and_then(|height| tracker?.consensus_hash_at(height))
+        };
+        let stacks_parent = hash_at(snapshot.parent_bitcoin_height);
+        nano_sync::SortitionInfo {
+            bitcoin_block_hash: snapshot.bitcoin_header_hash,
+            bitcoin_height: snapshot.bitcoin_height,
+            bitcoin_timestamp: snapshot.bitcoin_timestamp,
+            sortition_id: snapshot.sortition_id,
+            parent_sortition_id: snapshot.parent_sortition_id,
+            consensus_hash: snapshot.consensus_hash,
+            was_sortition: snapshot.winner_txid.is_some(),
+            miner_public_key_hash: snapshot
+                .winner_signing_key_hash
+                .map(nano_primitives::Hash160::from_bytes),
+            stacks_parent_consensus_hash: stacks_parent,
+            last_sortition_consensus_hash: hash_at(
+                tracker.and_then(|tracker| {
+                    tracker.previous_sortition_height(snapshot.bitcoin_height)
+                }),
+            ),
+            committed_block_hash: snapshot
+                .committed_block_hash
+                .map(nano_primitives::BlockHeaderHash::from_bytes),
+            vrf_seed: snapshot.winner_vrf_seed,
+        }
+    }
 }
 
 /// The public RPC answers from the state this node executed, and from nothing

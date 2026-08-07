@@ -210,6 +210,9 @@ fn seed_from(genesis: &Captured) -> SortitionSnapshot {
             <[u8; 32]>::try_from(decode(&genesis.sortition_id).as_slice()).expect("32 bytes"),
         ),
         parent_sortition_id: SortitionId::from_bytes([0; 32]),
+        // Both describe the winning *commitment*, which a seed row does not carry.
+        committed_block_hash: None,
+        parent_bitcoin_height: None,
         // Only the ops hash of the block *after* genesis is derived, so the
         // genesis one is never read.
         operations_hash: OpsHash::from_txids(&[]),
@@ -308,13 +311,17 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
                 block.operations.iter().find_map(|operation| {
                     match (operation.txid == winning, &operation.kind) {
                         (true, nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                            block_header_hash,
                             new_seed,
+                            parent_block_height,
                             ..
                         }) => Some(SortitionWinner {
                             signing_key_hash: None,
                             vrf_public_key: None,
                             txid: operation.txid,
                             vrf_seed: *new_seed,
+                            committed_block_hash: *block_header_hash,
+                            parent_bitcoin_height: u64::from(*parent_block_height),
                         }),
                         _ => None,
                     }
@@ -601,6 +608,8 @@ fn a_chain_reaching_through_a_missed_commitment_matches_stacks_core() {
         burn_sats,
         vrf_seed: [0; 32],
         vrf_public_key: None,
+        committed_block_hash: txid(id),
+        parent_bitcoin_height: 0,
     };
     let empty = || CommitmentWindowBlock {
         commitments: Vec::new(),

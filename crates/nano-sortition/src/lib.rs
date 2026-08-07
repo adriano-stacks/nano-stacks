@@ -107,6 +107,12 @@ pub struct MiningCommitment {
     pub vrf_public_key: Option<[u8; 32]>,
     /// The block-signing `Hash160` the same registration carried, if it had one.
     pub signing_key_hash: Option<[u8; 20]>,
+    /// The Stacks block this commitment committed to, which `/v3/sortitions`
+    /// reports as `committed_block_hash`.
+    pub committed_block_hash: [u8; 32],
+    /// The burn height of the sortition whose tenure this commitment builds on,
+    /// which the same route reports through as `stacks_parent_ch`.
+    pub parent_bitcoin_height: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +133,10 @@ pub struct SortitionWinner {
     /// registration may be below this node's window, and only some registrations
     /// carry one at all.
     pub signing_key_hash: Option<[u8; 20]>,
+    /// The Stacks block this commitment committed to.
+    pub committed_block_hash: [u8; 32],
+    /// The burn height of the sortition whose tenure it builds on.
+    pub parent_bitcoin_height: u64,
 }
 
 /// Bitcoin blocks a miner may name when it says which block it built on.
@@ -372,7 +382,9 @@ pub fn commitment_window_block(
     let mut missed_commitments = Vec::new();
     for operation in &block.operations {
         let BitcoinOperationKind::LeaderBlockCommit {
+            block_header_hash,
             new_seed,
+            parent_block_height,
             parent_modulus,
             key_block_height,
             key_transaction_index,
@@ -415,6 +427,8 @@ pub fn commitment_window_block(
                         u32::from(*key_transaction_index),
                     )
                     .and_then(|registration| registration.signing_key_hash),
+                committed_block_hash: *block_header_hash,
+                parent_bitcoin_height: u64::from(*parent_block_height),
             });
         } else {
             missed_commitments.push(MissedCommitment {
@@ -894,6 +908,16 @@ pub struct SortitionSnapshot {
     /// has one — only 101 of mainnet's 2,477 do — so its absence is ordinary and
     /// says the rule cannot run rather than that it failed.
     pub winner_signing_key_hash: Option<[u8; 20]>,
+    /// The Stacks block the winning commitment committed to, which
+    /// `/v3/sortitions` reports as `committed_block_hash`.
+    ///
+    /// Carried for the same reason the two keys above are: a node serving its own
+    /// derived sortitions has to answer everything the route states, and this is a
+    /// fact about the winning commitment that nothing else on the chain records.
+    pub committed_block_hash: Option<[u8; 32]>,
+    /// The burn height of the sortition whose tenure that commitment builds on,
+    /// which the same route reports as `stacks_parent_ch` once the history names it.
+    pub parent_bitcoin_height: Option<u64>,
     /// What this burn block's miners spent on its sortition, and the winner's
     /// share, which Clarity reads back as `miner-spend-total`/`miner-spend-winner`.
     ///
@@ -927,6 +951,8 @@ impl SortitionSnapshot {
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
             winner_signing_key_hash: None,
+            committed_block_hash: None,
+            parent_bitcoin_height: None,
             burn_spends: None,
             pox_id: PoxId::initial(),
         }
@@ -1237,6 +1263,8 @@ impl SnapshotChain {
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             winner_vrf_public_key: winner.and_then(|winner| winner.vrf_public_key),
             winner_signing_key_hash: winner.and_then(|winner| winner.signing_key_hash),
+            committed_block_hash: winner.map(|winner| winner.committed_block_hash),
+            parent_bitcoin_height: winner.map(|winner| winner.parent_bitcoin_height),
             // Filled by whoever holds the commitment window this sortition was
             // weighed over, which is `SortitionEngine::append`: this chain is given
             // a total burn and a winner and never sees a commitment.
@@ -1636,6 +1664,12 @@ impl SortitionEngine {
                             vrf_seed: distribution[index].candidate.vrf_seed,
                             vrf_public_key: distribution[index].candidate.vrf_public_key,
                             signing_key_hash: distribution[index].candidate.signing_key_hash,
+                            committed_block_hash: distribution[index]
+                                .candidate
+                                .committed_block_hash,
+                            parent_bitcoin_height: distribution[index]
+                                .candidate
+                                .parent_bitcoin_height,
                         },
                     )
                 })
@@ -2153,6 +2187,8 @@ mod tests {
             vrf_seed: [hash; 32],
             vrf_public_key: None,
             signing_key_hash: None,
+            committed_block_hash: [hash; 32],
+            parent_bitcoin_height: height.saturating_sub(1),
         };
         engine
             .append(
@@ -2188,6 +2224,8 @@ mod tests {
             spent_output: 3,
             burn_sats,
             vrf_seed: [0; 32],
+            committed_block_hash: [txid; 32],
+            parent_bitcoin_height: 0,
         }
     }
 
