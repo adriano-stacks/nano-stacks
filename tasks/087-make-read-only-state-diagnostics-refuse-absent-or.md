@@ -121,3 +121,14 @@ The accidental store was inspected and left alone: 24 KiB `marf.sqlite` and
 stamped 19:15 on 2026-08-07, beside the real 40.8 GB / 15.5 GB pair under
 `state/chainstate`. It is not deleted here; another operator may still want it as
 evidence.
+
+## Why this is still in progress
+
+Every acceptance criterion is met and tested except the last one end to end:
+"task 086 can retrieve the real deployed contract source without stopping on a
+false empty store." 086 has the source — a peer served it, which needed no state
+at all — so it is not stopped. But `check-module` has not been run against the
+real 40 GB `/home/aldur/mainnet-restored/state` through the new API, because a
+node owns that state and `refuse_uncommitted` correctly refuses its 13 MB
+`marf.sqlite-wal`. That is the API behaving as designed rather than a gap in it,
+and the run is one command once the node stops.
