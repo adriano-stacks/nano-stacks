@@ -1034,6 +1034,16 @@ impl ChainState {
         self.vm.tip()
     }
 
+    /// Whether a sealed block has a ledger this chain can stand on.
+    ///
+    /// A sealed state is not by itself a block this node executed: the ledger is
+    /// written first and the MARF seal is the commit, so a state whose ledger is
+    /// gone is one nothing names.
+    #[must_use]
+    pub fn has_ledger(&self, block: [u8; 32]) -> bool {
+        self.vm.has_recorded_ledger(block)
+    }
+
     /// Give back every sealed state above a height, which is state no ledger names.
     pub fn discard_above(&mut self, height: u32) -> Result<usize, ChainStateError> {
         Ok(self.vm.discard_above(height)?)

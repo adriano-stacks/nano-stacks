@@ -1526,6 +1526,15 @@ impl Vm {
         self.store.ledger_at(block)
     }
 
+    /// Whether a block has a ledger to stand on, without reading it back.
+    ///
+    /// A resume asks this of one block after another walking back, and a mainnet
+    /// ledger is tens of kilobytes, so the answer is worth having without the row.
+    #[must_use]
+    pub fn has_recorded_ledger(&self, block: [u8; 32]) -> bool {
+        self.store.has_ledger(block)
+    }
+
     /// Stand on the tenure-start answers a block's committed ledger holds.
     ///
     /// `get-tenure-info?` reads these, and they live in memory, so a restart
@@ -2454,11 +2463,25 @@ impl MarfStore {
     }
 
     /// Keep the state its caller holds beside the MARF, as of this block.
+    ///
+    /// A block already in here keeps the sequence it was first written at, and only
+    /// its data is replaced. `INSERT OR REPLACE` moved it to the front instead, and
+    /// the sequence is what the window below is measured in — so re-writing one
+    /// block advanced the window without adding a block to it, and 256 re-writes
+    /// pruned every *other* block's ledger away.
+    ///
+    /// That is not hypothetical. A live mainnet node retried one block 766 times --
+    /// each retry wrote this row and then failed on the MARF seal that follows it --
+    /// and its side store was left holding a single ledger, for the one block it
+    /// could not execute, with the 256 blocks of history a resume and a
+    /// reorganization walk need gone. Re-executing a block is ordinary: a fork
+    /// switch, a re-fetch and a retry all do it, and none of them is history.
     fn write_ledger(&self, block: [u8; 32], ledger: &[u8]) -> Result<(), MarfStoreError> {
         self.side_store
             .prepare_cached(
-                "INSERT OR REPLACE INTO chain_ledger (block_id, sequence, data) \
-                 VALUES (?1, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM chain_ledger), ?2)",
+                "INSERT INTO chain_ledger (block_id, sequence, data) \
+                 VALUES (?1, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM chain_ledger), ?2) \
+                 ON CONFLICT(block_id) DO UPDATE SET data = excluded.data",
             )?
             .execute(params![block.as_slice(), ledger])?;
         self.side_store
@@ -2468,6 +2491,19 @@ impl MarfStore {
             )?
             .execute(params![LEDGER_HISTORY])?;
         Ok(())
+    }
+
+    /// Whether this block has a ledger, without reading the ledger itself.
+    #[must_use]
+    pub fn has_ledger(&self, block: [u8; 32]) -> bool {
+        self.side_store
+            .prepare_cached("SELECT 1 FROM chain_ledger WHERE block_id = ?1")
+            .and_then(|mut statement| {
+                statement
+                    .query_row(params![block.as_slice()], |_| Ok(()))
+                    .optional()
+            })
+            .is_ok_and(|found| found.is_some())
     }
 
     /// The state the run that sealed this block kept beside the MARF.
@@ -5089,6 +5125,67 @@ mod tests {
         // The child's rows are on disk and unreachable: nothing addresses them
         // but the child, and the child is not in the MARF.
         assert!(store.ledger_at([2; 32]).is_some());
+    }
+
+    /// Re-writing one block's ledger is not history, and must not spend the window.
+    ///
+    /// A live mainnet node retried one block 766 times: each retry wrote that block's
+    /// ledger row and then failed on the MARF seal that follows it. The row moved to
+    /// the front of the window every time, so after 256 retries the side store held
+    /// **one** ledger — for the block it could not execute — and the 256 blocks of
+    /// history a resume and a reorganization walk need were gone. Its state is still
+    /// on disk with a single row in it.
+    ///
+    /// So the retries here outnumber the window, and what is asserted is that the
+    /// blocks before them are still there.
+    #[test]
+    fn retrying_one_block_does_not_prune_the_ledgers_of_the_blocks_before_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("open");
+        let block = |height: u32| {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&height.to_be_bytes());
+            id
+        };
+        let commit = |ledger: &str| BlockCommit {
+            header: BlockHeader::default(),
+            ledger: ledger.as_bytes().to_vec(),
+        };
+
+        let mut parent = None;
+        for height in 1..=8u32 {
+            store.begin(parent, block(height)).expect("begin");
+            store
+                .commit_to(block(height), &commit("as of a real block"))
+                .expect("commit");
+            parent = Some(block(height));
+        }
+
+        // The retry loop: the ninth block, over and over, more times than the window
+        // is wide. Execution begins under a *temporary* state id, the way the node
+        // does it, so nothing refuses the retry until `commit_to` seals to the real
+        // one — by which point `prepare_commit` has already written this block's
+        // header and its ledger. That ordering is the whole bug: the write that
+        // spends the window happens on the path that fails.
+        for retry in 0..crate::LEDGER_HISTORY + 64 {
+            let temporary = block(1_000_000 + retry);
+            store.begin(parent, temporary).expect("begin a block");
+            let outcome = store.commit_to(block(9), &commit("as of the block it cannot execute"));
+            assert!(
+                retry == 0 || outcome.is_err(),
+                "the MARF takes a version once, so every retry after the first fails"
+            );
+            drop(store.abort());
+        }
+
+        for height in 1..=8u32 {
+            assert!(
+                store.ledger_at(block(height)).is_some(),
+                "block {height}'s ledger was pruned away by retries of another block"
+            );
+        }
+        assert!(store.has_ledger(block(8)));
+        assert!(!store.has_ledger(block(64)), "a block never written has none");
     }
 
     /// The size at which a contract of trait calls stops compiling.

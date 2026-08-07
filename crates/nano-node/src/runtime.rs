@@ -1454,6 +1454,7 @@ pub async fn open_chainstate(
         context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
         return Ok((chainstate, anchor, Some(context)));
     };
+    let tip = deepest_block_a_ledger_names(&chainstate, tip, config.node.max_sync_blocks);
     // A peer that does not have this block yet is usually one still catching
     // up, not a chain that moved: it is worth waiting for. A peer that never
     // produces it means this state descends from a block the network dropped,
@@ -1502,6 +1503,55 @@ pub async fn open_chainstate(
     }
     recover_ledger(&mut chainstate, config, directory, &tip)?;
     Ok((chainstate, tip, None))
+}
+
+/// The deepest sealed state at or below `tip` that a ledger names.
+///
+/// The deepest sealed state is not always a block this node executed. A block is
+/// committed by writing its ledger and *then* sealing the MARF, so a state whose
+/// ledger is gone is one nothing points at — and standing on it costs the whole
+/// recovery: no reorganization reach, no tenure start heights, no parent tenure
+/// proof, and a maturity window read back from `accounting.json` instead of from
+/// the tip, which a mainnet node then refuses to start on.
+///
+/// A live mainnet state was left exactly there. It held sealed states to 8,713,522
+/// and one single ledger, for 8,713,222, because the block it could not execute
+/// re-wrote that row 766 times and pruned the rest away. Resuming at the seal put
+/// it on a block no ledger named; resuming at the ledger puts it back on its own
+/// chain with 300 states to give back and re-execute.
+///
+/// The reach is a catch-up round's worth of blocks, because that is how deep a run
+/// can seal before it fails: past that there is nothing to find, since every block
+/// sealed writes a ledger first.
+fn deepest_block_a_ledger_names(chainstate: &ChainState, tip: [u8; 32], reach: usize) -> [u8; 32] {
+    let mut walk = tip;
+    for walked in 0..reach {
+        if chainstate.has_ledger(walk) {
+            if walked > 0 {
+                println!(
+                    "the deepest sealed state {} has no ledger to stand on, so this run \
+                     resumes {walked} blocks back at {}, which has one, and gives back what \
+                     is above it",
+                    hex::encode(tip),
+                    hex::encode(walk)
+                );
+            }
+            return walk;
+        }
+        let Some(parent) = chainstate.parent_of(walk) else {
+            break;
+        };
+        walk = parent;
+    }
+    // Nothing within reach has one, so the caller falls back to `accounting.json`
+    // and says what that costs. Reported here too, because the seal it is about to
+    // resume at is not the reason -- the missing ledgers are.
+    eprintln!(
+        "no sealed state at or within {reach} blocks below {} has a ledger, so this run \
+         cannot stand on one",
+        hex::encode(tip)
+    );
+    tip
 }
 
 /// Stand on the state the run that sealed this block kept beside the MARF.
@@ -3396,6 +3446,100 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
                 "this failure must not give back state: {other}"
             );
         }
+    }
+
+    /// A resume stands on the deepest block a *ledger* names, not the deepest seal.
+    ///
+    /// The two part exactly where a mainnet state parted them: sealed states above
+    /// the last one a ledger names. Standing on the seal costs the whole recovery —
+    /// no reorganization reach, no tenure start heights, no parent tenure proof and
+    /// a maturity window read from `accounting.json`, which a mainnet node then
+    /// refuses to start on — and it also hides the residue from the give-back,
+    /// because there is nothing above the seal to give back.
+    #[test]
+    fn a_resume_stands_on_the_deepest_ledger_not_the_deepest_seal() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut chainstate =
+            nano_chainstate::ChainState::open(nano_primitives::Network::MAINNET, directory.path())
+                .expect("open");
+        let block = |height: u8| [height; 32];
+
+        let mut parent = None;
+        for height in 1..=3u8 {
+            chainstate
+                .vm_mut()
+                .begin_block(parent, block(height))
+                .expect("begin");
+            chainstate
+                .vm_mut()
+                .commit_block(
+                    block(height),
+                    &nano_vm::BlockCommit {
+                        header: nano_vm::BlockHeader::default(),
+                        ledger: b"a block this node committed".to_vec(),
+                    },
+                )
+                .expect("commit");
+            parent = Some(block(height));
+        }
+        // The residue: sealed, and no ledger names them.
+        for height in 4..=5u8 {
+            chainstate
+                .vm_mut()
+                .begin_block(parent, block(height))
+                .expect("begin");
+            chainstate
+                .vm_mut()
+                .seal_block_to(block(height))
+                .expect("seal");
+            parent = Some(block(height));
+        }
+
+        assert_eq!(chainstate.tip(), Some(block(5)), "the deepest seal");
+        assert_eq!(
+            super::deepest_block_a_ledger_names(&chainstate, block(5), 500),
+            block(3),
+            "and the deepest block a ledger names is two below it"
+        );
+        // Which is what makes the give-back reach them at all.
+        let height = chainstate.height_of(block(3)).expect("a sealed height");
+        assert_eq!(chainstate.discard_above(height).expect("give back"), 2);
+    }
+
+    /// A reach that does not span the residue leaves the tip where it was.
+    ///
+    /// Said rather than guessed: resuming somewhere arbitrary because the walk ran
+    /// out is worse than resuming at the seal and reporting what that costs.
+    #[test]
+    fn a_ledger_out_of_reach_leaves_the_resume_at_the_seal() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut chainstate =
+            nano_chainstate::ChainState::open(nano_primitives::Network::MAINNET, directory.path())
+                .expect("open");
+        chainstate
+            .vm_mut()
+            .begin_block(None, [1; 32])
+            .expect("begin");
+        chainstate
+            .vm_mut()
+            .commit_block(
+                [1; 32],
+                &nano_vm::BlockCommit {
+                    header: nano_vm::BlockHeader::default(),
+                    ledger: b"the only ledger".to_vec(),
+                },
+            )
+            .expect("commit");
+        chainstate
+            .vm_mut()
+            .begin_block(Some([1; 32]), [2; 32])
+            .expect("begin");
+        chainstate.vm_mut().seal_block_to([2; 32]).expect("seal");
+
+        assert_eq!(
+            super::deepest_block_a_ledger_names(&chainstate, [2; 32], 1),
+            [2; 32]
+        );
     }
 
     #[test]

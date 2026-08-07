@@ -41,4 +41,7 @@ name = "stacks-node"
 path = "src/main.rs"
 
 [dev-dependencies]
+# To build a state shaped like the mainnet one a resume has to recover: sealed
+# above the last block a ledger names. Already in the graph under nano-chainstate.
+nano-vm = { path = "../nano-vm" }
 tempfile = "3"
