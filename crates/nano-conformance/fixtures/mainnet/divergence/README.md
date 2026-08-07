@@ -64,8 +64,22 @@ reads above exist to handle, and the same family as the trait-reference work alr
 pinned by `as_contract_codegen::a_contract_principal_where_a_trait_is_expected_compiles`
 and `as_contract_sender::both_engines_agree_on_which_contract_a_trait_names`.
 
-Those tests pass, so whatever is wrong here is not covered by them. The argument to
-reproduce against is a contract principal carrying a **ten-character** contract name,
-passed as a trait, alongside a two-kilobyte buff — the buff matters because it is what
-moves everything after it in memory, and an offset that is wrong by the buff's length
-is the obvious suspect.
+Those tests pass, so whatever is wrong here is not covered by them.
+
+### Ruled out: the buff is not moving the principal
+
+The obvious suspect was the two-kilobyte buff — a buff is what moves everything after
+it in memory, so an offset wrong by its length would produce exactly a bogus version
+byte. `a_trait_beside_a_large_buff_still_names_its_contract` minimizes that shape: a
+read-only function taking `(<named> uint uint (buff 2048))`, called with buffs of 0,
+1, 64, 1024, 2000 and 2048 bytes, crosschecked against the interpreter.
+
+**It passes at every size.** So the argument *shape* is not the bug, and the test
+stays as a regression pinning that.
+
+What is left is what the minimization dropped. The real function is `define-public`
+rather than read-only, and it does not merely name its trait — it calls *through* it,
+into `sbtc-token`, and the surrounding transaction moves collateral. The next
+minimization should keep the trait being **called** rather than only read, since the
+principal that goes wrong may be the one reconstructed to dispatch the call rather
+than the one passed in.

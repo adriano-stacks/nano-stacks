@@ -44,6 +44,15 @@ const OUTER: &str = "
 (define-read-only (from-list (ts (list 4 <named>)) (at uint))
   (name-it (unwrap-panic (element-at? ts at))))
 
+;; The mainnet shape: a trait reference standing beside a large buff, which is
+;; what moves everything after it in memory. `v0-5-market::supply-collateral-add`
+;; takes exactly this -- a token trait, two uints and a two-kilobyte price-feed
+;; payload -- and nano failed the block it was in with `Unexpected principal
+;; data`, which is a version byte of 32 or more and so a principal read at the
+;; wrong offset. See `fixtures/mainnet/divergence`.
+(define-read-only (named-beside-a-buff (t <named>) (a uint) (b uint) (payload (buff 2048)))
+  (contract-of t))
+
 (define-public (inner-as-me) (contract-call? .inner as-me))
 (define-public (inner-as-me-entered) (as-contract (contract-call? .inner as-me)))
 (define-public (inner-who-entered) (as-contract (contract-call? .inner who)))
@@ -200,6 +209,36 @@ fn both_engines_agree_on_a_trait_taken_from_a_list() {
         assert_eq!(
             compiled, interpreted,
             "the engines agree on element {at} of a trait list"
+        );
+    }
+}
+
+/// A trait reference read correctly when a large buff shares the call.
+///
+/// The minimized shape of mainnet 8,708,126. That block calls
+/// `v0-5-market::supply-collateral-add` with a token trait, two uints and a
+/// two-kilobyte buff, and nano fails the *block* with `Unexpected principal data` --
+/// which `StandardPrincipalData::new` raises for one reason, a version byte of 32 or
+/// more, so something read a principal at the wrong offset.
+///
+/// A buff is what moves everything after it in memory, which is why it is the
+/// argument under suspicion rather than the trait. The buff grows across the sizes
+/// either side of the real one, because an offset wrong by a length is a bug that
+/// appears at a size rather than at a shape.
+#[test]
+fn a_trait_beside_a_large_buff_still_names_its_contract() {
+    for size in [0usize, 1, 64, 1024, 2000, 2048] {
+        let payload = Value::buff_from(vec![0xab; size]).expect("a buff");
+        let arguments = vec![
+            trait_argument(),
+            Value::UInt(46_413).serialize_to_vec().expect("a uint"),
+            Value::UInt(45_924).serialize_to_vec().expect("a uint"),
+            payload.serialize_to_vec().expect("the payload"),
+        ];
+        let (compiled, interpreted) = answers_with("named-beside-a-buff", &arguments);
+        assert_eq!(
+            compiled, interpreted,
+            "a {size}-byte buff beside a trait reference changed which contract it names"
         );
     }
 }
