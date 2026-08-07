@@ -100,3 +100,69 @@ The repository has no root CI configuration, ignores `flake.lock`, follows
 `nixos-unstable`, and asks rustup for floating `stable`. Nix regenerated the
 ignored lock during the audit, while `cargo fmt --all -- --check` failed across
 vendored clarity-wasm and workspace tooling.
+
+## The mainnet gates do run on this machine, 2026-08-07
+
+`NANO_REQUIRE_MAINNET=1` turns every `skip_gate` into a failure, so a run that
+claims the mainnet gates are green had to have run them. Run that way with no
+inputs at all, the suite reports **22 failures, 21 of them "could not run"** —
+which is the honest report and is what CI has been producing.
+
+The inputs exist on this machine and were never wired up. With them:
+
+```sh
+CP=/home/aldur/mainnet-capture
+ST=/home/aldur/mainnet-8716986/state/chainstate     # chain_id 1, no node on it, clean wal
+NANO_MAINNET_CAPTURE=$CP \
+NANO_MAINNET_RECEIPTS=/home/aldur/mainnet-receipts \
+NANO_MAINNET_CHECKPOINT=$CP/chainstate/checkpoint-H \
+NANO_MAINNET_MARF=$CP/chainstate/checkpoint-H/marf.sqlite \
+NANO_MAINNET_ARCHIVE=/home/aldur/mainnet-chainstate/mainnet/chainstate/vm/index.sqlite \
+NANO_MAINNET_STATE=$ST \
+NANO_NODE_MARF=$ST/marf.sqlite \
+NANO_NODE_CLARITY=$ST/clarity.sqlite \
+NANO_MAINNET_JOURNAL=/home/aldur/mainnet-journal-8665602-8665607.txt \
+NANO_MAINNET_BLOCKS=<concatenated capture/nakamoto/blocks/*.bin> \
+NANO_REQUIRE_MAINNET=1 \
+  cargo test --release -p nano-conformance --test conformance
+```
+
+**251 passed, 7 failed, 4 ignored**, from 236/22. What that buys is the gates
+themselves, not the number: `mainnet_sortition` (five of them, deriving mainnet's
+own window), `signer_weight_enforcement::every_captured_mainnet_block_authenticates`,
+`mainnet_codec` decoding every captured block against stacks-core's decoder,
+`tenure_continuity`, `burn_spends`, `mainnet_accounting` and
+`mainnet_receipts::a_run_reproduces_the_frozen_mainnet_receipts` all ran against
+real mainnet data rather than skipping.
+
+`NANO_MAINNET_BLOCKS` wants a single concatenated stream and the capture stores
+one file per block, which is why it read as a directory the first time.
+
+### The seven that are left, and why supplying more variables would be dishonest
+
+- `mainnet_checkpoint` ×3 and `write_journal::stacks_core_opens_a_mainnet_checkpoint_with_external_blobs`
+  want `NANO_MAINNET_BLOCK`, `NANO_MAINNET_KEY`, `NANO_MAINNET_ROOT`. These are
+  *parameterised investigations* — "tell me about this block, this key" — not
+  fixed gates, and inventing values to make them run would be making a number go
+  up.
+- `trie_diff` wants `NANO_TRIE_PROOF`, `NANO_TRIE_STATE`, `NANO_TRIE_PARENT` and
+  `NANO_TRIE_WRITES`: a specific recorded divergence, which is not one this
+  machine holds.
+- `write_journal::a_recorded_mainnet_journal_seals_the_chains_root` **ran** and
+  failed on `UNIQUE constraint failed: marf_data.block_hash` — it writes the
+  journal's block into a stacks-core MARF and the 56 GB archive already holds it.
+  It needs a writable copy of the archive, not another variable.
+
+`signer_weight_enforcement` had to be routed through `ChainState::open_existing`
+first. It used `ChainState::open`, which would have created the directory on a
+wrong path, adopted a network, appended an `engine_identity` row and left a WAL —
+on an operator's real state. It also found that `/home/aldur/mainnet-pristine`
+carries no `chain_identity` row at all, which the writable opener would have
+silently adopted as mainnet.
+
+## Tasks
+
+- [ ] Wire these variables into the release job so the mainnet gates run there,
+      and fail the job when any required one is absent rather than skipping.
+- [ ] Decide which of the seven are gates and which are diagnostics, and stop
+      counting the diagnostics as gates.

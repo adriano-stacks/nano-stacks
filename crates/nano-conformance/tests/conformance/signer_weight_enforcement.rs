@@ -316,8 +316,12 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
         );
         return;
     };
-    let mut chainstate = ChainState::open(nano_primitives::Network::MAINNET, &state)
-        .expect("the mainnet state opens");
+    // Read-only, because this is somebody's real mainnet state and the gate only
+    // reads it. `ChainState::open` would create the directory if the path were
+    // wrong, adopt a network, append an `engine_identity` row and leave a WAL --
+    // on an operator's 33 GB directory. See task 087.
+    let mut chainstate =
+        ChainState::open_existing(&state).expect("the mainnet state opens for reading");
     // The cycle the capture published, taken from the file rather than computed:
     // this test is about the set, and the calendar has its own tests.
     let cycle = fs::read_dir(capture.join("stacker_set"))
@@ -398,8 +402,12 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
         );
         return;
     };
-    let mut chainstate = ChainState::open(nano_primitives::Network::MAINNET, &state)
-        .expect("the mainnet state opens");
+    // Read-only, because this is somebody's real mainnet state and the gate only
+    // reads it. `ChainState::open` would create the directory if the path were
+    // wrong, adopt a network, append an `engine_identity` row and leave a WAL --
+    // on an operator's 33 GB directory. See task 087.
+    let mut chainstate =
+        ChainState::open_existing(&state).expect("the mainnet state opens for reading");
     let Some(set) = recorded_set_or_skip(&mut chainstate, mainnet_context(&capture)) else {
         return;
     };
