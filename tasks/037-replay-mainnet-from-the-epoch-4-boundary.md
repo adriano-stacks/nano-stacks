@@ -119,6 +119,32 @@ never from fetched, staged or peer-reported height.
         unknown, and the message named neither key; it now carries the registered
         hash, the recovered one and the VRF key the local burn distribution elected,
         so a recurrence answers itself. **Open.**
+      **Blocked, 2026-08-07, and the cause is recorded rather than guessed.**
+
+      Two things happened, one operational and one a defect.
+
+      The operational one was mine: a second node was started on the live state
+      directory after `node.lock` was deleted. Its startup give-back removed the MARF
+      version the *running* node was standing on, which produced eleven
+      `MARF version does not exist` failures and then a persistent state-root mismatch
+      at 8,716,986. The lock exists for exactly this and worked the moment it was left
+      alone. Rewinding the MARF to 8,716,970 -- the same operation `discard_above`
+      performs -- cleared it: the node re-executed 8,716,971 through 8,716,974 with
+      **zero** root mismatches, which is also what rules 077 out as the cause.
+
+      The defect is the one this task already names, now blocking rather than
+      theoretical. The rewind put the executed tip *behind* the saved sortition tip,
+      and a chain only walks forward:
+
+      > the local sortition chain holds no snapshot for burn 961,447, which this block
+      > stands on: it ends at burn 961,450 and keeps a bounded window behind that
+
+      Setting the saved chain aside so it re-seeds from the checkpoint did not help --
+      it seeded at 961,451, ahead again. So the fix is the one written above and is
+      now required, not optional: persist the retained window rather than the tip
+      alone, or seed a resumed chain at the burn view the *executed* tip needs. Until
+      then this state cannot advance, and the frontier stands at **8,716,974**.
+
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.

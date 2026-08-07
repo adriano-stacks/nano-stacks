@@ -1,7 +1,7 @@
 ---
 id: "077"
 title: "Remove peer-derived consensus execution fallbacks"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["049", "051"]
 tags: ["mainnet", "consensus", "sortition", "checkpoint"]
 created_at: 2026-08-07
+completed_at: 2026-08-07
 ---
 
 # Remove peer-derived consensus execution fallbacks
