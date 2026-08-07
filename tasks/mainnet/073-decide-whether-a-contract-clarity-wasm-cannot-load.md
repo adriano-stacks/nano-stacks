@@ -333,6 +333,48 @@ module-load refusal class stays reachable via 26,000 all-read bindings (peak
 that shape and stays 6/6 green. Validated independently: clar2wasm lib suite
 1,402/0, gate 6/6, clippy clean both crates.
 
+## Mainnet-state margin (2026-08-07, measured over real state)
+
+Compiled **every contract in the imported mainnet state** (137,340; checkpoint
+tip) under each contract's own stored epoch/Clarity version, with a shared
+analysis store and fixpoint passes for trait resolution: **137,332 compile**,
+8 fail (see below). Peak live locals per contract, measured by
+`locals_report` (A+G codegen; B1 only lowers these further):
+
+| peak live locals | contracts |
+|---|---|
+| 0–1,000 | 136,796 |
+| 1k–5k | 494 |
+| 5k–10k | 37 |
+| 10k–25k | 5 |
+| 25k–50k | 0 |
+| >50k | 0 |
+
+**Highest peak on mainnet: 16,505** (`SP3EGAD1…t-a-1`; the next are
+`this-13` 16,035, `anxious-peach-leopon` 15,005 — generated/test-looking
+contracts; the highest organic ones are the nakamoto-airdrop family at
+7,176). Margin to wasmtime's 50,000: **3.0× worst-case, ~7× for organic
+contracts, and 99.6% of mainnet sits under 1k.** This is the measured-margin
+evidence the acceptance criteria ask for.
+
+The 8 compile failures are NOT locals-related and warrant their own look
+(reported to the release-gate task): 3× `Not implemented`
+(`amm-swap003`, two `.pool` contracts), 4× duck-typing buffer errors
+(`gated-pages*`), 1× `Tuples fields should be typed`
+(`trajan-endorsement-alpha`). Some may be harness artifacts (plain
+`compile()` differs from nano-vm's `compile_under` in cost-epoch handling);
+each needs confirming against the production path before counting as a real
+differential.
+
+Method (reproducible): sources+epochs extracted read-only from
+`mainnet-tip/state/chainstate/clarity.sqlite` `metadata_table`; per contract
+`clar2wasm::compile` under its stored epoch/version; successful analyses
+planted back (`insert_contract_hash` + `set_metadata(analysis)` — the
+deploy-recipe; a bare `AnalysisDatabase::insert_contract` writes metadata the
+read path never finds, since reads key on the contract-hash table). Raw data:
+`/tmp/mainnet_margin.out` (per-contract peaks), extraction
+`/tmp/mainnet_contracts.jsonl`.
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
