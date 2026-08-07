@@ -71,6 +71,7 @@ mod release_inventory;
 mod restart;
 mod signer_weight_enforcement;
 mod submitted_transaction;
+mod tenure_block_reward;
 mod tenure_continuity;
 mod tenure_fee_maturity;
 mod tenure_vrf_enforcement;

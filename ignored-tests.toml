@@ -52,13 +52,22 @@ rule read as an environment problem.
 
 [[ignored]]
 test = "get_tenure_info_block_reward"
-class = "semantic"
+class = "infrastructure"
 owner = "060"
+job = "covered elsewhere"
+covered_by = "nano-conformance tenure_block_reward"
 measured = """
-`(get-tenure-info? block-reward u0)` answers `none` where the test expects
-`(some u0)`, because the harness does not simulate a block reward. That is a true
-statement about the harness and it leaves a live epoch-4.0 Clarity read with no
-crosscheck anywhere: nano's own suite does not cover `block-reward` either.
+`(get-tenure-info? block-reward u0)` answers `none` against an expected
+`(some u0)`, because that harness cannot simulate a block reward -- a true
+statement about it, and it used to leave a live epoch-4.0 Clarity read
+uncovered in both directions.
+
+Nano can simulate it, because nano's headers carry the number:
+`get_tokens_earned_for_block` reads `BlockHeader::block_reward` off the header a
+block was sealed with. `tenure_block_reward` builds a chain whose tenures earn
+different amounts and crosschecks the compiler against the reference interpreter
+for every one of them, plus `miner-spend-total` beside it. So the *behaviour* is
+gated even though this test cannot be.
 """
 
 # ---------------------------------------------------------------------------

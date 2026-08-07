@@ -134,7 +134,7 @@ guesses to **5 measured semantic differentials**:
 | ~~`asserts_false`~~ | **Fixed and running.** `(asserts! false V)` raises `EarlyReturn(AssertionFailed(V))` — which is correct; `UnwrapFailed` is `try!`'s — and the thrown value's list type comes back narrowed to the data's own length. The engines *agree* on both: the failure was at the expected-value assertion, not the engine-divergence one, so only the hand-built expectation was stale. Rewritten as `crosscheck_compare_only_with_expected_error` and un-ignored. |
 | ~~`asserts_with_begin_false`~~ | **Fixed and running**, same cause. |
 | ~~`as_contract_can_return_any_value`~~ | **Out-of-scope, measured.** `UnknownFunction("as-contract")` in both engines, and clarity's registry settles it: `AsContract("as-contract", Clarity1, Some(Clarity3))` — removed after Clarity 3, replaced by `as-contract?`. Nano covers `as-contract` at Clarity 3 in `as_contract_sender` (which matters, because 064 compiles an old contract under its deployment epoch) and `as-contract?` in `allowance_principal`. |
-| `get_tenure_info_block_reward` | `(get-tenure-info? block-reward u0)` answers `none` against an expected `(some u0)`. The harness cannot simulate a block reward, and nano's own suite does not cover `block-reward` either, so a live epoch-4.0 Clarity read has no crosscheck anywhere. |
+| ~~`get_tenure_info_block_reward`~~ | **Covered now.** The clar2wasm harness genuinely cannot simulate a block reward, but nano can: its headers carry the number. `tenure_block_reward` builds a chain whose tenures earn different amounts and crosschecks both engines for every one of them, plus `miner-spend-total` beside it. The test stays ignored where it is; the behaviour is gated where it can be. |
 
 Eleven are `out-of-scope`, and that is measured too rather than assumed: each
 fails with `use of unresolved function` in **both** engines, because the harness
@@ -152,13 +152,22 @@ three of them are the stock-signer and stock-client journeys 053 requires by nam
 behind a reason string that says the test system needs improving, and the test
 system is not what is wrong with it.
 
-**Two remain, from fifteen.** `contract_call_with_epoch_3_3` (costs-4 will not
-load) and `get_tenure_info_block_reward` (a live Clarity read with no crosscheck
-anywhere).
+**One remains, from fifteen.** `contract_call_with_epoch_3_3`: `costs-4` will not
+load, so the cost schedule epoch 4.0 runs under is crosschecked against nothing.
+That is task 023's work, not this task's.
+
+Writing `tenure_block_reward` repeated the mistake this task exists to remove,
+which is worth recording: its first draft asserted that tenure *H* answers
+`reward_of(H)`, and it failed — on the *expected value*, with the engines in
+agreement. `get-tenure-info?` resolves a tenure height through the tenure's first
+block and tenure 0 has no answer at all. The assertion is agreement plus
+*reading* now: the engines answer the same thing, the answers differ from tenure
+to tenure, and every one is a reward some header was sealed with. A hand-derived
+expectation is exactly what left `asserts_false` ignored.
 
 ## What is still open
 
-- The two semantic entries have to reach zero. Owners 023 and 060.
+- The last semantic entry has to reach zero. Owner 023.
 - `cargo test -p clar2wasm --all-features` fails one test,
   `clarity_v3::at_block_with_stacks_block_height`, where enabling every
   `test-clarity-vN` feature at once resolves `TestConfig::clarity_version()` to
