@@ -10,7 +10,7 @@ use clarity::vm::ClarityVersion;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 pub use walrus::Module;
-use wasm_generator::{GeneratorError, WasmGenerator};
+use wasm_generator::{GeneratorError, LocalsReport, WasmGenerator};
 
 use crate::error::WasmError;
 
@@ -54,6 +54,10 @@ pub struct CompileResult {
     pub diagnostics: Vec<Diagnostic>,
     pub module: Module,
     pub contract_analysis: ContractAnalysis,
+    /// Peak simultaneously-live wasm locals per generated function, measured
+    /// during generation. Measurement only: nothing refuses compilation
+    /// based on it.
+    pub locals_report: LocalsReport,
 }
 
 #[derive(Debug)]
@@ -276,12 +280,35 @@ pub fn compile_for_cost_epoch(
         true => WasmGenerator::with_cost_code_for_epoch(contract_analysis.clone(), cost_epoch),
     };
 
-    match generator.and_then(WasmGenerator::generate) {
+    let generator = match generator {
+        Ok(generator) => generator,
+        Err(e) => {
+            diagnostics.push(Diagnostic::err(&e));
+            return Err(CompileError::Generic {
+                ast: Box::new(ast),
+                diagnostics,
+                #[allow(clippy::expect_used)]
+                cost_tracker: Box::new(
+                    contract_analysis
+                        .cost_track
+                        .take()
+                        .expect("Failed to take cost tracker from contract analysis"),
+                ),
+            });
+        }
+    };
+
+    // The generator is consumed by `generate`, so keep a handle on the
+    // report it fills in as it works.
+    let locals_report = generator.locals_report.clone();
+
+    match generator.generate() {
         Ok(module) => Ok(CompileResult {
             ast,
             diagnostics,
             module,
             contract_analysis,
+            locals_report: locals_report.borrow().clone(),
         }),
         Err(e) => {
             diagnostics.push(Diagnostic::err(&e));
