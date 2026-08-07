@@ -53,6 +53,13 @@ const OUTER: &str = "
 (define-read-only (named-beside-a-buff (t <named>) (a uint) (b uint) (payload (buff 2048)))
   (contract-of t))
 
+;; And the same shape with the trait *called* rather than named, which is what
+;; `supply-collateral-add` does: it dispatches into the token it was handed. The
+;; principal that goes wrong may be the one reconstructed to make that call rather
+;; than the one passed in.
+(define-public (called-beside-a-buff (t <named>) (a uint) (b uint) (payload (buff 2048)))
+  (contract-call? t who))
+
 (define-public (inner-as-me) (contract-call? .inner as-me))
 (define-public (inner-as-me-entered) (as-contract (contract-call? .inner as-me)))
 (define-public (inner-who-entered) (as-contract (contract-call? .inner who)))
@@ -239,6 +246,30 @@ fn a_trait_beside_a_large_buff_still_names_its_contract() {
         assert_eq!(
             compiled, interpreted,
             "a {size}-byte buff beside a trait reference changed which contract it names"
+        );
+    }
+}
+
+/// The same shape with the trait *called*, which is what the mainnet function does.
+///
+/// `named-beside-a-buff` passes at every buff size, so the argument shape is not the
+/// bug. What that minimization dropped is the dispatch: `supply-collateral-add` does
+/// not name its token, it calls into it. A principal has to be reconstructed to make
+/// that call, and that is a second place one comes out of memory.
+#[test]
+fn a_trait_called_beside_a_large_buff_dispatches_to_the_same_contract() {
+    for size in [0usize, 1, 64, 1024, 2000, 2048] {
+        let payload = Value::buff_from(vec![0xcd; size]).expect("a buff");
+        let arguments = vec![
+            trait_argument(),
+            Value::UInt(46_413).serialize_to_vec().expect("a uint"),
+            Value::UInt(45_924).serialize_to_vec().expect("a uint"),
+            payload.serialize_to_vec().expect("the payload"),
+        ];
+        let (compiled, interpreted) = answers_with("called-beside-a-buff", &arguments);
+        assert_eq!(
+            compiled, interpreted,
+            "a {size}-byte buff beside a *called* trait changed where the call went"
         );
     }
 }

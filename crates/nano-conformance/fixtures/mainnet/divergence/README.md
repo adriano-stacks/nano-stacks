@@ -77,9 +77,28 @@ read-only function taking `(<named> uint uint (buff 2048))`, called with buffs o
 **It passes at every size.** So the argument *shape* is not the bug, and the test
 stays as a regression pinning that.
 
-What is left is what the minimization dropped. The real function is `define-public`
-rather than read-only, and it does not merely name its trait — it calls *through* it,
-into `sbtc-token`, and the surrounding transaction moves collateral. The next
-minimization should keep the trait being **called** rather than only read, since the
-principal that goes wrong may be the one reconstructed to dispatch the call rather
-than the one passed in.
+### Also ruled out: dispatching through the trait
+
+The next suspicion was the dispatch rather than the argument — a principal has to be
+reconstructed to make a `contract-call?` through a trait, which is a second place one
+comes out of memory. `a_trait_called_beside_a_large_buff_dispatches_to_the_same_contract`
+minimizes that: a `define-public` taking the same four arguments and *calling* the
+trait rather than naming it, at the same six buff sizes.
+
+**It passes too.** So neither the argument shape nor the dispatch reproduces it, and
+guessing at shapes has stopped paying.
+
+### What to do instead
+
+Reduce from the real source rather than towards it. `v0-5-market` is deployed, so it
+is in the imported state, and the restored state has it:
+
+```
+cargo xtask state-value /home/aldur/mainnet-restored tip \
+  "clarity-contract::SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-5-market"
+```
+
+(the node must be stopped first — it holds the state open). With the source in hand,
+`supply-collateral-add` can be read for what it actually does with the trait and the
+price payload, and cut down from there. Two shape guesses have now failed, which is
+the signal to stop guessing.
