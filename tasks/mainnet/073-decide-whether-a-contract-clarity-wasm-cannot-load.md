@@ -188,6 +188,13 @@ Options considered:
 
 Plan: A + G first in worktree `agent/locals`, merge, then B.
 
+Upstream status (checked 2026-08-07): [stx-labs/clarity-wasm#575](https://github.com/stx-labs/clarity-wasm/issues/575)
+("let function throwing a too many locals issue") is **open, unassigned, no
+fix in flight**. The most recent maintainer comment (2026-05-27) proposes
+exactly option B — detect the overflow and spill locals to memory with
+compile-time-known offsets — so B is likely welcome upstream, and A/G are a
+contribution candidate as well.
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
