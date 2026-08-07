@@ -2536,6 +2536,20 @@ where
             let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
             timing.execution += phase.elapsed();
+            // Executing a block is synchronous and takes as long as it takes, and a
+            // round executes up to five hundred of them. Between two blocks standing
+            // on the same burn view nothing above awaits, so the whole run was one
+            // uninterrupted task: a worker thread pegged at 100% for twelve minutes
+            // while the other fifteen sat idle, and the runtime never got the chance
+            // to poll anything else on it.
+            //
+            // What that costs is the node's whole HTTP surface. A live mainnet
+            // follower stopped answering `/v2/info` — its listening socket holding
+            // seven connections it had never accepted — for as long as it was
+            // catching up, which is exactly when a signer, a client or an operator
+            // most wants to ask. Handing the scheduler a turn between blocks is the
+            // whole fix; the work is unchanged.
+            tokio::task::yield_now().await;
             trace_executed_block(&block, executed_view.bitcoin_height);
             let phase = std::time::Instant::now();
             if announce_burn && let Some(observers) = self.observers.as_ref() {
