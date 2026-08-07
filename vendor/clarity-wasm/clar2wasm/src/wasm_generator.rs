@@ -1342,19 +1342,29 @@ impl WasmGenerator {
         // Mainnet block 8,668,161 is the case: a function that `asserts!` its
         // way out of `as-contract`, called twice by `map`, whose second call
         // then transferred to itself.
-        let sender_depth = self.module.locals.add(ValType::I32);
-        let caller_depth = self.module.locals.add(ValType::I32);
-        func_body
-            .call(self.func_by_name("stdlib.principal_depth"))
-            .local_set(caller_depth)
-            .local_set(sender_depth);
+        // Only where the body can actually switch the sender. Two `i32` locals and
+        // two calls on *every* function is a cost every contract on the chain pays
+        // for a thing almost none of them do, and locals are not free: a function's
+        // total is what wasmparser caps at 50,000, which is the limit task 073 is
+        // about. A body with no `as-contract` in it cannot leave the stacks deeper
+        // than it found them, so there is nothing to unwind.
+        let switches_sender = body_contains_as_contract(body);
+        let depths = switches_sender.then(|| {
+            let sender_depth = self.module.locals.add(ValType::I32);
+            let caller_depth = self.module.locals.add(ValType::I32);
+            func_body
+                .call(self.func_by_name("stdlib.principal_depth"))
+                .local_set(caller_depth)
+                .local_set(sender_depth);
+            (sender_depth, caller_depth)
+        });
 
         // The parameters, frame pointer and sender/caller depths bypass the
         // pool but are live for the whole function, so they count towards
         // its peak.
         (*self.local_pool)
             .borrow_mut()
-            .note_live(param_locals.len() as u32 + 3);
+            .note_live(param_locals.len() as u32 + 1 + u32::from(switches_sender) * 2);
 
         let mut block = func_body.dangling_instr_seq(InstrSeqType::new(
             &mut self.module.types,
@@ -1401,11 +1411,14 @@ impl WasmGenerator {
             .global_set(self.stack_pointer);
 
         // And the sender and caller stacks, which an early return out of
-        // `as-contract` would otherwise leave deeper than it found them.
-        func_body
-            .local_get(sender_depth)
-            .local_get(caller_depth)
-            .call(self.func_by_name("stdlib.restore_principal_depth"));
+        // `as-contract` would otherwise leave deeper than it found them. Emitted
+        // only where the prologue that records them was.
+        if let Some((sender_depth, caller_depth)) = depths {
+            func_body
+                .local_get(sender_depth)
+                .local_get(caller_depth)
+                .call(self.func_by_name("stdlib.restore_principal_depth"));
+        }
 
         // Restore the top-level locals map.
         self.bindings = top_level_locals;
@@ -3714,3 +3727,26 @@ mod tests {
     }
 }
 
+/// Whether a function body can switch the sender, and so needs the prologue that
+/// records the principal stacks' depth.
+///
+/// Conservative on purpose, and the asymmetry is the whole design: a wrong `true`
+/// costs two locals and two calls, while a wrong `false` lets a switched sender
+/// escape a function and be inherited by whatever runs next -- which is mainnet
+/// block 8,668,161, where a function that `asserts!` its way out of `as-contract`
+/// was called twice by `map` and the second call transferred to itself.
+///
+/// So this asks only whether the *name* appears anywhere in the body's tree,
+/// including inside `let` bodies, branches and arguments. It does not try to decide
+/// whether the call is reachable, and it does not follow calls into other functions:
+/// `as-contract` switches the sender for the dynamic extent of its own body, which
+/// ends before any callee's postlude runs, so a callee cannot leak into its caller.
+fn body_contains_as_contract(body: &SymbolicExpression) -> bool {
+    match &body.expr {
+        SymbolicExpressionType::Atom(name) => name.as_str() == "as-contract",
+        SymbolicExpressionType::List(expressions) => {
+            expressions.iter().any(body_contains_as_contract)
+        }
+        _ => false,
+    }
+}
