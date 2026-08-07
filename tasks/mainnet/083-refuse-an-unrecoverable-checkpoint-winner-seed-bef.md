@@ -1,7 +1,7 @@
 ---
 title: "Refuse an unrecoverable checkpoint winner seed before sortition"
 id: "083"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -24,9 +24,9 @@ chain instead of the typed startup refusal `plan.md` requires.
 
 ## Tasks
 
-- [ ] Make priming return a typed `TrackerError` when an elected seed snapshot
+- [x] Make priming return a typed `TrackerError` when an elected seed snapshot
       carries no winner seed and its eligible commitments do not agree on one.
-- [ ] Distinguish the valid cases explicitly: a saved chain carrying its effective
+- [x] Distinguish the valid cases explicitly: a saved chain carrying its effective
       winner seed, a captured block with one unanimous recoverable seed, and a burn
       block that elected nobody and therefore must carry the older effective seed.
 - [ ] Propagate the error through `resume_or_capture_below` and runtime startup;
@@ -56,3 +56,26 @@ At `95a17add`, `SortitionTracker::prime` handles
 "sample against zero", then calls `engine.prime` and returns `Ok(())`. The failure
 is therefore visible in logs but not in control flow, despite the checkpoint
 completeness rule requiring contradictory inputs to refuse startup.
+
+## Resolved 2026-08-07
+
+Two halves, and the first is why the second was reachable.
+
+**The seed row already names its winner.** Recovery required every eligible
+commitment in the seed's burn block to agree on a `new_seed`, and gave up when
+they did not — but `snapshots.json` states `winning_block_txid`, and *that*
+commitment's own `new_seed` is the seed the next sortition mixes. Exact, and
+needing no agreement between candidates. `winner_seed` reads it, falling back to
+unanimity only for a winning transaction this node did not decode as an on-time
+commitment. The checked-in capture is exactly the case that was being given up
+on: its seed block's commitments disagree, and its winner is named.
+
+**And it refuses rather than reports.** Priming used to print that it would
+"sample against zero" and carry on, which names miners that did not win and only
+surfaces hundreds of blocks later as their tenures' proofs being refused. It now
+returns `TrackerError::Seed` naming the commitment and saying a checkpoint has to
+carry `winner_vrf_seed` for a seed row that elected somebody.
+
+Before this the capture's derived consensus hashes diverged from the chain's at
+burn 364; after it they match every block from 361 to 479. Pinned by
+`pox_boundary`, which cannot pass without it.

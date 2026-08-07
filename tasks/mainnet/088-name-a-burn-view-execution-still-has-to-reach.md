@@ -2,7 +2,7 @@
 id: "088"
 group: mainnet
 title: "Name a burn view execution still has to reach"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 dependencies: ["049"]
@@ -81,19 +81,19 @@ one successful batch must not be read as a working follower.
 
 ## Tasks
 
-- [ ] Measure the lookup window from the burn view execution has reached, not
+- [x] Measure the lookup window from the burn view execution has reached, not
       from the lookahead tip, so a view the chain has already derived and passed
       is always nameable.
-- [ ] Keep the walk itself bounded per round: the cost 049 removed was one
+- [x] Keep the walk itself bounded per round: the cost 049 removed was one
       Bitcoin download per step toward an *undreached* view, which is a different
       thing from a backwards lookup over history already in memory.
-- [ ] Keep the retained snapshot window reaching the executed burn view, so
+- [x] Keep the retained snapshot window reaching the executed burn view, so
       `save_standing_on` can write the chain down after every batch rather than
       only when execution happens to be near the tip.
-- [ ] Bound the lookahead instead, or make retention follow execution: a tracker
+- [x] Bound the lookahead instead, or make retention follow execution: a tracker
       that may run arbitrarily far ahead of execution has to keep what execution
       still needs.
-- [ ] Keep refusing a view this node genuinely has not derived, and a view on
+- [x] Keep refusing a view this node genuinely has not derived, and a view on
       another chain. The refusal is right; only its reach is wrong.
 - [ ] Add a conformance test that executes a batch large enough to leave the
       executed burn view more than `CATCH_UP_LIMIT` behind a lookahead standing at
@@ -119,3 +119,33 @@ successfully and then failing the block in clarity-wasm, and only afterwards
 losing the ability to name any new view. Task 086 owns the first; folding the
 second into it would let a compiler fix stand in for a follower that cannot stay
 on the chain.
+
+## What landed 2026-08-07
+
+Both bounds were measured from the tracker's lookahead tip, which locating a
+single burn view runs all the way to Bitcoin's.
+
+`SnapshotChain` keeps a floor that follows execution: `keep_from` says which burn
+view execution has reached and nothing above it is dropped, so the window is
+`max(SNAPSHOTS_KEPT, tip - executed + 1)`. It costs two hundred bytes a snapshot
+times the lag, the lag is what a follower catching up necessarily has, the window
+closes again as execution catches up, and the floor only moves forward so it
+cannot shrink under a reader standing in it. `Node::local_view` says it, because
+that is the one place holding both numbers.
+
+`height_of_consensus_hash` no longer takes `CATCH_UP_LIMIT` entries. That bound
+exists because a walk costs one Bitcoin block download per step; this is a
+comparison against bytes already in memory. `holds_consensus_hash` beside it was
+already unbounded for the same reason.
+
+Pinned by `a_chain_keeps_the_burn_view_execution_is_standing_on` (a tip 282
+blocks past execution still answers for it — fails on the previous rule) and
+`a_chain_with_no_execution_keeps_the_fixed_window` (no leak where nothing is
+executing).
+
+**Still open:** the live crossing. The mainnet follower at
+`/home/aldur/mainnet-restored` is still running the pre-fix binary
+(`sha256:fca37025…`, started 19:15:53) and is still stalled at 8,708,625 with the
+gap now past 283. It has to be restarted on a binary carrying this before the
+node can be shown to advance across more than one batch, and that restart is the
+operator's: the handoff for this session said not to stop it.

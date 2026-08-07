@@ -2,7 +2,7 @@
 id: "082"
 group: mainnet
 title: "Cross a reward cycle boundary with a locally derived sortition chain"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["049", "077"]
@@ -46,15 +46,15 @@ gates both sit on the far side of this.
 
 ## Tasks
 
-- [ ] Derive whether an opening reward cycle selected a PoX anchor block from this
+- [x] Derive whether an opening reward cycle selected a PoX anchor block from this
       node's own executed state, and extend the `PoxId` with the bit it implies.
-- [ ] Decide it at the cycle's *prepare phase*, where stacks-core decides it, rather
+- [x] Decide it at the cycle's *prepare phase*, where stacks-core decides it, rather
       than at the boundary block — the answer has to be known before the first
       sortition of the new cycle is derived.
-- [ ] Keep the refusal for the case that remains genuinely unanswerable, and say
+- [x] Keep the refusal for the case that remains genuinely unanswerable, and say
       which of the two it is: a node that cannot yet decide, and a node whose state
       does not reach the prepare phase at all.
-- [ ] Extend the captured-fixture gate across at least one boundary, so the rigs
+- [x] Extend the captured-fixture gate across at least one boundary, so the rigs
       that lost their peer fallback replay the whole capture locally again.
 - [ ] Cross a boundary on mainnet with the derived chain and compare the resulting
       consensus hashes against a stock node's for the whole cycle after it.
@@ -190,3 +190,43 @@ capture's own history closed the seeding half and left this: the chain derives
 forward from burn 360, executes blocks 462–470, and stops at burn 379 with the
 reward-cycle refusal above. The same refusal is what a mainnet follower will meet at
 cycle 141.
+
+## Resolved 2026-08-07: there is nothing to decide
+
+The fifth verification route was stacks-core itself, which is a dev-dependency
+oracle and had not been read. It settles the question outright.
+
+`load_nakamoto_reward_set` builds exactly one anchor status,
+`PoxAnchorBlockStatus::SelectedAndKnown`
+(`stackslib/src/chainstate/nakamoto/coordinator/mod.rs:543`). So
+`is_reward_info_known` is unconditionally true and `make_next_pox_id`
+unconditionally calls `extend_with_present_block`. Its own comment states the
+rule: *"In Nakamoto, every reward cycle **must** have a PoX anchor block;
+otherwise, the chain halts."* The other outcome that path has is `Ok(None)` — the
+anchor is not processed *yet* — which is a wait, not a zero. `NotSelected` and
+`SelectedAndUnknown` are reachable only through the epoch-2.x path and the first
+reward cycle of epoch 3.0, and a node that starts at or after the 4.0 boundary is
+never asked about either.
+
+Epoch 4.0 therefore has no undecidable case and no zero case. The bit is one.
+`SortitionTracker::advance` extends with it, and `decide_anchor`,
+`anchor_decided` and `decide_pox_anchors` are removed rather than left as a seam
+nothing can fill.
+
+**Measured rather than reasoned**, which is what four earlier routes could not
+manage. `pox_boundary::a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain`
+derives from burn 360 to 479 through `catch_up` — the production path — and
+compares the sortition identifier *and* the consensus hash at every one of the
+119 blocks with what stacks-core wrote, across boundaries at 380, 400, 420, 440
+and 460. The identifier is the burn header hash and the PoX vector hashed
+together, so a wrong bit cannot hide in it: it diverges at 380 and stays
+diverged. `the_capture_states_the_pox_bit_at_every_boundary_it_crosses` reads the
+vector off every captured identifier independently and asserts one bit per
+boundary and no bit anywhere else — 20 bits at 379, 25 at 479. Neither is
+skip-gated.
+
+The conformance suite is **254 passed, 0 failed, 4 ignored**, from 238 passed and
+12 failed. The one acceptance criterion that stays open is the live crossing:
+a node holding mainnet tip across a cycle rollover, which is 053's soak and is
+blocked on the mainnet follower being restarted on a binary carrying this and
+[[088-name-a-burn-view-execution-still-has-to-reach]].
