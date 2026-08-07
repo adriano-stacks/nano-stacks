@@ -45,7 +45,40 @@ execution.
       it accept and sign a proposal nano validated with checkpointed leader-key
       history under [[070-carry-leader-key-history-into-proposal-validation]].
 
-      **Set up and started; blocked on container-to-host reachability, not on nano.**
+      **A stock signer registers against the signer set nano derived.** Run on the
+      host -- the binary copied out of the hacknet's own `stacks-signer-1`, version
+      `4.0.1 (026bcbc)`, no shim -- pointed at `127.0.0.1:24443`:
+
+      ```
+      Signer #2 (ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H) is registered for
+        reward cycle 19.
+      Cycle #19 Signer #2 Signer is registered for reward cycle 19 as signer #2.
+        Initialized signer state.
+      ```
+
+      That is the half of this item about *nano deriving the active PoX-5 signer
+      set*: the stock signer read `/v3/stacker_set` from nano, found its own key in
+      the set nano walked out of pox-5, and took its slot. No compatibility shim, and
+      no stacks-core node in the path.
+
+      Two answers it got back, both of which look right:
+
+      * `reward cycle 20 has no reward set yet` (400). Correct on this chain, and for
+        the reason [[069-resolve-the-pox-5-follower-state-root-divergence]] settled:
+        its sortitions stopped at burn 393, so no block's *tenure* ever reached
+        cycle 19's prepare phase and cycle 20's set was never written. stacks-core
+        says the same -- `last-set-cycle` there is still 19.
+      * One `503` initializing the signer's local state machine, which is the
+        remaining thread to pull.
+
+      What is still owed is the acceptance itself: a proposal arriving while the
+      signer watches. This chain's miner is extending one tenure rather than starting
+      new ones, so proposals are sparse; a chain still electing miners would produce
+      them promptly.
+
+      The earlier container attempt and why it failed, kept because it names the
+      trap: run the signer *on the host*, not inside the compose network.
+      **Container-to-host reachability, not nano.**
       A stock `stacks-signer` -- the binary out of the hacknet's own
       `stacks-signer-1`, no shim -- was configured against nano's RPC with a key from
       the active reward set and the `auth_password` matching nano's
