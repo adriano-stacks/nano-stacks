@@ -297,9 +297,15 @@ fn draw_heights(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
         Paragraph::new(Line::from(vec![
             label("executed "),
             number(sync.executed_stacks_height, Color::Green),
-            label("   selected "),
+            // Both of the others are snapshots, and neither is refreshed on the
+            // round that execution is. Fork choice is remade every sixty rounds, and
+            // a node at the tip stops asking peers for a full view at all -- so
+            // `executed` above `selected` is the ordinary state of a caught-up node
+            // and not a contradiction. Said on the screen, because two numbers side
+            // by side in the same style are a claim that they are equally fresh.
+            label("   chose (60 rounds) "),
             number(sync.selected_stacks_height, Color::Yellow),
-            label("   peer said "),
+            label("   peer last said "),
             number(sync.followed_stacks_height, Color::DarkGray),
             label("   burn "),
             number(info.burn_block_height, Color::Cyan),
