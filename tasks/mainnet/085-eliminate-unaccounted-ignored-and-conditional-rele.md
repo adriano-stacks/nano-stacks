@@ -131,9 +131,9 @@ guesses to **5 measured semantic differentials**:
 | test | measured |
 |---|---|
 | `contract_call_with_epoch_3_3` | `CostContractLoadFailure` on `costs-4`. The cost schedule epoch 4.0 runs under cannot be loaded, so nothing is crosschecked against it. Owner 023. |
-| `asserts_false` | `(asserts! false V)` raises `EarlyReturn(AssertionFailed(V))` where the test expects `UnwrapFailed(V)`, **and** the thrown value's list type comes back with `max_len` equal to the data's actual length against a declared 22. Both are consensus-visible: the thrown value lands in a receipt and its type signature decides how it serialises. |
-| `asserts_with_begin_false` | The same shape inside a `begin`. |
-| `as_contract_can_return_any_value` | `(as-contract V)` over every value shape, uncrosschecked. `as-contract` has produced two consensus bugs already — 081's restore prologue and the sender leak at 8,668,161. |
+| ~~`asserts_false`~~ | **Fixed and running.** `(asserts! false V)` raises `EarlyReturn(AssertionFailed(V))` — which is correct; `UnwrapFailed` is `try!`'s — and the thrown value's list type comes back narrowed to the data's own length. The engines *agree* on both: the failure was at the expected-value assertion, not the engine-divergence one, so only the hand-built expectation was stale. Rewritten as `crosscheck_compare_only_with_expected_error` and un-ignored. |
+| ~~`asserts_with_begin_false`~~ | **Fixed and running**, same cause. |
+| ~~`as_contract_can_return_any_value`~~ | **Out-of-scope, measured.** `UnknownFunction("as-contract")` in both engines, and clarity's registry settles it: `AsContract("as-contract", Clarity1, Some(Clarity3))` — removed after Clarity 3, replaced by `as-contract?`. Nano covers `as-contract` at Clarity 3 in `as_contract_sender` (which matters, because 064 compiles an old contract under its deployment epoch) and `as-contract?` in `allowance_principal`. |
 | `get_tenure_info_block_reward` | `(get-tenure-info? block-reward u0)` answers `none` against an expected `(some u0)`. The harness cannot simulate a block reward, and nano's own suite does not cover `block-reward` either, so a live epoch-4.0 Clarity read has no crosscheck anywhere. |
 
 Eleven are `out-of-scope`, and that is measured too rather than assumed: each
@@ -152,9 +152,20 @@ three of them are the stock-signer and stock-client journeys 053 requires by nam
 behind a reason string that says the test system needs improving, and the test
 system is not what is wrong with it.
 
+**Two remain, from fifteen.** `contract_call_with_epoch_3_3` (costs-4 will not
+load) and `get_tenure_info_block_reward` (a live Clarity read with no crosscheck
+anywhere).
+
 ## What is still open
 
-- The five semantic entries have to reach zero. Owners 023 and 060.
+- The two semantic entries have to reach zero. Owners 023 and 060.
+- `cargo test -p clar2wasm --all-features` fails one test,
+  `clarity_v3::at_block_with_stacks_block_height`, where enabling every
+  `test-clarity-vN` feature at once resolves `TestConfig::clarity_version()` to
+  Clarity1 while the test wants v3. It is newly *visible* rather than newly
+  broken: `--all-features` did not compile at all before the missing
+  `VmExecutionError` import was added. Default features are green — 1,408 passed,
+  0 failed.
 - `skip_gate` is not inventoried by call site yet. `NANO_REQUIRE_MAINNET` already
   turns every skip into a failure, so a release run cannot report green on gates
   that did not run; what it lacks is the per-site ownership the `#[ignore]` sites

@@ -51,37 +51,6 @@ rule read as an environment problem.
 """
 
 [[ignored]]
-test = "asserts_false"
-class = "semantic"
-owner = "060"
-measured = """
-`(asserts! false V)` for arbitrary V. The engine raises
-`EarlyReturn(AssertionFailed(V))` where the test expects
-`EarlyReturn(UnwrapFailed(V))`, and the thrown value's list type comes back with
-`max_len` equal to the data's actual length where the expectation carries the
-declared one (8, 9, 10 against 22). Both are consensus-visible: the thrown value
-lands in a receipt and its type signature decides how it serialises. `asserts!`
-is not a word epoch 4.0 removed.
-"""
-
-[[ignored]]
-test = "asserts_with_begin_false"
-class = "semantic"
-owner = "060"
-measured = "The same shape inside a `begin`. Fails with `asserts_false`."
-
-[[ignored]]
-test = "as_contract_can_return_any_value"
-class = "semantic"
-owner = "060"
-measured = """
-`(as-contract V)` for arbitrary V, crosschecked. `as-contract` has produced two
-consensus bugs already -- task 081's restore prologue and the sender leak at
-mainnet block 8,668,161 -- so a property test over every value shape is not one
-to leave off.
-"""
-
-[[ignored]]
 test = "get_tenure_info_block_reward"
 class = "semantic"
 owner = "060"
@@ -168,6 +137,21 @@ test = "crossprop_blockinfo_within_controlled_range"
 class = "out-of-scope"
 owner = "066"
 measured = "`use of unresolved function 'get-block-info?'`, in both engines."
+
+[[ignored]]
+test = "as_contract_can_return_any_value"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance as_contract_sender, as_contract_codegen, allowance_principal"
+measured = """
+`UnknownFunction("as-contract")`, in both engines. clarity's own registry settles
+it: `AsContract("as-contract", ClarityVersion::Clarity1, Some(ClarityVersion::Clarity3))`
+-- the word runs Clarity 1 through 3 and is removed after, replaced by
+`as-contract?`. The harness runs at Clarity 6. Nano covers `as-contract` at the
+versions where it exists (`as_contract_sender`, at Clarity 3, which matters
+because task 064 compiles an old contract under its deployment epoch) and
+`as-contract?` in `allowance_principal` and `as_contract_codegen`.
+"""
 
 [[ignored]]
 test = "a_contract_of_trait_calls_compiles_at_size"

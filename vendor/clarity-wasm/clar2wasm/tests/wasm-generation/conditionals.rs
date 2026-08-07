@@ -1,4 +1,4 @@
-use clar2wasm::tools::{crosscheck, crosscheck_compare_only};
+use clar2wasm::tools::{crosscheck, crosscheck_compare_only, crosscheck_compare_only_with_expected_error};
 use clarity::vm::errors::{EarlyReturnError, VmExecutionError};
 use clarity::vm::types::{ListTypeData, SequenceData, SequenceSubtype, TypeSignature};
 use clarity::vm::Value;
@@ -507,12 +507,19 @@ proptest! {
 proptest! {
     #![proptest_config(super::runtime_config())]
 
+    // Both engines against each other, and the error kind asserted rather than a
+    // hand-built value. This was ignored, with a reason about the test system --
+    // and the test system is not what was wrong with it. `asserts!` raises
+    // `AssertionFailed`, not `UnwrapFailed`, which is `try!`'s; and the thrown
+    // value's list type comes back narrowed to the data's own length where a value
+    // built from the declared type carries the declared one. The engines agree on
+    // both. Only the expectation was stale, and it was hiding a live epoch-4.0
+    // word behind an environment excuse. See `ignored-tests.toml`.
     #[test]
-    #[ignore = "test system needs to be improved relative to versioning and epochs"]
     fn asserts_false(throw_val in PropValue::any()) {
-        crosscheck(
+        crosscheck_compare_only_with_expected_error(
             &format!("(asserts! false {throw_val})"),
-            Err(VmExecutionError::EarlyReturn(EarlyReturnError::UnwrapFailed(Box::new(Value::from(throw_val))))),
+            |error| matches!(error, VmExecutionError::EarlyReturn(EarlyReturnError::AssertionFailed(_))),
         );
     }
 }
@@ -540,7 +547,6 @@ proptest! {
     #![proptest_config(super::runtime_config())]
 
     #[test]
-    #[ignore = "test system needs to be improved relative to versioning and epochs"]
     fn asserts_with_begin_false(
         (throw_val, val) in prop_signature()
             .prop_flat_map(|t| (PropValue::from_type(t.clone()), PropValue::from_type(t))),
@@ -552,10 +558,11 @@ proptest! {
             )
         ");
 
-        crosscheck(
-            &snippet,
-            Err(VmExecutionError::EarlyReturn(EarlyReturnError::UnwrapFailed(Box::new(Value::from(throw_val))))),
-        );
+        // See `asserts_false`: the same stale expectation, inside a `begin`.
+        let _ = throw_val;
+        crosscheck_compare_only_with_expected_error(&snippet, |error| {
+            matches!(error, VmExecutionError::EarlyReturn(EarlyReturnError::AssertionFailed(_)))
+        });
     }
 }
 
