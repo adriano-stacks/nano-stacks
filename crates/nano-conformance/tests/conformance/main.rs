@@ -19,6 +19,7 @@
 //! A test's name is now `<module>::<fn>`, so `cargo test -p nano-conformance
 //! marf_lockstep` runs what `--test marf_lockstep` used to.
 
+mod allowance_principal;
 mod as_contract_codegen;
 mod as_contract_sender;
 mod at_block_refusal;

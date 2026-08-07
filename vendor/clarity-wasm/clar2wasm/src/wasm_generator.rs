@@ -3617,6 +3617,39 @@ mod tests {
         );
     }
 
+    /// The mainnet shape: a *principal* binding read outside the allowance and
+    /// again inside it.
+    ///
+    /// `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-5-market::supply-collateral-add`
+    /// binds `ft-address` to `(contract-of ft)` and reads it three times — once
+    /// in a later binding's value, once in an `is-eq`, and once inside
+    /// `((with-ft ft-address "*" amount))`. Counted twice instead of three
+    /// times, the second read frees the binding's locals and the branch after it
+    /// borrows them back, so the allowance reads a principal from whatever offset
+    /// now sits in that slot. Both halves are `i32`, so wasmtime has nothing to
+    /// object to and the module loads: the failure is at run time, and it is
+    /// `Unexpected principal data` — a version byte of 32 or more. That is what
+    /// failed mainnet block 8,708,126, transaction `823f248a…`.
+    ///
+    /// The count is what the release depends on, so it is asserted rather than
+    /// the symptom: an undercount that happens to land on a compatible slot
+    /// computes with a principal nobody put there and no engine complains.
+    #[test]
+    fn binding_uses_counts_a_principal_read_from_an_allowance() {
+        assert_eq!(
+            binding_use_counts(
+                "(define-trait ft-trait ((transfer (uint) (response bool uint))))
+                 (define-public (supply-collateral-add (ft <ft-trait>) (amount uint))
+                   (let ((ft-address (contract-of ft))
+                         (asset (unwrap-panic (get-asset ft-address))))
+                     (if (is-eq ft-address WRAPPER)
+                       (as-contract? ((with-stx amount)) (ok asset))
+                       (as-contract? ((with-ft ft-address \"*\" amount)) (ok asset)))))"
+            ),
+            [3, 2]
+        );
+    }
+
     #[test]
     fn binding_uses_ignores_parameters() {
         // The parameter `a` is not a `let`/`match` binding: only `b` is
