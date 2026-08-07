@@ -1,7 +1,7 @@
 ---
 id: "069"
 title: "Resolve the PoX-5 follower state-root divergence"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 dependencies: []
@@ -76,6 +76,35 @@ tenure at burn 392, view at burn 399, which is inside cycle 19's prepare phase. 
 nano set cycle 20's signer set where stacks-core set nothing, and the live chain
 agrees with stacks-core — `last-set-cycle` there is still 19. Four keys of
 difference, identical receipts, identical costs, and the roots parted.
+
+## Reopened: the fix does not reach a node with no sortition chain
+
+Closed too early. Started the hacknet rig this session — the same one whose
+`hosted-signer` run produced this task — and it reproduces the original roots
+exactly, live:
+
+```
+state root mismatch: expected f90f06c983e2c98a…, got e939a7249dc9665e…
+executed nothing: sealed at 930, then the round failed
+```
+
+The replay path is genuinely fixed (that capture is 100/100). The **node** path is
+not, and the reason is that it takes the tenure's burn height from
+`SortitionTracker::height_of_consensus_hash` — and that node derives no sortitions
+at all: its log has zero `deriving sortitions locally` lines, because its checkpoint
+carries no sortition history to seed one from. With no tracker the override never
+fires, `tenure_bitcoin_height` stays equal to the view, the prepare phase fires at
+burn 399 where the tenure is at 392, and the root parts exactly as before.
+
+So the tenure height must be derivable **without** a tracker, and it is: a block
+that carries no tenure change has view equal to tenure, and one that carries an
+extend names the view in `burn_view_consensus_hash` while `header.consensus_hash`
+still names the tenure. The tenure's burn height is then the sortition of
+`header.consensus_hash` — which the node already fetches for the view and can fetch
+for the tenure the same way.
+
+Remaining work: derive it from the block and the sortition lookup rather than from
+the tracker alone, and re-run this rig until it passes 931.
 
 ## The fix
 
