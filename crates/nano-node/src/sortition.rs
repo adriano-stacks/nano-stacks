@@ -797,7 +797,37 @@ impl SortitionTracker {
     /// The saved form is the capture's own, so this is the same loader either way
     /// and a saved chain cannot be read more loosely than a captured one.
     pub fn resume_or_capture(state: &Path, capture: &Path) -> Result<Self, TrackerError> {
-        let mut tracker = match Self::from_capture(state) {
+        Self::resume_or_capture_below(state, capture, u64::MAX)
+    }
+
+    /// The same, refusing a saved chain seeded *above* the burn view execution needs.
+    ///
+    /// A chain only walks forward, so one seeded above the executed tip's burn view
+    /// can never answer for it: every staged block standing lower finds no snapshot
+    /// and the node stops. A live mainnet state was left exactly there -- executed
+    /// tip needing burn 961,447, saved chain ending at 961,450 -- and no restart
+    /// could get out of it, because the thing that could not be used was also the
+    /// thing being resumed from.
+    ///
+    /// So the saved chain is checked against what execution needs before it is
+    /// adopted, and the capture is used instead when it is too far ahead. That costs
+    /// a re-derivation, which is slow and correct.
+    pub fn resume_or_capture_below(
+        state: &Path,
+        capture: &Path,
+        executed_burn_view: u64,
+    ) -> Result<Self, TrackerError> {
+        let saved = Self::from_capture(state).and_then(|tracker| {
+            let seeded_at = tracker.tip().bitcoin_height;
+            if seeded_at > executed_burn_view {
+                return Err(TrackerError::Seed(format!(
+                    "the saved chain is seeded at burn {seeded_at}, above the burn view \
+                     {executed_burn_view} execution has reached, and a chain only walks forward"
+                )));
+            }
+            Ok(tracker)
+        });
+        let mut tracker = match saved {
             Ok(tracker) => tracker,
             Err(saved) => {
                 // Said out loud, because the fallback is not free: re-deriving
@@ -885,9 +915,27 @@ impl SortitionTracker {
         };
         // The tip when execution has caught up to it, and never above what the
         // history can be truncated to.
-        let tip = self
-            .snapshot_at(bitcoin_height.min(self.tip().bitcoin_height))
-            .unwrap_or_else(|| self.tip());
+        //
+        // `unwrap_or_else(tip)` used to be here, and it undid the whole point of this
+        // function: where the retained window no longer reaches the executed burn
+        // view -- which is exactly what a rewind or a long stall produces -- it saved
+        // the *lookahead* tip instead, and the next start seeded above what execution
+        // needed and could not walk back to it. A live mainnet state was left
+        // unusable that way: executed tip needing burn 961,447, saved chain ending at
+        // 961,450, and re-seeding from the checkpoint landed at 961,451.
+        //
+        // So a chain that cannot stand where it is asked to says so and writes
+        // nothing. The previous file stays, and a start that finds it unusable falls
+        // back to the capture, which is slow and correct -- where this was fast and
+        // wrong.
+        let asked = bitcoin_height.min(self.tip().bitcoin_height);
+        let Some(tip) = self.snapshot_at(asked) else {
+            return Err(TrackerError::Seed(format!(
+                "this chain keeps no snapshot for burn {asked}, which is the burn view \
+                 execution has reached, so writing it down would save a chain seeded above \
+                 what a restart needs"
+            )));
+        };
         let snapshots = vec![CapturedSnapshot {
             block_height: tip.bitcoin_height,
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),

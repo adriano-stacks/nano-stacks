@@ -2116,11 +2116,16 @@ async fn start_deriving_sortitions(
     // timestamp and the VRF seed, three of which Clarity reads back and so move a
     // state root. A node that cannot derive its own sortitions has nothing to
     // execute against ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
-    let tracker = SortitionTracker::resume_or_capture(state, capture).map_err(|error| {
+    // The burn view execution has reached, so a saved chain seeded above it is
+    // refused rather than adopted: a chain only walks forward, and one seeded too
+    // high can never answer for the blocks still staged below it.
+    let executed_burn_view = executor.lock().await.bitcoin_height();
+    let tracker = SortitionTracker::resume_or_capture_below(state, capture, executed_burn_view)
+        .map_err(|error| {
         format!(
             "this node cannot derive sortitions of its own, and will not execute blocks under              a burn view a peer chose: {error}"
-        )
-    })?;
+            )
+        })?;
     println!(
         "deriving sortitions locally from burn {} on PoX history {}",
         tracker.tip().bitcoin_height,
