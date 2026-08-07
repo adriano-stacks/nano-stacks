@@ -476,7 +476,20 @@ impl Served {
             "reward_phase_block_length": calendar.reward_phase_length,
             "reward_slots": calendar.reward_slots,
             "rejection_fraction": serde_json::Value::Null,
-            "contract_versions": [],
+            // Where pox-5 activates, which is how a node learns the waterfall
+            // opens and so how many outputs a commitment pays. `pox()` states it
+            // for the rigs that build a context in process; the ones that run the
+            // shipped binary read it here and got `None`, which counts two payout
+            // outputs on a chain that pays one — so every candidate's burn read as
+            // its own change, nothing was elected, and every consensus hash derived
+            // above the seed was wrong. A live `/v2/pox` states it, so serving it
+            // is this fixture catching up with production rather than a
+            // convenience.
+            "contract_versions": [{
+                "contract_id": "ST000000000000000000002AMW42H.pox-5",
+                "activation_burnchain_block_height": POX_5_ACTIVATION_HEIGHT,
+                "first_reward_cycle_id": 0,
+            }],
             "epochs": [],
         })
     }

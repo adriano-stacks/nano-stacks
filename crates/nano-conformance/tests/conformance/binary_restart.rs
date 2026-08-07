@@ -158,6 +158,20 @@ pub async fn serve_burnchain() -> (String, tokio::task::JoinHandle<()>) {
                 )
             }),
         )
+        // Where this burnchain ends, which is what bounds the node's walk forward.
+        // Without it the walk is skipped entirely and the node cannot name a burn
+        // view above its seed — so it refused every block of the capture past the
+        // first tenure, correctly and for a reason that was this rig's and not the
+        // node's.
+        .route(
+            "/blocks/tip/height",
+            get(|State(state): State<Burnchain>| async move {
+                state.0.keys().next_back().map_or_else(
+                    || (StatusCode::NOT_FOUND, String::new()),
+                    |height| (StatusCode::OK, height.to_string()),
+                )
+            }),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -229,6 +243,7 @@ state_root = "{root}"
 anchor_block = "{anchor_path}"
 anchor_bitcoin_height = {anchor_bitcoin_height}
 tenure_accounting = "{accounting}"
+sortition = "{sortition}"
 "#,
         working = directory.display(),
         marf = checkpoint.join("marf.sqlite").display(),
@@ -236,6 +251,13 @@ tenure_accounting = "{accounting}"
         root = manifest.state_index_root,
         anchor_path = anchor_path.display(),
         accounting = checkpoint.join("native-effects.json").display(),
+        // The capture's own burn/sortition history, which a node that executes
+        // blocks refuses to start without: it derives every burn view from this
+        // rather than from a peer, and the consensus hashes behind the seed are
+        // what let the skip-list reach past the checkpoint. The in-process rigs
+        // have always been given it; these two were started without it and
+        // reported exactly that.
+        sortition = fixtures.join("sortition").display(),
     );
     let path = directory.join("config.toml");
     fs::write(&path, config).expect("the configuration is written");

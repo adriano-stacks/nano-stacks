@@ -98,6 +98,9 @@ fn main() -> ExitCode {
         Some("export-leader-keys") => {
             export_leader_keys(&env::args().skip(2).collect::<Vec<_>>())
         }
+        Some("leader-keys-from-blocks") => {
+            leader_keys_from_blocks(&env::args().skip(2).collect::<Vec<_>>())
+        }
         Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
         Some("freeze-receipts") => freeze_receipts(&env::args().skip(2).collect::<Vec<_>>()),
         Some("compiler-identity") => compiler_identity(&env::args().skip(2).collect::<Vec<_>>()),
@@ -732,6 +735,117 @@ struct ExportedLeaderKey {
 /// is sound because the position is what a commitment names: mainnet's 2,477
 /// rows occupy 2,477 distinct positions and no position carries two different
 /// keys, so this drops nothing.
+/// Derive a leader-key registry from a capture's own Bitcoin blocks.
+///
+/// [`export_leader_keys`] copies stacks-core's `leader_keys` table, which is the
+/// only source for mainnet: a registration a winning commitment names sits tens of
+/// thousands of burn blocks below anything a checkpoint's window holds. A capture
+/// that begins at burn 0 is the other case — every registration the chain ever made
+/// is in the blocks it carries, so the registry is derivable from them and needs no
+/// archive at all.
+///
+/// Which is why the offline suite had none: the capture is complete and nothing
+/// read it. A node that executes blocks refuses to start without one rather than
+/// accept every tenure unchecked, so the two rigs that run the shipped binary could
+/// not start at all.
+fn leader_keys_from_blocks(arguments: &[String]) -> ExitCode {
+    let [blocks, out, magic] = arguments else {
+        eprintln!(
+            "usage: cargo xtask leader-keys-from-blocks <bitcoin/blocks dir> <out.json> <magic>\n\
+             for a capture that begins at burn 0, where every registration the chain made \
+             is in the blocks it carries; mainnet needs `export-leader-keys` and an archive"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(magic) = <[u8; 2]>::try_from(magic.as_bytes()) else {
+        eprintln!("the magic is two bytes, such as T3 or X2");
+        return ExitCode::FAILURE;
+    };
+    if !Path::new(blocks).is_dir() {
+        eprintln!("{blocks} is not a directory of captured Bitcoin blocks");
+        return ExitCode::FAILURE;
+    }
+
+    // Keyed by burn position, which is what a commitment names, so nothing can
+    // produce two rows for one position.
+    let mut keys: BTreeMap<(u64, u32), ExportedLeaderKey> = BTreeMap::new();
+    let mut read = 0_usize;
+    // Heights come from the capture's snapshots, which name each block by its
+    // header hash — the same pairing the fixture's other readers use.
+    let snapshots = Path::new(blocks)
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("sortition/snapshots.json"));
+    let Some(snapshots) = snapshots.filter(|path| path.is_file()) else {
+        eprintln!("the capture's sortition/snapshots.json is what names each block's height");
+        return ExitCode::FAILURE;
+    };
+    let Ok(rows) = fs::read(&snapshots)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).map_err(|e| e.to_string())
+        })
+    else {
+        eprintln!("cannot read {}", snapshots.display());
+        return ExitCode::FAILURE;
+    };
+
+    for row in &rows {
+        let (Some(height), Some(hash)) = (
+            row["block_height"].as_u64(),
+            row["burn_header_hash"].as_str(),
+        ) else {
+            continue;
+        };
+        let path = Path::new(blocks).join(format!("{hash}.hex"));
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(bytes) = hex::decode(raw.trim()) else {
+            continue;
+        };
+        let Ok(block) = nano_bitcoin::decode_block(height, &bytes, magic) else {
+            continue;
+        };
+        read += 1;
+        for operation in &block.operations {
+            if let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+                vrf_public_key,
+                block_signing_key_hash,
+                ..
+            } = &operation.kind
+            {
+                keys.insert(
+                    (height, operation.transaction_index),
+                    ExportedLeaderKey {
+                        block_height: height,
+                        vtxindex: operation.transaction_index,
+                        public_key: hex::encode(vrf_public_key),
+                        memo: block_signing_key_hash.map(hex::encode).unwrap_or_default(),
+                    },
+                );
+            }
+        }
+    }
+
+    let keys: Vec<ExportedLeaderKey> = keys.into_values().collect();
+    let signing = keys.iter().filter(|key| !key.memo.is_empty()).count();
+    match write_leader_keys(Path::new(out), &keys) {
+        Ok(_) => {
+            println!(
+                "read {read} Bitcoin blocks and derived {} leader-key registrations, {signing} \
+                 of them carrying a block-signing key hash",
+                keys.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("writing the leader keys failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn read_leader_keys(sortition: &Path, to_height: u64) -> Result<Vec<ExportedLeaderKey>, String> {
     let archive = open_archive(sortition)?;
     let mut statement = archive
