@@ -60,7 +60,13 @@ and steady state, with evidence tied to the durable executed chain.
 - [ ] Close every known clarity-wasm semantic differential, including
       [[067-reject-contract-call-through-a-constant-while-depl]] and
       [[068-resolve-asymmetric-tuple-least-supertype-semantics]]; an ignored
-      crosscheck is a failed release gate.
+      crosscheck is a failed release gate. Also evaluate the 8 mainnet
+      contracts that failed clar2wasm compilation in [[073]]'s margin sweep
+      (2026-08-07): 3× `Not implemented` (`amm-swap003`, two `.pool`), 4×
+      duck-typing buffer errors (`gated-pages*`), 1× `Tuples fields should be
+      typed` (`trajan-endorsement-alpha`) — confirm each against the
+      production `compile_under` path first; some may be sweep-harness
+      artifacts.
 - [ ] Reproduce and close the PoX-5 follower root mismatch under
       [[069-resolve-the-pox-5-follower-state-root-divergence]] before using that
       signer run as interoperability evidence.
