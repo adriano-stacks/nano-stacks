@@ -117,3 +117,36 @@ revision with the original refusal.
 **Five contracts remain**: four `gated-pages*` on duck typing
 (`buff 1` against `string-ascii 256`) and `trajan-endorsement-alpha` on
 `Tuples fields should be typed`.
+
+## The duck-typing family is located, 2026-08-08
+
+`gated-pages` line 390:
+
+```clarity
+(map airdrop-single-page recipients titles descriptions metadata-uri)
+```
+
+`airdrop-single-page` takes `(recipient principal) (title (string-ascii 64))
+(description (string-ascii 256)) (metadata-uri (string-ascii 256))`. The first
+three arguments to `map` are lists. **The fourth is not** — `metadata-uri` is a
+bare `(string-ascii 256)`, so `map` iterates over its *characters*, and each
+element is fed to a parameter declared `(string-ascii 256)`.
+
+The network accepted this, so the coercion is legal: an element of a
+`string-ascii` sequence is a one-character `string-ascii`, widened to the
+parameter's length. clar2wasm's `duck_type_stack` widens `StringType` to
+`StringType` in its pass-through arm and would handle exactly that.
+
+What it is actually asked to widen is `SequenceType(BufferType(BufferLength(1)))`
+to `SequenceType(StringType(ASCII(BufferLength(256))))`. So the element type
+clar2wasm derives for a `string-ascii` sequence under `map` is **`buff 1`**,
+where Clarity's is `string-ascii 1`. The duck-type refusal is the symptom; the
+wrong element type is the defect, and it is upstream of `duck_type.rs`.
+
+Next step is therefore *not* to add a `buff → string` arm to `duck_type_stack` —
+that would paper over a wrong type with a wrong coercion, and buffers and ASCII
+strings are not interchangeable. It is to find where `map`'s element type is
+derived and make a `string-ascii` sequence yield `string-ascii 1`.
+
+Worth checking at the same time: whether `map` over a `string-utf8` has the same
+problem, and whether anything else consumes that element type (`fold`, `filter`).
