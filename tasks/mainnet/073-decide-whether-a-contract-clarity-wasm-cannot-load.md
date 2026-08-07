@@ -248,9 +248,11 @@ Residual exposure after A: a single scope holding >50k simultaneously-live
 leaf values (e.g. the 60k-binding let) still refuses. Whether that shape is
 mainnet-valid under cost/size limits is what the per-shape boundary table
 (first checkbox) and the mainnet-state search answer; B closes the class
-structurally. The uncommitted broad pool-conversion sweep in the `agent/locals`
-worktree (remaining raw `module.locals.add` sites across word modules) is a
-possible follow-up commit, not required for the demonstrated fix.
+structurally. A broad pool-conversion sweep (remaining raw
+`module.locals.add` sites across 22 word files) was tried and **discarded**
+2026-08-07: it broke `cost::word::map_v{2,3}_with_cost` — a borrowed slot
+reused before its last read in the `map` word's charge path — real aliasing
+risk for a modest locals gain A already delivers where it matters.
 
 ### The residual class is mainnet-reachable, and B must cover scalars
 (2026-08-07)
