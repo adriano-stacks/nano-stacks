@@ -199,6 +199,20 @@ impl BindingUses {
             args,
         )) = list.split_first()
         else {
+            // A list that does not begin with a word is not a call, and this
+            // used to return without looking inside one. An allowance list is
+            // exactly that shape -- `((with-ft SBTC "sbtc-token" total))` -- so
+            // a binding read only from an allowance was counted zero times,
+            // `let` dropped its value instead of saving it, and the read pushed
+            // nothing: the allowance then took whatever was under it. Mainnet's
+            // `SP28MP1HQ….keepgoing-safe` compiled to a module wasmtime refuses
+            // for that reason, and the same miss with matching types would have
+            // computed a wrong value in a module that loads. Counting too many
+            // reads only keeps a slot alive; counting too few frees one that is
+            // still read, so the walk goes on rather than stopping here.
+            for expr in list {
+                self.walk(expr, get_ty);
+            }
             return;
         };
         match head.as_str() {
@@ -3551,6 +3565,31 @@ mod tests {
         assert_eq!(
             binding_use_counts("(let ((x u9)) (match (some u1) x x u0))"),
             [0, 1]
+        );
+    }
+
+    /// A list that does not begin with a word still reads bindings. The
+    /// allowance list of `as-contract?`/`restrict-assets?` is that shape, and a
+    /// read counted zero times frees a slot the read still needs.
+    #[test]
+    fn binding_uses_counts_reads_under_a_headless_list() {
+        assert_eq!(
+            binding_use_counts(
+                "(define-public (f (amount uint))
+                   (let ((total (+ amount u1)))
+                     (as-contract? ((with-stx total)) (ok true))))"
+            ),
+            [1]
+        );
+        assert_eq!(
+            binding_use_counts(
+                "(define-public (f (amount uint))
+                   (let ((total (+ amount u1)))
+                     (as-contract? ((with-ft current-contract \"t\" total)
+                                    (with-stx total))
+                       (ok true))))"
+            ),
+            [2]
         );
     }
 

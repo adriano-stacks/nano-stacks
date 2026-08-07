@@ -163,3 +163,43 @@ fn merging_none_over_an_optional_field_compiles_to_a_module_that_loads() {
     .expect("merging none over an optional field compiles");
 }
 
+
+/// An allowance amount bound by a `let` and read nowhere else.
+///
+/// The read is inside `((with-ft …))` — a list whose first element is a list
+/// rather than a word — and the use-count pre-pass behind wasm-local reuse
+/// returned without looking inside one. Counted zero, the binding's value was
+/// dropped instead of saved and its read pushed nothing, so the allowance took
+/// whatever was underneath: wasmtime refuses the module with "expected i64,
+/// found i32".
+///
+/// `SP28MP1HQDJWQAFSQJN2HBAXBVP7H7THD1W2NYZVK.keepgoing-safe` is that contract,
+/// and it stopped the mainnet follower at 8,717,486. The same miss where the
+/// types happen to line up needs no validator to be wrong — it computes with a
+/// value nobody put there — which is why this is a gate and not a lint.
+const ALLOWANCE_LET_BINDING: &str = "
+(define-fungible-token my-token)
+(define-public (send (amount uint) (recipient principal))
+  (let ((total (+ amount u1)))
+    (as-contract? ((with-ft current-contract \"my-token\" total))
+      (try! (ft-transfer? my-token amount current-contract recipient)))))
+(define-public (send-stx (amount uint) (recipient principal))
+  (let ((total (+ amount u1)))
+    (as-contract? ((with-stx total))
+      (try! (stx-transfer? amount current-contract recipient)))))
+";
+
+#[test]
+fn an_allowance_reading_a_let_binding_compiles_to_a_module_that_loads() {
+    let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+    vm.begin_block(None, [29; 32]).expect("begin block");
+    let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.allowance")
+        .expect("a contract identifier");
+    vm.check_module(
+        &contract,
+        ClarityVersion::Clarity4,
+        ALLOWANCE_LET_BINDING,
+        StacksEpochId::Epoch40,
+    )
+    .expect("an allowance reading a let binding compiles");
+}
