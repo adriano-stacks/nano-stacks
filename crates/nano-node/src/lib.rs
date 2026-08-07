@@ -2198,6 +2198,72 @@ where
         Ok(None)
     }
 
+    /// The burn height of the sortition that elected this block's tenure.
+    ///
+    /// This node's own chain first. Where it has none -- a checkpoint that carries no
+    /// sortition history seeds no chain, which is the case the hacknet rig runs in --
+    /// the tenure is still named by the block, so its burn block is one lookup away.
+    ///
+    /// Asking a peer for it is safe for the same reason asking for the view's is: the
+    /// prepare-phase rule this feeds decides whether a cycle's signer set is written,
+    /// which lands in the state root the block's own header commits to under
+    /// threshold signer weight. A peer that lies makes the block fail to seal; it
+    /// cannot make this node execute a different chain.
+    /// Put the tenure's own burn height into the context, leaving the view where it
+    /// is. They are the same block until an extend moves them apart.
+    ///
+    /// `&mut self` and not `&self`: this future is spawned onto the runtime, and the
+    /// executor holds `RefCell`s and a sqlite connection, so a shared borrow of it
+    /// crossing the await inside would make the whole follower future non-`Send`. A
+    /// unique borrow is what keeps it spawnable.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn record_tenure_burn_height(
+        &mut self,
+        peers: &mut TenureSource,
+        block: &NakamotoBlock,
+        bitcoin_context: &mut BitcoinBlockContext,
+    ) {
+        // Read off `self` before the await, so no borrow of the executor crosses it.
+        let derived = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash));
+        let view_has_moved = self
+            .bitcoin_view
+            .is_some_and(|view| view != block.header.consensus_hash);
+        let tenure =
+            Self::tenure_burn_height(derived, view_has_moved, peers, block.header.consensus_hash)
+                .await;
+        if let Some(tenure) = tenure.filter(|tenure| *tenure != bitcoin_context.height) {
+            let view = bitcoin_context.height;
+            bitcoin_context.move_to_burn_block(tenure);
+            bitcoin_context.extend_view_to(view);
+        }
+    }
+
+    async fn tenure_burn_height(
+        derived: Option<u64>,
+        view_has_moved: bool,
+        peers: &mut TenureSource,
+        tenure: nano_primitives::ConsensusHash,
+    ) -> Option<u64> {
+        if let Some(height) = derived {
+            return Some(height);
+        }
+        // Only worth a request when the view has actually moved off the tenure, which
+        // is what an extend does -- and it stays moved for every block after it until
+        // the next tenure change, so the carried view says so and not this block's
+        // own payload.
+        if !view_has_moved {
+            return None;
+        }
+        peers
+            .sortition(tenure)
+            .await
+            .ok()
+            .map(|sortition| sortition.bitcoin_height)
+    }
+
     /// Tell the VM the header hash of the burn blocks just behind this one.
     ///
     /// Clarity can ask about any burn block, and a node that started at a
@@ -2343,16 +2409,8 @@ where
         // Exactly one rule reads it: the prepare-phase signer-set update, which
         // stacks-core drives from the tenure's sortition. Reading the view there is
         // what parted the roots at pox-5 height 931.
-        if let Some(tenure) = self
-            .sortition
-            .as_ref()
-            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash))
-            .filter(|tenure| *tenure != bitcoin_context.height)
-        {
-            let view = bitcoin_context.height;
-            bitcoin_context.move_to_burn_block(tenure);
-            bitcoin_context.extend_view_to(view);
-        }
+        self.record_tenure_burn_height(peers, block, &mut bitcoin_context)
+            .await;
         let phase = std::time::Instant::now();
         self.seed_burn_headers(bitcoin_height);
         timing.headers += phase.elapsed();

@@ -1,7 +1,7 @@
 ---
 id: "069"
 title: "Resolve the PoX-5 follower state-root divergence"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: []
@@ -77,7 +77,29 @@ nano set cycle 20's signer set where stacks-core set nothing, and the live chain
 agrees with stacks-core — `last-set-cycle` there is still 19. Four keys of
 difference, identical receipts, identical costs, and the roots parted.
 
-## Reopened: the fix does not reach a node with no sortition chain
+## Closed on the rig that disproved it
+
+The reopening below stands as the record of a close that was made too early, and
+this is the close that is not. The same hacknet rig, with the tenure height derived
+without a tracker, ran from its sealed height of **930 to 14,417** — about 13,487
+blocks, the whole chain to its tip — with **zero state root mismatches**. Block 931
+is no longer a frontier; it is thirteen thousand blocks behind the node.
+
+What was missing is now explicit: the node took the tenure's burn height from
+`SortitionTracker::height_of_consensus_hash` alone, and a checkpoint that carries no
+sortition history seeds no tracker. The tenure is still named by the block's own
+`consensus_hash`, so where there is no local chain to ask, its sortition is one
+lookup away — and it is only worth asking when the carried burn view has moved off
+the tenure, which is what an extend does and which stays true for every block after
+it until the next tenure change.
+
+Asking a peer for that height is safe on the same argument the view's sortition
+already rests on: it feeds the prepare-phase rule, which decides whether a cycle's
+signer set is written, which lands in the state root the block's own header commits
+to under threshold signer weight. A peer that lies makes the block fail to seal. It
+cannot make this node execute a different chain.
+
+## Reopened: the fix did not reach a node with no sortition chain
 
 Closed too early. Started the hacknet rig this session — the same one whose
 `hosted-signer` run produced this task — and it reproduces the original roots
