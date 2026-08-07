@@ -4608,6 +4608,8 @@ fn transaction_cost_tracker_in_context(
     total: ExecutionCost,
 ) -> Result<LimitedCostTracker, VmExecutionError> {
     let network = store.network();
+    // Asked before the store is borrowed for the database.
+    let store_is_ephemeral = store.side_store_path().is_none();
     let mut database = clarity_database(store, bitcoin_context);
     database.begin();
     database.set_clarity_epoch_version(StacksEpochId::Epoch40)?;
@@ -4624,8 +4626,34 @@ fn transaction_cost_tracker_in_context(
             tracker.set_total(total);
             Ok(tracker)
         }
-        Err(CostErrors::CostContractLoadFailure | CostErrors::CostComputationFailed(_)) => {
+        // A free tracker charges nothing and limits nothing. On a node that is a
+        // fail-open in the middle of consensus: every transaction would cost zero,
+        // a block over `BLOCK_LIMIT_MAINNET_40` would be admitted where the network
+        // refuses it, and every receipt would carry a cost the chain does not
+        // agree with -- silently, because nothing downstream compares a cost it
+        // was never charged.
+        //
+        // It stays for an *in-memory* store, which is a test or a diagnostic VM
+        // with no boot contracts in it at all and nothing to load. A durable store
+        // is a node's, and a node whose cost contract will not load has to say so.
+        //
+        // Ungated, deliberately said rather than left implied: no state could be
+        // built here that reaches this branch. `new_mid_block` returns a tracker
+        // carrying `BLOCK_LIMIT_MAINNET_40` even against a durable store with no
+        // boot contracts at all, so the failure is not constructible from the
+        // outside and a test asserting it would have been asserting nothing. The
+        // branch is closed because a free tracker must never be a node's answer,
+        // not because a test proved it was reachable.
+        Err(CostErrors::CostContractLoadFailure | CostErrors::CostComputationFailed(_))
+            if store_is_ephemeral =>
+        {
             Ok(LimitedCostTracker::new_free())
+        }
+        Err(error @ (CostErrors::CostContractLoadFailure | CostErrors::CostComputationFailed(_))) => {
+            Err(VmInternalError::Expect(format!(
+                "the epoch 4.0 cost schedule could not be loaded from this state ({error:?}),                  and charging nothing instead would admit blocks the network refuses and write                  receipts with costs the chain does not agree with"
+            ))
+            .into())
         }
         Err(error) => Err(error.into()),
     }

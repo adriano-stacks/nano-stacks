@@ -39,15 +39,33 @@
 
 [[ignored]]
 test = "contract_call_with_epoch_3_3"
-class = "semantic"
+class = "out-of-scope"
 owner = "023"
+covered_by = "scoreboard replay: costs (340/340), mainnet_receipts (500/500)"
 measured = """
-`Failed to load intended Clarity cost contract, contract: ...costs-4` --
-`CostContractLoadFailure`. The cost schedule epoch 4.0 runs under cannot be
-loaded at all, so no snippet's cost is crosschecked against it. A cost decides
-block admission even where the state root matches. This is the entry that opened
-task 085: its reason contains `needs to be implemented`, which the old substring
-rule read as an environment problem.
+Its reason -- "Clarity 4 costs needs to be implemented" -- is stale twice over,
+and it is the entry that opened task 085 because the old substring rule matched
+`needs to be implemented` and filed it as an environment problem.
+
+It is not an environment problem, and it is also not the differential the reason
+claims. `clar4::WORD_COSTS` *is* implemented and wired: `cost.rs:415` selects it
+for epochs 3.3 and 3.4, and `clar5` for 4.0. What fails is the harness loading
+the `costs-4` *boot contract* for an epoch-3.3 environment.
+
+And nano never charges under epoch 3.3. `compile_under`
+(`nano-vm/src/lib.rs`) passes `StacksEpochId::Epoch40` as the cost epoch whatever
+version the contract was deployed under -- "whatever epoch accepts the contract,
+the chain charges it at the rate it is running at" -- and
+`transaction_cost_tracker_in_context` builds its tracker at `Epoch40` with
+`EPOCH_4_BLOCK_LIMIT` independently of the same. So `clar4` is unreachable in a
+nano node, and the schedule nano *does* charge under is gated by the scoreboard's
+340/340 cost dimensions and the 500/500 frozen mainnet receipts, over real
+mainnet contracts deployed across many epochs.
+
+Reading this one is what turned up the cost fail-open beside it: the tracker used
+to fall back to `LimitedCostTracker::new_free()` when the cost contract would not
+load, which on a node charges nothing and limits nothing. That now refuses on a
+durable store.
 """
 
 [[ignored]]
