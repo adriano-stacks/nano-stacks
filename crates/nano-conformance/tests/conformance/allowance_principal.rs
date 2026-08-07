@@ -234,22 +234,25 @@ fn an_allowance_reads_the_principal_its_let_bound() {
     }
 }
 
-/// The same binding when the allowance is its only reader, and when the
-/// allowance reads it first. Neither ordering may lose the principal.
+/// The same binding with the allowance reading it *first*, and the principal
+/// itself as the answer.
+///
+/// The ordering is the other half of the pair: `supply-collateral-add` reads the
+/// binding twice before the allowance, and this reads it there first. Asserting
+/// the principal by value is what makes this more than an error check — a slot
+/// handed back and borrowed again does not have to raise anything to be wrong,
+/// and where the types line up it simply answers with a different contract.
 #[test]
 fn an_allowance_is_a_read_wherever_it_sits() {
-    let token_argument = encode(&Value::Principal(token().into()));
-    let amount = encode(&Value::UInt(7));
-    for function in ["the-allowance-reads-it-first"] {
-        let (compiled, interpreted) =
-            answers(function, &[token_argument.clone(), amount.clone()]);
-        assert_eq!(
-            compiled, interpreted,
-            "the engines agree on `{function}`"
-        );
-        assert!(
-            compiled.contains(&format!("{:?}", Value::Principal(token().into()))),
-            "`{function}` named a principal that is not the token: {compiled}"
-        );
-    }
+    let function = "the-allowance-reads-it-first";
+    let arguments = [
+        encode(&Value::Principal(token().into())),
+        encode(&Value::UInt(7)),
+    ];
+    let (compiled, interpreted) = answers(function, &arguments);
+    assert_eq!(compiled, interpreted, "the engines agree on `{function}`");
+    assert!(
+        compiled.contains(&format!("{:?}", Value::Principal(token().into()))),
+        "`{function}` named a principal that is not the token: {compiled}"
+    );
 }
