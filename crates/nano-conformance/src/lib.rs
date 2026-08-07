@@ -2151,6 +2151,70 @@ mod tests {
         Ok(())
     }
 
+    /// The one measured point behind 082's anchor rule, from mainnet's own data.
+    ///
+    /// A locally derived sortition chain cannot cross a reward cycle boundary without
+    /// knowing whether the opening cycle selected a `PoX` anchor block: the consensus
+    /// hash mixes the `PoX` history, so a guessed bit derives a wrong hash for every
+    /// block after it. The rule the node uses is that a cycle it recorded a *signer
+    /// set* for selected an anchor — the anchor block is what carries the set.
+    ///
+    /// That rule was reasoned rather than measured, and every live source that could
+    /// have settled it was unavailable: the captured fixture's state cannot answer
+    /// `get-signers` for its opening cycle, the hacknet rig's chain is down, and the
+    /// mainnet state that holds both facts together was corrupted. What survives is
+    /// this, on disk and offline: mainnet's cycle 140 has a signer set, and mainnet's
+    /// `PoX` history is 142 bits with **no** zero in it — so the bit for a cycle with
+    /// a recorded set is 1, which is the direction the rule claims.
+    ///
+    /// Mainnet's `PoX` history at the checkpoint, as every run of the follower printed
+    /// it: 142 cycles, none of which failed to select an anchor.
+    ///
+    /// One confirming point and not a proof: nothing here exhibits a cycle whose bit
+    /// is 0, because mainnet has never had one. The converse stays unmeasured, and
+    /// the node's decider is built so that only a *positively* recorded set decides
+    /// anything — an unmeasured converse can therefore leave a boundary uncrossed,
+    /// but cannot produce a wrong hash.
+    const MAINNET_POX_HISTORY_AT_THE_CHECKPOINT: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111111111\
+         111111111111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_mainnet_cycle_with_a_signer_set_has_its_pox_anchor_bit_set() {
+        #[derive(Deserialize)]
+        struct Document {
+            stacker_set: Set,
+        }
+        #[derive(Deserialize)]
+        struct Set {
+            signers: Vec<serde_json::Value>,
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/mainnet/stacker_set-140.json");
+        let document: Document =
+            serde_json::from_slice(&fs::read(&path).expect("the cycle 140 set"))
+                .expect("a reward set document");
+        assert!(
+            !document.stacker_set.signers.is_empty(),
+            "mainnet cycle 140 has a recorded signer set, which is the half of the rule \
+             that says an anchor was selected"
+        );
+
+        // The other half, from the checkpoint this capture was taken at. Its
+        // sortition identifier is the burn header hash and the `PoX` history hashed
+        // together, so the history is recoverable from it and is not a claim the
+        // capture makes about itself.
+        let bits: String = MAINNET_POX_HISTORY_AT_THE_CHECKPOINT
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert_eq!(bits.len(), 142, "mainnet had 142 reward cycles at the checkpoint");
+        assert!(
+            !bits.contains('0'),
+            "a cycle that selected no anchor would be the case this rule cannot yet decide"
+        );
+    }
+
     #[test]
     fn checked_in_fixture_is_a_valid_capture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");

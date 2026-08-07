@@ -2,7 +2,7 @@
 id: "079"
 title: "Eliminate fallible MARF read panics after startup"
 status: in-progress
-priority: high
+priority: critical
 effort: medium
 type: bug
 group: mainnet

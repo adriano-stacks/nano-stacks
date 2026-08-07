@@ -150,8 +150,22 @@ machine. Written down so the next attempt starts somewhere new:
   `1` and cycle 140's signer set — and it is the state the two-writer corruption
   damaged.
 
-So the verification is blocked on having a healthy mainnet state, which makes
-replacing that state the first move here rather than more code. Until then the
+**One point survives, offline and on disk.** Mainnet cycle 140 has a recorded signer
+set of 25 entries, and mainnet's `PoX` history at the checkpoint is 142 bits with no
+zero among them — so the bit for a cycle with a recorded set is 1, which is the
+direction the rule claims. `a_mainnet_cycle_with_a_signer_set_has_its_pox_anchor_bit_set`
+pins both halves against the checked-in capture, so it is a regression rather than a
+note.
+
+It is one confirming point and not a proof: mainnet has never had a cycle that
+selected no anchor, so nothing here exhibits the `0` case and the converse stays
+unmeasured. That is survivable by construction — the decider decides only on a
+*positively* recorded set, so an unmeasured converse can leave a boundary uncrossed
+but cannot produce a wrong hash.
+
+The remaining verification is a live crossing, which is blocked on having a healthy
+mainnet state, and that makes replacing that state the first move here rather than
+more code. Until then the
 decider stays as it is: it decides only on a positively recorded non-empty signer
 set, and refuses otherwise, so an unverified rule cannot silently produce a wrong
 consensus hash — it can only fail to unblock a boundary.

@@ -1,7 +1,7 @@
 ---
 id: "073"
 title: "Decide whether a contract clarity-wasm cannot load is mainnet-valid"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["060"]
@@ -71,6 +71,11 @@ Two independent pressures push the local count up, and both are nano's:
       reaches and its margin. **Done 2026-08-07: 137,332/137,340 compile; highest
       peak 16,505 of 50,000 (3.0× margin; ~7× organic; 99.6% under 1k) — see
       "Mainnet-state margin".**
+- [ ] Run the eight contracts that failed the margin sweep through nano-vm's exact
+      production `compile_under` path. Classify every one as a sweep-harness fault,
+      network-invalid source or a distinct clarity-wasm conformance bug, and open a
+      blocking task for every confirmed bug rather than excluding it from the
+      denominator.
 - [x] Make the `as-contract` prologue pay for itself: emit the save/restore only
       for functions whose body contains an `as-contract`, and re-measure. This is
       worth doing whatever the answer above is, because it is a cost every mainnet
@@ -93,12 +98,18 @@ Two independent pressures push the local count up, and both are nano's:
       migration's clar2wasm-side test pins the shape still compiles and the
       runtime still refuses; the positive control pins the interpreter accepts
       the same source.**
-- [x] Record the outcome in the release report either way: a measured margin is
+- [ ] Close the function-type arity wall under
+      [[084-eliminate-wasm-function-type-arity-refusals-for-ne]] before treating
+      the moved refusal as harmless. The 600-field tuple still demonstrates an
+      interpreter-accepted source that clarity-wasm cannot load; its network
+      validity and ABI fix are release questions, not failure-test details.
+- [ ] Record the outcome in the release report either way: a measured margin is
       evidence, "no mainnet block has hit it" is not. **Recorded here:
       "Mainnet-state margin" (max peak 16,505/50,000 over all 137,332
       compilable mainnet contracts, 3.0× worst-case, ~7× organic, 99.6% under
       1k) plus per-shape before/after numbers in "A+G shipped", "B1 shipped",
-      "B2 shipped". The gate-time release report should cite these sections.**
+      "B2 shipped". This remains open until the gate-time report consumes the
+      measurement and the unresolved eight-contract and arity results.**
 
 ## Findings
 
@@ -128,6 +139,19 @@ number this task states the direction of the gap and not its reach.
   refusal, and `engine_failure.rs` still forces all three refusal classes.
 - The release report states the measured margin rather than the absence of an
   observed failure.
+- All 137,340 imported contracts have a production-path verdict; none is omitted
+  because the measurement harness could not compile it.
+- Task 084 has established and, where necessary, removed the network-valid
+  function-type arity boundary.
+
+## Reopened by the 2026-08-07 audit
+
+The locals work is real and remains complete. The task status was not: eight
+mainnet contracts still have no production-path verdict, the replacement
+600-field-tuple failure has not had its network validity established, and the
+release report does not emit the claimed margin. Those are direct exceptions to
+this task's own "no accepted source is refused" acceptance criterion, so the task
+is in progress until the unchecked items above close.
 
 ## Findings (2026-08-07)
 

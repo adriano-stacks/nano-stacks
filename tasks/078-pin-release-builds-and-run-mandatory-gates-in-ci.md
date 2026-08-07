@@ -2,7 +2,7 @@
 id: "078"
 title: "Pin release builds and run mandatory gates in CI"
 status: in-progress
-priority: high
+priority: critical
 effort: medium
 type: chore
 group: build
@@ -24,14 +24,23 @@ which compiler produced release evidence.
 - [x] Track `flake.lock` and pin `nixpkgs` to an immutable revision.
 - [ ] Pin an exact Rust toolchain and make the Nix shell and non-Nix setup select
       the same compiler, Cargo, Clippy and rustfmt versions.
-- [x] Add repository-root CI for formatting, release workspace Clippy, the full
+- [~] Add repository-root CI for formatting, release workspace Clippy, the full
       conformance suite, the scoreboard and the release report's offline gates.
-- [x] Require the scoreboard and release report commands to propagate failures;
+- [~] Require the scoreboard and release report commands to propagate failures;
       CI must not infer success by parsing a table.
 - [ ] Build the release artifact from the checked-out revision before hashing or
       inspecting it, then verify its embedded compiler identity.
 - [ ] Make `cargo fmt --all -- --check` clean for the workspace, including the
       vendored compiler sources the workspace owns.
+- [ ] Make release workspace Clippy warning-free and enforce warnings as errors.
+      An exit status of zero with `items_after_test_module` or an unused import is
+      not a passing lint gate under this repository's rules.
+- [ ] Separate ordinary offline CI from capture-backed release qualification.
+      Every committed workflow job must have the inputs needed to become green;
+      the release job must fail closed when its required capture is absent rather
+      than making the default workflow permanently red.
+- [ ] Make CI reject every unowned ignored or conditionally skipped required test
+      through [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
 - [x] Prove `nix develop` changes no tracked or ignored repository file in a clean
       checkout.
 
@@ -65,12 +74,22 @@ Still owed: building the artifact from the checked-out revision before hashing i
 and verifying its embedded compiler identity, which belongs with
 [[074-make-the-release-report-readable-and-its-fixtures-b]]'s artifact bullets.
 
+The audit found two more reasons the CI bullets are partial rather than done. The
+release-report step is invoked without a capture even though that command explicitly
+sets `NANO_REQUIRE_MAINNET=1` and says it is expected to fail without one, so an
+ordinary checkout cannot finish the committed workflow. Clippy also exits zero
+while emitting an unused `scoreboard_at` import and
+`items_after_test_module`; warnings are reported but not enforced.
+
 ## Acceptance Criteria
 
 - Two clean checkouts select the same Nix inputs and exact Rust toolchain without
   generating or rewriting a lock file.
 - Root CI runs every required offline gate and blocks a deliberately introduced
-  formatting, Clippy, replay or conformance failure.
+  formatting, Clippy warning, replay or conformance failure.
+- Ordinary offline CI has all required local inputs and can pass; capture-backed
+  release qualification is a distinct mandatory job that cannot pass without its
+  declared capture and services.
 - Release artifact identity is tied to the checked-out source and compiler, not
   to a pre-existing `target/` entry.
 - `cargo fmt --all -- --check` and release workspace Clippy both pass.
