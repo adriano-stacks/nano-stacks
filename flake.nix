@@ -24,6 +24,23 @@
               pkgs.rustfmt
               pkgs.sqlite
             ];
+
+            # Temporary files go to disk, not to RAM.
+            #
+            # `/` is a 16 GB tmpfs here, so everything under `/tmp` is memory. A
+            # test that opens a `Vm` writes a MARF and a Clarity store into a
+            # `tempfile::tempdir`, about 3.7 MB a time, and `Drop` is what removes
+            # them -- which a killed process never runs. Two and a half thousand of
+            # them had accumulated, 9.3 GB of RAM held by dead tests, and the
+            # shortage that leaves is what kills the next process, which leaks the
+            # next batch.
+            #
+            # Pointing `TMPDIR` at the 2 TB disk breaks the cycle: the leak still
+            # happens on a kill, and it costs disk instead of the machine.
+            shellHook = ''
+              export TMPDIR="''${TMPDIR_OVERRIDE:-$HOME/.cache/nano-stacks/tmp}"
+              mkdir -p "$TMPDIR"
+            '';
           };
         });
     };
