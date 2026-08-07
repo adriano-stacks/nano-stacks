@@ -346,6 +346,19 @@ execution.
       breaks the first peer six ways over real HTTP. The live half — removing a
       configured peer from a running node — stays open there.
 
+## A consumer for `/v2/pox`'s `stacked_ustx` now exists
+
+`pox_info`'s note says `stacked_ustx` is "read from `.pox-5`'s `get-pox-info`,
+which nothing in nano calls, and no consumer of this route needs". `nano-tui`
+needs it: on its first frame against the live mainnet follower it showed
+`stacked 0 STX` where a stock node answers `446,974,093,990,056` uSTX for
+cycle 140.
+
+Zero is the wrong shape of wrong here — it is a number a reader will believe. Nano
+can answer it without a new dependency, because it already has a read-only call
+path and its own pox-5 state; what it cannot do is keep publishing a plausible zero
+now that something reads it.
+
 ## Acceptance Criteria
 
 - A stock signer runs against nano without an RPC compatibility shim.
