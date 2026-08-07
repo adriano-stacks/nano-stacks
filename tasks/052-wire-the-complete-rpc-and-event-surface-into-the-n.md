@@ -145,9 +145,31 @@ execution.
 
         So `503` is the honest answer for this node: it has nothing to say about
         sortitions, and inventing a snapshot would be worse than declining. The fix
-        is not in the route but in the rig -- give that checkpoint a `sortition`
-        directory, as the mainnet one has, and the node derives them and the route
-        answers.
+        is not in the route but in the rig -- and giving that checkpoint a
+        `sortition` directory turned up a **capture-tooling gap** behind it.
+
+        `capture-fixtures` writes `sortition/snapshots.json` and
+        `sortition/leader-keys.json` and **not** `sortition/consensus-hashes.json`,
+        which is the file `SortitionTracker::history_from` reads. The mainnet capture
+        has all three; a capture this tool produced has two, so a node pointed at one
+        answers:
+
+        ```
+        cannot derive sortitions locally: sortition seed: neither the saved
+        sortitions (No such file or directory) nor the capture (No such file or
+        directory) can seed a chain
+        ```
+
+        That history is the one part a node cannot re-derive from its own snapshots,
+        because `ConsensusHash::from_ops` mixes hashes at power-of-two offsets. So
+        **every** capture this tool has produced yields a `sortition/` directory no
+        node can use -- which is why this rig derives no sortitions, and why
+        [[069-resolve-the-pox-5-follower-state-root-divergence]] was reachable on it.
+
+        Next action, bounded: write the consensus-hash history beside the snapshots
+        `write_capture` already writes, re-capture, and the rig derives sortitions --
+        after which `/v3/sortitions` answers and the stock signer's state machine
+        initializes.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
