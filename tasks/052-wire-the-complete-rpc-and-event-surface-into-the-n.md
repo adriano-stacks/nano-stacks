@@ -248,8 +248,22 @@ execution.
       `tenure_start_heights` and resolves a block by height, so a `tenure_tip`
       lookup beside the `tenure_start` one added for `tenure_info` answers it without
       walking the tenure's blocks — which matters here, where one tenure has extended
-      for thirteen thousand of them. **That is the next action, and it is the last
-      route standing between the stock signer and watching for proposals.**
+      for thirteen thousand of them.
+
+      **Done, and it moved the blocker off nano.** The route falls back to the
+      archive by one query keyed by consensus hash. The signer still gets `404`, and
+      that answer is now the honest one: nano's archive holds 17,476 blocks and every
+      one is in tenure `a06c505c`. The sortitions at burns 390-392 elected miners
+      whose tenures never produced a block, because the chain kept extending the one
+      before them -- so there is no last block of `bdb04d52` for anybody to serve.
+
+      **What is left is the rig's chain shape, not a nano route.** All three routes a
+      stock signer asks for on the way in now answer from what this node executed.
+      This chain has been extending a single tenure since block 931 and is stalled
+      outright, because participant 3 is down and Hacknet needs all three signatures.
+      No proposal arrives on a stalled chain. The next action is to get it electing
+      again -- restore participant 3, let the three stock signers carry it through
+      fresh sortitions, and only then hand the signer half to nano.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
