@@ -66,11 +66,19 @@ steady-state operation may require a hosted Stacks API.
       `stacks-node`, including inventory and block exchange in both directions
       and transaction relay. Reference-codec socket tests remain necessary but
       are not this acceptance run.
-- [ ] Route signer-role StackerDB replication and proposal recovery through the
+- [x] Route signer-role StackerDB replication and proposal recovery through the
       discovered peer pool under
       [[071-fail-over-signer-role-replication-across-peers]]. A chain sync that
       needs no Hiro while the hosted signer remains pinned to Hiro is not full
       node independence.
+      Closed with 071. Six loops held one startup client and none does: replication
+      walks a `Replicas` pool, the proposal validator takes the pool the chain is
+      followed over, `catch_up` and `binding` ask it, and the embedded signer's
+      service, announcer and live signer are retargeted as the turn moves.
+      Demonstrated on mainnet with nothing hosted configured — `peers = []`, joined
+      over p2p alone — and the active peer then removed mid-run: it never served a
+      round again, the pool rotated, and discovered peers served instead while p2p
+      grew the pool to eight underneath.
 
 ## Acceptance Criteria
 
