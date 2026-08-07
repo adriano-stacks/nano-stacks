@@ -1,7 +1,7 @@
 ---
 id: "073"
 title: "Decide whether a contract clarity-wasm cannot load is mainnet-valid"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["060"]
@@ -71,10 +71,12 @@ Two independent pressures push the local count up, and both are nano's:
       reaches and its margin. **Done 2026-08-07: 137,332/137,340 compile; highest
       peak 16,505 of 50,000 (3.0× margin; ~7× organic; 99.6% under 1k) — see
       "Mainnet-state margin".**
-- [ ] Make the `as-contract` prologue pay for itself: emit the save/restore only
+- [x] Make the `as-contract` prologue pay for itself: emit the save/restore only
       for functions whose body contains an `as-contract`, and re-measure. This is
       worth doing whatever the answer above is, because it is a cost every mainnet
-      contract currently carries.
+      contract currently carries. **Moved to
+      [[081-emit-the-as-contract-sender-restore-prologue-only]] (2026-08-07) — an
+      optimization, not part of this bug.**
 - [x] If a mainnet-valid contract cannot load, fix code generation so it does —
       no interpreter fallback, no healing path, no per-contract exception. Reuse
       of locals across disjoint scopes is the obvious lever and belongs upstream.
