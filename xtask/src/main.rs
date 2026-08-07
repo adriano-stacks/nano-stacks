@@ -1509,6 +1509,25 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
                                 }
                             }
                         }
+                        // Which contract a call targets, and how many arguments it
+                        // carried. A block that fails on an internal VM error names
+                        // the transaction now, and this is the next question after
+                        // that one: what it was calling.
+                        nano_codec::TransactionPayloadData::ContractCall {
+                            address,
+                            contract_name,
+                            function_name,
+                            arguments,
+                        } => {
+                            println!(
+                                "    calls {address}.{contract_name}::{function_name} with {} \
+                                 arguments",
+                                arguments.len()
+                            );
+                            for (index, argument) in arguments.iter().enumerate() {
+                                println!("      {index}: {argument:?}");
+                            }
+                        }
                         _ => {}
                     }
                 }

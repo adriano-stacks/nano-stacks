@@ -47,6 +47,25 @@ So it is the fifth transaction, a contract call from
 `SP2ZM1KNQNS96RM1MAJTZV7WE7F38GFGRND4E80DW` paying a 5,482 fee -- notably the largest
 fee in the block, which is what a call doing real work looks like.
 
-Next: what it calls, and which of its arguments or return values is a principal. The
-two offset reads above are where a principal comes out of memory, so the value that
-lands on the wrong side of one is the thing to find.
+### What it calls
+
+```
+SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-5-market::supply-collateral-add
+  arg 0  contract principal  SP…​.sbtc-token   <-- a trait reference
+  arg 1  uint 46413
+  arg 2  uint 45924
+  arg 3  buff, ~2 KB          (a price-feed update payload)
+```
+
+Argument 0 decodes as type byte `6` (contract principal), version `20`, twenty hash
+bytes, then a name length of `10` and `sbtc-token`. So the call passes a **contract
+principal where a trait is expected** — which is precisely the shape the two offset
+reads above exist to handle, and the same family as the trait-reference work already
+pinned by `as_contract_codegen::a_contract_principal_where_a_trait_is_expected_compiles`
+and `as_contract_sender::both_engines_agree_on_which_contract_a_trait_names`.
+
+Those tests pass, so whatever is wrong here is not covered by them. The argument to
+reproduce against is a contract principal carrying a **ten-character** contract name,
+passed as a trait, alongside a two-kilobyte buff — the buff matters because it is what
+moves everything after it in memory, and an offset that is wrong by the buff's length
+is the obvious suspect.
