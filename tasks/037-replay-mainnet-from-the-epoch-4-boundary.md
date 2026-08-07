@@ -155,6 +155,27 @@ never from fetched, staged or peer-reported height.
       from one of the preserved copies; it is not evidence of a consensus defect, and
       it must not be read as replay depth.
 
+      **Restored, and it produced a frontier rather than a repair.** `mainnet-wasm`
+      was the healthiest advanced copy -- sealed at 8,707,846 with a 229-row ledger
+      window -- and a reflink copy of it into `/home/aldur/mainnet-restored` took
+      seconds and left the original untouched. It resumed cleanly, seeded its
+      sortition chain at burn 961,189 from its own executed tenures, and executed
+      **279 blocks**, 8,707,846 through 8,708,125.
+
+      It then stopped on a VM error, once, at **8,708,126**:
+
+      > Clarity execution error: Internal(InvariantViolation("Expect(\"Internal(Expect(\\\"Unexpected principal data\\\"))\")"))
+
+      That is a clean state on a clean binary reaching a specific mainnet block and
+      failing inside Clarity, which is the kind of evidence [[060]] is about --
+      unlike the previous frontier, which was corruption of my own making. 7,639
+      blocks are staged behind it, so the node has the material to continue the
+      moment the block executes.
+
+      No boundary is in the way of that catch-up: cycle 141 opens at burn 962,150
+      and Bitcoin is at 961,466, so [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]]
+      does not block this state until it nears the rollover.
+
       **Three, and the third is a consensus defect the other two hid.** 8,716,986 also
       diverges on a *receipt*, which no MARF version can explain:
       `af3e472f…b372e6` is `success` on chain and

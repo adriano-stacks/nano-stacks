@@ -6,7 +6,7 @@ priority: critical
 effort: large
 type: bug
 group: mainnet
-dependencies: ["074", "075"]
+dependencies: []
 tags: ["mainnet", "conformance", "ci", "release", "gates"]
 created_at: "2026-08-07"
 ---

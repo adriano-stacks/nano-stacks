@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079"]
+dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079", "082", "083", "084", "085"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -87,6 +87,33 @@ and steady state, with evidence tied to the durable executed chain.
 - [ ] Make release evidence reproducible and mandatory under [[078]].
 - [ ] Remove residual MARF storage panics under [[079]].
 - [ ] Make the release report fail closed under [[074]].
+- [ ] Cross reward-cycle boundaries using only locally derived consensus under
+      [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]].
+- [ ] Refuse contradictory or missing checkpoint winner-seed evidence under
+      [[083-refuse-an-unrecoverable-checkpoint-winner-seed-bef]].
+- [ ] Eliminate network-valid WebAssembly function-type arity refusals under
+      [[084-eliminate-wasm-function-type-arity-refusals-for-ne]].
+- [ ] Account for and execute every required ignored or conditional gate under
+      [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
+
+### Audit coverage map
+
+Every gap from the repeated 2026-08-07 audit has an open release dependency:
+
+| Gap | Owning task |
+|---|---|
+| reward-cycle rollover stops local sortition derivation | [[082]] |
+| missing signer, tenure, leader-key or VRF evidence accepts | [[076]] |
+| asymmetric tuple runtime-value semantics | [[068]] |
+| contradictory checkpoint winner seed samples against zero | [[083]] |
+| valid-source locals, arity and unclassified mainnet compile failures | [[073]], [[084]] |
+| MARF/storage failure becomes key absence | [[079]] |
+| peer consensus execution fallback and adversarial proof | [[077]] |
+| scoreboard result does not fully control release status | [[075]], [[074]] |
+| stale artifact, misleading engine/differential report | [[074]], [[078]] |
+| ignored, skipped or missing-input tests | [[085]] |
+| floating toolchain, formatting and Clippy warnings | [[078]] |
+| no-hosted catch-up, stock signer/client and 24-hour tip hold | this task, [[054]] |
 
 ## Acceptance Criteria
 

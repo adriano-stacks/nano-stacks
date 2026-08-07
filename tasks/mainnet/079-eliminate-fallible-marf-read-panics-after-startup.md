@@ -23,6 +23,10 @@ fail.
 
 - [~] Replace production `expect("trie storage")` read paths with typed results
       through `nano-marf`, `nano-vm`, chainstate and RPC callers.
+- [ ] Preserve `MarfError` and side-store I/O errors through `MarfStore::get`,
+      `value_of` and every `ClarityBackingStore` caller. Never convert a failed read
+      to `None`, because corruption and a key that never existed are different
+      consensus-visible inputs.
 - [ ] Either verify the complete reachable trie graph at startup or preserve
       typed errors for nodes not covered by the bounded startup check.
 - [x] Add a fixture whose tip record and root survive while a reachable non-root
@@ -35,12 +39,13 @@ fail.
 
 ## Where this stands, 2026-08-07
 
-**The read paths a running node takes no longer panic.** `MarfTrie`'s whole API and
-`VersionedMarf::get`/`get_path` return `Result` now, and the two callers that matter
--- `MarfStore::get` and `value_of` in `nano-vm` -- report the failure and read as
-absent instead of taking the process down. A follower meeting a hole declines a block
-where it used to die mid-round, and the trie's own error names the block and node it
-could not read.
+**The MARF layer's read paths no longer panic, but the VM boundary is still
+fail-open.** `MarfTrie` and `VersionedMarf::get`/`get_path` return `Result`; the two
+callers that matter -- `MarfStore::get` and `value_of` in `nano-vm` -- immediately
+apply `.ok().flatten()` and return absence. That keeps the process alive but loses
+the typed refusal this task requires. A missing value can change Clarity control
+flow, receipts or RPC answers before a later state-root comparison has any chance
+to catch a write, so "read as absent" is not completion of error propagation.
 
 **The fixture is real corruption, built the only honest way.** There is no API that
 produces a trie with a hole, so the test deletes a `marf_node` row directly, reopens,
@@ -63,6 +68,8 @@ left visible rather than half-done.
 
 - No production MARF read can panic because SQLite data is absent, corrupt or
   unavailable.
+- No production MARF or side-store error is observable as an absent Clarity key,
+  metadata entry or RPC value.
 - Errors name the affected state directory, block and trie node without exposing
   keys or values.
 - Refusal mutates no inspected database and leaves the last coherent tip usable.

@@ -32,12 +32,12 @@ who learns to skip them on the report learns to skip them everywhere.
 
 ## Tasks
 
-- [ ] Stop the fixture replay's per-tenure diagnostics from reaching the report's
+- [x] Stop the fixture replay's per-tenure diagnostics from reaching the report's
       standard output. The replay does not have leader-key registrations for a
       captured chain and never will, so this is expected for that oracle and is
       not for a node run — count them and print the count, or route them where a
       reader can ask for them.
-- [ ] Do not silence the same messages on a node. What is expected in a fixture
+- [x] Do not silence the same messages on a node. What is expected in a fixture
       replay is a missing checkpoint input in production, and
       [[070-carry-leader-key-history-into-proposal-validation]] is exactly that
       distinction.
@@ -61,6 +61,9 @@ who learns to skip them on the report learns to skip them everywhere.
 - [ ] Report every declared known differential, including non-ignored tests that
       deliberately pin different engine answers under [[060]] and [[068]]. A
       zero ignored-test count is not a zero differential count.
+- [ ] Consume the explicit ignored/conditional-test inventory from
+      [[085-eliminate-unaccounted-ignored-and-conditional-rele]] instead of
+      discovering policy from test-name or reason-string heuristics.
 - [ ] Fail the report when a semantic differential, required ignored test or red
       scoreboard surface exists.
 - [ ] Build the release binary before reporting it, or require an explicit
@@ -94,3 +97,10 @@ report they could not run, and roughly 200 lines of fixture tenure warnings sit
 between the artifact digest and the scoreboard. `5b532421` and `6383fc82` are the
 most recent instance of a fixture whose incompleteness was invisible until
 something needed it.
+
+The repeat audit at `95a17add` confirmed that diagnostic counting landed without
+silencing production, but the decision remains unsound: `report_scoreboard` returns
+no verdict to `release_report`, `needs to be implemented` is still classified as
+infrastructure, the artifact path is read before any build, and the final exit code
+depends only on the three later gates. These are unchecked above and keep the task
+critical and in progress.

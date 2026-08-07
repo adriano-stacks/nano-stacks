@@ -21,16 +21,16 @@ gate.
 
 ## Tasks
 
-- [ ] Minimize and fix the block-76 transaction-status divergence that currently
+- [~] Minimize and fix the block-76 transaction-status divergence that currently
       stops state-root, receipt and cost replay at 75/340.
-- [ ] Restore 340/340 equality for state roots, receipt status, costs, events and
+- [x] Restore 340/340 equality for state roots, receipt status, costs, events and
       writes without weakening the oracle or editing expected output to match
       nano.
-- [ ] Return a non-zero exit status when any required scoreboard surface fails.
+- [x] Return a non-zero exit status when any required scoreboard surface fails.
       Loading the manifest successfully is not a passing replay.
 - [ ] Make `release-report` consume the scoreboard result rather than treating
       its printed table as evidence independent of success or failure.
-- [ ] Add a command-level regression that corrupts one expected receipt or root
+- [~] Add a command-level regression that corrupts one expected receipt or root
       and asserts that both `scoreboard` and the release gate fail.
 - [ ] Run the complete release conformance suite and close the event-observer,
       PoX-5 replay, kill-during-replay and write-journal failures exposed by the
@@ -53,6 +53,12 @@ gate.
   capture, flips one receipt's `status` from `success` to `abort_by_response` — the
   exact shape the block-76 regression took — and asserts the command fails, having
   first asserted the untampered tree passes.
+
+The repeat audit narrowed the last claim: the regression calls
+`scoreboard_result` directly. It proves the verdict function, but it does not spawn
+`cargo xtask scoreboard` and does not assert `release-report` exits non-zero for the
+same tampered tree. That is why the command-level bullet remains partial and the
+release-report bullet remains open.
 
 **Open, and the number moved the wrong way before it moved the right way.** The
 suite was 241/6 when this task was written; it is **235 passed, 12 failed** now.
