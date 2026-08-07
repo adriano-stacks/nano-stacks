@@ -44,8 +44,26 @@ execution.
       shim on a chain where nano derives the active PoX-5 signer set, and have
       it accept and sign a proposal nano validated with checkpointed leader-key
       history under [[070-carry-leader-key-history-into-proposal-validation]].
-- [ ] Submit a valid transaction through the public RPC and observe the same
+- [x] Submit a valid transaction through the public RPC and observe the same
       transaction admitted, mined, executed and emitted in `new_block`.
+      `submitted_transaction.rs` walks the whole journey offline and deterministically:
+      a **captured** mainnet-accepted transaction is posted to `/v2/transactions`
+      over a real socket to a served listener; it lands in the pool the miner reads;
+      the pool *offers* it against this node's own tip accounts; nano assembles its
+      own block in the place of the one that was dropped and that block carries it;
+      the receipt says `Success` where the network's receipt said `success`; and the
+      `new_block` payload names it with the same `status`, `raw_result` and
+      `execution_cost` stacks-core published for the same execution.
+
+      A captured transaction rather than a forged one, because a valid one needs a
+      funded account at the right nonce and a fixture cannot forge that without a key
+      it does not carry — one the network itself accepted is valid by construction
+      and arrives with its own oracle. The block is also asserted to be refused when
+      the pool offers nothing, so "mined" cannot be satisfied by an empty block.
+
+      `event_delivery.rs::an_observer_receives_what_the_node_dispatches` is the other
+      half — a listener, a dispatch, and the body arriving — so the payload is not
+      only built correctly but sent.
 - [x] Finish `/v3/stacker_set`: preserve `stacked_amt`, serve the current
       Waterfall shape and derive its sBTC address instead of returning V0/zero
       placeholders. `DerivedRewardSet` keeps `stacked` and `pox_ustx_threshold`
