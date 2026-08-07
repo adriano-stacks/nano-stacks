@@ -84,6 +84,9 @@ pub struct NextCycle {
 pub struct Block {
     pub height: u64,
     pub id: String,
+    /// What this block was built on, so the explorer can walk back and fill in the
+    /// blocks the node executed between two polls rather than sampling its tip.
+    pub parent_id: String,
     pub consensus_hash: String,
     pub state_index_root: String,
     pub transactions: Vec<Transaction>,
@@ -224,6 +227,7 @@ fn decode(bytes: &[u8], height: u64) -> Option<Block> {
     Some(Block {
         height: if height > 0 { height } else { block.header.chain_length },
         id: block.block_id().to_string(),
+        parent_id: block.header.parent_block_id.to_string(),
         consensus_hash: block.header.consensus_hash.to_string(),
         state_index_root: block.header.state_index_root.to_string(),
         signatures: block.header.signer_signatures.len(),

@@ -46,6 +46,13 @@ const POLL: Duration = Duration::from_secs(2);
 /// How many executed blocks the explorer keeps.
 const HISTORY: usize = 200;
 
+/// How far back one poll will walk to fill in blocks it did not see land.
+///
+/// A bound rather than "until it meets a known block", because the first poll after
+/// a restart meets nothing: without this it would walk the chain to the checkpoint,
+/// one request per block.
+const FILL: usize = 50;
+
 fn main() -> io::Result<()> {
     let url = std::env::args()
         .nth(1)
@@ -144,14 +151,39 @@ impl State {
         if self.blocks.first().is_some_and(|block| block.id == tip) {
             return;
         }
-        if let Some(block) = node.block(&tip, height) {
-            self.blocks.insert(0, block);
-            self.blocks.truncate(HISTORY);
-            // Keep the cursor on the block it was on, rather than letting a new tip
-            // slide the selection out from under the reader.
-            if let Some(index) = self.selected.selected() {
-                self.selected.select(Some((index + 1).min(self.blocks.len() - 1)));
+        // Walked back from the new tip through its parents, not sampled at it. The
+        // node executes several blocks between two polls whenever it is catching up
+        // -- and often when it is not -- so taking only the tip left holes in the
+        // list: 8,716,645, 8,716,644, 8,716,643, 8,716,641. A hole is not a small
+        // cosmetic problem here, because the list claims to be what this node
+        // executed, and a reader cannot tell a block that was skipped by the poll
+        // from one the node never ran.
+        let mut found = Vec::new();
+        let mut walk = Some(tip);
+        while let Some(id) = walk.take() {
+            if self.blocks.iter().any(|block| block.id == id) || found.len() >= FILL {
+                break;
             }
+            // The height is read from the block's own header, except for the tip,
+            // whose height the node has already stated.
+            let Some(block) = node.block(&id, if found.is_empty() { height } else { 0 }) else {
+                break;
+            };
+            walk = Some(block.parent_id.clone());
+            found.push(block);
+        }
+        if found.is_empty() {
+            return;
+        }
+        // `found` is newest-first, and so is the list.
+        let added = found.len();
+        self.blocks.splice(0..0, found);
+        self.blocks.truncate(HISTORY);
+        // Keep the cursor on the block it was on, rather than letting new tips slide
+        // the selection out from under the reader.
+        if let Some(index) = self.selected.selected() {
+            self.selected
+                .select(Some((index + added).min(self.blocks.len() - 1)));
         }
     }
 
