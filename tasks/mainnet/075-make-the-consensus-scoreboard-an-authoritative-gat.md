@@ -55,12 +55,21 @@ gate.
   first asserted the untampered tree passes.
 
 **Open, and the number moved the wrong way before it moved the right way.** The
-suite was 241/6 when this task was written; it is **240 passed, 7 failed** now.
+suite was 241/6 when this task was written; it is **235 passed, 12 failed** now.
 [[077-remove-peer-derived-consensus-execution-fallbacks]] is why: fifteen rigs
 executed under a peer's sortition answer, and with that path gone they had no burn
 view. Seeding them from the capture closed eight.
 
-The seven that remain are one finding, not seven: the tenure VRF rule now **runs**
+The twelve that remain are one finding, not twelve. They are three rig families --
+`catch_up_rounds`, `follow_path`, `execution_stall` -- and the count moves with the
+*seed height* of the fixture's consensus-hash history, not with anything else: seeding
+at burn 459 leaves seven failing, seeding at 360 leaves twelve, because a lower seed
+lets more rigs derive far enough forward to reach a reward cycle boundary and stop
+there. No seed makes them all pass, and that is the point --
+[[082-cross-a-reward-cycle-boundary-with-a-locally-derive]] is what makes them
+passable at all.
+
+The finding underneath is unchanged: the tenure VRF rule now **runs**
 on these rigs, where for want of a local chain it was skipped. Three fail it with
 `committed seed is not the hash of the parent tenure's VRF proof`, which says the
 seeding is wrong rather than the rule is. The capture's history ends at burn 459 and
