@@ -38,6 +38,10 @@ impl ComplexWord for Let {
         // costs more to search than the one the `let` itself sits in.
         generator.bindings.enter_scope()?;
 
+        // The locals of every binding this scope introduces, returned to the
+        // pool when the scope closes.
+        let mut scope_locals = Vec::new();
+
         // Traverse the bindings
         for i in 0..bindings.len() {
             let pair = bindings.get_list(i)?;
@@ -61,7 +65,8 @@ impl ComplexWord for Let {
             let locals = generator.save_to_locals(builder, &ty, true);
 
             // Add these named locals to the map
-            generator.bindings.insert(name.clone(), ty, locals);
+            generator.bindings.insert(name.clone(), ty, locals.clone());
+            scope_locals.extend(locals);
         }
 
         // WORKAROUND: need to set the last statement type to the type of the let expression
@@ -84,6 +89,11 @@ impl ComplexWord for Let {
 
         // Restore the named locals.
         generator.bindings = saved_locals;
+
+        // The scope is closed, so its bindings are unreadable and their slots
+        // can be reused. A binding that shadowed an outer name releases only
+        // its own locals; the outer binding's were never in the pool.
+        generator.release_locals(scope_locals);
 
         Ok(())
     }

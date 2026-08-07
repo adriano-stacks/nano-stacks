@@ -221,19 +221,19 @@ impl ComplexWord for Fold {
         generator.traverse_expr(builder, sequence)?;
         // STACK: [offset, length]
 
-        let length = generator.module.locals.add(ValType::I32);
-        let offset = generator.module.locals.add(ValType::I32);
-        let end_offset = generator.module.locals.add(ValType::I32);
+        let length = generator.borrow_local(ValType::I32);
+        let offset = generator.borrow_local(ValType::I32);
+        let end_offset = generator.borrow_local(ValType::I32);
 
         // Store the length and offset into locals.
-        builder.local_set(length).local_tee(offset);
+        builder.local_set(*length).local_tee(*offset);
         // STACK: [offset]
 
         // Compute the ending offset of the sequence.
         builder
-            .local_get(length)
+            .local_get(*length)
             .binop(BinaryOp::I32Add)
-            .local_set(end_offset);
+            .local_set(*end_offset);
         // STACK: []
 
         // Evaluate the initial value, so that its result is on the data stack
@@ -270,7 +270,7 @@ impl ComplexWord for Fold {
         let result_locals = generator.save_to_locals(&mut else_, &result_clar_ty, true);
         let acc_copy_locals: Vec<_> = result_wasm_types
             .iter()
-            .map(|&t| generator.module.locals.add(t))
+            .map(|&t| generator.alloc_local(t))
             .collect();
 
         // Define the body of a loop, to loop over the sequence and make the
@@ -279,7 +279,7 @@ impl ComplexWord for Fold {
         let loop_id = loop_.id();
 
         // Load the element from the sequence and duck-type it to the expected type
-        elem_ty.load(generator, &mut loop_, offset)?;
+        elem_ty.load(generator, &mut loop_, *offset)?;
         if let Some(FoldFuncTy {
             elem_ty: Some(expected_elem_ty),
             ..
@@ -306,6 +306,10 @@ impl ComplexWord for Fold {
         for &l in acc_copy_locals.iter() {
             loop_.local_get(l);
         }
+        // The accumulator copy is on the stack for the call; its slots are
+        // rewritten before every read on the next iteration, so they are dead
+        // past this point.
+        generator.release_locals(acc_copy_locals);
 
         if let Some(simple) = words::lookup_simple(func) {
             // Call simple builtin, which charges itself.
@@ -345,14 +349,14 @@ impl ComplexWord for Fold {
         // Increment the offset by the size of the element, leaving the
         // offset on the top of the stack
         loop_
-            .local_get(offset)
+            .local_get(*offset)
             .i32_const(elem_ty.type_size())
             .binop(BinaryOp::I32Add)
-            .local_tee(offset);
+            .local_tee(*offset);
 
         // Loop if we haven't reached the end of the sequence
         loop_
-            .local_get(end_offset)
+            .local_get(*end_offset)
             .binop(BinaryOp::I32LtU)
             .br_if(loop_id);
 
@@ -363,8 +367,11 @@ impl ComplexWord for Fold {
             else_.local_get(*result_local);
         }
 
+        // The intermediate result is on the stack; its slots are dead.
+        generator.release_locals(result_locals);
+
         builder
-            .local_get(length)
+            .local_get(*length)
             .unop(UnaryOp::I32Eqz)
             .instr(IfElse {
                 consequent: then_id,
@@ -379,9 +386,10 @@ impl ComplexWord for Fold {
         // we copy the result from the accumulator space to the allocated space for the result
         let locals = generator.save_to_locals(builder, &expr_ty, true);
         generator.copy_value(builder, &expr_ty, &locals, return_offset)?;
-        for l in locals.into_iter() {
-            builder.local_get(l);
+        for l in &locals {
+            builder.local_get(*l);
         }
+        generator.release_locals(locals);
 
         Ok(())
     }
