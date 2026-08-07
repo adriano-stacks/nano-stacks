@@ -152,10 +152,43 @@ struct LocalBurnView {
     state: std::path::PathBuf,
 }
 
+/// The capture a locally derived burn view is seeded from.
+///
+/// `checkpoint.sortition`, which is the same directory the canonical follower
+/// seeds from and the only one that holds a sortition history: `snapshots.json`
+/// and the consensus hashes behind it, because a consensus hash mixes the ones at
+/// power-of-two offsets back.
+///
+/// This took `checkpoint.marf`'s *parent directory* instead. That is
+/// `chainstate/checkpoint-H` — the trie, the block headers and the native effects,
+/// and never a snapshot — so the seed failed on every configuration where the two
+/// are not the same directory, which is every mainnet one. With it went the
+/// leader-key registry the same loader carries, so the validator could check no
+/// tenure's VRF proof and no miner's signature: the two things it exists to check.
+fn capture_directory(config: &Config) -> Option<&std::path::Path> {
+    let capture = config.checkpoint.sortition.as_deref();
+    if capture.is_none() {
+        eprintln!(
+            "no checkpoint sortition history is configured, so the proposal validator cannot \
+             derive burn views locally and can check no tenure's VRF"
+        );
+    }
+    capture
+}
+
 impl LocalBurnView {
     /// Resume the derived chain, or seed it from the checkpoint that carries one.
+    ///
+    /// From `checkpoint.sortition`, which is the same directory the canonical
+    /// follower seeds from and the only one that holds a sortition history. This
+    /// took the MARF's *parent directory* instead — `chainstate/checkpoint-H`,
+    /// which holds the trie, the headers and the native effects and has never held
+    /// `snapshots.json`. So the seed failed on every mainnet configuration, and
+    /// with it went the leader-key registry that the same loader carries: a
+    /// validator that can derive no burn view can check no tenure's VRF and no
+    /// miner's signature, which is the whole reason this exists.
     fn open(config: &Config) -> Option<Self> {
-        let capture = config.checkpoint.marf.parent()?;
+        let capture = capture_directory(config)?;
         let state = config.node.working_dir.clone();
         let tracker = crate::sortition::SortitionTracker::resume_or_capture(&state, capture)
             .inspect_err(|error| {
@@ -698,4 +731,61 @@ async fn pull(client: &StackerDbClient, state: &RpcState, contract: &StackerDbCo
 #[must_use]
 pub fn identifier(contract: &StackerDbContract) -> String {
     format!("{}.{}", contract.address, contract.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_directory;
+    use crate::config::Config;
+
+    /// A mainnet checkpoint whose sortition history is not beside its trie, which
+    /// is where every real one is.
+    const MAINNET: &str = r#"
+        [node]
+        working_dir = "/tmp/nano"
+        network = "mainnet"
+        peers = []
+        rpc_bind = "127.0.0.1:20443"
+
+        [burnchain]
+        rest_url = "https://example.invalid/api"
+        magic = "X2"
+        pox_5_activation_height = 960230
+
+        [checkpoint]
+        marf = "/capture/chainstate/checkpoint-H/marf.sqlite"
+        source_state_id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        state_root = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+        anchor_block = "/capture/nakamoto/anchor.bin"
+        anchor_bitcoin_height = 960231
+        sortition = "/capture/sortition"
+    "#;
+
+    /// The validator seeds from the sortition capture, not from beside the trie.
+    ///
+    /// It took `checkpoint.marf`'s parent directory, which on every mainnet
+    /// configuration is `chainstate/checkpoint-H` — the trie and the headers, never
+    /// a `snapshots.json`. So it seeded nothing, carried no leader-key registry, and
+    /// could check neither a tenure's VRF proof nor a miner's signature.
+    #[test]
+    fn the_proposal_validator_seeds_from_the_sortition_capture() {
+        let config = Config::parse(MAINNET).expect("a valid mainnet configuration");
+        assert_eq!(
+            capture_directory(&config),
+            Some(std::path::Path::new("/capture/sortition"))
+        );
+        assert_ne!(
+            capture_directory(&config),
+            config.checkpoint.marf.parent(),
+            "the trie's directory holds no sortition history, and this is the bug"
+        );
+    }
+
+    /// And a node configured without one is told, rather than seeding from a guess.
+    #[test]
+    fn a_checkpoint_with_no_sortition_history_derives_no_burn_view() {
+        let without = MAINNET.replace(r#"sortition = "/capture/sortition""#, "");
+        let config = Config::parse(&without).expect("a valid mainnet configuration");
+        assert_eq!(capture_directory(&config), None);
+    }
 }
