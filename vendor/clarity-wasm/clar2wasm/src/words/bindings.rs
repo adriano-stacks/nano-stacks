@@ -1,8 +1,10 @@
 use clarity::vm::{ClarityName, SymbolicExpression};
 
 use crate::cost::WordCharge;
-use crate::wasm_generator::{drop_value, ArgumentsExt, GeneratorError, WasmGenerator};
-use crate::wasm_utils::ArgumentCountCheck;
+use crate::wasm_generator::{
+    drop_value, ArgumentsExt, BindingStorage, GeneratorError, WasmGenerator,
+};
+use crate::wasm_utils::{get_type_size, ArgumentCountCheck};
 use crate::words::{ComplexWord, Word};
 use crate::{check_args, error_mapping};
 
@@ -30,6 +32,11 @@ impl ComplexWord for Let {
         self.charge(generator, builder, args_len as u32)?;
 
         let bindings = args.get_list(0)?;
+
+        // A scope wide enough to spill keeps its bindings at constant
+        // offsets into the function's frame, one slot each, instead of
+        // declaring one wasm local per leaf value.
+        let spilled = generator.spilled_scopes.contains(&_expr.id);
 
         // Save the current named locals
         let saved_locals = generator.bindings.clone();
@@ -69,6 +76,22 @@ impl ComplexWord for Let {
                 Some(id) if generator.binding_uses[id as usize] == 0 => {
                     drop_value(builder, &ty);
                     generator.bindings.insert(name.clone(), ty, Vec::new(), binding);
+                }
+                _ if spilled => {
+                    let delta = generator.spill_cursor;
+                    generator.spill_cursor += get_type_size(&ty) as u32;
+                    let frame_pointer = generator.frame_pointer.ok_or_else(|| {
+                        GeneratorError::InternalError(
+                            "spilled binding written outside of its frame".to_owned(),
+                        )
+                    })?;
+                    generator.write_to_memory(builder, frame_pointer, delta, &ty)?;
+                    generator.bindings.insert_spilled(
+                        name.clone(),
+                        ty,
+                        BindingStorage::Spilled { delta },
+                        binding,
+                    );
                 }
                 _ => {
                     let locals = generator.save_to_locals(builder, &ty, true);
