@@ -485,9 +485,16 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
             ]))
         })
         .collect();
+    // The count is on the title because "how much is this holding?" is a fair
+    // question to ask of a long-running dashboard, and the answer is bounded: this
+    // keeps blocks in memory and nothing on disk.
+    let title = format!(
+        " executed blocks — {} held, {HISTORY} max, nothing on disk ",
+        state.blocks.len()
+    );
     frame.render_stateful_widget(
         List::new(items)
-            .block(bordered(" executed blocks "))
+            .block(bordered(&title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▍"),
         area,
