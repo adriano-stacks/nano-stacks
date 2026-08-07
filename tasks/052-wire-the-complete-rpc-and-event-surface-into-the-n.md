@@ -95,9 +95,20 @@ execution.
         The fix belongs to this task's own rule -- *the chain this node executed,
         never the chain its peer advertised*. `tenure_info` should be answered from
         the sealed tip the snapshot already carries rather than from a peer-derived
-        tenure list that a catching-up node never has. `SealedTip` does not carry
-        every `TenureInfoWire` field today, so this is a small piece of work rather
-        than a one-line change, and it is the next action.
+        tenure list that a catching-up node never has.
+
+        Measured, so the next session starts at the work and not at the survey.
+        `SealedTip` covers `consensus_hash`, `tip_block_id` and `tip_height`
+        directly, and its `bitcoin_height` gives `reward_cycle` through the pox
+        calendar. Three have no source in it — `tenure_start_block_id`,
+        `parent_consensus_hash` and `parent_tenure_start_block_id` — and zeroing them
+        is not open: this task's own rule is that a field plainly absent beats one
+        confidently wrong. They are answerable from the executed-block archive
+        [[046-distinguish-followed-and-executed-chain-tips]] added, which already
+        keeps `tenure_start_heights` and resolves a block by height. So the work is
+        to give `tenure_info` that archive and walk the tip's tenure back one step —
+        which is why this is a small piece of work and not the one-line change it
+        looks like. It is the next action.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
