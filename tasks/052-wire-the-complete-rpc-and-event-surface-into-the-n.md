@@ -105,10 +105,20 @@ execution.
         is not open: this task's own rule is that a field plainly absent beats one
         confidently wrong. They are answerable from the executed-block archive
         [[046-distinguish-followed-and-executed-chain-tips]] added, which already
-        keeps `tenure_start_heights` and resolves a block by height. So the work is
-        to give `tenure_info` that archive and walk the tip's tenure back one step —
-        which is why this is a small piece of work and not the one-line change it
-        looks like. It is the next action.
+        keeps `tenure_start_heights` and resolves a block by height.
+
+        And the shape of that work is settled too, because the obvious version does
+        not work. `ExecutedBlocks` exposes only `block(id)` and
+        `tenure(start, stop)`, so answering from it alone means walking the tip's
+        parents until the consensus hash changes — which is fine for a short tenure
+        and unusable here: the pox-5 chain this is being tested on has been extending
+        a *single* tenure for thirteen thousand blocks, so one request would decode
+        thirteen thousand blocks.
+
+        So the next action is to widen the trait rather than walk behind it: give
+        `ExecutedBlocks` a tenure-start lookup, implement it in `nano_node::Archive`
+        over the `tenure_start_heights` it already keeps, and answer `tenure_info`
+        from the sealed tip plus that one lookup.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
