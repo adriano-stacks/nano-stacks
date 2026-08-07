@@ -1670,6 +1670,17 @@ where
         self.archive = Some(archive);
     }
 
+    /// Give back sealed states above a height. See `ChainState::discard_above`.
+    ///
+    /// Exposed because the residue of an abandoned block can appear *while the node
+    /// is up*, not only across a restart: a block sealed and then not committed leaves
+    /// the MARF ahead of the ledger, and the MARF refuses to begin a version it
+    /// already holds, so every later round fails on that same block until something
+    /// gives the state back.
+    pub fn discard_above(&mut self, height: u32) -> Result<usize, ChainStateError> {
+        self.chainstate.discard_above(height)
+    }
+
     /// Take over a derived sortition chain, and say where to keep it.
     ///
     /// A chain that is not written down is re-derived from the checkpoint's burn

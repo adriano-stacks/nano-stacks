@@ -550,6 +550,7 @@ async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> Ex
             // is reported in. The error names the peer's chain; this names ours.
             println!("{}", failed_round_report(from, executor.tip()));
             backfill_missing_header(&mut executor, peer, &error.to_string()).await;
+            give_back_states_above_the_tip(&mut executor, &error.to_string());
             peer_failed = true;
         }
     }
@@ -1901,6 +1902,49 @@ async fn start_hosting(
 async fn announce_executed_blocks(executor: Option<&SharedExecutor>, dispatcher: &EventDispatcher) {
     if let Some(executor) = executor {
         executor.lock().await.announce_to(dispatcher.clone());
+    }
+}
+
+/// Whether a round failed because the MARF already holds a version it was asked to
+/// write.
+///
+/// The name is the whole test: `VersionAlreadyExists` has one `Display`, and matching
+/// on the text is what keeps this out of the execution path's error type.
+fn round_hit_marf_residue(error: &str) -> bool {
+    error.contains("MARF version already exists")
+}
+
+/// Give back sealed states above this node's own tip, mid-run.
+///
+/// Startup already does this, and that was not enough. A round can leave the MARF
+/// ahead of the ledger *while the node is up* -- a block sealed and then not
+/// committed, because the peer went away between the two writes -- and the MARF
+/// refuses to begin a version it already holds, so every later round fails on the
+/// same block. A live mainnet node did exactly that: **691 identical failures in one
+/// run**, at height 8,713,221, ending only when somebody restarted it and startup
+/// swept up.
+///
+/// Only on the error that names it, and only above the tip: states at or below the
+/// tip are what the ledger points at, and re-executing what is above is cheap
+/// because the blocks are fetched again anyway
+/// ([[056-make-rejected-block-execution-leave-no-state]]).
+fn give_back_states_above_the_tip(executor: &mut CheckpointExecutor<BurnchainSource>, error: &str) {
+    if !round_hit_marf_residue(error) {
+        return;
+    }
+    let Ok(height) = u32::try_from(executor.tip().header.chain_length) else {
+        return;
+    };
+    match executor.discard_above(height) {
+        Ok(0) => eprintln!(
+            "the MARF refused a version it already holds, but there is nothing above \
+             {height} to give back: this is not the residue of an abandoned block"
+        ),
+        Ok(given_back) => println!(
+            "gave back {given_back} sealed states above {height} that no ledger names, \
+             so the next round can execute that block instead of failing on it"
+        ),
+        Err(error) => eprintln!("cannot give back the states above {height}: {error}"),
     }
 }
 
@@ -3317,6 +3361,41 @@ block height found for Stacks block dd254a1691f90df22c1d4585c6526feda3b88b941f6f
             hex::encode(block),
             "dd254a1691f90df22c1d4585c6526feda3b88b941f6ffa8c85d2e6b4bfb0b291"
         );
+    }
+
+    /// The message a live mainnet node printed 691 times in one run, at height
+    /// 8,713,221, and which only a restart cleared.
+    ///
+    /// The residue is real: that state's MARF held versions to 8,713,522 while its
+    /// ledger named 8,713,221, so every round asked the MARF to begin a version it
+    /// already had. Startup swept it; nothing did while the node was up.
+    const RESIDUE: &str = "executing the peer's chain failed: node execution failed: \
+checkpoint execution failed: state storage error: MARF error: MARF version already exists";
+
+    #[test]
+    fn the_marf_residue_failure_is_recognised_from_what_the_node_printed() {
+        assert!(super::round_hit_marf_residue(RESIDUE));
+    }
+
+    /// And nothing else is, because giving back state is not a thing to do on a
+    /// guess: every other round failure leaves the states above the tip alone.
+    #[test]
+    fn no_other_round_failure_gives_back_state() {
+        for other in [
+            REAL,
+            "executing the peer's chain failed: HTTP sync error: no peer left to ask",
+            "executing the peer's chain failed: node execution failed: checkpoint execution \
+             failed: state root mismatch: expected aa, got bb",
+            "executing the peer's chain failed: node execution failed: checkpoint execution \
+             failed: invalid transaction: committed seed is not the hash of the parent \
+             tenure's VRF proof",
+            "executing the peer's chain failed: state storage error: MARF error: write in progress",
+        ] {
+            assert!(
+                !super::round_hit_marf_residue(other),
+                "this failure must not give back state: {other}"
+            );
+        }
     }
 
     #[test]
