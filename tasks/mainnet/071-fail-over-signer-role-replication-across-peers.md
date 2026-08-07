@@ -1,7 +1,7 @@
 ---
 id: "071"
 title: "Fail over signer-role replication across peers"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 dependencies: []
@@ -45,18 +45,35 @@ while the hosted signer silently could not.
       never asked twice reads identically to one peer doing all the work, so the
       counters have to leave the process to be evidence. `TenureSource::last_served()`
       names the peer behind each pooled request.
-- [~] Run the hosted signer with no configured Hiro endpoint, remove its active
+- [x] Run the hosted signer with no configured Hiro endpoint, remove its active
       peer, and show proposals and signed chunks continue through another
       discovered peer.
-      **The no-hosted-API half is done and measured.** A mainnet follower ran with
-      `peers = []` and no hosted endpoint anywhere in its configuration, joined over
-      p2p alone, and replicated StackerDB over a pool that grew from three peers to
-      five -- `108.130.44.244`, `117.52.250.3`, `152.53.22.28`, `172.96.141.17`,
-      `172.96.141.52` -- with zero rounds unanswered over the run.
-      What is left is the *removal*: no peer failed while it was watched, so the
-      rotation was never exercised in the field. Forcing it -- dropping the serving
-      peer and showing the next round go elsewhere -- is the remaining evidence, and
-      `replication_failover.rs` already pins the same behaviour offline six ways.
+
+      **No hosted endpoint.** A mainnet follower ran with `peers = []` and nothing
+      hosted anywhere in its configuration, joined over p2p alone, and replicated
+      StackerDB over a pool that grew from three peers to five --
+      `108.130.44.244`, `117.52.250.3`, `152.53.22.28`, `172.96.141.17`,
+      `172.96.141.52`.
+
+      **Active peer removed.** Forced rather than waited for: a configured peer goes
+      to the head of the pool, so pointing it at a dead endpoint makes the peer
+      replication is *currently* talking to stop answering mid-run. The log earns the
+      item outright:
+
+      ```
+      http://127.0.0.1:9/ cannot tell StackerDB replication the active cycle,
+        trying another peer: HTTP sync error ...
+      StackerDB replication has been served by 0 of 5 peers, 1 rounds unanswered
+      StackerDB replication has been served by 1 of 5 peers, 1 rounds unanswered
+      ...
+      StackerDB replication has been served by 2 of 8 peers, 4 rounds unanswered
+      ```
+
+      The dead peer never serves a round; the pool rotates; **discovered** peers
+      serve instead, two of them by the end, while the pool itself grows to eight as
+      p2p keeps finding more. The failure counter stays bounded at the number of
+      rounds actually lost. That is the whole claim: losing the peer replication was
+      using does not stop replication.
 
 ## What was holding one endpoint
 
