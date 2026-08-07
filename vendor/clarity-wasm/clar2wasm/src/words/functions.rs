@@ -25,7 +25,10 @@ impl ComplexWord for DefinePrivateFunction {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
         let Some(signature) = args.get_expr(0)?.match_list() else {
-            return Err(GeneratorError::NotImplemented);
+            return Err(GeneratorError::NotImplemented(format!(
+                "a {} whose signature is not a list",
+                Self.name()
+            )));
         };
         let name = signature.get_name(0)?;
 
@@ -70,7 +73,10 @@ impl ComplexWord for DefineReadonlyFunction {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
         let Some(signature) = args.get_expr(0)?.match_list() else {
-            return Err(GeneratorError::NotImplemented);
+            return Err(GeneratorError::NotImplemented(format!(
+                "a {} whose signature is not a list",
+                Self.name()
+            )));
         };
         let name = signature.get_name(0)?;
         // Making sure name is not reserved
@@ -117,7 +123,10 @@ impl ComplexWord for DefinePublicFunction {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
         let Some(signature) = args.get_expr(0)?.match_list() else {
-            return Err(GeneratorError::NotImplemented);
+            return Err(GeneratorError::NotImplemented(format!(
+                "a {} whose signature is not a list",
+                Self.name()
+            )));
         };
         let name = signature.get_name(0)?;
 

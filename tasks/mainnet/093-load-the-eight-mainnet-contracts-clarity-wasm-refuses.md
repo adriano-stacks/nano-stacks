@@ -2,7 +2,7 @@
 id: "093"
 group: mainnet
 title: "Load the eight mainnet contracts clarity-wasm refuses"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["073"]
@@ -52,12 +52,18 @@ cargo xtask check-module /home/aldur/mainnet-8716986/state \
 
 ## Tasks
 
-- [ ] Name the word `Not implemented` refuses, for each of the three contracts.
-      `wasm_generator.rs` raises it where a `SymbolicExpression` shape has no
-      code generator; the message does not say which, and it should.
-- [ ] Reduce each of the three families to the smallest source that reproduces,
-      from the real contract rather than towards it — the lesson of task 086,
-      where two invented reductions passed while the real one differed.
+- [x] Name the word `Not implemented` refuses, for each of the three contracts.
+      **Done: `GeneratorError::NotImplemented` carries what it refused now, at all
+      eight raise sites. All three answer the same thing — `equality over
+      CallableType(Trait(..))`.**
+- [x] Reduce the `Not implemented` family. **Done: `(is-eq <trait> <trait>)`.
+      Fixed — `wasm_equal`'s principal arm covered `CallableSubtype::Principal`
+      and not `Trait`, though a trait reference *is* a principal at run time
+      ("a public function receives a trait argument as a bare principal",
+      `wasm_generator.rs`). All three contracts compile and load.**
+- [ ] Reduce the duck-typing and tuple families the same way, from the real
+      contract rather than towards it — the lesson of task 086, where two invented
+      reductions passed while the real one differed.
 - [ ] Fix the duck-typing rule: `buff 1` against `string-ascii 256` is a
       comparison four deployed contracts make and the network permits.
 - [ ] Fix `Tuples fields should be typed` for whatever shape
@@ -86,3 +92,28 @@ mainnet contracts left 8 failing and unclassified, with a note that "some may be
 harness artifacts". They are not. Splitting them out of 073 keeps that task's
 locals result, which is finished and green, from being held open by three
 unrelated code-generation defects.
+
+## Three of eight fixed, 2026-08-08
+
+`GeneratorError::NotImplemented` carried nothing, so all eight of its raise sites
+produced the same three words. It names what it refused now, and all three
+`Not implemented` contracts answered identically: **`equality over
+CallableType(Trait(..))`** — `(is-eq <trait> <trait>)`.
+
+`wasm_equal` handled `CallableSubtype::Principal` and not `CallableSubtype::Trait`
+in the arm that compares bytes, though the two are one thing at run time.
+`wasm_generator` states it where it lowers a parameter — *"a public function
+receives a trait argument as a bare principal"* — and `contract-of` is the read of
+it. One arm, and `amm-swap003` and both `.pool`s compile and load.
+
+Pinned by `trait_equality`, which crosschecks against the reference interpreter
+rather than asserting that it compiles. That distinction is the point: a trait
+reference is a principal in linear memory, so this bug had two possible endings —
+refuse to compile, or compare the wrong bytes and answer confidently. Task 086 is
+what the second looks like on mainnet. The tests cover equal pairs, unequal
+pairs, and equality tied to `contract-of`, and they fail on the previous
+revision with the original refusal.
+
+**Five contracts remain**: four `gated-pages*` on duck typing
+(`buff 1` against `string-ascii 256`) and `trajan-endorsement-alpha` on
+`Tuples fields should be typed`.

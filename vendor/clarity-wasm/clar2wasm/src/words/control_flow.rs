@@ -187,7 +187,10 @@ impl ComplexWord for UnwrapPanic {
 
                 Ok(())
             }
-            _ => Err(GeneratorError::NotImplemented),
+            other => Err(GeneratorError::NotImplemented(format!(
+                "{} over {other:?}",
+                Self.name()
+            ))),
         }
     }
 }
@@ -284,7 +287,10 @@ impl ComplexWord for UnwrapErrPanic {
 
                 Ok(())
             }
-            _ => Err(GeneratorError::NotImplemented),
+            other => Err(GeneratorError::NotImplemented(format!(
+                "{} over {other:?}",
+                Self.name()
+            ))),
         }
     }
 }

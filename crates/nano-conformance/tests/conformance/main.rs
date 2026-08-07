@@ -75,6 +75,7 @@ mod tenure_block_reward;
 mod tenure_continuity;
 mod tenure_fee_maturity;
 mod tenure_vrf_enforcement;
+mod trait_equality;
 mod trie_diff;
 mod wasm_builds_a_let_bound_placeholder;
 mod wasm_is_the_engine;

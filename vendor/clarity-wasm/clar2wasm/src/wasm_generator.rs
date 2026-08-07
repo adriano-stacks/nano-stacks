@@ -410,7 +410,13 @@ pub enum LiteralMemoryEntry {
 
 #[derive(Debug)]
 pub enum GeneratorError {
-    NotImplemented,
+    /// A shape code generation has no case for, and *which* shape.
+    ///
+    /// It carried nothing, so every one of the eight sites that raises it
+    /// produced the same three words. Three mainnet contracts refuse to compile
+    /// with exactly that message and task 093 has to reduce them; "Not
+    /// implemented" does not say what to reduce towards.
+    NotImplemented(String),
     InternalError(String),
     TypeError(String),
     ArgumentCountMismatch,
@@ -425,7 +431,7 @@ pub enum FunctionKind {
 impl DiagnosableError for GeneratorError {
     fn message(&self) -> String {
         match self {
-            GeneratorError::NotImplemented => "Not implemented".to_string(),
+            GeneratorError::NotImplemented(what) => format!("Not implemented: {what}"),
             GeneratorError::InternalError(msg) => format!("Internal error: {msg}"),
             GeneratorError::TypeError(msg) => format!("Type error: {msg}"),
             GeneratorError::ArgumentCountMismatch => "Argument count mismatch".to_string(),

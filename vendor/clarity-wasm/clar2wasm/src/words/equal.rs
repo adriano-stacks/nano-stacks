@@ -130,8 +130,20 @@ pub(super) fn wasm_equal(
         | TypeSignature::SequenceType(SequenceSubtype::StringType(_)) => {
             wasm_equal_bytes(generator, builder, first_op, nth_op)
         }
+        // A trait reference is a principal at run time -- `wasm_generator` says so
+        // where it lowers one ("a public function receives a trait argument as a
+        // bare principal") and `contract-of` is the read of it -- so comparing two
+        // is comparing the contracts they name, byte for byte, exactly as the
+        // `Principal` callable beside it already does.
+        //
+        // Only `Trait` was missing from this arm, and three contracts mainnet
+        // deployed and accepted refuse to compile for it: `amm-swap003` and two
+        // `.pool`s, each answering "Not implemented: equality over
+        // CallableType(Trait(..))". See task 093.
         TypeSignature::PrincipalType
-        | TypeSignature::CallableType(CallableSubtype::Principal(_))
+        | TypeSignature::CallableType(
+            CallableSubtype::Principal(_) | CallableSubtype::Trait(_),
+        )
         | TypeSignature::ListUnionType(_) => wasm_equal_bytes(generator, builder, first_op, nth_op),
         TypeSignature::OptionalType(some_ty) => {
             wasm_equal_optional(generator, builder, first_op, nth_op, some_ty)
@@ -157,7 +169,9 @@ pub(super) fn wasm_equal(
             list_ty.get_list_item_type(),
         ),
 
-        _ => Err(GeneratorError::NotImplemented),
+        _ => Err(GeneratorError::NotImplemented(format!(
+            "equality over {ty:?}"
+        ))),
     }
 }
 

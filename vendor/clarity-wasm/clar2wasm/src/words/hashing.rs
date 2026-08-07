@@ -71,8 +71,10 @@ pub fn traverse_hash(
             generator.ensure_work_space(u32::from(len) + work_space);
             "buf"
         }
-        _ => {
-            return Err(GeneratorError::NotImplemented);
+        other => {
+            return Err(GeneratorError::NotImplemented(format!(
+                "hashing over {other:?}"
+            )));
         }
     };
 
