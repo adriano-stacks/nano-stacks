@@ -5,6 +5,7 @@
 # over the next MATURITY tenures.
 set -euo pipefail
 
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 STATE_DIR=${STATE_DIR:?path to the Hacknet chainstate directory}
 OUT=${OUT:?output directory}
 PEER=${PEER:-http://127.0.0.1:20443}
@@ -191,6 +192,18 @@ checkpoint_bitcoin_height=$(curl -sf "$PEER/v3/sortitions/consensus/$checkpoint_
 attesting_cycle=$(curl -sf "$PEER/v2/pox" |
   python3 -c "import sys,json;p=json.load(sys.stdin);print(($checkpoint_bitcoin_height - p['first_burnchain_block_height']) // p['reward_cycle_length'])")
 curl -sf "$PEER/v3/stacker_set/$attesting_cycle" -o "$OUT/reward-set.json"
+
+# The sortition history the node derives its own snapshots from: the seed, the
+# run of consensus hashes behind it, and the leader-key registry a winning
+# commitment names. A checkpoint written without these is one the node cannot
+# derive a single burn view from -- so no tenure's coinbase proof is checkable,
+# no miner signature is, and `/v3/sortitions` answers 503, which is what a stock
+# signer's state machine fails to initialise on.
+#
+# Exported at the anchor, because everything above it the node walks Bitcoin for
+# itself.
+(cd "$ROOT" && cargo xtask export-sortition \
+  "$SORTITION_DB" "$OUT/sortition" "$anchor_bitcoin_height")
 
 # The same manifest a captured fixture publishes, so a checkpoint reads the
 # same whether it came from here or from `cargo xtask capture-fixtures`.

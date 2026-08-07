@@ -262,6 +262,7 @@ anchor_bitcoin_height = $(checkpoint_value first_bitcoin_height)
 tenure_accounting = "$RUN/checkpoint/native-effects.json"
 attesting_block = "$RUN/checkpoint/checkpoint-block.bin"
 attesting_reward_set = "$RUN/checkpoint/reward-set.json"
+sortition = "$RUN/checkpoint/sortition"
 
 EOF
         # The signer half is a stock stacks-signer when this node hosts one, so

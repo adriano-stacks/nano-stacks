@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         Some("repair-ledger") => repair_ledger(&env::args().skip(2).collect::<Vec<_>>()),
         Some("export-headers") => export_headers(&env::args().skip(2).collect::<Vec<_>>()),
         Some("import-headers") => import_headers(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("export-sortition") => export_sortition(&env::args().skip(2).collect::<Vec<_>>()),
         Some("export-leader-keys") => {
             export_leader_keys(&env::args().skip(2).collect::<Vec<_>>())
         }
@@ -92,7 +93,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|compiler-identity|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|compiler-identity|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|export-sortition|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
             );
             ExitCode::from(2)
         }
@@ -528,6 +529,121 @@ fn import_headers(arguments: &[String]) -> ExitCode {
 /// Fetching them from the peer that supplied the block is exactly the dependency
 /// this group of tasks exists to remove, and carrying them is small: mainnet's
 /// whole history is 2,477 registrations, a quarter of a megabyte of JSON.
+/// Export the whole sortition history a checkpoint has to carry, not only its keys.
+///
+/// A node seeded without one derives no sortitions at all, and everything that
+/// reads from a burn view then has nothing to read: no tenure's coinbase proof is
+/// checkable, no miner signature is, and `/v3/sortitions` answers `503` — which is
+/// what a stock signer's state machine fails to initialise on.
+///
+/// The three files go together and are useless apart. `snapshots.json` is the seed
+/// and the burn blocks above it; `consensus-hashes.json` is the run of hashes
+/// behind it, which is the one part a node cannot re-derive, because
+/// `ConsensusHash::from_ops` mixes the hashes at power-of-two offsets back;
+/// `leader-keys.json` is the registry a winning commitment names, registered once
+/// and reused for years and so far below any window a checkpointed node holds.
+///
+/// `capture-fixtures` already writes all three for a fixture capture. A *checkpoint*
+/// export had no way to, so every rig built from one derived nothing — which is how
+/// [[069-resolve-the-pox-5-follower-state-root-divergence]] became reachable on the
+/// hacknet rig, and why the stock signer hosted there could not initialise.
+fn export_sortition(arguments: &[String]) -> ExitCode {
+    let [sortition, out, height] = arguments else {
+        eprintln!(
+            "usage: cargo xtask export-sortition \
+             <stacks-core burnchain/sortition/marf.sqlite> <out-dir> <to-burn-height>\n\
+             writes snapshots.json, consensus-hashes.json and leader-keys.json, which a \
+             node's `checkpoint.sortition` points at"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(to_height) = height.parse::<u64>() else {
+        eprintln!("{height} is not a burn height");
+        return ExitCode::FAILURE;
+    };
+    match write_sortition_export(Path::new(sortition), Path::new(out), to_height) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("exporting the sortition history failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn write_sortition_export(sortition: &Path, out: &Path, to_height: u64) -> Result<(), String> {
+    // Every canonical snapshot up to the anchor, one row per burn block. A chain
+    // with forks has more than one at a height, and only the `pox_valid` one is
+    // this chain's.
+    let snapshots = sqlite_json(
+        sortition,
+        &format!(
+            "select block_height, burn_header_hash, sortition_id, parent_sortition_id, \
+             burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, \
+             total_burn, sortition, sortition_hash, winning_block_txid, \
+             winning_stacks_block_hash, num_sortitions, pox_valid, \
+             accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots \
+             where pox_valid = 1 and block_height <= {to_height} \
+             group by block_height order by block_height"
+        ),
+    )?;
+    // Every burn block that elected somebody, ascending. nano's own field rather
+    // than one of the archive's columns, and the seed cannot do without it: a chain
+    // seeded at one snapshot holds no row below it, so it cannot say which burn
+    // block before the seed last elected anybody. A tenure's accumulated coinbase is
+    // measured from that height and is *minted*, and `/v3/sortitions` reports it as
+    // `last_sortition_ch` -- which a stock signer requires, refusing to build a state
+    // machine at all when the pair it asks for comes back as one entry.
+    let electing = sqlite_json(
+        sortition,
+        &format!(
+            "select block_height from snapshots where pox_valid = 1 and sortition = 1 \
+             and block_height <= {to_height} order by block_height"
+        ),
+    )?;
+    let electing: Vec<u64> = serde_json::from_str::<Vec<serde_json::Value>>(&electing)
+        .map_err(|error| format!("unreadable sortition heights: {error}"))?
+        .iter()
+        .filter_map(|row| row.get("block_height")?.as_u64())
+        .collect();
+    let mut rows: Vec<serde_json::Value> = serde_json::from_str(&snapshots)
+        .map_err(|error| format!("unreadable snapshots: {error}"))?;
+    for row in &mut rows {
+        let Some(height) = row.get("block_height").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let below: Vec<u64> = electing
+            .iter()
+            .copied()
+            .filter(|elected| *elected <= height)
+            .collect();
+        if let Some(last) = below.last() {
+            object.insert("last_sortition_height".to_owned(), (*last).into());
+        }
+        object.insert("sortitions_below_window".to_owned(), below.into());
+    }
+    write_file(
+        &out.join("snapshots.json"),
+        serde_json::to_vec(&rows)
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+    )?;
+    // The same writer the fixture capture uses, so a checkpoint's history cannot be
+    // read more loosely than a capture's, and both end at a burn block that elected
+    // somebody.
+    CaptureConfig::write_consensus_hashes(out, sortition, to_height)?;
+    let (keys, signing) = read_leader_keys(sortition, to_height).and_then(|keys| {
+        write_leader_keys(&out.join(nano_node::sortition::LEADER_KEY_FILE), &keys)
+    })?;
+    println!(
+        "exported the sortition history up to burn {to_height}: {keys} leader-key \
+         registrations, {signing} of them with a block-signing key hash"
+    );
+    Ok(())
+}
+
 fn export_leader_keys(arguments: &[String]) -> ExitCode {
     let [sortition, out, height] = arguments else {
         eprintln!(
@@ -1806,8 +1922,10 @@ impl CaptureConfig {
     /// Whole from the chain's start, and one per burn block: a truncated run derives a
     /// different hash from there on. Mainnet's is 294,170 hashes, the cheapest thing in
     /// the capture.
+    /// `directory` is the sortition directory itself, not the capture root: a
+    /// checkpoint export writes the same three files somewhere else entirely.
     fn write_consensus_hashes(
-        staging: &Path,
+        directory: &Path,
         sortition_db: &Path,
         last_burn: u64,
     ) -> Result<(), String> {
@@ -1842,7 +1960,7 @@ impl CaptureConfig {
             hashes.len()
         );
         write_file(
-            &staging.join("sortition/consensus-hashes.json"),
+            &directory.join("consensus-hashes.json"),
             serde_json::to_vec(&serde_json::json!({ "hashes": hashes }))
                 .map_err(|error| error.to_string())?
                 .as_slice(),
@@ -1876,7 +1994,7 @@ impl CaptureConfig {
             snapshots.as_bytes(),
         )?;
 
-        Self::write_consensus_hashes(staging, sortition_db, last_burn)?;
+        Self::write_consensus_hashes(&staging.join("sortition"), sortition_db, last_burn)?;
 
         // The leader-key registry, without which no tenure's coinbase proof can
         // be checked at all: the registration a winning commitment names is

@@ -738,6 +738,20 @@ struct CapturedSnapshot {
     /// single height and is no worse than it was.
     #[serde(default)]
     sortitions_below_window: Vec<u64>,
+    /// The archive's own three facts about the seed's winning commitment.
+    ///
+    /// A seed row states them and a derived snapshot takes them off the commitment
+    /// it weighed, so only a chain standing on its *seed* needs these — which is
+    /// every chain until it derives its first block, and every rig whose chain is
+    /// not currently electing anybody. Left out, `/v3/sortitions` answers with the
+    /// winner's key, the block it committed to and the parent identifier all null,
+    /// and a stock signer will not initialise against that.
+    #[serde(default)]
+    parent_sortition_id: Option<String>,
+    #[serde(default)]
+    miner_pk_hash: Option<String>,
+    #[serde(default)]
+    winning_stacks_block_hash: Option<String>,
 }
 
 impl SortitionTracker {
@@ -884,6 +898,12 @@ impl SortitionTracker {
                 .snapshots()
                 .sortitions_below_window()
                 .to_vec(),
+            // Written down for the same reason the two above are: the next start is
+            // seeded on this row, and a seed that cannot state its winner's key or
+            // the block it committed to answers `/v3/sortitions` with nulls.
+            parent_sortition_id: Some(hex::encode(tip.parent_sortition_id.as_bytes())),
+            miner_pk_hash: tip.winner_signing_key_hash.map(hex::encode),
+            winning_stacks_block_hash: tip.committed_block_hash.map(hex::encode),
         }];
         let history = History {
             // Truncated to end at the snapshot above, because `from_capture` seeds a
@@ -972,6 +992,42 @@ impl SortitionTracker {
     }
 }
 
+/// The block-signing hash the seed's winning key was registered with.
+///
+/// `None` where the seed's burn block elected nobody, and where the export predates
+/// the field -- in both cases the answer is unavailable rather than zero, because a
+/// zero here is a miner nobody can be.
+fn seed_signing_key_hash(seed: &CapturedSnapshot) -> Result<Option<[u8; 20]>, TrackerError> {
+    let (Some(sortition), Some(hash)) = (seed.sortition, seed.miner_pk_hash.as_deref()) else {
+        return Ok(None);
+    };
+    if sortition == 0 {
+        return Ok(None);
+    }
+    let bytes = hex::decode(hash)
+        .map_err(|_| TrackerError::Seed("the miner key hash is not hexadecimal".to_owned()))?;
+    <[u8; 20]>::try_from(bytes.as_slice())
+        .map(Some)
+        .map_err(|_| TrackerError::Seed("the miner key hash is not 20 bytes".to_owned()))
+}
+
+/// The Stacks block the seed's winning commitment committed to.
+fn seed_committed_block_hash(seed: &CapturedSnapshot) -> Result<Option<[u8; 32]>, TrackerError> {
+    let (Some(sortition), Some(hash)) = (seed.sortition, seed.winning_stacks_block_hash.as_deref())
+    else {
+        return Ok(None);
+    };
+    if sortition == 0 {
+        return Ok(None);
+    }
+    let bytes = hex::decode(hash).map_err(|_| {
+        TrackerError::Seed("the winning stacks block hash is not hexadecimal".to_owned())
+    })?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map(Some).map_err(|_| {
+        TrackerError::Seed("the winning stacks block hash is not 32 bytes".to_owned())
+    })
+}
+
 fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerError> {
     // The sampling of the block after the seed mixes the most recent winner's VRF
     // seed, and where that seed is not the seed block's own it cannot be found in
@@ -1038,7 +1094,15 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         bitcoin_header_hash,
         bitcoin_timestamp: seed.burn_header_timestamp,
         sortition_id,
-        parent_sortition_id: nano_primitives::SortitionId::from_bytes([0; 32]),
+        parent_sortition_id: seed
+            .parent_sortition_id
+            .as_deref()
+            .map(|value| thirty_two(value, "parent sortition id"))
+            .transpose()?
+            .map_or_else(
+                || nano_primitives::SortitionId::from_bytes([0; 32]),
+                nano_primitives::SortitionId::from_bytes,
+            ),
         // Never read: only the hash of a block *after* the seed is derived.
         operations_hash: nano_sortition::OpsHash::from_txids(&[]),
         consensus_hash: ConsensusHash::from_bytes(
@@ -1078,12 +1142,14 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         // taken as given and no tenure is validated against it. Every snapshot
         // after it resolves them from the carried registry.
         winner_vrf_public_key: None,
-        winner_signing_key_hash: None,
-        // The same for these two: they describe the winning *commitment*, which a
-        // seed row does not carry, and every snapshot this chain derives afterwards
-        // takes them off the commitment it weighed. A route asked about the seed's
-        // own burn view answers without them rather than with a guess.
-        committed_block_hash: None,
+        // Stated by the archive for the seed, unlike the VRF key: `miner_pk_hash`
+        // is the block-signing hash the winning key was registered with, which is
+        // what `/v3/sortitions` reports and what a miner signs its headers under.
+        winner_signing_key_hash: seed_signing_key_hash(seed)?,
+        // The block the seed's winner committed to, where the archive states it.
+        // Not the *parent* burn height, which no column holds: that one stays
+        // unanswered for a seed rather than guessed at.
+        committed_block_hash: seed_committed_block_hash(seed)?,
         parent_bitcoin_height: None,
         // Filled by `prime`, which reads the seed's own burn block: the two spends
         // come out of the commitment window, not out of a captured row.
