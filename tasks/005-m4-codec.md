@@ -1,5 +1,6 @@
 ---
 id: "005"
+group: build
 title: "M4: implement SIP-005 transaction codec"
 status: completed
 priority: critical

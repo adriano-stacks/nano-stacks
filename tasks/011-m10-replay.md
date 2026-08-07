@@ -1,5 +1,6 @@
 ---
 id: "011"
+group: build
 title: "M10: implement full block execution and fixture replay"
 status: in-progress
 priority: critical

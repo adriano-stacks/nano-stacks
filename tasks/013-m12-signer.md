@@ -1,5 +1,6 @@
 ---
 id: "013"
+group: build
 title: "M12: implement StackerDB and embedded signer"
 status: completed
 priority: high

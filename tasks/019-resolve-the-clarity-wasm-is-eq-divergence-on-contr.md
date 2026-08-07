@@ -1,10 +1,12 @@
 ---
 id: "019"
+group: build
 title: "Resolve the clarity-wasm is-eq divergence on contract principals"
 status: completed
 priority: medium
+effort: medium
 dependencies: []
-tags: []
+tags: ["vm", "clarity", "conformance"]
 created_at: 2026-07-29
 completed_at: 2026-07-29
 ---

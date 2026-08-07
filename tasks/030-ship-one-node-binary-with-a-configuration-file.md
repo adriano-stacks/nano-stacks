@@ -1,5 +1,6 @@
 ---
 id: "030"
+group: build
 title: "Ship one node binary with a configuration file"
 status: completed
 priority: high

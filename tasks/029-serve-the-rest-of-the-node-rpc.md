@@ -1,5 +1,6 @@
 ---
 id: "029"
+group: build
 title: "Serve the rest of the node RPC and the event dispatcher"
 status: completed
 priority: high

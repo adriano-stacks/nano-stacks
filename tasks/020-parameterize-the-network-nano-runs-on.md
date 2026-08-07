@@ -1,5 +1,6 @@
 ---
 id: "020"
+group: build
 title: "Parameterize the network nano runs on"
 status: completed
 priority: critical

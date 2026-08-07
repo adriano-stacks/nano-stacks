@@ -1,5 +1,6 @@
 ---
 id: "006"
+group: build
 title: "M5: implement Bitcoin operation parsing"
 status: completed
 priority: high

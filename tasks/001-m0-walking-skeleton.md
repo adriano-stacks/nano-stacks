@@ -1,5 +1,6 @@
 ---
 id: "001"
+group: build
 title: "M0: establish the workspace, conformance harness, fixtures, and scoreboard"
 status: completed
 priority: critical

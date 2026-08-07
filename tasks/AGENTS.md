@@ -90,6 +90,26 @@ taskmd worklog <id>            # View worklog
 
 Write entries when starting, making key decisions, hitting blockers, or finishing.
 
+## Adding a task in a group
+
+`taskmd next-id` reads every task file, including the ones in subdirectories like
+`mainnet/`, so it answers correctly across groups. What it cannot do is reserve the
+number: two `add` calls that both read the board before either writes are both told
+the same next id, and ordinary `validate` does not report the collision -- it happened
+here, and two tasks were briefly `078`.
+
+So add one at a time, and check:
+
+```bash
+taskmd add "Title" --group mainnet     # one at a time
+taskmd validate --strict               # zero warnings, zero errors
+taskmd deduplicate                     # says which ids appear twice
+```
+
+Every task carries `group`, `effort` and `tags`. `--strict` is the check that says
+so, and it is expected to exit clean: a warning there is a task that will sort into
+the wrong place in a report, not a style preference.
+
 ## Validation
 
 Run `taskmd validate` before committing to check for missing fields, invalid values, duplicate IDs, circular dependencies, and broken references.

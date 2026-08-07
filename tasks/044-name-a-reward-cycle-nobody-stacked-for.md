@@ -1,5 +1,6 @@
 ---
 id: "044"
+group: mainnet
 title: "Name a reward cycle nobody stacked for"
 status: completed
 priority: medium

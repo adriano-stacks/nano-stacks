@@ -1,10 +1,12 @@
 ---
 id: "018"
+group: build
 title: "Mine a whole tenure, not only its first block"
 status: completed
 priority: high
+effort: medium
 dependencies: []
-tags: []
+tags: ["hacknet", "miner", "conformance"]
 created_at: 2026-07-29
 completed_at: 2026-07-29
 ---

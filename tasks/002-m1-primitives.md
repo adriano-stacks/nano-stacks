@@ -1,5 +1,6 @@
 ---
 id: "002"
+group: build
 title: "M1: implement primitive hashes, Uint256, and BitVec"
 status: completed
 priority: critical

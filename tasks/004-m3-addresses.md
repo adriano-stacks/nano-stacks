@@ -1,5 +1,6 @@
 ---
 id: "004"
+group: build
 title: "M3: implement Stacks and PoX addresses"
 status: completed
 priority: high

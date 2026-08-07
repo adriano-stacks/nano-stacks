@@ -1,5 +1,6 @@
 ---
 id: "033"
+group: build
 title: "Make the lint configuration workspace-global"
 status: completed
 priority: low

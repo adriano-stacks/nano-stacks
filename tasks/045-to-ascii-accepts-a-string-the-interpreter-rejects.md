@@ -1,5 +1,6 @@
 ---
 id: "045"
+group: mainnet
 title: "to-ascii? accepts a string the interpreter rejects"
 status: completed
 priority: high

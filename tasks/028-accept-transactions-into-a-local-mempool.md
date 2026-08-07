@@ -1,5 +1,6 @@
 ---
 id: "028"
+group: build
 title: "Accept transactions into a local mempool"
 status: completed
 priority: high

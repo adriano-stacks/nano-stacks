@@ -1,5 +1,6 @@
 ---
 id: "024"
+group: build
 title: "Verify the VRF seed a block commits to"
 status: completed
 priority: high

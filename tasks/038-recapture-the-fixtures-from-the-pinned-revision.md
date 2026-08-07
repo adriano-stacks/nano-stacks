@@ -1,5 +1,6 @@
 ---
 id: "038"
+group: mainnet
 title: "Recapture the fixtures from the pinned stacks-core revision"
 status: completed
 priority: critical

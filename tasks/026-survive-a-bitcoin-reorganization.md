@@ -1,5 +1,6 @@
 ---
 id: "026"
+group: build
 title: "Survive a Bitcoin reorganization"
 status: completed
 priority: high

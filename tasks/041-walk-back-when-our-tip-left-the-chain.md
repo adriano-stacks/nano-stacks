@@ -1,5 +1,6 @@
 ---
 id: "041"
+group: mainnet
 title: "Walk back when our tip left the chain"
 status: completed
 priority: high

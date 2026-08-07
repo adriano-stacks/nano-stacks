@@ -1,5 +1,6 @@
 ---
 id: "031"
+group: build
 title: "Establish a trust root for the checkpoint"
 status: completed
 priority: high

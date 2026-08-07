@@ -1,5 +1,6 @@
 ---
 id: "034"
+group: build
 title: "Bring dependencies up to date"
 status: completed
 priority: low

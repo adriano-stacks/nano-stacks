@@ -1,5 +1,6 @@
 ---
 id: "016"
+group: build
 title: "Verify nano-stacks against released Hacknet baseline"
 status: completed
 priority: high

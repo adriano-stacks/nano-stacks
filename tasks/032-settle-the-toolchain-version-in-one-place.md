@@ -1,5 +1,6 @@
 ---
 id: "032"
+group: build
 title: "Settle the toolchain version in one place"
 status: completed
 priority: low

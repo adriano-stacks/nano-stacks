@@ -1,5 +1,6 @@
 ---
 id: "040"
+group: mainnet
 title: "Let the conformance tests take any capture"
 status: completed
 priority: high

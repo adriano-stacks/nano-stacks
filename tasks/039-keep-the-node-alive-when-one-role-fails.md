@@ -1,5 +1,6 @@
 ---
 id: "039"
+group: mainnet
 title: "Keep the node alive when one role fails"
 status: completed
 priority: high

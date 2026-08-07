@@ -1,5 +1,6 @@
 ---
 id: "015"
+group: build
 title: "Update Hacknet master PoX-5 integration"
 status: completed
 priority: high

@@ -1,5 +1,6 @@
 ---
 id: "021"
+group: build
 title: "Hold mainnet-scale state on disk"
 status: completed
 priority: critical

@@ -1,5 +1,6 @@
 ---
 id: "010"
+group: build
 title: "M9: implement Nakamoto envelope validation and reward sets"
 status: completed
 priority: critical

@@ -1,5 +1,6 @@
 ---
 id: "014"
+group: build
 title: "M13: implement mining and hacknet interop"
 status: completed
 priority: high

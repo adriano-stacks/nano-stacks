@@ -1,5 +1,6 @@
 ---
 id: "023"
+group: build
 title: "Close the execution cost divergence"
 status: completed
 priority: critical

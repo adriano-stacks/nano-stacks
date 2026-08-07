@@ -1,5 +1,6 @@
 ---
 id: "025"
+group: build
 title: "Apply the SIP-031 emission"
 status: completed
 priority: high

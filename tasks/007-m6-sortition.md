@@ -1,5 +1,6 @@
 ---
 id: "007"
+group: build
 title: "M6: implement sortition"
 status: completed
 priority: high

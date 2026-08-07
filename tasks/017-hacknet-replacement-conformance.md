@@ -1,5 +1,6 @@
 ---
 id: "017"
+group: build
 title: "Run nano-stacks as a Hacknet replacement"
 status: completed
 priority: critical

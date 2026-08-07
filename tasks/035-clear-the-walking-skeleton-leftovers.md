@@ -1,5 +1,6 @@
 ---
 id: "035"
+group: build
 title: "Clear the walking-skeleton leftovers"
 status: completed
 priority: low

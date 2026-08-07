@@ -1,5 +1,6 @@
 ---
 id: "037"
+group: mainnet
 title: "Replay mainnet from the epoch 4.0 boundary"
 status: pending
 priority: critical

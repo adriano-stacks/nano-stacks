@@ -1,5 +1,6 @@
 ---
 id: "008"
+group: build
 title: "M7: implement bit-exact MARF and checkpoint import"
 status: completed
 priority: critical

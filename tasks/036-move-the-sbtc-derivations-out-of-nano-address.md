@@ -1,5 +1,6 @@
 ---
 id: "036"
+group: build
 title: "Move the sBTC derivations out of nano-address"
 status: completed
 priority: low

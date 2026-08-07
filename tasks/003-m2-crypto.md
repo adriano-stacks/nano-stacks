@@ -1,5 +1,6 @@
 ---
 id: "003"
+group: build
 title: "M2: implement secp256k1 and VRF primitives"
 status: completed
 priority: high

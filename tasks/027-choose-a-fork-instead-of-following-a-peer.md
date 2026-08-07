@@ -1,5 +1,6 @@
 ---
 id: "027"
+group: build
 title: "Choose a fork instead of following a peer"
 status: completed
 priority: critical
