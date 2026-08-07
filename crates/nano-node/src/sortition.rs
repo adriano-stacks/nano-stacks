@@ -121,6 +121,14 @@ pub struct SortitionTracker {
     /// snapshot of. Without them the window is short and the winner is not the
     /// one the network picked.
     primed: bool,
+    /// Whether the cycle opening at a burn height selected a `PoX` anchor block.
+    ///
+    /// Keyed by the burn height the cycle *opens* at, and answered by whoever holds
+    /// the executed state — this chain cannot know it, which is why it used to
+    /// refuse to cross a boundary at all rather than guess. A consensus hash mixes
+    /// the `PoX` history, so a guessed bit derives a wrong hash for every block
+    /// after it, silently.
+    anchors: std::collections::BTreeMap<u64, bool>,
 }
 
 impl SortitionTracker {
@@ -135,6 +143,7 @@ impl SortitionTracker {
             pox_id,
             keys: LeaderKeys::new(),
             primed: false,
+            anchors: std::collections::BTreeMap::new(),
         })
     }
 
@@ -155,6 +164,23 @@ impl SortitionTracker {
                     .map_err(|_| TrackerError::Seed("a consensus hash is not 20 bytes".to_owned()))
             })
             .collect()
+    }
+
+    /// Say whether the cycle opening at a burn height selected a `PoX` anchor block.
+    ///
+    /// The one fact this chain cannot derive for itself: the anchor is chosen in the
+    /// *previous* cycle's prepare phase, out of executed Stacks state, and this chain
+    /// holds Bitcoin blocks. Told rather than guessed, and told before the walk
+    /// reaches the boundary — a bit decided afterwards is already too late for the
+    /// consensus hash that mixed it.
+    pub fn decide_anchor(&mut self, opens_at: u64, selected: bool) {
+        self.anchors.insert(opens_at, selected);
+    }
+
+    /// Whether anything has decided the bit for the cycle opening at a burn height.
+    #[must_use]
+    pub fn anchor_decided(&self, opens_at: u64) -> bool {
+        self.anchors.contains_key(&opens_at)
     }
 
     /// The snapshot this chain is standing on.
@@ -313,12 +339,19 @@ impl SortitionTracker {
         // this node can answer yet, and assuming it did is a guess the consensus
         // hash would silently encode.
         if payouts.starts_reward_cycle(block.height) {
-            return Err(TrackerError::Seed(format!(
-                "burn {} opens a reward cycle, which adds a bit to the PoX history \
-                 the consensus hash mixes, and this node cannot yet say whether \
-                 that cycle chose an anchor block",
-                block.height
-            )));
+            // Answered by the caller, which holds the executed state this cannot see,
+            // or refused. Refusing is still the behaviour where nobody has decided:
+            // assuming the bit is what the histories seen so far happen to hold would
+            // encode a guess in every consensus hash after it.
+            let Some(selected) = self.anchors.get(&block.height).copied() else {
+                return Err(TrackerError::Seed(format!(
+                    "burn {} opens a reward cycle, which adds a bit to the PoX history \
+                     the consensus hash mixes, and nothing has said whether that cycle \
+                     chose an anchor block",
+                    block.height
+                )));
+            };
+            self.pox_id.extend_with_anchor(selected);
         }
         self.register_keys(block);
         let commitments =
@@ -1240,6 +1273,10 @@ mod tests {
     use super::SortitionTracker;
 
     /// A chain standing on one snapshot, with one hash behind it.
+    pub(super) fn a_chain() -> SortitionTracker {
+        tracker(1_000)
+    }
+
     fn tracker(total_burn: u64) -> SortitionTracker {
         let behind = ConsensusHash::from_bytes([0xbe; 20]);
         let seed = SortitionSnapshot {
@@ -1292,5 +1329,58 @@ mod tests {
             "a candidate at this chain's own total may be a sortition-less block ahead of it"
         );
         assert_eq!(tracker.derived(foreign, 8_000_000), None);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use nano_sortition::{PayoutSchedule, RewardCycleSchedule};
+
+    use super::tests::a_chain;
+
+    /// A cycle length of ten from burn zero, so 100 and 110 both open one.
+    fn payouts() -> PayoutSchedule {
+        PayoutSchedule::new(
+            RewardCycleSchedule::new(0, 10, None).expect("a schedule"),
+            2,
+        )
+        .expect("a payout schedule")
+    }
+
+    /// Crossing a reward cycle boundary needs a bit nobody had, and refusing was
+    /// the whole of the behaviour.
+    ///
+    /// A consensus hash mixes the `PoX` history, and the history gains a bit each
+    /// time a cycle opens: whether it selected an anchor block. The chain cannot know
+    /// it — the anchor is chosen out of executed Stacks state — so it stopped dead,
+    /// and a live follower would stop at cycle 141 the same way.
+    #[test]
+    fn a_boundary_is_refused_until_something_decides_the_anchor() {
+        let mut chain = a_chain();
+        // 111 and not 110: before the waterfall a cycle opens at offset 1.
+        let opening = 111;
+        assert!(!chain.anchor_decided(opening));
+        chain.decide_anchor(opening, true);
+        assert!(
+            chain.anchor_decided(opening),
+            "a decided bit is remembered, so the walk that follows can use it"
+        );
+    }
+
+    /// And the refusal survives for the cycle nobody decided, which is the half that
+    /// keeps this honest: an undecided bit and a bit decided wrongly produce the same
+    /// wrong hash, and only one of them says so.
+    #[test]
+    fn deciding_one_boundary_does_not_decide_the_next() {
+        let mut chain = a_chain();
+        chain.decide_anchor(111, true);
+        assert!(chain.anchor_decided(111));
+        assert!(
+            !chain.anchor_decided(121),
+            "the next cycle's bit is a different fact and has to be decided too"
+        );
+        // The schedule this is measured against opens a cycle at both.
+        assert!(payouts().starts_reward_cycle(111));
+        assert!(payouts().starts_reward_cycle(121));
     }
 }

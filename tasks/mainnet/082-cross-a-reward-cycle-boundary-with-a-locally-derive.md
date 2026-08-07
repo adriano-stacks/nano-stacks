@@ -2,7 +2,7 @@
 id: "082"
 group: mainnet
 title: "Cross a reward cycle boundary with a locally derived sortition chain"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["049", "077"]
@@ -83,6 +83,39 @@ Two things to establish before writing it, and neither is a guess to make blind:
   to be in hand *before* the first sortition of the new cycle is derived — not at the
   boundary block itself, which is already too late for the consensus hash that mixes
   it.
+
+## Measured: the reward-set rule is not the rule
+
+Half of this is now in the tree and half is deliberately not.
+
+**In:** the tracker can be *told*. `SortitionTracker::decide_anchor(opens_at,
+selected)` records the bit, `anchor_decided` answers whether anything has, and
+`advance` extends the `PoX` history with it at a boundary — or refuses exactly as
+before when nothing decided. The refusal is kept on purpose: an undecided bit and a
+bit decided wrongly produce the same wrong consensus hash, and only one of them says
+so.
+
+**Out, and this is the finding:** the obvious decider is wrong. "The cycle recorded a
+signer set, therefore it selected an anchor" was implemented against
+`ChainState::recorded_signer_set` and run on the captured fixture, which crosses five
+boundaries. It crossed all five and answered **0 every time**, where the capture's own
+`PoxId` is all ones:
+
+```
+the cycle opening at burn 380 selected no an anchor block, as this node's own
+reward set for it says, so the PoX history the consensus hash mixes gains a 0
+```
+
+So it was reverted rather than left in. A node that crosses a boundary with a wrong
+bit derives a wrong consensus hash for every block after it and reports nothing,
+which is worse than the node that stops.
+
+What that leaves for whoever picks this up: `recorded_signer_set` at the opening
+height is either the wrong question or asked at the wrong height — the anchor is
+chosen in the *previous* cycle's prepare phase, so the state to interrogate is the
+one at the prepare phase, not at the boundary. That is the next thing to establish,
+and there is now a mechanism waiting for the answer and a fixture that crosses five
+boundaries to check it against.
 
 ## Acceptance Criteria
 
