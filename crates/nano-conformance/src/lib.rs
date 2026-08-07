@@ -514,14 +514,23 @@ fn mainnet_rows() -> String {
     output
 }
 
-/// The anchor a mainnet state was imported at, and the height it has sealed to.
+/// The anchor a mainnet state was imported at, and the height it has executed to.
 ///
-/// Read straight out of the MARF's own block table, because that is the only height
-/// that means anything: a fetched, staged or peer-reported one is not a block this
-/// node has executed.
+/// Read out of the state on disk, because that is the only height that means
+/// anything: a fetched, staged or peer-reported one is not a block this node has
+/// executed.
+///
+/// The *deepest seal* is not that height either, and the difference is not
+/// theoretical. A block is committed by writing its ledger and then sealing the
+/// MARF, so a sealed state no ledger names is a block this node abandoned rather
+/// than executed. A live mainnet state held seals to 8,713,522 against a ledger
+/// naming 8,713,221 — this row would have reported 301 blocks of replay depth that
+/// no restart could stand on, which is precisely the overstatement the north-star
+/// metric exists to rule out. So the walk goes down to the deepest block a ledger
+/// names, and reports that.
 fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
     let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite")).ok()?;
-    let tip = marf.tip()?;
+    let tip = executed_tip(state, &marf, marf.tip()?);
     let height = marf.height(tip)?;
     // A checkpointed state's ancestry arrives with the import, so the anchor is the
     // first height this node sealed itself: the checkpoint's own height plus one.
@@ -534,6 +543,47 @@ fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| u64::from(height));
     Some((anchor, u64::from(height)))
+}
+
+/// Walk down from a seal to the deepest block the side store holds a ledger for.
+///
+/// The same rule the node resumes by, and bounded the same way: a run seals at most
+/// a catch-up round's worth of blocks before it commits one, so a walk longer than
+/// that has nothing to find. A state whose side store cannot be opened at all is
+/// reported at its seal rather than not at all — the row is a progress signal, and
+/// refusing to answer would read as zero.
+fn executed_tip(
+    state: &Path,
+    marf: &nano_marf::VersionedMarf,
+    tip: nano_marf::MarfBlockId,
+) -> nano_marf::MarfBlockId {
+    const REACH: usize = 1000;
+    let Ok(side_store) = rusqlite::Connection::open_with_flags(
+        state.join("chainstate/clarity.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return tip;
+    };
+    let mut walk = tip;
+    for _ in 0..REACH {
+        let named = side_store
+            .prepare_cached("SELECT COUNT(*) FROM chain_ledger WHERE block_id = ?1")
+            .and_then(|mut statement| {
+                statement.query_row(rusqlite::params![&walk[..]], |row| row.get::<_, u32>(0))
+            });
+        match named {
+            Ok(1..) => return walk,
+            Ok(0) => {}
+            // No table, no column, no readable database: the walk cannot tell a seal
+            // from a commit here, so it does not pretend to.
+            Err(_) => return tip,
+        }
+        match marf.parent(walk) {
+            Some(Some(parent)) => walk = parent,
+            _ => return tip,
+        }
+    }
+    tip
 }
 
 /// How many blocks the frozen mainnet regression slice pins, and which.
@@ -1919,6 +1969,54 @@ mod tests {
         });
         assert!(report.contains("0/1"));
         assert!(report.contains("block 1"));
+    }
+
+    /// Replay depth is the deepest block a ledger names, not the deepest seal.
+    ///
+    /// The two part on a real state: a live mainnet node held seals to 8,713,522
+    /// against a ledger naming 8,713,221, and reporting the seal would have claimed
+    /// 301 blocks of depth that no restart could stand on. The north-star metric is
+    /// the one number the whole plan is read through, so overstating it is worse
+    /// than most divergences it is supposed to find.
+    #[test]
+    fn replay_depth_is_the_deepest_committed_block_not_the_deepest_seal() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let state = directory.path();
+        fs::create_dir_all(state.join("chainstate")).expect("a chainstate directory");
+        {
+            let mut vm = nano_vm::Vm::open(nano_primitives::Network::MAINNET, state.join("chainstate"))
+                .expect("open");
+            let mut parent = None;
+            for height in 1..=3u8 {
+                vm.begin_block(parent, [height; 32]).expect("begin");
+                vm.commit_block(
+                    [height; 32],
+                    &nano_vm::BlockCommit {
+                        header: nano_vm::BlockHeader::default(),
+                        ledger: b"committed".to_vec(),
+                    },
+                )
+                .expect("commit");
+                parent = Some([height; 32]);
+            }
+            // Two seals above it that no ledger names.
+            for height in 4..=5u8 {
+                vm.begin_block(parent, [height; 32]).expect("begin");
+                vm.seal_block_to([height; 32]).expect("seal");
+                parent = Some([height; 32]);
+            }
+        }
+
+        let (anchor, tip) = super::mainnet_executed_height(state).expect("a height");
+        assert_eq!(anchor, tip, "no anchor is set, so the row reports the tip alone");
+        let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite"))
+            .expect("open the marf");
+        let sealed = marf.height(marf.tip().expect("a tip")).expect("a height");
+        assert_eq!(
+            u64::from(sealed) - tip,
+            2,
+            "the deepest seal is two blocks above the deepest ledger, and depth is the ledger's"
+        );
     }
 
     #[test]

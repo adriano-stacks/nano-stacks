@@ -79,8 +79,9 @@ node may invoke.
       and `freeze-receipts` stamps `COMPILER_IDENTITY` into it —
       `the_frozen_mainnet_slice_names_its_compiler` now refuses one that does not,
       via `skip_gate`, so it prints a reason offline and *fails* under
-      `NANO_REQUIRE_MAINNET`: the in-tree slice predates the field, so the release
-      report cannot come out clean until it is re-frozen. Not asserted *equal* to
+      `NANO_REQUIRE_MAINNET`. **Since re-frozen:** the in-tree slice names compiler
+      `sha256:1813d530…`, against an artifact built by `sha256:a544b056…`. Not
+      asserted *equal* to
       this artifact's compiler, deliberately — a baseline frozen by an earlier
       build is exactly what catches a change in this one. The `.clar` fixtures are
       inputs minimized from the chain and need no binding.

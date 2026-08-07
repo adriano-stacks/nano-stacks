@@ -24,6 +24,10 @@ nano-oracle = { path = "../nano-oracle" }
 # either way, and this crate is never in the node's graph.
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
+# The scoreboard reads a node's side store to tell a sealed state from a committed
+# block, and does it *read-only*: the state it is pointed at is usually a running
+# node's. Opening a `Vm` would be the DRY route and is the wrong one for that.
+rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
@@ -39,7 +43,6 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "t
 libstackerdb = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 libsigner = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 proptest = "1.11.0"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
 tempfile = "3.27.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 pox-locking = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
