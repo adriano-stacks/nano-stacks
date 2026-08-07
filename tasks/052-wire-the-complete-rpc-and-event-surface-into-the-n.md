@@ -40,10 +40,33 @@ execution.
       [[046-distinguish-followed-and-executed-chain-tips]].
 - [x] Exercise an event observer against the binary and retain delivered
       `new_block`, burn-block and proposal-response payloads.
-- [ ] Run a stock `stacks-signer` against the binary without a compatibility
+- [~] Run a stock `stacks-signer` against the binary without a compatibility
       shim on a chain where nano derives the active PoX-5 signer set, and have
       it accept and sign a proposal nano validated with checkpointed leader-key
       history under [[070-carry-leader-key-history-into-proposal-validation]].
+
+      **Set up and started; blocked on container-to-host reachability, not on nano.**
+      A stock `stacks-signer` -- the binary out of the hacknet's own
+      `stacks-signer-1`, no shim -- was configured against nano's RPC with a key from
+      the active reward set and the `auth_password` matching nano's
+      `block_proposal_token`, and it started:
+
+      ```
+      Signer spawned successfully. Waiting for messages to process...
+      INFO [libsigner/src/runloop.rs:65] Signer runloop begin
+      ```
+
+      It then times out reaching `10.0.0.1:24443` from inside the container. Nano
+      binds `0.0.0.0:24443` and answers on the host (`/v2/info` returns tip 14,516),
+      so what is missing is a route from the compose network to the host -- run the
+      signer on the host against `127.0.0.1:24443`, or put nano on the compose
+      network, and the run proceeds.
+
+      The rest of the preconditions are now met, which they were not before: nano
+      follows this chain to its tip (14,516, zero state root mismatches) after the
+      tenure-height fix in [[069-resolve-the-pox-5-follower-state-root-divergence]],
+      so proposals are reachable and validated where the earlier hosted-signer run
+      froze at height 931.
 - [x] Submit a valid transaction through the public RPC and observe the same
       transaction admitted, mined, executed and emitted in `new_block`.
       `submitted_transaction.rs` walks the whole journey offline and deterministically:
