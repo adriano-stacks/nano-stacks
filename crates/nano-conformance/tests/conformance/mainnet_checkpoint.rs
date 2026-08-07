@@ -95,6 +95,7 @@ fn every_checkpointed_contract_is_reachable_in_the_imported_trie() {
         .iter()
         .filter(|contract| {
             trie.get(block, format!("clarity-contract::{contract}").as_bytes())
+                .expect("the imported trie reads")
                 .is_none()
         })
         .collect();
@@ -128,7 +129,7 @@ fn nano_reports_a_key_at_a_block() {
             .expect("32 bytes");
 
     let trie = nano_marf::VersionedMarf::open(&marf).expect("open the trie");
-    let Some(value) = trie.get(block, key.as_bytes()) else {
+    let Some(value) = trie.get(block, key.as_bytes()).expect("the imported trie reads") else {
         println!("nano has no {key} at that block");
         return;
     };

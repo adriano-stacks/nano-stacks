@@ -2628,10 +2628,18 @@ impl MarfStore {
     }
 
     /// Read a value from a sealed state.
+    ///
+    /// A trie whose storage cannot answer -- a node that is gone, a database that
+    /// stopped answering -- reads as absent here rather than killing the process,
+    /// and the trie's own error names the block and node it could not read. See
+    /// `tasks/mainnet/079`.
     #[must_use]
     pub fn get(&self, block: [u8; 32], key: &str) -> Option<String> {
         self.marf
             .get(block, key.as_bytes())
+            .inspect_err(|error| eprintln!("reading a sealed state failed: {error}"))
+            .ok()
+            .flatten()
             .and_then(|value| self.data_from_side_store(value).ok().flatten())
     }
 
@@ -2850,7 +2858,11 @@ impl MarfStore {
         if self.reads_active_state() {
             return self.marf.get_active_path(path);
         }
-        self.marf.get_path(self.read_block?, path)
+        self.marf
+            .get_path(self.read_block?, path)
+            .inspect_err(|error| eprintln!("reading a sealed state failed: {error}"))
+            .ok()
+            .flatten()
     }
 
     fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {

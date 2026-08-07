@@ -356,46 +356,72 @@ impl TrieChild {
     }
 }
 
+/// Reads answer with a storage failure rather than panicking on one.
+///
+/// Verifying the tip's record, root and skip-list ancestors at startup says the
+/// state opens; it does not say every reachable child of every node is still there,
+/// and it cannot say that `SQLite` will still answer in an hour. A trie whose root
+/// survives while a node beneath it does not passes that check and then panics on
+/// the first lookup that descends into the hole -- which on a follower is a process
+/// death mid-round rather than a block it declines to execute.
+/// See `tasks/mainnet/079`.
 impl MarfTrie {
-    pub fn insert(&mut self, key: &[u8], value: MarfValue) {
-        self.insert_path(*key_path(key).as_bytes(), value);
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read or written.
+    pub fn insert(&mut self, key: &[u8], value: MarfValue) -> Result<(), MarfError> {
+        self.insert_path(*key_path(key).as_bytes(), value)
     }
 
-    pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) {
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read or written.
+    pub fn insert_path(&mut self, path: [u8; 32], value: MarfValue) -> Result<(), MarfError> {
         insert_under_root(&self.storage, &mut self.root_children, path, value)
-            .expect("trie storage");
     }
 
-    #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<MarfValue> {
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn get(&self, key: &[u8]) -> Result<Option<MarfValue>, MarfError> {
         self.get_path(*key_path(key).as_bytes())
     }
 
-    #[must_use]
-    pub fn get_path(&self, path: [u8; 32]) -> Option<MarfValue> {
-        find_path(&self.storage, &self.root_children, path).expect("trie storage")
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn get_path(&self, path: [u8; 32]) -> Result<Option<MarfValue>, MarfError> {
+        find_path(&self.storage, &self.root_children, path)
     }
 
-    #[must_use]
-    pub fn root_hash(&self) -> TrieHash {
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn root_hash(&self) -> Result<TrieHash, MarfError> {
         hash_children(&self.storage, TrieNodeId::Node256, &[], &self.root_children)
-            .expect("trie storage")
     }
 
     /// Return every stored path and value in deterministic path order.
-    #[must_use]
-    pub fn leaves(&self) -> Vec<(TrieHash, MarfValue)> {
-        collect_leaves(&self.storage, &self.root_children).expect("trie storage")
+    ///
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn leaves(&self) -> Result<Vec<(TrieHash, MarfValue)>, MarfError> {
+        collect_leaves(&self.storage, &self.root_children)
     }
 
     /// Return the root pointers in their consensus serialization order.
-    #[must_use]
-    pub fn root_pointers(&self) -> Vec<TriePointer> {
-        self.pointers_at(&[])
+    ///
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn root_pointers(&self) -> Result<Vec<TriePointer>, MarfError> {
+        Ok(self
+            .pointers_at(&[])?
             .unwrap_or_default()
             .into_iter()
             .map(|(pointer, _)| pointer)
-            .collect()
+            .collect())
     }
 
     /// Return the pointers and child hashes of the node reached by a path prefix.
@@ -403,9 +429,15 @@ impl MarfTrie {
     /// Two states that hold the same leaves under different roots differ in the
     /// shape of some node, and descending into the child whose hash differs is
     /// how that node is found.
-    #[must_use]
-    pub fn pointers_at(&self, prefix: &[u8]) -> Option<Vec<(TriePointer, TrieHash)>> {
-        pointers_under_root(&self.storage, &self.root_children, prefix).expect("trie storage")
+    ///
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn pointers_at(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Option<Vec<(TriePointer, TrieHash)>>, MarfError> {
+        pointers_under_root(&self.storage, &self.root_children, prefix)
     }
 }
 
@@ -1133,17 +1165,32 @@ impl VersionedMarf {
     }
 
     /// Read a logical key from a sealed state.
-    #[must_use]
-    pub fn get(&self, block: MarfBlockId, key: &[u8]) -> Option<MarfValue> {
+    ///
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read.
+    pub fn get(&self, block: MarfBlockId, key: &[u8]) -> Result<Option<MarfValue>, MarfError> {
         self.get_path(block, *key_path(key).as_bytes())
     }
 
     /// Read a raw path from a sealed state.
-    #[must_use]
-    pub fn get_path(&self, block: MarfBlockId, path: [u8; 32]) -> Option<MarfValue> {
-        self.sealed_root(block)
-            .expect("trie storage")
-            .and_then(|root| root.get(&self.storage, &path).expect("trie storage"))
+    ///
+    /// # Errors
+    ///
+    /// If the trie's storage cannot be read -- which includes a node that is simply
+    /// *gone*, the case `verify_tip` cannot see: it checks the tip's record, its root
+    /// and the skip-list ancestors, and none of those touches the nodes beneath the
+    /// root. This used to panic, so a follower meeting a hole died mid-round instead
+    /// of declining the block. See `tasks/mainnet/079`.
+    pub fn get_path(
+        &self,
+        block: MarfBlockId,
+        path: [u8; 32],
+    ) -> Result<Option<MarfValue>, MarfError> {
+        let Some(root) = self.sealed_root(block)? else {
+            return Ok(None);
+        };
+        root.get(&self.storage, &path)
     }
 
     /// Read a logical key from the state being written.
@@ -1453,21 +1500,21 @@ mod tests {
         for index in 0_u8..=48 {
             let mut path = [0; 32];
             path[0] = index;
-            trie.insert_path(path, MarfValue::from_u32(u32::from(index)));
+            trie.insert_path(path, MarfValue::from_u32(u32::from(index))).expect("the test trie stores");
         }
-        let root_before_overwrite = trie.root_hash();
+        let root_before_overwrite = trie.root_hash().expect("the test trie hashes");
         let mut overwritten_path = [0; 32];
         overwritten_path[0] = 9;
-        trie.insert_path(overwritten_path, MarfValue::from_u32(100));
-        let overwritten_root = trie.root_hash();
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100)).expect("the test trie stores");
+        let overwritten_root = trie.root_hash().expect("the test trie hashes");
         assert_ne!(overwritten_root, root_before_overwrite);
-        trie.insert_path(overwritten_path, MarfValue::from_u32(100));
-        assert_eq!(trie.root_hash(), overwritten_root);
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100)).expect("the test trie stores");
+        assert_eq!(trie.root_hash().expect("the test trie hashes"), overwritten_root);
         assert_eq!(
-            trie.get_path(overwritten_path),
+            trie.get_path(overwritten_path).expect("the test trie reads"),
             Some(MarfValue::from_u32(100))
         );
-        assert_eq!(trie.get_path([0xff; 32]), None);
+        assert_eq!(trie.get_path([0xff; 32]).expect("the test trie reads"), None);
     }
 
     #[test]
@@ -1476,7 +1523,7 @@ mod tests {
         let path = [7; 32];
         let first_value = MarfValue::from_u32(1);
         let mut trie = MarfTrie::default();
-        trie.insert_path(path, first_value);
+        trie.insert_path(path, first_value).expect("the test trie stores");
         super::prepare_root_for_copy(&mut trie.root_children, first);
         let mut pointers = vec![
             TriePointer {
@@ -1495,7 +1542,7 @@ mod tests {
         child_hashes[usize::from(path[0])] = TrieHash::from_bytes(first);
         let content = internal_node_hash(TrieNodeId::Node256, &pointers, &[], &child_hashes)
             .expect("hashes copied root");
-        assert_eq!(trie.root_hash(), content);
+        assert_eq!(trie.root_hash().expect("the test trie hashes"), content);
     }
 
     #[test]
@@ -1522,21 +1569,22 @@ mod tests {
         trie.insert_path(path, replacement)
             .expect("overwrites copied leaf");
         let third_root = trie.seal().expect("seals updated state");
-        assert_eq!(trie.get_path(first, path), Some(first_value));
-        assert_eq!(trie.get_path(third, path), Some(replacement));
+        assert_eq!(trie.get_path(first, path).expect("the test store reads"), Some(first_value));
+        assert_eq!(trie.get_path(third, path).expect("the test store reads"), Some(replacement));
         assert_eq!(
-            trie.get(third, OWN_BLOCK_HEIGHT_KEY.as_bytes()),
+            trie.get(third, OWN_BLOCK_HEIGHT_KEY.as_bytes()).expect("the test store reads"),
             Some(2.into())
         );
         assert_eq!(
-            trie.get(third, format!("{BLOCK_HEIGHT_TO_HASH_KEY}::0").as_bytes()),
+            trie.get(third, format!("{BLOCK_HEIGHT_TO_HASH_KEY}::0").as_bytes()).expect("the test store reads"),
             Some(MarfValue::from_block_id(first))
         );
         assert_eq!(
             trie.get(
                 third,
                 format!("{BLOCK_HASH_TO_HEIGHT_KEY}::{}", block_hex(second)).as_bytes()
-            ),
+            )
+            .expect("the test store reads"),
             Some(1.into())
         );
         assert_eq!(trie.root(first), Some(first_root));
@@ -1592,13 +1640,89 @@ mod tests {
         assert_eq!(reopened.tip(), Some(second));
         assert_eq!(reopened.root(second), Some(expected));
         assert_eq!(
-            reopened.get(second, key),
+            reopened.get(second, key).expect("the test store reads"),
             Some(MarfValue::from_value(b"two"))
         );
         assert_eq!(
-            reopened.get(first, key),
+            reopened.get(first, key).expect("the test store reads"),
             Some(MarfValue::from_value(b"one"))
         );
         std::fs::remove_dir_all(&directory).expect("remove directory");
+    }
+}
+
+#[cfg(test)]
+mod missing_node_tests {
+    use super::{MarfValue, VersionedMarf};
+
+    /// A tip whose root is intact and whose reachable child is gone.
+    ///
+    /// This is the shape `verify_tip` cannot see. It checks the tip's record, its
+    /// root and the skip-list ancestors — none of which touches the nodes *beneath*
+    /// the root, so a trie missing one passes startup and fails at the first lookup
+    /// that descends into the hole. Before this, that failure was an
+    /// `expect("trie storage")`: a follower died mid-round instead of declining a
+    /// block, and the operator got a backtrace where a state directory and a block
+    /// identifier belonged.
+    ///
+    /// Built by deleting a node row directly, because there is no honest way to
+    /// produce one through the API — which is the point: this is corruption, and the
+    /// claim is that the node answers rather than dies.
+    #[test]
+    fn a_reachable_node_that_is_gone_is_an_error_and_not_a_panic() {
+        let directory = std::env::temp_dir().join(format!(
+            "nano-marf-hole-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create directory");
+        let path = directory.join("marf.sqlite");
+        let block = [1; 32];
+        // Enough keys that the root has interior children rather than only leaves.
+        let keys: Vec<Vec<u8>> = (0..64u8).map(|index| vec![index; 8]).collect();
+        {
+            let mut marf = VersionedMarf::open(&path).expect("open MARF");
+            marf.begin(None, block).expect("begin");
+            for key in &keys {
+                marf.insert(key, MarfValue::from_value(key)).expect("insert");
+            }
+            marf.seal().expect("seal");
+        }
+
+        // One node, chosen for having a parent: the root's own row would fail the
+        // startup check, which is the case already covered.
+        let removed = {
+            let connection = rusqlite::Connection::open(&path).expect("open the store");
+            let count: u32 = connection
+                .query_row("SELECT COUNT(*) FROM marf_node", [], |row| row.get(0))
+                .expect("count the nodes");
+            assert!(count > 2, "the trie has interior nodes to remove");
+            connection
+                .execute(
+                    "DELETE FROM marf_node WHERE idx = (SELECT MAX(idx) FROM marf_node)",
+                    [],
+                )
+                .expect("remove one node")
+        };
+        assert_eq!(removed, 1);
+
+        // The claim: opening and reading answer, whatever they answer, and the
+        // process is still alive to be asked.
+        let reopened = VersionedMarf::open(&path).expect("a store with a hole still opens");
+        let mut refused = 0;
+        for key in &keys {
+            // Whatever it answers, it answers. Not asserted equal to anything: which
+            // keys descend through the removed node is an implementation detail of
+            // the trie's shape, and the claim is that the process survives asking.
+            if reopened.get(block, key).is_err() {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused > 0,
+            "removing a reachable node made no read fail, so this fixture is not the \
+             corruption it claims to be"
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 }

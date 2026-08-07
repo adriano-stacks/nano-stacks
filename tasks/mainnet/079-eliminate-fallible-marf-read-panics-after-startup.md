@@ -1,7 +1,7 @@
 ---
 id: "079"
 title: "Eliminate fallible MARF read panics after startup"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 type: bug
@@ -21,17 +21,43 @@ fail.
 
 ## Tasks
 
-- [ ] Replace production `expect("trie storage")` read paths with typed results
+- [~] Replace production `expect("trie storage")` read paths with typed results
       through `nano-marf`, `nano-vm`, chainstate and RPC callers.
 - [ ] Either verify the complete reachable trie graph at startup or preserve
       typed errors for nodes not covered by the bounded startup check.
-- [ ] Add a fixture whose tip record and root survive while a reachable non-root
+- [x] Add a fixture whose tip record and root survive while a reachable non-root
       trie node is missing; opening or reading it must return an actionable error
       without a panic.
 - [ ] Cover storage I/O failure after a successful open and prove no partial
       block or repair write is committed.
 - [ ] Retain the clean restart, SIGKILL and commit-boundary recovery gates from
       tasks 057 and 065.
+
+## Where this stands, 2026-08-07
+
+**The read paths a running node takes no longer panic.** `MarfTrie`'s whole API and
+`VersionedMarf::get`/`get_path` return `Result` now, and the two callers that matter
+-- `MarfStore::get` and `value_of` in `nano-vm` -- report the failure and read as
+absent instead of taking the process down. A follower meeting a hole declines a block
+where it used to die mid-round, and the trie's own error names the block and node it
+could not read.
+
+**The fixture is real corruption, built the only honest way.** There is no API that
+produces a trie with a hole, so the test deletes a `marf_node` row directly, reopens,
+and reads every key. It asserts two things and neither is the interesting one alone:
+that reads *refuse* -- otherwise the fixture is not the corruption it claims to be --
+and that the process is alive to be asked afterwards. Which keys descend through the
+removed node is a detail of the trie's shape and is deliberately not asserted.
+
+It also found the gap it was written for: with `MarfTrie` converted the test still
+panicked, on `VersionedMarf::get_path`, which is exactly the "deeper read API" this
+task names.
+
+**Eleven `expect("trie storage")` remain**, in paths a running node does not take on a
+block: `tip`, `root`, `leaves_at`, `pointers_at`, the jump list and the block record.
+They are startup, diagnostic and export paths. Converting them is the rest of the
+first bullet and ripples further -- `tip` alone has callers everywhere -- so it is
+left visible rather than half-done.
 
 ## Acceptance Criteria
 

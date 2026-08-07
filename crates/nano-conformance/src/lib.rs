@@ -2196,6 +2196,7 @@ mod tests {
             .filter(|contract| {
                 imported
                     .get(source, format!("clarity-contract::{contract}").as_bytes())
+                    .expect("the imported trie reads")
                     .is_none()
             })
             .collect();
@@ -4574,8 +4575,9 @@ mod tests {
             let reference = get_node_hash(&reference_root, &child_hashes, &mut map);
 
             let mut ours = MarfTrie::default();
-            ours.insert_path(path, MarfValue::from_value(text.as_bytes()));
-            let root = ours.root_hash();
+            ours.insert_path(path, MarfValue::from_value(text.as_bytes()))
+                .expect("the in-memory trie stores");
+            let root = ours.root_hash().expect("the in-memory trie hashes");
             prop_assert_eq!(root.as_bytes(), &reference.0);
         }
 
@@ -4614,9 +4616,11 @@ mod tests {
             let reference = get_node_hash(&reference_root, &root_hashes, &mut map);
 
             let mut ours = MarfTrie::default();
-            ours.insert_path(path, MarfValue::from_value(first_text.as_bytes()));
-            ours.insert_path(alternate, MarfValue::from_value(second_text.as_bytes()));
-            let root = ours.root_hash();
+            ours.insert_path(path, MarfValue::from_value(first_text.as_bytes()))
+                .expect("the in-memory trie stores");
+            ours.insert_path(alternate, MarfValue::from_value(second_text.as_bytes()))
+                .expect("the in-memory trie stores");
+            let root = ours.root_hash().expect("the in-memory trie hashes");
             prop_assert_eq!(root.as_bytes(), &reference.0);
         }
 
