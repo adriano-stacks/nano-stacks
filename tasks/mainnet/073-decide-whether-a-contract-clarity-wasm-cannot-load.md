@@ -195,6 +195,30 @@ exactly option B — detect the overflow and spill locals to memory with
 compile-time-known offsets — so B is likely welcome upstream, and A/G are a
 contribution candidate as well.
 
+### B design inventory (2026-08-07, full representation survey)
+
+- Good seams (change the helper, callers follow): `clar2wasm_ty`
+  (`wasm_generator.rs:234-269`), `write_to_memory`/`read_from_memory`
+  (`:1589-1878`), `save_to_locals`/`drop_value`, and the already-memory
+  host boundaries (maps, data-vars, `contract-call?`, `print`).
+- Hard spots (open-coded flattened assumptions): `words/tuples.rs` (all three
+  words), `equal.rs:429-496`, `duck_type.rs:144-181`, `copy.rs:157-174`,
+  `deserialize.rs:980-1068`, the `widen_actions` machinery in `visit_atom`
+  (`wasm_generator.rs:2255-2307`, assumes 1:1 leaf-slot correspondence), and
+  `runtime_size` optional/response slicing.
+- The decisive constraint: **the host ABI is the flattened mapping** —
+  `pass_argument_to_wasm` / `wasm_to_clarity_value` / `wasm_value_types`
+  (`wasm_utils.rs`) and the exported function signatures. Boxing must
+  therefore be internal-only: keep flattened export wrappers for
+  public/read-only functions (and `.top-level`) that box/unbox at the
+  boundary, or the host side of nano-vm changes too. Stdlib calls never see
+  composites (scalars + memory pairs only), so `standard.wasm` is unaffected.
+- Duplicates to update in lockstep: `wasm_value_types`
+  (`wasm_utils.rs:1444-1480`) mirrors `clar2wasm_ty`; `get_type_size` exists
+  twice (`layout.rs:6-21`, `wasm_utils.rs:646-669`).
+- Mechanical blast radius: 74 `clar2wasm_ty` uses in 17 files, 46
+  `save_to_locals` uses in 14 files.
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
