@@ -134,8 +134,20 @@ execution.
 
         `parent_consensus_hash` and `parent_tenure_start_block_id` come back empty on
         this node because the parent tenure predates what its bounded archive holds.
-        Empty and not invented, per this task's own rule. `/v3/sortitions` still
-        answers `503` and is the next one.
+        Empty and not invented, per this task's own rule. `/v3/sortitions` still answers `503`, and it is **not** the same
+        defect -- which is worth saying, because it looks like one.
+        `SortitionInfoWire` wants the burn block's hash, timestamp, sortition and
+        parent-sortition identifiers, the winner's key hash and the seed. A sealed
+        tip carries none of that; it lives in the sortition chain, and *this* node
+        derives none because its checkpoint carries no sortition history to seed one
+        from -- the same absence that made
+        [[069-resolve-the-pox-5-follower-state-root-divergence]] reachable here.
+
+        So `503` is the honest answer for this node: it has nothing to say about
+        sortitions, and inventing a snapshot would be worse than declining. The fix
+        is not in the route but in the rig -- give that checkpoint a `sortition`
+        directory, as the mainnet one has, and the node derives them and the route
+        answers.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
