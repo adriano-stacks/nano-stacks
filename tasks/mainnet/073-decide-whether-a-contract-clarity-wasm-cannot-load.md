@@ -273,6 +273,30 @@ compile-time offsets. Note the gate interplay: a fix that makes the 60k-let
 loadable retires the manufactured refusal, so `engine_failure.rs` needs a new
 forcing case at that point (as this task already anticipated).
 
+### B refined (2026-08-07): two sub-cases, two mechanisms
+
+- **B1 — use-based (last-use) liveness for named bindings.** A's release is
+  scope-based; a pre-pass over each function body can count atom uses per
+  binding, drop the save entirely for never-read bindings (the value is still
+  evaluated for cost and side effects), and release at last use otherwise.
+  This kills the never/rarely-used scalar flood (the 60k-let reads only
+  `a0`). Moderate change, highest conformance value per effort. Caveat:
+  walrus/wasmparser count *declared* locals per function, and pooled reuse
+  makes declarations track peak concurrency — so the hard core that survives
+  B1 is "50k locals genuinely live at one program point", e.g. 26k bindings
+  all read inside one final expression.
+- **B2 — composite boxing / spill.** A single live binding can still
+  overflow: `MAX_VALUE_SIZE` is 1 MiB
+  (`clarity-types/src/types/mod.rs:43`), so one tuple of ~26k int fields
+  (~440 KiB value, ~1 MiB literal — under the 2 MiB block) flattens to ~52k
+  i64 locals on its own. Boxing large composites as an i32 pointer (the
+  upstream-suggested direction) covers this and the B1-hard core alike;
+  spill-to-memory of locals is the general form.
+- Sequencing: B1 first (covers the demonstrated reachable case), B2 after,
+  with the per-shape boundary table quantifying what remains at each step.
+  The `engine_failure` gate needs a new manufactured refusal once B1 lands
+  (an all-used-at-one-point binding set is the candidate shape).
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000

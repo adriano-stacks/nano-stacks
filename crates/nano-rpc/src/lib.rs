@@ -92,6 +92,19 @@ pub trait ExecutedBlocks: Send + Sync {
         let _ = block_id;
         None
     }
+
+    /// The last block this node executed in the tenure a consensus hash names.
+    ///
+    /// A lookup for the same reason `tenure_start` is one, and keyed by the tenure
+    /// rather than by a block because that is what asks: a signer initialising its
+    /// state machine names the *parent tenure* and wants its last block.
+    ///
+    /// Defaulted to `None` so a store with no tenure index still compiles, and the
+    /// route then says it cannot answer rather than inventing a header.
+    fn tenure_tip(&self, consensus_hash: &[u8; 20]) -> Option<Vec<u8>> {
+        let _ = consensus_hash;
+        None
+    }
 }
 
 /// A block waiting to be vouched for, and where the verdict goes.
@@ -893,13 +906,29 @@ async fn tenure_tip_metadata(
     State(state): State<RpcState>,
     Path(consensus_hash): Path<String>,
 ) -> Result<axum::Json<Value>, RpcError> {
-    let tenure = executed(&state)
+    // The peer's account of the tenure where there is one, and this node's own
+    // archive where there is not -- which is every catching-up node and every idle
+    // one, because `publish_executed` builds that chain out of the *followed* view.
+    // A signer initialising its state machine asks for the parent tenure's last
+    // block and got `404` from a node that had executed every block of it.
+    let followed = executed(&state)
         .await?
         .chain
         .into_iter()
         .rfind(|tenure| tenure.sortition.consensus_hash.to_string() == consensus_hash)
-        .ok_or(RpcError::NotFound)?;
-    let header = &tenure.blocks.last().ok_or(RpcError::NotFound)?.header;
+        .and_then(|tenure| tenure.blocks.last().cloned());
+    let executed_tip = if let Some(block) = followed {
+        block
+    } else {
+        let hash: [u8; 20] = hex::decode(consensus_hash.trim_start_matches("0x"))
+            .ok()
+            .and_then(|bytes| <[u8; 20]>::try_from(bytes.as_slice()).ok())
+            .ok_or(RpcError::NotFound)?;
+        let archive = state.archive.as_ref().ok_or(RpcError::NotFound)?;
+        let bytes = archive.tenure_tip(&hash).ok_or(RpcError::NotFound)?;
+        NakamotoBlock::decode(&bytes).map_err(|_| RpcError::NotFound)?
+    };
+    let header = &executed_tip.header;
     Ok(axum::Json(json!({
         "anchored_header": { "Nakamoto": {
             "version": header.version,

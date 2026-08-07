@@ -271,6 +271,25 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
+    fn tenure_tip(&self, consensus_hash: &[u8; 20]) -> Option<Vec<u8>> {
+        let found = self.connection().ok()?.query_row(
+            "SELECT bytes FROM executed WHERE consensus_hash = ?1 ORDER BY height DESC LIMIT 1",
+            params![consensus_hash.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        match found {
+            Ok(bytes) => Some(bytes),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => {
+                eprintln!(
+                    "cannot read the last block of tenure {}: {error}",
+                    hex::encode(consensus_hash)
+                );
+                None
+            }
+        }
+    }
+
     fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>> {
         let Ok(Some(start)) = self.stored(start_block_id) else {
             return Vec::new();
