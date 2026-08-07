@@ -59,10 +59,12 @@ Two independent pressures push the local count up, and both are nano's:
       network would reject this too" from "the network accepts what nano cannot
       load". **Answered: the network accepts what nano cannot load** — see
       findings below.
-- [ ] Search the imported mainnet state for contracts near the boundary. The
+- [x] Search the imported mainnet state for contracts near the boundary. The
       checkpoint carries every deployed contract, so this is a measurement over
       real state, not a guess: report the highest local count any mainnet contract
-      reaches and its margin.
+      reaches and its margin. **Done 2026-08-07: 137,332/137,340 compile; highest
+      peak 16,505 of 50,000 (3.0× margin; ~7× organic; 99.6% under 1k) — see
+      "Mainnet-state margin".**
 - [ ] Make the `as-contract` prologue pay for itself: emit the save/restore only
       for functions whose body contains an `as-contract`, and re-measure. This is
       worth doing whatever the answer above is, because it is a cost every mainnet
