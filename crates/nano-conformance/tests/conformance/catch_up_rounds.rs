@@ -175,7 +175,12 @@ fn resumed(
         .find(|block| *block.block_id().as_bytes() == tip)
         .unwrap_or_else(|| panic!("the sealed tip {} is not a captured block", hex::encode(tip)))
         .clone();
-    CheckpointExecutor::resume(chainstate, block, burnchain)
+    let mut executor = CheckpointExecutor::resume(chainstate, block, burnchain);
+    // The burn views this rig executes under are derived here, from the capture,
+    // exactly as a node derives them from its checkpoint. Before 077 they came from
+    // the peer, which is the path that no longer exists.
+    nano_conformance::derive_sortitions(&mut executor, &crate::follow_path::fixtures(), directory);
+    executor
 }
 
 /// The tenures a chain executed, as the heights `restart::canonical` compares by.

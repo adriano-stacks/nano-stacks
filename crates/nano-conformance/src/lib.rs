@@ -572,6 +572,39 @@ fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
     Some((anchor, u64::from(height)))
 }
 
+/// Give an executor the sortition chain the capture carries.
+///
+/// A rig that skips this executes nothing now, and that is the point:
+/// [[077-remove-peer-derived-consensus-execution-fallbacks]] removed the path where
+/// a peer's `/v3/sortitions` answer became the burn view a block ran under, so a
+/// node -- or a harness -- without a locally derived chain has no burn view at all.
+/// These rigs were exercising exactly that removed path, which is why they are the
+/// ones that had to change.
+///
+/// Seeded from the capture's own `sortition/` directory, which is what a configured
+/// node's `checkpoint.sortition` points at, so a harness and a node derive from the
+/// same bytes by the same route.
+///
+/// # Panics
+///
+/// If the capture cannot seed a chain. A rig that silently ran without one is what
+/// this is here to prevent.
+pub fn derive_sortitions<S>(
+    executor: &mut nano_node::CheckpointExecutor<S>,
+    fixtures: &Path,
+    state: &Path,
+) where
+    S: nano_bitcoin::BitcoinSource,
+    S::Error: std::fmt::Display,
+{
+    let tracker = nano_node::sortition::SortitionTracker::resume_or_capture(
+        state,
+        &fixtures.join("sortition"),
+    )
+    .expect("the capture carries a sortition history a chain can be seeded from");
+    executor.track_sortitions(tracker, state.to_path_buf());
+}
+
 /// Walk down from a seal to the deepest block the side store holds a ledger for.
 ///
 /// The same rule the node resumes by, and bounded the same way: a run seals at most

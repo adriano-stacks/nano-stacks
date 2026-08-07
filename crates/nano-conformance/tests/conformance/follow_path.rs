@@ -770,8 +770,9 @@ pub fn node(
         .expect("the captured snapshots read")
         .get(&anchor.header.consensus_hash.to_string())
         .expect("the anchor's own burn block");
-    let executor = CheckpointExecutor::from_chainstate(chainstate, anchor, context, burnchain)
+    let mut executor = CheckpointExecutor::from_chainstate(chainstate, anchor, context, burnchain)
         .expect("the anchor block applies");
+    nano_conformance::derive_sortitions(&mut executor, &fixtures, directory);
     (executor, chain)
 }
 
