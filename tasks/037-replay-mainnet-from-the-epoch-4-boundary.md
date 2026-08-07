@@ -146,6 +146,15 @@ never from fetched, staged or peer-reported height.
       alone, or seed a resumed chain at the burn view the *executed* tip needs. Until
       then this state cannot advance, and the frontier stands at **8,716,974**.
 
+      **Resolved in code, and the state is still damaged.** The seed guard landed and
+      worked on this very state: it refused the saved chain at burn 961,451, fell back
+      to the checkpoint and re-derived forward to 961,460, so the sortition half is
+      fixed. Execution then stopped again at **8,716,980** with a persistent state-root
+      mismatch, 72 rounds of it -- which says the rewind to 8,716,970 did not go below
+      the two-writer corruption. This directory needs a deeper rewind or replacement
+      from one of the preserved copies; it is not evidence of a consensus defect, and
+      it must not be read as replay depth.
+
       **Three, and the third is a consensus defect the other two hid.** 8,716,986 also
       diverges on a *receipt*, which no MARF version can explain:
       `af3e472f…b372e6` is `success` on chain and
