@@ -166,10 +166,25 @@ execution.
         node can use -- which is why this rig derives no sortitions, and why
         [[069-resolve-the-pox-5-follower-state-root-divergence]] was reachable on it.
 
-        Next action, bounded: write the consensus-hash history beside the snapshots
-        `write_capture` already writes, re-capture, and the rig derives sortitions --
-        after which `/v3/sortitions` answers and the stock signer's state machine
-        initializes.
+        **Fixed, and it corrects the paragraph above.** `write_capture` writes the
+        history now, ended at the last burn block that *elected* somebody rather than
+        simply the last one captured -- a chain is seeded by the snapshot its history
+        ends at, and the tracker refuses a seed whose own block won nothing, because
+        the sampling of the next block mixes the most recent winner's seed. The
+        snapshots and Bitcoin blocks still run to the full span, since the replay needs
+        the burn blocks above the seed. Re-captured and restarted, the rig says:
+
+        ```
+        deriving sortitions locally from burn 393 on PoX history 1111…
+        ```
+
+        So `503` was *not* the honest answer after all: this node has a sortition chain
+        now and `latest_sortition` still cannot answer, because it reads
+        `executed().chain.last()` -- the **followed** view -- exactly as `tenure_info`
+        did before it was fixed. The route needs the same treatment: answer from the
+        node's own sortition chain, which holds every field `SortitionInfoWire` wants
+        and which the executor already carries. That is the next action, and it is a
+        route fix rather than a rig fix.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting

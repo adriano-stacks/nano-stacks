@@ -1787,6 +1787,68 @@ impl CaptureConfig {
         Ok(())
     }
 
+    /// The consensus-hash history, without which the snapshots beside it seed nothing.
+    ///
+    /// `ConsensusHash::from_ops` mixes the hashes at power-of-two offsets behind a burn
+    /// block, so it reaches back thousands and a node cannot re-derive it from its own
+    /// snapshots. `SortitionTracker::history_from` reads this file, and a capture
+    /// written without it answered "neither the saved sortitions nor the capture can
+    /// seed a chain" -- which is how a rig came to derive no sortitions at all, and how
+    /// tasks/069 became reachable on it.
+    ///
+    /// Ended at the last burn block that *elected* somebody, not simply at the last one
+    /// captured. A chain is seeded by the snapshot its history ends at, and the sampling
+    /// of the block after a seed mixes the most recent winner's VRF seed -- so a seed
+    /// whose own block elected nobody cannot supply it, and the tracker refuses rather
+    /// than guessing. The snapshots and Bitcoin blocks still run to `last_burn`, because
+    /// the replay needs the burn blocks above the seed; only the seed must have won.
+    ///
+    /// Whole from the chain's start, and one per burn block: a truncated run derives a
+    /// different hash from there on. Mainnet's is 294,170 hashes, the cheapest thing in
+    /// the capture.
+    fn write_consensus_hashes(
+        staging: &Path,
+        sortition_db: &Path,
+        last_burn: u64,
+    ) -> Result<(), String> {
+        let seed_burn = sqlite(
+            sortition_db,
+            &format!(
+                "select max(block_height) from snapshots where pox_valid = 1 and \
+                 sortition = 1 and block_height <= {last_burn}"
+            ),
+        )?;
+        let seed_burn: u64 = seed_burn.trim().parse().map_err(|error| {
+            format!(
+                "no burn block at or below {last_burn} elected anybody, so no snapshot can \
+                 seed a chain: {error}"
+            )
+        })?;
+        let history = sqlite_json(
+            sortition_db,
+            &format!(
+                "select consensus_hash from snapshots where pox_valid = 1 and \
+                 block_height <= {seed_burn} group by block_height order by block_height"
+            ),
+        )?;
+        let hashes: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&history)
+            .map_err(|error| format!("unreadable consensus-hash history: {error}"))?
+            .iter()
+            .filter_map(|row| row.get("consensus_hash")?.as_str().map(ToOwned::to_owned))
+            .collect();
+        println!(
+            "captured {} consensus hashes up to burn {seed_burn}, the last that elected \
+             anybody, which is what lets the snapshots seed a chain",
+            hashes.len()
+        );
+        write_file(
+            &staging.join("sortition/consensus-hashes.json"),
+            serde_json::to_vec(&serde_json::json!({ "hashes": hashes }))
+                .map_err(|error| error.to_string())?
+                .as_slice(),
+        )
+    }
+
     fn write_capture(
         &self,
         staging: &Path,
@@ -1813,6 +1875,8 @@ impl CaptureConfig {
             &staging.join("sortition/snapshots.json"),
             snapshots.as_bytes(),
         )?;
+
+        Self::write_consensus_hashes(staging, sortition_db, last_burn)?;
 
         // The leader-key registry, without which no tenure's coinbase proof can
         // be checked at all: the registration a winning commitment names is
