@@ -40,7 +40,7 @@ tests may not be waived.
 - [ ] Reconcile the current ignored Hacknet, hosted-signer, miner, sync, Clarity
       cost and block-info tests; record which ordinary CI job and which release job
       exercises each one.
-- [ ] Make the release report consume the inventory and fail when any required
+- [x] Make the release report consume the inventory and fail when any required
       entry did not run or any semantic entry still exists.
 
 ## Acceptance Criteria
@@ -112,5 +112,6 @@ later test inherit a waiver silently.
   ownership the `#[ignore]` sites now have.
 - The fifteen blocking entries have to reach zero, which is 023's and 060's work
   and not this task's.
-- The release report does not yet *exit non-zero* on a blocking count; it prints
-  it. That is the last enforcement step.
+- The release report exits non-zero on a blocking count now: it prints the
+  fifteen and then fails whatever else passed, which is how a waived cost
+  differential rode along in a green report for as long as it did.

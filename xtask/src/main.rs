@@ -4719,7 +4719,7 @@ fn report_engines() {
 /// A reason the inventory does not list is `unclassified`, which counts against
 /// the release exactly as `semantic` does, so the undecided case cannot be the
 /// quiet one.
-fn report_differentials() {
+fn report_differentials() -> usize {
     println!("\nignored tests");
     let roots = [
         "vendor/clarity-wasm/clar2wasm/src",
@@ -4748,15 +4748,17 @@ fn report_differentials() {
     println!("  tools                {tools} (assert no required behaviour)");
     if blocking.is_empty() {
         println!("  blocking             0 -- nothing required is waived by being skipped");
-        return;
+        return 0;
     }
     println!(
         "  blocking             {} -- each one is a failed release gate, not a skipped test",
         blocking.len()
     );
+    let count = blocking.len();
     for (path, reason, class) in blocking {
         println!("    [{class}] {path}: {reason}");
     }
+    count
 }
 
 /// Where every `#[ignore]` is accounted for, by the exact reason it gives.
@@ -5142,7 +5144,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     );
     report_revision();
     report_engines();
-    report_differentials();
+    let blocking = report_differentials();
     report_artifact();
     report_checkpoint(state.as_deref());
     report_scoreboard();
@@ -5162,7 +5164,16 @@ fn release_report(arguments: &[String]) -> ExitCode {
     println!("  Bitcoin reorganization, or for a stock stacks-signer run against the binary.");
     println!("  Those need wall-clock and a pox-5 chain. tasks/053 says which is which.");
 
-    if passed {
+    // A blocking ignore is a failed gate whether or not the gates that ran passed.
+    // Printing the count and exiting zero is how a waived cost differential rode
+    // along in a green report for as long as it did.
+    if blocking > 0 {
+        println!(
+            "\n  {blocking} ignored test(s) are semantic or unclassified, so this report \
+             fails whatever else passed. See ignored-tests.toml."
+        );
+    }
+    if passed && blocking == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
