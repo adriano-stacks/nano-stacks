@@ -1253,16 +1253,23 @@ impl VersionedMarf {
     }
 
     /// Read a logical key from the state being written.
-    #[must_use]
-    pub fn get_active(&self, key: &[u8]) -> Option<MarfValue> {
+    pub fn get_active(&self, key: &[u8]) -> Result<Option<MarfValue>, MarfError> {
         self.get_active_path(*key_path(key).as_bytes())
     }
 
     /// Read a raw path from the state being written.
-    #[must_use]
-    pub fn get_active_path(&self, path: [u8; 32]) -> Option<MarfValue> {
-        let active = self.active.as_ref()?;
-        find_path(&self.storage, &active.root_children, path).expect("trie storage")
+    ///
+    /// Storage failure is returned rather than panicked and rather than answered
+    /// as absence. This is a read of the block being executed, so a value that
+    /// came back `None` because `SQLite` could not answer is a Clarity branch taken
+    /// on a fact that is not the chain's -- and a wrong branch is a wrong receipt
+    /// and a wrong root, neither of which says where it came from. See
+    /// `tasks/mainnet/079`.
+    pub fn get_active_path(&self, path: [u8; 32]) -> Result<Option<MarfValue>, MarfError> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        find_path(&self.storage, &active.root_children, path)
     }
 
     /// Return a sealed state root.

@@ -1997,8 +1997,7 @@ impl Vm {
     }
 
     /// Access a stored Clarity database value for a sealed block.
-    #[must_use]
-    pub fn get(&self, block: [u8; 32], key: &str) -> Option<String> {
+    pub fn get(&self, block: [u8; 32], key: &str) -> Result<Option<String>, MarfStoreError> {
         self.store.get(block, key)
     }
 }
@@ -2729,17 +2728,15 @@ impl MarfStore {
     /// Read a value from a sealed state.
     ///
     /// A trie whose storage cannot answer -- a node that is gone, a database that
-    /// stopped answering -- reads as absent here rather than killing the process,
-    /// and the trie's own error names the block and node it could not read. See
+    /// stopped answering -- is an error here rather than an absence, because the
+    /// two are different answers and only one of them is about the chain. See
     /// `tasks/mainnet/079`.
-    #[must_use]
-    pub fn get(&self, block: [u8; 32], key: &str) -> Option<String> {
-        self.marf
-            .get(block, key.as_bytes())
-            .inspect_err(|error| eprintln!("reading a sealed state failed: {error}"))
-            .ok()
-            .flatten()
-            .and_then(|value| self.data_from_side_store(value).ok().flatten())
+    pub fn get(&self, block: [u8; 32], key: &str) -> Result<Option<String>, MarfStoreError> {
+        let Some(value) = self.marf.get(block, key.as_bytes())? else {
+            return Ok(None);
+        };
+        self.data_from_side_store(value)
+            .map_err(|error| MarfStoreError::IncoherentState(error.to_string()))
     }
 
     /// Seal the active state and return its MARF root.
@@ -2953,15 +2950,25 @@ impl MarfStore {
     }
 
     /// Resolve a key against whichever state reads are pointed at.
-    fn value_of(&self, path: [u8; 32]) -> Option<MarfValue> {
-        if self.reads_active_state() {
-            return self.marf.get_active_path(path);
-        }
-        self.marf
-            .get_path(self.read_block?, path)
-            .inspect_err(|error| eprintln!("reading a sealed state failed: {error}"))
-            .ok()
-            .flatten()
+    ///
+    /// Storage failure is a refusal, not an absence. A trie that cannot be read
+    /// and a key that was never written are different consensus inputs: the
+    /// second is a fact about the chain and the first is a fact about this disk,
+    /// and answering both as `None` lets Clarity take a branch on the wrong one.
+    /// It then writes a receipt and seals a root, and neither says where the
+    /// answer came from. See `tasks/mainnet/079`.
+    fn value_of(&self, path: [u8; 32]) -> Result<Option<MarfValue>, VmExecutionError> {
+        let read = if self.reads_active_state() {
+            self.marf.get_active_path(path)
+        } else {
+            let Some(block) = self.read_block else {
+                return Ok(None);
+            };
+            self.marf.get_path(block, path)
+        };
+        read.map_err(|error| {
+            VmInternalError::Expect(format!("reading state failed: {error}")).into()
+        })
     }
 
     fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {
@@ -3518,7 +3525,7 @@ impl ClarityBackingStore for MarfStore {
         &mut self,
         path: &ReferenceTrieHash,
     ) -> Result<Option<String>, VmExecutionError> {
-        let Some(value) = self.value_of(*path.as_bytes()) else {
+        let Some(value) = self.value_of(*path.as_bytes())? else {
             return Ok(None);
         };
         let found = self.data_from_side_store(value)?;
@@ -4916,8 +4923,55 @@ mod tests {
             .expect("read through the reader")
     }
 
+    /// A trie that cannot be read is refused, not answered as an absence.
+    ///
+    /// The two are different consensus inputs: a key the chain never wrote is a
+    /// fact about the chain, and a node `SQLite` cannot return is a fact about this
+    /// disk. Answered the same way, Clarity takes a branch on the second, writes a
+    /// receipt from it and seals a root over it, and nothing downstream can tell
+    /// which one it was — a state-root comparison catches a *write*, and this
+    /// changes a read.
+    ///
+    /// Built the only honest way there is: the nodes of a sealed block are deleted
+    /// out of `marf_node` directly, because no API produces a trie with a hole.
+    /// `tasks/mainnet/079`.
+    #[test]
+    fn a_read_that_cannot_be_answered_is_an_error_and_not_an_absence() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let first = [1; 32];
+        let second = [2; 32];
+        {
+            let mut store =
+                MarfStore::open(Network::TESTNET, directory.path()).expect("create a store");
+            store.begin(None, first).expect("begin");
+            store.put("counter", "one").expect("write");
+            store.seal().expect("seal");
+            store.begin(Some(first), second).expect("begin");
+            store.put("other", "two").expect("write");
+            store.seal().expect("seal");
+        }
 
+        // The first block's nodes, so the tip's own record and root survive and the
+        // store still opens: the hole is under a *reachable* back-pointer.
+        let connection = rusqlite::Connection::open(directory.path().join(crate::MARF_FILE))
+            .expect("the MARF opens");
+        let removed = connection
+            .execute(
+                "DELETE FROM marf_node WHERE block = (SELECT id FROM marf_block WHERE hash = ?1)",
+                rusqlite::params![&first[..]],
+            )
+            .expect("the first block's nodes are removable");
+        assert!(removed > 0, "the fixture removed nothing, so it is not corruption");
+        drop(connection);
 
+        let store = MarfStore::open(Network::TESTNET, directory.path()).expect("reopen");
+        let answer = store.get(first, "counter");
+        assert!(
+            answer.is_err(),
+            "a trie with a hole answered {answer:?} instead of refusing"
+        );
+        println!("refused: {}", answer.unwrap_err());
+    }
 
     #[test]
     fn marf_store_keeps_forked_values_and_roots() {
@@ -4948,9 +5002,9 @@ mod tests {
             .expect("write fork state");
         let fork_root = store.seal().expect("seal fork state");
 
-        assert_eq!(store.get(first, "counter").as_deref(), Some("one"));
-        assert_eq!(store.get(second, "counter").as_deref(), Some("two"));
-        assert_eq!(store.get(fork, "counter").as_deref(), Some("fork"));
+        assert_eq!(store.get(first, "counter").expect("the store answers").as_deref(), Some("one"));
+        assert_eq!(store.get(second, "counter").expect("the store answers").as_deref(), Some("two"));
+        assert_eq!(store.get(fork, "counter").expect("the store answers").as_deref(), Some("fork"));
         assert_eq!(store.root(first), Some(first_root));
         assert_eq!(store.root(second), Some(second_root));
         assert_eq!(store.root(fork), Some(fork_root));
@@ -5007,7 +5061,7 @@ mod tests {
         store.rollback_transaction().expect("roll back transaction");
         store.seal().expect("seal block");
 
-        assert_eq!(store.get(block, "counter").as_deref(), Some("one"));
+        assert_eq!(store.get(block, "counter").expect("the store answers").as_deref(), Some("one"));
     }
 
     /// A block executes at its own height, not one past it.

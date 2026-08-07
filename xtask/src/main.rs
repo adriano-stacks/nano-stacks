@@ -3282,9 +3282,19 @@ fn state_value(arguments: &[String]) -> ExitCode {
         eprintln!("the block must be 32 hexadecimal bytes, or `tip` on a sealed state");
         return ExitCode::FAILURE;
     };
-    let Some(value) = store.get(block, key) else {
-        println!("no value for {key} at {}", hex::encode(block));
-        return ExitCode::FAILURE;
+    // Three answers, not two: the chain does not hold this key, or this state
+    // could not be read. Collapsing the second into the first is what task 079
+    // exists to stop, and a diagnostic is the last place it should happen.
+    let value = match store.get(block, key) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            println!("no value for {key} at {}", hex::encode(block));
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("reading {key} at {} failed: {error}", hex::encode(block));
+            return ExitCode::FAILURE;
+        }
     };
     println!("{value}");
     describe_stored_value(&value);
