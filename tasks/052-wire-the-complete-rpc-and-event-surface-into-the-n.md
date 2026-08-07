@@ -115,10 +115,27 @@ execution.
         a *single* tenure for thirteen thousand blocks, so one request would decode
         thirteen thousand blocks.
 
-        So the next action is to widen the trait rather than walk behind it: give
-        `ExecutedBlocks` a tenure-start lookup, implement it in `nano_node::Archive`
-        over the `tenure_start_heights` it already keeps, and answer `tenure_info`
-        from the sealed tip plus that one lookup.
+        **Done.** `ExecutedBlocks` gained a `tenure_start` lookup, defaulted to
+        `None` so a store with no tenure index still compiles and a route says it
+        cannot answer rather than guessing; `Archive` implements it as one query for
+        the lowest height of the tip's consensus hash; and `tenure_info` answers from
+        the followed view where there is one and from the sealed tip plus that lookup
+        where there is not. Live on the hacknet node:
+
+        ```
+        /v3/tenures/info  200
+        {"consensus_hash":"0xa06c505c…","tenure_start_block_id":"0x4779701c…",
+         "tip_block_id":"0x9ae3ee97…","tip_height":14843,"reward_cycle":19}
+        ```
+
+        `0x4779701c…` is block **931** — the divergence frontier
+        [[069-resolve-the-pox-5-follower-state-root-divergence]] was named for, now
+        simply the start of a tenure extended to 14,843.
+
+        `parent_consensus_hash` and `parent_tenure_start_block_id` come back empty on
+        this node because the parent tenure predates what its bounded archive holds.
+        Empty and not invented, per this task's own rule. `/v3/sortitions` still
+        answers `503` and is the next one.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting

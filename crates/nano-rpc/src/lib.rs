@@ -77,6 +77,21 @@ pub trait ExecutedBlocks: Send + Sync {
     /// The blocks of the tenure that starts at this block, lowest first, and
     /// stopping before `stop` when it is named.
     fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>>;
+
+    /// The first block of the tenure this block belongs to.
+    ///
+    /// A lookup and not a walk. Answering it by following parent links until the
+    /// consensus hash changes is correct and unusable: a tenure that is being
+    /// *extended* has no bound, and the pox-5 chain this is tested against has been
+    /// extending one for thirteen thousand blocks, so a single request would decode
+    /// thirteen thousand of them.
+    ///
+    /// Defaulted to `None` so a store that keeps no tenure index still compiles;
+    /// a route that needs it then says it cannot answer rather than guessing.
+    fn tenure_start(&self, block_id: StacksBlockId) -> Option<StacksBlockId> {
+        let _ = block_id;
+        None
+    }
 }
 
 /// A block waiting to be vouched for, and where the verdict goes.
@@ -754,14 +769,49 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, Rp
 async fn tenure_info(
     State(state): State<RpcState>,
 ) -> Result<axum::Json<TenureInfoWire>, RpcError> {
-    let latest = executed(&state)
-        .await?
-        .chain
-        .last()
-        .ok_or(RpcError::Unavailable)?
-        .info
-        .clone();
-    Ok(axum::Json(TenureInfoWire::from(latest)))
+    let executed = executed(&state).await?;
+    // The followed view first, where there is one: it already carries the tenure
+    // links whole.
+    if let Some(latest) = executed.chain.last() {
+        return Ok(axum::Json(TenureInfoWire::from(latest.info.clone())));
+    }
+    // A node that caught up by height has no followed view -- the tenure walk a full
+    // one needs fails from thousands of blocks back, which is exactly the state a
+    // freshly synced node is in -- and answering `503` there told a stock signer
+    // this node was not ready when it had executed to the tip. So the tip this node
+    // sealed answers instead, which is what this route is supposed to describe.
+    let archive = state.archive.clone().ok_or(RpcError::Unavailable)?;
+    let tip = executed.tip;
+    let start = archive
+        .tenure_start(tip.stacks_tip)
+        .ok_or(RpcError::Unavailable)?;
+    // The parent tenure, through the tenure-start block's own parent. Absent for the
+    // first tenure a checkpointed node holds, where saying so beats inventing links.
+    let parent = archive
+        .block(start)
+        .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
+        .map(|block| block.header.parent_block_id);
+    let parent_start = parent.and_then(|parent| archive.tenure_start(parent));
+    let parent_consensus = parent
+        .and_then(|parent| archive.block(parent))
+        .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
+        .map(|block| block.header.consensus_hash);
+    Ok(axum::Json(TenureInfoWire {
+        consensus_hash: format!("0x{}", tip.consensus_hash),
+        tenure_start_block_id: format!("0x{start}"),
+        parent_consensus_hash: parent_consensus
+            .map(|hash| format!("0x{hash}"))
+            .unwrap_or_default(),
+        parent_tenure_start_block_id: parent_start
+            .map(|start| format!("0x{start}"))
+            .unwrap_or_default(),
+        tip_block_id: format!("0x{}", tip.stacks_tip),
+        tip_height: tip.stacks_height,
+        reward_cycle: executed
+            .pox
+            .as_ref()
+            .map_or(0, |pox| pox.reward_cycle(tip.bitcoin_height)),
+    }))
 }
 
 async fn sortition(

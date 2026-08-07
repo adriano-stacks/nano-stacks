@@ -253,6 +253,24 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
+    fn tenure_start(&self, block_id: StacksBlockId) -> Option<StacksBlockId> {
+        let stored = self.stored(block_id).ok().flatten()?;
+        let found = self.connection().ok()?.query_row(
+            "SELECT block_id FROM executed WHERE consensus_hash = ?1 ORDER BY height ASC LIMIT 1",
+            params![stored.consensus_hash],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        match found {
+            Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice())
+                .ok()
+                .map(StacksBlockId::from_bytes),
+            Err(error) => {
+                eprintln!("cannot read the tenure start of {block_id}: {error}");
+                None
+            }
+        }
+    }
+
     fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>> {
         let Ok(Some(start)) = self.stored(start_block_id) else {
             return Vec::new();
