@@ -1823,7 +1823,25 @@ impl ChainState {
                     "transaction authorization failed: {error}"
                 ))
             })?;
-            let receipt = self.execute_transaction(transaction, &execution_cost)?;
+            // Named, because a failure here fails the *block* and the error carries no
+            // transaction. An ordinary failed transaction is a receipt and does not
+            // reach this: what does is an internal one -- a VM invariant, a host
+            // failure -- and those are compiler gaps rather than transactions the
+            // network also failed, because the network executed this block.
+            //
+            // Mainnet 8,708,126 is the case: `Unexpected principal data`, from a block
+            // with six transactions and no way to tell which. See
+            // `fixtures/mainnet/divergence`.
+            let receipt = self
+                .execute_transaction(transaction, &execution_cost)
+                .map_err(|error| {
+                    ChainStateError::InvalidTransaction(format!(
+                        "transaction {} of {} failed the block rather than its own receipt: \
+                         {error}",
+                        hex::encode(transaction.txid()),
+                        block.header.chain_length
+                    ))
+                })?;
             execution_cost.add(&receipt.result.cost).map_err(|error| {
                 ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))
             })?;
