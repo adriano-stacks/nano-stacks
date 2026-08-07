@@ -86,6 +86,132 @@ pub struct WasmGenerator {
     local_pool: Rc<RefCell<LocalPool>>,
     /// Peak live locals measured per generated function.
     pub(crate) locals_report: Rc<RefCell<LocalsReport>>,
+    /// Reads remaining per `let`/`match` binding, by binding id, counted by a
+    /// pre-pass over the contract's expressions; a binding's locals return
+    /// to the pool when its last read is emitted.
+    pub(crate) binding_uses: Vec<u32>,
+    /// The binding id introduced by each binding-name expression, by the
+    /// expression's AST id.
+    pub(crate) binding_ids: HashMap<u64, u32>,
+}
+
+/// Counts the reads of every lexically introduced binding (`let` and
+/// `match` names) in the contract's expressions, so that code generation
+/// can return a binding's locals to the pool at its last read. The walk
+/// mirrors evaluation order, and code generation traverses each expression
+/// exactly once, so a binding's count reaches zero at its last read
+/// whichever order the two visits happen in. Function parameters are not
+/// counted: they stay live for their whole body.
+#[derive(Debug, Default)]
+struct BindingUses {
+    uses: Vec<u32>,
+    ids: HashMap<u64, u32>,
+    /// Bindings in scope during the walk, innermost last.
+    scopes: HashMap<ClarityName, Vec<u32>>,
+}
+
+impl BindingUses {
+    fn compute(expressions: &[SymbolicExpression]) -> Self {
+        let mut uses = Self::default();
+        for expr in expressions {
+            uses.walk(expr);
+        }
+        uses
+    }
+
+    fn bind(&mut self, name_expr: &SymbolicExpression, name: &ClarityName) {
+        let id = self.uses.len() as u32;
+        self.uses.push(0);
+        self.ids.insert(name_expr.id, id);
+        self.scopes.entry(name.clone()).or_default().push(id);
+    }
+
+    fn unbind(&mut self, name: &ClarityName) {
+        if let Some(ids) = self.scopes.get_mut(name) {
+            ids.pop();
+        }
+    }
+
+    fn walk(&mut self, expr: &SymbolicExpression) {
+        match &expr.expr {
+            SymbolicExpressionType::Atom(name) => {
+                if let Some(&id) = self.scopes.get(name).and_then(|ids| ids.last()) {
+                    self.uses[id as usize] += 1;
+                }
+            }
+            SymbolicExpressionType::List(list) => self.walk_list(list),
+            _ => {}
+        }
+    }
+
+    fn walk_list(&mut self, list: &[SymbolicExpression]) {
+        let Some((
+            SymbolicExpression {
+                expr: SymbolicExpressionType::Atom(head),
+                ..
+            },
+            args,
+        )) = list.split_first()
+        else {
+            return;
+        };
+        match head.as_str() {
+            // `let` bindings are visible to the values bound after them and
+            // to the body.
+            "let" => {
+                let mut bound = Vec::new();
+                if let Some(SymbolicExpression {
+                    expr: SymbolicExpressionType::List(bindings),
+                    ..
+                }) = args.first()
+                {
+                    for pair in bindings {
+                        if let SymbolicExpressionType::List(pair) = &pair.expr {
+                            if let [name_expr, value] = pair.as_slice() {
+                                self.walk(value);
+                                if let SymbolicExpressionType::Atom(name) = &name_expr.expr {
+                                    self.bind(name_expr, name);
+                                    bound.push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                for expr in args.get(1..).unwrap_or(&[]) {
+                    self.walk(expr);
+                }
+                for name in bound.iter().rev() {
+                    self.unbind(name);
+                }
+            }
+            // `match` binds a name in each arm's body: the success name in
+            // the first, and the error name too in a response match.
+            "match" if args.len() == 4 || args.len() == 5 => {
+                self.walk(&args[0]);
+                if let SymbolicExpressionType::Atom(name) = &args[1].expr {
+                    self.bind(&args[1], name);
+                    self.walk(&args[2]);
+                    self.unbind(name);
+                } else {
+                    self.walk(&args[2]);
+                }
+                if args.len() == 4 {
+                    self.walk(&args[3]);
+                } else if let SymbolicExpressionType::Atom(name) = &args[3].expr {
+                    self.bind(&args[3], name);
+                    self.walk(&args[4]);
+                    self.unbind(name);
+                } else {
+                    self.walk(&args[4]);
+                }
+            }
+            _ => {
+                for expr in list {
+                    self.walk(expr);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +224,10 @@ pub(crate) struct Bindings {
 struct InnerBindings {
     locals: Vec<LocalId>,
     ty: TypeSignature,
+    /// The binding's id in the use count pre-pass, for `let`/`match`
+    /// bindings. Function parameters carry none: they stay live for their
+    /// whole body.
+    binding: Option<u32>,
 }
 
 impl Bindings {
@@ -105,8 +235,21 @@ impl Bindings {
         Self::default()
     }
 
-    pub(crate) fn insert(&mut self, name: ClarityName, ty: TypeSignature, locals: Vec<LocalId>) {
-        self.values.insert(name, InnerBindings { locals, ty });
+    pub(crate) fn insert(
+        &mut self,
+        name: ClarityName,
+        ty: TypeSignature,
+        locals: Vec<LocalId>,
+        binding: Option<u32>,
+    ) {
+        self.values.insert(
+            name,
+            InnerBindings {
+                locals,
+                ty,
+                binding,
+            },
+        );
     }
 
     pub(crate) fn enter_scope(&mut self) -> Result<(), GeneratorError> {
@@ -128,10 +271,10 @@ impl Bindings {
     pub(crate) fn get_locals_and_type(
         &self,
         name: &ClarityName,
-    ) -> Option<(Vec<LocalId>, TypeSignature)> {
+    ) -> Option<(Vec<LocalId>, TypeSignature, Option<u32>)> {
         self.values
             .get(name)
-            .map(|binding| (binding.locals.clone(), binding.ty.clone()))
+            .map(|binding| (binding.locals.clone(), binding.ty.clone(), binding.binding))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -569,6 +712,8 @@ impl WasmGenerator {
             maps_types: HashMap::new(),
             local_pool: Rc::new(RefCell::new(LocalPool::default())),
             locals_report: Rc::new(RefCell::new(LocalsReport::default())),
+            binding_uses: Vec::new(),
+            binding_ids: HashMap::new(),
             nft_types: HashMap::new(),
             used_traits: HashMap::new(),
             defined_functions: HashSet::new(),
@@ -638,6 +783,13 @@ impl WasmGenerator {
     pub fn generate(mut self) -> Result<Module, GeneratorError> {
         self.register_defined_traits()?;
         let expressions = std::mem::take(&mut self.contract_analysis.expressions);
+
+        // Count the reads of every `let`/`match` binding, so that code
+        // generation can return a binding's locals to the pool at its last
+        // read instead of keeping them to the end of its scope.
+        let binding_uses = BindingUses::compute(&expressions);
+        self.binding_uses = binding_uses.uses;
+        self.binding_ids = binding_uses.ids;
 
         // Get the type of the last top-level expression with a return value
         // or default to `None`.
@@ -767,12 +919,13 @@ impl WasmGenerator {
                 "callable reference must be an atom".to_owned(),
             ));
         };
-        let (values, _) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+        let (values, _, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
-        for value in values {
-            builder.local_get(value);
+        for value in &values {
+            builder.local_get(*value);
         }
+        self.note_binding_read(binding, &values);
         Ok(())
     }
 
@@ -965,7 +1118,9 @@ impl WasmGenerator {
             } else {
                 param.signature.clone()
             };
-            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone());
+            // Parameters are not counted by the use pre-pass: they stay live
+            // for the whole body.
+            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone(), None);
             parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
@@ -1703,6 +1858,32 @@ impl WasmGenerator {
         }
     }
 
+    /// The binding id the use pre-pass assigned to a binding-name
+    /// expression, if it introduces a `let`/`match` binding.
+    pub(crate) fn binding_id(&self, name_expr: &SymbolicExpression) -> Option<u32> {
+        self.binding_ids.get(&name_expr.id).copied()
+    }
+
+    /// Note a read of a binding's locals, returning them to the pool when it
+    /// was the binding's last read: the pre-pass counted every read, and
+    /// code generation traverses each expression exactly once. Parameters
+    /// carry no binding id and stay live for their whole body.
+    fn note_binding_read(&mut self, binding: Option<u32>, locals: &[LocalId]) {
+        let Some(id) = binding else { return };
+        let Some(remaining) = self.binding_uses.get_mut(id as usize) else {
+            return;
+        };
+        // A count already at zero means the expression was traversed more
+        // times than the pre-pass counted reads; leave the slots alone.
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        if *remaining == 0 {
+            self.release_locals(locals.to_vec());
+        }
+    }
+
     /// Write the value that is on the top of the data stack, which has type
     /// `ty`, to the memory, at offset stored in local variable,
     /// `offset_local`, plus constant offset `offset`. Returns the number of
@@ -2373,7 +2554,7 @@ impl WasmGenerator {
         }
 
         // Handle parameters and local bindings
-        let (values, ty) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+        let (values, ty, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
 
@@ -2411,12 +2592,13 @@ impl WasmGenerator {
                     }
                 }
                 self.charge_variable_lookup(builder, self.bindings.depth())?;
+                self.note_binding_read(binding, &values);
                 return Ok(());
             }
         }
 
-        for value in values {
-            builder.local_get(value);
+        for value in &values {
+            builder.local_get(*value);
         }
         self.charge_variable_lookup(builder, self.bindings.depth())?;
         if self.charge_local_value_copy {
@@ -2425,6 +2607,10 @@ impl WasmGenerator {
             builder.local_set(*size);
             self.charge_variable_copy(builder, *size)?;
         }
+        // The gets above are this read of the binding (the copy charge
+        // re-saves from the stack into its own slots); at the binding's
+        // last read its slots return to the pool.
+        self.note_binding_read(binding, &values);
         Ok(())
     }
 
@@ -2980,15 +3166,17 @@ mod tests {
 
     #[test]
     fn more_simultaneous_bindings_than_wasmtime_allows_still_compiles() {
-        // 60,000 bindings live in one scope must keep compiling: the refusal
-        // of the emitted module is the runtime's, and nano-conformance's
-        // `engine_failure.rs` gates on it staying that way.
+        // 60,000 bindings of which only `a0` is read: the unused bindings are
+        // dropped instead of saved, so the emitted module is small and
+        // wasmtime loads it. nano-conformance's `engine_failure.rs` used to
+        // force a module-load refusal with this shape; it now uses a `let`
+        // whose bindings are all read (see the next test).
         let bindings = (0..60_000_u32)
             .map(|index| format!("(a{index} u1)"))
             .collect::<Vec<_>>()
             .join(" ");
         let snippet = format!("(define-public (f) (ok (let ({bindings}) a0)))");
-        let compiled = compile(
+        let mut compiled = compile(
             &snippet,
             &QualifiedContractIdentifier::new(
                 StandardPrincipalData::transient(),
@@ -3002,24 +3190,136 @@ mod tests {
         )
         .expect("a let wider than wasmtime's locals limit still compiles");
 
-        // The bindings are all live in one scope, so the measurement sees
-        // the peak the runtime will refuse at load.
+        // Only `a0` is live at the body, so the measured peak is far under
+        // wasmtime's limit...
+        let peak = compiled.locals_report.max_live_locals["f"];
+        assert!(
+            peak < 50_000,
+            "60,000 bindings of which one is read should measure well under the limit, got {peak}"
+        );
+
+        // ...and the runtime accepts the module.
+        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+            .expect("wasmtime loads the module");
+    }
+
+    #[test]
+    fn all_bindings_read_at_once_still_refuses_at_load() {
+        // The refusal class must stay reachable: every binding is read by the
+        // final `list`, so all of them are live at its construction point and
+        // no liveness pass can free them. 26,000 `uint` bindings are 52,000
+        // locals — past wasmtime's hardcoded 50,000-per-function limit. The
+        // compiler must not refuse; the runtime must.
+        let bindings = (0..26_000_u32)
+            .map(|index| format!("(a{index} u1)"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let uses = (0..26_000_u32)
+            .map(|index| format!("a{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let snippet = format!("(define-public (f) (ok (let ({bindings}) (list {uses}))))");
+        let mut compiled = compile(
+            &snippet,
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::from_literal("wide-let-all-used"),
+            ),
+            LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+            &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+            true,
+        )
+        .expect("a let whose bindings are all read still compiles");
+
+        // The measurement sees the peak the runtime will refuse at load.
         let peak = compiled.locals_report.max_live_locals["f"];
         assert!(
             peak > 50_000,
-            "60,000 live bindings should measure past wasmtime's limit, got {peak}"
+            "26,000 bindings read at once should measure past wasmtime's limit, got {peak}"
+        );
+
+        let err = wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+            .expect_err("wasmtime refuses the module");
+        let err = format!("{err:?}");
+        assert!(
+            err.contains("too many locals"),
+            "expected a too-many-locals refusal, got {err}"
         );
     }
 
     #[test]
-    fn end_of_standard_data_is_correct() {
-        const STANDARD_LIB_PATH: &str =
+    fn end_of_standard_data_is_correct() {        const STANDARD_LIB_PATH: &str =
             concat!(env!("CARGO_MANIFEST_DIR"), "/src/standard/standard.wasm");
         let standard_lib_wasm = std::fs::read(STANDARD_LIB_PATH).expect("Failed to read WASM file");
         let module = Module::from_buffer(&standard_lib_wasm).unwrap();
         let initial_data_size: usize = module.data.iter().map(|d| d.value.len()).sum();
 
         assert!((initial_data_size as u32) == END_OF_STANDARD_DATA);
+    }
+
+    /// Reads counted per `let`/`match` binding, in the order the bindings
+    /// are introduced.
+    fn binding_use_counts(snippet: &str) -> Vec<u32> {
+        let ast = clarity::vm::ast::build_ast(
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::from_literal("binding-uses"),
+            ),
+            snippet,
+            &mut LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+        )
+        .expect("test source parses");
+        super::BindingUses::compute(&ast.expressions).uses
+    }
+
+    #[test]
+    fn binding_uses_let() {
+        // Both bindings are read once in the body.
+        assert_eq!(binding_use_counts("(let ((a u1) (b u2)) (+ a b))"), [1, 1]);
+        // An unread binding counts zero.
+        assert_eq!(binding_use_counts("(let ((a u1)) u2)"), [0]);
+        // A binding is visible to the values bound after it.
+        assert_eq!(binding_use_counts("(let ((a u1) (b a)) b)"), [1, 1]);
+        // A shadowed binding keeps its own count: the outer `a` is unread,
+        // the inner one is read once.
+        assert_eq!(binding_use_counts("(let ((a u1)) (let ((a u2)) a))"), [0, 1]);
+        // Uses after the scope closes resolve to the outer binding.
+        assert_eq!(
+            binding_use_counts("(let ((a u1)) (let ((b a)) b) a)"),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn binding_uses_match() {
+        assert_eq!(
+            binding_use_counts("(match (some u1) x (+ x u1) u0)"),
+            [1]
+        );
+        // Each arm's binding is counted separately.
+        assert_eq!(
+            binding_use_counts("(match (ok u1) ok-v ok-v err-v (+ err-v err-v))"),
+            [1, 2]
+        );
+        // An arm binding that shadows an enclosing `let` keeps its own count.
+        assert_eq!(
+            binding_use_counts("(let ((x u9)) (match (some u1) x x u0))"),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn binding_uses_ignores_parameters() {
+        // The parameter `a` is not a `let`/`match` binding: only `b` is
+        // counted.
+        assert_eq!(
+            binding_use_counts("(define-private (f (a uint)) (let ((b a)) (+ b a)))"),
+            [1]
+        );
     }
 
     #[test]

@@ -371,9 +371,12 @@ impl ComplexWord for Match {
 
                 let some_locals = generator.save_to_locals(builder, &inner_type, true);
 
-                generator
-                    .bindings
-                    .insert(success_binding.clone(), *inner_type, some_locals);
+                generator.bindings.insert(
+                    success_binding.clone(),
+                    *inner_type,
+                    some_locals,
+                    generator.binding_id(args.get_expr(1)?),
+                );
 
                 let some_block = generator.block_from_bound_expr(
                     builder,
@@ -409,9 +412,12 @@ impl ComplexWord for Match {
                 let err_locals = generator.save_to_locals(builder, err_ty, true);
                 let ok_locals = generator.save_to_locals(builder, ok_ty, true);
 
-                generator
-                    .bindings
-                    .insert(success_binding.clone(), ok_ty.clone(), ok_locals);
+                generator.bindings.insert(
+                    success_binding.clone(),
+                    ok_ty.clone(),
+                    ok_locals,
+                    generator.binding_id(args.get_expr(1)?),
+                );
                 let ok_block = generator.block_from_bound_expr(
                     builder,
                     success_body,
@@ -423,9 +429,12 @@ impl ComplexWord for Match {
                 generator.bindings.clone_from(&saved_bindings);
 
                 // bind err branch local
-                generator
-                    .bindings
-                    .insert(err_binding.clone(), err_ty.clone(), err_locals);
+                generator.bindings.insert(
+                    err_binding.clone(),
+                    err_ty.clone(),
+                    err_locals,
+                    generator.binding_id(args.get_expr(3)?),
+                );
 
                 let err_block = generator.block_from_bound_expr(
                     builder,
