@@ -1627,6 +1627,18 @@ where
         let Some(payouts) = payout_schedule(pox) else {
             return LocalView::NoChain;
         };
+        // Before anything walks: the retained snapshot window has to reach the burn
+        // view *execution* is standing on, which is not near the tip this walk is
+        // about to move. Locating one view runs the tracker to Bitcoin's tip while
+        // a batch of blocks moves execution a dozen burn blocks, so the fixed window
+        // dropped snapshots this node had derived itself and then refused to execute
+        // under them. Said here because this is the one place that knows both.
+        let executed = self.bitcoin_height();
+        if executed > 0
+            && let Some(tracker) = self.sortition.as_mut()
+        {
+            tracker.keep_from(executed);
+        }
         // Split the borrow: the tracker reads burn blocks through the same
         // source the executor holds.
         let Self {

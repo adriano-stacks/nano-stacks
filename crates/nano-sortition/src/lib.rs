@@ -1045,6 +1045,21 @@ pub struct SnapshotChain {
     /// seeded at burn 961,342, asked about 961,320, and it could only say "this
     /// chain cannot say", which stops execution rather than minting a guess.
     sortitions_below_window: Vec<u64>,
+    /// The burn view execution has reached, below which nothing can be asked.
+    ///
+    /// [`SNAPSHOTS_KEPT`] was chosen for a chain whose tip runs a little ahead of
+    /// the blocks being executed under it. A follower catching up from a checkpoint
+    /// is not that chain: locating one burn view walks the tip all the way to
+    /// Bitcoin's, and a batch of five hundred Stacks blocks moves execution eleven
+    /// burn blocks while the tip moves two hundred and eighty. Execution then asks
+    /// for a snapshot the window has already dropped — a burn block *this chain
+    /// derived* — and the node refuses to execute, refuses to write itself down, and
+    /// re-walks the same ground every round while Bitcoin widens the gap. It does
+    /// not recover: a restart re-seeds at the executed view and buys one more batch.
+    ///
+    /// So the floor follows execution rather than the tip. `None` keeps the fixed
+    /// window, which is right for a chain nothing is executing against.
+    needed_from: Option<u64>,
 }
 
 impl SnapshotChain {
@@ -1054,6 +1069,7 @@ impl SnapshotChain {
             consensus_hashes: vec![genesis.consensus_hash],
             snapshots: vec![genesis],
             sortitions_below_window: Vec::new(),
+            needed_from: None,
         }
     }
 
@@ -1070,6 +1086,7 @@ impl SnapshotChain {
             snapshots: vec![genesis],
             consensus_hashes: history,
             sortitions_below_window: Vec::new(),
+            needed_from: None,
         })
     }
 
@@ -1322,7 +1339,7 @@ impl SnapshotChain {
     /// hashes at power-of-two offsets, and a truncated history derives a different
     /// hash from there on.
     fn forget_snapshots_nothing_can_ask_for(&mut self) {
-        while self.snapshots.len() > SNAPSHOTS_KEPT {
+        while self.snapshots.len() > self.snapshots_to_keep() {
             let dropped = self.snapshots.remove(0);
             // The one fact a dropped snapshot still has to answer for. A tenure
             // collects the coinbase of every burn block since the last sortition,
@@ -1334,6 +1351,39 @@ impl SnapshotChain {
                 self.remember_sortition_below_window(dropped.bitcoin_height);
             }
         }
+    }
+
+    /// How many snapshots behind the tip this chain has to keep.
+    ///
+    /// [`SNAPSHOTS_KEPT`] unless execution is standing further back than that, in
+    /// which case everything from there up. A window that does not reach the burn
+    /// view being executed is not a smaller window — it is a chain that cannot
+    /// answer the one question it exists to answer, about a burn block it derived
+    /// itself. It costs what the lag costs: two hundred bytes a snapshot, and the
+    /// lag is what a follower catching up from a checkpoint necessarily has.
+    fn snapshots_to_keep(&self) -> usize {
+        let tip = self.tip().bitcoin_height;
+        self.needed_from
+            .and_then(|floor| tip.checked_sub(floor))
+            .and_then(|behind| usize::try_from(behind).ok())
+            .map_or(0, |behind| behind.saturating_add(1))
+            .max(SNAPSHOTS_KEPT)
+    }
+
+    /// Say which burn view execution has reached, so nothing above it is dropped.
+    ///
+    /// Monotonic: execution only moves forward, and a floor that went backwards
+    /// would let the window shrink under a reader still standing in it.
+    pub fn keep_from(&mut self, bitcoin_height: u64) {
+        if self.needed_from.is_none_or(|floor| bitcoin_height > floor) {
+            self.needed_from = Some(bitcoin_height);
+        }
+    }
+
+    /// The burn view execution has reached, if anything has said.
+    #[must_use]
+    pub const fn needed_from(&self) -> Option<u64> {
+        self.needed_from
     }
 
     /// The snapshot this chain derived for a Bitcoin height.
@@ -1839,6 +1889,77 @@ mod tests {
         older.seed_sortition_below_window(Some(961_342));
         assert_eq!(older.last_sortition_at_or_below(961_342), Some(961_342));
         assert_eq!(older.last_sortition_at_or_below(961_320), None);
+    }
+
+    /// A chain whose tip has run far ahead of execution still holds what execution
+    /// is standing on.
+    ///
+    /// The window was a fixed 144, chosen for a chain running "a little ahead of
+    /// the blocks being executed under it". A follower catching up from a
+    /// checkpoint is not that chain: locating one burn view walks the tip to
+    /// Bitcoin's, and on mainnet a 500-block batch left execution at burn 961,206
+    /// with the tip at 961,488 — 282 back. The snapshot was dropped, the node
+    /// refused to execute a burn block it had derived itself, refused to write its
+    /// chain down, and re-walked the same ground every round while Bitcoin widened
+    /// the gap. A restart re-seeded at the executed view and bought one more batch.
+    #[test]
+    fn a_chain_keeps_the_burn_view_execution_is_standing_on() {
+        let mut chain = SnapshotChain::new(SortitionSnapshot::genesis(
+            961_206,
+            nano_primitives::BitcoinHeaderHash::from_bytes([3; 32]),
+        ));
+        chain.keep_from(961_206);
+        for height in 961_207..=961_488 {
+            chain
+                .append(
+                    &bitcoin_block(height, 4),
+                    0,
+                    super::PoxId::initial(),
+                )
+                .expect("append a derived burn block");
+        }
+
+        assert_eq!(chain.tip().bitcoin_height, 961_488);
+        // 282 back, against the fixed window of 144 this used to keep.
+        assert!(
+            chain.snapshot_at(961_206).is_some(),
+            "the chain dropped the burn view execution is standing on"
+        );
+        assert!(chain.snapshot_at(961_300).is_some());
+        assert_eq!(chain.needed_from(), Some(961_206));
+
+        // Execution catching up lets the window close again: the floor moves, and
+        // nothing below it is kept beyond the fixed window.
+        chain.keep_from(961_480);
+        chain
+            .append(&bitcoin_block(961_489, 5), 0, super::PoxId::initial())
+            .expect("append");
+        assert!(chain.snapshot_at(961_480).is_some());
+        assert!(
+            chain.snapshot_at(961_206).is_none(),
+            "the window has to close behind execution, or it is a leak"
+        );
+
+        // The floor only moves forward: a reader standing in the window must not
+        // have it shrink underneath.
+        chain.keep_from(961_300);
+        assert_eq!(chain.needed_from(), Some(961_480));
+    }
+
+    /// A chain nothing executes against keeps the fixed window and no more.
+    #[test]
+    fn a_chain_with_no_execution_keeps_the_fixed_window() {
+        let mut chain = SnapshotChain::new(SortitionSnapshot::genesis(
+            1_000,
+            nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+        ));
+        for height in 1_001..=1_400 {
+            chain
+                .append(&bitcoin_block(height, 2), 0, super::PoxId::initial())
+                .expect("append");
+        }
+        assert_eq!(chain.needed_from(), None);
+        assert_eq!(chain.snapshots().len(), super::SNAPSHOTS_KEPT);
     }
 
     #[test]

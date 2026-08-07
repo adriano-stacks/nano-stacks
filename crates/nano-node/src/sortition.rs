@@ -228,13 +228,23 @@ impl SortitionTracker {
     /// order, so this is the reverse of [`Self::consensus_hash_at`] and the answer
     /// a node otherwise had to ask a peer for. Searched from the tip backwards
     /// because a follower's views arrive in ascending order and the newest is
-    /// almost always the one being asked about; the walk is bounded by the same
-    /// window a catch-up is, since a view further back than that belongs to a chain
-    /// this node is not executing.
+    /// almost always the one being asked about.
     ///
-    /// `None` where the history does not hold it: the view is ahead of this chain,
-    /// which one round of catching up may close, or it belongs to a burnchain this
-    /// node is not on, which no amount of walking will.
+    /// Not bounded by [`CATCH_UP_LIMIT`], which it used to be. That bound exists
+    /// because a *walk* costs one Bitcoin block download per step; this is a
+    /// comparison against bytes already in memory, and the two share nothing but a
+    /// direction. Bounded, it stopped naming burn views this node had already
+    /// derived and walked through: the tracker runs its tip to Bitcoin's while
+    /// execution lags behind it, so after one 500-block batch on mainnet the view
+    /// execution stood on was 282 blocks back against a window of 144, and the
+    /// follower never executed again — it re-walked the same ground every round
+    /// while Bitcoin widened the gap. The whole history is a quarter of a million
+    /// twenty-byte entries and the scan is a fraction of a millisecond, against a
+    /// burn view that changes once a tenure.
+    ///
+    /// `None` where the history does not hold it at all: the view is ahead of this
+    /// chain, which one round of catching up may close, or it belongs to a burnchain
+    /// this node is not on, which no amount of walking will.
     #[must_use]
     pub fn height_of_consensus_hash(&self, consensus_hash: ConsensusHash) -> Option<u64> {
         let history = self.engine.snapshots().history();
@@ -242,9 +252,17 @@ impl SortitionTracker {
         history
             .iter()
             .rev()
-            .take(usize::try_from(CATCH_UP_LIMIT).unwrap_or(usize::MAX))
             .position(|hash| *hash == consensus_hash)
             .and_then(|back| tip.checked_sub(u64::try_from(back).ok()?))
+    }
+
+    /// Say which burn view execution has reached, so no snapshot above it is
+    /// dropped before it is read.
+    ///
+    /// See [`nano_sortition::SnapshotChain::keep_from`]. The tracker running ahead
+    /// of execution is the design; running away from it is the defect.
+    pub fn keep_from(&mut self, bitcoin_height: u64) {
+        self.engine.snapshots_mut().keep_from(bitcoin_height);
     }
 
     /// Whether the six burn blocks behind the seed have been read.
