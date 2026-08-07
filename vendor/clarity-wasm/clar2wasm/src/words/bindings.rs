@@ -1,7 +1,7 @@
 use clarity::vm::{ClarityName, SymbolicExpression};
 
 use crate::cost::WordCharge;
-use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
+use crate::wasm_generator::{drop_value, ArgumentsExt, GeneratorError, WasmGenerator};
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::{ComplexWord, Word};
 use crate::{check_args, error_mapping};
@@ -38,13 +38,10 @@ impl ComplexWord for Let {
         // costs more to search than the one the `let` itself sits in.
         generator.bindings.enter_scope()?;
 
-        // The locals of every binding this scope introduces, returned to the
-        // pool when the scope closes.
-        let mut scope_locals = Vec::new();
-
         // Traverse the bindings
         for i in 0..bindings.len() {
             let pair = bindings.get_list(i)?;
+            let name_expr = pair.get_expr(0)?;
             let name = pair.get_name(0)?;
             let value = pair.get_expr(1)?;
             // make sure name does not collide with builtin symbols
@@ -62,11 +59,25 @@ impl ComplexWord for Let {
                     GeneratorError::TypeError("let value expression must be typed".to_owned())
                 })?
                 .clone();
-            let locals = generator.save_to_locals(builder, &ty, true);
 
-            // Add these named locals to the map
-            generator.bindings.insert(name.clone(), ty, locals.clone());
-            scope_locals.extend(locals);
+            let binding = generator.binding_id(name_expr);
+            match binding {
+                // A binding nothing reads: the value is still evaluated for
+                // its cost and side effects, but the result is dropped
+                // instead of saved. The name stays in the map so shadowing
+                // checks still see it; its empty locals are never read.
+                Some(id) if generator.binding_uses[id as usize] == 0 => {
+                    drop_value(builder, &ty);
+                    generator.bindings.insert(name.clone(), ty, Vec::new(), binding);
+                }
+                _ => {
+                    let locals = generator.save_to_locals(builder, &ty, true);
+
+                    // Add these named locals to the map. The locals return to
+                    // the pool at the binding's last read (see visit_atom).
+                    generator.bindings.insert(name.clone(), ty, locals, binding);
+                }
+            }
         }
 
         // WORKAROUND: need to set the last statement type to the type of the let expression
@@ -87,13 +98,9 @@ impl ComplexWord for Let {
         // Traverse the body
         generator.traverse_statement_list(builder, &args[1..])?;
 
-        // Restore the named locals.
+        // Restore the named locals. The scope's bindings returned their
+        // slots to the pool at their last read, so nothing is left to free.
         generator.bindings = saved_locals;
-
-        // The scope is closed, so its bindings are unreadable and their slots
-        // can be reused. A binding that shadowed an outer name releases only
-        // its own locals; the outer binding's were never in the pool.
-        generator.release_locals(scope_locals);
 
         Ok(())
     }

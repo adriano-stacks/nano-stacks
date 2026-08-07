@@ -14,7 +14,7 @@
 //! | class | forced by |
 //! |---|---|
 //! | compile refusal | a source naming a function that does not exist |
-//! | module-load refusal | a `let` with 60,000 bindings — more wasm locals than wasmtime's validator accepts |
+//! | module-load refusal | a `let` with 26,000 bindings, all read by one final `list` — more wasm locals than wasmtime's validator accepts |
 //! | runtime trap | `(- u0 u1)`, after a write |
 //!
 //! The module-load case took some finding. wasmtime's own limits are the only
@@ -22,12 +22,15 @@
 //! `clar2wasm`, and most are out of reach: a function's parameters are capped at
 //! 256 by Clarity's *analyzer* long before wasm's limit of 1,000, and a contract
 //! cannot be planted into state as bytes because its metadata is written once.
-//! Locals are reachable, because a `let` binding becomes one and nothing between
-//! the source and the validator counts them.
+//! Locals are reachable, because a `let` binding becomes one. They are no longer
+//! reachable by width alone: clar2wasm frees a binding's locals at its last
+//! read and drops a binding nothing reads, so 60,000 bindings of which one is
+//! read compile to a module that loads. What still refuses is every binding
+//! live at once — each read by the same final `list`.
 //!
 //! ## Falling through would have changed the answer
 //!
-//! The `let` with 60,000 bindings is a positive control as well as a failure
+//! The `let` with 26,000 bindings is a positive control as well as a failure
 //! case: the reference interpreter compiles nothing, so it **deploys and runs
 //! that contract perfectly well**. Same source, same state, one engine refuses
 //! and the other answers — which is exactly the shape of a compiler gap. nano
@@ -61,16 +64,22 @@ const ATTEMPTS: usize = 20;
 
 /// A source that compiles and produces a module wasmtime will not load.
 ///
-/// Every `let` binding is a wasm local, and wasmtime's validator accepts 50,000
-/// of them. Nothing between Clarity's analyzer and the validator counts, so this
-/// is a module the compiler emits and the runtime refuses — the one failure class
+/// Every `let` binding is a wasm local, and wasmtime's validator accepts
+/// 50,000 of them per function. clar2wasm frees a binding's locals at its
+/// last read, so the bindings all have to be live at once — each is read by
+/// the final `list`, and 26,000 `uint` bindings are 52,000 locals. This is a
+/// module the compiler emits and the runtime refuses — the one failure class
 /// that is otherwise only reachable through a compiler bug.
 fn too_many_locals() -> String {
-    let bindings = (0..60_000_u32)
+    let bindings = (0..26_000_u32)
         .map(|index| format!("(a{index} u1)"))
         .collect::<Vec<_>>()
         .join(" ");
-    format!("(define-public (f) (ok (let ({bindings}) a0)))")
+    let uses = (0..26_000_u32)
+        .map(|index| format!("a{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("(define-public (f) (ok (let ({bindings}) (list {uses}))))")
 }
 
 fn contract(name: &str) -> QualifiedContractIdentifier {
@@ -338,7 +347,7 @@ fn the_engine_the_node_does_not_have_would_have_answered() {
         &source,
         LimitedCostTracker::new_free(),
     )
-    .expect("the interpreter deploys a contract with sixty thousand let bindings");
+    .expect("the interpreter deploys a contract with twenty-six thousand let bindings");
     let interpreted = nano_oracle::execute_contract_call_outcome(
         &mut store,
         sender(&identifier),
