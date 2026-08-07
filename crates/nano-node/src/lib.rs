@@ -2687,6 +2687,59 @@ where
         &self.tip
     }
 
+    /// Walk the derived sortition chain toward Bitcoin's tip, on Bitcoin's clock.
+    ///
+    /// Every other walk is driven by execution — the chain is advanced to name the
+    /// burn view a staged block stands on — so a node at the chain tip with nothing
+    /// staged never advanced at all. It then held no snapshot for its *own* tip's
+    /// burn view, and answered `/v3/sortitions` with `503` while perfectly healthy
+    /// and simply idle, which is the condition a signer spends most of its time in.
+    ///
+    /// Bounded and quiet: a walk that finds nothing new costs one `tip_height` call,
+    /// and only a walk that actually moved is written down or reported.
+    pub fn follow_burnchain(&mut self, pox: &PoxInfo) {
+        let Some(payouts) = payout_schedule(pox) else {
+            return;
+        };
+        let Self {
+            sortition: Some(tracker),
+            bitcoin,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let Ok(burnchain_tip) = bitcoin.tip_height() else {
+            // Reported by the execution path already, and every round would repeat
+            // it: a burnchain that cannot be read is not news twice a minute.
+            return;
+        };
+        if burnchain_tip <= tracker.tip().bitcoin_height {
+            return;
+        }
+        let standing_on = tracker.tip().bitcoin_height;
+        match tracker.follow_burnchain(
+            |height| bitcoin.block_at(height),
+            burnchain_tip,
+            payouts,
+            crate::sortition::CATCH_UP_LIMIT,
+        ) {
+            Ok(walk) if walk.advanced > 0 => {
+                println!(
+                    "derived {} sortitions locally as Bitcoin advanced, from burn {standing_on} \
+                     to {}",
+                    walk.advanced,
+                    self.sortition
+                        .as_ref()
+                        .map_or(standing_on, |tracker| tracker.tip().bitcoin_height)
+                );
+                self.save_sortitions();
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("following the burnchain locally failed: {error}"),
+        }
+    }
+
     /// The sortitions this node derived, anchored at the burn view it executed.
     ///
     /// What `/v3/sortitions` answers from. Anchored at the *executed* tip's burn

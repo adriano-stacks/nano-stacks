@@ -413,6 +413,31 @@ impl SortitionTracker {
         Ok((found, walk))
     }
 
+    /// Walk toward Bitcoin's tip because Bitcoin moved, not because a block asked.
+    ///
+    /// Every other walk here is driven by execution: the chain is advanced to name
+    /// the burn view a staged block stands on. A node at the chain tip with nothing
+    /// staged therefore never advances at all — so it holds no snapshot for its own
+    /// tip's burn view, and `/v3/sortitions` answers `503` on a node that is
+    /// perfectly healthy and simply idle. That is the condition a signer spends most
+    /// of its time in, and a burn block is news to one whether or not a Stacks block
+    /// stands on it yet.
+    pub fn follow_burnchain<E: Display>(
+        &mut self,
+        mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
+        burnchain_tip: u64,
+        payouts: PayoutSchedule,
+        limit: u64,
+    ) -> Result<CatchUp, TrackerError> {
+        let mut walk = CatchUp::default();
+        if !self.primed {
+            self.prime(&mut block_at, payouts, &mut walk)?;
+        }
+        let room = burnchain_tip.saturating_sub(self.tip().bitcoin_height);
+        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| false)?;
+        Ok(walk)
+    }
+
     /// Read burn blocks and derive their sortitions until `done`, or the bound runs
     /// out.
     ///

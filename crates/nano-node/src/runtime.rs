@@ -794,7 +794,14 @@ async fn follow(follower: Follower) -> Role {
             rounds.failed |= round.peer_failed;
             let sealed = round.sealed;
             if let Some(state) = state.as_ref() {
-                let sortitions = executor.lock().await.derived_sortitions();
+                let sortitions = {
+                    let mut executor = executor.lock().await;
+                    // On Bitcoin's clock rather than execution's: a node at the chain
+                    // tip with nothing staged derives no burn view otherwise, and
+                    // cannot then describe the one its own tip stands on.
+                    executor.follow_burnchain(&pox);
+                    executor.derived_sortitions()
+                };
                 state.publish_executed(sealed, sortitions).await;
                 publish_reward_cycle(RewardCycleInputs {
                     state,
