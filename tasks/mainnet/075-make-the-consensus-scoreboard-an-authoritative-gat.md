@@ -1,7 +1,7 @@
 ---
 id: "075"
 title: "Make the consensus scoreboard an authoritative gate"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 type: bug
@@ -35,6 +35,38 @@ gate.
 - [ ] Run the complete release conformance suite and close the event-observer,
       PoX-5 replay, kill-during-replay and write-journal failures exposed by the
       same regression.
+
+## Where this stands, 2026-08-07
+
+**Done.**
+
+- The board reads **340/340** and exits zero. The block-76 divergence was transient
+  — an in-flight edit in the vendored compiler while 073 was being worked — and is
+  not reproducible on the current tree.
+- `scoreboard` now exits non-zero when any required surface diverges.
+  `scoreboard_result` answers the table *and* the verdict, and required means the
+  captured replay: roots, receipts and costs, because a cost decides block admission
+  even where the root matches.
+- `release-report` reads that exit status and prints `FAIL` instead of describing
+  the artifact as though the replay had passed.
+- The command-level regression tampers rather than constructs: it copies the
+  capture, flips one receipt's `status` from `success` to `abort_by_response` — the
+  exact shape the block-76 regression took — and asserts the command fails, having
+  first asserted the untampered tree passes.
+
+**Open, and the number moved the wrong way before it moved the right way.** The
+suite was 241/6 when this task was written; it is **240 passed, 7 failed** now.
+[[077-remove-peer-derived-consensus-execution-fallbacks]] is why: fifteen rigs
+executed under a peer's sortition answer, and with that path gone they had no burn
+view. Seeding them from the capture closed eight.
+
+The seven that remain are one finding, not seven: the tenure VRF rule now **runs**
+on these rigs, where for want of a local chain it was skipped. Three fail it with
+`committed seed is not the hash of the parent tenure's VRF proof`, which says the
+seeding is wrong rather than the rule is. The capture's history ends at burn 459 and
+the anchor executes at 460+; whether the derived winner at those heights is right
+needs the capture's Bitcoin blocks walked against stacks-core's own snapshot rows,
+which is the next action here and is not guesswork to do blind.
 
 ## Acceptance Criteria
 
