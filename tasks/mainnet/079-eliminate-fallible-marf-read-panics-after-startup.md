@@ -23,7 +23,7 @@ fail.
 
 - [~] Replace production `expect("trie storage")` read paths with typed results
       through `nano-marf`, `nano-vm`, chainstate and RPC callers.
-- [ ] Preserve `MarfError` and side-store I/O errors through `MarfStore::get`,
+- [x] Preserve `MarfError` and side-store I/O errors through `MarfStore::get`,
       `value_of` and every `ClarityBackingStore` caller. Never convert a failed read
       to `None`, because corruption and a key that never existed are different
       consensus-visible inputs.
@@ -80,3 +80,42 @@ left visible rather than half-done.
 `VersionedMarf::verify_tip` checks the tip record, root and skip-list ancestors,
 but deeper read APIs still use `expect("trie storage")`. A surviving root with a
 missing reachable child can therefore pass startup and panic on a later lookup.
+
+## The fail-open is closed, 2026-08-07
+
+Three read paths turned storage failure into absence, and one of them is the path
+Clarity takes:
+
+- `VersionedMarf::get_active_path` panicked outright on reads of the block being
+  executed — the single hottest read there is.
+- `MarfStore::value_of` printed the error and returned `None`. This is what
+  `ClarityBackingStore::get_data` calls, so a trie that could not be read looked
+  to Clarity exactly like a key the chain never wrote.
+- `MarfStore::get` did the same for sealed reads, and `xtask state-value` with it.
+
+All three carry the error now. `get_data_from_path` already returned `Result` and
+simply propagates. `xtask state-value` has three answers rather than two.
+
+Pinned by `a_read_that_cannot_be_answered_is_an_error_and_not_an_absence`, which
+deletes a sealed block's `marf_node` rows, leaves the tip's record and root intact
+so the store still opens, and reads through the hole.
+
+## What remains, and one of it is a boundary rather than work
+
+**Ten `expect("trie storage")` remain** in `nano-marf`: `tip`, `contains`,
+`leaves`, `pointers_at`, `parent`, `block_at_height` and the `record` they share.
+`leaves` and `pointers_at` are export and probe paths. `tip`, `contains`,
+`parent` and `block_at_height` are not — `block_at_height` is how
+`get-block-info?` resolves a height.
+
+**And converting `block_at_height` runs into clarity's own trait.**
+`ClarityBackingStore::get_block_at_height` returns `Option<StacksBlockId>`, so a
+storage failure underneath it has exactly two exits: panic, or answer `None`. The
+second is the fail-open this task exists to remove, so the panic is the *correct*
+one of the two at that boundary — it stops the block loudly and cannot be
+mistaken for something the chain said. What is still worth doing is carrying the
+typed error up to that boundary so the decision is made there and says so, rather
+than being made in `nano-marf` by an `expect`.
+
+That is a real refactor (`tip` alone has callers everywhere) and it is not the
+dangerous direction, which is closed. Left visible rather than half-done.
