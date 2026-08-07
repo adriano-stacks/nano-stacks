@@ -4731,12 +4731,16 @@ fn report_differentials() -> usize {
     let mut infrastructure = 0usize;
     let mut tools = 0usize;
     for root in roots {
-        for (path, reason) in ignored_tests(&workspace_root().join(root)) {
-            match inventory.get(reason.as_str()).map(String::as_str) {
+        for (path, name, reason) in ignored_tests(&workspace_root().join(root)) {
+            match inventory.get(name.as_str()).map(String::as_str) {
                 Some("infrastructure") => infrastructure += 1,
-                Some("tool") => tools += 1,
-                Some(class) => blocking.push((path, reason, class.to_owned())),
-                None => blocking.push((path, reason, "unclassified".to_owned())),
+                Some("tool" | "out-of-scope") => tools += 1,
+                Some(class) => blocking.push((path, format!("{name}: {reason}"), class.to_owned())),
+                None => blocking.push((
+                    path,
+                    format!("{name}: {reason}"),
+                    "unclassified".to_owned(),
+                )),
             }
         }
     }
@@ -4745,7 +4749,10 @@ fn report_differentials() -> usize {
         "  infrastructure       {infrastructure} (a service, network or fixture this machine \
          does not have; every one names the job that supplies it)"
     );
-    println!("  tools                {tools} (assert no required behaviour)");
+    println!(
+        "  tools / out-of-scope {tools} (assert no required behaviour, or a word epoch 4.0 \
+         removed with nano's own gate named)"
+    );
     if blocking.is_empty() {
         println!("  blocking             0 -- nothing required is waived by being skipped");
         return 0;
@@ -4796,7 +4803,7 @@ fn parse_ignored_inventory(text: &str) -> BTreeMap<String, String> {
         let trimmed = line.trim();
         if trimmed == "[[ignored]]" {
             reason = None;
-        } else if trimmed.starts_with("reason") {
+        } else if trimmed.starts_with("test") {
             reason = value(trimmed);
         } else if trimmed.starts_with("class")
             && let (Some(key), Some(class)) = (reason.take(), value(trimmed))
@@ -4807,8 +4814,8 @@ fn parse_ignored_inventory(text: &str) -> BTreeMap<String, String> {
     found
 }
 
-/// Every `#[ignore]` under `root`, as `(file:line, reason)`.
-fn ignored_tests(root: &Path) -> Vec<(String, String)> {
+/// Every `#[ignore]` under `root`, as `(file:line, test name, reason)`.
+fn ignored_tests(root: &Path) -> Vec<(String, String, String)> {
     let mut found = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
         return found;
@@ -4841,7 +4848,28 @@ fn ignored_tests(root: &Path) -> Vec<(String, String)> {
                 .split_once('"')
                 .and_then(|(_, rest)| rest.rsplit_once('"').map(|(reason, _)| reason.to_owned()))
                 .unwrap_or_else(|| "no reason given".to_owned());
-            found.push((format!("{shown}:{}", line + 1), reason));
+            // Keyed by the test's own name, not by its reason. Twelve sites share
+            // the wording "test system needs to be improved relative to versioning
+            // and epochs", and they are not one thing: some are words epoch 4.0
+            // removed and some are `asserts!` and `as-contract`, which it very much
+            // has. One key for both would classify the second by the first.
+            // The first declaration below the attribute, whatever else sits
+            // between them: `#[ignore]` may come before `#[test]`, and the
+            // declaration may be `async fn`, `pub fn` or a `proptest!` body's
+            // plain `fn`. Anything else in between is another attribute.
+            let name = source
+                .lines()
+                .skip(line + 1)
+                .take(8)
+                .find_map(|next| {
+                    let next = next.trim_start();
+                    let rest = ["fn ", "async fn ", "pub fn ", "pub async fn "]
+                        .into_iter()
+                        .find_map(|prefix| next.strip_prefix(prefix))?;
+                    Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest).to_owned())
+                })
+                .unwrap_or_else(|| format!("{shown}:{}", line + 1));
+            found.push((format!("{shown}:{}", line + 1), name, reason));
         }
     }
     found

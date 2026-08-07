@@ -29,7 +29,7 @@ tests may not be waived.
 - [x] Give every entry an explicit class, owner task, required environment and
       release policy. Do not infer semantic versus infrastructure from substrings
       such as `needs to be implemented`.
-- [ ] Remove every ignored semantic, cost, receipt, state, consensus and
+- [~] Remove every ignored semantic, cost, receipt, state, consensus and
       interoperability differential; a known unequal answer must remain a failing
       test until fixed, not two accepted expectations.
 - [ ] Run infrastructure-only tests in named CI/release jobs with their fixtures or
@@ -37,7 +37,7 @@ tests may not be waived.
       never a green test count.
 - [x] Add a source-level gate that rejects a new ignore or conditional skip unless
       it is added to the inventory with an open owner task and explicit policy.
-- [ ] Reconcile the current ignored Hacknet, hosted-signer, miner, sync, Clarity
+- [x] Reconcile the current ignored Hacknet, hosted-signer, miner, sync, Clarity
       cost and block-info tests; record which ordinary CI job and which release job
       exercises each one.
 - [x] Make the release report consume the inventory and fail when any required
@@ -115,3 +115,47 @@ later test inherit a waiver silently.
 - The release report exits non-zero on a blocking count now: it prints the
   fifteen and then fails whatever else passed, which is how a waived cost
   differential rode along in a green report for as long as it did.
+
+## Classified by running them, not by reading them, 2026-08-07
+
+The inventory is keyed by the **test's own name**, not its reason. Keying by
+reason was the substring rule wearing a different hat: twelve sites share the
+wording *"test system needs to be improved relative to versioning and epochs"*
+and they are not one thing — some are words epoch 4.0 removed, and some are
+`asserts!` and `as-contract`, which epoch 4.0 very much has.
+
+Every entry was classified by running it (`cargo test -p clar2wasm
+--all-features -- --ignored`) and reading what it did. The count went from 15
+guesses to **5 measured semantic differentials**:
+
+| test | measured |
+|---|---|
+| `contract_call_with_epoch_3_3` | `CostContractLoadFailure` on `costs-4`. The cost schedule epoch 4.0 runs under cannot be loaded, so nothing is crosschecked against it. Owner 023. |
+| `asserts_false` | `(asserts! false V)` raises `EarlyReturn(AssertionFailed(V))` where the test expects `UnwrapFailed(V)`, **and** the thrown value's list type comes back with `max_len` equal to the data's actual length against a declared 22. Both are consensus-visible: the thrown value lands in a receipt and its type signature decides how it serialises. |
+| `asserts_with_begin_false` | The same shape inside a `begin`. |
+| `as_contract_can_return_any_value` | `(as-contract V)` over every value shape, uncrosschecked. `as-contract` has produced two consensus bugs already — 081's restore prologue and the sender leak at 8,668,161. |
+| `get_tenure_info_block_reward` | `(get-tenure-info? block-reward u0)` answers `none` against an expected `(some u0)`. The harness cannot simulate a block reward, and nano's own suite does not cover `block-reward` either, so a live epoch-4.0 Clarity read has no crosscheck anywhere. |
+
+Eleven are `out-of-scope`, and that is measured too rather than assumed: each
+fails with `use of unresolved function` in **both** engines, because the harness
+runs at epoch 4.0 / Clarity 6 where `at-block` and `get-block-info?` no longer
+exist. A contract using one fails analysis in both engines on a 4.0 chain, so
+nothing there can reach a receipt, and what 4.0 *does* do with `at-block` in an
+older contract is nano's own unconditional `at_block_refusal` gate. The two
+engines' error *envelopes* differ around the identical diagnostic; recorded as a
+real difference, not blocking, and not hidden.
+
+Eighteen are `infrastructure`, every one naming the job that supplies it, and
+three of them are the stock-signer and stock-client journeys 053 requires by name.
+
+`asserts_false` is a find rather than a reclassification: it had been sitting
+behind a reason string that says the test system needs improving, and the test
+system is not what is wrong with it.
+
+## What is still open
+
+- The five semantic entries have to reach zero. Owners 023 and 060.
+- `skip_gate` is not inventoried by call site yet. `NANO_REQUIRE_MAINNET` already
+  turns every skip into a failure, so a release run cannot report green on gates
+  that did not run; what it lacks is the per-site ownership the `#[ignore]` sites
+  now have.

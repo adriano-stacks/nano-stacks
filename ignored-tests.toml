@@ -6,105 +6,286 @@
 # costs needs to be implemented" as an environment problem. A reason string is
 # prose; it is not a policy. This file is the policy, and the report reads it.
 #
-# Keyed by the exact reason text. An `#[ignore]` whose reason is not listed here
-# is `unclassified`, which the release report treats the same as `semantic`: a
-# failed gate. That is the source-level gate task 085 asks for -- a new ignore
-# cannot be added without appearing here with an owner.
+# **Keyed by the test's own name, not by its reason.** Twelve sites share the
+# wording "test system needs to be improved relative to versioning and epochs" and
+# they are not one thing: some are words epoch 4.0 removed, and some are
+# `asserts!` and `as-contract`, which epoch 4.0 very much has. One key for both
+# would have classified the second by the first, which is the same mistake as the
+# substring rule wearing a different hat.
+#
+# A test not listed here is `unclassified`, which the release report treats the
+# same as `semantic`: a failed gate. That is the source-level gate task 085 asks
+# for -- a new ignore cannot be added without appearing here with an owner.
 #
 # class:
 #   infrastructure  a required behaviour that needs a service, network or fixture
-#                   this machine does not have. Must name the job that supplies it,
+#                   this machine does not have. Names the job that supplies it,
 #                   and that job must have run before task 053 can pass.
+#   out-of-scope    the behaviour does not exist in epoch 4.0, and nano's own gate
+#                   for what 4.0 *does* do is named. Not blocking.
 #   semantic        a disagreement about what Clarity means, or any consensus,
 #                   cost, receipt or state differential. A failed release gate now.
-#   tool            a developer aid that asserts no required behaviour. Owned and
-#                   listed, but nothing has to run it.
-#   unclassified    nobody has decided yet. Treated as `semantic` on purpose, so
-#                   the undecided case cannot be the quiet one.
+#   tool            a developer aid that asserts no required behaviour.
+#   unclassified    nobody has decided. Treated as `semantic` on purpose, so the
+#                   undecided case cannot be the quiet one.
+#
+# Every entry below was classified by *running* the ignored test and reading what
+# it actually did, 2026-08-07 (`cargo test -p clar2wasm --all-features -- --ignored`).
+# None of it is inferred from the reason text.
+
+# ---------------------------------------------------------------------------
+# semantic: live epoch-4.0 behaviour, measured to differ or to be uncovered.
+# ---------------------------------------------------------------------------
 
 [[ignored]]
-reason = "Clarity 4 costs needs to be implemented"
+test = "contract_call_with_epoch_3_3"
 class = "semantic"
 owner = "023"
-note = """
-The one this task was opened over. `clar2wasm`'s own cost suite skips Clarity 4,
-which is the cost schedule epoch 4.0 runs under -- a cost decides block admission
-even where the state root matches, so this is a differential and not a chore.
+measured = """
+`Failed to load intended Clarity cost contract, contract: ...costs-4` --
+`CostContractLoadFailure`. The cost schedule epoch 4.0 runs under cannot be
+loaded at all, so no snippet's cost is crosschecked against it. A cost decides
+block admission even where the state root matches. This is the entry that opened
+task 085: its reason contains `needs to be implemented`, which the old substring
+rule read as an environment problem.
 """
 
 [[ignored]]
-reason = "test system needs to be improved relative to versioning and epochs"
-class = "unclassified"
+test = "asserts_false"
+class = "semantic"
 owner = "060"
-note = """
-Twelve sites in the vendored compiler's own suite. The reason describes the
-harness rather than the answer, so it may be hiding nothing or may be hiding a
-per-epoch differential; nobody has looked. Unclassified rather than assumed
-benign, which is what the substring rule did.
+measured = """
+`(asserts! false V)` for arbitrary V. The engine raises
+`EarlyReturn(AssertionFailed(V))` where the test expects
+`EarlyReturn(UnwrapFailed(V))`, and the thrown value's list type comes back with
+`max_len` equal to the data's actual length where the expectation carries the
+declared one (8, 9, 10 against 22). Both are consensus-visible: the thrown value
+lands in a receipt and its type signature decides how it serialises. `asserts!`
+is not a word epoch 4.0 removed.
 """
 
 [[ignored]]
-reason = "block-reward is not simulated in the test framework"
-class = "unclassified"
+test = "asserts_with_begin_false"
+class = "semantic"
 owner = "060"
-note = """
-Two sites. Same reasoning: a test framework that cannot pay a block reward is an
-infrastructure statement, but what the skipped assertions cover has not been
-checked against nano's own coinbase and maturity gates.
+measured = "The same shape inside a `begin`. Fails with `asserts_false`."
+
+[[ignored]]
+test = "as_contract_can_return_any_value"
+class = "semantic"
+owner = "060"
+measured = """
+`(as-contract V)` for arbitrary V, crosschecked. `as-contract` has produced two
+consensus bugs already -- task 081's restore prologue and the sender leak at
+mainnet block 8,668,161 -- so a property test over every value shape is not one
+to leave off.
 """
 
 [[ignored]]
-reason = "requires a running Hacknet node on localhost"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "get_tenure_info_block_reward"
+class = "semantic"
+owner = "060"
+measured = """
+`(get-tenure-info? block-reward u0)` answers `none` where the test expects
+`(some u0)`, because the harness does not simulate a block reward. That is a true
+statement about the harness and it leaves a live epoch-4.0 Clarity read with no
+crosscheck anywhere: nano's own suite does not cover `block-reward` either.
+"""
+
+# ---------------------------------------------------------------------------
+# out-of-scope: the word does not exist in Clarity 6, measured.
+# ---------------------------------------------------------------------------
+#
+# Every one of these fails with `use of unresolved function`, in *both* engines,
+# because the harness runs at epoch 4.0 / Clarity 6 where the word was removed --
+# it says so itself: "Provided epoch (4.0) and Clarity version (Clarity 1) do not
+# match. Defaulting to epoch (4.0) and Clarity version (Clarity 6)". A contract
+# using one of these fails analysis in both engines on a 4.0 chain, so nothing
+# here can reach a receipt. What epoch 4.0 *does* do with `at-block` in a contract
+# deployed under an older epoch is nano's own gate,
+# `nano-conformance`'s `at_block_refusal`, which runs unconditionally.
+#
+# The two engines' error envelopes differ (`Compilation failure Generic { .. }`
+# against `StaticCheckError { UnknownFunction }`) around the identical diagnostic.
+# Recorded because it is a real difference; not blocking because it is an analysis
+# refusal of a word 4.0 does not have, and both engines refuse.
 
 [[ignored]]
-reason = "requires a running Hacknet node and Bitcoin Core on localhost"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "at_block_needs_cleanup"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "requires a running Hacknet node and NANO_SIGNER_PUBLIC_KEY"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "at_block_needs_cleanup_top_level"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "requires a running Hacknet node and NANO_MINER_BLOCK_ID"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "at_block_less_than_two_args"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "requires a local Hacknet node on port 20443"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "at_block_more_than_two_args"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "requires a Hacknet network with one participant's signer hosted on nano"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
-note = "The stock-signer and stock-client journeys task 053 requires by name."
+test = "at_block_var"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "requires a Hacknet network with one participant replaced by nano"
-class = "infrastructure"
-owner = "053"
-job = "hacknet"
+test = "crosscheck_at_block"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
 
 [[ignored]]
-reason = "reads mempool.space"
+test = "crosscheck_at_block_no_leak"
+class = "out-of-scope"
+owner = "066"
+covered_by = "nano-conformance at_block_refusal"
+
+[[ignored]]
+test = "get_block_info_block_reward"
+class = "out-of-scope"
+owner = "066"
+measured = """
+`use of unresolved function 'get-block-info?'`. Clarity 6 replaced it with
+`get-stacks-block-info?` and `get-tenure-info?`. The `block-reward` field itself
+is still live and is covered by `get_tenure_info_block_reward` above, which is
+classified `semantic`.
+"""
+
+[[ignored]]
+test = "crossprop_blockinfo_within_controlled_range"
+class = "out-of-scope"
+owner = "066"
+measured = "`use of unresolved function 'get-block-info?'`, in both engines."
+
+[[ignored]]
+test = "a_contract_of_trait_calls_compiles_at_size"
+class = "tool"
+owner = "060"
+measured = "A search over generated programs. It asserts no required behaviour."
+
+# ---------------------------------------------------------------------------
+# infrastructure: a service or network this machine does not have.
+# ---------------------------------------------------------------------------
+
+[[ignored]]
+test = "reads_a_mainnet_burn_block"
 class = "infrastructure"
 owner = "053"
 job = "network"
-note = "Reaches a public Esplora, so it is not run in an offline suite."
 
 [[ignored]]
-reason = "a search, run when hunting the generator bug"
-class = "tool"
-owner = "060"
-note = "A developer search over generated programs. It asserts no required behaviour."
+test = "a_stock_signer_answers_proposals_through_nano"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+note = "One of the stock-signer journeys task 053 requires by name."
+
+[[ignored]]
+test = "a_transaction_posted_to_nano_is_admitted_and_reported"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+note = "The stock-client journey task 053 requires by name."
+
+[[ignored]]
+test = "an_observer_on_nano_is_told_what_stacks_core_tells_its_own"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_keeps_working_with_a_nano_participant"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "serves_a_validated_hacknet_block"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_accepts_a_nano_mined_block"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_accepts_a_nano_signature_in_a_block"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_commitment_matches_the_stock_miners"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_follower_retains_an_authenticated_tenure"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_follower_spans_prepare_phase_and_reward_cycle_rollover"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+note = "The ≥2 reward cycles including prepare/rollover that task 053 requires."
+
+[[ignored]]
+test = "hacknet_miners_stackerdb_is_readable"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_pox_calendar_is_available"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_sortition_authenticates_the_current_tenure"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_sortition_hash_verifies_the_winning_vrf_proof"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_tenure_downloads_and_links"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_tip_block_downloads_and_validates"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
+
+[[ignored]]
+test = "hacknet_total_burn_continues_the_parent_tenure"
+class = "infrastructure"
+owner = "053"
+job = "hacknet"
