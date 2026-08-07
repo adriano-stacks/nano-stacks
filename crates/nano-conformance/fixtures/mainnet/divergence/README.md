@@ -102,3 +102,11 @@ cargo xtask state-value /home/aldur/mainnet-restored tip \
 `supply-collateral-add` can be read for what it actually does with the trait and the
 price payload, and cut down from there. Two shape guesses have now failed, which is
 the signal to stop guessing.
+
+**Tried, and it did not resolve:** `state-value` against the sealed tip
+(`cf8bd32e…`) with that key answers `no value`. The key form is right — it is what
+`mainnet_checkpoint.rs` reads contracts through — so either the deepest seal is not
+the block to ask (it is a *seal*, and after `tasks/mainnet/079` the deepest one is not
+necessarily the deepest *committed* block), or a contract's source is metadata in the
+side store rather than a trie leaf and `state-value` does not reach it. Worth ten
+minutes with `MarfStore`'s metadata path before assuming the former.
