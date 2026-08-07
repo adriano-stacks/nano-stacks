@@ -82,7 +82,16 @@ pub enum ConsensusError {
     /// The tenure change was not signed by the miner that signed the block.
     TenureChangeMinerKey,
     /// The block was not signed by the miner that won its sortition.
-    MinerIsNotTheSortitionWinner,
+    ///
+    /// Both hashes are carried because the bare sentence cannot be acted on: which
+    /// of the two is wrong is the whole question, and answering it from a running
+    /// node otherwise means deriving the sortition again by hand.
+    MinerIsNotTheSortitionWinner {
+        /// What the winning leader key was registered with, as this node has it.
+        registered: Hash160,
+        /// What the header's own miner signature recovers to.
+        signed: Hash160,
+    },
     /// More `problematic_txs` markers than a block could hold transactions.
     ProblematicMarkerCount(usize),
     /// Markers that repeat or run backwards, so a replay cannot follow them.
@@ -173,8 +182,10 @@ impl std::fmt::Display for ConsensusError {
             }
             Self::TenureChangeMinerKey => formatter
                 .write_str("the tenure change was not signed by the miner that signed the block"),
-            Self::MinerIsNotTheSortitionWinner => formatter.write_str(
-                "the block was not signed by the miner whose leader key won its sortition",
+            Self::MinerIsNotTheSortitionWinner { registered, signed } => write!(
+                formatter,
+                "the block was not signed by the miner whose leader key won its sortition: \
+                 the winning key is registered with {registered}, the header signed by {signed}"
             ),
             Self::ProblematicMarkerCount(markers) => write!(
                 formatter,
@@ -454,10 +465,12 @@ pub fn verify_miner_signature(
     header: &NakamotoBlockHeader,
     signing_key_hash: &[u8; 20],
 ) -> Result<(), ConsensusError> {
-    if recovered_miner_key_hash(header)? == Hash160::from_bytes(*signing_key_hash) {
+    let signed = recovered_miner_key_hash(header)?;
+    let registered = Hash160::from_bytes(*signing_key_hash);
+    if signed == registered {
         Ok(())
     } else {
-        Err(ConsensusError::MinerIsNotTheSortitionWinner)
+        Err(ConsensusError::MinerIsNotTheSortitionWinner { registered, signed })
     }
 }
 

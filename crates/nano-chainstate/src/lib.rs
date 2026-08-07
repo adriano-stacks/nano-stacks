@@ -1703,7 +1703,20 @@ impl ChainState {
             );
             return Ok(());
         };
-        authenticate::verify_miner_signature(&block.header, &signing_key_hash)
+        authenticate::verify_miner_signature(&block.header, &signing_key_hash).inspect_err(
+            |_| {
+                // The two hashes are in the error; this is the third fact needed to
+                // tell *which* of them is wrong — a node that derived the wrong
+                // winner and one whose registry names a stale key produce the same
+                // sentence, and the VRF key the sortition elected separates them.
+                eprintln!(
+                    "the tenure at burn {} was checked against the leader key {}, which is \
+                     the one this node's own burn distribution elected",
+                    context.height,
+                    hex::encode(vrf_public_key)
+                );
+            },
+        )
     }
 
     /// A tenure-start block claims a tenure it says it won, and the VRF rules are
