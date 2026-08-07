@@ -1167,9 +1167,26 @@ impl SnapshotChain {
     /// *bidding* for rather than the one last won.
     #[must_use]
     pub fn effective_winner_seed(&self) -> Option<[u8; 32]> {
+        self.effective_winner_seed_at_or_below(self.tip().bitcoin_height)
+    }
+
+    /// The same, as it stood on a burn block this chain has already passed.
+    ///
+    /// The tip is not always where a chain is *written down*: locating a burn view
+    /// walks ahead of execution and keeps what it derived, so the saved row is the
+    /// burn block execution reached and everything above it is lookahead. Answering
+    /// from the tip there states a seed no sortition at or below that row had won
+    /// yet -- mainnet saved a row calling itself burn 961,448 carrying the seed of
+    /// the commitments in 961,459, and the chain resumed on it sampled 961,449
+    /// against it and named a miner who did not win. The wrong winner's own seed is
+    /// then the newest one, so every later save rewrote the same error and no
+    /// restart could shake it.
+    #[must_use]
+    pub fn effective_winner_seed_at_or_below(&self, bitcoin_height: u64) -> Option<[u8; 32]> {
         self.snapshots
             .iter()
             .rev()
+            .skip_while(|snapshot| snapshot.bitcoin_height > bitcoin_height)
             .find_map(|snapshot| snapshot.winner_vrf_seed)
     }
 
@@ -1944,6 +1961,49 @@ mod tests {
         assert_eq!(snapshot.winner_txid, Some(second.txid));
         assert_eq!(snapshot.winner_vrf_seed, Some(second.vrf_seed));
         assert_eq!(engine.commitment_window().len(), 2);
+    }
+
+    /// A chain walked ahead of execution answers for the burn block it is asked
+    /// about, not for the one it has reached.
+    #[test]
+    fn the_effective_seed_below_a_height_is_not_the_lookaheads() {
+        let genesis = SortitionSnapshot::genesis(0, super::BitcoinHeaderHash::from_bytes([0; 32]));
+        let mut engine = SortitionEngine::new(genesis);
+        let mut won = Vec::new();
+        for height in 1..=3 {
+            let candidate = commitment(height, height - 1, 10);
+            let snapshot = engine
+                .append(
+                    &bitcoin_block(u64::from(height), height),
+                    &[candidate.txid],
+                    CommitmentWindowBlock {
+                        commitments: vec![candidate.clone()],
+                        missed_commitments: Vec::new(),
+                        requires_single_commit: false,
+                    },
+                    super::PoxId::initial(),
+                    MINING_COMMITMENT_WINDOW,
+                )
+                .expect("sortition snapshot");
+            assert_eq!(snapshot.bitcoin_height, u64::from(height));
+            won.push(candidate.vrf_seed);
+        }
+        let snapshots = engine.snapshots();
+        assert_eq!(snapshots.effective_winner_seed(), Some(won[2]));
+        assert_eq!(
+            snapshots.effective_winner_seed_at_or_below(1),
+            Some(won[0]),
+            "a row written down at burn 1 states the seed won by burn 1"
+        );
+        assert_eq!(
+            snapshots.effective_winner_seed_at_or_below(2),
+            Some(won[1])
+        );
+        assert_eq!(
+            snapshots.effective_winner_seed_at_or_below(0),
+            None,
+            "nothing had won yet, which is an absent seed and not the tip's"
+        );
     }
 
     #[test]

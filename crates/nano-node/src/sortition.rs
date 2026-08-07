@@ -979,11 +979,19 @@ impl SortitionTracker {
             total_burn: tip.total_burn.to_string(),
             sortition: Some(i64::from(tip.winner_txid.is_some())),
             winning_block_txid: tip.winner_txid.map(hex::encode),
-            // The one field a resumed chain cannot derive and must not guess.
+            // The one field a resumed chain cannot derive and must not guess -- and
+            // the row is the burn block *execution* reached, so the seed has to be
+            // the one that had been won by then. Taken from the chain's tip, it was
+            // the lookahead's: a row calling itself burn 961,448 carried the seed of
+            // the commitments in 961,459, the resumed chain sampled 961,449 against
+            // it, and the miner it named was not the one the network elected -- so
+            // every block of that tenure was refused for a signature the winning key
+            // could not have made. `None` where nothing at or below the row had won
+            // yet, which the loader refuses and re-derives rather than guesses.
             winner_vrf_seed: self
                 .engine
                 .snapshots()
-                .effective_winner_seed()
+                .effective_winner_seed_at_or_below(tip.bitcoin_height)
                 .map(hex::encode),
             // The other one. Where the tip itself elected somebody this is the tip's
             // own height and the resumed chain would find it anyway; where it did
