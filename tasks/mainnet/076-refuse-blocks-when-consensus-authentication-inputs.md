@@ -37,6 +37,28 @@ check with a warning.
 - [ ] Prove that a block with a self-consistent state root is rejected when any
       authentication input is missing or forged.
 
+## The constraint the first bullet runs into
+
+`check_signer_signatures` does not report-and-accept out of laziness, and a naive
+fail-closed change stops the live mainnet follower on its first block.
+
+Mainnet's **cycle 140 was stacked in pox-4**, before the state nano imports, so the
+block that wrote its `.signers` entries is *below the checkpoint*. A node replaying
+from that checkpoint has nothing to check the set against, and refusing at the block
+would refuse every block of the chain the network is actually on.
+
+So the bullet's own wording is the design — "according to when the missing state is
+discovered". The refusal belongs at **startup**, where the node can ask a different
+question: for the cycles this checkpoint will execute, is a signer set available at
+all? A checkpoint that cannot answer is incomplete and must not begin syncing. Once
+that holds, a missing set *at execution time* is a genuine failure and can be typed
+as one, because startup has already established it should have been there.
+
+Doing it the other way round -- turning the execution-time `Ok(())` into a refusal
+first -- produces a node that refuses mainnet, and the checkpoint that would make it
+correct is a separate piece of work. Order matters here, which is why it is written
+down.
+
 ## Acceptance Criteria
 
 - Every accepted followed block has verified signer weight, miner signature,

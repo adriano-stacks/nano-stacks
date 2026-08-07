@@ -4723,16 +4723,69 @@ fn report_state_engines(directory: &Path) {
     }
 }
 
+/// The scoreboard, and a count of what the replay said while producing it.
+///
+/// Run as a subprocess rather than in-process, for one reason: the fixture replay
+/// writes a diagnostic per tenure -- `carries a coinbase proof this node cannot
+/// check`, `commits a seed this node cannot check` -- and a captured chain has
+/// hundreds of tenures. Those lines used to land in the middle of this report,
+/// between the artifact digest and the six-line table somebody is reading it for.
+///
+/// They are not noise on a *node*, where an unavailable leader-key registration is
+/// a missing checkpoint input, and nothing here silences them there: production is
+/// untouched, and the same message on a node still prints once a tenure. What is
+/// wrong is printing them here, where they are expected -- a capture carries no
+/// registry for keys registered years before it -- and where they bury the decision.
+///
+/// So they are counted by shape and reported as counts. A reader who wants them
+/// runs `cargo xtask scoreboard`.
 fn report_scoreboard() {
     println!("\nscoreboard");
     let manifest_path = fixture_root().join("manifest.toml");
-    match FixtureManifest::load(&manifest_path) {
-        Ok(manifest) => {
-            for line in scoreboard_at(&fixture_root(), manifest).lines() {
-                println!("  {line}");
-            }
-        }
-        Err(error) => println!("  no fixture manifest at {}: {error}", manifest_path.display()),
+    if let Err(error) = FixtureManifest::load(&manifest_path) {
+        println!("  no fixture manifest at {}: {error}", manifest_path.display());
+        return;
+    }
+    let Ok(binary) = env::current_exe() else {
+        println!("  cannot find this binary to run the scoreboard with");
+        return;
+    };
+    let Ok(run) = Command::new(binary).arg("scoreboard").output() else {
+        println!("  the scoreboard could not be run");
+        return;
+    };
+    for line in String::from_utf8_lossy(&run.stdout).lines() {
+        println!("  {line}");
+    }
+    report_replay_diagnostics(&String::from_utf8_lossy(&run.stderr));
+}
+
+/// What the replay said, by shape rather than by line.
+fn report_replay_diagnostics(stderr: &str) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        // Keyed by the phrase that names the condition, so one entry covers every
+        // tenure it happened at rather than one entry per tenure.
+        let shape = if line.contains("carries a coinbase proof this node cannot check") {
+            "tenures whose coinbase proof could not be checked: no leader-key registration"
+        } else if line.contains("commits a seed this node cannot check") {
+            "tenures whose committed seed could not be checked: no parent tenure proof"
+        } else if line.contains("carries a miner signature this node cannot check") {
+            "tenures whose miner signature could not be checked: no registered signing key"
+        } else if line.contains("carries signer signatures this node cannot check") {
+            "tenures whose signer signatures could not be checked: no recorded signer set"
+        } else {
+            "other lines the replay wrote"
+        };
+        *counts.entry(shape).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return;
+    }
+    println!("\n  what the fixture replay reported while producing that table");
+    println!("  (expected of a capture, and *not* silenced on a node -- see tasks/076)");
+    for (shape, count) in counts {
+        println!("    {count:>5}  {shape}");
     }
 }
 

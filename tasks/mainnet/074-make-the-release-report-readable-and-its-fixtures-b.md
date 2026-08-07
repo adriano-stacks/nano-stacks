@@ -1,7 +1,7 @@
 ---
 id: "074"
 title: "Make the release report readable and its fixtures self-describing"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 dependencies: []
