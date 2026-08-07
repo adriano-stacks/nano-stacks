@@ -4712,8 +4712,13 @@ fn report_engines() {
 /// **semantic** one, which is a disagreement about what Clarity means and is a
 /// failed release gate rather than a skipped test.
 ///
-/// A test with a bare `#[ignore]` and no reason counts as semantic: an unexplained
-/// skip is the thing this section exists to make impossible.
+/// The split is read from `ignored-tests.toml` and not guessed from the reason.
+/// It used to be guessed, by looking for substrings — and one of the markers was
+/// `needs to be implemented`, which filed "Clarity 4 costs needs to be
+/// implemented" under *environment*. A reason string is prose; it is not a policy.
+/// A reason the inventory does not list is `unclassified`, which counts against
+/// the release exactly as `semantic` does, so the undecided case cannot be the
+/// quiet one.
 fn report_differentials() {
     println!("\nignored tests");
     let roots = [
@@ -4721,47 +4726,83 @@ fn report_differentials() {
         "vendor/clarity-wasm/clar2wasm/tests",
         "crates",
     ];
-    let mut semantic = Vec::new();
+    let inventory = ignored_inventory();
+    let mut blocking = Vec::new();
     let mut infrastructure = 0usize;
+    let mut tools = 0usize;
     for root in roots {
         for (path, reason) in ignored_tests(&workspace_root().join(root)) {
-            if is_infrastructure(&reason) {
-                infrastructure += 1;
-            } else {
-                semantic.push((path, reason));
+            match inventory.get(reason.as_str()).map(String::as_str) {
+                Some("infrastructure") => infrastructure += 1,
+                Some("tool") => tools += 1,
+                Some(class) => blocking.push((path, reason, class.to_owned())),
+                None => blocking.push((path, reason, "unclassified".to_owned())),
             }
         }
     }
-    semantic.sort();
+    blocking.sort();
     println!(
-        "  infrastructure       {infrastructure} (a running node, a network, or a fixture \
-         nobody has)"
+        "  infrastructure       {infrastructure} (a service, network or fixture this machine \
+         does not have; every one names the job that supplies it)"
     );
-    if semantic.is_empty() {
-        println!("  semantic             0 -- no Clarity differential is waived by being skipped");
+    println!("  tools                {tools} (assert no required behaviour)");
+    if blocking.is_empty() {
+        println!("  blocking             0 -- nothing required is waived by being skipped");
         return;
     }
     println!(
-        "  semantic             {} -- each one is a failed release gate, not a skipped test",
-        semantic.len()
+        "  blocking             {} -- each one is a failed release gate, not a skipped test",
+        blocking.len()
     );
-    for (path, reason) in semantic {
-        println!("    {path}: {reason}");
+    for (path, reason, class) in blocking {
+        println!("    [{class}] {path}: {reason}");
     }
 }
 
-/// Whether an ignore reason is about the environment rather than about Clarity.
-fn is_infrastructure(reason: &str) -> bool {
-    const ENVIRONMENT: [&str; 7] = [
-        "requires a",
-        "requires the",
-        "reads ",
-        "test system needs",
-        "not simulated",
-        "run when hunting",
-        "needs to be implemented",
-    ];
-    ENVIRONMENT.iter().any(|marker| reason.contains(marker))
+/// Where every `#[ignore]` is accounted for, by the exact reason it gives.
+pub const IGNORED_INVENTORY: &str = "ignored-tests.toml";
+
+/// The inventory, as `reason -> class`.
+///
+/// An unreadable or unparsable inventory yields nothing, which classifies every
+/// ignored test as `unclassified` and fails the gate. That is the right direction
+/// to fail in: the file existing is part of what is being asserted.
+fn ignored_inventory() -> BTreeMap<String, String> {
+    let Ok(text) = fs::read_to_string(workspace_root().join(IGNORED_INVENTORY)) else {
+        eprintln!("{IGNORED_INVENTORY} cannot be read, so every ignored test is unclassified");
+        return BTreeMap::new();
+    };
+    parse_ignored_inventory(&text)
+}
+
+/// Read `reason` and `class` out of the inventory's `[[ignored]]` tables.
+///
+/// Hand-parsed rather than pulling a TOML crate into `xtask` for eleven entries of
+/// two flat string fields each. It reads only what it needs and ignores the rest,
+/// which is why `note` may be a multi-line string without this caring.
+fn parse_ignored_inventory(text: &str) -> BTreeMap<String, String> {
+    let mut found = BTreeMap::new();
+    let mut reason: Option<String> = None;
+    let value = |line: &str| -> Option<String> {
+        let (_, rest) = line.split_once('=')?;
+        let rest = rest.trim();
+        // Only single-line quoted scalars: `note` is a `"""` block and is not read.
+        let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+        (!inner.starts_with('"')).then(|| inner.to_owned())
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[ignored]]" {
+            reason = None;
+        } else if trimmed.starts_with("reason") {
+            reason = value(trimmed);
+        } else if trimmed.starts_with("class")
+            && let (Some(key), Some(class)) = (reason.take(), value(trimmed))
+        {
+            found.insert(key, class);
+        }
+    }
+    found
 }
 
 /// Every `#[ignore]` under `root`, as `(file:line, reason)`.

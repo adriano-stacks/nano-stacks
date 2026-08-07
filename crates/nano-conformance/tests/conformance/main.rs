@@ -67,6 +67,7 @@ mod pox_locking;
 mod rejected_blocks;
 mod replication_failover;
 mod release_dependencies;
+mod release_inventory;
 mod restart;
 mod signer_weight_enforcement;
 mod submitted_transaction;
