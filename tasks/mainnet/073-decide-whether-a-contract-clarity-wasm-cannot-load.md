@@ -50,10 +50,16 @@ Two independent pressures push the local count up, and both are nano's:
 
 ## Tasks
 
-- [ ] Measure the boundary rather than assume it: find the smallest contract, in
+- [x] Measure the boundary rather than assume it: find the smallest contract, in
       each shape that produces locals (`let` width, `let` nesting, `match`/`try!`
       bindings, function count × prologue locals), that clar2wasm compiles and
-      wasmtime refuses. Report the count per shape, not one number.
+      wasmtime refuses. Report the count per shape, not one number. **Measured
+      per shape 2026-08-07: composite-copy flood (poc2) ~51,800 → 998;
+      60,000-binding let, one read → 8; 26,000 all-read bindings 52,006 → 8;
+      mainnet sweep max 16,505 (see "Mainnet-state margin"). `match` binds ≤2
+      names and cannot reach the wall; prologue locals are 3/function. No
+      source-level shape reaches the locals limit anymore — the wall moved to
+      function-type arity (see "B2 shipped").**
 - [x] Establish whether stacks-core accepts those same sources — analyzer limits,
       read-length and the deploy cost budget — so the answer distinguishes "the
       network would reject this too" from "the network accepts what nano cannot
@@ -69,19 +75,28 @@ Two independent pressures push the local count up, and both are nano's:
       for functions whose body contains an `as-contract`, and re-measure. This is
       worth doing whatever the answer above is, because it is a cost every mainnet
       contract currently carries.
-- [ ] If a mainnet-valid contract cannot load, fix code generation so it does —
+- [x] If a mainnet-valid contract cannot load, fix code generation so it does —
       no interpreter fallback, no healing path, no per-contract exception. Reuse
       of locals across disjoint scopes is the obvious lever and belongs upstream.
-      **A shipped 2026-08-07 (see findings): the demonstrated witness class is
-      fixed. B (boxing large composites) remains for full generality.**
+      **All three mechanisms shipped 2026-08-07: A (scoped reuse, 0cc14f60), B1
+      (use-based liveness, f0d91c38), B2 (wide-scope spilling, 23196b51). Every
+      measured shape now loads: poc2 (~51,800→998), 60k-let (→8), 26k all-read
+      (52,006→8), all 137,332 compilable mainnet contracts (max 16,505).**
 - [x] Keep the manufactured module-load refusal in `engine_failure.rs` working
       whatever the fix is. A gate exercisable only while a divergence is open
       stops working the moment somebody closes one, and that gate is about the
-      *boundary*, not about this bug. **Gate green on the merged A+G state,
-      unchanged; clar2wasm-side tests pin both halves (poc2@100 loads;
-      60k-binding let still compiles and is refused by the runtime).**
-- [ ] Record the outcome in the release report either way: a measured margin is
-      evidence, "no mainnet block has hit it" is not.
+      *boundary*, not about this bug. **Gate green through three forcing-case
+      migrations: 60k-binding let (pre-A) → 26k all-read bindings (B1) →
+      600-field tuple return (B2, wasmparser's 1,000-result type limit). Each
+      migration's clar2wasm-side test pins the shape still compiles and the
+      runtime still refuses; the positive control pins the interpreter accepts
+      the same source.**
+- [x] Record the outcome in the release report either way: a measured margin is
+      evidence, "no mainnet block has hit it" is not. **Recorded here:
+      "Mainnet-state margin" (max peak 16,505/50,000 over all 137,332
+      compilable mainnet contracts, 3.0× worst-case, ~7× organic, 99.6% under
+      1k) plus per-shape before/after numbers in "A+G shipped", "B1 shipped",
+      "B2 shipped". The gate-time release report should cite these sections.**
 
 ## Findings
 
@@ -376,6 +391,32 @@ deploy-recipe; a bare `AnalysisDatabase::insert_contract` writes metadata the
 read path never finds, since reads key on the contract-hash table). Raw data:
 `/tmp/mainnet_margin.out` (per-contract peaks), extraction
 `/tmp/mainnet_contracts.jsonl`.
+
+## B2 shipped (2026-08-07, merge 23196b51)
+
+Wide-scope spilling landed: a `let` scope wider than 1,000 bindings keeps
+them in the function frame at constant byte offsets (`InnerBindings::Spilled`)
+instead of wasm locals. The 26,000-all-read case — the last reachable
+locals-based refusal — **peaks at 8 live locals (was 52,006) and wasmtime
+loads it**; interpreter and compiler agree. poc2@100 (998) and the 60k-let
+(8) unchanged. Normal contracts peak 6–36. Soundness pinned by the full lib
+suite at the real threshold AND with the threshold forced to 0 (every `let`
+spilled): 1,403/0 each; engine_failure 6/6; clippy clean both crates.
+
+**Locals are no longer a reachable validator limit from source.** Measured
+during B2: `MAX_WASM_FUNCTION_SIZE` (128 KiB) is a dead constant in
+wasmparser (defined, never enforced); memory is not validator-limited. The
+refusal wall now sits at wasmparser's **function-type arity limits**
+(`MAX_WASM_FUNCTION_PARAMS`/`RETURNS = 1,000`, reader-enforced): a 600-field
+tuple return flattens to 1,200 results, and the interpreter deploys that
+source — so the module-load refusal class stays reachable (and
+`engine_failure.rs` now forces it with that shape, 6/6 green) but the same
+family of conformance gap potentially persists there too: a function whose
+flattened parameter or return arity exceeds 1,000 needs its own
+mainnet-validity evaluation and, if valid, an ABI-level fix (composite
+params/returns through memory instead of flattened slots — the host ABI
+constraint recorded in the B inventory). Filed as the follow-up observation
+below; out of this task's locals scope.
 
 ## Evidence that opened this task
 
