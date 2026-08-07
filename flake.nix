@@ -1,7 +1,14 @@
 {
   description = "nano-stacks development shell";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # Pinned to a revision, not to a channel.
+  #
+  # `nixos-unstable` is a moving branch, and `flake.lock` was ignored -- so every
+  # `nix develop` re-resolved it and could hand a different rustc to two runs a day
+  # apart. A release report names the compiler that built the artifact, which is
+  # worth nothing if a clean checkout picks a different one. The lock file is tracked
+  # now and this is the revision it holds.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436";
 
   outputs = { nixpkgs, ... }:
     let

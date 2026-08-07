@@ -1,0 +1,68 @@
+# The gates a change has to pass before anybody reads a release report.
+#
+# Every job here runs offline: no capture, no mainnet state, no docker. That is the
+# whole point of the bounded fixture -- the replay oracle is 340 blocks of
+# stacks-core's own output, checked in, so a divergence is caught by a pull request
+# rather than by a node that has been following mainnet for a day.
+#
+# Nothing here parses a table. `scoreboard` and `release-report` propagate failure
+# through their exit status, which is what task 075 made true; a job that grepped
+# their output for a word would go green the moment the wording changed.
+name: gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One toolchain, from the tracked lock file. A job that resolved `nixos-unstable`
+# would build release evidence with a compiler nobody chose.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: the lock file decides the toolchain, and a run may not rewrite it
+        run: |
+          nix develop --command rustc --version
+          git diff --exit-code flake.lock
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Not enforced yet, and saying so beats a gate nobody can make green. The
+      # workspace has never been `cargo fmt`-clean -- 86 files in `crates/`, 8 in the
+      # vendored compiler -- and reformatting it is a mechanical ninety-file commit
+      # that has to land on a quiet tree, not alongside other work. Task 078 owns it.
+      - name: formatting (reported, not enforced -- see tasks/078)
+        continue-on-error: true
+        run: nix develop --command cargo fmt --all -- --check
+
+      - name: clippy, release profile, every target
+        run: nix develop --command cargo clippy --release --workspace --all-targets
+
+      - name: the bounded fixture replay, as a gate
+        run: nix develop --command cargo xtask scoreboard
+
+      - name: fixture integrity
+        run: nix develop --command cargo xtask validate-fixtures
+
+      - name: the conformance suite
+        run: nix develop --command cargo test --release -p nano-conformance --test conformance
+
+      - name: unit tests
+        run: nix develop --command cargo test --release --workspace
+
+      # Last, because it builds the artifact it describes and is the slowest thing
+      # here. Its own gates re-run some of the above deliberately: the report is the
+      # document 053 decides on, and it has to stand alone.
+      - name: release report
+        run: nix develop --command cargo xtask release-report
