@@ -2126,6 +2126,25 @@ async fn start_deriving_sortitions(
             "this node cannot derive sortitions of its own, and will not execute blocks under              a burn view a peer chose: {error}"
             )
         })?;
+    // A node that executes checks every tenure's coinbase proof and every miner
+    // signature against the leader key that won the sortition, and a leader key is
+    // registered once and named for years afterwards -- tens of thousands of burn
+    // blocks below any window a checkpointed node holds. Without the registry those
+    // two rules cannot run at all, and a rule that never runs looks exactly like one
+    // that always passes.
+    //
+    // The tracker warns and carries on, which is right for a harness walking a
+    // captured window where the registrations are inside it. It is not right for a
+    // node ([[076-refuse-blocks-when-consensus-authentication-inputs]]).
+    if tracker.leader_keys() == 0 {
+        return Err(format!(
+            "this checkpoint carries no leader-key registry, so this node could check no \
+             tenure's coinbase proof and no miner's signature against the key that won the \
+             sortition -- and would accept every tenure without checking either. \
+             `cargo xtask export-leader-keys` writes one into {}",
+            capture.display()
+        ));
+    }
     println!(
         "deriving sortitions locally from burn {} on PoX history {}",
         tracker.tip().bitcoin_height,

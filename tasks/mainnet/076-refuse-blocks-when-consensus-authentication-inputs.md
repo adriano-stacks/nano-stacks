@@ -1,7 +1,7 @@
 ---
 id: "076"
 title: "Refuse blocks when consensus authentication inputs are unavailable"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 type: bug
@@ -27,7 +27,7 @@ check with a warning.
       checked against the imported executed ledger.
 - [ ] Refuse a tenure-start block when its winner VRF key, registered miner
       signing key, coinbase proof or parent-tenure proof is unavailable.
-- [ ] Validate checkpoint completeness before synchronization starts: signer
+- [~] Validate checkpoint completeness before synchronization starts: signer
       sets, executed tenure history, leader-key registry and parent proof must be
       coherent with the attested state.
 - [ ] Remove production tests that expect an unknown leader or signing key to
@@ -58,6 +58,24 @@ Doing it the other way round -- turning the execution-time `Ok(())` into a refus
 first -- produces a node that refuses mainnet, and the checkpoint that would make it
 correct is a separate piece of work. Order matters here, which is why it is written
 down.
+
+## First piece, 2026-08-07: the leader-key registry
+
+`SortitionTracker::resume_or_capture` warned about a checkpoint carrying zero leader
+keys and carried on. That is right for a *harness* walking a captured window, where
+the registrations it needs are inside the window and the tracker picks them up as it
+walks. It is wrong for a node: a leader key is registered once and named for years,
+tens of thousands of burn blocks below any window a checkpointed node holds, so
+without the registry `check_tenure_vrf` and `check_miner_won_the_sortition` cannot run
+at all — and a rule that never runs looks exactly like one that always passes.
+
+So the refusal is in the node's startup path and not in the tracker, which keeps both
+callers honest. Both live configurations carry one already (mainnet 2,477
+registrations, the hacknet rig 3), so this refuses nothing that works today.
+
+Verified by construction rather than by a negative run: the count is the same
+`leader_keys()` the live nodes print on every start. Reaching the refusal for real
+needs a checkpoint import of a 30 GB MARF, which is not a test.
 
 ## Acceptance Criteria
 
