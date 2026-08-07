@@ -93,7 +93,25 @@ pub struct WasmGenerator {
     /// The binding id introduced by each binding-name expression, by the
     /// expression's AST id.
     pub(crate) binding_ids: HashMap<u64, u32>,
+    /// `let` scopes whose bindings spill to the frame, by the scope
+    /// expression's AST id.
+    pub(crate) spilled_scopes: HashSet<u64>,
+    /// Spill-area bytes reserved at each function's entry, by function name
+    /// (`.top-level` for the contract body).
+    spill_sizes: HashMap<String, u32>,
+    /// The frame pointer of the function whose body is being emitted, while
+    /// it has a spill area.
+    pub(crate) frame_pointer: Option<LocalId>,
+    /// Next free byte in the current frame's spill area.
+    pub(crate) spill_cursor: u32,
 }
+
+/// A `let`/`match` scope introducing more than this many bindings keeps its
+/// bindings in the function's frame (one constant-offset memory slot each)
+/// instead of in wasm locals, so that no source the analyzer accepts can
+/// reach the runtime's 50,000-locals-per-function limit through scope width
+/// alone. Far above any scope a normal contract writes, far below the limit.
+const SPILL_SCOPE_THRESHOLD: usize = 1_000;
 
 /// Counts the reads of every lexically introduced binding (`let` and
 /// `match` names) in the contract's expressions, so that code generation
@@ -102,28 +120,47 @@ pub struct WasmGenerator {
 /// exactly once, so a binding's count reaches zero at its last read
 /// whichever order the two visits happen in. Function parameters are not
 /// counted: they stay live for their whole body.
+///
+/// The same walk marks the scopes wide enough to spill
+/// (`SPILL_SCOPE_THRESHOLD`) and sizes each function's spill area, both of
+/// which code generation must know before the function's body is emitted.
 #[derive(Debug, Default)]
 struct BindingUses {
     uses: Vec<u32>,
     ids: HashMap<u64, u32>,
     /// Bindings in scope during the walk, innermost last.
     scopes: HashMap<ClarityName, Vec<u32>>,
+    /// Wide scopes whose bindings spill to the frame, by the scope
+    /// expression's AST id.
+    spilled: HashSet<u64>,
+    /// Spill-area bytes to reserve at each function's entry, by function
+    /// name (`.top-level` for the contract body).
+    spill_sizes: HashMap<String, u32>,
+    /// The function whose body is being walked.
+    current_fn: String,
 }
 
 impl BindingUses {
-    fn compute(expressions: &[SymbolicExpression]) -> Self {
-        let mut uses = Self::default();
+    fn compute(
+        expressions: &[SymbolicExpression],
+        get_ty: impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
+    ) -> Self {
+        let mut uses = Self {
+            current_fn: ".top-level".to_owned(),
+            ..Self::default()
+        };
         for expr in expressions {
-            uses.walk(expr);
+            uses.walk(expr, &get_ty);
         }
         uses
     }
 
-    fn bind(&mut self, name_expr: &SymbolicExpression, name: &ClarityName) {
+    fn bind(&mut self, name_expr: &SymbolicExpression, name: &ClarityName) -> u32 {
         let id = self.uses.len() as u32;
         self.uses.push(0);
         self.ids.insert(name_expr.id, id);
         self.scopes.entry(name.clone()).or_default().push(id);
+        id
     }
 
     fn unbind(&mut self, name: &ClarityName) {
@@ -132,19 +169,28 @@ impl BindingUses {
         }
     }
 
-    fn walk(&mut self, expr: &SymbolicExpression) {
+    fn walk(
+        &mut self,
+        expr: &SymbolicExpression,
+        get_ty: &impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
+    ) {
         match &expr.expr {
             SymbolicExpressionType::Atom(name) => {
                 if let Some(&id) = self.scopes.get(name).and_then(|ids| ids.last()) {
                     self.uses[id as usize] += 1;
                 }
             }
-            SymbolicExpressionType::List(list) => self.walk_list(list),
+            SymbolicExpressionType::List(list) => self.walk_list(expr.id, list, get_ty),
             _ => {}
         }
     }
 
-    fn walk_list(&mut self, list: &[SymbolicExpression]) {
+    fn walk_list(
+        &mut self,
+        expr_id: u64,
+        list: &[SymbolicExpression],
+        get_ty: &impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
+    ) {
         let Some((
             SymbolicExpression {
                 expr: SymbolicExpressionType::Atom(head),
@@ -168,46 +214,79 @@ impl BindingUses {
                     for pair in bindings {
                         if let SymbolicExpressionType::List(pair) = &pair.expr {
                             if let [name_expr, value] = pair.as_slice() {
-                                self.walk(value);
+                                self.walk(value, get_ty);
                                 if let SymbolicExpressionType::Atom(name) = &name_expr.expr {
-                                    self.bind(name_expr, name);
-                                    bound.push(name.clone());
+                                    let id = self.bind(name_expr, name);
+                                    bound.push((name.clone(), id, get_ty(value)));
                                 }
                             }
                         }
                     }
                 }
                 for expr in args.get(1..).unwrap_or(&[]) {
-                    self.walk(expr);
+                    self.walk(expr, get_ty);
                 }
-                for name in bound.iter().rev() {
+                // Counts are final once the body is walked. A wide scope
+                // spills every binding anything reads to the frame.
+                if bound.len() > SPILL_SCOPE_THRESHOLD {
+                    self.spilled.insert(expr_id);
+                    let size: u32 = bound
+                        .iter()
+                        .filter(|(_, id, _)| self.uses[*id as usize] > 0)
+                        .filter_map(|(_, _, ty)| ty.as_ref())
+                        .map(|ty| get_type_size(ty) as u32)
+                        .sum();
+                    *self.spill_sizes.entry(self.current_fn.clone()).or_default() += size;
+                }
+                for (name, _, _) in bound.iter().rev() {
                     self.unbind(name);
                 }
             }
             // `match` binds a name in each arm's body: the success name in
             // the first, and the error name too in a response match.
             "match" if args.len() == 4 || args.len() == 5 => {
-                self.walk(&args[0]);
+                self.walk(&args[0], get_ty);
                 if let SymbolicExpressionType::Atom(name) = &args[1].expr {
                     self.bind(&args[1], name);
-                    self.walk(&args[2]);
+                    self.walk(&args[2], get_ty);
                     self.unbind(name);
                 } else {
-                    self.walk(&args[2]);
+                    self.walk(&args[2], get_ty);
                 }
                 if args.len() == 4 {
-                    self.walk(&args[3]);
+                    self.walk(&args[3], get_ty);
                 } else if let SymbolicExpressionType::Atom(name) = &args[3].expr {
                     self.bind(&args[3], name);
-                    self.walk(&args[4]);
+                    self.walk(&args[4], get_ty);
                     self.unbind(name);
                 } else {
-                    self.walk(&args[4]);
+                    self.walk(&args[4], get_ty);
                 }
+            }
+            // A function body is walked as its own function: spill areas
+            // are per-frame.
+            "define-public" | "define-read-only" | "define-private" => {
+                let outer = match args.first() {
+                    Some(SymbolicExpression {
+                        expr: SymbolicExpressionType::List(signature),
+                        ..
+                    }) => match signature.first() {
+                        Some(SymbolicExpression {
+                            expr: SymbolicExpressionType::Atom(name),
+                            ..
+                        }) => std::mem::replace(&mut self.current_fn, name.as_str().to_owned()),
+                        _ => self.current_fn.clone(),
+                    },
+                    _ => self.current_fn.clone(),
+                };
+                for expr in args {
+                    self.walk(expr, get_ty);
+                }
+                self.current_fn = outer;
             }
             _ => {
                 for expr in list {
-                    self.walk(expr);
+                    self.walk(expr, get_ty);
                 }
             }
         }
@@ -219,15 +298,24 @@ pub(crate) struct Bindings {
     values: HashMap<ClarityName, InnerBindings>,
     depth: u32,
 }
-
 #[derive(Debug, Clone)]
 struct InnerBindings {
-    locals: Vec<LocalId>,
+    storage: BindingStorage,
     ty: TypeSignature,
     /// The binding's id in the use count pre-pass, for `let`/`match`
     /// bindings. Function parameters carry none: they stay live for their
     /// whole body.
     binding: Option<u32>,
+}
+
+/// Where a binding's value lives.
+#[derive(Debug, Clone)]
+pub(crate) enum BindingStorage {
+    Locals(Vec<LocalId>),
+    /// A constant byte offset into the function's frame spill area, used by
+    /// scopes wide enough that one wasm local per leaf would hit the
+    /// runtime's locals limit. The binding declares no wasm locals.
+    Spilled { delta: u32 },
 }
 
 impl Bindings {
@@ -242,10 +330,20 @@ impl Bindings {
         locals: Vec<LocalId>,
         binding: Option<u32>,
     ) {
+        self.insert_spilled(name, ty, BindingStorage::Locals(locals), binding);
+    }
+
+    pub(crate) fn insert_spilled(
+        &mut self,
+        name: ClarityName,
+        ty: TypeSignature,
+        storage: BindingStorage,
+        binding: Option<u32>,
+    ) {
         self.values.insert(
             name,
             InnerBindings {
-                locals,
+                storage,
                 ty,
                 binding,
             },
@@ -271,10 +369,14 @@ impl Bindings {
     pub(crate) fn get_locals_and_type(
         &self,
         name: &ClarityName,
-    ) -> Option<(Vec<LocalId>, TypeSignature, Option<u32>)> {
-        self.values
-            .get(name)
-            .map(|binding| (binding.locals.clone(), binding.ty.clone(), binding.binding))
+    ) -> Option<(BindingStorage, TypeSignature, Option<u32>)> {
+        self.values.get(name).map(|binding| {
+            (
+                binding.storage.clone(),
+                binding.ty.clone(),
+                binding.binding,
+            )
+        })
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -714,6 +816,10 @@ impl WasmGenerator {
             locals_report: Rc::new(RefCell::new(LocalsReport::default())),
             binding_uses: Vec::new(),
             binding_ids: HashMap::new(),
+            spilled_scopes: HashSet::new(),
+            spill_sizes: HashMap::new(),
+            frame_pointer: None,
+            spill_cursor: 0,
             nft_types: HashMap::new(),
             used_traits: HashMap::new(),
             defined_functions: HashSet::new(),
@@ -786,10 +892,13 @@ impl WasmGenerator {
 
         // Count the reads of every `let`/`match` binding, so that code
         // generation can return a binding's locals to the pool at its last
-        // read instead of keeping them to the end of its scope.
-        let binding_uses = BindingUses::compute(&expressions);
+        // read instead of keeping them to the end of its scope, and mark the
+        // scopes wide enough that their bindings spill to the frame.
+        let binding_uses = BindingUses::compute(&expressions, |expr| self.get_expr_type(expr).cloned());
         self.binding_uses = binding_uses.uses;
         self.binding_ids = binding_uses.ids;
+        self.spilled_scopes = binding_uses.spilled;
+        self.spill_sizes = binding_uses.spill_sizes;
 
         // Get the type of the last top-level expression with a return value
         // or default to `None`.
@@ -802,7 +911,24 @@ impl WasmGenerator {
         let mut current_function = FunctionBuilder::new(&mut self.module.types, &[], &return_ty);
 
         if !expressions.is_empty() {
-            self.traverse_statement_list(&mut current_function.func_body(), &expressions)?;
+            let mut body = current_function.func_body();
+
+            // The contract body is a frame of its own: reserve its spill
+            // area below the working stack.
+            let spill_size = self.spill_sizes.get(".top-level").copied().unwrap_or(0);
+            if spill_size > 0 {
+                let frame_pointer = self.module.locals.add(ValType::I32);
+                body.global_get(self.stack_pointer)
+                    .local_set(frame_pointer)
+                    .global_get(self.stack_pointer)
+                    .i32_const(spill_size as i32)
+                    .binop(BinaryOp::I32Add)
+                    .global_set(self.stack_pointer);
+                self.frame_pointer = Some(frame_pointer);
+                self.frame_size += spill_size as i32;
+            }
+
+            self.traverse_statement_list(&mut body, &expressions)?;
         }
 
         // Defined functions save and restore the live-local counts around
@@ -919,9 +1045,26 @@ impl WasmGenerator {
                 "callable reference must be an atom".to_owned(),
             ));
         };
-        let (values, _, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+        let (storage, ty, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
+        let values = match storage {
+            BindingStorage::Locals(values) => values,
+            BindingStorage::Spilled { delta } => {
+                let frame_pointer = self.frame_pointer.ok_or_else(|| {
+                    GeneratorError::InternalError(
+                        "spilled binding read outside of its frame".to_owned(),
+                    )
+                })?;
+                self.read_from_memory(builder, frame_pointer, delta, &ty)?;
+                let values = self.save_to_locals(builder, &ty, true);
+                for value in &values {
+                    builder.local_get(*value);
+                }
+                self.release_locals(values);
+                return Ok(());
+            }
+        };
         for value in &values {
             builder.local_get(*value);
         }
@@ -1151,6 +1294,23 @@ impl WasmGenerator {
             .global_get(self.stack_pointer)
             .local_set(frame_pointer);
 
+        // Reserve the spill area wide `let` scopes keep their bindings in,
+        // below the working frame, and make it visible to the body. The
+        // enclosing frame's spill state is saved and restored around the
+        // body, so a spilled scope in it keeps its offsets.
+        let saved_frame = self.frame_pointer.take();
+        let saved_cursor = std::mem::replace(&mut self.spill_cursor, 0);
+        let spill_size = self.spill_sizes.get(name.as_str()).copied().unwrap_or(0);
+        if spill_size > 0 {
+            func_body
+                .global_get(self.stack_pointer)
+                .i32_const(spill_size as i32)
+                .binop(BinaryOp::I32Add)
+                .global_set(self.stack_pointer);
+            self.frame_size += spill_size as i32;
+            self.frame_pointer = Some(frame_pointer);
+        }
+
         // Entering the function type-checks every argument it was given.
         self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
         for (parameter_type, value_type, locals) in &parameters {
@@ -1249,6 +1409,10 @@ impl WasmGenerator {
 
         // Restore the top-level locals map.
         self.bindings = top_level_locals;
+
+        // And the enclosing frame's spill state.
+        self.frame_pointer = saved_frame;
+        self.spill_cursor = saved_cursor;
 
         // Reset the return type and early block to None
         self.current_function_type = None;
@@ -2554,9 +2718,26 @@ impl WasmGenerator {
         }
 
         // Handle parameters and local bindings
-        let (values, ty, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
+        let (storage, ty, binding) = self.bindings.get_locals_and_type(atom).ok_or_else(|| {
             GeneratorError::InternalError(format!("unable to find local for {}", atom.as_str()))
         })?;
+
+        // A spilled binding lives in the frame rather than in locals: read
+        // it onto the stack and into pooled temporaries, so that every read
+        // path below is unchanged. The temporaries are released before
+        // returning; the binding itself has no locals to free.
+        let (values, spill_temps) = match storage {
+            BindingStorage::Locals(values) => (values, false),
+            BindingStorage::Spilled { delta } => {
+                let frame_pointer = self.frame_pointer.ok_or_else(|| {
+                    GeneratorError::InternalError(
+                        "spilled binding read outside of its frame".to_owned(),
+                    )
+                })?;
+                self.read_from_memory(builder, frame_pointer, delta, &ty)?;
+                (self.save_to_locals(builder, &ty, true), true)
+            }
+        };
 
         // A `let` stores a binding laid out for the type its *value* analysed
         // as, and `{ t: target, r: none }` analyses `none` as `(optional
@@ -2592,7 +2773,11 @@ impl WasmGenerator {
                     }
                 }
                 self.charge_variable_lookup(builder, self.bindings.depth())?;
-                self.note_binding_read(binding, &values);
+                if spill_temps {
+                    self.release_locals(values);
+                } else {
+                    self.note_binding_read(binding, &values);
+                }
                 return Ok(());
             }
         }
@@ -2610,7 +2795,11 @@ impl WasmGenerator {
         // The gets above are this read of the binding (the copy charge
         // re-saves from the stack into its own slots); at the binding's
         // last read its slots return to the pool.
-        self.note_binding_read(binding, &values);
+        if spill_temps {
+            self.release_locals(values);
+        } else {
+            self.note_binding_read(binding, &values);
+        }
         Ok(())
     }
 
@@ -3037,7 +3226,7 @@ mod tests {
     // Tests that don't relate to specific words
     use crate::{
         compile,
-        tools::{crosscheck, evaluate},
+        tools::{crosscheck, crosscheck_compare_only, evaluate},
         wasm_generator::END_OF_STANDARD_DATA,
     };
 
@@ -3169,8 +3358,9 @@ mod tests {
         // 60,000 bindings of which only `a0` is read: the unused bindings are
         // dropped instead of saved, so the emitted module is small and
         // wasmtime loads it. nano-conformance's `engine_failure.rs` used to
-        // force a module-load refusal with this shape; it now uses a `let`
-        // whose bindings are all read (see the next test).
+        // force a module-load refusal with this shape; it now uses a return
+        // value wider than wasmtime's function-type limit (see
+        // `more_wasm_returns_than_wasmtime_allows_still_refuses_at_load`).
         let bindings = (0..60_000_u32)
             .map(|index| format!("(a{index} u1)"))
             .collect::<Vec<_>>()
@@ -3204,12 +3394,11 @@ mod tests {
     }
 
     #[test]
-    fn all_bindings_read_at_once_still_refuses_at_load() {
-        // The refusal class must stay reachable: every binding is read by the
-        // final `list`, so all of them are live at its construction point and
-        // no liveness pass can free them. 26,000 `uint` bindings are 52,000
-        // locals — past wasmtime's hardcoded 50,000-per-function limit. The
-        // compiler must not refuse; the runtime must.
+    fn all_bindings_read_at_once_stays_loadable() {
+        // Every binding is read by the final `list`, so all 26,000 are live
+        // at its construction point and no liveness pass can free them. A
+        // scope this wide spills its bindings to the frame: the function
+        // declares no locals for them, and wasmtime loads the module.
         let bindings = (0..26_000_u32)
             .map(|index| format!("(a{index} u1)"))
             .collect::<Vec<_>>()
@@ -3219,6 +3408,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let snippet = format!("(define-public (f) (ok (let ({bindings}) (list {uses}))))");
+
+        // The interpreter and the compiler agree on the result.
+        crosscheck_compare_only(&snippet);
+
         let mut compiled = compile(
             &snippet,
             &QualifiedContractIdentifier::new(
@@ -3233,24 +3426,58 @@ mod tests {
         )
         .expect("a let whose bindings are all read still compiles");
 
-        // The measurement sees the peak the runtime will refuse at load.
+        // The bindings live in the frame, so the measured peak is far under
+        // wasmtime's limit (52,006 live locals before spilling)...
         let peak = compiled.locals_report.max_live_locals["f"];
         assert!(
-            peak > 50_000,
-            "26,000 bindings read at once should measure past wasmtime's limit, got {peak}"
+            peak < 50_000,
+            "26,000 spilled bindings should measure well under the limit, got {peak}"
         );
+
+        // ...and the runtime accepts the module.
+        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+            .expect("wasmtime loads the module");
+    }
+
+    #[test]
+    fn more_wasm_returns_than_wasmtime_allows_still_refuses_at_load() {
+        // The module-load refusal class must stay reachable. Locals no
+        // longer reach it — spilling moves wide scopes to the frame — but
+        // wasmparser also refuses a function *type* with more than 1,000
+        // results, and a return value flattens to one wasm result per leaf
+        // value: one 600-field tuple is 1,200. The compiler must not refuse;
+        // the runtime must.
+        let fields = (0..600_u32)
+            .map(|index| format!("f{index}: 1"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let snippet = format!("(define-public (f) (ok {{{fields}}}))");
+        let mut compiled = compile(
+            &snippet,
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::from_literal("wide-return"),
+            ),
+            LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+            &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+            true,
+        )
+        .expect("a function returning a wide tuple still compiles");
 
         let err = wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
             .expect_err("wasmtime refuses the module");
         let err = format!("{err:?}");
         assert!(
-            err.contains("too many locals"),
-            "expected a too-many-locals refusal, got {err}"
+            err.contains("function returns"),
+            "expected a function-returns refusal, got {err}"
         );
     }
 
     #[test]
-    fn end_of_standard_data_is_correct() {        const STANDARD_LIB_PATH: &str =
+    fn end_of_standard_data_is_correct() {
+        const STANDARD_LIB_PATH: &str =
             concat!(env!("CARGO_MANIFEST_DIR"), "/src/standard/standard.wasm");
         let standard_lib_wasm = std::fs::read(STANDARD_LIB_PATH).expect("Failed to read WASM file");
         let module = Module::from_buffer(&standard_lib_wasm).unwrap();
@@ -3273,7 +3500,9 @@ mod tests {
             StacksEpochId::latest(),
         )
         .expect("test source parses");
-        super::BindingUses::compute(&ast.expressions).uses
+        // A parsed-but-not-analyzed AST has no types; use counts and spill
+        // marks do not need them.
+        super::BindingUses::compute(&ast.expressions, |_| None).uses
     }
 
     #[test]
@@ -3484,3 +3713,4 @@ mod tests {
         }
     }
 }
+
