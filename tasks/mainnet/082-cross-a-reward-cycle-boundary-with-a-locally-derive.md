@@ -59,6 +59,31 @@ gates both sit on the far side of this.
 - [ ] Cross a boundary on mainnet with the derived chain and compare the resulting
       consensus hashes against a stock node's for the whole cycle after it.
 
+## The shape of the fix, measured rather than guessed
+
+The mechanism already exists: `PoxId::extend_with_anchor(present: bool)`
+(`nano-sortition`). Nothing needs inventing to *carry* the bit — what is missing is
+the caller that decides it, and the tracker is the wrong place to decide it from
+because it holds no chain state.
+
+So the decision belongs to the executor, which has both: it derives the cycle's
+reward set at the prepare phase (`signers::update_signer_set`, and
+`ChainState::recorded_signer_set` reads one back), and it owns the tracker. The
+executor tells the tracker the bit as the boundary is reached, and `advance` takes it
+instead of refusing.
+
+Two things to establish before writing it, and neither is a guess to make blind:
+
+- **What "selected an anchor" means in epoch 4.0.** Every history observed so far is
+  all ones — mainnet's is 142 bits of `1`, hacknet's 21 — so the bit has never been
+  zero on a chain nano has seen. That is a reason to be careful rather than a licence
+  to hardcode `true`: a cycle with no reward set is exactly the case the plan calls
+  fatal, and the two must not be conflated.
+- **When it is known.** stacks-core decides at the prepare phase, so the answer has
+  to be in hand *before* the first sortition of the new cycle is derived — not at the
+  boundary block itself, which is already too late for the consensus hash that mixes
+  it.
+
 ## Acceptance Criteria
 
 - A locally derived chain crosses a reward cycle boundary and derives the same
