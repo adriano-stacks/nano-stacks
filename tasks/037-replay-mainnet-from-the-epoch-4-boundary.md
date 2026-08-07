@@ -145,6 +145,20 @@ never from fetched, staged or peer-reported height.
       alone, or seed a resumed chain at the burn view the *executed* tip needs. Until
       then this state cannot advance, and the frontier stands at **8,716,974**.
 
+      **Three, and the third is a consensus defect the other two hid.** 8,716,986 also
+      diverges on a *receipt*, which no MARF version can explain:
+      `af3e472f…b372e6` is `success` on chain and
+      `RuntimeFailure(Runtime(DivisionByZero))` in nano. Replaying that transaction
+      against a reflinked copy of the live state reproduces it away from the node,
+      bisects to [[073]]'s B1 (`d3731c10` clean, `23196b51` diverging) and is fixed by
+      generating an `if`'s condition before its branches -- the release of a binding's
+      locals at its last read was firing at the condition, which *runs* first and was
+      *generated* last. Both engines now return the chain's own answer. Recorded in
+      full under [[073-decide-whether-a-contract-clarity-wasm-cannot-load]]; the
+      operational clobber above is real and separate, and the run that produced it was
+      executing a binary with this defect in it, so "zero root mismatches after the
+      rewind" was measured over blocks below 8,716,986 and does not clear it.
+
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.

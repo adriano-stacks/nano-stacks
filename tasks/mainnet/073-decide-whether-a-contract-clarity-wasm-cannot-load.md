@@ -352,6 +352,41 @@ module-load refusal class stays reachable via 26,000 all-read bindings (peak
 that shape and stays 6/6 green. Validated independently: clar2wasm lib suite
 1,402/0, gate 6/6, clippy clean both crates.
 
+### B1 diverged on mainnet, and the fix is generation order (2026-08-07)
+
+B1's soundness argument — "code generation traverses each expression exactly
+once, so a binding's count reaches zero at its last read" — held for counting
+and failed for **order**. `If::traverse` generated both branches *before* the
+condition, so the condition's read, which runs first, looked like the last
+one: the slots went back to the pool and the condition's own temporaries took
+them, and the branch that had not run yet then read whatever was left.
+
+Mainnet block **8,716,986** is that bug, in the only place it shows: a receipt.
+`SM1FKXGNZ…dlmm-liquidity-router-v-1-2::add-liquidity-multi`
+(`af3e472f…b372e6`) is `success` on chain and
+`RuntimeFailure(Runtime(DivisionByZero))` in nano, because
+`dlmm-core-v-1-1.add-liquidity` guards its division with
+`(or (is-eq bin-shares u0) (is-eq bin-liquidity-value u0))` and then divides by
+that same `bin-liquidity-value`. Reduced to eight lines and confirmed against
+the two engines:
+
+```clarity
+(define-read-only (f (x uint)) (let ((d (* u5 u7))) (if (is-eq d u0) u0 (/ x d))))
+(f u70)   ;; interpreter u2, compiler DivisionByZero
+```
+
+Bisected to this commit: the same call replays clean at `d3731c10` and
+diverges at `23196b51`. The condition is generated first now — generation
+order is execution order there — and the transaction returns the chain's own
+150-element list on both engines. Three crosschecks pin the shape
+(`words/conditionals.rs`): a binding read in a condition and a branch, the same
+through `or` with mainnet's values, and one read only in a branch.
+
+An audit of every word that builds an instruction sequence found `If` to be the
+only inversion; the invariant is stated where the release happens, because a
+future word that builds a block before the code preceding it breaks consensus
+silently.
+
 ## Mainnet-state margin (2026-08-07, measured over real state)
 
 Compiled **every contract in the imported mainnet state** (137,340; checkpoint

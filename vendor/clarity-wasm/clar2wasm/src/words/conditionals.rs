@@ -299,13 +299,22 @@ impl ComplexWord for If {
         generator.set_expr_type(true_branch, expr_ty.clone())?;
         generator.set_expr_type(false_branch, expr_ty)?;
 
-        let id_true = generator.block_from_expr(builder, true_branch)?;
-        let id_false = generator.block_from_expr(builder, false_branch)?;
-
+        // The condition is generated first because it *runs* first, and a
+        // binding's locals are freed at its last generated read: branches
+        // generated ahead of the condition made the condition's read look
+        // like the last one, so the slots were reused while a branch that
+        // had not run yet still had to read them. Mainnet block 8,716,986
+        // divided by a bin liquidity value the condition had just tested
+        // against zero, and got `DivisionByZero` where the chain got a
+        // quotient. Generation order is execution order here.
+        //
         // The interpreter reads the condition where it is rather than
         // copying it out of its binding, so a bound name here does not pay
         // to be copied.
         generator.traverse_expr_as_borrowed_value(builder, conditional)?;
+
+        let id_true = generator.block_from_expr(builder, true_branch)?;
+        let id_false = generator.block_from_expr(builder, false_branch)?;
 
         builder.instr(ir::IfElse {
             consequent: id_true,
@@ -1070,6 +1079,51 @@ mod tests {
     #[test]
     fn trivial() {
         crosscheck("true", Ok(Some(Value::Bool(true))));
+    }
+
+    /// A binding read once in the condition and once in a branch. The read in
+    /// the branch runs last, so the slots must still hold the value there.
+    #[test]
+    fn binding_read_in_condition_survives_into_the_branch() {
+        crosscheck(
+            "(define-read-only (f (x uint))
+               (let ((d (* u5 u7)))
+                 (if (is-eq d u0) u0 (/ x d))))
+             (f u70)",
+            Ok(Some(Value::UInt(2))),
+        );
+    }
+
+    /// The same, through `or`: mainnet's `dlmm-core-v-1-1.add-liquidity`
+    /// guards its division with `(or (is-eq shares u0) (is-eq value u0))`
+    /// and then divides by that same `value`.
+    #[test]
+    fn binding_read_in_a_disjunction_survives_into_the_branch() {
+        crosscheck(
+            "(define-read-only (f (x uint))
+               (let ((shares u33619060)
+                     (value (* u14073473 x))
+                     (bin-value (* u14073473 u419249642)))
+                 (if (or (is-eq shares u0) (is-eq bin-value u0))
+                     (sqrti value)
+                     (/ (* value shares) bin-value))))
+             (f u2204130835)",
+            Ok(Some(Value::UInt(176_746_261))),
+        );
+    }
+
+    /// A binding whose only read is in the branch, with the condition
+    /// reading another binding of the same shape: the branch still runs
+    /// after the condition.
+    #[test]
+    fn binding_read_only_in_a_branch_survives_the_condition() {
+        crosscheck(
+            "(define-read-only (f (x uint))
+               (let ((guard (> x u0)) (d (+ x u1)))
+                 (if guard (/ (* d d) d) u0)))
+             (f u41)",
+            Ok(Some(Value::UInt(42))),
+        );
     }
 
     #[test]
