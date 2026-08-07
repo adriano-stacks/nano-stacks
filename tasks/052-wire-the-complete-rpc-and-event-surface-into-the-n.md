@@ -225,11 +225,31 @@ execution.
       perfectly healthy and simply idle. That is exactly the condition a signer waits
       in.
 
-      The fix is for the follower to walk its derived chain toward the burnchain tip
-      every round whether or not it has blocks to execute; a burn block is news to a
-      signer even when no Stacks block stands on it yet. Seeding further back is a
-      workaround and not one: it only defers the same question to the next quiet
-      period.
+      **Fixed.** A round walks toward Bitcoin's tip whether or not it executed
+      anything, bounded by the same limit and quiet when nothing moved. On the rig
+      `/v3/sortitions/latest_and_last` went from `503` to the full pair — burn 392
+      and 391, each naming its winner's key and its predecessor.
+
+      **And the signer moved one step further, onto the same defect a third time.**
+      It now asks for the last block of the parent tenure and gets `404`:
+
+      ```
+      Signer State: Failed to fetch last block in parent tenure from stacks-node,
+        parent_tenure_id: bdb04d52…, err: RequestFailure(404)
+      Failed to initialize local state machine: NoParentTenureInfo(bdb04d52…)
+      ```
+
+      `tenure_tip_metadata` reads `executed().chain` — the peer-derived followed
+      tenures — which is exactly what `tenure_info` did before it was fixed and what
+      the sortition routes did before they were. A node whose followed view is empty,
+      which is every catching-up node and every idle one, cannot answer.
+
+      The fix is the same shape and the archive already holds the answer: it keeps
+      `tenure_start_heights` and resolves a block by height, so a `tenure_tip`
+      lookup beside the `tenure_start` one added for `tenure_info` answers it without
+      walking the tenure's blocks — which matters here, where one tenure has extended
+      for thirteen thousand of them. **That is the next action, and it is the last
+      route standing between the stock signer and watching for proposals.**
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
