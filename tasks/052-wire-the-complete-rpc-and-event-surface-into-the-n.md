@@ -186,6 +186,30 @@ execution.
         and which the executor already carries. That is the next action, and it is a
         route fix rather than a rig fix.
 
+        **Done, and it was a route fix.** The three sortition routes read a derived
+        view published with the executed tip, anchored at the burn view the node has
+        *executed* under rather than at the derived chain's own tip, which runs ahead
+        naming views for staged blocks. Two fields had no source and are now carried
+        off the winning commitment, which already parses both: `committed_block_hash`,
+        and the parent burn height that resolves `stacks_parent_ch` through this
+        node's own consensus-hash history.
+
+        Serving a *peer's* sortition was never only a gap — it would hand a stranger
+        the burn view and through it the fork. So the regression publishes a peer view
+        and a derived one that disagree on every field, and asserts the peer's own
+        burn view comes back `404`.
+
+        Live on mainnet, `/v3/sortitions` answers burn 961,377 and **all twelve
+        fields match what a stock stacks-core node answers** for the same consensus
+        hash, derived from nano's own Bitcoin blocks with nothing taken from that
+        peer. `latest_and_last` returns the pair.
+
+        One thing had to be fixed before any of it could be *seen*: a catch-up round
+        executes up to 500 blocks with no await between them, so the node's whole HTTP
+        surface went dead for minutes at a time — `/v2/info` included, socket holding
+        connections nobody accepted. A node that cannot answer while catching up
+        cannot host a signer, and that is exactly when a signer asks.
+
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
       new ones, so proposals are sparse; a chain still electing miners would produce

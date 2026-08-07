@@ -88,6 +88,37 @@ never from fetched, staged or peer-reported height.
       the resumed chain at the executed tip's burn view and re-walk forward. That is
       the same shape of defect as the one above, one level up, and it is what to do
       next.
+
+      **Advanced to 49,457** (8,665,600 → 8,715,057), still off the durable executed
+      tip and now measured honestly: the scoreboard read `marf.tip()`, the *deepest
+      seal*, which on this very state stood 301 blocks above anything a ledger named.
+      That row now walks down to the deepest committed block, so the earlier numbers
+      here were the right shape and slightly generous.
+
+      Three defects were in the way, all found on the live follower and all fixed:
+
+      * **A round that failed after sealing stalled the node for good.** 766 identical
+        `MARF version already exists` failures in one run at 8,713,221 — every retry
+        re-executed the same block, and each retry re-wrote that block's ledger row
+        *before* failing on the seal, which pruned the 256-block ledger history down
+        to a single row. The state was then unrecoverable: the resume stood on the
+        deepest seal, which no ledger named, so it fell back to `accounting.json` and
+        refused to start on an incomplete maturity window. Resume now stands on the
+        deepest block a ledger names, a re-written ledger keeps its original
+        sequence, and the give-back runs mid-run. Live afterwards: *"gave back 37
+        sealed states above 8,715,051"*, and the next round executed instead of
+        failing.
+      * **The node's HTTP surface went down whenever it was busy.** A round executes
+        up to 500 blocks with no await between them, so one worker ran at 100% for
+        twelve minutes while fifteen idled and the listening socket held seven
+        connections nobody accepted. `yield_now` between blocks; `/v2/info` answers
+        mid-round now.
+      * **A tenure-start block was refused 64 times** at 8,713,289 —
+        `the block was not signed by the miner whose leader key won its sortition` —
+        and then executed without complaint after a restart. Not deterministic, cause
+        unknown, and the message named neither key; it now carries the registered
+        hash, the recovered one and the VRF key the local burn distribution elected,
+        so a recurrence answers itself. **Open.**
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
