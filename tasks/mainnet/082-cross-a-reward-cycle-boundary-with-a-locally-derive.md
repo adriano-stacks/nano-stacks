@@ -110,12 +110,26 @@ So it was reverted rather than left in. A node that crosses a boundary with a wr
 bit derives a wrong consensus hash for every block after it and reports nothing,
 which is worse than the node that stops.
 
-What that leaves for whoever picks this up: `recorded_signer_set` at the opening
-height is either the wrong question or asked at the wrong height — the anchor is
-chosen in the *previous* cycle's prepare phase, so the state to interrogate is the
-one at the prepare phase, not at the boundary. That is the next thing to establish,
-and there is now a mechanism waiting for the answer and a fixture that crosses five
-boundaries to check it against.
+**It was asked at the wrong height, and that is now fixed.**
+`CheckpointExecutor::recorded_signer_set` moves the context to *the executor's own*
+burn height before reading — so it answers "the cycle I am in", and the question here
+is about a cycle ahead of it. Every one of those five zeroes was that override, not
+the rule. The decider asks `ChainState::recorded_signer_set` directly now, at the
+opening height.
+
+**And it fails closed, which is why it is safe to keep.** It decides only when the
+chainstate positively reports a non-empty signer set for that cycle; anything else
+leaves the bit undecided and the chain refuses exactly as before. Re-run against the
+fixture, it decides nothing and stops at burn 379 — the capture's state cannot answer
+`get-signers` for the opening cycle — so the rigs are still red and the node is still
+correct.
+
+What that leaves is **verification**: no state available here can answer, so the rule
+"a recorded signer set means an anchor was selected" is reasoned rather than
+measured. The check that would settle it is a live one — mainnet's `PoxId` is 142
+bits of `1` and the node holds cycle 140's signer set, so asking the decider about
+cycle 140's opening height must answer `true`. That needs a healthy mainnet state,
+which is the other thing outstanding.
 
 ## Acceptance Criteria
 
