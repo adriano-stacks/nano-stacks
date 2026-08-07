@@ -20,6 +20,7 @@ members = [
     "crates/nano-miner",
     "crates/nano-node",
     "crates/nano-rpc",
+    "crates/nano-tui",
     "crates/nano-conformance",
     "xtask",
 ]

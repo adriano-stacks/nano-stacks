@@ -1,0 +1,25 @@
+[package]
+name = "nano-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "nano-tui"
+path = "src/main.rs"
+
+[dependencies]
+# The node's own decoder, so a block shown here is a block read the way the node
+# reads it rather than a second opinion about the same bytes.
+nano-codec = { path = "../nano-codec" }
+nano-chainstate = { path = "../nano-chainstate" }
+nano-primitives = { path = "../nano-primitives" }
+crossterm = "0.29"
+ratatui = "0.29"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = { version = "2.12", default-features = false, features = ["json", "gzip"] }
+
+[lints]
+workspace = true
