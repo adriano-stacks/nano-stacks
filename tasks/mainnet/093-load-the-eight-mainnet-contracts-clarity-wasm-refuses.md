@@ -150,3 +150,42 @@ derived and make a `string-ascii` sequence yield `string-ascii 1`.
 
 Worth checking at the same time: whether `map` over a `string-utf8` has the same
 problem, and whether anything else consumes that element type (`fold`, `filter`).
+
+### Pinned to the line, and `fold` already solved it
+
+`WasmGenerator::get_sequence_element_type` (`wasm_generator.rs:3144`) returns
+`SequenceElementType::Byte` for **both** a buffer and a `string-ascii` — the
+comment there says so: *"For buffer and string-ascii return none, which indicates
+that elements should be read byte-by-byte."* That is fine for reading bytes and
+wrong as a *type*: `Byte.into()` is `(buff 1)`, so `map`'s duck-typing step
+(`sequences.rs:968`, `need_ducktyping(&element_type.into(), fn_arg)`) asks to
+widen `(buff 1)` to the parameter's `(string-ascii 256)` and `duck_type_stack`
+refuses.
+
+`fold` hit this and worked around it. Its `FoldFuncTy` carries the comment
+verbatim:
+
+> Only for a list: `get_sequence_element_type` reports `(buff 1)` for a buffer
+> *and* for a string, so ducking a string's element to the parameter's
+> `(string-ascii n)` is refused as incompatible.
+
+and takes the element type from the folded **function's declared parameter**
+instead. `map` has the same problem and no such workaround, which is the whole of
+this defect.
+
+Two ways out, and they are not equivalent:
+
+- **Local**, mirroring `fold`: at `map`'s site, take each sequence's element type
+  from the corresponding parameter, or from the sequence's own `TypeSignature`
+  rather than from `SequenceElementType`. Smallest diff; leaves the ambiguity in
+  place for the next caller to trip over.
+- **At the source**: split `SequenceElementType::Byte` into a buffer byte and an
+  ASCII byte so the conversion to `TypeSignature` cannot lose which it is. Bigger
+  diff, and it retires the trap — `fold`'s workaround could then go too.
+
+The second is the one to do, and it wants a session with room to check every
+`SequenceElementType` consumer rather than the tail of one. Whichever is taken,
+the assertion is a crosscheck of `(map f a-string)` against the reference
+interpreter, not that the contract compiles: this is a *type* being wrong, and a
+wrong type that happens to lay out compatibly computes a wrong answer quietly —
+which is what task 086 was.
