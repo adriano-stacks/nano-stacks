@@ -68,8 +68,26 @@ execution.
         its sortitions stopped at burn 393, so no block's *tenure* ever reached
         cycle 19's prepare phase and cycle 20's set was never written. stacks-core
         says the same -- `last-set-cycle` there is still 19.
-      * One `503` initializing the signer's local state machine, which is the
-        remaining thread to pull.
+      * One `503` initializing the signer's local state machine, and pulling that
+        thread found a **nano defect**, not an environment one. `/v3/tenures/info`
+        and `/v3/sortitions` both answer `503` on a node that is executing normally
+        at height 14,516:
+
+        ```
+        /v2/pox           200      /v3/stacker_set/19   200
+        /v2/info          200      /v3/tenures/info     503
+                                   /v3/sortitions       503
+        ```
+
+        `tenure_info` reads `executed(&state).chain.last()` and answers
+        `Unavailable` when that chain is empty -- and it is empty on a node whose
+        executed tip is fresh, so the executed snapshot is not being published with
+        a chain the routes can read. Those two endpoints are the first ones a stock
+        signer asks for, so this is what stands between "registered" and "watching
+        for proposals".
+
+        That is the next action on this item, and it is squarely in this task's own
+        scope: *serve every route from the coherent executed snapshot*.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
