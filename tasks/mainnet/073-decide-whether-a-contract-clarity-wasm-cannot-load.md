@@ -1,7 +1,7 @@
 ---
 id: "073"
 title: "Decide whether a contract clarity-wasm cannot load is mainnet-valid"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["060"]
@@ -142,6 +142,51 @@ function count × prologue), the search of imported mainnet state for the
 highest local count any deployed contract reaches, the `as-contract` prologue
 fix, and the codegen fix itself — now confirmed release-blocking rather than
 hypothetical.
+
+## Solution sketch (2026-08-07)
+
+Root cause, in code: `save_to_locals` (`wasm_generator.rs:2143`) always
+allocates fresh locals and never frees them; a `let` scope exit restores the
+name map but not the LocalIds. A pool exists (`borrow_local`/`BorrowedLocal`,
+`wasm_generator.rs:1573`) but only small scalar temporaries inside word
+implementations use it. Named bindings and sequence-construction saves bypass
+it. Allocation is monotonic per function — that is the whole bug.
+
+Options considered:
+
+- **A. Scoped local reuse (chosen, near-term).** Allocate from the pool in
+  `save_to_locals` and return a binding's locals when its lexical scope
+  closes. Sound because reuse is purely lexical (no closures in Clarity, and
+  the name-map restore already makes dead locals unreadable). Collapses poc2
+  from ~50k locals to ~1–2k: the binding lives once, the per-element
+  temporaries share one slot set. Crucially, the 60,000-binding `let` keeps
+  all bindings live in one scope simultaneously, so it still refuses and the
+  `engine_failure.rs` gate keeps working unchanged. Residual exposure after A:
+  a single scope with >50k simultaneously-live leaves — whether that shape is
+  mainnet-valid is what the boundary table answers.
+- **B. Box large composites in linear memory (chosen, structural).** Above a
+  leaf-count threshold, pass composite values as one `i32` pointer into
+  workspace memory. Collapses every shape, including 60k bindings. Large
+  blast radius: composite words, the user-function calling convention, the
+  `standard.wasm` ABI. Design jointly with the asymmetric-tuple work
+  ([[068-resolve-asymmetric-tuple-least-supertype-semantics]]) — both are
+  value-representation problems.
+- C. Post-pass local coalescing (wasm-opt-style). General and codegen-free,
+  but adds a consensus-critical external transformation and breaks the
+  manufactured gate, which would need a new forcing case. Fallback if B
+  stalls.
+- D. Function outlining. Raises the per-function ceiling without removing the
+  blowup; early-return control flow across function boundaries is messy.
+  Rejected as primary.
+- E. Raising the limit. Hardcoded in wasmparser, no wasmtime knob, does not
+  scale (100 KB contract → ~25M locals). Rejected.
+- F. Interpreter fallback. Forbidden by the release rule. Rejected.
+- **G. Compile-time local counting (chosen, complementary).** Count locals
+  during generation, refuse early with a precise error, and emit the
+  per-shape boundary table this task's first checkbox asks for. Does not fix
+  conformance; makes the residual exposure a measured number.
+
+Plan: A + G first in worktree `agent/locals`, merge, then B.
 
 ## Evidence that opened this task
 
