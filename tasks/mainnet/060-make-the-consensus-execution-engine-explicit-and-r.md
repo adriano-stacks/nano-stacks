@@ -101,14 +101,19 @@ node may invoke.
 - [x] Resolve `match` branch bindings that shadow an enclosing local: wasm
       currently accepts a shape the reference interpreter rejects with
       `NameAlreadyUsed`. Pin both the taken and untaken branch behavior.
-- [x] Account for every ignored Clarity semantic differential in the release
+- [~] Account for every ignored Clarity semantic differential in the release
       report. A known engine disagreement may not be waived merely because it
       has not appeared in the replayed mainnet window.
       An `ignored tests` section, scanned rather than written down: it reads every
       `#[ignore]` in the engine's own suite and the conformance suite out of the
       sources and splits infrastructure reasons from semantic ones. A bare
       `#[ignore]` with no reason counts as semantic, because an unexplained skip is
-      what the section exists to make impossible. It reports **0 semantic** —
+      what the section exists to make impossible. **Audit correction
+      2026-08-07:** this is not complete. `needs to be implemented` is classified
+      as infrastructure, which hides the ignored Clarity-4 contract-call cost
+      test, and the scan cannot see [[068]] because its replacement tests pin two
+      unequal engine answers without an ignore. The report must account for both
+      forms under [[074]]. It currently reports **0 semantic** —
       `#[ignore = "see issue #316"]` turned out to hide a wrong *expectation* and
       not a disagreement: both engines answer `(+ 3 4)` for a deploy whose last
       top-level form is a definition, which is what `initialize_contract` and

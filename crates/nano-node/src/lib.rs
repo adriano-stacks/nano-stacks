@@ -16,7 +16,7 @@ use nano_chainstate::{
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
 use nano_primitives::{Network, StacksBlockId, TrieHash};
-use nano_sync::{FollowedTenure, Node, NodeView, PoxInfo, SyncClient, SyncError, TenureSource};
+use nano_sync::{PoxInfo, SyncClient, SyncError, TenureSource};
 
 use crate::staging::{Staging, StagingError};
 
@@ -70,7 +70,6 @@ pub struct CheckpointExecutor<S> {
     /// One entry rather than a map, because a replay walks burn views in order and
     /// never looks back. Keeping the earlier ones would be a leak dressed as a
     /// cache — a catch-up crosses thousands of them.
-    sortition_view: Option<(nano_primitives::ConsensusHash, nano_sync::SortitionInfo)>,
     /// Where to announce the blocks this node executes.
     ///
     /// An observer's whole purpose is to see what a node *executed*, so this
@@ -178,8 +177,17 @@ enum LocalView {
     /// round tries again.
     Unreached { standing_on: u64 },
     /// There is no local chain at all: no checkpoint sortition history, or no payout
-    /// calendar to derive one with. Then, and only then, a peer's `/v3/sortitions`
-    /// answer is the execution context, as it was for every node before this.
+    /// calendar to derive one with.
+    ///
+    /// This used to be the one place a peer's `/v3/sortitions` answer became the
+    /// execution context. It filled the Bitcoin height, the burn header hash, the
+    /// timestamp and the VRF seed -- three of which Clarity reads back and which
+    /// therefore move a state root, and one of which decides whether a tenure is the
+    /// one the network elected. A stranger could choose all four.
+    ///
+    /// So it refuses now, and startup refuses earlier still: a node with an executing
+    /// role and no way to derive sortitions does not begin
+    /// ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
     NoChain,
 }
 
@@ -195,20 +203,6 @@ struct ExecutedView {
     bitcoin_height: u64,
     bitcoin_block_hash: nano_primitives::BitcoinHeaderHash,
     consensus_hash: nano_primitives::ConsensusHash,
-}
-
-/// The burn block a sortition is derived for, and the answer to check it against.
-///
-/// Two callers, and the difference is the whole point of
-/// [[049-derive-canonical-sortitions-from-the-local-burncha]]: a view this node's
-/// own chain already names needs no peer at all, while a view it has not reached
-/// yet is located by a peer's answer and then derived anyway. The second carries
-/// that answer so the two can be compared; the first has nothing to compare
-/// against and needs nothing.
-#[derive(Clone, Copy, Debug)]
-struct BurnTarget<'a> {
-    bitcoin_height: u64,
-    peer: Option<&'a nano_sync::SortitionInfo>,
 }
 
 /// Where a round of execution spent its time.
@@ -339,51 +333,6 @@ fn report_sortition_walk(walk: &crate::sortition::CatchUp, standing_on: u64) {
     );
 }
 
-/// Say where a locally derived sortition and the peer's answer part company.
-///
-/// Reported rather than enforced while the derivation is being brought up, and
-/// per field, because which field disagrees names which arithmetic is wrong: the
-/// consensus hash covers the operation set, the burn total and the `PoX` history
-/// together, while the VRF seed is the winning commitment's alone.
-fn report_disagreements(
-    local: &nano_sortition::SortitionSnapshot,
-    peer: &nano_sync::SortitionInfo,
-) {
-    if local.consensus_hash != peer.consensus_hash {
-        eprintln!(
-            "locally derived consensus hash at burn {} is {} where the peer says {}",
-            peer.bitcoin_height, local.consensus_hash, peer.consensus_hash
-        );
-    }
-    if let Some(seed) = peer.vrf_seed
-        && local.winner_vrf_seed != Some(seed)
-    {
-        eprintln!(
-            "locally derived VRF seed at burn {} is {:?} where the peer says {}",
-            peer.bitcoin_height,
-            local.winner_vrf_seed.map(hex::encode),
-            hex::encode(seed)
-        );
-    }
-    // The two remaining execution inputs, which are now taken from here rather than
-    // from the answer they are compared against. Said out loud for the same reason
-    // the seed is: a difference names which of the two chains of Bitcoin blocks is
-    // not the network's, and the state root that refuses the block afterwards does
-    // not say which field caused it.
-    if local.bitcoin_header_hash != peer.bitcoin_block_hash {
-        eprintln!(
-            "locally derived burn header hash at burn {} is {} where the peer says {}",
-            peer.bitcoin_height, local.bitcoin_header_hash, peer.bitcoin_block_hash
-        );
-    }
-    if local.bitcoin_timestamp != peer.bitcoin_timestamp {
-        eprintln!(
-            "locally derived burn header time at burn {} is {} where the peer says {}",
-            peer.bitcoin_height, local.bitcoin_timestamp, peer.bitcoin_timestamp
-        );
-    }
-}
-
 /// Where a descent stops: the block this node has executed, by identity and by
 /// height, because a batch can step over the one without reaching the other.
 #[derive(Clone, Copy, Debug)]
@@ -444,13 +393,6 @@ pub struct CatchUpRound {
     pub rate_limited: bool,
 }
 
-/// A follower that executes each accepted tenure update from a checkpointed state.
-#[derive(Debug)]
-pub struct ExecutingNode<S> {
-    node: Node,
-    executor: CheckpointExecutor<S>,
-    executed_view: Option<NodeView>,
-}
 
 #[derive(Debug)]
 pub enum NodeExecutionError {
@@ -801,7 +743,6 @@ where
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
             bitcoin_view: None,
-            sortition_view: None,
             observers: None,
             archive: None,
             bitcoin,
@@ -824,66 +765,10 @@ where
             tip,
             bitcoin_height: 0,
             bitcoin_view: None,
-            sortition_view: None,
             observers: None,
             archive: None,
             bitcoin,
         }
-    }
-
-    /// Apply the blocks in a followed tenure that extend the current execution tip.
-    pub fn apply_followed_tenure(
-        &mut self,
-        tenure: &FollowedTenure,
-        pox: &PoxInfo,
-    ) -> Result<Vec<AppliedBlock>, CheckpointExecutionError> {
-        let mut bitcoin_context = pox.bitcoin_context();
-        bitcoin_context.move_to_burn_block(tenure.sortition.bitcoin_height);
-        bitcoin_context.burn_header_hash = *tenure.sortition.bitcoin_block_hash.as_bytes();
-        // `get-tenure-info? time` and `vrf-seed` read these back. Left zero they
-        // answer zero, which is not a failure a replay notices — it is a wrong
-        // number in a receipt, and a state root that differs for no visible
-        // reason. The sortition already carries both.
-        bitcoin_context.burn_block_time = tenure.sortition.bitcoin_timestamp;
-        bitcoin_context.vrf_seed = tenure.sortition.vrf_seed.unwrap_or_default();
-        // As in `execute_staged`: the tenure VRF rules read these two, and they
-        // have to be this node's own answers rather than the peer's. The burn
-        // total comes from the first block of the tenure, which is the one that
-        // can start it.
-        let bitcoin_spent = tenure
-            .blocks
-            .first()
-            .map_or(0, |block| block.header.bitcoin_spent);
-        let target = BurnTarget {
-            bitcoin_height: tenure.sortition.bitcoin_height,
-            peer: Some(&tenure.sortition),
-        };
-        if let Some(local) = self.local_sortition(pox, target, bitcoin_spent)? {
-            local.record(&mut bitcoin_context);
-        }
-        self.seed_burn_headers(tenure.sortition.bitcoin_height);
-        let current_tip = self.tip.block_id();
-        let blocks = tenure
-            .blocks
-            .iter()
-            .skip_while(|block| block.block_id() != current_tip);
-        let mut blocks = blocks.peekable();
-        if blocks.peek().is_some() {
-            blocks.next();
-        }
-        let mut applied = Vec::new();
-        let operations = self
-            .bitcoin
-            .block_at(bitcoin_context.height)
-            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
-        for block in blocks {
-            applied.push(self.apply_with_operations(
-                block,
-                bitcoin_context,
-                &operations.operations,
-            )?);
-        }
-        Ok(applied)
     }
 
     /// Validate and execute one direct descendant of the current execution tip.
@@ -1723,66 +1608,6 @@ where
         self.sortition_state = Some(state);
     }
 
-    /// Derive the sortition a block executes under, from this node's burnchain.
-    ///
-    /// The tracker walks every burn block up to the one the block stands on —
-    /// nothing is skipped, because a consensus hash mixes the ones behind it and
-    /// a height left out changes every hash from there on. That walk is what the
-    /// previous version of this could not do: it advanced exactly one block and
-    /// bailed out otherwise, so on mainnet, where the checkpoint's sortition seed
-    /// is twelve blocks older than the first block executed, the check never ran
-    /// once.
-    ///
-    /// Two answers come back to the caller and are its own, not the peer's: the
-    /// tenure's sortition hash, and the winning commitment's leader key when the
-    /// burn block left no choice about which commitment won. Both are
-    /// validation-only — no Clarity word reads either — so neither moves a state
-    /// root.
-    ///
-    /// Differences with the peer are reported, not enforced, with one exception:
-    /// a burn total that disagrees with a signed header means every consensus hash
-    /// from here on is derived from a wrong number, so deriving stops rather than
-    /// reporting the same wrongness at every block after it.
-    /// The sortition for a burn view, asked of the pool at most once.
-    ///
-    /// The pool and not the round's own peer, because this request stalled a live
-    /// mainnet catch-up for fifty minutes: one discovered peer's HTTP port stopped
-    /// answering, every round asked it and only it, and each round abandoned the
-    /// 28,458 blocks already staged rather than executing them.
-    async fn sortition_for(
-        &mut self,
-        peers: &mut TenureSource,
-        view: nano_primitives::ConsensusHash,
-    ) -> Result<nano_sync::SortitionInfo, NodeExecutionError> {
-        if let Some((known, sortition)) = self.sortition_view.as_ref()
-            && *known == view
-        {
-            return Ok(sortition.clone());
-        }
-        let sortition = peers.sortition(view).await?;
-        // Where this node's own chain already names the view, the peer does not get
-        // to say which burn block it is. The pool has already refused an answer
-        // carrying another view's consensus hash; this refuses one that agrees about
-        // the hash and lies about the height, which is the same substitution made
-        // one field along — and the height decides which Bitcoin block every
-        // Clarity-visible burn field is then read from.
-        if let Some(height) = self
-            .sortition
-            .as_ref()
-            .and_then(|tracker| tracker.height_of_consensus_hash(view))
-            && height != sortition.bitcoin_height
-        {
-            return Err(CheckpointExecutionError::BurnViewHeight {
-                view,
-                peer: sortition.bitcoin_height,
-                derived: height,
-            }
-            .into());
-        }
-        self.sortition_view = Some((view, sortition.clone()));
-        Ok(sortition)
-    }
-
     /// Name the burn view a block stands on, from this node's own sortition chain.
     ///
     /// This is what used to require a peer, and the reason it did is worth stating
@@ -1920,11 +1745,9 @@ where
     fn local_sortition(
         &mut self,
         pox: &PoxInfo,
-        target: BurnTarget<'_>,
+        bitcoin_height: u64,
         bitcoin_spent: u64,
     ) -> Result<Option<LocalSortition>, CheckpointExecutionError> {
-        let bitcoin_height = target.bitcoin_height;
-        let peer = target.peer;
         if payout_schedule(pox).is_none() {
             return Ok(None);
         }
@@ -1950,9 +1773,6 @@ where
             }
             return Ok(None);
         };
-        if let Some(peer) = peer {
-            report_disagreements(snapshot, peer);
-        }
         // The winner's identity is published as derived. It used to be withheld
         // wherever more than one commitment competed, because the distribution
         // named 12 of the captured window's 14 — and the cause turned out not to
@@ -2023,7 +1843,6 @@ where
         }
         self.tip = block;
         self.bitcoin_view = None;
-        self.sortition_view = None;
         self.bitcoin_height = 0;
         // And the blocks kept for serving, which are a claim about what this node
         // executed: everything above the block it now stands on it no longer did.
@@ -2349,22 +2168,18 @@ where
         let phase = std::time::Instant::now();
         let local_view = self.local_view(pox, view);
         timing.local += phase.elapsed();
-        // The peer's answer, only where this node has no chain of its own to name the
-        // view with. It is still checked against what little there is to check it
-        // against — the pool refuses an answer carrying another view's consensus hash
-        // — and it is still the last thing in the tree that lets a stranger choose a
-        // burn height.
-        let peer = match local_view {
+        // No peer answer, in any branch. This was the last place a stranger could
+        // choose the burn block a block executes under, and the four fields it chose
+        // are read back by Clarity and by the tenure VRF rule.
+        match local_view {
             LocalView::NoChain => {
-                let phase = std::time::Instant::now();
-                let Some(sortition) = ended_by_a_rate_limit(self.sortition_for(peers, view).await)?
-                else {
-                    return Ok(None);
-                };
-                timing.sortition += phase.elapsed();
-                Some(sortition)
+                eprintln!(
+                    "this node derives no sortitions of its own, so it cannot say which burn                      block {} stands on and will not take a peer's word for it: give the                      checkpoint a sortition history and a payout calendar",
+                    block.header.chain_length
+                );
+                return Ok(None);
             }
-            LocalView::At(_) => None,
+            LocalView::At(_) => {}
             LocalView::Unreached { standing_on } => {
                 eprintln!(
                     "the local sortition chain cannot name burn view {view}, standing on burn \
@@ -2374,37 +2189,19 @@ where
                 );
                 return Ok(None);
             }
-        };
-        let bitcoin_height = match local_view {
-            LocalView::At(height) => height,
-            _ => peer
-                .as_ref()
-                .map_or(0, |sortition| sortition.bitcoin_height),
+        }
+        // The only remaining source, and it is this node's own arithmetic over
+        // Bitcoin blocks it downloaded.
+        let LocalView::At(bitcoin_height) = local_view else {
+            return Ok(None);
         };
         let mut bitcoin_context = pox.bitcoin_context();
         bitcoin_context.move_to_burn_block(bitcoin_height);
-        if let Some(sortition) = peer.as_ref() {
-            // Clarity reads this back through `get-burn-block-info?`, and sBTC
-            // compares it against the hash a withdrawal was signed for. A
-            // context that leaves it zero makes every such call fail.
-            bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
-            // As in `apply_followed_tenure`: zero here is a wrong answer rather
-            // than a stall.
-            bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
-            bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
-        }
         let phase = std::time::Instant::now();
         // Everything this node's own burnchain can answer, from there. The validation
         // inputs `check_tenure_vrf` reads, and the Clarity-visible ones that move a
         // state root: see `LocalSortition`.
-        let local = self.local_sortition(
-            pox,
-            BurnTarget {
-                bitcoin_height,
-                peer: peer.as_ref(),
-            },
-            block.header.bitcoin_spent,
-        )?;
+        let local = self.local_sortition(pox, bitcoin_height, block.header.bitcoin_spent)?;
         timing.local += phase.elapsed();
         if let Some(local) = local {
             local.record(&mut bitcoin_context);
@@ -2426,9 +2223,7 @@ where
         self.seed_burn_headers(bitcoin_height);
         timing.headers += phase.elapsed();
         let phase = std::time::Instant::now();
-        let Some(bitcoin_context) = self
-            .tenure_coinbase(peers, block, bitcoin_context, local_view)
-            .await?
+        let Some(bitcoin_context) = self.tenure_coinbase(block, bitcoin_context, bitcoin_height)
         else {
             return Ok(None);
         };
@@ -2456,24 +2251,22 @@ where
     /// the snapshots hold `winner_txid` per burn block, so the walk is a walk over
     /// this node's own window. A window that cannot reach the answer ends the chunk
     /// rather than minting a zero.
-    async fn tenure_coinbase(
+    ///
+    /// There is no peer branch left. This used to fall back to the peer's two-request
+    /// walk whenever the local chain could not name the view, which made the one
+    /// *minted* quantity in the whole context a stranger's answer: every other field
+    /// a peer could get wrong makes the block fail to seal, while this one makes it
+    /// seal a different balance
+    /// ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
+    fn tenure_coinbase(
         &mut self,
-        peers: &mut TenureSource,
         block: &NakamotoBlock,
         mut bitcoin_context: BitcoinBlockContext,
-        local_view: LocalView,
-    ) -> Result<Option<BitcoinBlockContext>, NodeExecutionError> {
+        bitcoin_height: u64,
+    ) -> Option<BitcoinBlockContext> {
         let schedule = self.chainstate.accounting_mut().schedule();
         let Some(schedule) = schedule.filter(|_| nano_chainstate::starts_new_tenure(block)) else {
-            return Ok(Some(bitcoin_context));
-        };
-        let LocalView::At(bitcoin_height) = local_view else {
-            // No local chain: the peer's two-request walk, as before.
-            let context = peers
-                .tenure_coinbase_context(block, Some(schedule), bitcoin_context)
-                .await
-                .map_err(NodeExecutionError::from);
-            return ended_by_a_rate_limit(context);
+            return Some(bitcoin_context);
         };
         let Some(previous) = self
             .sortition
@@ -2486,11 +2279,11 @@ where
                  that height — so block {} is not executed rather than minting a guess",
                 block.header.chain_length
             );
-            return Ok(None);
+            return None;
         };
         bitcoin_context.accumulated_coinbase =
             schedule.accumulated_at(bitcoin_height, Some(previous));
-        Ok(Some(bitcoin_context))
+        Some(bitcoin_context)
     }
 
     /// Execute staged blocks forward from this node's tip, up to `budget`.
@@ -2841,53 +2634,44 @@ impl<S: Send> nano_rpc::ChainAccess for CheckpointExecutor<S> {
     }
 }
 
-impl<S> ExecutingNode<S>
-where
-    S: BitcoinSource,
-    S::Error: fmt::Display,
-{
-    /// Couple a peer follower to a checkpoint executor.
-    #[must_use]
-    pub const fn new(node: Node, executor: CheckpointExecutor<S>) -> Self {
-        Self {
-            node,
-            executor,
-            executed_view: None,
+
+#[cfg(test)]
+mod peer_boundary_tests {
+    /// The execution path holds no route back to a peer's opinion of a burn view.
+    ///
+    /// A source check, and it says so. The behaviour it guards cannot be reached from
+    /// a unit test — it needs a checkpoint, an executor and a burnchain — but what it
+    /// guards against is a one-line reintroduction, which is exactly what happened
+    /// before: `LocalView::NoChain` filled the Bitcoin height, the burn header hash,
+    /// the timestamp and the VRF seed from `/v3/sortitions`, and `tenure_coinbase`
+    /// asked a peer for the accumulated coinbase. Three of those are read back by
+    /// Clarity and so move a state root; the fourth decides whether a tenure is the
+    /// one the network elected; and the coinbase is *minted*, so a wrong answer seals
+    /// a different balance rather than failing to seal at all.
+    ///
+    /// So the assertion is on the two functions that build a block's execution
+    /// context, and it is deliberately about *names*: a peer's sortition and its
+    /// coinbase walk have no business being mentioned in either of them.
+    #[test]
+    fn no_peer_answer_reaches_a_block_s_execution_context() {
+        let source = include_str!("lib.rs");
+        for (function, forbidden) in [
+            ("async fn context_for", "peers.sortition"),
+            ("async fn context_for", "sortition_for"),
+            ("fn tenure_coinbase", "tenure_coinbase_context"),
+            ("fn local_sortition", "SortitionInfo"),
+        ] {
+            let Some(start) = source.find(function) else {
+                panic!("{function} is gone; this guard has to move with it");
+            };
+            // To the next item at the same indentation, which is where a method ends.
+            let body = &source[start..];
+            let end = body[1..].find("\n    /// ").map_or(body.len(), |at| at + 1);
+            assert!(
+                !body[..end].contains(forbidden),
+                "{function} mentions {forbidden}: a peer cannot be allowed to choose the \
+                 burn view a block executes under"
+            );
         }
-    }
-
-    /// Follow, validate, and execute the peer's next tenure update.
-    pub async fn poll(&mut self) -> Result<Option<FollowedTenure>, NodeExecutionError> {
-        let followed = self.node.poll().await?;
-        let view = self.node.view().ok_or(NodeExecutionError::MissingView)?;
-        let current_tip = self.executor.tip().block_id();
-        let first_tenure = view
-            .tenures
-            .iter()
-            .position(|tenure| {
-                tenure
-                    .blocks
-                    .iter()
-                    .any(|block| block.block_id() == current_tip)
-            })
-            .unwrap_or_else(|| view.tenures.len().saturating_sub(1));
-        for tenure in &view.tenures[first_tenure..] {
-            self.executor
-                .apply_followed_tenure(tenure, &view.pox_info)?;
-        }
-        self.executed_view = Some(view);
-        Ok(followed)
-    }
-
-    /// Return the executed chain tip.
-    #[must_use]
-    pub const fn executed_tip(&self) -> &NakamotoBlock {
-        self.executor.tip()
-    }
-
-    /// Return the latest completely executed node view.
-    #[must_use]
-    pub fn view(&self) -> Option<NodeView> {
-        self.executed_view.clone()
     }
 }

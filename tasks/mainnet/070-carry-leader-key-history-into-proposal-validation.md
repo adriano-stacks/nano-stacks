@@ -2,7 +2,7 @@
 id: "070"
 title: "Carry leader-key history into proposal validation"
 status: in-progress
-priority: high
+priority: critical
 effort: medium
 dependencies: ["050", "051"]
 tags: ["mainnet", "signer", "checkpoint", "conformance"]

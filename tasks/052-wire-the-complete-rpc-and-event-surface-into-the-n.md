@@ -2,7 +2,7 @@
 id: "052"
 title: "Wire the complete RPC and event surface into the node"
 status: in-progress
-priority: high
+priority: critical
 effort: large
 type: feature
 group: mainnet

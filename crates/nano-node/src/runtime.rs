@@ -746,7 +746,7 @@ async fn follow(follower: Follower) -> Role {
         execute: config.node.max_sync_blocks,
     };
     let mut pox = pox;
-    prepare_to_follow(executor.as_ref(), &config, &peer, &pox, source).await;
+    prepare_to_follow(executor.as_ref(), &config, &peer, &pox, source).await?;
     let mut rounds = Rounds::new(peer);
     loop {
         rounds.history.refresh(&config, discovered.as_ref());
@@ -832,18 +832,27 @@ async fn prepare_to_follow(
     peer: &SyncClient,
     pox: &PoxInfo,
     source: [u8; 32],
-) {
+) -> Role {
     let Some(executor) = executor else {
-        return;
+        return Ok(());
     };
-    // Derive sortitions alongside the peer's answers, when the checkpoint
-    // carries the history that makes it possible.
-    if let Some(directory) = config.checkpoint.sortition.as_ref() {
-        let phase = Phase::start("seeding the local sortition chain");
-        start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
-        drop(phase);
-    }
+    // A node that executes derives its own sortitions, or it does not run. The
+    // checkpoint has to carry the history to seed one from, and a configuration
+    // without it is refused here rather than at the first block -- which is the
+    // difference between a node that will not start and a node that starts and
+    // takes a stranger's word for every burn view it executes under.
+    let Some(directory) = config.checkpoint.sortition.as_ref() else {
+        return Err(
+            "this node executes blocks and has no checkpoint sortition history to derive burn              views from: set `checkpoint.sortition` to a directory holding snapshots.json,              consensus-hashes.json and leader-keys.json, which `cargo xtask export-sortition`              writes"
+                .to_owned(),
+        );
+    };
+    let phase = Phase::start("seeding the local sortition chain");
+    let seeded = start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
+    drop(phase);
+    seeded?;
     backfill_ancestors(executor, peer, pox, source).await;
+    Ok(())
 }
 
 /// Take the blocks the public API admitted and stage them.
@@ -2094,23 +2103,34 @@ async fn backfill_one_header(
 
 /// Derive sortitions alongside the peer's answers, when the checkpoint carries
 /// the history that makes it possible.
-async fn start_deriving_sortitions(executor: &SharedExecutor, capture: &Path, state: &Path) {
+async fn start_deriving_sortitions(
+    executor: &SharedExecutor,
+    capture: &Path,
+    state: &Path,
+) -> Role {
     // No `PoxId` is passed: the seed's own sortition identifier states the bit
     // vector it was produced under, so the tracker reads it off the checkpoint.
-    match SortitionTracker::resume_or_capture(state, capture) {
-        Ok(tracker) => {
-            println!(
-                "deriving sortitions locally from burn {} on PoX history {}",
-                tracker.tip().bitcoin_height,
-                tracker.tip().pox_id
-            );
-            executor
-                .lock()
-                .await
-                .track_sortitions(tracker, state.to_path_buf());
-        }
-        Err(error) => eprintln!("cannot derive sortitions locally: {error}"),
-    }
+    // A failure here is fatal rather than reported. It used to be printed and
+    // passed over, and what followed was a node that executed every block under a
+    // burn view a *peer* handed it -- the Bitcoin height, the burn header hash, the
+    // timestamp and the VRF seed, three of which Clarity reads back and so move a
+    // state root. A node that cannot derive its own sortitions has nothing to
+    // execute against ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
+    let tracker = SortitionTracker::resume_or_capture(state, capture).map_err(|error| {
+        format!(
+            "this node cannot derive sortitions of its own, and will not execute blocks under              a burn view a peer chose: {error}"
+        )
+    })?;
+    println!(
+        "deriving sortitions locally from burn {} on PoX history {}",
+        tracker.tip().bitcoin_height,
+        tracker.tip().pox_id
+    );
+    executor
+        .lock()
+        .await
+        .track_sortitions(tracker, state.to_path_buf());
+    Ok(())
 }
 
 /// Check the checkpoint against a signed header before any of it is opened.

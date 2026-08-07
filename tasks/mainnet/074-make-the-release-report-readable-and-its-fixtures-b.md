@@ -2,7 +2,7 @@
 id: "074"
 title: "Make the release report readable and its fixtures self-describing"
 status: pending
-priority: high
+priority: critical
 effort: medium
 dependencies: []
 tags: ["mainnet", "conformance", "release", "tooling"]
@@ -16,7 +16,9 @@ group: mainnet
 ## Objective
 
 `cargo xtask release-report` is the artifact task 053 decides on. It is currently
-correct and unreadable, and an unreadable gate is one nobody checks.
+neither readable nor sufficient to make that decision: it can classify a missing
+semantic implementation as infrastructure, report a stale binary beside current
+source metadata and print a red scoreboard without failing.
 
 A run today prints **hundreds of lines** of `tenure at burn N carries a coinbase
 proof this node cannot check` and `tenure at burn N commits a seed this node
@@ -54,6 +56,19 @@ who learns to skip them on the report learns to skip them everywhere.
 - [ ] Keep the 21 unrunnable gates named individually. That part is right and is
       the reason the report is trustworthy; nothing here should compress it into
       a number.
+- [ ] Remove `needs to be implemented` from infrastructure classification. An
+      ignored VM or cost test with that reason is a semantic release failure.
+- [ ] Report every declared known differential, including non-ignored tests that
+      deliberately pin different engine answers under [[060]] and [[068]]. A
+      zero ignored-test count is not a zero differential count.
+- [ ] Fail the report when a semantic differential, required ignored test or red
+      scoreboard surface exists.
+- [ ] Build the release binary before reporting it, or require an explicit
+      immutable artifact path. Verify the binary's embedded compiler identity
+      before pairing it with revision and source identity.
+- [ ] Describe the artifact accurately: the Clarity interpreter machinery is
+      linked as unreachable frontend/ABI code, while no interpreter entry point
+      or call edge is reachable from production.
 
 ## Acceptance Criteria
 
@@ -66,6 +81,11 @@ who learns to skip them on the report learns to skip them everywhere.
 - The report states the frozen slice's compiler and the artifact's compiler
   side by side.
 - No gate that could not run is reported as anything other than "could not run".
+- Every known semantic difference is named and makes the report fail, whether it
+  is ignored or pinned as two unequal expected answers.
+- The artifact digest, embedded compiler identity, source identity and revision
+  describe one freshly built binary.
+- A red scoreboard or required gate makes `release-report` exit non-zero.
 
 ## Evidence that opened this task
 

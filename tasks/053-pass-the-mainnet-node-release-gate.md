@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071"]
+dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -75,6 +75,18 @@ and steady state, with evidence tied to the durable executed chain.
 - [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
       conformance report.
+
+### Audit regressions opened 2026-08-07
+
+- [ ] Restore the bounded replay and make red scoreboard output fail under
+      [[075-make-the-consensus-scoreboard-an-authoritative-gat]].
+- [ ] Remove fail-open block authentication under
+      [[076-refuse-blocks-when-consensus-authentication-inputs]].
+- [ ] Remove peer-derived consensus context under
+      [[077-remove-peer-derived-consensus-execution-fallbacks]].
+- [ ] Make release evidence reproducible and mandatory under [[078]].
+- [ ] Remove residual MARF storage panics under [[079]].
+- [ ] Make the release report fail closed under [[074]].
 
 ## Acceptance Criteria
 
