@@ -80,14 +80,24 @@ execution.
         ```
 
         `tenure_info` reads `executed(&state).chain.last()` and answers
-        `Unavailable` when that chain is empty -- and it is empty on a node whose
-        executed tip is fresh, so the executed snapshot is not being published with
-        a chain the routes can read. Those two endpoints are the first ones a stock
-        signer asks for, so this is what stands between "registered" and "watching
-        for proposals".
+        `Unavailable` when that chain is empty. The cause is one line up:
+        `publish_executed` builds that chain out of `self.followed` -- the view the
+        *follow* loop keeps -- and the comment immediately below it says why that is
+        often absent: "Catching up, the follower asks the peer only for its height:
+        the tenure walk a full view needs fails every round from thousands of blocks
+        back."
 
-        That is the next action on this item, and it is squarely in this task's own
-        scope: *serve every route from the coherent executed snapshot*.
+        So a node that catches up by height, executes cleanly and seals a fresh tip
+        publishes a snapshot with **no chain**, and the two endpoints a stock signer
+        asks for first answer `503`. That is what stands between "registered against
+        the set nano derived" and "watching for proposals".
+
+        The fix belongs to this task's own rule -- *the chain this node executed,
+        never the chain its peer advertised*. `tenure_info` should be answered from
+        the sealed tip the snapshot already carries rather than from a peer-derived
+        tenure list that a catching-up node never has. `SealedTip` does not carry
+        every `TenureInfoWire` field today, so this is a small piece of work rather
+        than a one-line change, and it is the next action.
 
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
