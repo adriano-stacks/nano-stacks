@@ -94,9 +94,12 @@ impl ComplexWord for TupleCons {
         }
 
         // Finally load the locals onto the stack
-        for local in locals_map.into_values().flatten() {
-            builder.local_get(local);
+        let locals: Vec<_> = locals_map.into_values().flatten().collect();
+        for local in &locals {
+            builder.local_get(*local);
         }
+        // The fields are on the stack; the slots they were saved in are dead.
+        generator.release_locals(locals);
 
         Ok(())
     }
@@ -152,7 +155,7 @@ impl ComplexWord for TupleGet {
         })?);
         let mut val_locals = Vec::with_capacity(wasm_types.len());
         for local_ty in wasm_types.iter().rev() {
-            let local = generator.module.locals.add(*local_ty);
+            let local = generator.alloc_local(*local_ty);
             val_locals.push(local);
         }
 
@@ -175,6 +178,7 @@ impl ComplexWord for TupleGet {
         for local in val_locals.iter().rev() {
             builder.local_get(*local);
         }
+        generator.release_locals(val_locals);
 
         Ok(())
     }

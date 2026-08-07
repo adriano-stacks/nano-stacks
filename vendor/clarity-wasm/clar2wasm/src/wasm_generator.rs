@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::rc::Rc;
@@ -84,7 +83,9 @@ pub struct WasmGenerator {
     /// Size of the maximum extra work space required by the stdlib functions
     /// to be available on the stack.
     max_work_space: u32,
-    local_pool: Rc<RefCell<HashMap<ValType, Vec<LocalId>>>>,
+    local_pool: Rc<RefCell<LocalPool>>,
+    /// Peak live locals measured per generated function.
+    pub(crate) locals_report: Rc<RefCell<LocalsReport>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -448,17 +449,12 @@ fn get_function(module: &Module, name: &str) -> Result<FunctionId, GeneratorErro
 pub struct BorrowedLocal {
     id: LocalId,
     ty: ValType,
-    pool: Rc<RefCell<HashMap<ValType, Vec<LocalId>>>>,
+    pool: Rc<RefCell<LocalPool>>,
 }
 
 impl Drop for BorrowedLocal {
     fn drop(&mut self) {
-        match (*self.pool).borrow_mut().entry(self.ty) {
-            Entry::Occupied(mut list) => list.get_mut().push(self.id),
-            Entry::Vacant(e) => {
-                e.insert(vec![self.id]);
-            }
-        }
+        (*self.pool).borrow_mut().give_back(self.ty, self.id);
     }
 }
 
@@ -467,6 +463,71 @@ impl Deref for BorrowedLocal {
     fn deref(&self) -> &Self::Target {
         &self.id
     }
+}
+
+/// Locals released by dead scopes and temporaries, available for reuse, plus
+/// a running count of the live ones so the peak a function reaches is
+/// measurable at compile time.
+#[derive(Debug, Default)]
+pub(crate) struct LocalPool {
+    free: HashMap<ValType, Vec<LocalId>>,
+    live: u32,
+    max_live: u32,
+}
+
+impl LocalPool {
+    fn take(&mut self, ty: ValType) -> Option<LocalId> {
+        let local = self.free.get_mut(&ty).and_then(Vec::pop);
+        if local.is_some() {
+            self.note_live(1);
+        }
+        local
+    }
+
+    fn note_live(&mut self, count: u32) {
+        self.live += count;
+        self.max_live = self.max_live.max(self.live);
+    }
+
+    fn give_back(&mut self, ty: ValType, local: LocalId) {
+        self.live -= 1;
+        self.free.entry(ty).or_default().push(local);
+    }
+
+    /// Zero the live counts, returning their previous values so that
+    /// generating a function nested inside another one does not disturb the
+    /// caller's count.
+    fn reset_counts(&mut self) -> (u32, u32) {
+        let saved = (self.live, self.max_live);
+        self.live = 0;
+        self.max_live = 0;
+        saved
+    }
+
+    fn max_live(&self) -> u32 {
+        self.max_live
+    }
+
+    /// Restore counts saved by `reset_counts`, returning the peak reached
+    /// since the reset.
+    fn restore_counts(&mut self, saved: (u32, u32)) -> u32 {
+        let peak = self.max_live;
+        self.live = saved.0;
+        self.max_live = saved.1;
+        peak
+    }
+}
+
+/// The peak number of simultaneously live locals each generated function
+/// reached, keyed by function name (`.top-level` for the contract body).
+///
+/// wasmtime refuses to load a module with a function declaring more than
+/// 50,000 locals, so the margin to that limit is a property of the contract
+/// worth measuring. This is measurement only: nothing refuses compilation
+/// based on it.
+#[derive(Debug, Clone, Default)]
+pub struct LocalsReport {
+    pub max_live_locals: HashMap<String, u32>,
 }
 
 impl WasmGenerator {
@@ -506,7 +567,8 @@ impl WasmGenerator {
             max_work_space: 0,
             datavars_types: HashMap::new(),
             maps_types: HashMap::new(),
-            local_pool: Rc::new(RefCell::new(HashMap::new())),
+            local_pool: Rc::new(RefCell::new(LocalPool::default())),
+            locals_report: Rc::new(RefCell::new(LocalsReport::default())),
             nft_types: HashMap::new(),
             used_traits: HashMap::new(),
             defined_functions: HashSet::new(),
@@ -590,6 +652,14 @@ impl WasmGenerator {
         if !expressions.is_empty() {
             self.traverse_statement_list(&mut current_function.func_body(), &expressions)?;
         }
+
+        // Defined functions save and restore the live-local counts around
+        // their own generation, so the peak left here is the top-level's own.
+        let peak = (*self.local_pool).borrow().max_live();
+        self.locals_report
+            .borrow_mut()
+            .max_live_locals
+            .insert(".top-level".to_owned(), peak);
 
         self.contract_analysis.expressions = expressions;
 
@@ -800,6 +870,12 @@ impl WasmGenerator {
                         }
                     }
 
+                    // Every argument was consumed by its visit; the slots the
+                    // evaluated arguments were saved in are dead.
+                    for locals in evaluated {
+                        self.release_locals(locals);
+                    }
+
                     // first argument is traversed outside loop
                 } else {
                     self.traverse_call_user_defined(builder, expr, function_name, args)?;
@@ -843,6 +919,10 @@ impl WasmGenerator {
         };
 
         self.current_function_type = Some(function_type.clone());
+
+        // Count live locals from zero for this function; the caller's counts
+        // (the top-level's, for a define) are restored on the way out.
+        let saved_counts = (*self.local_pool).borrow_mut().reset_counts();
 
         // Call the host interface to save this function
         // Arguments are kind (already pushed) and name (offset, length)
@@ -954,6 +1034,13 @@ impl WasmGenerator {
             .local_set(caller_depth)
             .local_set(sender_depth);
 
+        // The parameters, frame pointer and sender/caller depths bypass the
+        // pool but are live for the whole function, so they count towards
+        // its peak.
+        (*self.local_pool)
+            .borrow_mut()
+            .note_live(param_locals.len() as u32 + 3);
+
         let mut block = func_body.dangling_instr_seq(InstrSeqType::new(
             &mut self.module.types,
             &[],
@@ -1011,6 +1098,13 @@ impl WasmGenerator {
         // Reset the return type and early block to None
         self.current_function_type = None;
         self.early_return_block_id = None;
+
+        // Record this function's peak and hand the counts back to the caller.
+        let peak = (*self.local_pool).borrow_mut().restore_counts(saved_counts);
+        self.locals_report
+            .borrow_mut()
+            .max_live_locals
+            .insert(name.as_str().to_string(), peak);
 
         Ok(func_builder.finish(param_locals, &mut self.module.funcs))
     }
@@ -1277,10 +1371,13 @@ impl WasmGenerator {
         let size = self.borrow_local(ValType::I32);
         self.runtime_size(builder, ty, &values, *size)?;
 
-        for value in values {
-            builder.local_get(value);
+        for value in &values {
+            builder.local_get(*value);
         }
         builder.local_get(*size);
+
+        // The saved values are back on the stack; their slots are dead.
+        self.release_locals(values);
 
         Ok(())
     }
@@ -1571,14 +1668,38 @@ impl WasmGenerator {
     }
 
     pub fn borrow_local(&mut self, ty: ValType) -> BorrowedLocal {
-        let reuse = (*self.local_pool)
-            .borrow_mut()
-            .get_mut(&ty)
-            .and_then(Vec::pop);
+        let id = self.alloc_local(ty);
         BorrowedLocal {
-            id: reuse.unwrap_or_else(|| self.module.locals.add(ty)),
+            id,
             ty,
             pool: self.local_pool.clone(),
+        }
+    }
+
+    /// Allocate a local of type `ty`, reusing a released local from the pool
+    /// when one of the same type is available.
+    pub(crate) fn alloc_local(&mut self, ty: ValType) -> LocalId {
+        let reuse = (*self.local_pool).borrow_mut().take(ty);
+        match reuse {
+            Some(local) => local,
+            None => {
+                let local = self.module.locals.add(ty);
+                (*self.local_pool).borrow_mut().note_live(1);
+                local
+            }
+        }
+    }
+
+    /// Return `locals` previously obtained from `save_to_locals` or
+    /// `alloc_local` to the pool, so later allocations can reuse their slots.
+    /// Must only be called after the last possible read of the values they
+    /// hold: lexically, a binding's locals are unreadable once its scope has
+    /// closed, and a pooled local is only handed out again once released.
+    pub(crate) fn release_locals(&mut self, locals: Vec<LocalId>) {
+        let mut pool = (*self.local_pool).borrow_mut();
+        for local in locals {
+            let ty = self.module.locals.get(local).ty();
+            pool.give_back(ty, local);
         }
     }
 
@@ -1625,17 +1746,17 @@ impl WasmGenerator {
             | TypeSignature::SequenceType(_) => {
                 // Data stack: TOP | Length | Offset | ...
                 // Save the offset/length to locals.
-                let seq_offset = self.module.locals.add(ValType::I32);
-                let seq_length = self.module.locals.add(ValType::I32);
-                builder.local_set(seq_length).local_set(seq_offset);
+                let seq_offset = self.borrow_local(ValType::I32);
+                let seq_length = self.borrow_local(ValType::I32);
+                builder.local_set(*seq_length).local_set(*seq_offset);
 
                 // Store the offset/length to memory.
-                builder.local_get(offset_local).local_get(seq_offset).store(
+                builder.local_get(offset_local).local_get(*seq_offset).store(
                     memory,
                     StoreKind::I32 { atomic: false },
                     MemArg { align: 4, offset },
                 );
-                builder.local_get(offset_local).local_get(seq_length).store(
+                builder.local_get(offset_local).local_get(*seq_length).store(
                     memory,
                     StoreKind::I32 { atomic: false },
                     MemArg {
@@ -1648,11 +1769,11 @@ impl WasmGenerator {
             TypeSignature::BoolType => {
                 // Data stack: TOP | Value | ...
                 // Save the value to a local.
-                let bool_val = self.module.locals.add(ValType::I32);
-                builder.local_set(bool_val);
+                let bool_val = self.borrow_local(ValType::I32);
+                builder.local_set(*bool_val);
 
                 // Store the value to memory.
-                builder.local_get(offset_local).local_get(bool_val).store(
+                builder.local_get(offset_local).local_get(*bool_val).store(
                     memory,
                     StoreKind::I32 { atomic: false },
                     MemArg { align: 4, offset },
@@ -1677,11 +1798,11 @@ impl WasmGenerator {
                     self.write_to_memory(builder, offset_local, offset + 4, some_ty)?;
 
                 // Save the variant to a local and store it to memory
-                let variant_val = self.module.locals.add(ValType::I32);
+                let variant_val = self.borrow_local(ValType::I32);
                 builder
-                    .local_set(variant_val)
+                    .local_set(*variant_val)
                     .local_get(offset_local)
-                    .local_get(variant_val)
+                    .local_get(*variant_val)
                     .store(
                         memory,
                         StoreKind::I32 { atomic: false },
@@ -1707,11 +1828,11 @@ impl WasmGenerator {
                 bytes_written +=
                     self.write_to_memory(builder, offset_local, offset + 4, &ok_err_ty.0)?;
 
-                let variant_val = self.module.locals.add(ValType::I32);
+                let variant_val = self.borrow_local(ValType::I32);
                 builder
-                    .local_set(variant_val)
+                    .local_set(*variant_val)
                     .local_get(offset_local)
-                    .local_get(variant_val)
+                    .local_get(*variant_val)
                     .store(
                         memory,
                         StoreKind::I32 { atomic: false },
@@ -2151,7 +2272,7 @@ impl WasmGenerator {
         // Iterate in reverse order, since we are popping items off of the top
         // in reverse order.
         for wasm_ty in wasm_types.iter().rev() {
-            let local = self.module.locals.add(*wasm_ty);
+            let local = self.alloc_local(*wasm_ty);
             locals.push(local);
             builder.local_set(local);
         }
@@ -2792,6 +2913,101 @@ mod tests {
         assert_eq!(
             get_initial_memory(format!("{prologue} (sha256 foo))")),
             get_initial_memory(format!("{prologue} (sha256 foo) (sha256 foo))"))
+        );
+    }
+
+    /// The `poc2` witness from `benches/comparison.rs`: a wide nested tuple
+    /// bound once, then read `copies` times through a list. Every read pays
+    /// a copy charge that saves the value to locals, which used to allocate
+    /// ~518 fresh locals per read, so 100 copies overflowed wasmtime's
+    /// 50,000-locals-per-function limit on a source the interpreter accepts.
+    fn poc2_source(copies: usize) -> String {
+        format!(
+            r#"
+            (define-public (poc2 (v int))
+                (begin
+                    (let ((a {{a: {{a: {{b: 1,c: 1,d: 1,e: 1,f: 1,g: 1,h: 1,i: 1,j: 1,k: 1,l: 1,m: 1,n: 1,o: 1,p: 1,q: 1,r: 1,s: 1,t: 1,u-: 1,v: 1,w: 1,x: 1,y: 1,z: 1,A: 1,B: 1,C: 1,D: 1,E: 1,F: 1,G: 1,H: 1,I: 1,J: 1,K: 1,L: 1,M: 1,N: 1,O: 1,P: 1,Q: 1,R: 1,S: 1,T: 1,U: 1,V: 1,W: 1,X: 1,Y: 1,Z: 1,ba: 1,bb: 1,bc: 1,bd: 1,be: 1,bf: 1,bg: 1,bh: 1,bi: 1,bj: 1,bk: 1,bl: 1,bm: 1,bn: 1,bo: 1,bp: 1,bq: 1,br: 1,bs: 1,bt: 1,bu: 1,bv: 1,bw: 1,bx: 1,by: 1,bz: 1,bA: 1,bB: 1,bC: 1,bD: 1,bE: 1,bF: 1,bG: 1,bH: 1,bI: 1,bJ: 1,bK: 1,bL: 1,bM: 1,bN: 1,bO: 1,bP: 1,bQ: 1,bR: 1,bS: 1,bT: 1,bU: 1,bV: 1,bW: 1,bX: 1,bY: 1,bZ: 1,ca: 1,cb: 1,cc: 1,cd: 1,ce: 1,cf: 1,cg: 1,ch: 1,ci: 1,cj: 1,ck: 1,cl: 1,cm: 1,cn: 1,co: 1,cp: 1,cq: 1,cr: 1,cs: 1,ct: 1,cu: 1,cv: 1,cw: 1,cx: 1,cy: 1,cz: 1,cA: 1,cB: 1,cC: 1,cD: 1,cE: 1,cF: 1,cG: 1,cH: 1,cI: 1,cJ: 1,cK: 1,cL: 1,cM: 1,cN: 1,cO: 1,cP: 1,cQ: 1,cR: 1,cS: 1,cT: 1,cU: 1,cV: 1,cW: 1,cX: 1,cY: 1,cZ: 1,da: 1,db: 1,dc: 1,dd: 1,de: 1,df: 1,dg: 1,dh: 1,di: 1,dj: 1,dk: 1,dl: 1,dm: 1,dn: 1,do: 1,dp: 1,dq: 1,dr: 1,ds: 1,dt: 1,du: 1,dv: 1,dw: 1,dx: 1,dy: 1,dz: 1,dA: 1,dB: 1,dC: 1,dD: 1,dE: 1,dF: 1,dG: 1,dH: 1,dI: 1,dJ: 1,dK: 1,dL: 1,dM: 1,dN: 1,dO: 1,dP: 1,dQ: 1,dR: 1,dS: 1,dT: 1,dU: 1,dV: 1,dW: 1,dX: 1,dY: 1,dZ: 1,ea: 1,eb: 1,ec: 1,ed: 1,ee: 1,ef: 1,eg: 1,eh: 1,ei: 1,ej: 1,ek: 1,el: 1,em: 1,en: 1,eo: 1,ep: 1,eq: 1,er: 1,es: 1,et: 1,eu: 1,ev: 1,ew: 1,ex: 1,ey: 1,ez: 1,eA: 1,eB: 1,eC: 1,eD: 1,eE: 1,eF: 1,eG: 1,eH: 1,eI: 1,eJ: 1,eK: 1,eL: 1,eM: 1,eN: 1,eO: 1}}}}}}) (b (list{} ))) b)
+                    (ok (+ 1 1))
+                )
+            )
+            (poc2 42)"#,
+            " a".repeat(copies)
+        )
+    }
+
+    #[test]
+    fn wide_tuple_read_many_times_stays_loadable() {
+        let snippet = poc2_source(100);
+
+        // The interpreter and the compiler agree on the result.
+        crosscheck(
+            &snippet,
+            Ok(Some(Value::okay(Value::Int(2)).expect("ok response"))),
+        );
+
+        // And the emitted module loads.
+        let mut compiled = compile(
+            &snippet,
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::from_literal("poc2"),
+            ),
+            LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+            &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+            true,
+        )
+        .expect("poc2 compiles");
+        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+            .expect("wasmtime loads the module");
+
+        // The measured peak is far under wasmtime's 50,000-locals limit: the
+        // binding lives once and every read reuses the same slots. Before
+        // scoped local reuse the same source peaked at ~51,800.
+        let peak = compiled
+            .locals_report
+            .max_live_locals
+            .values()
+            .max()
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            peak < 10_000,
+            "poc2 at 100 copies peaks at {peak} live locals"
+        );
+    }
+
+    #[test]
+    fn more_simultaneous_bindings_than_wasmtime_allows_still_compiles() {
+        // 60,000 bindings live in one scope must keep compiling: the refusal
+        // of the emitted module is the runtime's, and nano-conformance's
+        // `engine_failure.rs` gates on it staying that way.
+        let bindings = (0..60_000_u32)
+            .map(|index| format!("(a{index} u1)"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let snippet = format!("(define-public (f) (ok (let ({bindings}) a0)))");
+        let compiled = compile(
+            &snippet,
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::from_literal("wide-let"),
+            ),
+            LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+            &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+            true,
+        )
+        .expect("a let wider than wasmtime's locals limit still compiles");
+
+        // The bindings are all live in one scope, so the measurement sees
+        // the peak the runtime will refuse at load.
+        let peak = compiled.locals_report.max_live_locals["f"];
+        assert!(
+            peak > 50_000,
+            "60,000 live bindings should measure past wasmtime's limit, got {peak}"
         );
     }
 
