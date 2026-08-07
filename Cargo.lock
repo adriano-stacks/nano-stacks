@@ -6063,6 +6063,7 @@ dependencies = [
  "nano-vm",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
  "wasmprinter",
 ]

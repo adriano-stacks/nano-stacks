@@ -150,6 +150,27 @@ impl TrieStorage {
         Self::open_with_journal(path, true)
     }
 
+    /// Open a store that is already there, writing nothing to the filesystem.
+    ///
+    /// Not merely `SQLITE_OPEN_READ_ONLY`: a read-only connection to a WAL
+    /// database still creates the `-shm` wal-index beside it, and a command that
+    /// says it is reading must leave a state exactly as it found it. `immutable=1`
+    /// takes no lock and builds no index, which is sound only because
+    /// [`crate::refuse_uncommitted`] has already refused a database whose journal
+    /// still holds frames — an immutable read of one of those would answer with
+    /// pages nothing committed.
+    pub(crate) fn open_existing(path: &Path) -> Result<Self, MarfError> {
+        let connection = Connection::open_with_flags(
+            crate::immutable_uri(path),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        connection.execute_batch(
+            "PRAGMA cache_size = -2000000;
+             PRAGMA temp_store = MEMORY;",
+        )?;
+        Ok(Self::with_caches(connection))
+    }
+
     /// Open a store that is about to be written in one enormous transaction.
     ///
     /// A checkpoint import is a single write of the whole trie graph, and under
@@ -192,14 +213,18 @@ impl TrieStorage {
 
     fn from_connection(connection: Connection) -> Result<Self, MarfError> {
         connection.execute_batch(SCHEMA)?;
-        Ok(Self {
+        Ok(Self::with_caches(connection))
+    }
+
+    fn with_caches(connection: Connection) -> Self {
+        Self {
             connection,
             nodes: RefCell::new(Cache::new(NODE_CACHE)),
             node_hashes: RefCell::new(Cache::new(NODE_CACHE)),
             blocks: RefCell::new(Cache::new(BLOCK_CACHE)),
             hashes: RefCell::new(Cache::new(BLOCK_CACHE)),
             staging: std::cell::Cell::new(false),
-        })
+        }
     }
 
     /// The sealed state with the greatest height, which is where a reopened

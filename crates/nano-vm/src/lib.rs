@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -1172,6 +1172,17 @@ impl BurnStateDB for BitcoinContext {
     }
 }
 
+/// Whether a state directory is being run on or only looked at.
+///
+/// A diagnostic that says it is reading has to leave the filesystem alone, so
+/// this decides how every connection into the state is opened rather than
+/// relying on nothing happening to call a write.
+#[derive(Clone, Copy)]
+enum Access {
+    Writable,
+    ReadOnly,
+}
+
 /// Epoch 4 Clarity execution over a versioned MARF-backed store.
 #[derive(Debug)]
 pub struct Vm {
@@ -1210,6 +1221,18 @@ impl Vm {
         Ok(Self::over(MarfStore::open(network, directory)?))
     }
 
+    /// Open a chainstate that is already in `directory`, for reading only.
+    ///
+    /// See [`MarfStore::open_existing`]. A block may still be opened on the tip
+    /// and aborted — that is how a contract is compiled or a Clarity read is
+    /// answered — but nothing it writes can reach the disk.
+    pub fn open_existing(directory: impl AsRef<Path>) -> Result<Self, MarfStoreError> {
+        Ok(Self::assemble_over(
+            MarfStore::open_existing(directory)?,
+            Access::ReadOnly,
+        ))
+    }
+
     /// Open a durable chainstate, importing `checkpoint` the first time only.
     pub fn open_from_checkpoint(
         network: Network,
@@ -1228,21 +1251,33 @@ impl Vm {
     }
 
     fn over(store: MarfStore) -> Self {
+        Self::assemble_over(store, Access::Writable)
+    }
+
+    fn assemble_over(store: MarfStore, access: Access) -> Self {
         // The context answers header reads from the same file the store writes
         // them to, through a connection of its own because the two are
         // borrowed at once while Clarity runs.
         let store_network = store.network();
         let mainnet = store_network.is_mainnet();
-        let headers_db = store
-            .side_store_path()
-            .and_then(|path| rusqlite::Connection::open(path).ok())
-            .map(Mutex::new);
-        let index_db = store
-            .marf_path()
-            .and_then(|path| rusqlite::Connection::open(path).ok())
-            .map(Mutex::new);
+        let connect = |path: PathBuf| match access {
+            Access::Writable => rusqlite::Connection::open(path).ok(),
+            Access::ReadOnly => rusqlite::Connection::open_with_flags(
+                nano_marf::immutable_uri(&path),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .ok(),
+        };
+        let headers_db = store.side_store_path().and_then(connect).map(Mutex::new);
+        let index_db = store.marf_path().and_then(connect).map(Mutex::new);
         Self {
-            modules: native_module_cache(store.side_store_path().as_deref()),
+            // A read-only VM keeps its compiled modules in memory: the on-disk
+            // cache is a directory this would otherwise create inside the state
+            // it promised not to touch.
+            modules: match access {
+                Access::Writable => native_module_cache(store.side_store_path().as_deref()),
+                Access::ReadOnly => ModuleCache::default(),
+            },
             store,
             context: BitcoinContext {
                 mainnet,
@@ -2108,6 +2143,14 @@ pub enum MarfStoreError {
     /// stopped early -- and the message has to be actionable rather than a
     /// backtrace.
     IncoherentState(String),
+    /// A directory asked to be inspected that is not a chainstate: it is not
+    /// there, it holds no databases, or the databases it holds say nothing.
+    ///
+    /// Separate from [`Self::IncoherentState`], which is a real state that is
+    /// short of something. This one is an *input* error, and it exists because
+    /// the alternative — creating the state and truthfully reporting that the
+    /// new store holds no value — is a wrong answer that reads like a right one.
+    NotAState(String),
     /// A state directory opened as a chain other than the one it was created
     /// for. Refused, because executing on it would fork: the boot address sits
     /// inside every principal a block writes and the identifier is what
@@ -2121,6 +2164,9 @@ impl std::fmt::Display for MarfStoreError {
             Self::Marf(error) => write!(formatter, "MARF error: {error}"),
             Self::IncoherentState(detail) => {
                 write!(formatter, "this state directory is not whole: {detail}")
+            }
+            Self::NotAState(detail) => {
+                write!(formatter, "this is not a state directory: {detail}")
             }
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
@@ -2206,6 +2252,59 @@ impl MarfStore {
             ))
         })?;
         Ok(Self::assemble(network, marf, side_store, tip))
+    }
+
+    /// Open a state that is already in `directory`, for reading only.
+    ///
+    /// Nothing here creates: not the directory, not either database, not the
+    /// chain-identity row, not an `engine_identity` row. [`Self::open`] does all
+    /// four, which is right for a node and wrong for a diagnostic — a mistyped
+    /// path there becomes a new empty store that answers every question with an
+    /// absence, and an absence from the wrong directory is indistinguishable from
+    /// an absence in the right one.
+    ///
+    /// The network is read out of the state rather than supplied, because there
+    /// is no safe default: naming the wrong chain does not fail, it answers with
+    /// different boot principals.
+    pub fn open_existing(directory: impl AsRef<Path>) -> Result<Self, MarfStoreError> {
+        let directory = directory.as_ref();
+        if !directory.is_dir() {
+            return Err(MarfStoreError::NotAState(format!(
+                "{} is not a directory",
+                directory.display()
+            )));
+        }
+        let marf_path = directory.join(MARF_FILE);
+        let clarity_path = directory.join(CLARITY_FILE);
+        for path in [&marf_path, &clarity_path] {
+            if !path.is_file() {
+                return Err(MarfStoreError::NotAState(format!(
+                    "{} holds no {}",
+                    directory.display(),
+                    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+                )));
+            }
+        }
+        UnfinishedImport::refuse(directory)?;
+        let marf = VersionedMarf::open_existing(&marf_path)?;
+        nano_marf::refuse_uncommitted(&clarity_path)?;
+        let side_store = open_side_store_existing(&clarity_path)?;
+        let network = stored_network(&side_store).ok_or_else(|| {
+            MarfStoreError::NotAState(format!(
+                "{} names no chain, so nothing can be read out of it without guessing one",
+                clarity_path.display()
+            ))
+        })?;
+        let tip = marf.verify_tip().map_err(|error| {
+            MarfStoreError::IncoherentState(format!("{}: {error}", marf_path.display()))
+        })?;
+        let tip = tip.ok_or_else(|| {
+            MarfStoreError::NotAState(format!(
+                "{} is sealed at no block, so it holds no state to read",
+                marf_path.display()
+            ))
+        })?;
+        Ok(Self::assemble(network, marf, side_store, Some(tip)))
     }
 
     /// Load a checkpointed Clarity MARF and its corresponding `SQLite` side tables.
@@ -3260,6 +3359,22 @@ fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
     open_side_store_with_journal(path, true)
+}
+
+/// The side store of a state being read rather than run, creating nothing.
+///
+/// No schema either: a database missing one of these tables is a database that
+/// is not a side store, and saying that is the whole point of this path.
+fn open_side_store_existing(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    let connection = rusqlite::Connection::open_with_flags(
+        nano_marf::immutable_uri(path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    connection.execute_batch(
+        "PRAGMA cache_size = -1000000;
+         PRAGMA temp_store = MEMORY;",
+    )?;
+    Ok(connection)
 }
 
 /// The side store while a checkpoint is being imported into it.

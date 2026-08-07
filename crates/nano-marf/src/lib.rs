@@ -13,6 +13,51 @@ pub use provenance::{
 };
 use storage::{BlockRecord, TrieStorage};
 
+/// A `SQLite` URI that opens `path` immutably: no lock, no `-shm`, no `-wal`.
+///
+/// `SQLite` decodes `%XX` inside a URI path, so the three characters that would
+/// otherwise be read as URI syntax are the three that have to be written back as
+/// escapes. A path byte that is not ASCII is escaped too, because the URI is a
+/// `str` and the path is not required to be one.
+#[must_use]
+pub fn immutable_uri(path: &Path) -> String {
+    use fmt::Write as _;
+
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        match byte {
+            b'%' | b'?' | b'#' => write!(uri, "%{byte:02x}").expect("a string write cannot fail"),
+            other if other.is_ascii() => uri.push(char::from(*other)),
+            other => write!(uri, "%{other:02x}").expect("a string write cannot fail"),
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
+/// Refuse a database whose journal still holds frames nothing has folded in.
+///
+/// Reading such a database immutably would skip those frames and answer with
+/// pages the writer has already superseded — a plausible wrong answer, which is
+/// worse than no answer. A non-empty `-wal` or `-journal` means a node owns this
+/// state right now or was killed while it did, and either way the honest reply is
+/// to say so.
+pub fn refuse_uncommitted(path: &Path) -> Result<(), MarfError> {
+    for suffix in ["-wal", "-journal"] {
+        let mut journal = path.as_os_str().to_os_string();
+        journal.push(suffix);
+        let journal = Path::new(&journal);
+        if journal.metadata().is_ok_and(|data| data.len() > 0) {
+            return Err(MarfError::Storage(format!(
+                "{} holds pages nothing has committed: a node is running on this state, or was \
+                 killed while it was. Stop it and let it close, then read.",
+                journal.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The 40-byte value stored in a MARF leaf.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MarfValue([u8; 40]);
@@ -933,6 +978,20 @@ impl VersionedMarf {
     /// Open, creating if absent, the MARF held in `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MarfError> {
         Ok(Self::from_storage(TrieStorage::open(path.as_ref())?))
+    }
+
+    /// Open a MARF that is already there, creating and writing nothing.
+    ///
+    /// Every write on the result fails rather than being silently dropped, which
+    /// is what makes this safe to hand to a diagnostic that opens a block and
+    /// aborts it: the in-memory version it builds never reaches the file.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, MarfError> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(MarfError::Storage(format!("{} is not there", path.display())));
+        }
+        refuse_uncommitted(path)?;
+        Ok(Self::from_storage(TrieStorage::open_existing(path)?))
     }
 
     pub(crate) const fn from_storage(storage: TrieStorage) -> Self {

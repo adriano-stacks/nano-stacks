@@ -991,6 +991,17 @@ impl ChainState {
         })
     }
 
+    /// Open chainstate that is already in `directory`, for reading only.
+    ///
+    /// The chain comes from the state rather than from the caller, and nothing
+    /// is created: see [`Vm::open_existing`].
+    pub fn open_existing(directory: impl AsRef<Path>) -> Result<Self, ChainStateError> {
+        Ok(Self {
+            vm: Vm::open_existing(directory)?,
+            ledger: ChainLedger::default(),
+        })
+    }
+
     /// Open chainstate from a checkpointed Clarity MARF.
     pub fn from_checkpoint(
         network: Network,

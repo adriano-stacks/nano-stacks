@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nano_conformance::{FixtureManifest, FixtureStatus, scoreboard_at, validate_fixture_tree};
+use nano_conformance::{FixtureManifest, FixtureStatus, validate_fixture_tree};
 // The maturity window comes from the node's own crate rather than being restated
 // here: the export refuses a window shorter than it, and a copy that drifted
 // would write a checkpoint the node it is for cannot pay from.
@@ -46,14 +46,27 @@ fn state_network(chainstate: &Path) -> Network {
         .map_or(Network::MAINNET, Network::from_chain_id)
 }
 
-/// Open a state directory's VM as the chain the state itself names.
+/// Open a state directory's VM to look at it, creating and writing nothing.
+///
+/// The route every inspection takes. `Vm::open` would create the directory, both
+/// databases, a chain-identity row naming whatever network was assumed and an
+/// `engine_identity` row — so a mistyped path there does not fail, it answers,
+/// and it answers with an absence that looks exactly like a real one.
 fn open_state_vm(chainstate: &Path) -> Result<nano_vm::Vm, nano_vm::MarfStoreError> {
-    nano_vm::Vm::open(state_network(chainstate), chainstate)
+    nano_vm::Vm::open_existing(chainstate)
 }
 
-/// Open a state directory's Clarity store as the chain the state itself names.
+/// Open a state directory's Clarity store to look at it, creating nothing.
 fn open_state_store(chainstate: &Path) -> Result<nano_vm::MarfStore, nano_vm::MarfStoreError> {
-    nano_vm::MarfStore::open(state_network(chainstate), chainstate)
+    nano_vm::MarfStore::open_existing(chainstate)
+}
+
+/// Open a state directory's VM to *change* it, as the chain the state names.
+///
+/// Kept apart from [`open_state_vm`] and named for what it does: the commands
+/// that repair, import or backfill are the only ones allowed through here.
+fn open_state_vm_for_writing(chainstate: &Path) -> Result<nano_vm::Vm, nano_vm::MarfStoreError> {
+    nano_vm::Vm::open(state_network(chainstate), chainstate)
 }
 
 fn main() -> ExitCode {
@@ -92,8 +105,25 @@ fn main() -> ExitCode {
             rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
         }
         _ => {
+            // Split by what they do to a state directory, because that is the
+            // distinction an operator has to get right: the readers refuse a path
+            // that is not already a state, and the writers create one.
             eprintln!(
-                "usage: cargo xtask <scoreboard|release-report|validate-fixtures|capture-fixtures|freeze-receipts|compiler-identity|public-key|verify-block|decode-blocks|check-module|rebuild-accounting|repair-ledger|export-headers|import-headers|export-leader-keys|export-sortition|block-info|probe-root|call-both|call-both-tx|state-value|snapshot-state|heal-contracts>"
+                "usage: cargo xtask <command>\n\
+                 \n\
+                 reads a state directory, creating and changing nothing:\n\
+                 \x20 block-info  call-both  call-both-tx  check-module  eval  probe-header\n\
+                 \x20 probe-root  state-value\n\
+                 \n\
+                 writes to a state directory, creating one if it is not there:\n\
+                 \x20 backfill-header  heal-contracts  import-headers  rebuild-accounting\n\
+                 \x20 repair-ledger\n\
+                 \n\
+                 reads or writes elsewhere:\n\
+                 \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
+                 \x20 export-leader-keys  export-sortition  freeze-receipts  public-key\n\
+                 \x20 release-report  scoreboard  snapshot-state  validate-fixtures\n\
+                 \x20 verify-block"
             );
             ExitCode::from(2)
         }
@@ -174,7 +204,8 @@ fn eval_in_state(arguments: &[String]) -> ExitCode {
     let [state, source] = arguments else {
         eprintln!(
             "usage: cargo xtask eval <state-dir> <clarity-expression>\n\
-             the node must not be running: it holds the state open"
+             reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
         );
         return ExitCode::FAILURE;
     };
@@ -213,6 +244,7 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
     let [state, peer, block] = arguments else {
         eprintln!(
             "usage: cargo xtask backfill-header <state-dir> <peer-url> <block-id>\n\
+             writes to the state, and creates one if the path is not already there\n\
              the node must not be running: it holds the state open"
         );
         return ExitCode::FAILURE;
@@ -251,7 +283,7 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
         }
     };
 
-    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm_for_writing(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
@@ -367,7 +399,8 @@ fn block_info(arguments: &[String]) -> ExitCode {
     let [state, height] = arguments else {
         eprintln!(
             "usage: cargo xtask block-info <state-dir> <stacks-height>\n\
-             the node must not be running: it holds the state open"
+             reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
         );
         return ExitCode::from(2);
     };
@@ -493,11 +526,12 @@ fn import_headers(arguments: &[String]) -> ExitCode {
     let [state, export] = arguments else {
         eprintln!(
             "usage: cargo xtask import-headers <state-dir> <block-headers.sqlite>\n\
+             writes to the state, and creates one if the path is not already there\n\
              the node must not be running: it holds the state open"
         );
         return ExitCode::from(2);
     };
-    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm_for_writing(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error}");
@@ -1171,7 +1205,8 @@ fn probe_header(arguments: &[String]) -> ExitCode {
     let [state, block] = arguments else {
         eprintln!(
             "usage: cargo xtask probe-header <state-dir> <block-id>\n\
-             the node must not be running: it holds the state open"
+             reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
         );
         return ExitCode::FAILURE;
     };
@@ -2906,7 +2941,8 @@ fn check_module(arguments: &[String]) -> ExitCode {
             eprintln!(
                 "usage: cargo xtask check-module <state-dir> <contract-id> [clarity-version] [source-file]\n\
                  without either the state's own version and source are used\n\
-                 the node must not be running: it holds the state open"
+                 reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
             );
             return ExitCode::FAILURE;
         }
@@ -3109,7 +3145,8 @@ fn state_value(arguments: &[String]) -> ExitCode {
     let [state, block, key] = arguments else {
         eprintln!(
             "usage: cargo xtask state-value <state-dir> <block-id|tip> <clarity-key>\n\
-             the node must not be running: it holds the state open"
+             reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
         );
         return ExitCode::FAILURE;
     };
@@ -3441,7 +3478,7 @@ fn probe_root(arguments: &[String]) -> ExitCode {
     // the real one — sealing to a stand-in gives a root that cannot be compared
     // with anything. Each attempt therefore rolls its block back.
     let seal = |omit: Option<&str>| -> Option<[u8; 32]> {
-        let mut marf = nano_marf::VersionedMarf::open(&marf_path).ok()?;
+        let mut marf = nano_marf::VersionedMarf::open_existing(&marf_path).ok()?;
         // The node executes under a placeholder identifier and renames the
         // block when it seals, so the identifier the trie carries during
         // execution is that placeholder, not the block's own.
@@ -3647,7 +3684,7 @@ fn open_state_as_the_node_left_it(
     // The chain the state names, not an assumption: a diagnostic opened as the
     // wrong network reads different boot principals and answers a different
     // `(chain-id)`, which is exactly the confusion these tools exist to remove.
-    let mut chain = nano_chainstate::ChainState::open(state_network(directory), directory)
+    let mut chain = nano_chainstate::ChainState::open_existing(directory)
         .map_err(|error| format!("cannot open the state: {error:?}"))?;
     if let Some(tip) = chain.tip() {
         chain
@@ -3851,11 +3888,14 @@ fn ask_both_engines_about(
 /// nothing here moves a state root.
 fn heal_contracts(state: Option<&str>) -> ExitCode {
     let Some(state) = state else {
-        eprintln!("usage: cargo xtask heal-contracts <state-dir>\n\
-                   the node must not be running: it holds the state open");
+        eprintln!(
+            "usage: cargo xtask heal-contracts <state-dir>\n\
+             writes to the state, and creates one if the path is not already there\n\
+             the node must not be running: it holds the state open"
+        );
         return ExitCode::FAILURE;
     };
-    let mut vm = match open_state_vm(&Path::new(state).join("chainstate")) {
+    let mut vm = match open_state_vm_for_writing(&Path::new(state).join("chainstate")) {
         Ok(vm) => vm,
         Err(error) => {
             eprintln!("cannot open the state: {error:?}");
