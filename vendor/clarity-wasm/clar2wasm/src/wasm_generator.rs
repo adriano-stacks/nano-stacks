@@ -3236,6 +3236,30 @@ fn count_in_memory_space(ty: &TypeSignature) -> u32 {
     }
 }
 
+/// Whether a function body can switch the sender, and so needs the prologue that
+/// records the principal stacks' depth.
+///
+/// Conservative on purpose, and the asymmetry is the whole design: a wrong `true`
+/// costs two locals and two calls, while a wrong `false` lets a switched sender
+/// escape a function and be inherited by whatever runs next -- which is mainnet
+/// block 8,668,161, where a function that `asserts!` its way out of `as-contract`
+/// was called twice by `map` and the second call transferred to itself.
+///
+/// So this asks only whether the *name* appears anywhere in the body's tree,
+/// including inside `let` bodies, branches and arguments. It does not try to decide
+/// whether the call is reachable, and it does not follow calls into other functions:
+/// `as-contract` switches the sender for the dynamic extent of its own body, which
+/// ends before any callee's postlude runs, so a callee cannot leak into its caller.
+fn body_contains_as_contract(body: &SymbolicExpression) -> bool {
+    match &body.expr {
+        SymbolicExpressionType::Atom(name) => name.as_str() == "as-contract",
+        SymbolicExpressionType::List(expressions) => {
+            expressions.iter().any(body_contains_as_contract)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -3763,29 +3787,5 @@ mod tests {
                 evaluate("(ok false)"),
             );
         }
-    }
-}
-
-/// Whether a function body can switch the sender, and so needs the prologue that
-/// records the principal stacks' depth.
-///
-/// Conservative on purpose, and the asymmetry is the whole design: a wrong `true`
-/// costs two locals and two calls, while a wrong `false` lets a switched sender
-/// escape a function and be inherited by whatever runs next -- which is mainnet
-/// block 8,668,161, where a function that `asserts!` its way out of `as-contract`
-/// was called twice by `map` and the second call transferred to itself.
-///
-/// So this asks only whether the *name* appears anywhere in the body's tree,
-/// including inside `let` bodies, branches and arguments. It does not try to decide
-/// whether the call is reachable, and it does not follow calls into other functions:
-/// `as-contract` switches the sender for the dynamic extent of its own body, which
-/// ends before any callee's postlude runs, so a callee cannot leak into its caller.
-fn body_contains_as_contract(body: &SymbolicExpression) -> bool {
-    match &body.expr {
-        SymbolicExpressionType::Atom(name) => name.as_str() == "as-contract",
-        SymbolicExpressionType::List(expressions) => {
-            expressions.iter().any(body_contains_as_contract)
-        }
-        _ => false,
     }
 }
