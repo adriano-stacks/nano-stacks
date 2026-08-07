@@ -60,6 +60,7 @@ mod p2p_inbound;
 mod p2p_relay;
 mod p2p_wire;
 mod peer_equivocation;
+mod pox_boundary;
 mod pox_five_replay;
 mod pre_checkpoint_headers;
 mod pox_locking;

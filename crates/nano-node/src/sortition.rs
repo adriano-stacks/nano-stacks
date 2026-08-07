@@ -121,14 +121,6 @@ pub struct SortitionTracker {
     /// snapshot of. Without them the window is short and the winner is not the
     /// one the network picked.
     primed: bool,
-    /// Whether the cycle opening at a burn height selected a `PoX` anchor block.
-    ///
-    /// Keyed by the burn height the cycle *opens* at, and answered by whoever holds
-    /// the executed state — this chain cannot know it, which is why it used to
-    /// refuse to cross a boundary at all rather than guess. A consensus hash mixes
-    /// the `PoX` history, so a guessed bit derives a wrong hash for every block
-    /// after it, silently.
-    anchors: std::collections::BTreeMap<u64, bool>,
 }
 
 impl SortitionTracker {
@@ -143,7 +135,6 @@ impl SortitionTracker {
             pox_id,
             keys: LeaderKeys::new(),
             primed: false,
-            anchors: std::collections::BTreeMap::new(),
         })
     }
 
@@ -164,23 +155,6 @@ impl SortitionTracker {
                     .map_err(|_| TrackerError::Seed("a consensus hash is not 20 bytes".to_owned()))
             })
             .collect()
-    }
-
-    /// Say whether the cycle opening at a burn height selected a `PoX` anchor block.
-    ///
-    /// The one fact this chain cannot derive for itself: the anchor is chosen in the
-    /// *previous* cycle's prepare phase, out of executed Stacks state, and this chain
-    /// holds Bitcoin blocks. Told rather than guessed, and told before the walk
-    /// reaches the boundary — a bit decided afterwards is already too late for the
-    /// consensus hash that mixed it.
-    pub fn decide_anchor(&mut self, opens_at: u64, selected: bool) {
-        self.anchors.insert(opens_at, selected);
-    }
-
-    /// Whether anything has decided the bit for the cycle opening at a burn height.
-    #[must_use]
-    pub fn anchor_decided(&self, opens_at: u64) -> bool {
-        self.anchors.contains_key(&opens_at)
     }
 
     /// The snapshot this chain is standing on.
@@ -350,26 +324,34 @@ impl SortitionTracker {
         block: &BitcoinBlock,
         payouts: PayoutSchedule,
     ) -> Result<&SortitionSnapshot, TrackerError> {
-        // A reward cycle opening adds a bit to the `PoX` history, and the
-        // consensus hash mixes that history — so a chain that carried the seed's
-        // vector across a boundary would derive a wrong hash for every block
-        // after it. Whether the new cycle chose an anchor block is not something
-        // this node can answer yet, and assuming it did is a guess the consensus
-        // hash would silently encode.
+        // A reward cycle opening adds a bit to the `PoX` history, and the consensus
+        // hash mixes that history, so getting this wrong derives a wrong hash for
+        // every block after it and reports nothing.
+        //
+        // In Nakamoto the bit is one. Not because every history seen so far happens
+        // to be all ones -- mainnet's 142, hacknet's 21, this repository's capture
+        // going 20, 21, 22, 23, 24, 25 across its five boundaries -- but because
+        // epoch 3.0 onwards has no code path that writes a zero.
+        // `load_nakamoto_reward_set` builds exactly one status,
+        // `PoxAnchorBlockStatus::SelectedAndKnown`
+        // (`nakamoto/coordinator/mod.rs:543`), so `is_reward_info_known` is
+        // unconditionally true and `make_next_pox_id` unconditionally calls
+        // `extend_with_present_block`. Its own comment says why: "In Nakamoto, every
+        // reward cycle _must_ have a PoX anchor block; otherwise, the chain halts."
+        // The alternative that does exist there is `Ok(None)` -- the anchor is not
+        // processed *yet* -- and that is a wait, not a zero.
+        //
+        // `NotSelected` and `SelectedAndUnknown` are reachable only through the
+        // epoch-2.x path and the first cycle of epoch 3.0, which a node that starts
+        // at or after the 4.0 boundary can never be asked about.
+        //
+        // So this is the epoch-4.0 rule rather than a guess, and it is checked
+        // rather than asserted: `pox_boundary` derives forward across the capture's
+        // five boundaries and compares every sortition identifier and consensus hash
+        // with what stacks-core wrote. A wrong bit changes the identifier at the
+        // first boundary and every block after it.
         if payouts.starts_reward_cycle(block.height) {
-            // Answered by the caller, which holds the executed state this cannot see,
-            // or refused. Refusing is still the behaviour where nobody has decided:
-            // assuming the bit is what the histories seen so far happen to hold would
-            // encode a guess in every consensus hash after it.
-            let Some(selected) = self.anchors.get(&block.height).copied() else {
-                return Err(TrackerError::Seed(format!(
-                    "burn {} opens a reward cycle, which adds a bit to the PoX history \
-                     the consensus hash mixes, and nothing has said whether that cycle \
-                     chose an anchor block",
-                    block.height
-                )));
-            };
-            self.pox_id.extend_with_anchor(selected);
+            self.pox_id.extend_with_anchor(true);
         }
         self.register_keys(block);
         let commitments =
@@ -545,24 +527,26 @@ impl SortitionTracker {
             // saved states the seed exactly, and the recovery below is a
             // capture's fallback that holds only because a capture whose seed
             // elected nobody is refused when it is loaded.
-            if height == tip && self.tip().winner_vrf_seed.is_none() {
-                match unanimous_winner_seed(&block) {
-                    Some(seed) => {
-                        self.engine.adopt_root_winner_seed(seed);
-                    }
-                    // The seed said this block elected somebody, so its
-                    // commitments should have agreed on the seed that winner
-                    // carried. When they do not there is no telling which of them
-                    // won, and every sortition after this one is sampled against a
-                    // zero seed — which names miners that did not win, and only
-                    // shows up as their tenures' proofs being refused.
-                    None => eprintln!(
-                        "the sortition seed at burn {height} says its block elected somebody, \
-                         but its commitments do not agree on the seed that winner carried, so \
-                         this node cannot recover the seed the next sortition mixes and will \
-                         sample against zero"
-                    ),
-                }
+            if height == tip
+                && self.tip().winner_vrf_seed.is_none()
+                && let Some(winner) = self.tip().winner_txid
+            {
+                // Refused rather than reported. Sampling the next sortition against
+                // a zero seed names miners that did not win, and the only sign of
+                // it is their tenures' coinbase proofs being refused hundreds of
+                // blocks later — a chain derived from a seed nobody can name is not
+                // a rougher answer, it is a different one.
+                let seed = winner_seed(&block, winner).ok_or_else(|| {
+                    TrackerError::Seed(format!(
+                        "the sortition seed at burn {height} says commitment {} won, and \
+                         neither that commitment nor an agreement between the block's \
+                         eligible ones says which VRF seed it carried -- so the seed the \
+                         next sortition mixes cannot be recovered. A checkpoint has to \
+                         carry `winner_vrf_seed` for a seed row that elected somebody.",
+                        hex::encode(winner)
+                    ))
+                })?;
+                self.engine.adopt_root_winner_seed(seed);
             }
             let commitments =
                 commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
@@ -679,6 +663,31 @@ impl nano_sync::BurnView for SortitionTracker {
 /// lets a checkpoint's seed snapshot recover the winning seed it does not record,
 /// which the sampling of the block after it reads. Candidates that disagree give
 /// nothing: there is no telling which of them won.
+/// The VRF seed the block's *winning* commitment carried.
+///
+/// A capture's seed row names the winner by txid, and that commitment's own
+/// `new_seed` is the seed the next sortition mixes — exact, and needing no
+/// agreement between candidates to read. The mainnet capture this repository
+/// carries has a seed block whose eligible commitments disagree, so requiring
+/// unanimity gave up on a question the row had already answered.
+///
+/// Unanimity stays as the fallback for the block whose winning transaction this
+/// node did not decode as an on-time commitment: see [`unanimous_winner_seed`].
+fn winner_seed(block: &BitcoinBlock, winner_txid: [u8; 32]) -> Option<[u8; 32]> {
+    block
+        .operations
+        .iter()
+        .find_map(|operation| match &operation.kind {
+            BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }
+                if operation.txid == winner_txid =>
+            {
+                Some(*new_seed)
+            }
+            _ => None,
+        })
+        .or_else(|| unanimous_winner_seed(block))
+}
+
 fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
     let mut seeds = block.operations.iter().filter_map(|operation| {
         match &operation.kind {
@@ -1360,11 +1369,12 @@ mod tests {
 
 #[cfg(test)]
 mod anchor_tests {
-    use nano_sortition::{PayoutSchedule, RewardCycleSchedule};
+    use nano_bitcoin::BitcoinBlock;
+    use nano_sortition::{PayoutSchedule, PoxId, RewardCycleSchedule};
 
     use super::tests::a_chain;
 
-    /// A cycle length of ten from burn zero, so 100 and 110 both open one.
+    /// A cycle length of ten from burn zero, so 111 and 121 both open one.
     fn payouts() -> PayoutSchedule {
         PayoutSchedule::new(
             RewardCycleSchedule::new(0, 10, None).expect("a schedule"),
@@ -1373,40 +1383,49 @@ mod anchor_tests {
         .expect("a payout schedule")
     }
 
-    /// Crossing a reward cycle boundary needs a bit nobody had, and refusing was
-    /// the whole of the behaviour.
-    ///
-    /// A consensus hash mixes the `PoX` history, and the history gains a bit each
-    /// time a cycle opens: whether it selected an anchor block. The chain cannot know
-    /// it — the anchor is chosen out of executed Stacks state — so it stopped dead,
-    /// and a live follower would stop at cycle 141 the same way.
-    #[test]
-    fn a_boundary_is_refused_until_something_decides_the_anchor() {
-        let mut chain = a_chain();
-        // 111 and not 110: before the waterfall a cycle opens at offset 1.
-        let opening = 111;
-        assert!(!chain.anchor_decided(opening));
-        chain.decide_anchor(opening, true);
-        assert!(
-            chain.anchor_decided(opening),
-            "a decided bit is remembered, so the walk that follows can use it"
-        );
+    fn empty_block(height: u64) -> BitcoinBlock {
+        BitcoinBlock {
+            height,
+            hash: [u8::try_from(height % 251).unwrap_or(0); 32],
+            timestamp: 0,
+            operations: Vec::new(),
+        }
     }
 
-    /// And the refusal survives for the cycle nobody decided, which is the half that
-    /// keeps this honest: an undecided bit and a bit decided wrongly produce the same
-    /// wrong hash, and only one of them says so.
+    /// A boundary adds one bit, and a block that opens no cycle adds none.
+    ///
+    /// The chain used to refuse a boundary outright, because whether a cycle
+    /// selected an anchor block was a fact it could not derive. In epoch 4.0 there
+    /// is nothing to derive: `load_nakamoto_reward_set` builds only
+    /// `PoxAnchorBlockStatus::SelectedAndKnown`, so `make_next_pox_id` only ever
+    /// extends with the present-anchor bit, and the alternative stacks-core has is
+    /// to wait rather than to write a zero. See `advance`.
+    ///
+    /// What that is worth is checked where it can be: `pox_boundary` derives across
+    /// the capture's five boundaries and compares every sortition identifier and
+    /// consensus hash with what stacks-core wrote. This pins the arithmetic.
     #[test]
-    fn deciding_one_boundary_does_not_decide_the_next() {
+    fn a_boundary_adds_a_bit_and_nothing_else_does() {
         let mut chain = a_chain();
-        chain.decide_anchor(111, true);
-        assert!(chain.anchor_decided(111));
-        assert!(
-            !chain.anchor_decided(121),
-            "the next cycle's bit is a different fact and has to be decided too"
-        );
-        // The schedule this is measured against opens a cycle at both.
+        let before = chain.tip().pox_id.as_consensus_bytes().len();
         assert!(payouts().starts_reward_cycle(111));
         assert!(payouts().starts_reward_cycle(121));
+
+        // 111 and not 110: before the waterfall a cycle opens at offset 1.
+        let mut opened = 0;
+        for height in (chain.tip().bitcoin_height + 1)..=121 {
+            if payouts().starts_reward_cycle(height) {
+                opened += 1;
+            }
+            chain
+                .advance(&empty_block(height), payouts())
+                .expect("a boundary is crossed rather than refused");
+        }
+        assert!(opened >= 2, "the walk crosses more than one boundary");
+        assert_eq!(
+            chain.tip().pox_id,
+            PoxId::from_bits(vec![true; before + opened]),
+            "one bit per boundary crossed, no bit anywhere else, and every one of them set"
+        );
     }
 }

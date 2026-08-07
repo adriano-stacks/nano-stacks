@@ -1673,9 +1673,6 @@ where
                 return LocalView::Unreached { standing_on };
             }
         };
-        // Before the walk, not during it: a bit decided after the boundary is crossed
-        // is already too late for the consensus hash that mixed it.
-        self.decide_pox_anchors(pox, burnchain_tip);
         let Self {
             sortition: Some(tracker),
             bitcoin,
@@ -2495,61 +2492,6 @@ where
         let mut context = context;
         context.move_to_burn_block(self.bitcoin_height());
         self.chainstate.recorded_signer_set(context).ok()
-    }
-
-    /// Decide the `PoX` anchor bit for every cycle boundary between here and a burn
-    /// height, so the derived chain can cross them.
-    ///
-    /// A consensus hash mixes the `PoX` history, and the history gains a bit each
-    /// time a reward cycle opens: whether that cycle selected an anchor block. The
-    /// sortition chain cannot know it -- the anchor is chosen out of executed Stacks
-    /// state, and the chain holds Bitcoin blocks -- so it refused to cross a boundary
-    /// at all rather than guess, and a node stopped dead at the first one it met.
-    ///
-    /// This node does know it. A cycle's anchor block is what carries its reward set,
-    /// and that set is written into `.signers` during the *previous* cycle's prepare
-    /// phase, which this node executed. A cycle it recorded a signer set for selected
-    /// an anchor.
-    ///
-    /// Asked of the chainstate directly and not through
-    /// [`Self::recorded_signer_set`], which moves the context to the executor's own
-    /// burn height -- that wrapper answers "the cycle I am in", and the question here
-    /// is about a cycle ahead of it.
-    ///
-    /// Where nothing can be read, nothing is decided and the chain still refuses.
-    /// That is the honest half: an undecided bit and a bit decided wrongly give the
-    /// same wrong consensus hash, and only one of them says so.
-    fn decide_pox_anchors(&mut self, pox: &PoxInfo, up_to: u64) {
-        let Some(payouts) = payout_schedule(pox) else {
-            return;
-        };
-        let Some(from) = self.sortition.as_ref().map(|tracker| tracker.tip().bitcoin_height) else {
-            return;
-        };
-        for height in (from + 1)..=up_to {
-            if !payouts.starts_reward_cycle(height)
-                || self
-                    .sortition
-                    .as_ref()
-                    .is_some_and(|tracker| tracker.anchor_decided(height))
-            {
-                continue;
-            }
-            let mut context = pox.bitcoin_context();
-            context.move_to_burn_block(height);
-            let Ok(set) = self.chainstate.recorded_signer_set(context) else {
-                continue;
-            };
-            let selected = !set.entries().is_empty();
-            if let Some(tracker) = self.sortition.as_mut() {
-                println!(
-                    "the cycle opening at burn {height} selected an anchor block, as the {} \
-                     signers this node recorded for it say, so the PoX history gains a 1",
-                    set.entries().len()
-                );
-                tracker.decide_anchor(height, selected);
-            }
-        }
     }
 
     /// Return the most recently executed block.

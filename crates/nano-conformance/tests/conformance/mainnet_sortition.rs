@@ -25,23 +25,23 @@ use nano_sortition::{
 
 /// What a captured snapshot says, in the fields nano derives.
 #[derive(Debug, serde::Deserialize)]
-struct Captured {
-    block_height: u64,
-    burn_header_hash: String,
+pub struct Captured {
+    pub block_height: u64,
+    pub burn_header_hash: String,
     /// The burn block's header time, which Clarity reads as `burn-block-time`.
-    burn_header_timestamp: u64,
-    sortition_id: String,
-    consensus_hash: String,
-    sortition_hash: String,
-    ops_hash: String,
-    total_burn: String,
-    sortition: i64,
-    winning_block_txid: String,
+    pub burn_header_timestamp: u64,
+    pub sortition_id: String,
+    pub consensus_hash: String,
+    pub sortition_hash: String,
+    pub ops_hash: String,
+    pub total_burn: String,
+    pub sortition: i64,
+    pub winning_block_txid: String,
     /// stacks-core's `pox_payouts` column: `(addresses, amount-per-address)` as
     /// JSON, with the address list padded to the payout-output count. It is the
     /// archive's statement of the two Clarity-visible burn spends of a sortition —
     /// see `burn_spends.rs`.
-    pox_payouts: String,
+    pub pox_payouts: String,
 }
 
 impl Captured {
@@ -78,7 +78,7 @@ fn chain_from(root: &std::path::Path, genesis: &SortitionSnapshot) -> SnapshotCh
 /// A consensus hash mixes the ones at power-of-two offsets behind it, reaching
 /// back thousands of blocks, so without these a window can derive every other
 /// field and not this one.
-fn consensus_history(root: &std::path::Path) -> Option<Vec<ConsensusHash>> {
+pub fn consensus_history(root: &std::path::Path) -> Option<Vec<ConsensusHash>> {
     #[derive(serde::Deserialize)]
     struct History {
         hashes: Vec<String>,
@@ -199,7 +199,7 @@ fn report_operations(height: u64, block: &BitcoinBlock) {
 }
 
 /// The snapshot a replay starts from, taken from the capture as given.
-fn seed_from(genesis: &Captured) -> SortitionSnapshot {
+pub fn seed_from(genesis: &Captured) -> SortitionSnapshot {
     SortitionSnapshot {
         bitcoin_height: genesis.block_height,
         bitcoin_timestamp: genesis.burn_header_timestamp,
