@@ -252,6 +252,27 @@ structurally. The uncommitted broad pool-conversion sweep in the `agent/locals`
 worktree (remaining raw `module.locals.add` sites across word modules) is a
 possible follow-up commit, not required for the demonstrated fix.
 
+### The residual class is mainnet-reachable, and B must cover scalars
+(2026-08-07)
+
+Measured on the exact 60,000-binding `let` from `engine_failure.rs`: 708,925
+source bytes (under `MAX_BLOCK_LEN` = 2 MiB,
+`stacks-codec/src/transaction.rs:55`), interpreter deploys it and the call
+answers `(ok u1)`. Cost fits with wide margin (per-binding analysis is
+linear; even ~1,000 runtime/binding is 60M against the 5e9 block budget, and
+the deploy's write_length is the ~0.7 MB source against 15M). So the residual
+class is not theoretical: a miner could include it.
+
+Consequence for B's design: those are **scalar** locals — boxing large
+*composites* does not shrink a `let` with 60k uint bindings, and an
+all-live-and-used variant is constructible flatly (`(list a0 a1 … aN)`, no
+nesting-depth cap). Closing the class therefore needs more than composite
+boxing: use-based liveness for never-read bindings, a coalescing/linear-scan
+pass over the generated IR, or the upstream-suggested spill-to-memory with
+compile-time offsets. Note the gate interplay: a fix that makes the 60k-let
+loadable retires the manufactured refusal, so `engine_failure.rs` needs a new
+forcing case at that point (as this task already anticipated).
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
