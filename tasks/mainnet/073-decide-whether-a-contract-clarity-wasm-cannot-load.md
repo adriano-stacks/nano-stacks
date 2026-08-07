@@ -297,6 +297,27 @@ forcing case at that point (as this task already anticipated).
   The `engine_failure` gate needs a new manufactured refusal once B1 lands
   (an all-used-at-one-point binding set is the candidate shape).
 
+B1 implementation sketch: pre-pass per function body (and `.top-level`)
+walking the typed AST to compute, per lexically-bound name, its use count and
+last-use `SymbolicExpression` id. Then:
+
+- zero uses: `Let::traverse` still traverses the value expression (cost and
+  side effects) but `drop_value`s it instead of `save_to_locals` +
+  `bindings.insert`; collision checks still apply.
+- otherwise: release the binding's locals at the last read — inside
+  `visit_atom`, after the `local.get`s, when the atom's id is the recorded
+  last-use id. Sound because the gets have already executed in program order
+  and the copy-charge path (`clarity_value_size_on_stack`) re-saves from the
+  stack into its own slots.
+- `match` arm bindings get the same treatment; function parameters stay
+  live-for-body (few).
+- Gate consequence: with B1 the 60k-let compiles to a tiny module that
+  LOADS, retiring the current forcing case. The replacement: N ~25k uint
+  bindings all read inside one final `(list a0 … aN)` — all live at the list
+  construction point, so ~50k+ declared locals, still compiled by clar2wasm
+  and still refused by wasmtime. Pin with a test before flipping
+  `engine_failure.rs` over to it.
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
