@@ -210,6 +210,27 @@ execution.
         connections nobody accepted. A node that cannot answer while catching up
         cannot host a signer, and that is exactly when a signer asks.
 
+      **The rig now exports a sortition history, and the next defect is named.**
+      `cargo xtask export-sortition` writes the three files a chain seeds from, and
+      `signer-checkpoint.sh` calls it, so the rig is reproducible rather than
+      hand-built. The stock signer moved `RequestFailure(503)` →
+      `UnexpectedSortitionInfo` → routes answering `200`: it reads the content now
+      instead of having the request refused.
+
+      What stops it there is a real gap, stated exactly. **A derived sortition chain
+      only advances when execution asks it to.** The chain is walked forward to find
+      the burn view a staged block stands on — so a node sitting at the chain tip
+      with nothing to execute never derives its own tip's burn view, `snapshot_at`
+      answers nothing for it, and `/v3/sortitions` is `503` on a node that is
+      perfectly healthy and simply idle. That is exactly the condition a signer waits
+      in.
+
+      The fix is for the follower to walk its derived chain toward the burnchain tip
+      every round whether or not it has blocks to execute; a burn block is news to a
+      signer even when no Stacks block stands on it yet. Seeding further back is a
+      workaround and not one: it only defers the same question to the next quiet
+      period.
+
       What is still owed is the acceptance itself: a proposal arriving while the
       signer watches. This chain's miner is extending one tenure rather than starting
       new ones, so proposals are sparse; a chain still electing miners would produce
