@@ -70,10 +70,14 @@ Two independent pressures push the local count up, and both are nano's:
 - [ ] If a mainnet-valid contract cannot load, fix code generation so it does —
       no interpreter fallback, no healing path, no per-contract exception. Reuse
       of locals across disjoint scopes is the obvious lever and belongs upstream.
-- [ ] Keep the manufactured module-load refusal in `engine_failure.rs` working
+      **A shipped 2026-08-07 (see findings): the demonstrated witness class is
+      fixed. B (boxing large composites) remains for full generality.**
+- [x] Keep the manufactured module-load refusal in `engine_failure.rs` working
       whatever the fix is. A gate exercisable only while a divergence is open
       stops working the moment somebody closes one, and that gate is about the
-      *boundary*, not about this bug.
+      *boundary*, not about this bug. **Gate green on the merged A+G state,
+      unchanged; clar2wasm-side tests pin both halves (poc2@100 loads;
+      60k-binding let still compiles and is refused by the runtime).**
 - [ ] Record the outcome in the release report either way: a measured margin is
       evidence, "no mainnet block has hit it" is not.
 
@@ -218,6 +222,35 @@ contribution candidate as well.
   twice (`layout.rs:6-21`, `wasm_utils.rs:646-669`).
 - Mechanical blast radius: 74 `clar2wasm_ty` uses in 17 files, 46
   `save_to_locals` uses in 14 files.
+
+## A+G shipped (2026-08-07, merge 0cc14f60)
+
+A (scoped local reuse) and G (compile-time measurement) are merged to main.
+`save_to_locals` allocates from the local pool and slots are released at
+lexical scope exit (`let` bindings, variadic args, fold accumulators, tuple
+construction/projection, and the per-read copy-charge save in
+`clarity_value_size_on_stack` — the dominant leak). G surfaces
+`CompileResult.locals_report`: peak simultaneously-live locals per function.
+
+Measured on the poc2 witness (100 copies): **998 peak live locals, down from
+~51,800** — a 52× reduction, 50× under wasmtime's 50,000 limit. The
+60,000-binding `let` still peaks above the limit (all bindings live in one
+scope), still compiles, and is still refused at module load, so the
+`engine_failure.rs` gate keeps forcing all three refusal classes unchanged.
+
+Validation on the merged commit: clar2wasm lib suite 1,398 passed / 0 failed;
+`engine_failure` 6/6; clippy clean on clar2wasm and nano-vm; regression tests
+`wide_tuple_read_many_times_stays_loadable` (crosscheck + wasmtime load +
+<10,000 peak assertion) and
+`more_simultaneous_bindings_than_wasmtime_allows_still_compiles`.
+
+Residual exposure after A: a single scope holding >50k simultaneously-live
+leaf values (e.g. the 60k-binding let) still refuses. Whether that shape is
+mainnet-valid under cost/size limits is what the per-shape boundary table
+(first checkbox) and the mainnet-state search answer; B closes the class
+structurally. The uncommitted broad pool-conversion sweep in the `agent/locals`
+worktree (remaining raw `module.locals.add` sites across word modules) is a
+possible follow-up commit, not required for the demonstrated fix.
 
 ## Evidence that opened this task
 
