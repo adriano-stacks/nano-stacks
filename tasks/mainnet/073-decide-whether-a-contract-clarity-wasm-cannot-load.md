@@ -320,6 +320,19 @@ last-use `SymbolicExpression` id. Then:
   and still refused by wasmtime. Pin with a test before flipping
   `engine_failure.rs` over to it.
 
+## B1 shipped (2026-08-07, merge f0d91c38)
+
+Use-based liveness landed: a `BindingUses` pre-pass counts reads of every
+`let`/`match` binding (scope-mirrored, shadowing-safe; parameters excluded),
+`visit_atom`/`traverse_callable_reference` release a binding's locals at its
+last read, and zero-use bindings are evaluated then dropped. Measured:
+**60,000-binding `let` with one read peaks at 8 live locals and wasmtime
+loads it** (was: refused at >100k); poc2@100 unchanged at 998. The
+module-load refusal class stays reachable via 26,000 all-read bindings (peak
+52,006 → still refused); `engine_failure.rs` swapped its forcing source to
+that shape and stays 6/6 green. Validated independently: clar2wasm lib suite
+1,402/0, gate 6/6, clippy clean both crates.
+
 ## Evidence that opened this task
 
 `engine_failure.rs:234` asserts on `too many locals`, reached with a 60,000
