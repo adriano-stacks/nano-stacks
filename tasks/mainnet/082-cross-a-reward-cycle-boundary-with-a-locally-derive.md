@@ -131,6 +131,31 @@ bits of `1` and the node holds cycle 140's signer set, so asking the decider abo
 cycle 140's opening height must answer `true`. That needs a healthy mainnet state,
 which is the other thing outstanding.
 
+## Four verification routes, all exhausted, 2026-08-07
+
+The rule "a recorded signer set for a cycle means that cycle selected an anchor" is
+reasoned and not measured, and it stayed that way after trying every source on this
+machine. Written down so the next attempt starts somewhere new:
+
+- **The captured fixture.** Its state cannot answer `get-signers` for the cycle that
+  opens at burn 380, so the decider decides nothing and the chain refuses. Correct
+  behaviour, no evidence.
+- **The hacknet rig.** Its `PoxId` is 21 bits of `1` and it would have been ideal.
+  The chain is down: `harness.sh host 3` stopped participant 3, and miners 1 and 2
+  are no longer running either, so nano has no peer and the stock nodes serve
+  nothing.
+- **The mainnet capture.** Spans fifteen burn blocks, 960,219 to 960,233, and holds
+  one stacker set (cycle 140). No cycle boundary falls inside it.
+- **The live mainnet state.** The one place both facts exist together — 142 bits of
+  `1` and cycle 140's signer set — and it is the state the two-writer corruption
+  damaged.
+
+So the verification is blocked on having a healthy mainnet state, which makes
+replacing that state the first move here rather than more code. Until then the
+decider stays as it is: it decides only on a positively recorded non-empty signer
+set, and refuses otherwise, so an unverified rule cannot silently produce a wrong
+consensus hash — it can only fail to unblock a boundary.
+
 ## Acceptance Criteria
 
 - A locally derived chain crosses a reward cycle boundary and derives the same
