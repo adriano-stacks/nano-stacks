@@ -110,6 +110,52 @@ fn core_marf(path: &Path) -> MARF<StacksBlockId> {
     .expect("open the stacks-core MARF")
 }
 
+/// A reflink copy of a stacks-core MARF, and its blob file with it.
+///
+/// stacks-core opens a MARF **read-write**, whatever it is asked for, so a gate
+/// pointed at the artifact it is meant to be checking will write to it. Both
+/// tests below said "point it at a copy" in their own documentation and nothing
+/// enforced it; on 2026-08-07 a run pointed `NANO_MAINNET_MARF` at
+/// `mainnet-capture/chainstate/checkpoint-H/marf.sqlite` and stacks-core appended
+/// 56,579 bytes to the 229 GB `marf.sqlite.blobs` beside it before its
+/// transaction rolled back on a `UNIQUE constraint`. The index was untouched and
+/// nothing referenced was lost, but nothing about that was by design.
+///
+/// So the copy is made here rather than asked for. `--reflink=always` because
+/// these files are hundreds of gigabytes: on a filesystem that can share extents
+/// it is instant and free, and on one that cannot the honest answer is to refuse
+/// rather than silently duplicate a quarter of a terabyte. The returned directory
+/// owns the copy and deletes it.
+fn reflinked(path: &Path) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("a directory for the copy");
+    let name = path.file_name().expect("the MARF has a file name");
+    let copy = directory.path().join(name);
+    for (from, to) in [
+        (path.to_path_buf(), copy.clone()),
+        (
+            path.with_extension("sqlite.blobs"),
+            copy.with_extension("sqlite.blobs"),
+        ),
+    ] {
+        if !from.exists() {
+            continue;
+        }
+        let status = std::process::Command::new("cp")
+            .arg("--reflink=always")
+            .arg(&from)
+            .arg(&to)
+            .status()
+            .expect("run cp");
+        assert!(
+            status.success(),
+            "cannot reflink {} -- this filesystem would need a real copy of it, and a gate \
+             may not write to the artifact it was given",
+            from.display()
+        );
+    }
+    (directory, copy)
+}
+
 /// The state a followed Nakamoto block executes under, before it is sealed under
 /// its real identifier.
 ///
@@ -709,7 +755,9 @@ fn stacks_core_opens_a_mainnet_checkpoint_with_external_blobs() {
         return;
     };
     let block = StacksBlockId::from_hex(&block).expect("the block identifier is hexadecimal");
-    let mut core = core_marf(Path::new(&path));
+    // Never the path handed in: see `reflinked`.
+    let (_copy, path) = reflinked(Path::new(&path));
+    let mut core = core_marf(&path);
     let opened = core
         .get_root_hash_at(&block)
         .expect("stacks-core reads the checkpoint's root")
@@ -719,6 +767,24 @@ fn stacks_core_opens_a_mainnet_checkpoint_with_external_blobs() {
         opened, root,
         "stacks-core opens the mainnet checkpoint and agrees with its published root"
     );
+}
+
+/// Drop every block a MARF holds above `parent`, on a copy.
+///
+/// The journal replays the blocks that come after its parent, and a MARF that
+/// already holds them refuses the insert. Doing this by hand against a
+/// hand-made copy is what the test used to ask for; both halves are automatic
+/// now, which is one fewer way to point a writing gate at a real archive.
+fn truncate_above(marf: &Path, parent: [u8; 32]) {
+    let connection = rusqlite::Connection::open(marf).expect("open the copy");
+    let removed = connection
+        .execute(
+            "DELETE FROM marf_data WHERE block_id > (SELECT block_id FROM marf_data \
+             WHERE block_hash = ?1)",
+            rusqlite::params![StacksBlockId(parent).to_hex()],
+        )
+        .expect("the copy is writable");
+    println!("dropped {removed} block(s) above the journal's parent from the copy");
 }
 
 /// Read back the journal `replay-blocks` writes.
@@ -803,8 +869,17 @@ fn a_recorded_mainnet_journal_seals_the_chains_root() {
     let journals = read_journal(&fs::read_to_string(&journal).expect("read the journal"));
     assert!(!journals.is_empty(), "the journal holds at least one block");
 
-    let mut core = core_marf(Path::new(&path));
+    // Never the path handed in: this test *writes* the journal's blocks into the
+    // MARF it is given. See `reflinked`.
+    let (_copy, path) = reflinked(Path::new(&path));
     let mut parent = journals[0].parent.expect("the journal names its own parent");
+    // And the archive already holds the blocks about to be replayed, so inserting
+    // them fails on `UNIQUE constraint failed: marf_data.block_hash`. This test
+    // used to tell an operator to run the delete by hand against a copy they had
+    // also made by hand; the copy is private now, so it does it. Everything above
+    // the journal's parent is exactly what the journal is about to write.
+    truncate_above(&path, parent);
+    let mut core = core_marf(&path);
     println!(
         "stacks-core reads the journal's parent as {}",
         core.get_root_hash_at(&StacksBlockId(parent))

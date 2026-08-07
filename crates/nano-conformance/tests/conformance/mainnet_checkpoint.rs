@@ -90,7 +90,9 @@ fn every_checkpointed_contract_is_reachable_in_the_imported_trie() {
     contracts.push(CONTRACT.to_owned());
     assert!(!contracts.is_empty(), "the side store names contracts");
 
-    let trie = nano_marf::VersionedMarf::open(&marf).expect("open the trie");
+    // Read-only: this is somebody's real state and the gate only reads it.
+    // `VersionedMarf::open` creates on a wrong path and opens read-write. Task 087.
+    let trie = nano_marf::VersionedMarf::open_existing(&marf).expect("open the trie");
     let missing: Vec<&String> = contracts
         .iter()
         .filter(|contract| {
@@ -128,7 +130,9 @@ fn nano_reports_a_key_at_a_block() {
         <[u8; 32]>::try_from(hex::decode(&block).expect("hexadecimal").as_slice())
             .expect("32 bytes");
 
-    let trie = nano_marf::VersionedMarf::open(&marf).expect("open the trie");
+    // Read-only: this is somebody's real state and the gate only reads it.
+    // `VersionedMarf::open` creates on a wrong path and opens read-write. Task 087.
+    let trie = nano_marf::VersionedMarf::open_existing(&marf).expect("open the trie");
     let Some(value) = trie.get(block, key.as_bytes()).expect("the imported trie reads") else {
         println!("nano has no {key} at that block");
         return;

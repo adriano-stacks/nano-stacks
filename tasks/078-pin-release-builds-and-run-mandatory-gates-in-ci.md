@@ -127,7 +127,7 @@ NANO_REQUIRE_MAINNET=1 \
   cargo test --release -p nano-conformance --test conformance
 ```
 
-**251 passed, 7 failed, 4 ignored**, from 236/22. What that buys is the gates
+**255 passed, 3 failed, 4 ignored**, from 236/22. What that buys is the gates
 themselves, not the number: `mainnet_sortition` (five of them, deriving mainnet's
 own window), `signer_weight_enforcement::every_captured_mainnet_block_authenticates`,
 `mainnet_codec` decoding every captured block against stacks-core's decoder,
@@ -166,3 +166,57 @@ silently adopted as mainnet.
       and fail the job when any required one is absent rather than skipping.
 - [ ] Decide which of the seven are gates and which are diagnostics, and stop
       counting the diagnostics as gates.
+
+## Two gates were writing to the artifacts they were given
+
+Found the hard way. `write_journal` is documented — in its own doc comment —
+"Point it at a **copy**: stacks-core opens a MARF read-write, blob file and all."
+Nothing enforced it, and a run here pointed `NANO_MAINNET_MARF` at
+`mainnet-capture/chainstate/checkpoint-H/marf.sqlite`. stacks-core appended
+**56,579 bytes** to the 229 GB `marf.sqlite.blobs` beside it before its
+transaction rolled back on a `UNIQUE constraint`. The index was untouched
+(mtime still 2026-07-31) and every byte it references is intact; what is there is
+unreferenced tail. It has deliberately **not** been truncated — whether
+stacks-core's next append uses the file length or the highest referenced offset
+decides whether that is waste or self-correcting, and guessing on operator data
+is what caused it.
+
+Both halves are automatic now: `reflinked` makes a private copy with
+`--reflink=always`, and `truncate_above` does the `DELETE FROM marf_data` the
+test used to ask an operator to run by hand. Verified — the checkpoint's blobs
+file is byte- and mtime-identical across a run that previously wrote to it. And
+`a_recorded_mainnet_journal_seals_the_chains_root` **passes** now: nano's write
+journal replayed into stacks-core's own MARF seals the same root.
+
+`mainnet_checkpoint` had the same shape — `VersionedMarf::open`, which creates on
+a wrong path and opens read-write — and `signer_weight_enforcement` had
+`ChainState::open`. Both go through task 087's read-only openers now.
+
+## And one near-miss worth recording
+
+`every_checkpointed_contract_is_reachable_in_the_imported_trie` reported *"1 of
+21 unreachable: SP4SZE…native-pool-v1"* against two independent nano states,
+which reads exactly like a checkpoint-completeness defect. It is not one. Task
+037 already records that `native-pool-v1` was **deployed at height 8,665,687**,
+eighty-five blocks *above* the checkpoint at 8,665,600 — so it is legitimately
+absent at the checkpoint anchor, and the gate needs a `NANO_MAINNET_BLOCK` that
+postdates the deployment. Given the 8,716,986 state's own tip
+(`63f2beda…`), all twenty-one are reachable and the gate passes.
+
+Which surfaces a real limitation of the harness rather than of the node:
+`write_journal::stacks_core_opens_a_mainnet_checkpoint_with_external_blobs` wants
+`NANO_MAINNET_BLOCK` to be the *checkpoint anchor* while `mainnet_checkpoint`
+wants one above it. One variable, two required values, so a single run cannot
+satisfy both.
+
+## What is left after all of that
+
+- `trie_diff` wants `NANO_TRIE_PROOF`/`STATE`/`PARENT`/`WRITES`: a recorded trie
+  divergence this machine does not hold.
+- `p2p_discovery::nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api`
+  reaches the live network and is not deterministic offline.
+- `write_journal::stacks_core_opens_a_mainnet_checkpoint_with_external_blobs`,
+  per the variable conflict above.
+- `kill_during_import` is timing-sensitive: it needs three kills in four to land
+  inside the import and gets fewer under parallel load. Seen failing once,
+  green on three isolated re-runs and on clean full runs.
