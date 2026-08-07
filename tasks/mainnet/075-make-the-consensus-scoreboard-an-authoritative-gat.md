@@ -68,6 +68,18 @@ the anchor executes at 460+; whether the derived winner at those heights is righ
 needs the capture's Bitcoin blocks walked against stacks-core's own snapshot rows,
 which is the next action here and is not guesswork to do blind.
 
+**Answered, and it is not the seeding.** The blocks stand on burn **362**, not 460 --
+the first seeding attempt was 98 burn blocks too high. Seeded below it at burn 360
+the chain derives forward and executes blocks 462-470, then stops at burn **379**:
+one short of the reward cycle boundary at 380, which `SortitionTracker::advance`
+refuses to cross because the `PoxId` bit for the opening cycle is unknown and a
+consensus hash mixes it. The capture spans five such boundaries.
+
+So these rigs cannot replay locally end to end until a derived chain can cross one,
+which is [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]] -- and that is a
+release blocker in its own right, because the live follower meets the same refusal at
+cycle 141.
+
 ## Acceptance Criteria
 
 - `cargo xtask scoreboard` reports 340/340 for every required bounded-fixture

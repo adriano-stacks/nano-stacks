@@ -1,0 +1,81 @@
+---
+id: "082"
+group: mainnet
+title: "Cross a reward cycle boundary with a locally derived sortition chain"
+status: pending
+priority: critical
+effort: large
+dependencies: ["049", "077"]
+tags: ["mainnet", "sortition", "consensus", "release"]
+created_at: 2026-08-07
+type: bug
+---
+
+# Cross a reward cycle boundary with a locally derived sortition chain
+
+## Objective
+
+A locally derived sortition chain stops dead at the first reward cycle boundary it
+meets. `SortitionTracker::advance` refuses by design:
+
+> burn N opens a reward cycle, which adds a bit to the `PoX` history the consensus
+> hash mixes, and this node cannot yet say whether that cycle chose an anchor block
+
+The refusal is right — a consensus hash mixes the `PoxId`, so guessing the bit
+derives a wrong hash for every block after it, silently. What is missing is the
+answer: whether the opening cycle selected a PoX anchor block, which is a fact about
+this node's own executed state and not something to ask a peer for.
+
+## Why this is critical rather than theoretical
+
+Two places, and the second is the release.
+
+**The conformance rigs.** `follow_path` and `catch_up_rounds` replay a capture
+spanning burns 360–479 with a cycle length of 20, so the run crosses boundaries at
+380, 400, 420, 440 and 460. Seeded at burn 360 the chain derives forward, executes
+blocks 462–470, and stops at burn **379** — one short of the first boundary. These
+rigs used to execute under the peer's `/v3/sortitions` answer, which is the path
+[[077-remove-peer-derived-consensus-execution-fallbacks]] removed, so the limit was
+invisible until the fallback went.
+
+**The live mainnet follower.** It is on cycle 140 and `/v2/pox` puts cycle 141 about
+713 burn blocks out. A node that cannot cross a boundary cannot hold tip through one,
+which is exactly what [[053-pass-the-mainnet-node-release-gate]] requires: *"tracks
+across ≥2 reward cycles incl. prepare/rollover"*. The 24-hour soak and the cycle-141
+gates both sit on the far side of this.
+
+## Tasks
+
+- [ ] Derive whether an opening reward cycle selected a PoX anchor block from this
+      node's own executed state, and extend the `PoxId` with the bit it implies.
+- [ ] Decide it at the cycle's *prepare phase*, where stacks-core decides it, rather
+      than at the boundary block — the answer has to be known before the first
+      sortition of the new cycle is derived.
+- [ ] Keep the refusal for the case that remains genuinely unanswerable, and say
+      which of the two it is: a node that cannot yet decide, and a node whose state
+      does not reach the prepare phase at all.
+- [ ] Extend the captured-fixture gate across at least one boundary, so the rigs
+      that lost their peer fallback replay the whole capture locally again.
+- [ ] Cross a boundary on mainnet with the derived chain and compare the resulting
+      consensus hashes against a stock node's for the whole cycle after it.
+
+## Acceptance Criteria
+
+- A locally derived chain crosses a reward cycle boundary and derives the same
+  consensus hashes, sortition identifiers and winners as stacks-core for the cycle
+  that follows.
+- `follow_path` and `catch_up_rounds` replay the whole capture with no peer
+  sortition answer anywhere in the path.
+- A node holds mainnet tip across a cycle rollover, which is the precondition for
+  053's cycle-141 gates and its sustained soak.
+- Where the bit genuinely cannot be decided, the node refuses with a message naming
+  which of the two causes it is, and does not guess.
+
+## Evidence that opened this task
+
+2026-08-07. After [[077-remove-peer-derived-consensus-execution-fallbacks]] removed
+the peer sortition fallback, seven conformance rigs failed. Seeding them from the
+capture's own history closed the seeding half and left this: the chain derives
+forward from burn 360, executes blocks 462–470, and stops at burn 379 with the
+reward-cycle refusal above. The same refusal is what a mainnet follower will meet at
+cycle 141.
