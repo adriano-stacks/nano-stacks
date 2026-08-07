@@ -71,11 +71,15 @@ Two independent pressures push the local count up, and both are nano's:
       reaches and its margin. **Done 2026-08-07: 137,332/137,340 compile; highest
       peak 16,505 of 50,000 (3.0× margin; ~7× organic; 99.6% under 1k) — see
       "Mainnet-state margin".**
-- [ ] Run the eight contracts that failed the margin sweep through nano-vm's exact
+- [x] Run the eight contracts that failed the margin sweep through nano-vm's exact
       production `compile_under` path. Classify every one as a sweep-harness fault,
       network-invalid source or a distinct clarity-wasm conformance bug, and open a
       blocking task for every confirmed bug rather than excluding it from the
-      denominator.
+      denominator. **Done 2026-08-08: all eight reproduce on `compile_under`, so
+      none is a harness fault, and every error string lives only in clarity-wasm
+      and nowhere in clarity's analyzer, so none is a Clarity refusal. Three
+      distinct code-generation defects, split out as
+      [[093-load-the-eight-mainnet-contracts-clarity-wasm-refuses]].**
 - [x] Make the `as-contract` prologue pay for itself: emit the save/restore only
       for functions whose body contains an `as-contract`, and re-measure. This is
       worth doing whatever the answer above is, because it is a cost every mainnet
@@ -487,3 +491,21 @@ was found and why it was the only reachable one. [[060]] records the
 `as-contract` prologue's two locals per function and upstream issue #575. No
 replayed mainnet block has hit it, which is the reason this is a measurement task
 and not an outage — and, under the release rule, not a reason to close it.
+
+## The eight are classified, 2026-08-08
+
+Re-run through `cargo xtask check-module`, which is nano-vm's own
+`compile_under` and not the sweep's bare `clar2wasm::compile`. All eight
+reproduce, so the "some may be harness artifacts" caveat is closed: none is.
+
+Nor is any of them a Clarity analysis refusal, which was the other way this could
+have gone. `Not implemented`, `Incompatible types for duck typing` and `Tuples
+fields should be typed` are each present **only** in clarity-wasm —
+`wasm_generator.rs`, `duck_type.rs`, `words/tuples.rs` — and absent from
+clarity's shared analyzer. The network deployed and accepted all eight.
+
+Three defects, eight contracts, moved to
+[[093-load-the-eight-mainnet-contracts-clarity-wasm-refuses]] so that this task's
+locals result — which is finished, measured and green — is not held open by
+unrelated code generation. Sources preserved read-only at
+`/home/aldur/nano-073-sources/`.
