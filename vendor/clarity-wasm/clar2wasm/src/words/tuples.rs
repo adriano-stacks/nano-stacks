@@ -69,7 +69,14 @@ impl ComplexWord for TupleCons {
         // Now we can iterate over the fields and evaluate them.
         for (key, value) in values {
             let value_ty = tuple_ty.remove(key).ok_or_else(|| {
-                GeneratorError::TypeError("Tuples fields should be typed".to_owned())
+                // Which key, and what the analysed type does hold. The bare
+                // sentence was the whole message, and one mainnet contract
+                // refuses to compile with it -- see task 093.
+                GeneratorError::TypeError(format!(
+                    "Tuples fields should be typed: the literal names `{key}`, and the \
+                     analysed type holds {:?}",
+                    tuple_ty.keys().map(ToString::to_string).collect::<Vec<_>>()
+                ))
             })?;
 
             // WORKAROUND: if you have a tuple like `(tuple (foo none))`, the `none` will have the type

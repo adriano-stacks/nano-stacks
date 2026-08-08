@@ -36,7 +36,7 @@ analyzer:
 |---|---|---|
 | `Not implemented` | `clar2wasm/src/wasm_generator.rs` | `SPXWGJQ101N1C1FYHK64TGTHN4793CHVKTJAT7VQ.amm-swap003`, `SP93HY1S36HJXC5MY9TKKKPDM2YZSKK385VBV15P.pool`, `SP11KTHSX0QSQWB4KRAH2S6BA058XPEZW4HT0D55W.pool` |
 | `Incompatible types for duck typing: buff 1 against string-ascii 256` | `clar2wasm/src/duck_type.rs` | `SP2BRB6P0BK6T35DHTGXCV6MZ5TGRN5E0RKZ1T8B5.gated-pages`, `.gated-pages-004`, `.gated-pages-005`, `.gated-page-006` |
-| `Tuples fields should be typed` | `clar2wasm/src/words/tuples.rs` | `SP1J70VWT7MRRP635NZ6E3J86PFE78JFXS0QR5ZAH.trajan-endorsement-alpha` |
+| `Tuples fields should be typed` | `clar2wasm/src/words/tuples.rs` | `SP1J70VWT7MRRP635NZ6E3J86PFE78JFXS0QR5ZAH.trajan-endorsement-alpha` — since traced to [[068]], see below |
 
 So this is task 073's own phrasing, confirmed: **the network accepts what nano
 cannot load.** Three distinct defects, eight contracts.
@@ -63,16 +63,16 @@ cargo xtask check-module /home/aldur/mainnet-8716986/state \
       `wasm_generator.rs`). All three contracts compile and load.**
 - [x] Reduce the duck-typing family from the real contract. **Done:
       `(map f a-string)`, from `gated-pages` line 390.**
-- [ ] Reduce the tuple family the same way, from the real contract rather than
-      towards it — the lesson of task 086, where two invented reductions passed
-      while the real one differed.
+- [x] Reduce the tuple family from the real contract. **Done, and it is not this
+      task's to fix: it is [[068]]'s asymmetric least-supertype problem. See
+      below.**
 - [x] Fix the duck-typing rule. **Done, and it was not a rule to relax: the
       element type was wrong. `map` now takes it from clarity's own
       `SequenceSubtype::unit_type` rather than from a read strategy that cannot
       tell a buffer from an ASCII string. All four `gated-pages` compile and
       load.**
-- [ ] Fix `Tuples fields should be typed` for whatever shape
-      `trajan-endorsement-alpha` uses.
+- [ ] `trajan-endorsement-alpha` is blocked on [[068]] rather than on a fix here.
+      Moved there.
 - [ ] Crosscheck each minimized source against the reference interpreter for
       result, receipt, cost, events and writes — not merely that it compiles.
 - [ ] Add every reduction to the mandatory conformance suite, and re-run the
@@ -217,3 +217,41 @@ than refusing. It fails on the previous revision with the mainnet error verbatim
 
 **One contract remains**: `trajan-endorsement-alpha`, on `Tuples fields should be
 typed`.
+
+## The last one belongs to 068, 2026-08-08
+
+`Tuples fields should be typed` carried no detail either, so it says which key and
+what the analysed type holds now:
+
+```
+the literal names `profile-sender`, and the analysed type holds
+  ["date-event", "date-sent", "endorsement", "endorsementURI", "title"]
+```
+
+`trajan-endorsement-alpha` line 263 appends a **seven**-field tuple to
+`submission-drafts`, whose declared element type (line 49) has **five**:
+
+```clarity
+drafts: (list 25 {date-sent: uint, date-event: uint, title: (string-ascii 256),
+                  endorsement: (string-ascii 2048), endorsementURI: (string-ascii 128)})
+...
+(append submission-drafts { profile-sender: true, profile-receiver: false,
+                            date-sent: .., date-event: .., title: ..,
+                            endorsement: .., endorsementURI: .. })
+```
+
+So the analyser narrowed the literal to the list's element type and code
+generation is asked to build the narrow shape out of a wider literal. That is
+exactly [[068-resolve-asymmetric-tuple-least-supertype-semantics]]: its own
+finding is that `least_supertype_v2_1`'s tuple arm "silently drops the ones the
+second has and the first does not", and that **no static layout can be
+conformant** — what is needed is a value representation carrying its shape at run
+time, which 068 records as a clar2wasm architecture change rather than a choice
+inside one word.
+
+So this contract is not a ninth defect and must not be fixed here with a
+per-shape workaround. It is the first *mainnet* instance of 068, which until now
+had only minimized cases, and that is worth knowing: 068 is no longer only a
+differential nobody has met.
+
+**Seven of eight load. The eighth is 068's.**

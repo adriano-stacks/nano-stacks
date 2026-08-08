@@ -112,3 +112,27 @@ case and explains why the existing compiler layout cannot close it locally. A
 recent commit description said the least-supertype issue was fixed, but the
 actual differential remains ignored. This task, not the commit description, is
 the release accounting for that gap.
+
+## A mainnet contract reaches this, 2026-08-08
+
+Until now this task had minimized cases and no deployed one.
+`SP1J70VWT7MRRP635NZ6E3J86PFE78JFXS0QR5ZAH.trajan-endorsement-alpha` is a
+deployed contract that clarity-wasm cannot compile at all because of it — found
+by task 073's sweep over every contract in the imported mainnet state, and traced
+here by [[093-load-the-eight-mainnet-contracts-clarity-wasm-refuses]].
+
+It appends a seven-field tuple to a list whose declared element type has five
+(lines 263 and 49). The analyser narrows the literal to the list's element type
+and `words/tuples.rs` is then asked to build the narrow shape out of a wider
+literal, which it refuses:
+
+```
+Tuples fields should be typed: the literal names `profile-sender`, and the
+  analysed type holds ["date-event", "date-sent", "endorsement",
+                       "endorsementURI", "title"]
+```
+
+That is this task's *refusal* direction rather than its silent-divergence one, so
+it is the safe half — but it means the outstanding architecture change now has a
+deployed contract behind it and not only a reduction. The network accepted this
+contract; nano cannot load it.
