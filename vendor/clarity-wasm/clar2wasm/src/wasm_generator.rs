@@ -539,7 +539,7 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
 }
 
 /// wasmparser rejects function and block types above this many inputs or outputs.
-pub(crate) const MAX_WASM_TYPE_ARITY: usize = 1_000;
+pub const MAX_WASM_TYPE_ARITY: usize = 1_000;
 
 pub(crate) fn uses_packed_slots(params: usize, results: usize) -> bool {
     params > MAX_WASM_TYPE_ARITY || results > MAX_WASM_TYPE_ARITY

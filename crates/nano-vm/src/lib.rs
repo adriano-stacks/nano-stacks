@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub use clar2wasm::wasm_generator::LocalsReport;
+pub use clar2wasm::{ArityReport, MAX_WASM_TYPE_ARITY};
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
 use clarity::vm::ast::build_ast;
@@ -1185,6 +1187,17 @@ enum Access {
     ReadOnly,
 }
 
+/// Maximum locals the pinned Wasmtime validator accepts in one function.
+pub const MAX_WASM_FUNCTION_LOCALS: u32 = 50_000;
+
+/// A compiled contract's raw source measurements and the runtime's load verdict.
+#[derive(Debug)]
+pub struct ModuleInspection {
+    pub arity_report: ArityReport,
+    pub locals_report: LocalsReport,
+    pub refusal: Option<VmExecutionError>,
+}
+
 /// Epoch 4 Clarity execution over a versioned MARF-backed store.
 #[derive(Debug)]
 pub struct Vm {
@@ -1754,9 +1767,32 @@ impl Vm {
         source: &str,
         epoch: StacksEpochId,
     ) -> Result<(), VmExecutionError> {
-        compile_under(&mut self.store, contract, source, version, epoch)
-            .and_then(|compiled| loadable(contract, compiled, self.modules.engine()))
-            .map(|_| ())
+        let inspected = self.inspect_module(contract, version, source, epoch)?;
+        inspected.refusal.map_or_else(|| Ok(()), Err)
+    }
+
+    /// Compile once, retaining raw source measurements and any module-load refusal.
+    pub fn inspect_module(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        version: ClarityVersion,
+        source: &str,
+        epoch: StacksEpochId,
+    ) -> Result<ModuleInspection, VmExecutionError> {
+        let compiled = compile_under_report(&mut self.store, contract, source, version, epoch)?;
+        let arity_report = compiled.arity_report.clone();
+        let locals_report = compiled.locals_report.clone();
+        let refusal = loadable(
+            contract,
+            compiled.into_compiled_contract(),
+            self.modules.engine(),
+        )
+        .err();
+        Ok(ModuleInspection {
+            arity_report,
+            locals_report,
+            refusal,
+        })
     }
 
     /// The source and Clarity version this state holds for a contract.
@@ -3823,6 +3859,17 @@ fn compile_under(
     version: ClarityVersion,
     epoch: StacksEpochId,
 ) -> Result<clar2wasm::CompiledContract, VmExecutionError> {
+    compile_under_report(store, contract, source, version, epoch)
+        .map(clar2wasm::CompileResult::into_compiled_contract)
+}
+
+fn compile_under_report(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+    source: &str,
+    version: ClarityVersion,
+    epoch: StacksEpochId,
+) -> Result<clar2wasm::CompileResult, VmExecutionError> {
     let mut analysis = AnalysisDatabase::new(store);
     analysis
         .execute::<_, _, StaticCheckError>(|analysis_db| {
@@ -3838,7 +3885,6 @@ fn compile_under(
                 analysis_db,
                 true,
             )
-            .map(clar2wasm::CompileResult::into_compiled_contract)
             .map_err(|error: clar2wasm::CompileError| {
                 // Name the contract: a compile failure surfaces at whatever
                 // call needed the module, which is routinely a different

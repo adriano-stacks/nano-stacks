@@ -13,7 +13,9 @@ use nano_conformance::{FixtureManifest, FixtureStatus, validate_fixture_tree};
 // The maturity window comes from the node's own crate rather than being restated
 // here: the export refuses a window shorter than it, and a copy that drifted
 // would write a checkpoint the node it is for cannot pay from.
-use nano_chainstate::{MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet};
+use nano_chainstate::{
+    CHECKPOINT_HISTORY_LIMIT, MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet,
+};
 use nano_primitives::Network;
 use serde_json::json;
 
@@ -78,6 +80,9 @@ fn main() -> ExitCode {
         Some("infrastructure-tests") => infrastructure_tests(),
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("export-checkpoint-history") => {
+            export_checkpoint_history(&env::args().skip(2).collect::<Vec<_>>())
+        }
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
         Some("verify-block") => verify_block(&env::args().skip(2).collect::<Vec<_>>()),
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
@@ -121,12 +126,361 @@ fn main() -> ExitCode {
                  \n\
                  reads or writes elsewhere:\n\
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
-                 \x20 export-leader-keys  export-sortition  freeze-receipts  public-key\n\
+                 \x20 export-checkpoint-history  export-leader-keys  export-sortition\n\
+                 \x20 freeze-receipts  public-key\n\
                  \x20 infrastructure-tests  release-report  scoreboard  snapshot-state\n\
                  \x20 validate-fixtures\n\
                  \x20 verify-block"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContractArity {
+    contract: String,
+    report: nano_vm::ArityReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContractLocalsPeak {
+    contract: String,
+    function: String,
+    locals: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContractRefusal {
+    contract: String,
+    arity: Option<nano_vm::ArityReport>,
+}
+
+#[derive(Default)]
+struct ContractInventory {
+    named: usize,
+    checked: usize,
+    loaded: usize,
+    maximum: nano_vm::ArityReport,
+    over_boundary: Vec<ContractArity>,
+    maximum_live_locals: u32,
+    maximum_live_local_sites: Vec<ContractLocalsPeak>,
+    refused: BTreeMap<String, Vec<ContractRefusal>>,
+    unmeasured: BTreeMap<String, Vec<String>>,
+}
+
+impl ContractInventory {
+    fn note_arity(&mut self, contract: &str, report: nano_vm::ArityReport) {
+        self.maximum.max_function_params = self
+            .maximum
+            .max_function_params
+            .max(report.max_function_params);
+        self.maximum.max_function_results = self
+            .maximum
+            .max_function_results
+            .max(report.max_function_results);
+        self.maximum.max_control_params = self
+            .maximum
+            .max_control_params
+            .max(report.max_control_params);
+        self.maximum.max_control_results = self
+            .maximum
+            .max_control_results
+            .max(report.max_control_results);
+        self.maximum.top_level_results =
+            self.maximum.top_level_results.max(report.top_level_results);
+        if crosses_wasm_arity_boundary(&report) {
+            self.over_boundary.push(ContractArity {
+                contract: contract.to_owned(),
+                report,
+            });
+        }
+    }
+
+    fn note_locals(&mut self, contract: &str, report: &nano_vm::LocalsReport) -> bool {
+        for (function, locals) in &report.max_live_locals {
+            match locals.cmp(&self.maximum_live_locals) {
+                std::cmp::Ordering::Greater => {
+                    self.maximum_live_locals = *locals;
+                    self.maximum_live_local_sites.clear();
+                    self.maximum_live_local_sites.push(ContractLocalsPeak {
+                        contract: contract.to_owned(),
+                        function: function.clone(),
+                        locals: *locals,
+                    });
+                }
+                std::cmp::Ordering::Equal => {
+                    self.maximum_live_local_sites.push(ContractLocalsPeak {
+                        contract: contract.to_owned(),
+                        function: function.clone(),
+                        locals: *locals,
+                    });
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        !report.max_live_locals.is_empty()
+    }
+
+    fn sort_measurements(&mut self) {
+        self.over_boundary
+            .sort_by(|left, right| left.contract.cmp(&right.contract));
+        self.maximum_live_local_sites.sort_by(|left, right| {
+            left.contract
+                .cmp(&right.contract)
+                .then_with(|| left.function.cmp(&right.function))
+        });
+    }
+
+    fn passes(&self) -> bool {
+        self.checked == self.named
+            && self.loaded == self.checked
+            && self.refused.is_empty()
+            && self.unmeasured.is_empty()
+    }
+}
+
+fn crosses_wasm_arity_boundary(report: &nano_vm::ArityReport) -> bool {
+    [
+        report.max_function_params,
+        report.max_function_results,
+        report.max_control_params,
+        report.max_control_results,
+        report.top_level_results,
+    ]
+    .into_iter()
+    .any(|arity| arity > nano_vm::MAX_WASM_TYPE_ARITY)
+}
+
+fn arity_dimensions(report: &nano_vm::ArityReport) -> String {
+    format!(
+        "function params/results {}/{}, control params/results {}/{}, top-level results {}",
+        report.max_function_params,
+        report.max_function_results,
+        report.max_control_params,
+        report.max_control_results,
+        report.top_level_results
+    )
+}
+
+fn refusal_reason(error: &impl std::fmt::Debug) -> String {
+    let reason = format!("{error:?}");
+    reason
+        .split("contract analysis failed: ")
+        .nth(1)
+        .unwrap_or(&reason)
+        .chars()
+        .take(90)
+        .collect()
+}
+
+fn chainstate_directory(state: &Path) -> PathBuf {
+    let has_database_pair = |directory: &Path| {
+        directory.join("marf.sqlite").is_file() && directory.join("clarity.sqlite").is_file()
+    };
+    let nested = state.join("chainstate");
+    if has_database_pair(&nested) {
+        nested
+    } else if has_database_pair(state)
+        || state
+            .file_name()
+            .is_some_and(|name| name == OsStr::new("chainstate"))
+    {
+        state.to_path_buf()
+    } else {
+        nested
+    }
+}
+
+fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
+    let chainstate = chainstate_directory(state);
+    let mut vm =
+        open_state_vm(&chainstate).map_err(|error| format!("cannot open state: {error}"))?;
+    let tip = vm
+        .tip()
+        .map_err(|error| format!("cannot read state tip: {error}"))?
+        .ok_or_else(|| "the state is sealed at no block, so it holds no contracts".to_owned())?;
+    vm.begin_block(Some(tip), [0xc5; 32])
+        .map_err(|error| format!("cannot open a block on the tip: {error:?}"))?;
+
+    let contracts = sqlite(
+        &chainstate.join("clarity.sqlite"),
+        "SELECT key FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis' ORDER BY key",
+    )?;
+    let contracts: Vec<String> = contracts
+        .lines()
+        .filter_map(|key| {
+            Some(
+                key.strip_prefix("clr-meta::")?
+                    .strip_suffix("::analysis")?
+                    .to_owned(),
+            )
+        })
+        .collect();
+    if contracts.is_empty() {
+        return Err("the state names no contracts".to_owned());
+    }
+
+    let mut inventory = ContractInventory {
+        named: contracts.len(),
+        ..ContractInventory::default()
+    };
+    for contract in contracts {
+        let identifier = match clarity::vm::types::QualifiedContractIdentifier::parse(&contract) {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                inventory
+                    .unmeasured
+                    .entry(format!("invalid contract identifier: {error}"))
+                    .or_default()
+                    .push(contract);
+                continue;
+            }
+        };
+        let (source, version) = match vm.contract_source(&identifier) {
+            Ok(source) => source,
+            Err(error) => {
+                inventory
+                    .unmeasured
+                    .entry(format!("source is unavailable: {error:?}"))
+                    .or_default()
+                    .push(contract);
+                continue;
+            }
+        };
+        let epoch = match vm.recorded_deploy_epoch(&identifier) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                inventory
+                    .unmeasured
+                    .entry(format!("deploy epoch is unavailable: {error:?}"))
+                    .or_default()
+                    .push(contract);
+                continue;
+            }
+        };
+        inventory.checked += 1;
+        match vm.inspect_module(&identifier, version, &source, epoch) {
+            Ok(inspected) => {
+                if !inventory.note_locals(&contract, &inspected.locals_report) {
+                    inventory
+                        .unmeasured
+                        .entry("compiler returned no live-locals measurement".to_owned())
+                        .or_default()
+                        .push(contract.clone());
+                }
+                let report = inspected.arity_report;
+                inventory.note_arity(&contract, report.clone());
+                match inspected.refusal {
+                    Some(error) => inventory
+                        .refused
+                        .entry(refusal_reason(&error))
+                        .or_default()
+                        .push(ContractRefusal {
+                            contract,
+                            arity: Some(report),
+                        }),
+                    None => inventory.loaded += 1,
+                }
+            }
+            Err(error) => inventory
+                .refused
+                .entry(refusal_reason(&error))
+                .or_default()
+                .push(ContractRefusal {
+                    contract,
+                    arity: None,
+                }),
+        }
+    }
+    inventory.sort_measurements();
+    Ok(inventory)
+}
+
+fn print_contract_inventory(inventory: &ContractInventory) {
+    println!(
+        "{}/{} contracts compile and load ({} named by the state)",
+        inventory.loaded, inventory.checked, inventory.named
+    );
+    println!(
+        "  Wasm type boundary   {} flattened parameters or results",
+        nano_vm::MAX_WASM_TYPE_ARITY
+    );
+    println!(
+        "  maximum function     {} params, {} results",
+        inventory.maximum.max_function_params, inventory.maximum.max_function_results
+    );
+    println!(
+        "  maximum control      {} params, {} results",
+        inventory.maximum.max_control_params, inventory.maximum.max_control_results
+    );
+    println!(
+        "  maximum top-level    {} results",
+        inventory.maximum.top_level_results
+    );
+    let locals_limit = nano_vm::MAX_WASM_FUNCTION_LOCALS;
+    if inventory.maximum_live_local_sites.is_empty() {
+        println!("  maximum live locals unavailable (no function was measured)");
+    } else if inventory.maximum_live_locals <= locals_limit {
+        println!(
+            "  maximum live locals {}/{} ({} headroom)",
+            inventory.maximum_live_locals,
+            locals_limit,
+            locals_limit - inventory.maximum_live_locals
+        );
+    } else {
+        println!(
+            "  maximum live locals {}/{} ({} OVER LIMIT)",
+            inventory.maximum_live_locals,
+            locals_limit,
+            inventory.maximum_live_locals - locals_limit
+        );
+    }
+    for peak in &inventory.maximum_live_local_sites {
+        println!("    {} :: {}", peak.contract, peak.function);
+    }
+
+    let refused: BTreeSet<&str> = inventory
+        .refused
+        .values()
+        .flatten()
+        .map(|entry| entry.contract.as_str())
+        .collect();
+    println!(
+        "  raw arity above boundary {} contract(s)",
+        inventory.over_boundary.len()
+    );
+    for measurement in &inventory.over_boundary {
+        println!(
+            "    {}{}: {}",
+            if refused.contains(measurement.contract.as_str()) {
+                "REFUSED "
+            } else {
+                "lowered "
+            },
+            measurement.contract,
+            arity_dimensions(&measurement.report)
+        );
+    }
+
+    for (reason, contracts) in &inventory.refused {
+        println!("\n  REFUSED {} x {reason}", contracts.len());
+        for refusal in contracts {
+            match &refusal.arity {
+                Some(report) => {
+                    println!("      {}: {}", refusal.contract, arity_dimensions(report));
+                }
+                None => println!(
+                    "      {}: arity unavailable because compilation did not finish",
+                    refusal.contract
+                ),
+            }
+        }
+    }
+    for (reason, contracts) in &inventory.unmeasured {
+        println!("\n  UNMEASURED {} x {reason}", contracts.len());
+        for contract in contracts {
+            println!("      {contract}");
         }
     }
 }
@@ -139,10 +493,11 @@ fn main() -> ExitCode {
 /// is a *validator* limit, so a module that exceeds it compiles cleanly and fails
 /// to load. The sweep could not have seen one.
 ///
-/// This runs the production path -- `Vm::check_module`, which is `compile_under`
-/// followed by `loadable` -- over every contract in the state, in one process and
-/// read-only. So it answers both questions at once: which contracts clarity-wasm
-/// cannot compile, and which produce a module the engine will not accept.
+/// This runs `Vm::inspect_module`, the report-preserving form of the production
+/// `check_module` path (`compile_under` followed by `loadable`), over every contract
+/// in the state, in one process and read-only. So it answers both questions at
+/// once: which contracts clarity-wasm cannot compile, and which produce a module
+/// the engine will not accept.
 fn sweep_contracts(arguments: &[String]) -> ExitCode {
     let [state] = arguments else {
         eprintln!(
@@ -153,106 +508,19 @@ fn sweep_contracts(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    let chainstate = Path::new(state).join("chainstate");
-    let mut vm = match open_state_vm(&chainstate) {
-        Ok(vm) => vm,
-        Err(error) => {
-            eprintln!("cannot open the state: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let tip = match vm.tip() {
-        Ok(Some(tip)) => tip,
-        Ok(None) => {
-            eprintln!("the state is sealed at no block, so it holds no contracts to compile");
-            return ExitCode::FAILURE;
+    match contract_inventory(Path::new(state)) {
+        Ok(inventory) => {
+            print_contract_inventory(&inventory);
+            if inventory.passes() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(error) => {
-            eprintln!("cannot read the state tip: {error}");
-            return ExitCode::FAILURE;
+            eprintln!("contract inventory failed: {error}");
+            ExitCode::FAILURE
         }
-    };
-    if let Err(error) = vm.begin_block(Some(tip), [0xc5; 32]) {
-        eprintln!("cannot open a block on the tip: {error:?}");
-        return ExitCode::FAILURE;
-    }
-
-    // The analyses name every contract the state holds, which is what a checkpoint
-    // carries and what a replay can be asked to run.
-    let contracts = match sqlite(
-        &chainstate.join("clarity.sqlite"),
-        "SELECT key FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis'",
-    ) {
-        Ok(rows) => rows,
-        Err(error) => {
-            eprintln!("cannot list the state's contracts: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let contracts: Vec<String> = contracts
-        .lines()
-        .filter_map(|key| {
-            Some(
-                key.strip_prefix("clr-meta::")?
-                    .strip_suffix("::analysis")?
-                    .to_owned(),
-            )
-        })
-        .collect();
-    if contracts.is_empty() {
-        eprintln!("the state names no contracts");
-        return ExitCode::FAILURE;
-    }
-
-    let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut checked = 0_usize;
-    for contract in &contracts {
-        let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract)
-        else {
-            continue;
-        };
-        let Ok((source, version)) = vm.contract_source(&identifier) else {
-            continue;
-        };
-        // The epoch the *chain* records for it, not epoch 4.0. `ensure_wasm_module`
-        // compiles under the recorded one because it decides which words exist,
-        // and a sweep that assumed 4.0 reported 878 pre-4.0 contracts refusing
-        // `at-block` -- the epoch-4.0 rule applied to contracts never under it.
-        let Ok(epoch) = vm.recorded_deploy_epoch(&identifier) else {
-            continue;
-        };
-        checked += 1;
-        if let Err(error) = vm.check_module(&identifier, version, &source, epoch) {
-            // Grouped by the refusal rather than listed one per line: eight
-            // failures over 137,340 contracts is three defects, and a flat list
-            // of eight hides that.
-            let reason = format!("{error:?}");
-            let reason = reason
-                .split("contract analysis failed: ")
-                .nth(1)
-                .unwrap_or(&reason)
-                .chars()
-                .take(90)
-                .collect::<String>();
-            refused.entry(reason).or_default().push(contract.clone());
-        }
-    }
-
-    println!(
-        "{}/{checked} contracts compile and load ({} named by the state)",
-        checked - refused.values().map(Vec::len).sum::<usize>(),
-        contracts.len()
-    );
-    for (reason, contracts) in &refused {
-        println!("\n  {} x {reason}", contracts.len());
-        for contract in contracts.iter().take(8) {
-            println!("      {contract}");
-        }
-    }
-    if refused.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
@@ -1949,6 +2217,67 @@ fn describe_fixture(root: &Path, replay_blocks: u64) -> Result<String, String> {
     ))
 }
 
+#[derive(Debug)]
+struct CheckpointHistoryExport {
+    blocks_db: PathBuf,
+    source: [u8; 32],
+    state_root: [u8; 32],
+    out_dir: PathBuf,
+}
+
+impl CheckpointHistoryExport {
+    fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut values = arguments.iter();
+        let mut blocks_db = None;
+        let mut source = None;
+        let mut state_root = None;
+        let mut out_dir = None;
+        while let Some(flag) = values.next() {
+            let value = values
+                .next()
+                .ok_or_else(|| format!("missing value for {flag}"))?;
+            match flag.as_str() {
+                "--blocks-db" => blocks_db = Some(PathBuf::from(value)),
+                "--source-id" => source = Some(parse_hash(value)?),
+                "--state-root" => state_root = Some(parse_hash(value)?),
+                "--out-dir" => out_dir = Some(PathBuf::from(value)),
+                _ => {
+                    return Err(format!(
+                        "unknown export-checkpoint-history argument: {flag}"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            blocks_db: blocks_db.ok_or_else(|| "--blocks-db is required".to_owned())?,
+            source: source.ok_or_else(|| "--source-id is required".to_owned())?,
+            state_root: state_root.ok_or_else(|| "--state-root is required".to_owned())?,
+            out_dir: out_dir.ok_or_else(|| "--out-dir is required".to_owned())?,
+        })
+    }
+}
+
+fn export_checkpoint_history(arguments: &[String]) -> ExitCode {
+    let result = CheckpointHistoryExport::parse(arguments).and_then(|config| {
+        write_checkpoint_authentication_history(
+            &config.blocks_db,
+            config.source,
+            config.state_root,
+            &config.out_dir,
+        )
+    });
+    match result {
+        Ok(blocks) => {
+            println!("exported {blocks} authenticated checkpoint blocks");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("checkpoint history export failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 struct CaptureConfig {
     /// Rewrite only `native-effects.json`, into this existing checkpoint.
     accounting_only: Option<PathBuf>,
@@ -2425,6 +2754,12 @@ impl CaptureConfig {
         let checkpoint = Self::block_at_height(blocks_db, self.checkpoint_height)?;
         let checkpoint_dir = staging.join("chainstate/checkpoint-H");
         let checkpoint_root = self.write_checkpoint_block(&checkpoint, &checkpoint_dir)?;
+        write_checkpoint_authentication_history(
+            blocks_db,
+            parse_hash(&checkpoint.index_block_hash)?,
+            parse_hash(&checkpoint_root)?,
+            &checkpoint_dir.join("authentication-history"),
+        )?;
         copy_clarity_source(&node_root.join("chainstate/vm/clarity"), &checkpoint_dir)?;
         Self::write_native_effects(
             &node_root.join("chainstate/vm/index.sqlite"),
@@ -3001,6 +3336,177 @@ impl CapturedBlock {
             index_block_hash,
         })
     }
+}
+
+struct ArchivedNakamotoBlock {
+    raw: Vec<u8>,
+    block: NakamotoBlock,
+}
+
+const ARCHIVED_NAKAMOTO_BLOCK_QUERY: &str = "SELECT height, block_hash, consensus_hash, index_block_hash, parent_block_id, \
+            is_tenure_start, data \
+     FROM nakamoto_staging_blocks \
+     WHERE index_block_hash = ?1 AND processed = 1 AND orphaned = 0";
+
+fn read_archived_nakamoto_block(
+    statement: &mut rusqlite::Statement<'_>,
+    expected_id: [u8; 32],
+) -> Result<ArchivedNakamotoBlock, String> {
+    let expected_id_hex = encode_hex(&expected_id);
+    let mut rows = statement
+        .query(rusqlite::params![expected_id_hex])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Err(format!(
+            "canonical Nakamoto block {} is absent from the archive",
+            encode_hex(&expected_id)
+        ));
+    };
+    let stored = (
+        row.get::<_, u64>(0).map_err(|error| error.to_string())?,
+        row.get::<_, String>(1).map_err(|error| error.to_string())?,
+        row.get::<_, String>(2).map_err(|error| error.to_string())?,
+        row.get::<_, String>(3).map_err(|error| error.to_string())?,
+        row.get::<_, String>(4).map_err(|error| error.to_string())?,
+        row.get::<_, i64>(5).map_err(|error| error.to_string())?,
+        row.get::<_, Vec<u8>>(6)
+            .map_err(|error| error.to_string())?,
+    );
+    if rows.next().map_err(|error| error.to_string())?.is_some() {
+        return Err(format!(
+            "canonical Nakamoto block {} occurs more than once in the archive",
+            encode_hex(&expected_id)
+        ));
+    }
+    let (height, block_hash, consensus_hash, index_block_hash, parent_block_id, start, raw) =
+        stored;
+    let block = NakamotoBlock::decode(&raw).map_err(|error| {
+        format!(
+            "canonical Nakamoto block {} cannot be decoded: {error}",
+            encode_hex(&expected_id)
+        )
+    })?;
+    let stored_start = match start {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(format!(
+                "canonical Nakamoto block {} has invalid is_tenure_start value {value}",
+                encode_hex(&expected_id)
+            ));
+        }
+    };
+    let decoded_id = encode_hex(block.block_id().as_bytes());
+    let decoded_hash = encode_hex(block.header.block_hash().as_bytes());
+    let decoded_consensus = encode_hex(block.header.consensus_hash.as_bytes());
+    let decoded_parent = encode_hex(block.header.parent_block_id.as_bytes());
+    let decoded_start = nano_chainstate::starts_new_tenure(&block);
+    if decoded_id != encode_hex(&expected_id)
+        || index_block_hash != decoded_id
+        || block_hash != decoded_hash
+        || consensus_hash != decoded_consensus
+        || parent_block_id != decoded_parent
+        || height != block.header.chain_length
+        || stored_start != decoded_start
+    {
+        return Err(format!(
+            "canonical archive metadata does not match decoded Nakamoto block {}",
+            encode_hex(&expected_id)
+        ));
+    }
+    Ok(ArchivedNakamotoBlock { raw, block })
+}
+
+fn write_checkpoint_authentication_history(
+    database: &Path,
+    source: [u8; 32],
+    state_root: [u8; 32],
+    output: &Path,
+) -> Result<usize, String> {
+    if output.exists() {
+        return Err(format!(
+            "checkpoint authentication output {} already exists",
+            output.display()
+        ));
+    }
+    let connection = open_archive(database)?;
+    let mut statement = connection
+        .prepare(ARCHIVED_NAKAMOTO_BLOCK_QUERY)
+        .map_err(|error| error.to_string())?;
+
+    let source_block = read_archived_nakamoto_block(&mut statement, source)?;
+    if source_block.block.header.state_index_root.as_bytes() != &state_root {
+        return Err(format!(
+            "checkpoint source {} publishes state root {}, not {}",
+            encode_hex(&source),
+            encode_hex(source_block.block.header.state_index_root.as_bytes()),
+            encode_hex(&state_root)
+        ));
+    }
+
+    let mut reversed = vec![source_block];
+    while !nano_chainstate::starts_new_tenure(&reversed.last().expect("source block").block) {
+        if reversed.len() == CHECKPOINT_HISTORY_LIMIT {
+            return Err(format!(
+                "checkpoint authentication suffix exceeds the bounded limit of \
+                 {CHECKPOINT_HISTORY_LIMIT} blocks"
+            ));
+        }
+        let child = &reversed.last().expect("source block").block;
+        let parent_id = *child.header.parent_block_id.as_bytes();
+        let parent = read_archived_nakamoto_block(&mut statement, parent_id)?;
+        if parent.block.header.chain_length.checked_add(1) != Some(child.header.chain_length) {
+            return Err(format!(
+                "checkpoint authentication history jumps from Stacks height {} to {}",
+                parent.block.header.chain_length, child.header.chain_length
+            ));
+        }
+        reversed.push(parent);
+    }
+
+    let first = &reversed.last().expect("history starts at a tenure").block;
+    let mut child_height = first.header.chain_length;
+    let mut boundary_id = *first.header.parent_block_id.as_bytes();
+    let boundary = loop {
+        let parent = read_archived_nakamoto_block(&mut statement, boundary_id)?;
+        if parent.block.header.chain_length.checked_add(1) != Some(child_height) {
+            return Err(format!(
+                "checkpoint boundary walk jumps from Stacks height {} to {child_height}",
+                parent.block.header.chain_length
+            ));
+        }
+        if nano_chainstate::starts_new_tenure(&parent.block) {
+            break parent.block;
+        }
+        child_height = parent.block.header.chain_length;
+        boundary_id = *parent.block.header.parent_block_id.as_bytes();
+    };
+    let proof = nano_chainstate::coinbase_vrf_proof(&boundary).ok_or_else(|| {
+        format!(
+            "checkpoint boundary tenure {} has no Nakamoto coinbase VRF proof",
+            boundary.header.consensus_hash
+        )
+    })?;
+
+    let boundary_json = serde_json::to_vec_pretty(&json!({
+        "parent_tenure_consensus_hash": encode_hex(boundary.header.consensus_hash.as_bytes()),
+        "coinbase_vrf_proof": encode_hex(&proof),
+    }))
+    .map_err(|error| format!("serialize checkpoint authentication boundary: {error}"))?;
+    write_file(&output.join("boundary.json"), &boundary_json)?;
+    reversed.reverse();
+    for entry in &reversed {
+        let block = &entry.block;
+        write_file(
+            &output.join("blocks").join(format!(
+                "{:08}-{}.bin",
+                block.header.chain_length,
+                encode_hex(block.block_id().as_bytes())
+            )),
+            &entry.raw,
+        )?;
+    }
+    Ok(reversed.len())
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
@@ -4910,13 +5416,13 @@ fn conditional_gates() -> ConditionalInventory {
         let policy = field("policy").unwrap_or_default();
         let job = field("job").unwrap_or_default();
         let owner = field("owner").unwrap_or_default();
-        let requires = field("requires").unwrap_or_default();
+        let prerequisites = field("requires").unwrap_or_default();
         let valid = match (class.as_str(), policy.as_str()) {
             ("infrastructure", "required") => job == "release-qualification",
             ("diagnostic", "optional") => job == "manual-diagnostics",
             _ => false,
         } && !owner.is_empty()
-            && !requires.is_empty();
+            && !prerequisites.is_empty();
         if !valid {
             errors.push(format!("{site} has an invalid or incomplete policy"));
         }
@@ -5419,6 +5925,33 @@ fn build_release_artifact() -> bool {
     gate.passed
 }
 
+fn report_contract_arities(state: Option<&Path>) -> bool {
+    println!("\ncontract arity inventory");
+    let Some(state) = state else {
+        println!("  no --state directory given, so no full-state arity claim is made");
+        return true;
+    };
+    match contract_inventory(state) {
+        Ok(inventory) => {
+            print_contract_inventory(&inventory);
+            if inventory.passes() {
+                println!("  PASS: every named contract was measured and its module loads");
+                true
+            } else {
+                println!(
+                    "  FAIL: a named contract was unmeasured or refused; this state does not \
+                     support the no-arity-refusal release claim"
+                );
+                false
+            }
+        }
+        Err(error) => {
+            println!("  FAIL: {error}");
+            false
+        }
+    }
+}
+
 fn report_checkpoint(state: Option<&Path>) {
     println!("\ncheckpoint provenance");
     let Some(directory) = state else {
@@ -5753,6 +6286,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let artifact_path =
         artifact.unwrap_or_else(|| workspace_root().join("target/release/stacks-node"));
     let artifact = report_artifact(&artifact_path);
+    let contract_arities = report_contract_arities(state.as_deref());
     report_checkpoint(state.as_deref());
     let scoreboard = report_scoreboard();
     report_inputs();
@@ -5779,6 +6313,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && blocking == 0
         && built
         && artifact
+        && contract_arities
         && scoreboard
         && receipt_binding
         && capture_valid
@@ -5921,8 +6456,379 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{MINER_REWARD_MATURITY, refuse_a_short_earnings_window};
+    use std::{collections::HashMap, fs, path::Path};
+
+    use super::{
+        ARCHIVED_NAKAMOTO_BLOCK_QUERY, CheckpointHistoryExport, ContractArity, ContractInventory,
+        ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
+        chainstate_directory, crosses_wasm_arity_boundary, encode_hex,
+        refuse_a_short_earnings_window, write_checkpoint_authentication_history,
+    };
+    use nano_chainstate::NakamotoBlock;
     use serde_json::json;
+
+    struct FixtureBlock {
+        raw: Vec<u8>,
+        decoded: NakamotoBlock,
+    }
+
+    #[test]
+    fn chainstate_directory_prefers_a_complete_nested_pair_over_distracting_root_databases() {
+        let root = tempfile::tempdir().expect("temporary state");
+        let nested = root.path().join("chainstate");
+        fs::create_dir(&nested).expect("nested chainstate");
+        for directory in [root.path(), nested.as_path()] {
+            fs::write(directory.join("marf.sqlite"), []).expect("MARF database marker");
+            fs::write(directory.join("clarity.sqlite"), []).expect("Clarity database marker");
+        }
+
+        assert_eq!(chainstate_directory(root.path()), nested);
+        assert_eq!(chainstate_directory(&nested), nested);
+
+        let direct = root.path().join("direct");
+        fs::create_dir(&direct).expect("direct chainstate");
+        fs::write(direct.join("marf.sqlite"), []).expect("direct MARF database marker");
+        fs::write(direct.join("clarity.sqlite"), []).expect("direct Clarity database marker");
+        assert_eq!(chainstate_directory(&direct), direct);
+    }
+
+    fn fixture_blocks() -> Vec<FixtureBlock> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/nano-conformance/fixtures/nakamoto/blocks");
+        let mut paths = fs::read_dir(directory)
+            .expect("fixture blocks")
+            .map(|entry| entry.expect("fixture entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let raw = fs::read(path).expect("read fixture block");
+                let decoded = NakamotoBlock::decode(&raw).expect("decode fixture block");
+                FixtureBlock { raw, decoded }
+            })
+            .collect()
+    }
+
+    fn archive(path: &Path, blocks: &[FixtureBlock]) {
+        let connection = rusqlite::Connection::open(path).expect("create archive");
+        connection
+            .execute_batch(
+                "CREATE TABLE nakamoto_staging_blocks (
+                    height INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL,
+                    consensus_hash TEXT NOT NULL,
+                    index_block_hash TEXT PRIMARY KEY NOT NULL,
+                    parent_block_id TEXT NOT NULL,
+                    is_tenure_start INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    processed INTEGER NOT NULL,
+                    orphaned INTEGER NOT NULL
+                );",
+            )
+            .expect("archive schema");
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO nakamoto_staging_blocks
+                 (height, block_hash, consensus_hash, index_block_hash, parent_block_id,
+                  is_tenure_start, data, processed, orphaned)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0)",
+            )
+            .expect("archive insertion");
+        for fixture in blocks {
+            let block = &fixture.decoded;
+            insert
+                .execute(rusqlite::params![
+                    block.header.chain_length,
+                    encode_hex(block.header.block_hash().as_bytes()),
+                    encode_hex(block.header.consensus_hash.as_bytes()),
+                    encode_hex(block.block_id().as_bytes()),
+                    encode_hex(block.header.parent_block_id.as_bytes()),
+                    i64::from(nano_chainstate::starts_new_tenure(block)),
+                    &fixture.raw,
+                ])
+                .expect("insert fixture block");
+        }
+    }
+
+    #[test]
+    fn checkpoint_history_lookup_uses_the_archive_block_id_index() {
+        let blocks = fixture_blocks();
+        let root = tempfile::tempdir().expect("temporary archive");
+        let database = root.path().join("nakamoto.sqlite");
+        archive(&database, &blocks[..1]);
+        let connection = rusqlite::Connection::open(&database).expect("open archive");
+        let plan = connection
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {ARCHIVED_NAKAMOTO_BLOCK_QUERY}"),
+                rusqlite::params![encode_hex(blocks[0].decoded.block_id().as_bytes())],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query plan");
+
+        assert!(plan.contains("SEARCH"), "archive lookup scans: {plan}");
+        assert!(
+            plan.contains("INDEX"),
+            "archive lookup ignores its index: {plan}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_history_export_is_a_bounded_tenure_suffix() {
+        let blocks = fixture_blocks();
+        let starts = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, fixture)| nano_chainstate::starts_new_tenure(&fixture.decoded))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(starts.len() >= 2, "fixture has two tenure starts");
+        let boundary_index = starts[0];
+        let first_index = starts[1];
+        let source_index = starts.get(2).map_or(blocks.len() - 1, |index| *index - 1);
+        let root = tempfile::tempdir().expect("temporary export");
+        let database = root.path().join("nakamoto.sqlite");
+        archive(&database, &blocks[boundary_index..=source_index]);
+        let source = &blocks[source_index].decoded;
+        let output = root.path().join("authentication-history");
+
+        let written = write_checkpoint_authentication_history(
+            &database,
+            *source.block_id().as_bytes(),
+            *source.header.state_index_root.as_bytes(),
+            &output,
+        )
+        .expect("export authentication history");
+
+        assert_eq!(written, source_index - first_index + 1);
+        assert_eq!(
+            fs::read_dir(output.join("blocks"))
+                .expect("exported blocks")
+                .count(),
+            written
+        );
+        let boundary: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("boundary.json")).expect("boundary proof"),
+        )
+        .expect("boundary JSON");
+        let expected_boundary = &blocks[boundary_index].decoded;
+        assert_eq!(
+            boundary["parent_tenure_consensus_hash"],
+            encode_hex(expected_boundary.header.consensus_hash.as_bytes())
+        );
+        assert_eq!(
+            boundary["coinbase_vrf_proof"],
+            encode_hex(
+                &nano_chainstate::coinbase_vrf_proof(expected_boundary)
+                    .expect("boundary coinbase proof")
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_history_export_refuses_a_wrong_root() {
+        let blocks = fixture_blocks();
+        let starts = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, fixture)| nano_chainstate::starts_new_tenure(&fixture.decoded))
+            .map(|(index, _)| index)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2, "fixture has two tenure starts");
+        let root = tempfile::tempdir().expect("temporary export");
+        let database = root.path().join("nakamoto.sqlite");
+        archive(&database, &blocks[starts[0]..=starts[1]]);
+        let source = &blocks[starts[1]].decoded;
+        let output = root.path().join("wrong-root");
+
+        let error = write_checkpoint_authentication_history(
+            &database,
+            *source.block_id().as_bytes(),
+            [0xff; 32],
+            &output,
+        )
+        .expect_err("wrong checkpoint root must be refused");
+
+        assert!(error.contains("publishes state root"), "{error}");
+        assert!(!output.exists(), "a refused export wrote output");
+    }
+
+    #[test]
+    fn checkpoint_history_export_refuses_a_source_metadata_mismatch() {
+        let blocks = fixture_blocks();
+        let starts = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, fixture)| nano_chainstate::starts_new_tenure(&fixture.decoded))
+            .map(|(index, _)| index)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2, "fixture has two tenure starts");
+        let root = tempfile::tempdir().expect("temporary export");
+        let database = root.path().join("nakamoto.sqlite");
+        archive(&database, &blocks[starts[0]..=starts[1]]);
+        let source = &blocks[starts[1]].decoded;
+        let forged_source = [0xaa; 32];
+        let connection = rusqlite::Connection::open(&database).expect("open archive");
+        connection
+            .execute(
+                "UPDATE nakamoto_staging_blocks SET index_block_hash = ?1 \
+                 WHERE index_block_hash = ?2",
+                rusqlite::params![
+                    encode_hex(&forged_source),
+                    encode_hex(source.block_id().as_bytes()),
+                ],
+            )
+            .expect("forge archive metadata");
+        drop(connection);
+        let output = root.path().join("wrong-source");
+
+        let error = write_checkpoint_authentication_history(
+            &database,
+            forged_source,
+            *source.header.state_index_root.as_bytes(),
+            &output,
+        )
+        .expect_err("wrong checkpoint source must be refused");
+
+        assert!(error.contains("metadata does not match"), "{error}");
+        assert!(!output.exists(), "a refused export wrote output");
+    }
+
+    #[test]
+    fn checkpoint_history_arguments_require_fixed_width_hashes() {
+        let state_root = "00".repeat(32);
+        let arguments = [
+            "--blocks-db",
+            "archive.sqlite",
+            "--source-id",
+            "abcd",
+            "--state-root",
+            &state_root,
+            "--out-dir",
+            "history",
+        ]
+        .map(str::to_owned);
+        let error = CheckpointHistoryExport::parse(&arguments).expect_err("short source ID");
+        assert!(error.contains("not 32 hex bytes"), "{error}");
+    }
+
+    fn arity(values: [usize; 5]) -> nano_vm::ArityReport {
+        nano_vm::ArityReport {
+            max_function_params: values[0],
+            max_function_results: values[1],
+            max_control_params: values[2],
+            max_control_results: values[3],
+            top_level_results: values[4],
+        }
+    }
+
+    #[test]
+    fn arity_inventory_records_each_numeric_maximum_and_exact_boundary_crossing() {
+        let exact = arity([1_000, 9, 8, 7, 6]);
+        let wide = arity([3, 1_001, 5, 1_002, 1_003]);
+        assert!(!crosses_wasm_arity_boundary(&exact));
+        assert!(crosses_wasm_arity_boundary(&wide));
+
+        let mut inventory = ContractInventory {
+            named: 2,
+            checked: 2,
+            loaded: 2,
+            ..ContractInventory::default()
+        };
+        inventory.note_arity("SP000000000000000000002Q6VF78.exact", exact);
+        inventory.note_arity("SP000000000000000000002Q6VF78.wide", wide.clone());
+
+        assert_eq!(inventory.maximum, arity([1_000, 1_001, 8, 1_002, 1_003]));
+        assert_eq!(
+            inventory.over_boundary,
+            vec![ContractArity {
+                contract: "SP000000000000000000002Q6VF78.wide".to_owned(),
+                report: wide,
+            }]
+        );
+        assert!(inventory.passes());
+    }
+
+    #[test]
+    fn a_refused_or_unmeasured_contract_fails_the_arity_inventory() {
+        let report = arity([1_001, 2, 3, 4, 5]);
+        let mut refused = ContractInventory {
+            named: 1,
+            checked: 1,
+            ..ContractInventory::default()
+        };
+        refused.note_arity("SP000000000000000000002Q6VF78.refused", report.clone());
+        refused.refused.insert(
+            "function params size is out of bounds".to_owned(),
+            vec![ContractRefusal {
+                contract: "SP000000000000000000002Q6VF78.refused".to_owned(),
+                arity: Some(report.clone()),
+            }],
+        );
+        assert!(!refused.passes());
+        assert_eq!(
+            arity_dimensions(&report),
+            "function params/results 1001/2, control params/results 3/4, top-level results 5"
+        );
+
+        let mut unmeasured = ContractInventory {
+            named: 1,
+            ..ContractInventory::default()
+        };
+        unmeasured.unmeasured.insert(
+            "source unavailable".to_owned(),
+            vec!["SP.invalid".to_owned()],
+        );
+        assert!(!unmeasured.passes());
+    }
+
+    #[test]
+    fn locals_inventory_records_the_exact_peak_and_sorts_every_tied_site() {
+        assert_eq!(nano_vm::MAX_WASM_FUNCTION_LOCALS, 50_000);
+        let mut inventory = ContractInventory::default();
+        assert!(inventory.note_locals(
+            "SP000000000000000000002Q6VF78.z-contract",
+            &nano_vm::LocalsReport {
+                max_live_locals: HashMap::from([
+                    ("omega".to_owned(), 12),
+                    ("alpha".to_owned(), 15),
+                    ("gamma".to_owned(), 15),
+                ]),
+            },
+        ));
+        assert!(inventory.note_locals(
+            "SP000000000000000000002Q6VF78.a-contract",
+            &nano_vm::LocalsReport {
+                max_live_locals: HashMap::from([("beta".to_owned(), 15)]),
+            },
+        ));
+        assert!(!inventory.note_locals("SP.empty", &nano_vm::LocalsReport::default()));
+        inventory.sort_measurements();
+
+        assert_eq!(inventory.maximum_live_locals, 15);
+        assert_eq!(
+            inventory.maximum_live_local_sites,
+            vec![
+                ContractLocalsPeak {
+                    contract: "SP000000000000000000002Q6VF78.a-contract".to_owned(),
+                    function: "beta".to_owned(),
+                    locals: 15,
+                },
+                ContractLocalsPeak {
+                    contract: "SP000000000000000000002Q6VF78.z-contract".to_owned(),
+                    function: "alpha".to_owned(),
+                    locals: 15,
+                },
+                ContractLocalsPeak {
+                    contract: "SP000000000000000000002Q6VF78.z-contract".to_owned(),
+                    function: "gamma".to_owned(),
+                    locals: 15,
+                },
+            ]
+        );
+    }
 
     /// The shape `write_native_effects` builds: one entry per tenure it could
     /// price, in ascending order, with the heights it could not simply absent.

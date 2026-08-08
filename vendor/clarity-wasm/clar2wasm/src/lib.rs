@@ -10,7 +10,7 @@ use clarity::vm::ClarityVersion;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 pub use walrus::Module;
-pub use wasm_generator::ArityReport;
+pub use wasm_generator::{ArityReport, MAX_WASM_TYPE_ARITY};
 use wasm_generator::{GeneratorError, LocalsReport, WasmGenerator};
 
 use crate::error::WasmError;

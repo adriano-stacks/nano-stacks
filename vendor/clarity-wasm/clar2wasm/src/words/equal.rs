@@ -36,14 +36,60 @@ impl ComplexWord for IsEq {
             self.charge(generator, builder, args_len as u32)?;
         }
 
-        // Since all argument should have compatible types, we unify them so that they all have the same representation.
-        let unified_ty = args.iter().try_fold(TypeSignature::NoType, |ty, arg| {
-            let arg_ty = generator.get_expr_type(arg).ok_or_else(|| {
-                GeneratorError::TypeError("Is-eq argument should be typed".to_owned())
-            })?;
-            TypeSignature::least_supertype(&generator.contract_analysis.epoch, &ty, arg_ty)
-                .map_err(|e| GeneratorError::TypeError(format!("Incompatible types in is-eq: {e}")))
+        let operand_types = args
+            .iter()
+            .map(|arg| {
+                generator.get_expr_type(arg).cloned().ok_or_else(|| {
+                    GeneratorError::TypeError("Is-eq argument should be typed".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Match the analyzer's operand order. Tuple least-supertype is
+        // asymmetric: the next operand is the left-hand side.
+        let mut types = operand_types.iter();
+        let mut unified_ty = types.next().cloned().ok_or_else(|| {
+            GeneratorError::InternalError("is-eq must have at least one operand".to_owned())
         })?;
+        for operand_ty in types {
+            unified_ty = TypeSignature::least_supertype(
+                &generator.contract_analysis.epoch,
+                operand_ty,
+                &unified_ty,
+            )
+            .map_err(|error| {
+                GeneratorError::TypeError(format!("Incompatible types in is-eq: {error}"))
+            })?;
+        }
+
+        // Tuple values with different field sets cannot compare equal. Keep
+        // their original layouts, but still evaluate and charge every operand.
+        // Narrowing both to the analyzer's common type would turn unequal
+        // TupleData values into equal ones when their shared fields match.
+        if operand_types
+            .iter()
+            .skip(1)
+            .any(|ty| tuples_are_statically_distinct(&operand_types[0], ty))
+        {
+            for (operand, ty) in args.iter().zip(&operand_types) {
+                generator.traverse_expr(builder, operand)?;
+                if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+                    generator.serialization_size(builder, ty)?;
+                    builder
+                        .local_get(serialization_size_sum)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(serialization_size_sum);
+                }
+                drop_value(builder, ty);
+            }
+            if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+                self.charge(generator, builder, serialization_size_sum)?;
+            }
+            builder.i32_const(0);
+            return Ok(());
+        }
+
+        // Compatible operands use one representation for their value comparison.
         for a in args {
             generator.set_expr_type(a, unified_ty.clone())?;
         }
@@ -99,6 +145,20 @@ impl ComplexWord for IsEq {
 
         Ok(())
     }
+}
+
+fn tuples_are_statically_distinct(left: &TypeSignature, right: &TypeSignature) -> bool {
+    let (TypeSignature::TupleType(left), TypeSignature::TupleType(right)) = (left, right) else {
+        return false;
+    };
+    let left = left.get_type_map();
+    let right = right.get_type_map();
+    left.len() != right.len()
+        || left.iter().any(|(name, left)| {
+            right
+                .get(name)
+                .is_none_or(|right| tuples_are_statically_distinct(left, right))
+        })
 }
 
 pub(super) fn wasm_equal(
@@ -634,7 +694,7 @@ fn wasm_equal_list(
 mod tests {
     use clarity::vm::Value;
 
-    use crate::tools::{crosscheck, evaluate};
+    use crate::tools::{crosscheck, crosscheck_cost, evaluate};
 
     #[test]
     fn is_eq_less_than_one_arg() {
@@ -687,5 +747,37 @@ mod tests {
         let snippet = "(is-eq (err false) (if true (ok u1) (err true)))";
 
         crosscheck(snippet, Ok(Some(Value::Bool(false))));
+    }
+
+    #[test]
+    fn is_eq_preserves_asymmetric_tuple_shapes() {
+        const SOURCE: &str = "
+            (define-data-var narrow { common: uint } { common: u1 })
+            (define-data-var nested-narrow
+                { outer: { common: uint } }
+                { outer: { common: u1 } })
+            (define-read-only (different-shape (wide { common: uint, extra: bool }))
+                (is-eq (print wide) (print (var-get narrow))))
+            (define-read-only (different-nested-shape
+                    (wide { outer: { common: uint, extra: bool } }))
+                (is-eq (print wide) (print (var-get nested-narrow))))
+        ";
+
+        crosscheck(
+            &format!("{SOURCE} (different-shape {{ common: u1, extra: false }})"),
+            Ok(Some(Value::Bool(false))),
+        );
+        crosscheck(
+            &format!(
+                "{SOURCE} (different-nested-shape \
+                 {{ outer: {{ common: u1, extra: false }} }})"
+            ),
+            Ok(Some(Value::Bool(false))),
+        );
+
+        let wide = evaluate("{ common: u1, extra: false }")
+            .expect("the argument evaluates")
+            .expect("the argument has a value");
+        crosscheck_cost(SOURCE, "different-shape", &[wide]);
     }
 }

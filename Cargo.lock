@@ -6054,6 +6054,7 @@ version = "0.1.0"
 dependencies = [
  "clarity",
  "hex",
+ "nano-bitcoin",
  "nano-chainstate",
  "nano-codec",
  "nano-conformance",

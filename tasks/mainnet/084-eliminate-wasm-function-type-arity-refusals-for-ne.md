@@ -25,28 +25,30 @@ bug.
 
 ## Tasks
 
-- [ ] Measure the smallest source that exceeds WebAssembly parameter and result
+- [x] Measure the smallest source that exceeds WebAssembly parameter and result
       arity separately, including nested tuples, optionals, responses, public
       functions, read-only functions and cross-contract calls.
 - [ ] Establish network validity with the pinned stacks-core analyzer, source and
       transaction size limits, deploy costs and an actual stock-node deployment;
       interpreter acceptance alone is not sufficient release evidence.
-- [x] Measure the maximum flattened parameter/result arity across every contract in
+- [ ] Measure the maximum flattened parameter/result arity across every contract in
       the imported mainnet state and account for every contract the sweep cannot
       compile under task 073. **The second half is done — [[093]] classified all
       eight, and seven now load. The first half had a hole: 073's sweep called
       `clar2wasm::compile` and never handed the result to wasmtime, and arity is a
       *validator* limit, so a module exceeding it compiles cleanly and fails to
       load. That sweep could not have seen one. `cargo xtask sweep-contracts`
-      closes the hole — it runs `Vm::check_module`, which is `compile_under`
-      followed by `loadable`, over every contract in a state, read-only and in one
-      process.**
-- [ ] If a network-valid source reaches the limit, change the clarity-wasm ABI to
+      now has the measurement path — it runs `Vm::inspect_module`, the
+      report-preserving form of `compile_under` followed by `loadable`, over every
+      contract in a state, read-only and in one process. **This remains open until
+      that new inventory is run over the full imported state and every named but
+      unmeasurable entry is accounted for.**
+- [x] If a network-valid source reaches the limit, change the clarity-wasm ABI to
       pass oversized composites through linear memory or another vetted bounded
       representation instead of flattened WebAssembly slots.
-- [ ] Differentially test returned values, costs, events, writes and contract-call
+- [x] Differentially test returned values, costs, events, writes and contract-call
       ABI behavior on both sides of the former boundary.
-- [ ] Preserve compile, module-load, host and runtime failure-path coverage with
+- [x] Preserve compile, module-load, host and runtime failure-path coverage with
       faults that are not valid Clarity programs the production node is required
       to execute.
 - [ ] Add the measured boundary and verdict to the release report, and make any
@@ -140,6 +142,34 @@ carries the wrong thing. `expected i64 but nothing on stack` is the same family
 one step worse. That commit fixed one instance (`keepgoing-safe`, and
 `v0-5-market` with it — see [[086]]); these three are further instances or a
 sibling defect, and they belong with that work rather than with arity.
+
+## The reachable boundary is lowered through memory, 2026-08-08
+
+Commit `72f980ab` keeps the engine's 1,000-slot limit and changes the ABI rather
+than raising it. Function parameters/results, wide control results and the
+top-level return use a memory-backed representation only when their flattened
+source type exceeds the boundary. `ArityReport` records the pre-lowering widths:
+maximum function parameters/results, control parameters/results and top-level
+results.
+
+The committed boundary tests cover exactly 1,000 and 1,001 flattened slots across
+tuple, optional and response values, read-only and public functions, top-level
+results and cross-contract parameters/results. The differential exercises values,
+costs, events, committed and rolled-back writes, and the cross-contract ABI on
+both sides. The engine-failure fixture no longer keeps a valid over-wide Clarity
+program broken: malformed Wasm reaches the production module-load boundary, while
+separate fixtures retain compile, host and runtime failure coverage.
+
+The inventory bridge keeps the report beside the result of the same compilation;
+it does not compile each contract twice and does not copy the 1,000-slot constant.
+`sweep-contracts` prints all five numeric maxima, every exact contract whose raw
+arity crosses the boundary, and whether that module loaded. A contract which
+cannot be parsed, sourced or assigned its recorded deploy epoch is now
+`UNMEASURED` and makes the verdict fail instead of disappearing from the
+denominator. `release-report --state` consumes the same verdict and fails for an
+unmeasured or refusing contract. No full-state run of the new measurement, actual
+stock-node deployment, or release qualification has been claimed yet; those are
+why the corresponding checklist items remain open.
 
 ### One caution, recorded because it cost a whole run
 

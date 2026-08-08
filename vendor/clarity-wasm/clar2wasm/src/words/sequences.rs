@@ -411,6 +411,10 @@ impl ComplexWord for Append {
 
         let list = args.get_expr(0)?;
         let elem = args.get_expr(1)?;
+        let original_elem_ty = generator
+            .get_expr_type(elem)
+            .ok_or_else(|| GeneratorError::TypeError("append element must be typed".to_string()))?
+            .clone();
 
         // WORKAROUND: setting correct types for arguments
         let elem_ty = match &ty {
@@ -487,7 +491,12 @@ impl ComplexWord for Append {
             builder,
             elem_ty
                 .size()
-                .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                .map_err(|error| GeneratorError::TypeError(error.to_string()))?
+                .max(
+                    original_elem_ty
+                        .size()
+                        .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                ),
         )?;
 
         // Store the element at the write pointer.
@@ -2192,6 +2201,21 @@ mod tests {
                 Value::cons_list_unsanitized(vec![Value::Int(42)]).unwrap(),
             )),
         )
+    }
+
+    #[test]
+    fn append_sanitizes_wider_tuple_after_evaluating_every_field() {
+        crosscheck_compare_only(
+            "
+                (append
+                    (list { outer: { kept: u1 } })
+                    {
+                        outer: { kept: u2, nested-extra: (print u3) },
+                        outer-extra: (print u4)
+                    }
+                )
+            ",
+        );
     }
 
     #[test]
