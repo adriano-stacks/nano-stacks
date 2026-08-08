@@ -427,7 +427,6 @@ impl ComplexWord for Append {
                         .expect("Argument type should be correct as it is the same as the expression type with a smaller max_len")
                         .into(),
                 )?;
-                generator.set_expr_type(elem, elem_ty.clone())?;
                 elem_ty.clone()
             }
             _ => {
@@ -498,6 +497,18 @@ impl ComplexWord for Append {
                         .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
                 ),
         )?;
+
+        // `append` evaluates the element at its own type, then sanitizes it to
+        // the list's entry type. Rewriting the expression's type is not enough:
+        // a user-defined call still returns its declared layout and would leave
+        // any extra tuple fields on the Wasm stack.
+        if need_ducktyping(&original_elem_ty, &elem_ty) {
+            let workspace = match dt_needed_workspace(&elem_ty) {
+                0 => None,
+                size => Some(generator.create_call_stack_bytes(builder, size as i32).0),
+            };
+            generator.duck_type(builder, &original_elem_ty, &elem_ty, workspace)?;
+        }
 
         // Store the element at the write pointer.
         generator.write_to_memory(builder, write_ptr, 0, &elem_ty)?;
@@ -2214,6 +2225,17 @@ mod tests {
                         outer-extra: (print u4)
                     }
                 )
+            ",
+        );
+    }
+
+    #[test]
+    fn append_sanitizes_a_wider_user_function_result() {
+        crosscheck_compare_only(
+            "
+                (define-private (wide)
+                    { kept: u2, extra: u3 })
+                (append (list { kept: u1 }) (wide))
             ",
         );
     }
