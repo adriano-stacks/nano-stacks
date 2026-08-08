@@ -22,6 +22,7 @@
           # asks rustup for the same channel, for anyone outside this shell.
           default = pkgs.mkShell {
             packages = [
+              pkgs.actionlint
               pkgs.cargo
               pkgs.clippy
               pkgs.curl

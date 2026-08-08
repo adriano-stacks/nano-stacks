@@ -87,7 +87,7 @@ fn the_networks_root_children_name_the_missing_write() {
         setting("NANO_TRIE_PARENT"),
         setting("NANO_TRIE_WRITES"),
     ) else {
-        nano_conformance::skip_gate(
+        nano_conformance::skip_diagnostic(
             "NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES are needed",
         );
         return;

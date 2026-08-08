@@ -126,7 +126,7 @@ fn nano_reports_a_key_at_a_block() {
         env::var("NANO_MAINNET_BLOCK"),
         env::var("NANO_MAINNET_KEY"),
     ) else {
-        nano_conformance::skip_gate(
+        nano_conformance::skip_diagnostic(
             "NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY are needed",
         );
         return;

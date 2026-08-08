@@ -72,6 +72,10 @@ pub enum ConsensusError {
     TenureChangePreviousTenure,
     /// The tenure change names a previous tenure this chain did not execute.
     TenureChangeParentTenure,
+    /// The parent block is absent from the authenticated checkpoint history.
+    TenureChangeParentUnavailable,
+    /// The parent header does not carry a usable tenure start height.
+    TenureChangeLengthUnavailable,
     /// The tenure change miscounts the blocks in the tenure it ends.
     TenureChangeBlockCount {
         claimed: u32,
@@ -92,6 +96,10 @@ pub enum ConsensusError {
         /// What the header's own miner signature recovers to.
         signed: Hash160,
     },
+    /// The local sortition has no winning leader key to authenticate the tenure.
+    WinnerVrfKeyUnavailable,
+    /// The winning leader key has no registered block-signing key hash.
+    WinnerSigningKeyUnavailable,
     /// More `problematic_txs` markers than a block could hold transactions.
     ProblematicMarkerCount(usize),
     /// Markers that repeat or run backwards, so a replay cannot follow them.
@@ -103,6 +111,8 @@ pub enum ConsensusError {
     ProblematicMarkerTarget(u32),
     /// The signatures do not carry the reward set's threshold weight.
     SignerWeight(SignerSetError),
+    /// The authenticated state carries no signer set for this reward cycle.
+    SignerSetUnavailable(u64),
     /// The header's cumulative burn is not the total this node derived from its
     /// own burnchain for the same burn view.
     BitcoinSpent {
@@ -175,6 +185,11 @@ impl std::fmt::Display for ConsensusError {
                 .write_str("the tenure change's previous tenure is not the one its cause requires"),
             Self::TenureChangeParentTenure => formatter
                 .write_str("the tenure change names a previous tenure this chain did not execute"),
+            Self::TenureChangeParentUnavailable => formatter.write_str(
+                "the tenure change's parent is absent from the authenticated block history",
+            ),
+            Self::TenureChangeLengthUnavailable => formatter
+                .write_str("the tenure change's parent has no authenticated tenure start height"),
             Self::TenureChangeBlockCount { claimed, executed } => write!(
                 formatter,
                 "the tenure change reports {claimed} blocks in the tenure it ends, \
@@ -190,6 +205,10 @@ impl std::fmt::Display for ConsensusError {
                 "the block was not signed by the miner whose leader key won its sortition: \
                  the winning key is registered with {registered}, the header signed by {signed}"
             ),
+            Self::WinnerVrfKeyUnavailable => formatter
+                .write_str("the local sortition carries no winning VRF key for this tenure"),
+            Self::WinnerSigningKeyUnavailable => formatter
+                .write_str("the winning leader key carries no registered block-signing key hash"),
             Self::ProblematicMarkerCount(markers) => write!(
                 formatter,
                 "{markers} problematic-transaction markers exceed the cap of \
@@ -212,6 +231,10 @@ impl std::fmt::Display for ConsensusError {
                 "the header spends {header} burn and this node's burnchain makes it {derived}"
             ),
             Self::SignerWeight(error) => write!(formatter, "signer signatures: {error}"),
+            Self::SignerSetUnavailable(cycle) => write!(
+                formatter,
+                "reward cycle {cycle} has no authenticated signer set"
+            ),
         }
     }
 }

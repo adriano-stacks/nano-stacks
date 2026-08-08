@@ -39,6 +39,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: workflow syntax
+        run: nix develop --command actionlint
+
       - name: formatting
         run: nix develop --command cargo fmt --all -- --check
 
@@ -90,6 +93,7 @@ jobs:
       - name: capture-backed release report
         run: |
           set -a
+          # shellcheck source=/dev/null
           . "$NANO_RELEASE_ENV"
           set +a
           nix develop --command cargo xtask release-report \

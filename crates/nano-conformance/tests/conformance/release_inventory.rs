@@ -17,8 +17,8 @@
 //! What this deliberately does *not* do is turn an accounted gap green. Declared
 //! semantic differentials still fail the release report; naming them only prevents
 //! them from hiding behind a passing count. `conditional-tests.toml` does the same
-//! by stable call-site identity
-//! for `skip_gate`: module, containing function and ordinal within that function.
+//! by stable call-site identity for `skip_gate` and `skip_diagnostic`: module,
+//! containing function and ordinal within that function.
 //! Moving a line does not invalidate an entry, while adding or removing a call does.
 
 use std::{
@@ -35,6 +35,16 @@ struct ConditionalEntry {
     job: String,
     requires: String,
     policy: String,
+}
+
+#[derive(Default)]
+struct IgnoredEntry {
+    test: String,
+    class: String,
+    owner: String,
+    job: String,
+    requires: String,
+    covered_by: String,
 }
 
 fn workspace_root() -> PathBuf {
@@ -109,18 +119,49 @@ fn ignored_reasons(root: &Path, found: &mut Vec<(String, String, String)>) {
     }
 }
 
-/// The test names the inventory accounts for.
-fn inventoried() -> BTreeSet<String> {
+fn ignored_inventory() -> Vec<IgnoredEntry> {
     let text = fs::read_to_string(workspace_root().join("ignored-tests.toml"))
         .expect("ignored-tests.toml is part of the release gate and has to be there");
-    text.lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("test"))
-        .filter_map(|line| {
-            let (_, rest) = line.split_once('=')?;
-            let inner = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
-            Some(inner.to_owned())
-        })
+    let mut entries = Vec::new();
+    let mut current: Option<IgnoredEntry> = None;
+    for line in text.lines().map(str::trim) {
+        if line == "[[ignored]]" {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(IgnoredEntry::default());
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        let Some((name, _)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(value) = scalar(line) else {
+            continue;
+        };
+        match name.trim() {
+            "test" => entry.test = value,
+            "class" => entry.class = value,
+            "owner" => entry.owner = value,
+            "job" => entry.job = value,
+            "requires" => entry.requires = value,
+            "covered_by" => entry.covered_by = value,
+            _ => {}
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// The test names the inventory accounts for.
+fn inventoried() -> BTreeSet<String> {
+    ignored_inventory()
+        .into_iter()
+        .map(|entry| entry.test)
         .collect()
 }
 
@@ -207,7 +248,9 @@ fn conditional_sites() -> BTreeSet<String> {
                 }
             }
             let calls = line.matches("nano_conformance::skip_gate(").count()
-                + usize::from(trimmed.starts_with("skip_gate("));
+                + usize::from(trimmed.starts_with("skip_gate("))
+                + line.matches("nano_conformance::skip_diagnostic(").count()
+                + usize::from(trimmed.starts_with("skip_diagnostic("));
             for _ in 0..calls {
                 let ordinal = ordinals.entry(function.clone()).or_default();
                 *ordinal += 1;
@@ -359,6 +402,49 @@ fn the_inventory_names_no_test_that_is_gone() {
 }
 
 #[test]
+fn every_ignored_test_has_a_class_policy_and_an_owner() {
+    let entries = ignored_inventory();
+    let mut statuses = BTreeMap::new();
+    task_statuses(&workspace_root().join("tasks"), &mut statuses);
+    let distinct: BTreeSet<&str> = entries.iter().map(|entry| entry.test.as_str()).collect();
+    let mut invalid = Vec::new();
+    if distinct.len() != entries.len() {
+        invalid.push("ignored test names must be unique".to_owned());
+    }
+    invalid.extend(entries.iter().filter_map(|entry| {
+        let status = statuses.get(&entry.owner).map(String::as_str);
+        let class_policy = match entry.class.as_str() {
+            "infrastructure" => entry.job == "release-qualification" && !entry.requires.is_empty(),
+            "covered" | "out-of-scope" => !entry.covered_by.is_empty(),
+            "semantic" | "tool" | "unclassified" => true,
+            _ => false,
+        };
+        (entry.test.is_empty()
+            || entry.owner.is_empty()
+            || matches!(status, None | Some("cancelled"))
+            || !class_policy)
+            .then(|| {
+                format!(
+                    "{}: class={:?}, owner={} ({status:?}), job={:?}, requires={:?}, \
+                     covered_by={:?}",
+                    entry.test,
+                    entry.class,
+                    entry.owner,
+                    entry.job,
+                    entry.requires,
+                    entry.covered_by,
+                )
+            })
+    }));
+    assert!(
+        invalid.is_empty(),
+        "ignored entries need an explicit class policy, an existing owner, and the metadata \
+         their class requires:\n  {}",
+        invalid.join("\n  ")
+    );
+}
+
+#[test]
 fn every_conditional_gate_is_owned_by_the_inventory() {
     let live = conditional_sites();
     assert!(!live.is_empty(), "the conditional-gate scan found nothing");
@@ -389,7 +475,7 @@ fn every_conditional_gate_is_owned_by_the_inventory() {
 }
 
 #[test]
-fn every_conditional_gate_has_release_policy_and_an_open_owner() {
+fn every_conditional_site_has_a_policy_and_an_owner() {
     let entries = conditional_inventory();
     let mut statuses = BTreeMap::new();
     task_statuses(&workspace_root().join("tasks"), &mut statuses);
@@ -397,12 +483,17 @@ fn every_conditional_gate_has_release_policy_and_an_open_owner() {
         .iter()
         .filter_map(|entry| {
             let status = statuses.get(&entry.owner).map(String::as_str);
+            let valid_policy = match (entry.class.as_str(), entry.policy.as_str()) {
+                ("infrastructure", "required") => entry.job == "release-qualification",
+                ("diagnostic", "optional") => entry.job == "manual-diagnostics",
+                _ => false,
+            };
+            // Completion preserves the task as historical ownership. Cancellation
+            // removes that accountability and an absent task never supplied it.
             (entry.site.is_empty()
-                || entry.class != "infrastructure"
-                || entry.job.is_empty()
                 || entry.requires.is_empty()
-                || entry.policy != "required"
-                || matches!(status, None | Some("completed" | "cancelled")))
+                || !valid_policy
+                || matches!(status, None | Some("cancelled")))
             .then(|| {
                 format!(
                     "{}: class={:?}, owner={} ({status:?}), job={:?}, requires={:?}, policy={:?}",
@@ -413,7 +504,7 @@ fn every_conditional_gate_has_release_policy_and_an_open_owner() {
         .collect();
     assert!(
         invalid.is_empty(),
-        "conditional gate entries need an explicit release policy and open owner:\n  {}",
+        "conditional entries need a valid release policy and an existing owner:\n  {}",
         invalid.join("\n  ")
     );
 }

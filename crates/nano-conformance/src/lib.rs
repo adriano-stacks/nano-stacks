@@ -893,7 +893,7 @@ pub fn replay_into(
             &mut bitcoin_view,
             &path,
             &mut |_| {},
-            ChainState::execute_nakamoto_block_with_bitcoin_operations,
+            ChainState::execute_unauthenticated_fixture_block_with_bitcoin_operations,
         ) {
             Ok(block) => block,
             Err(divergence) => {
@@ -1145,6 +1145,12 @@ pub fn skip_gate(reason: &str) {
     eprintln!("skipped: {reason}");
 }
 
+/// Name an unavailable parameterized investigation without treating it as a
+/// release gate. Diagnostic call sites are separately inventoried as optional.
+pub fn skip_diagnostic(reason: &str) {
+    eprintln!("diagnostic unavailable: {reason}");
+}
+
 /// Execute the next captured block with a state root its header does not commit
 /// to, so that it is rejected exactly where a real divergence rejects it.
 ///
@@ -1203,7 +1209,7 @@ pub fn reject_captured_block(
             // before it has touched anything worth rolling back.
             block.header.timestamp = block.header.timestamp.wrapping_add(1);
         },
-        ChainState::append_nakamoto_block_with_bitcoin_operations,
+        ChainState::append_unauthenticated_fixture_block_with_bitcoin_operations,
     )
     .is_err())
 }
@@ -2592,7 +2598,7 @@ mod tests {
             .get(&block.header.consensus_hash.to_string())
             .expect("Bitcoin context");
         let applied = chainstate
-            .execute_nakamoto_block_with_bitcoin_operations(
+            .execute_unauthenticated_fixture_block_with_bitcoin_operations(
                 bitcoin_context,
                 bitcoin_operations
                     .get(&block.header.consensus_hash.to_string())
@@ -2719,7 +2725,7 @@ mod tests {
             .block_at(first_context.height)
             .expect("first Bitcoin operations");
         chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_unauthenticated_fixture_block_with_bitcoin_operations(
                 first_context,
                 &first_operations.operations,
                 Some(source),
@@ -2809,7 +2815,7 @@ mod tests {
             .block_at(first_context.height)
             .expect("first Bitcoin operations");
         chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_unauthenticated_fixture_block_with_bitcoin_operations(
                 first_context,
                 &first_operations.operations,
                 Some(source),
@@ -2943,7 +2949,7 @@ mod tests {
                 &mut bitcoin_view,
                 &path,
                 &mut |_| {},
-                ChainState::execute_nakamoto_block_with_bitcoin_operations,
+                ChainState::execute_unauthenticated_fixture_block_with_bitcoin_operations,
             )
             .expect("apply captured block");
             parent = Some(*block.block_id().as_bytes());
@@ -3391,7 +3397,7 @@ mod tests {
         let apply = |chainstate: &mut ChainState, block: &NanoNakamotoBlock, parent| {
             let view = block.header.consensus_hash.to_string();
             chainstate
-                .append_nakamoto_block_with_bitcoin_operations(
+                .append_unauthenticated_fixture_block_with_bitcoin_operations(
                     *snapshots.get(&view).expect("Bitcoin context"),
                     operations.get(&view).expect("Bitcoin operations"),
                     parent,
@@ -3518,7 +3524,7 @@ mod tests {
                 .expect("decode block");
             let view = block.header.consensus_hash.to_string();
             chainstate
-                .append_nakamoto_block_with_bitcoin_operations(
+                .append_unauthenticated_fixture_block_with_bitcoin_operations(
                     *snapshots.get(&view).expect("Bitcoin context"),
                     operations.get(&view).expect("Bitcoin operations"),
                     parent,
@@ -3815,7 +3821,7 @@ mod tests {
                 .expect("decode block");
             let view = block.header.consensus_hash.to_string();
             chainstate
-                .append_nakamoto_block_with_bitcoin_operations(
+                .append_unauthenticated_fixture_block_with_bitcoin_operations(
                     *snapshots.get(&view).expect("Bitcoin context"),
                     bitcoin_operations.get(&view).expect("Bitcoin operations"),
                     parent,
@@ -3903,7 +3909,7 @@ mod tests {
             let view = block.header.consensus_hash.to_string();
             let context = *snapshots.get(&view).expect("Bitcoin context");
             chainstate
-                .append_nakamoto_block_with_bitcoin_operations(
+                .append_unauthenticated_fixture_block_with_bitcoin_operations(
                     context,
                     bitcoin_operations.get(&view).expect("Bitcoin operations"),
                     parent,
@@ -4191,7 +4197,7 @@ mod tests {
             let mut context = captured_context;
             context.move_to_burn_block(height);
             let applied = chainstate
-                .execute_nakamoto_block_with_bitcoin_operations(
+                .execute_unauthenticated_fixture_block_with_bitcoin_operations(
                     context,
                     operations,
                     Some(source),

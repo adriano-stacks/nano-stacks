@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fmt::Write as _,
@@ -4874,24 +4874,71 @@ fn classify_failures(output: &str) -> (BTreeMap<String, Vec<String>>, Vec<String
     (unrunnable, broken)
 }
 
-/// How many owned conditional call sites each conformance file declares.
-///
-/// `release_inventory` separately proves this inventory matches the source in
-/// both directions. The report consumes the policy file rather than rediscovering
-/// policy from syntax, for the same reason ignored tests use their inventory.
-fn conditional_gates() -> Vec<(String, usize)> {
+struct ConditionalInventory {
+    modules: Vec<(String, usize)>,
+    required: usize,
+    diagnostics: usize,
+    errors: Vec<String>,
+}
+
+/// Summarize and validate the owned conditional policy entries.
+fn conditional_gates() -> ConditionalInventory {
     let Ok(text) = fs::read_to_string(workspace_root().join("conditional-tests.toml")) else {
-        return Vec::new();
+        return ConditionalInventory {
+            modules: Vec::new(),
+            required: 0,
+            diagnostics: 0,
+            errors: vec!["conditional-tests.toml is absent or unreadable".to_owned()],
+        };
     };
     let mut modules = BTreeMap::new();
-    for site in text.lines().map(str::trim).filter_map(|line| {
-        line.strip_prefix("site = \"")
-            .and_then(|site| site.strip_suffix('"'))
-    }) {
-        let module = site.split_once("::").map_or(site, |(module, _)| module);
+    let mut sites = BTreeSet::new();
+    let mut required = 0;
+    let mut diagnostics = 0;
+    let mut errors = Vec::new();
+    for table in text.split("[[conditional]]").skip(1) {
+        let field = |name: &str| {
+            let prefix = format!("{name} = \"");
+            table
+                .lines()
+                .map(str::trim)
+                .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix('"'))
+                .map(str::to_owned)
+        };
+        let site = field("site").unwrap_or_else(|| "UNNAMED".to_owned());
+        let class = field("class").unwrap_or_default();
+        let policy = field("policy").unwrap_or_default();
+        let job = field("job").unwrap_or_default();
+        let owner = field("owner").unwrap_or_default();
+        let requires = field("requires").unwrap_or_default();
+        let valid = match (class.as_str(), policy.as_str()) {
+            ("infrastructure", "required") => job == "release-qualification",
+            ("diagnostic", "optional") => job == "manual-diagnostics",
+            _ => false,
+        } && !owner.is_empty()
+            && !requires.is_empty();
+        if !valid {
+            errors.push(format!("{site} has an invalid or incomplete policy"));
+        }
+        if !sites.insert(site.clone()) {
+            errors.push(format!("{site} is declared more than once"));
+        }
+        if class == "diagnostic" {
+            diagnostics += 1;
+        } else {
+            required += 1;
+        }
+        let module = site
+            .split_once("::")
+            .map_or(site.as_str(), |(module, _)| module);
         *modules.entry(module.to_owned()).or_default() += 1;
     }
-    modules.into_iter().collect()
+    ConditionalInventory {
+        modules: modules.into_iter().collect(),
+        required,
+        diagnostics,
+        errors,
+    }
 }
 
 /// The version the lock file pins for a crate, if it pins exactly one.
@@ -5181,6 +5228,7 @@ fn infrastructure_tests() -> ExitCode {
         "--workspace".to_owned(),
         "--".to_owned(),
         "--ignored".to_owned(),
+        "--test-threads=1".to_owned(),
     ];
     let mut skipped: Vec<String> = inventory
         .into_iter()
@@ -5551,7 +5599,7 @@ fn report_replay_diagnostics(stderr: &str) {
     }
 }
 
-/// Every `NANO_*` variable this run was given.
+/// Every `NANO_*` variable this run was given, without secret material.
 ///
 /// Part of "the exact commands": most of the mainnet gates take their inputs from
 /// the environment, so a report that printed only the command line would be
@@ -5568,24 +5616,39 @@ fn report_inputs() {
         println!("  none, so every gate that needs one will report that it could not run");
     }
     for (name, value) in names {
-        println!("  {name:<24} {value}");
+        let shown = if name == "NANO_FUNDED_KEY"
+            || name.contains("PRIVATE_KEY")
+            || name.contains("PASSWORD")
+            || name.contains("SECRET")
+            || name.contains("TOKEN")
+        {
+            "<redacted>"
+        } else {
+            &value
+        };
+        println!("  {name:<24} {shown}");
     }
 }
 
 fn report_conditional_gates() -> bool {
     println!("\nconditional gates");
     let conditional = conditional_gates();
-    let total: usize = conditional.iter().map(|(_, count)| count).sum();
     println!(
-        "  {total} required call sites across {} files are owned in conditional-tests.toml.",
-        conditional.len()
+        "  {} required gates and {} optional diagnostics across {} files are owned in \
+         conditional-tests.toml.",
+        conditional.required,
+        conditional.diagnostics,
+        conditional.modules.len()
     );
-    println!("  They may skip offline and panic when NANO_REQUIRE_MAINNET is set; that is what");
-    println!("  makes the release conformance run evidence rather than green skipped tests.");
-    for (name, count) in &conditional {
+    println!("  Required gates panic when NANO_REQUIRE_MAINNET is set; diagnostics only name");
+    println!("  the parameters an operator would need for a specific investigation.");
+    for (name, count) in &conditional.modules {
         println!("    {name:<34} {count}");
     }
-    total > 0
+    for error in &conditional.errors {
+        println!("  FAIL: {error}");
+    }
+    conditional.required > 0 && conditional.errors.is_empty()
 }
 
 /// Run the three gates tasks/053 names and report what each said.

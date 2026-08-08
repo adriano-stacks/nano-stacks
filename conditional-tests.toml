@@ -1,7 +1,7 @@
-# Every conditional conformance gate, by stable source-level call-site identity.
-# A release run sets NANO_REQUIRE_MAINNET, so every entry is required and a
-# missing prerequisite fails rather than becoming a green test. The named
-# self-hosted CI job supplies the large fixtures, network and services.
+# Every conditional conformance gate or diagnostic, by stable source-level
+# call-site identity. A release run sets NANO_REQUIRE_MAINNET, so every required
+# entry fails when its prerequisite is absent. The two optional diagnostics are
+# parameterized investigations, not fixed claims a release can satisfy.
 
 [[conditional]]
 site = "block_authentication::a_real_tenure_start_block_authenticates#1"
@@ -189,11 +189,11 @@ policy = "required"
 
 [[conditional]]
 site = "mainnet_checkpoint::nano_reports_a_key_at_a_block#1"
-class = "infrastructure"
-owner = "053"
-job = "release-qualification"
-requires = "NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_MARF, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY as used by the test"
-policy = "required"
+class = "diagnostic"
+owner = "060"
+job = "manual-diagnostics"
+requires = "NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY"
+policy = "optional"
 
 [[conditional]]
 site = "mainnet_checkpoint::stacks_core_finds_the_contract_nano_cannot#1"
@@ -661,11 +661,11 @@ policy = "required"
 
 [[conditional]]
 site = "trie_diff::the_networks_root_children_name_the_missing_write#1"
-class = "infrastructure"
+class = "diagnostic"
 owner = "060"
-job = "release-qualification"
+job = "manual-diagnostics"
 requires = "NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES"
-policy = "required"
+policy = "optional"
 
 [[conditional]]
 site = "write_journal::stacks_core_opens_a_mainnet_checkpoint_with_external_blobs#1"

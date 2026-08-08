@@ -724,6 +724,13 @@ struct BlockExecution<'a> {
     effects: NativeBlockEffects,
     /// Transactions the block may carry if execution admits them.
     candidates: &'a [Transaction],
+    authentication: BlockAuthentication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockAuthentication {
+    Required,
+    UnauthenticatedFixture,
 }
 
 /// Everything a block changes that the MARF does not hold.
@@ -1232,6 +1239,34 @@ impl ChainState {
                 root: RootPolicy::Verify,
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
+                authentication: BlockAuthentication::Required,
+            },
+        )
+    }
+
+    /// Execute a fixture block and verify its state root without authenticating consensus.
+    ///
+    /// This is only for execution-oracle fixtures whose checkpoint does not carry
+    /// the signer, tenure and VRF evidence a followed block requires. Production
+    /// callers must use [`Self::append_nakamoto_block_with_bitcoin_operations`].
+    pub fn append_unauthenticated_fixture_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            &mut block,
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Verify,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::UnauthenticatedFixture,
             },
         )
     }
@@ -1254,6 +1289,7 @@ impl ChainState {
                 root: RootPolicy::Verify,
                 effects,
                 candidates: &[],
+                authentication: BlockAuthentication::Required,
             },
         )
     }
@@ -1291,6 +1327,33 @@ impl ChainState {
                 root: RootPolicy::Trust,
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
+                authentication: BlockAuthentication::Required,
+            },
+        )
+    }
+
+    /// Execute a fixture block without checking its state root or consensus authentication.
+    ///
+    /// The method name is intentionally explicit: a replay using this path proves
+    /// VM execution only and is not evidence that a node would accept the block.
+    pub fn execute_unauthenticated_fixture_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            &mut block,
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Trust,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::UnauthenticatedFixture,
             },
         )
     }
@@ -1313,6 +1376,7 @@ impl ChainState {
                 root: RootPolicy::Trust,
                 effects,
                 candidates: &[],
+                authentication: BlockAuthentication::Required,
             },
         )
     }
@@ -1334,6 +1398,7 @@ impl ChainState {
                 root: RootPolicy::Mine(miner_key),
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
+                authentication: BlockAuthentication::Required,
             },
         )?;
         Ok((block, applied))
@@ -1383,6 +1448,7 @@ impl ChainState {
                 root: RootPolicy::Mine(miner_key),
                 effects: NativeBlockEffects::default(),
                 candidates,
+                authentication: BlockAuthentication::Required,
             },
         )?;
         Ok((block, applied))
@@ -1515,12 +1581,9 @@ impl ChainState {
     /// the set is read out of this chain's own state, where a prepare phase wrote
     /// it under the state root the network agreed with.
     ///
-    /// A cycle with no recorded set is **reported and accepted**, and that is not
-    /// the same thing as a check that passed. Mainnet's cycle 140 was stacked in
-    /// pox-4, before the state nano imports, so the block that would have written
-    /// its `.signers` entries is below the checkpoint; a node replaying there has
-    /// nothing to check against and says so. Rejecting instead would refuse every
-    /// block of a chain the network is on, which is the worse failure of the two.
+    /// A missing set is an incomplete checkpoint or state, never a successful
+    /// signature check. Startup validates the imported cycle before sync and this
+    /// remains fail-closed in case state becomes incoherent afterwards.
     fn check_signer_signatures(
         &mut self,
         block: &NakamotoBlock,
@@ -1542,20 +1605,10 @@ impl ChainState {
                     set.approval_threshold(),
                 ))
             }),
-            Err(error) => {
-                // Said once a tenure rather than once a block. The condition
-                // belongs to the whole reward cycle — thousands of blocks — and a
-                // line per block would bury everything else the run prints,
-                // which on mainnet is how a real message gets missed.
-                if block_starts_new_tenure(block) {
-                    eprintln!(
-                        "the tenure at burn {} carries signer signatures this node cannot \
-                         check: {error}",
-                        context.height
-                    );
-                }
-                Ok(())
-            }
+            Err(ChainStateError::NoSignerSet(cycle)) => Err(ChainStateError::InvalidTransaction(
+                ConsensusError::SignerSetUnavailable(cycle).to_string(),
+            )),
+            Err(error) => Err(error),
         }
     }
 
@@ -1612,14 +1665,10 @@ impl ChainState {
     /// parent's height within it (`get_nakamoto_tenure_length`, which reads the
     /// parent's own `height_in_tenure`).
     ///
-    /// Both are skipped rather than guessed when the list cannot answer, and the
-    /// two cases are different. A parent that is not in the list at all is the
-    /// checkpoint's anchor — reported, because that is a real hole. A count whose
-    /// tenure begins below the retained window cannot be *completed*, and a
-    /// partial count is lower than the truth, so it would reject an honest block:
-    /// that one is passed over in silence, because the tenure tie beside it did
-    /// run and a mainnet tenure longer than the window would otherwise say so on
-    /// every block of it.
+    /// The parent header is authenticated by the checkpoint state root or by the
+    /// block that sealed it. Its recorded tenure start height makes the count
+    /// independent of the bounded reorganization ledger, so a long tenure does
+    /// not become unverifiable when its first block falls out of that window.
     fn check_tenure_continuity(
         &self,
         block: &NakamotoBlock,
@@ -1628,40 +1677,28 @@ impl ChainState {
         let Some(payload) = authenticate::tenure_change_payload(block) else {
             return Ok(());
         };
-        let Some(parent) = parent else {
-            return Ok(());
-        };
-        let Some(position) = self
-            .ledger
-            .executed
-            .iter()
-            .rposition(|executed| executed.block_id == parent)
-        else {
-            eprintln!(
-                "the tenure change at height {} names a previous tenure and a block count \
-                 this node cannot check: its parent is not among the blocks this chain has \
-                 executed, which is what the first tenure after a checkpoint looks like",
-                block.header.chain_length
-            );
-            return Ok(());
-        };
-        let executed = &self.ledger.executed[..=position];
-        let parent_tenure = executed[position].consensus_hash;
-        if payload.previous_tenure_consensus_hash != parent_tenure {
+        let parent = parent.ok_or(ConsensusError::TenureChangeParentUnavailable)?;
+        let recorded = self
+            .recorded_header(parent)
+            .ok_or(ConsensusError::TenureChangeParentUnavailable)?;
+        if payload.previous_tenure_consensus_hash.as_bytes() != &recorded.consensus_hash {
             return Err(ConsensusError::TenureChangeParentTenure);
         }
-        // A tenure is exactly the run of blocks sharing a consensus hash: a new
-        // sortition is a new hash, and an extension keeps the one it has, which
-        // is why `height_in_tenure` counts across extensions as well.
-        let blocks = executed
-            .iter()
-            .rev()
-            .take_while(|executed| executed.consensus_hash == parent_tenure)
-            .count();
-        if blocks < executed.len() && u32::try_from(blocks) != Ok(payload.previous_tenure_blocks) {
+        let start = u64::from(recorded.tenure_start_height);
+        let parent_height = block
+            .header
+            .chain_length
+            .checked_sub(1)
+            .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
+        let blocks = parent_height
+            .checked_sub(start)
+            .and_then(|distance| distance.checked_add(1))
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
+        if blocks != payload.previous_tenure_blocks {
             return Err(ConsensusError::TenureChangeBlockCount {
                 claimed: payload.previous_tenure_blocks,
-                executed: u32::try_from(blocks).unwrap_or(u32::MAX),
+                executed: blocks,
             });
         }
         Ok(())
@@ -1690,29 +1727,18 @@ impl ChainState {
         if !block_starts_new_tenure(block) {
             return Ok(());
         }
-        let Some(vrf_public_key) = context.winner_vrf_public_key else {
-            // `check_tenure_vrf` reports this one already, and once is enough.
-            return Ok(());
-        };
+        let vrf_public_key = context
+            .winner_vrf_public_key
+            .ok_or(ConsensusError::WinnerVrfKeyUnavailable)?;
         // The tenure's own burn block first: a registration *in* it is the
         // sharpest evidence there is, because nothing about it was carried or
         // trusted. Then the registry the checkpoint brought, which is where a key
         // registered years earlier lives — and that is the ordinary case, since a
         // leader key is registered once and named for as long as its miner mines.
-        let Some(signing_key_hash) =
+        let signing_key_hash =
             authenticate::registered_signing_key_hash(operations, &vrf_public_key)
                 .or(context.winner_signing_key_hash)
-        else {
-            eprintln!(
-                "the tenure at burn {} carries a miner signature this node cannot check: it \
-                 knows which leader key won the sortition but not the block-signing key that \
-                 key was registered with. It is in the burn block that registered it, and \
-                 only some registrations carry one at all -- 101 of mainnet's 2,477 -- so a \
-                 carried registry may legitimately not have it either",
-                context.height
-            );
-            return Ok(());
-        };
+                .ok_or(ConsensusError::WinnerSigningKeyUnavailable)?;
         authenticate::verify_miner_signature(&block.header, &signing_key_hash).inspect_err(|_| {
             // The two hashes are in the error; this is the third fact needed to
             // tell *which* of them is wrong — a node that derived the wrong
@@ -1751,45 +1777,22 @@ impl ChainState {
     /// *parent* tenure's proof — otherwise a miner could commit any seed and
     /// steer the sortition that follows.
     ///
-    /// Either input can be unavailable, and the two cases are different from
-    /// each other and from a failure:
-    ///
-    /// - the leader key is unknown when this node cannot name which of the burn
-    ///   block's commitments won, which needs the burn distribution;
-    /// - the parent proof is unknown for the first tenure after a checkpoint, and
-    ///   for the first after a restart of a state written before the ledger was
-    ///   committed with the seal. Every later one is read back from that ledger.
-    ///
-    /// Neither is a reason to accept quietly. An unavailable input is reported
-    /// and named; a rule that *can* be checked and fails rejects the block.
+    /// Both inputs are mandatory. Startup refuses a checkpoint without them and
+    /// execution refuses if either nevertheless becomes unavailable.
     fn check_tenure_vrf(
         &self,
         block: &NakamotoBlock,
         context: BitcoinBlockContext,
     ) -> Result<(), TenureVrfError> {
-        if let Some(key) = context.winner_vrf_public_key {
-            verify_coinbase_vrf_proof(block, &key, &context.sortition_hash)?;
-        } else {
-            eprintln!(
-                "tenure at burn {} carries a coinbase proof this node cannot check: it has \
-                 no leader-key registration for the commitment that won the sortition. A \
-                 leader key is registered once and named for years afterwards, so the \
-                 registration is far below any burnchain window this node holds and has to \
-                 come with the checkpoint -- see `xtask export-leader-keys`.",
-                context.height
-            );
-        }
-        if let Some(parent_proof) = self.ledger.parent_tenure_proof {
-            verify_committed_vrf_seed(&context.vrf_seed, &parent_proof)?;
-        } else {
-            eprintln!(
-                "tenure at burn {} commits a seed this node cannot check: it has no \
-                 coinbase proof for the parent tenure, which is expected for the first \
-                 tenure after a checkpoint and for the first after resuming a state \
-                 written before the ledger was committed with the seal",
-                context.height
-            );
-        }
+        let key = context
+            .winner_vrf_public_key
+            .ok_or(TenureVrfError::MissingLeaderKey)?;
+        verify_coinbase_vrf_proof(block, &key, &context.sortition_hash)?;
+        let parent_proof = self
+            .ledger
+            .parent_tenure_proof
+            .ok_or(TenureVrfError::MissingParentProof)?;
+        verify_committed_vrf_seed(&context.vrf_seed, &parent_proof)?;
         Ok(())
     }
 
@@ -1880,6 +1883,7 @@ impl ChainState {
             root,
             effects,
             candidates,
+            authentication,
         } = execution;
         // A block this node is assembling is not one it is following, and the
         // difference is signatures: the miner signs the header at seal time and
@@ -1887,7 +1891,9 @@ impl ChainState {
         // asked of a followed block and not of a candidate. The miner's own
         // answer to each of them is the code that builds the block.
         let assembled = matches!(root, RootPolicy::Mine(_));
-        self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
+        if authentication == BlockAuthentication::Required {
+            self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
+        }
         self.vm
             .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
         // The block runs against a copy of everything kept outside the MARF, and
@@ -1910,7 +1916,7 @@ impl ChainState {
             // this point and nothing has been written — the MARF version opened
             // above is empty and is aborted with everything else if this fails —
             // so the block is still refused before any of it executes.
-            if !assembled {
+            if !assembled && authentication == BlockAuthentication::Required {
                 self.check_signer_signatures(block, bitcoin_context)?;
             }
             self.vm.setup_block_metadata(block.header.timestamp)?;
@@ -3018,6 +3024,10 @@ pub fn vrf_seed_from_proof(proof: &[u8; 80]) -> [u8; 32] {
 /// A tenure-start block whose VRF does not hold up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TenureVrfError {
+    /// The local sortition did not resolve the winning leader key.
+    MissingLeaderKey,
+    /// The checkpoint or recovered ledger carries no proof for the parent tenure.
+    MissingParentProof,
     /// A tenure-start block reached execution without a coinbase proof.
     MissingProof,
     /// The proof is not 80 well-formed bytes.
@@ -3031,6 +3041,10 @@ pub enum TenureVrfError {
 impl std::fmt::Display for TenureVrfError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::MissingLeaderKey => "the local sortition carries no winning VRF key",
+            Self::MissingParentProof => {
+                "the authenticated state carries no parent-tenure VRF proof"
+            }
             Self::MissingProof => "tenure-start block has no coinbase VRF proof",
             Self::MalformedProof => "coinbase VRF proof is malformed",
             Self::ProofNotFromLeaderKey => {
