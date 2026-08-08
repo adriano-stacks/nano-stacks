@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="nano-stacks project history and status">
+  <title>nano-stacks — a modern Stacks node</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="deck" aria-live="polite">
+    <section class="slide cover active" data-title="Cover">
+      <img class="cover-art" src="assets/modern-node.png" alt="A modular node with a central WebAssembly engine">
+      <div class="cover-shade"></div>
+      <div class="cover-copy">
+        <p class="eyebrow">NANO / STACKS</p>
+        <h1>A modern<br>Stacks node.</h1>
+        <p class="lede">Smaller. WASM only. Not released.</p>
+      </div>
+      <footer>Evidence snapshot · 8 August 2026</footer>
+    </section>
+
+    <section class="slide" data-title="State">
+      <header><p class="kicker">THE STATE</p><h2>The node is real.<br>The release is not.</h2></header>
+      <div class="metric-grid four">
+        <article><strong>19 + 1</strong><span>product crates + WASM</span></article>
+        <article><strong>65.4k</strong><span>production Rust lines</span></article>
+        <article><strong>981</strong><span>Git commits</span></article>
+        <article class="warn"><strong>19</strong><span>open release items</span></article>
+      </div>
+      <div class="statement">
+        <span class="signal good" aria-hidden="true">&#8203;</span>
+        <p>It follows and executes real mainnet blocks with clarity-wasm.</p>
+      </div>
+      <div class="statement">
+        <span class="signal bad" aria-hidden="true">&#8203;</span>
+        <p>It has not passed the clean replay, signer, cycle, and 24-hour gates.</p>
+      </div>
+      <footer>Sources: task 053, taskmd snapshot, Git, Tree-sitter measurement</footer>
+    </section>
+
+    <section class="slide" data-title="Architecture">
+      <header><p class="kicker">01 · THE NODE</p><h2>This is the product boundary.</h2></header>
+      <div class="architecture" role="img" aria-label="Inputs enter a modular node. The node makes local consensus decisions and exposes roles and APIs.">
+        <div class="arch-column inputs">
+          <p class="arch-label">INPUTS</p>
+          <div class="arch-card amber">Bitcoin source</div>
+          <div class="arch-card cyan">Stacks peers</div>
+          <div class="arch-card violet">Attested checkpoint</div>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="node-shell">
+          <p class="arch-label">ONE NODE</p>
+          <div class="node-grid">
+            <div>burnchain<br><b>sortition</b></div>
+            <div>P2P<br><b>sync</b></div>
+            <div>codec<br><b>chainstate</b></div>
+            <div class="core">clarity-wasm<br><b>only</b></div>
+            <div>MARF<br><b>ledger</b></div>
+            <div>mempool<br><b>miner</b></div>
+          </div>
+          <p class="node-rule">Peers serve candidates. This node selects and executes.</p>
+        </div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-column outputs">
+          <p class="arch-label">SURFACES</p>
+          <div class="arch-card">RPC + events</div>
+          <div class="arch-card">signer + StackerDB</div>
+          <div class="arch-card">miner + TUI</div>
+        </div>
+      </div>
+      <footer>Source: plan.md architecture and amendments</footer>
+    </section>
+
+    <section class="slide" data-title="Modern">
+      <header><p class="kicker">WHAT “MODERN” MEANS</p><h2>Remove history. Keep consensus.</h2></header>
+      <div class="compare-list">
+        <div><span class="from">many protocol epochs</span><i>→</i><span class="to">epoch 4.0 only</span></div>
+        <div><span class="from">one hosted data source</span><i>→</i><span class="to">P2P discovery and peer failover</span></div>
+        <div><span class="from">peer view as a shortcut</span><i>→</i><span class="to">local Bitcoin and sortition state</span></div>
+        <div><span class="from">two execution engines</span><i>→</i><span class="to">one clarity-wasm engine</span></div>
+        <div><span class="from">replay from genesis</span><i>→</i><span class="to">attested continuation checkpoint</span></div>
+        <div><span class="from">large mixed modules</span><i>→</i><span class="to">small consensus crates</span></div>
+      </div>
+      <p class="bottom-line">The node drops old paths. It does not drop current validation.</p>
+      <footer>Source: plan.md “Plan amendments”</footer>
+    </section>
+
+    <section class="slide" data-title="Measurement">
+      <header><p class="kicker">02 · CODE SIZE</p><h2>Tree-sitter removed the tests.</h2></header>
+      <div class="method-flow">
+        <div><b>1</b><p>Parse each Rust file with the Rust grammar.</p></div>
+        <div><b>2</b><p>Remove test paths and test syntax.</p></div>
+        <div><b>3</b><p>Remove blank and comment-only lines.</p></div>
+        <div><b>4</b><p>Sum the product scope.</p></div>
+      </div>
+      <div class="scope-grid">
+        <article>
+          <h3>nano-stacks</h3>
+          <p>Include 19 product crates.</p>
+          <p>Include vendored <code>clar2wasm</code>.</p>
+          <p>Exclude conformance and xtask.</p>
+        </article>
+        <article>
+          <h3>stacks-core</h3>
+          <p>Include 13 product crates.</p>
+          <p>Use pinned dependency commit <code>efc34a07a2</code>.</p>
+          <p>Exclude contrib tools.</p>
+        </article>
+        <article>
+          <h3>Test syntax</h3>
+          <p>Remove <code>#[cfg(test)]</code> items.</p>
+          <p>Remove test functions and test files.</p>
+          <p>Keep production feature branches.</p>
+        </article>
+      </div>
+      <footer><a href="tools/measure_loc.py">Reproduce: presentation/tools/measure_loc.py</a></footer>
+    </section>
+
+    <section class="slide" data-title="Code result">
+      <header><p class="kicker">THE RESULT</p><h2>70% less repository code.</h2></header>
+      <div class="loc-chart">
+        <div class="loc-row nano">
+          <div class="loc-label"><b>nano-stacks</b><span>65,372</span></div>
+          <div class="track"><div class="bar" style="--w:29.5%"><span class="owned">35,557 owned</span><span class="vendored">29,815 WASM</span></div></div>
+        </div>
+        <div class="loc-row core">
+          <div class="loc-label"><b>stacks-core</b><span>221,771</span></div>
+          <div class="track"><div class="bar" style="--w:100%"></div></div>
+        </div>
+      </div>
+      <div class="metric-grid three slim">
+        <article><strong>3.39×</strong><span>core / nano</span></article>
+        <article><strong>6.24×</strong><span>core / owned nano</span></article>
+        <article><strong>347k</strong><span>test lines removed</span></article>
+      </div>
+      <p class="caveat-line">This is repository code. Nano still uses pinned Clarity frontend types from stacks-core.</p>
+      <footer>Production Rust lines · nano commit eac1f89d · core dependency efc34a07a2</footer>
+    </section>
+
+    <section class="slide" data-title="Code shape">
+      <header><p class="kicker">THE SHAPE</p><h2>One old core is larger than the new node.</h2></header>
+      <div class="split-bars">
+        <article>
+          <h3>nano-stacks</h3>
+          <div class="mini-bar"><span style="--w:100%">clarity-wasm <b>29.8k</b></span></div>
+          <div class="mini-bar"><span style="--w:23.5%">node <b>7.0k</b></span></div>
+          <div class="mini-bar"><span style="--w:14.8%">chainstate <b>4.4k</b></span></div>
+          <div class="mini-bar"><span style="--w:13.6%">VM <b>4.1k</b></span></div>
+          <div class="mini-bar"><span style="--w:9.4%">MARF <b>2.8k</b></span></div>
+          <div class="mini-bar"><span style="--w:8.3%">P2P <b>2.5k</b></span></div>
+        </article>
+        <article>
+          <h3>stacks-core</h3>
+          <div class="mini-bar old"><span style="--w:100%">stackslib <b>123.0k</b></span></div>
+          <div class="mini-bar old"><span style="--w:32.9%">clarity <b>40.4k</b></span></div>
+          <div class="mini-bar old"><span style="--w:14.5%">node <b>17.8k</b></span></div>
+          <div class="mini-bar old"><span style="--w:12.4%">common <b>15.3k</b></span></div>
+          <div class="mini-bar old"><span style="--w:7.7%">signer <b>9.4k</b></span></div>
+        </article>
+      </div>
+      <p class="bottom-line">The largest nano-owned crate has 7,019 production lines.</p>
+      <footer>Tree-sitter totals by crate</footer>
+    </section>
+
+    <section class="slide" data-title="History">
+      <header><p class="kicker">03 · THE HISTORY</p><h2>981 commits in 13 days.</h2></header>
+      <div class="timeline">
+        <article><time>27 JUL</time><b>Skeleton</b><p>Codex built primitives, codecs, MARF, and the task board.</p><span>99 commits</span></article>
+        <article><time>28–29 JUL</time><b>Hacknet</b><p>The node gained WASM, chainstate, signer, miner, and RPC paths.</p><span>221 commits</span></article>
+        <article><time>30 JUL–2 AUG</time><b>Mainnet</b><p>Replay exposed costs, checkpoints, P2P, and continuation state.</p><span>177 commits</span></article>
+        <article><time>3–6 AUG</time><b>Conformance</b><p>Local consensus, atomic state, exact receipts, and failover became gates.</p><span>351 commits</span></article>
+        <article><time>7–8 AUG</time><b>Reality</b><p>Live runs found liveness, storage, task, and WASM defects.</p><span>133 commits</span></article>
+      </div>
+      <div class="metric-grid three slim">
+        <article><strong>734</strong><span>Git author: Claude</span></article>
+        <article><strong>247</strong><span>Git author: Codex</span></article>
+        <article><strong>93</strong><span>project tasks</span></article>
+      </div>
+      <footer>Git author labels do not measure research or review effort</footer>
+    </section>
+
+    <section class="slide" data-title="Plan changes">
+      <header><p class="kicker">THE PLAN LEARNED</p><h2>Evidence changed six assumptions.</h2></header>
+      <table class="change-table">
+        <thead><tr><th>Original</th><th>Current rule</th><th>Cause</th></tr></thead>
+        <tbody>
+          <tr><td>HTTP sync is enough.</td><td>P2P is required.</td><td>Rate limits and one-source failure</td></tr>
+          <tr><td>The interpreter can help.</td><td>WASM is the only product engine.</td><td>A fallback can seal hidden divergence.</td></tr>
+          <tr><td>A MARF root is enough.</td><td>The checkpoint carries full continuation state.</td><td>Rewards and proofs need history.</td></tr>
+          <tr><td>A peer can supply the view.</td><td>Consensus comes from local Bitcoin state.</td><td>A peer can lag or lie.</td></tr>
+          <tr><td>A matching root is enough.</td><td>Receipts, costs, events, and writes must match.</td><td>Costs change block admission.</td></tr>
+          <tr><td>A live demo is enough.</td><td>A clean replay and a 24-hour hold are required.</td><td>Short and resumed runs hide defects.</td></tr>
+        </tbody>
+      </table>
+      <footer><a href="../plan.md">Source: plan.md “Plan amendments discovered during implementation”</a></footer>
+    </section>
+
+    <section class="slide" data-title="WASM works">
+      <header><p class="kicker">04 · HAPPY NEWS</p><h2>WASM executes the chain.</h2></header>
+      <div class="proof-stack">
+        <article><span>01</span><div><b>One engine</b><p>The product artifact has no interpreter execution path.</p></div></article>
+        <article><span>02</span><div><b>Real state</b><p>A run crossed mainnet block 8,708,126 and advanced 500 blocks.</p></div></article>
+        <article><span>03</span><div><b>Real contracts</b><p>The locals redesign covered all 137,332 contracts that the first sweep compiled.</p></div></article>
+        <article><span>04</span><div><b>Measured margin</b><p>The highest live local count was 16,505 of the 50,000 limit.</p></div></article>
+      </div>
+      <div class="callout good-callout"><strong>102</strong><span>commits touched the vendored WASM compiler.</span></div>
+      <footer>Sources: tasks 060, 073, 086; Git path history</footer>
+    </section>
+
+    <section class="slide" data-title="WASM fixes">
+      <header><p class="kicker">THE FIXES</p><h2>“WASM works” required a list.</h2></header>
+      <div class="fix-grid">
+        <article><span class="fix-no">A</span><h3>Epoch 4</h3><p>Clarity 6 words, costs-5, crypto, Bitcoin words, and variadic concat.</p></article>
+        <article><span class="fix-no">B</span><h3>Costs</h3><p>Values, folds, sequences, constants, calls, aborts, and receipt dimensions.</p></article>
+        <article><span class="fix-no">C</span><h3>Layout</h3><p>Tuple widths, placeholders, many arguments, traits, and sender restore.</p></article>
+        <article><span class="fix-no">D</span><h3>Semantics</h3><p>ASCII, contract targets, equality, allowances, block info, and error identity.</p></article>
+        <article><span class="fix-no">E</span><h3>Scale</h3><p>Local pools, last-use release, frame spills, and compile-time limits.</p></article>
+        <article><span class="fix-no">F</span><h3>Product</h3><p>Compiled-module cache, fail-closed errors, and no interpreter fallback.</p></article>
+      </div>
+      <p class="caveat-line">Seven of the first eight mainnet compile failures now load. One tuple case remains open.</p>
+      <footer>Sources: tasks 019, 023, 042, 045, 060, 067, 068, 073, 093</footer>
+    </section>
+
+    <section class="slide" data-title="Caveats">
+      <header><p class="kicker">05 · CAVEATS</p><h2>Do not call this a release.</h2></header>
+      <div class="proof-open">
+        <article>
+          <h3><span class="signal good" aria-hidden="true">&#8203;</span>Proved</h3>
+          <ul>
+            <li>The artifact has one engine.</li>
+            <li>All three engine refusal paths fail closed.</li>
+            <li>Peer failure and a lying peer do not choose the chain.</li>
+            <li>Crash tests cover block commit boundaries.</li>
+            <li>A rejected block does not keep state.</li>
+            <li>Stock RPC and event surfaces respond.</li>
+          </ul>
+        </article>
+        <article>
+          <h3><span class="signal bad" aria-hidden="true">&#8203;</span>Not proved</h3>
+          <ul>
+            <li>A clean no-Hiro checkpoint-to-tip replay</li>
+            <li>Stock signer accept, sign, and inclusion</li>
+            <li>Reward-cycle 141 signer gates</li>
+            <li>A continuous 24-hour tip hold</li>
+            <li>All valid WASM modules compile and load</li>
+            <li>Every release gate fails closed in CI</li>
+          </ul>
+        </article>
+      </div>
+      <footer><a href="../tasks/053-pass-the-mainnet-node-release-gate.md">Source: task 053</a></footer>
+    </section>
+
+    <section class="slide" data-title="Release gate">
+      <header><p class="kicker">THE BOARD</p><h2>The open work is named.</h2></header>
+      <div class="gate-ring">
+        <svg viewBox="0 0 220 220" role="img" aria-label="12 of 31 release items are complete">
+          <circle cx="110" cy="110" r="86" class="ring-bg"></circle>
+          <circle cx="110" cy="110" r="86" class="ring-value" pathLength="100" stroke-dasharray="38.7 61.3"></circle>
+          <text x="110" y="102" text-anchor="middle">12 / 31</text>
+          <text x="110" y="130" text-anchor="middle" class="ring-small">release items</text>
+        </svg>
+        <div>
+          <div class="status-line"><b>67</b><span>tasks complete</span></div>
+          <div class="status-line"><b>25</b><span>tasks in progress</span></div>
+          <div class="status-line"><b>1</b><span>task pending</span></div>
+          <div class="status-line hot"><b>19</b><span>release items open</span></div>
+        </div>
+      </div>
+      <p class="bottom-line">The task board reopened four claims on 8 August.</p>
+      <footer>Source: taskmd verification snapshot, excluding task 095; task 053; commit d06bcdd6</footer>
+    </section>
+
+    <section class="slide" data-title="Tokens">
+      <header><p class="kicker">06 · THE LABOR</p><h2>9.38 billion recorded tokens.</h2></header>
+      <div class="token-chart">
+        <div class="token-row"><div><b>Claude</b><span>7.361B</span></div><div class="token-track"><i style="--w:78.5%" aria-hidden="true">&#8203;</i></div><small>11.977M output</small></div>
+        <div class="token-row"><div><b>Codex</b><span>1.550B</span></div><div class="token-track"><i style="--w:16.5%" aria-hidden="true">&#8203;</i></div><small>3.351M output</small></div>
+        <div class="token-row"><div><b>Kimi</b><span>0.468B</span></div><div class="token-track"><i style="--w:5.0%" aria-hidden="true">&#8203;</i></div><small>0.599M output</small></div>
+      </div>
+      <div class="metric-grid three slim">
+        <article><strong>28</strong><span>direct project sessions</span></article>
+        <article><strong>15.93M</strong><span>output tokens</span></article>
+        <article><strong>5</strong><span>Codex sessions lack counters</span></article>
+      </div>
+      <p class="caveat-line">Most input was cached context. Vendor records use different field names.</p>
+      <footer><a href="tools/session_metrics.py">Cutoff: start of this deck · Reproduce: session_metrics.py</a></footer>
+    </section>
+
+    <section class="slide" data-title="Continuation">
+      <header><p class="kicker">THE HUMAN LOOP</p><h2>The agents did stop.</h2></header>
+      <div class="big-pair">
+        <article><strong>16</strong><span>explicit goal commands</span></article>
+        <article><strong>16</strong><span>direct continuation or speed prompts</span></article>
+      </div>
+      <div class="quote-strip">
+        <blockquote>“chop chop! … you are not done yet!”<cite>5 Aug · Claude</cite></blockquote>
+        <blockquote>“continue, faster!!!”<cite>5 Aug · Claude</cite></blockquote>
+        <blockquote>“the agent is stopping again”<cite>7 Aug · Codex review</cite></blockquote>
+        <blockquote>“why you have not started?”<cite>7 Aug · Claude</cite></blockquote>
+      </div>
+      <p class="bottom-line">The transcript records the pressure. It does not infer mood.</p>
+      <footer>See appendix and <a href="evidence.md">evidence.md</a></footer>
+    </section>
+
+    <section class="slide" data-title="Corrections">
+      <header><p class="kicker">THE HUMAN CONTROL</p><h2>Corrections changed the design.</h2></header>
+      <div class="correction-list">
+        <div><time>29 JUL</time><p><b>“Mine every possible block.”</b><br>The miner had stopped after the first block in a tenure.</p><code>task 018</code></div>
+        <div><time>4 AUG</time><p><b>“It needs to use clarity-wasm.”</b><br>The product still had interpreter healing and fallback concepts.</p><code>tasks 059–060</code></div>
+        <div><time>5 AUG</time><p><b>“We have tasks.”</b><br>The agent created ad hoc issues and documents instead of taskmd records.</p><code>workflow correction</code></div>
+        <div><time>7 AUG</time><p><b>“Do not treat elapsed time as a blocker.”</b><br>Actionable work remained while the agent waited for live gates.</p><code>goal reset</code></div>
+      </div>
+      <footer>Direct transcript excerpts; spelling is normalized for STE</footer>
+    </section>
+
+    <section class="slide" data-title="Agent errors I">
+      <header><p class="kicker">THE ERROR LEDGER · 1/2</p><h2>Shortcuts became product defects.</h2></header>
+      <table class="error-table">
+        <thead><tr><th>Agent choice</th><th>What failed</th><th>Correction</th></tr></thead>
+        <tbody>
+          <tr><td>Use HTTP as the main sync path.</td><td>Rate limits stopped progress.</td><td>Build Stacks P2P and peer failover.</td></tr>
+          <tr><td>Retry WASM work in the interpreter.</td><td>A fallback could hide a consensus bug.</td><td>Remove the interpreter from the product.</td></tr>
+          <tr><td>Reuse stacks-core PoX logic.</td><td>The new node was not independent.</td><td>Own the native PoX boundary.</td></tr>
+          <tr><td>Use peer sortition views.</td><td>A peer could select execution context.</td><td>Derive consensus from local Bitcoin state.</td></tr>
+          <tr><td>Import only the trie graph.</td><td>Rewards, proofs, and tenure state were incomplete.</td><td>Bind full continuation history to the checkpoint.</td></tr>
+        </tbody>
+      </table>
+      <footer>Sources: plan amendments; tasks 049, 051, 054, 060–062, 077</footer>
+    </section>
+
+    <section class="slide" data-title="Agent errors II">
+      <header><p class="kicker">THE ERROR LEDGER · 2/2</p><h2>Green claims were not always green.</h2></header>
+      <table class="error-table">
+        <thead><tr><th>Claim or failure</th><th>Evidence</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>A failed block was safe to retry.</td><td>1,417 retries multiplied tenure fees.</td><td>State adoption became atomic.</td></tr>
+          <tr><td>The contract sweep was complete.</td><td>It compiled modules but did not load them.</td><td>The load sweep found failures that compile could not see.</td></tr>
+          <tr><td>Task 073 was complete.</td><td>Eight mainnet contracts had no verdict.</td><td>The task reopened. Seven now load.</td></tr>
+          <tr><td>Four mainnet tasks were complete.</td><td>Acceptance items were still open.</td><td>Tasks 064, 069, 082, and 083 reopened.</td></tr>
+          <tr><td>An arity failure was a boot contract.</td><td>The deployed contract was not a boot contract.</td><td>The task record corrected the claim.</td></tr>
+          <tr><td>Parallel builds would be faster.</td><td>rustc exhausted CPU and memory.</td><td>Cargo was capped at four jobs.</td></tr>
+        </tbody>
+      </table>
+      <footer>Sources: tasks 057, 073, 084, 093; commits 92f659cd, a7181ac8, d06bcdd6</footer>
+    </section>
+
+    <section class="slide finale" data-title="Conclusion">
+      <div class="final-copy">
+        <p class="kicker">NANO / STACKS</p>
+        <h2>The result is real.<br>The caveats are also real.</h2>
+        <div class="final-rule"></div>
+        <p>Keep the smaller node.</p>
+        <p>Keep the strict gates.</p>
+        <p>Finish the release evidence.</p>
+      </div>
+      <footer>Next condition: task 053 has zero open items.</footer>
+    </section>
+
+    <section class="slide appendix" data-title="Appendix: LOC">
+      <header><p class="kicker">APPENDIX A</p><h2>Code measurement notes</h2></header>
+      <div class="appendix-grid">
+        <article><h3>Metric</h3><p>A line has Rust syntax after test, comment, and blank content is removed.</p></article>
+        <article><h3>Test removal</h3><p>Tree-sitter finds test attributes. Path rules remove test, bench, and fuzz files.</p></article>
+        <article><h3>Nano scope</h3><p>19 product crates plus the vendored clar2wasm library. Oracle, conformance, tools, and compiler CLIs are out.</p></article>
+        <article><h3>Core scope</h3><p>13 product workspace crates at dependency commit efc34a07a2. Contrib tools are out.</p></article>
+        <article><h3>Parser recovery</h3><p>The grammar recovered in one nano file and two core files. No test boundary used those errors.</p></article>
+        <article><h3>Snapshot</h3><p>Nano is commit eac1f89d. Core is commit efc34a07a2. Both are clean Git archives.</p></article>
+      </div>
+      <footer><a href="tools/prod_loc.py">Tool source</a> · <a href="evidence.md">commands and hashes</a></footer>
+    </section>
+
+    <section class="slide appendix" data-title="Appendix: tokens">
+      <header><p class="kicker">APPENDIX B</p><h2>Token measurement notes</h2></header>
+      <table class="change-table token-table">
+        <thead><tr><th>Vendor</th><th>Input rule</th><th>Output</th><th>Total traffic</th></tr></thead>
+        <tbody>
+          <tr><td>Claude</td><td>uncached + cache creation + cache read</td><td>11,977,465</td><td>7,360,549,573</td></tr>
+          <tr><td>Kimi</td><td>inputOther + cache creation + cache read</td><td>598,599</td><td>467,835,323</td></tr>
+          <tr><td>Codex</td><td>input includes cached input</td><td>3,351,018</td><td>1,550,439,639</td></tr>
+        </tbody>
+      </table>
+      <ul class="plain-notes">
+        <li>The cutoff is 2026-08-08 15:17:53 UTC.</li>
+        <li>Claude usage records are deduplicated by request ID, with message ID as a fallback.</li>
+        <li>Kimi includes the direct nano-stacks session and its 14 agents.</li>
+        <li>Codex uses the last cumulative counter in each direct repository session.</li>
+        <li>Five of 14 Codex sessions have no usable counter.</li>
+        <li>Unrelated stacks-core security audits are out of scope.</li>
+      </ul>
+      <footer><a href="tools/session_metrics.py">Tool source</a></footer>
+    </section>
+
+    <section class="slide appendix compact" data-title="Appendix: nudges">
+      <header><p class="kicker">APPENDIX C</p><h2>Direct continuation and speed prompts</h2></header>
+      <div class="ledger two-col">
+        <p><time>31 Jul</time> “What happened? … the session just crashed?”</p>
+        <p><time>5 Aug</time> “Why are you not working? … chop chop!”</p>
+        <p><time>5 Aug</time> “Why just one agent?”</p>
+        <p><time>5 Aug</time> “Use worktrees … rather than being idle.”</p>
+        <p><time>5 Aug</time> “Not good enough. Make it go faster.”</p>
+        <p><time>5 Aug</time> “You have to be faster.”</p>
+        <p><time>5 Aug</time> “Continue, faster.”</p>
+        <p><time>5 Aug</time> “Faster.”</p>
+        <p><time>5 Aug</time> “FASTER.”</p>
+        <p><time>6 Aug</time> “What? Continue.”</p>
+        <p><time>7 Aug</time> “The agent is stopping again.”</p>
+        <p><time>7 Aug</time> “Continue please.”</p>
+        <p><time>7 Aug</time> “Continue please.”</p>
+        <p><time>7 Aug</time> “You have been OOM again.”</p>
+        <p><time>7 Aug</time> “Why have you not started?”</p>
+        <p><time>7 Aug</time> “Continue.”</p>
+      </div>
+      <footer>Exact raw text and timestamps are listed in evidence.md</footer>
+    </section>
+
+    <section class="slide appendix compact" data-title="Appendix: evidence">
+      <header><p class="kicker">APPENDIX D</p><h2>Evidence map</h2></header>
+      <div class="evidence-map">
+        <a href="../plan.md"><b>Architecture and amendments</b><span>plan.md</span></a>
+        <a href="../tasks/053-pass-the-mainnet-node-release-gate.md"><b>Release state</b><span>task 053</span></a>
+        <a href="../tasks/mainnet/060-make-the-consensus-execution-engine-explicit-and-r.md"><b>WASM-only boundary</b><span>task 060</span></a>
+        <a href="../tasks/mainnet/073-decide-whether-a-contract-clarity-wasm-cannot-load.md"><b>WASM local limit</b><span>task 073</span></a>
+        <a href="../tasks/mainnet/084-eliminate-wasm-function-type-arity-refusals-for-ne.md"><b>WASM load limit</b><span>task 084</span></a>
+        <a href="../tasks/mainnet/093-load-the-eight-mainnet-contracts-clarity-wasm-refuses.md"><b>Mainnet contract sweep</b><span>task 093</span></a>
+        <a href="tools/measure_loc.py"><b>Code measurement</b><span>measure_loc.py</span></a>
+        <a href="tools/session_metrics.py"><b>Token measurement</b><span>session_metrics.py</span></a>
+        <a href="evidence.md"><b>Full local ledger</b><span>evidence.md</span></a>
+      </div>
+      <footer>All deck claims use local evidence. No network source is required.</footer>
+    </section>
+  </main>
+
+  <nav class="controls" aria-label="Slide controls">
+    <button id="prev" type="button" aria-label="Previous slide">←</button>
+    <span id="counter">1 / 23</span>
+    <button id="next" type="button" aria-label="Next slide">→</button>
+  </nav>
+  <div class="progress"><i id="progress"></i></div>
+  <script src="deck.js"></script>
+</body>
+</html>
