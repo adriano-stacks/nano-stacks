@@ -210,10 +210,15 @@ fn sweep_contracts(arguments: &[String]) -> ExitCode {
         let Ok((source, version)) = vm.contract_source(&identifier) else {
             continue;
         };
+        // The epoch the *chain* records for it, not epoch 4.0. `ensure_wasm_module`
+        // compiles under the recorded one because it decides which words exist,
+        // and a sweep that assumed 4.0 reported 878 pre-4.0 contracts refusing
+        // `at-block` -- the epoch-4.0 rule applied to contracts never under it.
+        let Ok(epoch) = vm.recorded_deploy_epoch(&identifier) else {
+            continue;
+        };
         checked += 1;
-        if let Err(error) =
-            vm.check_module(&identifier, version, &source, clarity::types::StacksEpochId::Epoch40)
-        {
+        if let Err(error) = vm.check_module(&identifier, version, &source, epoch) {
             // Grouped by the refusal rather than listed one per line: eight
             // failures over 137,340 contracts is three defects, and a flat list
             // of eight hides that.

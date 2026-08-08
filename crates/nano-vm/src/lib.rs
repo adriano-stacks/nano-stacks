@@ -1730,6 +1730,20 @@ impl Vm {
     /// it started, resolving references against the state on disk. Pointing it
     /// at an edited source is how a contract whose module the runtime refuses
     /// gets narrowed down to the definition that causes it.
+    /// The epoch this state records a contract as having been analysed in.
+    ///
+    /// What `ensure_wasm_module` compiles under, and the only honest answer for a
+    /// contract already on the chain: it decides which words exist and which type
+    /// rules applied. A sweep that compiled every contract as epoch 4.0 would
+    /// report every pre-4.0 contract using `at-block` as refusing, which is the
+    /// epoch-4.0 rule being applied to a contract that was never under it.
+    pub fn recorded_deploy_epoch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+    ) -> Result<StacksEpochId, VmExecutionError> {
+        deploy_epoch(&mut self.store, contract)
+    }
+
     pub fn check_module(
         &mut self,
         contract: &QualifiedContractIdentifier,

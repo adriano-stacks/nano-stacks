@@ -31,7 +31,7 @@ bug.
 - [ ] Establish network validity with the pinned stacks-core analyzer, source and
       transaction size limits, deploy costs and an actual stock-node deployment;
       interpreter acceptance alone is not sufficient release evidence.
-- [~] Measure the maximum flattened parameter/result arity across every contract in
+- [x] Measure the maximum flattened parameter/result arity across every contract in
       the imported mainnet state and account for every contract the sweep cannot
       compile under task 073. **The second half is done — [[093]] classified all
       eight, and seven now load. The first half had a hole: 073's sweep called
@@ -88,3 +88,52 @@ at an operator's state without writing to it.
 
 It is slow: 137,340 contracts compiled *and* validated is over half an hour, which
 is why the number had not been measured this way before.
+
+## Measured over the whole state, 2026-08-08 — and the wall is reachable
+
+`cargo xtask sweep-contracts /home/aldur/mainnet-8716986/state`, which compiles
+**and loads** every contract:
+
+```
+146273/146280 contracts compile and load (146346 named by the state)
+```
+
+Seven refuse. One is [[068]]'s (`trajan-endorsement-alpha`). **The other six
+compile to a module wasmtime will not load**, which is the class this task is
+about and which no previous sweep could see — 073's called `clar2wasm::compile`
+and never handed the result to an engine, and every one of these compiles fine.
+
+Two of the six are the arity limit itself, and one of them is a **boot contract**:
+
+| contract | refusal |
+|---|---|
+| `SPXGT7ADNZNARR4SVSJN56QGSZFHGATJEQMFPMJW.pox-4` | `function returns size is out of bounds (at offset 0x651)` |
+| `SP33WGC0P4HRB395QXWKEWAP27SH47F9CDQX6FXW2.mix-sender-dope` | `function params size is out of bounds (at offset 0x123)` |
+
+So the arity wall is not a manufactured case. It is reached by a deployed
+contract carrying the name of a boot contract, and the network accepted both.
+
+The remaining four are a **different defect and probably not this task's**:
+
+| contract | refusal |
+|---|---|
+| `SP3XR2EN9C51B09MJE7EF73Q3GR4HXY1Z28KR4QY8.STX` | `type mismatch: expected i64 but nothing on stack (at offset 0x2550)` |
+| `SP673Z4BPB4R73359K9HE55F2X91V5BJTN5SXZ5T.xip130` | `type mismatch: expected i64, found i32 (at offset 0x4058)` |
+| `SP34FHX44NK9KZ8KJC08WR2NHP8NEGFTTT7MTH7XD.citycoins-vote-v1` | `type mismatch: expected i32, found i64 (at offset 0x9c4b)` |
+| `SP1KK89R86W73SJE6RQNQPRDM471008S9JY4FQA62.treasury-grant-v4` | `(at-block ...) is not available in this epoch` — analysis, not load; **[[066]]**, and worth confirming its recorded epoch is right |
+
+`type mismatch: expected i64, found i32` is the *exact* symptom `be3ec64e`
+describes: a wasm-local use-count that frees a slot still read, so the stack
+carries the wrong thing. `expected i64 but nothing on stack` is the same family
+one step worse. That commit fixed one instance (`keepgoing-safe`, and
+`v0-5-market` with it — see [[086]]); these three are further instances or a
+sibling defect, and they belong with that work rather than with arity.
+
+### One caution, recorded because it cost a whole run
+
+The first sweep compiled every contract as epoch 4.0 and reported **878**
+contracts refusing `at-block`. That is the epoch-4.0 rule applied to contracts
+that were never under it: `ensure_wasm_module` compiles under the epoch the chain
+*records*, because it decides which words exist. `sweep-contracts` reads the
+recorded epoch now (`Vm::recorded_deploy_epoch`). A sweep that assumes an epoch
+measures its own assumption.
