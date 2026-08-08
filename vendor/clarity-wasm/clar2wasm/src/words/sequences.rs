@@ -240,21 +240,17 @@ impl ComplexWord for Fold {
         generator.traverse_expr(builder, initial)?;
         // STACK: [initial_val]
 
-        // If the length of the sequence is 0, then just return the initial
-        // value which is already on the stack. Else, loop over the sequence
-        // and apply the function.
-        let then = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut generator.module.types,
-            &result_wasm_types,
-            &result_wasm_types,
-        ));
+        // Keep the accumulator in locals across the conditional. Passing it
+        // through the `if` type would recreate the engine's 1,000-slot
+        // function-type boundary for a wide accumulator.
+        let result_locals = generator.save_to_locals(builder, &result_clar_ty, true);
+
+        // If the length of the sequence is 0, keep the initial value. Else,
+        // loop over the sequence and apply the function.
+        let then = builder.dangling_instr_seq(None);
         let then_id = then.id();
 
-        let mut else_ = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut generator.module.types,
-            &result_wasm_types,
-            &result_wasm_types,
-        ));
+        let mut else_ = builder.dangling_instr_seq(None);
         let else_id = else_.id();
 
         // we will need to reset the stack-pointer after every run of the loop, otherwise it would
@@ -264,10 +260,6 @@ impl ComplexWord for Fold {
             .global_get(generator.stack_pointer)
             .local_set(*former_stack_pointer);
 
-        // Define local(s) to hold the intermediate result, and initialize them
-        // with the initial value. Note that we are looping in reverse order,
-        // to pop values from the top of the stack.
-        let result_locals = generator.save_to_locals(&mut else_, &result_clar_ty, true);
         let acc_copy_locals: Vec<_> = result_wasm_types
             .iter()
             .map(|&t| generator.alloc_local(t))
@@ -362,14 +354,6 @@ impl ComplexWord for Fold {
 
         else_.instr(Loop { seq: loop_id });
 
-        // Push the locals to the stack
-        for result_local in result_locals.iter() {
-            else_.local_get(*result_local);
-        }
-
-        // The intermediate result is on the stack; its slots are dead.
-        generator.release_locals(result_locals);
-
         builder
             .local_get(*length)
             .unop(UnaryOp::I32Eqz)
@@ -377,6 +361,11 @@ impl ComplexWord for Fold {
                 consequent: then_id,
                 alternative: else_id,
             });
+
+        for result_local in &result_locals {
+            builder.local_get(*result_local);
+        }
+        generator.release_locals(result_locals);
 
         // since the return type of the function and the accumulator could have different types, we need to duck-type.
         if let Some(tys) = &fold_func_ty {

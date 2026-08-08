@@ -178,10 +178,7 @@ impl ComplexWord for AsContractSafe {
             // In this subblock, we traverse the inner expressions. If one of them fail, we jump to the end of it
             // to execute a cleanup of the current context.
             let fail_block_id = {
-                let fail_block_ty = match generator
-                    .get_current_function_return_type()
-                    .map(clar2wasm_ty)
-                {
+                let fail_block_ty = match generator.current_function_wasm_return_types() {
                     Some(return_ty) => {
                         InstrSeqType::new(&mut generator.module.types, &[], &return_ty)
                     }
@@ -356,10 +353,7 @@ impl ComplexWord for RestrictAssets {
             // In this subblock, we traverse the inner expressions. If one of them fail, we jump to the end of it
             // to execute a cleanup of the current context.
             let fail_block_id = {
-                let fail_block_ty = match generator
-                    .get_current_function_return_type()
-                    .map(clar2wasm_ty)
-                {
+                let fail_block_ty = match generator.current_function_wasm_return_types() {
                     Some(return_ty) => {
                         InstrSeqType::new(&mut generator.module.types, &[], &return_ty)
                     }

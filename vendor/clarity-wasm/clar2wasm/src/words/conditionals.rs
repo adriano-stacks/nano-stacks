@@ -139,7 +139,8 @@ impl<'a> ShortReturnable<'a> {
         builder: &mut InstrSeqBuilder,
         condition: impl FnMut(&mut InstrSeqBuilder),
     ) -> Result<(), GeneratorError> {
-        match generator.get_current_function_return_type() {
+        let return_ty = generator.get_current_function_return_type().cloned();
+        match return_ty.as_ref() {
             Some(return_ty) => {
                 self.handle_short_return_function(generator, builder, return_ty, condition)
             }
@@ -213,7 +214,7 @@ impl<'a> ShortReturnable<'a> {
     /// This is part of [ShortReturnable::handle_short_return] and shouldn't be used directly.
     fn handle_short_return_function(
         &self,
-        generator: &WasmGenerator,
+        generator: &mut WasmGenerator,
         builder: &mut InstrSeqBuilder,
         expected_type: &TypeSignature,
         mut condition: impl FnMut(&mut InstrSeqBuilder),
@@ -259,6 +260,30 @@ impl<'a> ShortReturnable<'a> {
                 "Expected a block id for returning after an assertion".to_owned(),
             )
         })?;
+
+        if let Some(return_offset) = generator.packed_return_offset {
+            // An `if` body cannot consume values below its control-frame
+            // boundary. Save the assembled return value before entering it,
+            // then reload it only on the returning path.
+            let return_value = generator.save_to_locals(builder, expected_type, true);
+            let return_id = {
+                let mut return_ = builder.dangling_instr_seq(None);
+                for local in &return_value {
+                    return_.local_get(*local);
+                }
+                generator.write_to_memory(&mut return_, return_offset, 0, expected_type)?;
+                return_.br(early_return_block_id);
+                return_.id()
+            };
+            let continue_id = builder.dangling_instr_seq(None).id();
+            condition(builder);
+            builder.instr(IfElse {
+                consequent: return_id,
+                alternative: continue_id,
+            });
+            generator.release_locals(return_value);
+            return Ok(());
+        }
 
         // we check if we should short-return, and if yes we br_if to the current early-return block id.
         condition(builder);

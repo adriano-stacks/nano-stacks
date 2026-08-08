@@ -55,6 +55,8 @@ pub struct WasmGenerator {
     pub(crate) early_return_block_id: Option<InstrSeqId>,
     /// The type of the current function.
     pub(crate) current_function_type: Option<FixedFunction>,
+    /// Return-buffer parameter while emitting a memory-backed user function.
+    pub(crate) packed_return_offset: Option<LocalId>,
     /// The types of defined data-vars
     pub(crate) datavars_types: HashMap<ClarityName, TypeSignature>,
     /// The types of (key, value) in defined maps
@@ -534,6 +536,20 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
     }
 }
 
+/// wasmparser rejects function types above 1,000 parameters or results.
+/// Functions beyond either boundary pass their values through linear memory.
+pub(crate) fn uses_packed_abi(function: &FixedFunction) -> bool {
+    const MAX_WASM_FUNCTION_ARITY: usize = 1_000;
+
+    function
+        .args
+        .iter()
+        .map(|arg| clar2wasm_ty(&arg.signature).len())
+        .sum::<usize>()
+        > MAX_WASM_FUNCTION_ARITY
+        || clar2wasm_ty(&function.returns).len() > MAX_WASM_FUNCTION_ARITY
+}
+
 /// One step of reading a stored value out as a wider type.
 ///
 /// A value laid out for a type carrying `NoType` placeholders has fewer wasm
@@ -828,6 +844,7 @@ impl WasmGenerator {
             cost_context: None,
             early_return_block_id: None,
             current_function_type: None,
+            packed_return_offset: None,
             frame_size: 0,
             max_work_space: 0,
             datavars_types: HashMap::new(),
@@ -1237,6 +1254,7 @@ impl WasmGenerator {
         };
 
         self.current_function_type = Some(function_type.clone());
+        let packed_abi = uses_packed_abi(&function_type);
 
         // Count live locals from zero for this function; the caller's counts
         // (the top-level's, for a define) are restored on the way out.
@@ -1259,6 +1277,13 @@ impl WasmGenerator {
         let mut params_types = Vec::new();
         let mut parameters = Vec::new();
         let mut reused_arg = None;
+        let packed_offsets = packed_abi.then(|| {
+            let arguments = self.module.locals.add(ValType::I32);
+            let result = self.module.locals.add(ValType::I32);
+            param_locals.extend([arguments, result]);
+            params_types.extend([ValType::I32, ValType::I32]);
+            (arguments, result)
+        });
         for param in function_type.args.iter() {
             // Interpreter returns the first reused arg as NameAlreadyUsed argument
             if reused_arg.is_none() && bindings.contains(&param.name) {
@@ -1269,9 +1294,11 @@ impl WasmGenerator {
             let mut plocals = Vec::with_capacity(param_types.len());
             for ty in param_types {
                 let local = self.module.locals.add(ty);
-                param_locals.push(local);
                 plocals.push(local);
-                params_types.push(ty);
+                if !packed_abi {
+                    param_locals.push(local);
+                    params_types.push(ty);
+                }
             }
             // A public function receives a trait argument as a bare principal.
             let value_ty = if matches!(&kind, FunctionKind::Public)
@@ -1303,9 +1330,20 @@ impl WasmGenerator {
                 .iter()
                 .map(|(signature, _, _)| get_type_in_memory_size(signature, true))
                 .sum::<i32>();
+            if packed_abi {
+                self.frame_size += parameters
+                    .iter()
+                    .map(|(signature, _, _)| get_type_size(signature))
+                    .sum::<i32>()
+                    + get_type_size(&function_type.returns);
+            }
         }
 
-        let results_types = clar2wasm_ty(&function_type.returns);
+        let results_types = if packed_abi {
+            Vec::new()
+        } else {
+            clar2wasm_ty(&function_type.returns)
+        };
         let mut func_builder = FunctionBuilder::new(
             &mut self.module.types,
             params_types.as_slice(),
@@ -1336,6 +1374,22 @@ impl WasmGenerator {
                 .global_set(self.stack_pointer);
             self.frame_size += spill_size as i32;
             self.frame_pointer = Some(frame_pointer);
+        }
+
+        if let Some((arguments_offset, _)) = packed_offsets {
+            let mut offset = 0;
+            for (_, value_type, locals) in &parameters {
+                let bytes_read =
+                    self.read_from_memory(&mut func_body, arguments_offset, offset, value_type)?;
+                offset += u32::try_from(bytes_read).map_err(|_| {
+                    GeneratorError::InternalError(
+                        "a Clarity value representation has a negative size".to_owned(),
+                    )
+                })?;
+                for local in locals.iter().rev() {
+                    func_body.local_set(*local);
+                }
+            }
         }
 
         // Entering the function type-checks every argument it was given.
@@ -1389,9 +1443,13 @@ impl WasmGenerator {
         // The parameters, frame pointer and sender/caller depths bypass the
         // pool but are live for the whole function, so they count towards
         // its peak.
-        (*self.local_pool)
-            .borrow_mut()
-            .note_live(param_locals.len() as u32 + 1 + u32::from(switches_sender) * 2);
+        let binding_locals = parameters
+            .iter()
+            .map(|(_, _, locals)| locals.len() as u32)
+            .sum::<u32>();
+        (*self.local_pool).borrow_mut().note_live(
+            binding_locals + u32::from(packed_abi) * 2 + 1 + u32::from(switches_sender) * 2,
+        );
 
         let mut block = func_body.dangling_instr_seq(InstrSeqType::new(
             &mut self.module.types,
@@ -1401,10 +1459,14 @@ impl WasmGenerator {
         let block_id = block.id();
 
         self.early_return_block_id = Some(block_id);
+        self.packed_return_offset = packed_offsets.map(|(_, result)| result);
 
         // Traverse the body of the function
         self.set_expr_type(body, function_type.returns.clone())?;
         self.traverse_expr(&mut block, body)?;
+        if let Some(return_offset) = self.packed_return_offset {
+            self.write_to_memory(&mut block, return_offset, 0, &function_type.returns)?;
+        }
 
         // If the same arg name is used multiple times, the interpreter throws an
         // `Unchecked` error at runtime, so we do the same here
@@ -1457,6 +1519,7 @@ impl WasmGenerator {
         // Reset the return type and early block to None
         self.current_function_type = None;
         self.early_return_block_id = None;
+        self.packed_return_offset = None;
 
         // Record this function's peak and hand the counts back to the caller.
         let peak = (*self.local_pool).borrow_mut().restore_counts(saved_counts);
@@ -3005,7 +3068,64 @@ impl WasmGenerator {
         let function = self.user_functions.get(name).copied().ok_or_else(|| {
             GeneratorError::InternalError(format!("function {name} was not defined"))
         })?;
-        builder.call(function);
+
+        let function_type = match self.get_function_type(name) {
+            Some(FunctionType::Fixed(function_type)) => function_type.clone(),
+            _ => {
+                return Err(GeneratorError::TypeError(format!(
+                    "function {name} must have a fixed type"
+                )))
+            }
+        };
+        if !uses_packed_abi(&function_type) {
+            builder.call(function);
+            return Ok(());
+        }
+
+        // Arguments are already on the operand stack in declaration order.
+        // Save them from the top down, then write their representations in
+        // declaration order into one bounded function argument.
+        let mut arguments = function_type
+            .args
+            .iter()
+            .rev()
+            .map(|argument| {
+                (
+                    argument.signature.clone(),
+                    self.save_to_locals(builder, &argument.signature, true),
+                )
+            })
+            .collect::<Vec<_>>();
+        arguments.reverse();
+
+        let arguments_size = arguments
+            .iter()
+            .map(|(ty, _)| get_type_size(ty) as u32)
+            .sum::<u32>();
+        let return_size = get_type_size(&function_type.returns);
+        let (arguments_offset, _) =
+            self.create_call_stack_bytes(builder, arguments_size as i32 + return_size);
+        let return_offset = self.module.locals.add(ValType::I32);
+        builder
+            .local_get(arguments_offset)
+            .i32_const(arguments_size as i32)
+            .binop(BinaryOp::I32Add)
+            .local_set(return_offset);
+
+        let mut offset = 0;
+        for (ty, locals) in arguments {
+            for local in &locals {
+                builder.local_get(*local);
+            }
+            offset += self.write_to_memory(builder, arguments_offset, offset, &ty)?;
+            self.release_locals(locals);
+        }
+
+        builder
+            .local_get(arguments_offset)
+            .local_get(return_offset)
+            .call(function);
+        self.read_from_memory(builder, return_offset, 0, &function_type.returns)?;
 
         Ok(())
     }
@@ -3200,6 +3320,16 @@ impl WasmGenerator {
 
     pub(crate) fn get_current_function_return_type(&self) -> Option<&TypeSignature> {
         self.current_function_type.as_ref().map(|f| &f.returns)
+    }
+
+    pub(crate) fn current_function_wasm_return_types(&self) -> Option<Vec<ValType>> {
+        self.current_function_type.as_ref().map(|function| {
+            if self.packed_return_offset.is_some() {
+                Vec::new()
+            } else {
+                clar2wasm_ty(&function.returns)
+            }
+        })
     }
 
     pub(crate) fn get_current_function_arg_type(
@@ -3442,7 +3572,7 @@ mod tests {
         // wasmtime loads it. nano-conformance's `engine_failure.rs` used to
         // force a module-load refusal with this shape; it now uses a return
         // value wider than wasmtime's function-type limit (see
-        // `more_wasm_returns_than_wasmtime_allows_still_refuses_at_load`).
+        // `more_wasm_returns_than_wasmtime_allows_uses_packed_abi_and_loads`).
         let bindings = (0..60_000_u32)
             .map(|index| format!("(a{index} u1)"))
             .collect::<Vec<_>>()
@@ -3522,13 +3652,10 @@ mod tests {
     }
 
     #[test]
-    fn more_wasm_returns_than_wasmtime_allows_still_refuses_at_load() {
-        // The module-load refusal class must stay reachable. Locals no
-        // longer reach it — spilling moves wide scopes to the frame — but
-        // wasmparser also refuses a function *type* with more than 1,000
-        // results, and a return value flattens to one wasm result per leaf
-        // value: one 600-field tuple is 1,200. The compiler must not refuse;
-        // the runtime must.
+    fn more_wasm_returns_than_wasmtime_allows_uses_packed_abi_and_loads() {
+        // A return value flattens to one wasm result per leaf value: one
+        // 600-field tuple is 1,200. User functions beyond wasmparser's
+        // 1,000-result limit use the memory-backed ABI instead.
         let fields = (0..600_u32)
             .map(|index| format!("f{index}: 1"))
             .collect::<Vec<_>>()
@@ -3548,13 +3675,8 @@ mod tests {
         )
         .expect("a function returning a wide tuple still compiles");
 
-        let err = wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-            .expect_err("wasmtime refuses the module");
-        let err = format!("{err:?}");
-        assert!(
-            err.contains("function returns"),
-            "expected a function-returns refusal, got {err}"
-        );
+        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+            .expect("wasmtime loads the packed-ABI module");
     }
 
     #[test]

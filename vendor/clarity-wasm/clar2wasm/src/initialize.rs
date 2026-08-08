@@ -18,6 +18,7 @@ use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
 use crate::error_mapping;
 use crate::linker::{link_cost_globals, link_host_functions};
+use crate::wasm_generator::uses_packed_abi;
 use crate::wasm_utils::*;
 use crate::{CompiledContract, ModuleCache};
 
@@ -552,14 +553,16 @@ pub fn call_function(
         .ok_or(crate::error::wasm_error(WasmError::NotInDatabase(
             function_name.into(),
         )))?;
-    let return_type = match function_type {
-        FunctionType::Fixed(function) => function.returns.clone(),
+    let fixed_function = match function_type {
+        FunctionType::Fixed(function) => function,
         _ => {
             return Err(crate::error::wasm_error(WasmError::InvalidFunctionKind(
                 function_name.into(),
             )));
         }
     };
+    let return_type = fixed_function.returns.clone();
+    let packed_abi = uses_packed_abi(fixed_function);
     let expected_arguments = function.get_arg_types();
     let read_only = function.is_read_only();
     let epoch = global_context.epoch_id;
@@ -613,6 +616,13 @@ pub fn call_function(
         .get(&mut store)
         .i32()
         .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    let arguments_offset = offset;
+    let mut representation_offset = offset;
+    let mut in_memory_offset = if packed_abi {
+        offset + expected_arguments.iter().map(get_type_size).sum::<i32>()
+    } else {
+        offset
+    };
     let mut wasm_arguments = Vec::new();
     for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
         let argument = implicit_contract_cast(expected_type, argument);
@@ -636,10 +646,29 @@ pub fn call_function(
             )
             .into());
         }
-        let (values, next_offset) =
-            pass_argument_to_wasm(memory, &mut store, expected_type, &argument, offset)?;
-        wasm_arguments.extend(values);
-        offset = next_offset;
+        if packed_abi {
+            let (written, in_memory_written) = write_to_wasm(
+                &mut store,
+                memory,
+                expected_type,
+                representation_offset,
+                in_memory_offset,
+                &argument,
+                true,
+            )?;
+            representation_offset += written;
+            in_memory_offset += in_memory_written;
+        } else {
+            let (values, next_offset) =
+                pass_argument_to_wasm(memory, &mut store, expected_type, &argument, offset)?;
+            wasm_arguments.extend(values);
+            offset = next_offset;
+        }
+    }
+    let packed_return_offset = packed_abi.then_some(in_memory_offset);
+    if let Some(return_offset) = packed_return_offset {
+        wasm_arguments.extend([Val::I32(arguments_offset), Val::I32(return_offset)]);
+        offset = return_offset + get_type_size(&return_type);
     }
     stack_pointer
         .set(&mut store, Val::I32(offset))
@@ -649,10 +678,14 @@ pub fn call_function(
         .ok_or_else(|| {
             clarity::vm::errors::RuntimeCheckErrorKind::UndefinedFunction(function_name.into())
         })?;
-    let mut results = wasm_value_types(&return_type)
-        .into_iter()
-        .map(placeholder_for_type)
-        .collect::<Vec<_>>();
+    let mut results = if packed_abi {
+        Vec::new()
+    } else {
+        wasm_value_types(&return_type)
+            .into_iter()
+            .map(placeholder_for_type)
+            .collect::<Vec<_>>()
+    };
     if read_only {
         store.data_mut().global_context.begin_read_only();
     } else {
@@ -677,11 +710,15 @@ pub fn call_function(
         call_result.map_err(|error| {
             error_mapping::resolve_error(error, instance, &mut store, &epoch, &clarity_version)
         })?;
-        wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?
-            .0
-            .ok_or(crate::error::wasm_error(WasmError::Expect(
-                "function returned no value".into(),
-            )))
+        if let Some(return_offset) = packed_return_offset {
+            read_from_wasm_indirect(memory, &mut store, &return_type, return_offset, epoch)
+        } else {
+            wasm_to_clarity_value(&return_type, 0, &results, memory, &mut &mut store, epoch)?
+                .0
+                .ok_or(crate::error::wasm_error(WasmError::Expect(
+                    "function returned no value".into(),
+                )))
+        }
     })();
     let value = if read_only {
         store.data_mut().global_context.roll_back()?;

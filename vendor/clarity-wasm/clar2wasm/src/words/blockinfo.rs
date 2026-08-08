@@ -220,10 +220,7 @@ impl ComplexWord for AtBlock {
             let mut e_block = builder.dangling_instr_seq(wasm_ty);
             let e_block_id = e_block.id();
 
-            let fail_block_ty = match generator
-                .get_current_function_return_type()
-                .map(clar2wasm_ty)
-            {
+            let fail_block_ty = match generator.current_function_wasm_return_types() {
                 Some(wasm_ty) => InstrSeqType::new(&mut generator.module.types, &[], &wasm_ty),
                 None => None.into(),
             };

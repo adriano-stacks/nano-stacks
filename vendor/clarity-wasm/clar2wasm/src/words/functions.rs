@@ -152,7 +152,9 @@ mod tests {
     use clarity::types::StacksEpochId;
     use clarity::vm::errors::RuntimeCheckErrorKind::NameAlreadyUsed;
     use clarity::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
+    use clarity::vm::types::TupleData;
     use clarity::vm::{ClarityVersion, ContractName, Value};
+    use clarity_types::ClarityName;
 
     use crate::tools::{
         crosscheck, crosscheck_expect_failure, crosscheck_multi_contract, evaluate, TestEnvironment,
@@ -646,5 +648,84 @@ mod tests {
         let mut env = TestEnvironment::new(StacksEpochId::Epoch25, ClarityVersion::Clarity2);
         env.init_contract_with_snippet("foo", foo).unwrap();
         env.init_contract_with_snippet("bar", bar).unwrap();
+    }
+
+    #[test]
+    fn packed_user_function_abi_crosses_both_arity_boundaries() {
+        const FIELD_COUNT: u32 = 501;
+
+        let fields = (0..FIELD_COUNT)
+            .map(|index| format!("f{index}: {index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let field_types = (0..FIELD_COUNT)
+            .map(|index| format!("f{index}: int"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let snippet = format!(
+            r#"
+            (define-read-only (wide) {{{fields}}})
+            (define-read-only (local-wide-first) (get f0 (wide)))
+            (define-read-only (first (value {{{field_types}}})) (get f0 value))
+            (define-read-only (local-first) (first {{{fields}}}))
+            (define-private (map-wide (value int)) {{{fields}}})
+            (define-read-only (mapped-wide-length) (len (map map-wide (list 1))))
+            (define-private (map-first (value {{{field_types}}})) (get f0 value))
+            (define-read-only (mapped-first)
+                (is-eq (map map-first (list {{{fields}}})) (list 0)))
+            (define-private (fold-wide (value int) (total {{{field_types}}})) total)
+            (define-read-only (folded-wide-first)
+                (get f0 (fold fold-wide (list 1) {{{fields}}})))
+            (define-public (early)
+                (begin
+                    (asserts! false (err u7))
+                    (ok {{{fields}}})))
+            "#
+        );
+        let tuple = Value::Tuple(
+            TupleData::from_data(
+                (0..FIELD_COUNT)
+                    .map(|index| {
+                        (
+                            ClarityName::try_from(format!("f{index}"))
+                                .expect("generated tuple field name is valid"),
+                            Value::Int(index.into()),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("generated tuple is valid"),
+        );
+
+        let mut compiled = TestEnvironment::default();
+        let mut interpreted = TestEnvironment::default();
+        assert_eq!(
+            compiled.init_contract_with_snippet("wide-abi", &snippet),
+            interpreted.interpret_contract_with_snippet("wide-abi", &snippet)
+        );
+
+        for (function, arguments, expected) in [
+            ("wide", Vec::new(), tuple.clone()),
+            ("local-wide-first", Vec::new(), Value::Int(0)),
+            ("first", vec![tuple.clone()], Value::Int(0)),
+            ("local-first", Vec::new(), Value::Int(0)),
+            ("mapped-wide-length", Vec::new(), Value::UInt(1)),
+            ("mapped-first", Vec::new(), Value::Bool(true)),
+            ("folded-wide-first", Vec::new(), Value::Int(0)),
+            ("early", Vec::new(), Value::err_uint(7)),
+        ] {
+            let compiled_result = compiled.call_contract("wide-abi", function, &arguments);
+            let interpreted_result =
+                interpreted.interpret_call_contract("wide-abi", function, &arguments);
+            assert_eq!(
+                compiled_result, interpreted_result,
+                "compiled and interpreted calls diverged for {function}"
+            );
+            assert_eq!(
+                compiled_result.expect("compiled call succeeds"),
+                expected,
+                "unexpected result from {function}"
+            );
+        }
     }
 }
