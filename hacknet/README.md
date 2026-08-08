@@ -39,9 +39,45 @@ prints what would be written without starting anything, and `restore` stops the
 node with `SIGTERM`. Set `NANO_RPC_BIND` to serve the public RPC as well, and
 `NANO_EVENT_OBSERVERS` to a comma-separated list to post events.
 
-`status` prints the heights of all three participants, the reward cycle, and
-whether nano is running. `wait` fails as soon as Bitcoin advances with a frozen
-Stacks tip, which is what a broken replacement looks like.
+`status` prints the heights of all three participants, the reward cycle, the
+stacking horizon, and whether nano is running. `wait` fails as soon as Bitcoin
+advances with a frozen Stacks tip, which is what a broken replacement looks like.
+
+## Keep stacking ahead of the prepare phase
+
+Hacknet normally locks for one reward cycle. If its stacker misses the reward
+phase in which it must renew, the next cycle has no signer set. PoX-5 rejects a
+staking update during the prepare phase, so the network cannot repair the set
+after the boundary is buried.
+
+The harness sets `STACKING_CYCLES=12`. This is the maximum accepted by pox-4 and
+is also valid under pox-5. `stacking` reads pox-5's signer-list head for each
+future cycle and fails when fewer than two cycles are ready:
+
+```
+hacknet/harness.sh stacking
+stacking: cycles 15..26 have a pox-5 signer set (12 ahead of cycle 14)
+```
+
+`cycles [count] [timeout]` follows the stock chain across each requested reward
+cycle boundary. It requires the Stacks tip to keep moving and the new cycle's
+`/v3/stacker_set` response to contain at least one signer. Run this before using
+a long-lived Hacknet chain as release evidence.
+
+A separate stock-only failure occurred at the first Nakamoto reward-cycle
+boundary: Bitcoin advanced while the nodes repeated `Missing canonical anchor
+block`. The current hypothesis is that epoch 3.0 starts too close to that prepare
+phase. The harness keeps Hacknet's upstream heights until this is proved. To run
+the earlier-start diagnostic without editing the checkout:
+
+```
+STACKS_30_HEIGHT=222 STACKS_31_HEIGHT=223 \
+STACKS_32_HEIGHT=224 STACKS_33_HEIGHT=225 \
+  hacknet/harness.sh up
+hacknet/harness.sh cycles 2
+```
+
+Only a successful boundary run can promote those diagnostic heights to defaults.
 
 ## The other direction: a stock signer on nano
 

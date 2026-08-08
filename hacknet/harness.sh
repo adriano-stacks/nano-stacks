@@ -30,6 +30,15 @@ PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 MINE_INTERVAL_EPOCH3=${MINE_INTERVAL_EPOCH3:-10}
 # Seconds a frozen Stacks tip is tolerated while Bitcoin keeps advancing.
 STALL_SECS=${STALL_SECS:-240}
+# Hacknet otherwise locks for one cycle and can miss its only renewal window.
+# Twelve is the maximum accepted by pox-4 and remains valid under pox-5.
+STACKING_CYCLES=${STACKING_CYCLES:-12}
+# Keep Hacknet's epoch defaults, but pass them explicitly so an anchor-window
+# diagnostic can move Nakamoto earlier without editing the upstream checkout.
+STACKS_30_HEIGHT=${STACKS_30_HEIGHT:-232}
+STACKS_31_HEIGHT=${STACKS_31_HEIGHT:-233}
+STACKS_32_HEIGHT=${STACKS_32_HEIGHT:-234}
+STACKS_33_HEIGHT=${STACKS_33_HEIGHT:-235}
 # Where the node binaries are. Release by default: this node executes every
 # block it is given, and a debug build is too slow to keep up with a tenure.
 BIN=${NANO_BIN_DIR:-$ROOT/target/release}
@@ -56,6 +65,9 @@ stock_index() { case ${1:?index} in 1) echo 2 ;; *) echo 1 ;; esac; }
 compose() {
     (cd "$SRC" && CHAINSTATE_DIR="$(chainstate_dir)" \
         PAUSE_HEIGHT="$PAUSE_HEIGHT" MINE_INTERVAL_EPOCH3="$MINE_INTERVAL_EPOCH3" \
+        STACKING_CYCLES="$STACKING_CYCLES" \
+        STACKS_30_HEIGHT="$STACKS_30_HEIGHT" STACKS_31_HEIGHT="$STACKS_31_HEIGHT" \
+        STACKS_32_HEIGHT="$STACKS_32_HEIGHT" STACKS_33_HEIGHT="$STACKS_33_HEIGHT" \
         docker compose -f docker/docker-compose.yml --profile default -p "$PROJECT" "$@")
 }
 
@@ -170,7 +182,54 @@ print(
     )
 )
 PY
+    (stacking) || true
     printf 'nano: %s\n' "$(nano_state)"
+}
+
+# Report how many future pox-5 cycles already contain at least one signer.
+stacking() {
+    local peer cycle contract horizon=0 probe
+    peer=$(peer_url "${1:-1}")
+    read -r cycle contract < <(pox_cycle "$peer") ||
+        die "cannot read the reward cycle from $peer"
+    case $contract in
+    *.pox-5) ;;
+    *)
+        printf 'stacking: %s is active, not pox-5; nothing to measure yet\n' "$contract"
+        return 0
+        ;;
+    esac
+    while [ "$horizon" -lt 96 ]; do
+        probe=$((cycle + horizon + 1))
+        pox5_has_signers "$peer" "$probe" || break
+        horizon=$((horizon + 1))
+    done
+    if [ "$horizon" -gt 0 ]; then
+        printf 'stacking: cycles %s..%s have a pox-5 signer set (%s ahead of cycle %s)\n' \
+            "$((cycle + 1))" "$((cycle + horizon))" "$horizon" "$cycle"
+    else
+        printf 'stacking: no future pox-5 signer set after cycle %s\n' "$cycle"
+    fi
+    [ "$horizon" -ge 2 ] ||
+        die "only $horizon cycle(s) stacked ahead of $cycle: without renewal the chain stops at cycle $((cycle + horizon + 1))"
+}
+
+pox_cycle() {
+    curl -sf --max-time 5 "${1:?peer}/v2/pox" 2>/dev/null |
+        python3 -c 'import json,sys
+pox = json.load(sys.stdin)
+print(pox["current_cycle"]["id"], pox["contract_id"])' 2>/dev/null
+}
+
+pox5_has_signers() {
+    local peer=${1:?peer} cycle=${2:?cycle} argument
+    argument=$(printf '0x01%032x' "$cycle")
+    curl -sf --max-time 10 -X POST -H 'content-type: application/json' \
+        -d "{\"sender\":\"ST000000000000000000002AMW42H\",\"arguments\":[\"$argument\"]}" \
+        "$peer/v2/contracts/call-read/ST000000000000000000002AMW42H/pox-5/get-signer-set-first-item-for-cycle" |
+        python3 -c 'import json,sys
+result = json.load(sys.stdin).get("result", "")
+raise SystemExit(0 if result.startswith("0x0a") else 1)'
 }
 
 nano_state() {
@@ -213,6 +272,52 @@ wait_for() {
         sleep 10
     done
     die "burn height $target not reached within ${timeout}s (burn $burn, stacks $stacks)"
+}
+
+# Follow the stock chain across reward-cycle boundaries and fail if the new
+# cycle has no usable signer set or the Stacks tip stops advancing.
+cross_cycles() {
+    local count=${1:-2} timeout=${2:-3600} peer cycle current burn stacks tenure
+    peer=$(peer_url 1)
+    local deadline=$((SECONDS + timeout)) highest=0 progress_at=$SECONDS crossed=0
+    read -r cycle _ < <(pox_cycle "$peer") ||
+        die "cannot read the reward cycle from $peer"
+    log "crossing $count reward-cycle boundaries from cycle $cycle"
+    stacking
+    while [ "$crossed" -lt "$count" ]; do
+        [ "$SECONDS" -lt "$deadline" ] ||
+            die "only crossed $crossed of $count cycles in ${timeout}s"
+        read -r burn stacks tenure < <(peer_info "$peer" 2>/dev/null || echo "0 0 0")
+        if [ "$stacks" -gt "$highest" ]; then
+            highest=$stacks
+            progress_at=$SECONDS
+        elif [ $((SECONDS - progress_at)) -gt "$STALL_SECS" ]; then
+            die "stalled at burn $burn, Stacks tip frozen at $stacks for ${STALL_SECS}s"
+        fi
+        read -r current _ < <(pox_cycle "$peer" || echo "$cycle -")
+        if [ "$current" -gt "$cycle" ]; then
+            cycle=$current
+            crossed=$((crossed + 1))
+            printf 'crossed into cycle %s at burn %s, Stacks tip %s, tenure %s: %s\n' \
+                "$cycle" "$burn" "$stacks" "$tenure" \
+                "$(reward_set_summary "$peer" "$cycle")" >&2
+            stacking
+        fi
+        sleep 5
+    done
+}
+
+reward_set_summary() {
+    curl -sf --max-time 10 "${1:?peer}/v3/stacker_set/${2:?cycle}" |
+        python3 -c '
+import json, sys
+signers = json.load(sys.stdin)["stacker_set"]["signers"] or []
+if not signers:
+    raise SystemExit("empty reward set")
+print("{} signers, total weight {}".format(
+    len(signers), sum(s["weight"] for s in signers)
+))
+' || die "cycle ${2} has no usable reward set"
 }
 
 # Export the state a nano participant validates from.
@@ -633,6 +738,7 @@ traffic() {
             while [ \$(date +%s) -lt \$end ]; do timeout 90 npx tsx flood.ts || true; done"
 }
 
+main() {
 case ${1:-} in
 setup) setup ;;
 up) up ;;
@@ -640,6 +746,8 @@ down) down ;;
 wipe) wipe ;;
 status) status ;;
 wait) shift && wait_for "$@" ;;
+cycles) shift && cross_cycles "$@" ;;
+stacking) shift && stacking "$@" ;;
 checkpoint) checkpoint ;;
 fund) shift && fund "$@" ;;
 register) register ;;
@@ -662,6 +770,8 @@ usage: harness.sh <command>
   setup              clone Hacknet at the pinned commit and patch it
   up                 build and boot the network from genesis
   wait <height> [s]  wait for a Bitcoin height, failing on a Stacks stall
+  cycles [n] [s]     cross n reward-cycle boundaries and require signer sets
+  stacking           show how many future pox-5 cycles have signers
   checkpoint         export the state a nano participant validates from
   replace <1|2|3>    stop one stock participant and run nano in its place
   host <1|2|3>       run nano as the node half and a stock stacks-signer on it
@@ -682,3 +792,8 @@ USAGE
     exit 2
     ;;
 esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

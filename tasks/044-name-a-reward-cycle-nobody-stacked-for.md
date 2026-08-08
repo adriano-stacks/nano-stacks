@@ -92,9 +92,11 @@ window in the middle, which is worth knowing before planning to validate on it.
       network's.
 - [x] Report an unstacked cycle as itself rather than as an invalid
       transaction.
-- [ ] Give the Hacknet harness a way to keep stacking ahead of the prepare
+- [x] Give the Hacknet harness a way to keep stacking ahead of the prepare
       phase, so a long run does not deadlock at a cycle boundary. `W13` already
-      notes the stacker needed a pox-5 path; this is the rest of it.
+      notes the stacker needed a pox-5 path; this is the rest of it. The harness
+      now locks for 12 cycles, reports the future pox-5 signer-set horizon, and
+      has a `cycles` command that fails on a missing set or frozen Stacks tip.
 - [ ] Find why a fresh genesis wedges on `Missing canonical anchor block` at
       the first cycle boundary, and whether the boot needs a longer pre-Nakamoto
       run or a prepared snapshot.
@@ -103,3 +105,21 @@ window in the middle, which is worth knowing before planning to validate on it.
 
 - A cycle with no stackers is reported as such, naming the cycle.
 - The distinction is visible in the log without reading the source.
+
+## Harness boundary controls, 2026-08-08
+
+The accounting worktree contained two ideas. Only the reward-cycle controls
+belong here; its unrelated multi-network compose renderer was not ported.
+
+`hacknet/harness.sh` now passes `STACKING_CYCLES=12` to Hacknet's existing
+stacker. Twelve is pox-4's maximum and is accepted by pox-5. `stacking` queries
+`get-signer-set-first-item-for-cycle` for each future cycle and names the first
+unprepared boundary. `cycles` crosses live boundaries and requires both a moving
+Stacks tip and a non-empty `/v3/stacker_set` on the far side. The offline shell
+test pins the compose inputs, Clarity uint encoding, horizon diagnosis and
+reward-set summary without starting Docker.
+
+The earlier-Nakamoto idea is still a hypothesis. The harness passes the four
+epoch heights as overrides but keeps Hacknet's defaults. The README gives the
+`222..225` diagnostic command, followed by `cycles 2`; until that stock-only run
+crosses the boundary, the fresh-genesis item above stays open.
