@@ -75,6 +75,7 @@ fn main() -> ExitCode {
     match command.as_deref() {
         Some("scoreboard") => print_scoreboard(),
         Some("release-report") => release_report(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("infrastructure-tests") => infrastructure_tests(),
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
@@ -121,7 +122,8 @@ fn main() -> ExitCode {
                  reads or writes elsewhere:\n\
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
                  \x20 export-leader-keys  export-sortition  freeze-receipts  public-key\n\
-                 \x20 release-report  scoreboard  snapshot-state  validate-fixtures\n\
+                 \x20 infrastructure-tests  release-report  scoreboard  snapshot-state\n\
+                 \x20 validate-fixtures\n\
                  \x20 verify-block"
             );
             ExitCode::from(2)
@@ -159,9 +161,16 @@ fn sweep_contracts(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
-        eprintln!("the state is sealed at no block, so it holds no contracts to compile");
-        return ExitCode::FAILURE;
+    let tip = match vm.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block, so it holds no contracts to compile");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     if let Err(error) = vm.begin_block(Some(tip), [0xc5; 32]) {
         eprintln!("cannot open a block on the tip: {error:?}");
@@ -349,9 +358,16 @@ fn eval_in_state(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = store.tip() else {
-        eprintln!("the state is sealed at no block");
-        return ExitCode::FAILURE;
+    let tip = match store.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     if let Err(error) = store.begin(Some(tip), [0xef; 32]) {
         eprintln!("cannot open a block on the tip: {error:?}");
@@ -551,9 +567,16 @@ fn block_info(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
-        eprintln!("the state is sealed at no block");
-        return ExitCode::FAILURE;
+    let tip = match vm.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     // The tip's own burn height, so the epoch of the block being stood on is the
     // one it really ran under. Every read below resolves its own block's epoch
@@ -1479,7 +1502,13 @@ fn probe_header(arguments: &[String]) -> ExitCode {
         }
     };
 
-    let stacks_height = u64::from(vm.height_of(id).unwrap_or(0));
+    let stacks_height = match vm.height_of(id) {
+        Ok(height) => u64::from(height.unwrap_or(0)),
+        Err(error) => {
+            eprintln!("cannot read the block height: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     println!("Stacks height: {stacks_height}");
 
     // Three different answers, and the point of printing which: a block with no
@@ -1866,8 +1895,16 @@ fn print_scoreboard() -> ExitCode {
 fn validate_fixtures() -> ExitCode {
     match validate_fixture_tree(&fixture_root()) {
         Ok(FixtureStatus::Captured { replay_blocks }) => {
-            println!("captured fixture tree is valid for {replay_blocks} replay blocks");
-            ExitCode::SUCCESS
+            match describe_fixture(&fixture_root(), replay_blocks) {
+                Ok(description) => {
+                    print!("{description}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("fixture validation failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Ok(FixtureStatus::Baseline { .. }) => {
             eprintln!("fixture tree is still the empty baseline; capture real epoch-4 data first");
@@ -1878,6 +1915,38 @@ fn validate_fixtures() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Name the oracle and prove that its captured consensus history seeds a chain.
+fn describe_fixture(root: &Path, replay_blocks: u64) -> Result<String, String> {
+    let provenance = fs::read_to_string(root.join("provenance.toml"))
+        .map_err(|error| format!("cannot read provenance.toml: {error}"))?;
+    let field = |name: &str| {
+        provenance
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))
+            .map(|value| value.trim().trim_matches('"').to_owned())
+            .ok_or_else(|| format!("provenance.toml does not name {name}"))
+    };
+    let source = field("source")?;
+    let source_revision = field("hacknet_commit")?;
+    let stacks_core = field("stacks_core_rev")?;
+    let captured_at = field("captured_at_unix")?;
+    let history = nano_node::sortition::SortitionTracker::history_from(&root.join("sortition"))
+        .map_err(|error| format!("the consensus-hash history is unreadable: {error}"))?;
+    let tracker = nano_node::sortition::SortitionTracker::from_capture(&root.join("sortition"))
+        .map_err(|error| format!("the consensus-hash history cannot seed a chain: {error}"))?;
+
+    Ok(format!(
+        "captured fixture tree is valid\n\
+         capture: {source} revision {source_revision}, taken at unix {captured_at}\n\
+         stacks-core oracle revision: {stacks_core}\n\
+         replay: {replay_blocks} blocks\n\
+         consensus history: {} hashes; seeds a chain at burn {} ({})\n",
+        history.len(),
+        tracker.tip().bitcoin_height,
+        tracker.tip().consensus_hash,
+    ))
 }
 
 struct CaptureConfig {
@@ -3232,9 +3301,16 @@ fn check_module(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
-        eprintln!("the state is sealed at no block, so there is nothing to compile against");
-        return ExitCode::FAILURE;
+    let tip = match vm.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block, so there is nothing to compile against");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     if let Err(error) = vm.begin_block(Some(tip), [0xcc; 32]) {
         eprintln!("cannot begin a block on the tip: {error:?}");
@@ -3431,7 +3507,13 @@ fn state_value(arguments: &[String]) -> ExitCode {
         }
     };
     let resolved = if block == "tip" {
-        store.tip()
+        match store.tip() {
+            Ok(tip) => tip,
+            Err(error) => {
+                eprintln!("cannot read the state tip: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         hex::decode(block)
             .ok()
@@ -3932,9 +4014,16 @@ fn call_both(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = chain.tip() else {
-        eprintln!("the state is sealed at no block");
-        return ExitCode::FAILURE;
+    let tip = match chain.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     let caller = match sender.as_deref() {
         Some(text) if text.contains('.') => {
@@ -3983,7 +4072,10 @@ fn open_state_as_the_node_left_it(directory: &Path) -> Result<nano_chainstate::C
     // `(chain-id)`, which is exactly the confusion these tools exist to remove.
     let mut chain = nano_chainstate::ChainState::open_existing(directory)
         .map_err(|error| format!("cannot open the state: {error:?}"))?;
-    if let Some(tip) = chain.tip() {
+    if let Some(tip) = chain
+        .tip()
+        .map_err(|error| format!("cannot read the state tip: {error}"))?
+    {
         chain
             .recover_ledger_at(tip)
             .map_err(|error| format!("cannot read the ledger the tip sealed: {error:?}"))?;
@@ -4084,9 +4176,16 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = chain.tip() else {
-        eprintln!("the state is sealed at no block");
-        return ExitCode::FAILURE;
+    let tip = match chain.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     let staging = match nano_node::staging::Staging::open(&chainstate.join("staging.sqlite")) {
         Ok(staging) => staging,
@@ -4203,9 +4302,16 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(tip) = vm.tip() else {
-        eprintln!("the state is sealed at no block");
-        return ExitCode::FAILURE;
+    let tip = match vm.tip() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
+            eprintln!("the state is sealed at no block");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read the state tip: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     if let Err(error) = vm.begin_block(Some(tip), [0xea; 32]) {
         eprintln!("cannot begin a block on the tip: {error:?}");
@@ -4768,40 +4874,24 @@ fn classify_failures(output: &str) -> (BTreeMap<String, Vec<String>>, Vec<String
     (unrunnable, broken)
 }
 
-/// How many `skip_gate` call sites each conformance file has.
+/// How many owned conditional call sites each conformance file declares.
 ///
-/// Reported because it is the size of the conditional surface: these are the
-/// assertions a working tree is allowed to skip and a release is not, and a
-/// reader should be able to see how much of the suite that is without taking
-/// anybody's word for it.
+/// `release_inventory` separately proves this inventory matches the source in
+/// both directions. The report consumes the policy file rather than rediscovering
+/// policy from syntax, for the same reason ignored tests use their inventory.
 fn conditional_gates() -> Vec<(String, usize)> {
-    let directory = workspace_root().join("crates/nano-conformance/tests/conformance");
-    let Ok(entries) = fs::read_dir(&directory) else {
+    let Ok(text) = fs::read_to_string(workspace_root().join("conditional-tests.toml")) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .collect();
-    paths.sort();
-    let mut found = Vec::new();
-    for path in paths {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        // The call, not the import and not a mention in prose.
-        let count = text.matches("skip_gate(").count();
-        if count > 0 {
-            found.push((
-                path.file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                count,
-            ));
-        }
+    let mut modules = BTreeMap::new();
+    for site in text.lines().map(str::trim).filter_map(|line| {
+        line.strip_prefix("site = \"")
+            .and_then(|site| site.strip_suffix('"'))
+    }) {
+        let module = site.split_once("::").map_or(site, |(module, _)| module);
+        *modules.entry(module.to_owned()).or_default() += 1;
     }
-    found
+    modules.into_iter().collect()
 }
 
 /// The version the lock file pins for a crate, if it pins exactly one.
@@ -4860,6 +4950,40 @@ fn report_revision() {
     );
 }
 
+/// A supplied release capture is evidence only if production can seed from it.
+fn report_capture_validation(capture: Option<&str>) -> bool {
+    println!("\ncapture validation");
+    let Some(capture) = capture else {
+        println!("  no capture supplied; no capture-backed claim is made here");
+        return true;
+    };
+    let root = Path::new(capture);
+    match validate_fixture_tree(root) {
+        Ok(FixtureStatus::Captured { replay_blocks }) => {
+            match describe_fixture(root, replay_blocks) {
+                Ok(description) => {
+                    for line in description.lines() {
+                        println!("  {line}");
+                    }
+                    true
+                }
+                Err(error) => {
+                    println!("  FAIL: {error}");
+                    false
+                }
+            }
+        }
+        Ok(FixtureStatus::Baseline { .. }) => {
+            println!("  FAIL: the supplied tree is an empty baseline, not a capture");
+            false
+        }
+        Err(error) => {
+            println!("  FAIL: {error}");
+            false
+        }
+    }
+}
+
 /// The engine, named by content.
 ///
 /// tasks/060 asks for the clarity-wasm and compiler revisions by name. The
@@ -4889,7 +5013,32 @@ fn report_engines() {
     for crate_name in ["wasmtime", "clarity", "stackslib"] {
         println!("  {crate_name:<20} {}", locked_version(crate_name));
     }
-    println!("  interpreter          not linked into the artifact; see the gates below");
+    println!(
+        "  execution            Clarity contracts enter clarity-wasm only; stacks-core's \
+         frontend/ABI types and the native STX-transfer helper remain linked"
+    );
+}
+
+/// Put the frozen receipt baseline and this compiler beside each other.
+fn report_receipt_binding() -> bool {
+    let path = workspace_root().join("crates/nano-conformance/fixtures/mainnet/receipts.json");
+    let fixture = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value["compiler"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "UNNAMED".to_owned());
+    println!("\nfrozen mainnet receipt slice");
+    println!("  baseline compiler    {fixture}");
+    println!("  artifact compiler    {}", nano_vm::COMPILER_IDENTITY);
+    println!(
+        "  binding              {}",
+        if fixture == nano_vm::COMPILER_IDENTITY {
+            "same compiler; a re-freeze must explain why the baseline moved"
+        } else {
+            "different compilers; the baseline is intentionally testing this artifact"
+        }
+    );
+    fixture != "UNNAMED"
 }
 
 /// Every `#[ignore]` in the execution engine's own suite and in the conformance
@@ -4926,7 +5075,7 @@ fn report_differentials() -> usize {
         for (path, name, reason) in ignored_tests(&workspace_root().join(root)) {
             match inventory.get(name.as_str()).map(String::as_str) {
                 Some("infrastructure") => infrastructure += 1,
-                Some("tool" | "out-of-scope") => tools += 1,
+                Some("covered" | "tool" | "out-of-scope") => tools += 1,
                 Some(class) => blocking.push((path, format!("{name}: {reason}"), class.to_owned())),
                 None => {
                     blocking.push((path, format!("{name}: {reason}"), "unclassified".to_owned()));
@@ -4940,8 +5089,8 @@ fn report_differentials() -> usize {
          does not have; every one names the job that supplies it)"
     );
     println!(
-        "  tools / out-of-scope {tools} (assert no required behaviour, or a word epoch 4.0 \
-         removed with nano's own gate named)"
+        "  covered / tools / out-of-scope {tools} (covered by an unconditional replacement, \
+         asserts no required behaviour, or a word epoch 4.0 removed)"
     );
     if blocking.is_empty() {
         println!("  blocking             0 -- nothing required is waived by being skipped");
@@ -4958,6 +5107,51 @@ fn report_differentials() -> usize {
     count
 }
 
+/// Running tests that intentionally assert the engines are unequal.
+fn report_declared_differentials() -> usize {
+    println!("\ndeclared semantic differentials");
+    let Ok(text) = fs::read_to_string(workspace_root().join("known-differentials.toml")) else {
+        println!("  FAIL: known-differentials.toml is absent or unreadable");
+        return 1;
+    };
+    let mut entries = Vec::new();
+    let mut current = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line == "[[differential]]" {
+            if !current.is_empty() {
+                entries.push(std::mem::take(&mut current));
+            }
+        } else if let Some((name, value)) = line.split_once(" = ")
+            && let Some(value) = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        {
+            current.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    if !current.is_empty() {
+        entries.push(current);
+    }
+    if entries.is_empty() {
+        println!("  0 -- no running test accepts unequal engine answers");
+        return 0;
+    }
+    println!(
+        "  {} blocking -- these tests measure unequal answers; green means unchanged, not equal",
+        entries.len()
+    );
+    for entry in &entries {
+        println!(
+            "    {} ({}, owner task {}, {})",
+            entry.get("test").map_or("UNNAMED", String::as_str),
+            entry.get("file").map_or("no file", String::as_str),
+            entry.get("owner").map_or("none", String::as_str),
+            entry.get("surface").map_or("no surface", String::as_str),
+        );
+    }
+    entries.len()
+}
+
 /// Where every `#[ignore]` is accounted for, by the exact reason it gives.
 pub const IGNORED_INVENTORY: &str = "ignored-tests.toml";
 
@@ -4972,6 +5166,66 @@ fn ignored_inventory() -> BTreeMap<String, String> {
         return BTreeMap::new();
     };
     parse_ignored_inventory(&text)
+}
+
+/// Run every ignored test classified as infrastructure, and no waived semantics.
+///
+/// Cargo supplies one filter string but any number of `--skip` filters, so one
+/// workspace invocation can execute the complete infrastructure class without
+/// starting a Cargo process per test. The release runner supplies their services.
+fn infrastructure_tests() -> ExitCode {
+    let inventory = ignored_inventory();
+    let mut arguments = vec![
+        "test".to_owned(),
+        "--release".to_owned(),
+        "--workspace".to_owned(),
+        "--".to_owned(),
+        "--ignored".to_owned(),
+    ];
+    let mut skipped: Vec<String> = inventory
+        .into_iter()
+        .filter_map(|(test, class)| (class != "infrastructure").then_some(test))
+        .collect();
+    skipped.sort();
+    for test in skipped {
+        arguments.push("--skip".to_owned());
+        arguments.push(test);
+    }
+    Command::new("cargo")
+        .args(&arguments)
+        .current_dir(workspace_root())
+        .status()
+        .map_or_else(
+            |error| {
+                eprintln!("could not run the infrastructure tests: {error}");
+                ExitCode::FAILURE
+            },
+            |status| {
+                if status.success() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            },
+        )
+}
+
+fn infrastructure_gate(environment: &[(&str, &str)]) -> GateResult {
+    let binary = env::current_exe().ok();
+    binary.map_or_else(
+        || GateResult {
+            command: "cargo xtask infrastructure-tests".to_owned(),
+            passed: false,
+            detail: "the xtask binary cannot be found".to_owned(),
+        },
+        |binary| {
+            run_gate(
+                binary.to_string_lossy().as_ref(),
+                &["infrastructure-tests"],
+                environment,
+            )
+        },
+    )
 }
 
 /// Read `reason` and `class` out of the inventory's `[[ignored]]` tables.
@@ -5070,10 +5324,9 @@ fn ignored_tests(root: &Path) -> Vec<(String, String, String)> {
     found
 }
 
-fn report_artifact() {
+fn report_artifact(binary: &Path) -> bool {
     println!("\nartifact");
-    let binary = workspace_root().join("target/release/stacks-node");
-    match fs::read(&binary) {
+    match fs::read(binary) {
         Ok(bytes) => {
             println!("  path                 {}", binary.display());
             println!("  bytes                {}", bytes.len());
@@ -5081,9 +5334,41 @@ fn report_artifact() {
                 "  sha256               {}",
                 hex::encode(nano_primitives::sha256(&bytes).as_bytes())
             );
+            let embedded = bytes
+                .windows(nano_vm::COMPILER_IDENTITY.len())
+                .any(|window| window == nano_vm::COMPILER_IDENTITY.as_bytes());
+            println!(
+                "  embedded compiler    {}",
+                if embedded {
+                    nano_vm::COMPILER_IDENTITY
+                } else {
+                    "MISSING"
+                }
+            );
+            embedded
         }
-        Err(error) => println!("  path                 {} ({error})", binary.display()),
+        Err(error) => {
+            println!("  path                 {} ({error})", binary.display());
+            false
+        }
     }
+}
+
+/// Build the artifact this report hashes, rather than describing target/ leftovers.
+fn build_release_artifact() -> bool {
+    println!("\nbuild");
+    let gate = run_gate(
+        "cargo",
+        &["build", "--release", "--bin", "stacks-node"],
+        &[],
+    );
+    println!("  {}", gate.command);
+    println!(
+        "    {:<6} {}",
+        if gate.passed { "pass" } else { "FAIL" },
+        gate.detail
+    );
+    gate.passed
 }
 
 fn report_checkpoint(state: Option<&Path>) {
@@ -5203,7 +5488,7 @@ fn report_state_engines(directory: &Path) {
 ///
 /// So they are counted by shape and reported as counts. A reader who wants them
 /// runs `cargo xtask scoreboard`.
-fn report_scoreboard() {
+fn report_scoreboard() -> bool {
     println!("\nscoreboard");
     let manifest_path = fixture_root().join("manifest.toml");
     if let Err(error) = FixtureManifest::load(&manifest_path) {
@@ -5211,15 +5496,15 @@ fn report_scoreboard() {
             "  no fixture manifest at {}: {error}",
             manifest_path.display()
         );
-        return;
+        return false;
     }
     let Ok(binary) = env::current_exe() else {
         println!("  cannot find this binary to run the scoreboard with");
-        return;
+        return false;
     };
     let Ok(run) = Command::new(binary).arg("scoreboard").output() else {
         println!("  the scoreboard could not be run");
-        return;
+        return false;
     };
     for line in String::from_utf8_lossy(&run.stdout).lines() {
         println!("  {line}");
@@ -5234,6 +5519,7 @@ fn report_scoreboard() {
         );
     }
     report_replay_diagnostics(&String::from_utf8_lossy(&run.stderr));
+    run.status.success()
 }
 
 /// What the replay said, by shape rather than by line.
@@ -5286,20 +5572,20 @@ fn report_inputs() {
     }
 }
 
-fn report_conditional_gates() {
+fn report_conditional_gates() -> bool {
     println!("\nconditional gates");
     let conditional = conditional_gates();
     let total: usize = conditional.iter().map(|(_, count)| count).sum();
     println!(
-        "  {total} assertions across {} files skip themselves when their capture or \
-         tool is absent,",
+        "  {total} required call sites across {} files are owned in conditional-tests.toml.",
         conditional.len()
     );
-    println!("  and panic instead when NANO_REQUIRE_MAINNET is set. That variable is what");
-    println!("  makes the conformance run below evidence rather than a count of green dots.");
+    println!("  They may skip offline and panic when NANO_REQUIRE_MAINNET is set; that is what");
+    println!("  makes the release conformance run evidence rather than green skipped tests.");
     for (name, count) in &conditional {
         println!("    {name:<34} {count}");
     }
+    total > 0
 }
 
 /// Run the three gates tasks/053 names and report what each said.
@@ -5333,9 +5619,18 @@ fn report_gates(capture: Option<&str>) -> bool {
             ],
             &environment,
         ),
+        infrastructure_gate(&environment),
         run_gate(
             "cargo",
-            &["clippy", "--release", "--workspace", "--all-targets"],
+            &[
+                "clippy",
+                "--release",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
             &[],
         ),
     ];
@@ -5355,17 +5650,19 @@ fn report_gates(capture: Option<&str>) -> bool {
 fn release_report(arguments: &[String]) -> ExitCode {
     let mut capture = env::var("NANO_MAINNET_CAPTURE").ok();
     let mut state: Option<PathBuf> = None;
+    let mut artifact: Option<PathBuf> = None;
     let mut run_gates = true;
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
         match flag.as_str() {
             "--capture" => capture = rest.next().cloned(),
             "--state" => state = rest.next().map(PathBuf::from),
+            "--artifact" => artifact = rest.next().map(PathBuf::from),
             "--no-gates" => run_gates = false,
             other => {
                 eprintln!(
                     "usage: cargo xtask release-report [--capture <dir>] [--state <dir>] \
-                     [--no-gates]\nunexpected argument: {other}"
+                     [--artifact <stacks-node>] [--no-gates]\nunexpected argument: {other}"
                 );
                 return ExitCode::from(2);
             }
@@ -5380,14 +5677,23 @@ fn release_report(arguments: &[String]) -> ExitCode {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs())
     );
+    println!("\nwhat this report cannot establish");
+    println!("  It is not evidence for holding mainnet tip for 24 hours, a live Bitcoin");
+    println!("  reorganization, or a stock stacks-signer run against this binary.");
+    println!("  Those require the named task-053 qualification runs.");
     report_revision();
+    let capture_valid = report_capture_validation(capture.as_deref());
     report_engines();
-    let blocking = report_differentials();
-    report_artifact();
+    let receipt_binding = report_receipt_binding();
+    let blocking = report_differentials() + report_declared_differentials();
+    let built = artifact.is_some() || build_release_artifact();
+    let artifact_path =
+        artifact.unwrap_or_else(|| workspace_root().join("target/release/stacks-node"));
+    let artifact = report_artifact(&artifact_path);
     report_checkpoint(state.as_deref());
-    report_scoreboard();
+    let scoreboard = report_scoreboard();
     report_inputs();
-    report_conditional_gates();
+    let conditional_inventory = report_conditional_gates();
 
     let passed = if run_gates {
         report_gates(capture.as_deref())
@@ -5397,21 +5703,24 @@ fn release_report(arguments: &[String]) -> ExitCode {
         true
     };
 
-    println!("\nwhat this report does not say");
-    println!("  Nothing here is evidence for holding mainnet tip for 24 hours, for a live");
-    println!("  Bitcoin reorganization, or for a stock stacks-signer run against the binary.");
-    println!("  Those need wall-clock and a pox-5 chain. tasks/053 says which is which.");
-
     // A blocking ignore is a failed gate whether or not the gates that ran passed.
     // Printing the count and exiting zero is how a waived cost differential rode
     // along in a green report for as long as it did.
     if blocking > 0 {
         println!(
-            "\n  {blocking} ignored test(s) are semantic or unclassified, so this report \
-             fails whatever else passed. See ignored-tests.toml."
+            "\n  {blocking} ignored or declared semantic differential(s) remain, so this \
+             report fails whatever else passed. See the release inventories."
         );
     }
-    if passed && blocking == 0 {
+    if passed
+        && blocking == 0
+        && built
+        && artifact
+        && scoreboard
+        && receipt_binding
+        && capture_valid
+        && conditional_inventory
+    {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

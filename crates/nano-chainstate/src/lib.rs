@@ -1040,9 +1040,8 @@ impl ChainState {
     }
 
     /// The deepest sealed block state, which is where a reopened node resumes.
-    #[must_use]
-    pub fn tip(&self) -> Option<[u8; 32]> {
-        self.vm.tip()
+    pub fn tip(&self) -> Result<Option<[u8; 32]>, ChainStateError> {
+        Ok(self.vm.tip()?)
     }
 
     /// Whether a sealed block has a ledger this chain can stand on.
@@ -1061,15 +1060,13 @@ impl ChainState {
     }
 
     /// The height a sealed state sits at.
-    #[must_use]
-    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
-        self.vm.height_of(block)
+    pub fn height_of(&self, block: [u8; 32]) -> Result<Option<u32>, ChainStateError> {
+        Ok(self.vm.height_of(block)?)
     }
 
     /// The state a block was built on, for walking back over a reorganization.
-    #[must_use]
-    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
-        self.vm.parent_of(block)
+    pub fn parent_of(&self, block: [u8; 32]) -> Result<Option<[u8; 32]>, ChainStateError> {
+        Ok(self.vm.parent_of(block)?)
     }
 
     /// The executed state, for reads that answer the public RPC.
@@ -1153,27 +1150,29 @@ impl ChainState {
     }
 
     /// Return the committed MARF leaves for a block state.
-    #[must_use]
-    pub fn state_leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
-        self.vm.state_leaves(block)
+    pub fn state_leaves(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<(TrieHash, MarfValue)>>, ChainStateError> {
+        Ok(self.vm.state_leaves(block)?)
     }
 
     /// Whether this block's state has already been executed and sealed.
-    #[must_use]
-    pub fn has_block_state(&self, block: [u8; 32]) -> bool {
-        self.vm.content_root(block).is_some()
+    pub fn has_block_state(&self, block: [u8; 32]) -> Result<bool, ChainStateError> {
+        Ok(self.vm.content_root(block)?.is_some())
     }
 
     /// Return the MARF content hash before ancestry is incorporated.
-    #[must_use]
-    pub fn state_content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
-        self.vm.content_root(block)
+    pub fn state_content_root(&self, block: [u8; 32]) -> Result<Option<TrieHash>, ChainStateError> {
+        Ok(self.vm.content_root(block)?)
     }
 
     /// Return the root pointers in their consensus serialization order.
-    #[must_use]
-    pub fn state_root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
-        self.vm.root_pointers(block)
+    pub fn state_root_pointers(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<TriePointer>>, ChainStateError> {
+        Ok(self.vm.root_pointers(block)?)
     }
 
     /// Return the pointers and child hashes a block state holds under a prefix.
@@ -1182,8 +1181,8 @@ impl ChainState {
         &self,
         block: [u8; 32],
         prefix: &[u8],
-    ) -> Option<Vec<(TriePointer, TrieHash)>> {
-        self.vm.pointers_at(block, prefix)
+    ) -> Result<Option<Vec<(TriePointer, TrieHash)>>, ChainStateError> {
+        Ok(self.vm.pointers_at(block, prefix)?)
     }
 
     /// Execute the supported transaction forms in a block and verify its committed state root.
@@ -1584,7 +1583,7 @@ impl ChainState {
                 u32::try_from(parent_height).map_err(|_| {
                     ChainStateError::InvalidTransaction("Stacks height overflows u32".to_owned())
                 })?,
-            );
+            )?;
         }
         let signatures = if assembled {
             authenticate::Signatures::Pending
@@ -3873,7 +3872,9 @@ mod tests {
 
         let before = chainstate.ledger.clone();
         let owed = before.accounting.to_json().expect("encode the accounting");
-        let content_root = chainstate.state_content_root(source);
+        let content_root = chainstate
+            .state_content_root(source)
+            .expect("read checkpoint content root");
 
         for attempt in 0..REJECTED_ATTEMPTS {
             let error = chainstate
@@ -3896,17 +3897,21 @@ mod tests {
                 "attempt {attempt} writes the same accounting bytes a restart would read"
             );
             assert_eq!(
-                chainstate.tip(),
+                chainstate.tip().expect("read tip"),
                 Some(source),
                 "attempt {attempt} seals nothing"
             );
             assert_eq!(
-                chainstate.state_content_root(source),
+                chainstate
+                    .state_content_root(source)
+                    .expect("read checkpoint content root"),
                 content_root,
                 "attempt {attempt} leaves the state it stands on alone"
             );
             assert!(
-                !chainstate.has_block_state(rejected_id),
+                !chainstate
+                    .has_block_state(rejected_id)
+                    .expect("check rejected block state"),
                 "attempt {attempt} leaves no state for the block it rejected"
             );
             assert!(
@@ -3919,12 +3924,21 @@ mod tests {
         drop(chainstate);
         let (mut chainstate, source, context) = open_captured(directory.path());
         assert_eq!(
-            chainstate.tip(),
+            chainstate.tip().expect("read reopened tip"),
             Some(source),
             "the restart resumes at the checkpoint"
         );
-        assert_eq!(chainstate.state_content_root(source), content_root);
-        assert!(!chainstate.has_block_state(rejected_id));
+        assert_eq!(
+            chainstate
+                .state_content_root(source)
+                .expect("read reopened content root"),
+            content_root
+        );
+        assert!(
+            !chainstate
+                .has_block_state(rejected_id)
+                .expect("check rejected block state")
+        );
         assert!(!chainstate.has_recorded_header(rejected_id));
 
         // And an accepted block after all those rejections owes exactly what it
@@ -3981,8 +3995,10 @@ mod tests {
         chainstate
             .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
             .expect("the captured block executes");
-        assert_eq!(chainstate.tip(), Some(id));
-        let content_root = chainstate.state_content_root(id);
+        assert_eq!(chainstate.tip().expect("read tip"), Some(id));
+        let content_root = chainstate
+            .state_content_root(id)
+            .expect("read content root");
         let header = chainstate
             .recorded_header(id)
             .expect("a header was written");
@@ -4011,12 +4027,20 @@ mod tests {
         );
         let chainstate = reopened;
         assert_eq!(
-            chainstate.tip(),
+            chainstate.tip().expect("read reopened tip"),
             Some(id),
             "the reopened state stands on the block it sealed"
         );
-        assert_eq!(chainstate.state_content_root(id), content_root);
-        assert_eq!(chainstate.parent_of(id), Some(source));
+        assert_eq!(
+            chainstate
+                .state_content_root(id)
+                .expect("read reopened content root"),
+            content_root
+        );
+        assert_eq!(
+            chainstate.parent_of(id).expect("read block parent"),
+            Some(source)
+        );
         assert_eq!(
             chainstate.recorded_header(id).as_ref(),
             Some(&header),

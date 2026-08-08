@@ -605,6 +605,18 @@ mod tests {
     }
 
     #[test]
+    fn user_function_can_share_a_name_with_a_host_import() {
+        crosscheck(
+            r#"
+                (define-public (call-log) (ok (log)))
+                (define-private (log) true)
+                (call-log)
+            "#,
+            evaluate("(ok true)"),
+        );
+    }
+
+    #[test]
     fn private_function_direct_call() {
         crosscheck(
             r#"

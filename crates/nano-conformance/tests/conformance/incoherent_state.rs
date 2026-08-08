@@ -49,7 +49,10 @@ fn a_state_missing_its_tips_trie_is_refused_by_name() {
     let directory = tempfile::tempdir().expect("a state directory");
     let state = directory.path().join("chainstate");
     let chainstate = opened_state(&state);
-    let tip = chainstate.tip().expect("the checkpoint sealed a state");
+    let tip = chainstate
+        .tip()
+        .expect("read the checkpoint tip")
+        .expect("the checkpoint sealed a state");
     drop(chainstate);
 
     // The rows a copy taken mid-write loses: the trie nodes of the sealed tip. The
@@ -96,7 +99,10 @@ fn refusing_an_incoherent_state_changes_no_file() {
     let directory = tempfile::tempdir().expect("a state directory");
     let state = directory.path().join("chainstate");
     let chainstate = opened_state(&state);
-    let tip = chainstate.tip().expect("the checkpoint sealed a state");
+    let tip = chainstate
+        .tip()
+        .expect("read the checkpoint tip")
+        .expect("the checkpoint sealed a state");
     drop(chainstate);
     let connection = rusqlite::Connection::open(state.join("marf.sqlite")).expect("the MARF opens");
     connection
@@ -146,10 +152,13 @@ fn fingerprint(state: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
 fn a_clean_state_directory_still_opens() {
     let directory = tempfile::tempdir().expect("a state directory");
     let state = directory.path().join("chainstate");
-    let tip = opened_state(&state).tip().expect("a sealed state");
+    let tip = opened_state(&state)
+        .tip()
+        .expect("read the sealed tip")
+        .expect("a sealed state");
     let reopened = ChainState::open(captured_network(), &state).expect("a clean directory opens");
     assert_eq!(
-        reopened.tip(),
+        reopened.tip().expect("read the reopened tip"),
         Some(tip),
         "the reopened tip is the sealed one"
     );

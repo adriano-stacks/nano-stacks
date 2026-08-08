@@ -208,7 +208,7 @@ async fn bulk_history_comes_from_several_mainnet_peers() {
     // test rather than a load generator against strangers' nodes.
     const TENURES: usize = 10;
     if std::env::var_os("NANO_P2P_MAINNET").is_none() {
-        println!("skipped: set NANO_P2P_MAINNET=1 to reach mainnet");
+        nano_conformance::skip_gate("NANO_P2P_MAINNET must be set to dial mainnet");
         return;
     }
     let mut swarm = Swarm::new(
@@ -311,7 +311,7 @@ async fn mainnet_inventories_schedule_a_forward_download() {
     /// How many of the newest claimed tenures to leave alone. See the comment below.
     const NEWEST_UNSERVED: usize = 4;
     if std::env::var_os("NANO_P2P_MAINNET").is_none() {
-        println!("skipped: set NANO_P2P_MAINNET=1 to reach mainnet");
+        nano_conformance::skip_gate("NANO_P2P_MAINNET must be set to dial mainnet");
         return;
     }
     let mut swarm = Swarm::new(

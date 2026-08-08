@@ -749,18 +749,18 @@ fn ordering_is_consensus_for_writes_that_share_a_path_prefix() {
 ///
 /// ```text
 /// NANO_MAINNET_MARF=/copy/checkpoint-H/marf.sqlite \
-/// NANO_MAINNET_BLOCK=<64 hex chars> NANO_MAINNET_ROOT=<64 hex chars> \
+/// NANO_MAINNET_CHECKPOINT_BLOCK=<64 hex chars> NANO_MAINNET_ROOT=<64 hex chars> \
 ///   cargo test -p nano-conformance write_journal -- --nocapture
 /// ```
 #[test]
 fn stacks_core_opens_a_mainnet_checkpoint_with_external_blobs() {
     let (Ok(path), Ok(block), Ok(root)) = (
         std::env::var("NANO_MAINNET_MARF"),
-        std::env::var("NANO_MAINNET_BLOCK"),
+        std::env::var("NANO_MAINNET_CHECKPOINT_BLOCK"),
         std::env::var("NANO_MAINNET_ROOT"),
     ) else {
         nano_conformance::skip_gate(
-            "NANO_MAINNET_MARF, NANO_MAINNET_BLOCK and NANO_MAINNET_ROOT are needed",
+            "NANO_MAINNET_MARF, NANO_MAINNET_CHECKPOINT_BLOCK and NANO_MAINNET_ROOT are needed",
         );
         return;
     };

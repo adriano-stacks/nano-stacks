@@ -101,7 +101,7 @@ fn retrying_a_rejected_block_changes_nothing() {
         progress.first_divergence
     );
 
-    let tip = chainstate.tip();
+    let tip = chainstate.tip().expect("read the pre-rejection tip");
     let owed = chainstate
         .accounting_mut()
         .to_json()
@@ -117,11 +117,12 @@ fn retrying_a_rejected_block_changes_nothing() {
                 &fixtures(),
                 manifest(1),
                 usize::try_from(BLOCKS).expect("a small count"),
-            ),
+            )
+            .expect("read the state while rejecting the block"),
             "attempt {attempt} is rejected, so the assertions below mean something"
         );
         assert_eq!(
-            chainstate.tip(),
+            chainstate.tip().expect("read the post-rejection tip"),
             tip,
             "attempt {attempt} leaves the sealed tip alone"
         );

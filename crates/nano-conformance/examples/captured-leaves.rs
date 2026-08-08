@@ -39,6 +39,7 @@ fn main() {
         )
         .expect("open the captured block state")
         .state_leaves(block_id)
+        .expect("read captured leaves")
         .expect("captured leaves")
         .into_iter()
         .map(|(key, value)| (hex::encode(key.as_bytes()), hex::encode(value.as_bytes())))

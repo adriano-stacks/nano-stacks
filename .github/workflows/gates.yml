@@ -14,6 +14,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # One toolchain, from the tracked lock file. A job that resolved `nixos-unstable`
 # would build release evidence with a compiler nobody chose.
@@ -38,16 +39,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Not enforced yet, and saying so beats a gate nobody can make green. The
-      # workspace has never been `cargo fmt`-clean -- 86 files in `crates/`, 8 in the
-      # vendored compiler -- and reformatting it is a mechanical ninety-file commit
-      # that has to land on a quiet tree, not alongside other work. Task 078 owns it.
-      - name: formatting (reported, not enforced -- see tasks/078)
-        continue-on-error: true
+      - name: formatting
         run: nix develop --command cargo fmt --all -- --check
 
       - name: clippy, release profile, every target
-        run: nix develop --command cargo clippy --release --workspace --all-targets
+        run: nix develop --command cargo clippy --release --workspace --all-targets -- -D warnings
 
       - name: the bounded fixture replay, as a gate
         run: nix develop --command cargo xtask scoreboard
@@ -61,8 +57,40 @@ jobs:
       - name: unit tests
         run: nix develop --command cargo test --release --workspace
 
-      # Last, because it builds the artifact it describes and is the slowest thing
-      # here. Its own gates re-run some of the above deliberately: the report is the
-      # document 053 decides on, and it has to stand alone.
-      - name: release report
-        run: nix develop --command cargo xtask release-report
+      # The report still builds and inspects the release artifact, checks the
+      # ignored/conditional inventory and consumes the scoreboard verdict. It does
+      # not pretend that this offline runner has the mainnet and Hacknet inputs.
+      - name: offline release evidence
+        run: nix develop --command cargo xtask release-report --no-gates
+
+  # Release qualification is deliberately not a push/PR job. It needs large
+  # captured state, a live mainnet route and stock Hacknet services; pretending a
+  # hosted runner has those made every ordinary workflow structurally red. The
+  # self-hosted runner's `nano-mainnet-release` environment supplies the NANO_*
+  # paths and endpoints named by `.github/release.env.example` and the inventories.
+  # Missing any one remains
+  # a failed `skip_gate` because release-report sets NANO_REQUIRE_MAINNET.
+  release-qualification:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, nano-mainnet-release]
+    environment: nano-mainnet-release
+    env:
+      NANO_RELEASE_ENV: ${{ vars.NANO_RELEASE_ENV }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: the qualification runner declares its input bundle
+        run: test -n "${NANO_RELEASE_ENV:-}" && test -r "$NANO_RELEASE_ENV"
+
+      - name: capture-backed release report
+        run: |
+          set -a
+          . "$NANO_RELEASE_ENV"
+          set +a
+          nix develop --command cargo xtask release-report \
+            --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE"

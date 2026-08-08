@@ -262,6 +262,7 @@ where
         if self
             .chainstate
             .has_block_state(*block.block_id().as_bytes())
+            .map_err(|error| error.to_string())?
         {
             return Ok(());
         }

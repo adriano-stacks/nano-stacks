@@ -204,8 +204,11 @@ fn descend(nano: &ChainState, stock: &ChainState, block: [u8; 32]) {
     let mut prefix = Vec::new();
     loop {
         let (Some(left), Some(right)) = (
-            nano.state_pointers_at(block, &prefix),
-            stock.state_pointers_at(block, &prefix),
+            nano.state_pointers_at(block, &prefix)
+                .expect("read nano pointers"),
+            stock
+                .state_pointers_at(block, &prefix)
+                .expect("read stacks-core pointers"),
         ) else {
             println!(
                 "the node at prefix {} exists on only one side",
@@ -259,6 +262,7 @@ fn imported(network: Network, path: &Path, block: &NakamotoBlock) -> ChainState 
 fn leaves(state: &ChainState, block: &NakamotoBlock) -> BTreeMap<TrieHash, MarfValue> {
     state
         .state_leaves(*block.block_id().as_bytes())
+        .expect("read state leaves")
         .unwrap_or_default()
         .into_iter()
         .collect()
@@ -273,6 +277,7 @@ fn writes(
     let leaves = |state: &ChainState, block: &NakamotoBlock| {
         state
             .state_leaves(*block.block_id().as_bytes())
+            .expect("read state leaves")
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeMap<_, _>>()

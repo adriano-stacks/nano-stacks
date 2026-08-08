@@ -1,0 +1,24 @@
+# Deliberately unequal engine answers asserted by running tests. These are useful
+# measurements, not passing conformance: every entry blocks a release until its
+# owner removes both the mismatch and this declaration.
+
+[[differential]]
+test = "clar_default_to_narrowing_answers_with_the_branch_the_reference_took"
+file = "vendor/clarity-wasm/clar2wasm/src/words/default_to.rs"
+owner = "068"
+policy = "blocking"
+surface = "value, consensus serialization, state and receipt"
+
+[[differential]]
+test = "a_narrowed_default_parts_from_the_reference_only_where_it_must"
+file = "crates/nano-conformance/tests/conformance/wasm_response_fold.rs"
+owner = "068"
+policy = "blocking"
+surface = "value, consensus serialization, state and receipt"
+
+[[differential]]
+test = "every_narrowing_kind_parts_on_the_some_branch_only"
+file = "crates/nano-conformance/tests/conformance/wasm_response_fold.rs"
+owner = "068"
+policy = "blocking"
+surface = "nested tuple, optional and response values"

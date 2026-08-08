@@ -1,0 +1,686 @@
+# Every conditional conformance gate, by stable source-level call-site identity.
+# A release run sets NANO_REQUIRE_MAINNET, so every entry is required and a
+# missing prerequisite fails rather than becoming a green test. The named
+# self-hosted CI job supplies the large fixtures, network and services.
+
+[[conditional]]
+site = "block_authentication::a_real_tenure_start_block_authenticates#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_coinbase_without_a_vrf_proof_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_second_coinbase_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_coinbase_without_a_tenure_change_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_tenure_start_with_its_transactions_swapped_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::an_extension_carrying_a_coinbase_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_tenure_change_that_does_not_end_at_the_parent_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_tenure_change_naming_another_tenure_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_block_found_claiming_its_own_tenure_as_the_previous_one_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_tenure_change_signed_by_another_miner_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_tampered_header_no_longer_matches_its_tenure_change#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "block_authentication::a_problematic_marker_on_a_tenure_transaction_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "burn_spends::the_captured_snapshots_state_the_payout_output_count#1"
+class = "infrastructure"
+owner = "069"
+job = "release-qualification"
+requires = "mainnet capture whose payout schedule has two outputs"
+policy = "required"
+
+[[conditional]]
+site = "derived_reward_set::the_derived_reward_set_is_the_document_the_network_published#1"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "capture with a block above its checkpoint and its published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "derived_reward_set::the_derived_reward_set_is_the_document_the_network_published#2"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "capture with a block above its checkpoint and its published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "derived_reward_set::every_published_cycle_derives_the_same_signers#1"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "capture with a block above its checkpoint and its published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "hosted_signer::hosted#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "NANO_HOSTED_RPC, NANO_HACKNET_PEER, signer key, event directories and funded key"
+policy = "required"
+
+[[conditional]]
+site = "hosted_signer::a_transaction_posted_to_nano_is_admitted_and_reported#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "NANO_HOSTED_RPC, NANO_HACKNET_PEER, signer key, event directories and funded key"
+policy = "required"
+
+[[conditional]]
+site = "kill_during_import::an_import_a_kill_interrupted_is_refused_and_not_resumed#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "checked-in captured blocks and timing isolation"
+policy = "required"
+
+[[conditional]]
+site = "kill_during_replay::a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "checked-in captured blocks and timing isolation"
+policy = "required"
+
+[[conditional]]
+site = "kill_during_replay::a_kill_inside_a_tenure_transition_leaves_the_complete_parent#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "checked-in captured blocks and timing isolation"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_accounting::the_mainnet_checkpoint_owes_a_full_maturity_window#1"
+class = "infrastructure"
+owner = "052"
+job = "release-qualification"
+requires = "NANO_MAINNET_CHECKPOINT"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_checkpoint::every_checkpointed_contract_is_reachable_in_the_imported_trie#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_MARF, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_checkpoint::nano_reports_a_key_at_a_block#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "NANO_NODE_MARF, NANO_NODE_CLARITY, NANO_MAINNET_MARF, NANO_MAINNET_BLOCK and NANO_MAINNET_KEY as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_checkpoint::stacks_core_finds_the_contract_nano_cannot#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "NANO_MAINNET_MARF and NANO_MAINNET_CHECKPOINT_BLOCK"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_codec::nano_decodes_every_mainnet_block_stacks_core_does#1"
+class = "infrastructure"
+owner = "011"
+job = "release-qualification"
+requires = "NANO_MAINNET_BLOCKS"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_receipts::the_frozen_mainnet_slice_names_its_compiler#1"
+class = "infrastructure"
+owner = "060"
+job = "release-qualification"
+requires = "the named checked-in compiler baseline or NANO_MAINNET_RECEIPTS as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_receipts::a_run_reproduces_the_frozen_mainnet_receipts#1"
+class = "infrastructure"
+owner = "060"
+job = "release-qualification"
+requires = "the named checked-in compiler baseline or NANO_MAINNET_RECEIPTS as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::mainnet_sortitions_derive_from_mainnet_bitcoin_blocks#1"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_burn_distribution_matches_stacks_core#1"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_burn_distribution_matches_stacks_core#2"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_node_tracker_derives_the_same_window#1"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_node_tracker_derives_the_same_window#2"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner#1"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner#2"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner#3"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure#1"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure#2"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure#3"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE with Bitcoin blocks, sortitions and leader-key history"
+policy = "required"
+
+[[conditional]]
+site = "one_engine_in_the_artifact::the_artifact_holds_no_interpreter_entry_point#1"
+class = "infrastructure"
+owner = "060"
+job = "release-qualification"
+requires = "nm and objdump on PATH"
+policy = "required"
+
+[[conditional]]
+site = "one_engine_in_the_artifact::the_artifact_cannot_enter_the_interpreters_evaluator#1"
+class = "infrastructure"
+owner = "060"
+job = "release-qualification"
+requires = "nm and objdump on PATH"
+policy = "required"
+
+[[conditional]]
+site = "p2p_discovery::nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api#1"
+class = "infrastructure"
+owner = "054"
+job = "release-qualification"
+requires = "NANO_P2P_MAINNET and outbound mainnet access"
+policy = "required"
+
+[[conditional]]
+site = "p2p_discovery::bulk_history_comes_from_several_mainnet_peers#1"
+class = "infrastructure"
+owner = "054"
+job = "release-qualification"
+requires = "NANO_P2P_MAINNET and outbound mainnet access"
+policy = "required"
+
+[[conditional]]
+site = "p2p_discovery::mainnet_inventories_schedule_a_forward_download#1"
+class = "infrastructure"
+owner = "054"
+job = "release-qualification"
+requires = "NANO_P2P_MAINNET and outbound mainnet access"
+policy = "required"
+
+[[conditional]]
+site = "p2p_relay::a_block_stacks_core_pushes_reaches_the_authenticated_boundary#1"
+class = "infrastructure"
+owner = "054"
+job = "release-qualification"
+requires = "capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "p2p_relay::a_block_already_accepted_is_not_offered_again#1"
+class = "infrastructure"
+owner = "054"
+job = "release-qualification"
+requires = "capture with a tenure-start block"
+policy = "required"
+
+[[conditional]]
+site = "pre_checkpoint_headers::every_exported_field_matches_stacks_cores_own_headers_db#1"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "NANO_MAINNET_ARCHIVE and NANO_MAINNET_CAPTURE with header export"
+policy = "required"
+
+[[conditional]]
+site = "pre_checkpoint_headers::every_exported_field_matches_stacks_cores_own_headers_db#2"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "NANO_MAINNET_ARCHIVE and NANO_MAINNET_CAPTURE with header export"
+policy = "required"
+
+[[conditional]]
+site = "pre_checkpoint_headers::the_export_answers_offline_what_stacks_core_answered#1"
+class = "infrastructure"
+owner = "070"
+job = "release-qualification"
+requires = "NANO_MAINNET_ARCHIVE and NANO_MAINNET_CAPTURE with header export"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::the_recorded_signer_set_is_the_one_the_network_published#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::the_recorded_signer_set_is_the_one_the_network_published#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::the_derived_and_recorded_signer_sets_agree#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::a_block_the_reward_set_signed_is_accepted#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::a_block_below_the_weight_threshold_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::signatures_out_of_reward_set_order_are_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::signatures_out_of_reward_set_order_are_rejected#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::a_signature_from_outside_the_reward_set_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::a_signature_that_recovers_to_nothing_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::the_mainnet_state_carries_the_signer_set_mainnet_published#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::recorded_set_or_skip#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::mainnet_blocks_pass_the_check_against_mainnet_state#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "signer_weight_enforcement::every_captured_mainnet_block_authenticates#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
+site = "submitted_transaction::replay_below#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "captured checkpoint and NANO_FUNDED_KEY"
+policy = "required"
+
+[[conditional]]
+site = "submitted_transaction::a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node#1"
+class = "infrastructure"
+owner = "053"
+job = "release-qualification"
+requires = "captured checkpoint and NANO_FUNDED_KEY"
+policy = "required"
+
+[[conditional]]
+site = "tenure_continuity::the_tenure_the_network_counted_is_the_tenure_this_chain_executed#1"
+class = "infrastructure"
+owner = "082"
+job = "release-qualification"
+requires = "capture with at least two tenures or NANO_MAINNET_CAPTURE as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "tenure_continuity::a_tenure_change_miscounting_the_tenure_it_ends_is_rejected#1"
+class = "infrastructure"
+owner = "082"
+job = "release-qualification"
+requires = "capture with at least two tenures or NANO_MAINNET_CAPTURE as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "tenure_continuity::a_tenure_change_confirming_a_tenure_this_chain_never_executed_is_rejected#1"
+class = "infrastructure"
+owner = "082"
+job = "release-qualification"
+requires = "capture with at least two tenures or NANO_MAINNET_CAPTURE as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "tenure_continuity::mainnet_tenure_changes_agree_with_the_count_over_a_tenures_blocks#1"
+class = "infrastructure"
+owner = "082"
+job = "release-qualification"
+requires = "capture with at least two tenures or NANO_MAINNET_CAPTURE as used by the test"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_with_its_own_leader_key_is_accepted#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_with_its_own_leader_key_is_accepted#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_with_another_miners_leader_key_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_with_a_malformed_leader_key_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::an_unknown_leader_key_accepts_the_block_and_says_so#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::the_winning_registration_names_the_key_that_signed_the_tenure#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::the_winning_registration_names_the_key_that_signed_the_tenure#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::the_winning_registration_names_the_key_that_signed_the_tenure#3"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_signed_by_the_winning_miner_is_accepted#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_signed_by_the_winning_miner_is_accepted#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_signed_by_a_miner_that_did_not_win_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_tenure_signed_by_a_miner_that_did_not_win_is_rejected#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::an_unregistered_signing_key_accepts_the_block_and_says_so#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::an_unregistered_signing_key_accepts_the_block_and_says_so#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with tenure start, leader-key registration and signing-key hash"
+policy = "required"
+
+[[conditional]]
+site = "trie_diff::the_networks_root_children_name_the_missing_write#1"
+class = "infrastructure"
+owner = "060"
+job = "release-qualification"
+requires = "NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES"
+policy = "required"
+
+[[conditional]]
+site = "write_journal::stacks_core_opens_a_mainnet_checkpoint_with_external_blobs#1"
+class = "infrastructure"
+owner = "069"
+job = "release-qualification"
+requires = "NANO_MAINNET_MARF, NANO_MAINNET_CHECKPOINT_BLOCK and NANO_MAINNET_ROOT"
+policy = "required"
+
+[[conditional]]
+site = "write_journal::a_recorded_mainnet_journal_seals_the_chains_root#1"
+class = "infrastructure"
+owner = "069"
+job = "release-qualification"
+requires = "NANO_MAINNET_MARF, NANO_MAINNET_BLOCK, NANO_MAINNET_ROOT and NANO_MAINNET_JOURNAL as used by the test"
+policy = "required"
+
+# 85 call sites inventoried.

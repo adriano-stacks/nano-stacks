@@ -1,4 +1,4 @@
-//! Every `#[ignore]` is accounted for by name, in a file, with an owner.
+//! Every `#[ignore]` and conditional gate is accounted for by name and owner.
 //!
 //! The release report used to decide whether an ignored test was an environment
 //! problem or a Clarity differential by searching its reason for substrings — and
@@ -14,16 +14,28 @@
 //! reads the same file and counts anything unlisted as `unclassified`, which it
 //! treats exactly as `semantic` — so the undecided case cannot be the quiet one.
 //!
-//! What this deliberately does *not* do is assert that nothing is blocking. Five
-//! entries are measured semantic differentials the release cannot ship with, and
-//! hiding them behind a green test is the failure mode this whole file exists to
-//! prevent. Task 053's report is where that count has to reach zero.
+//! What this deliberately does *not* do is turn an accounted gap green. Declared
+//! semantic differentials still fail the release report; naming them only prevents
+//! them from hiding behind a passing count. `conditional-tests.toml` does the same
+//! by stable call-site identity
+//! for `skip_gate`: module, containing function and ordinal within that function.
+//! Moving a line does not invalidate an entry, while adding or removing a call does.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
+
+#[derive(Default)]
+struct ConditionalEntry {
+    site: String,
+    class: String,
+    owner: String,
+    job: String,
+    requires: String,
+    policy: String,
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -112,6 +124,175 @@ fn inventoried() -> BTreeSet<String> {
         .collect()
 }
 
+fn scalar(line: &str) -> Option<String> {
+    let (_, value) = line.split_once('=')?;
+    value
+        .trim()
+        .strip_prefix('"')?
+        .strip_suffix('"')
+        .map(str::to_owned)
+}
+
+fn conditional_inventory() -> Vec<ConditionalEntry> {
+    let text = fs::read_to_string(workspace_root().join("conditional-tests.toml"))
+        .expect("conditional-tests.toml is part of the release gate and has to be there");
+    let mut entries = Vec::new();
+    let mut current: Option<ConditionalEntry> = None;
+    for line in text.lines().map(str::trim) {
+        if line == "[[conditional]]" {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(ConditionalEntry::default());
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        let Some((name, _)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(value) = scalar(line) else {
+            continue;
+        };
+        match name.trim() {
+            "site" => entry.site = value,
+            "class" => entry.class = value,
+            "owner" => entry.owner = value,
+            "job" => entry.job = value,
+            "requires" => entry.requires = value,
+            "policy" => entry.policy = value,
+            _ => {}
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// Stable identities of the conditional calls in the conformance suite.
+fn conditional_sites() -> BTreeSet<String> {
+    let directory = workspace_root().join("crates/nano-conformance/tests/conformance");
+    let mut paths: Vec<PathBuf> = fs::read_dir(directory)
+        .expect("read conformance sources")
+        .map(|entry| entry.expect("read conformance entry").path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "rs")
+                && path
+                    .file_stem()
+                    .is_none_or(|stem| stem != "release_inventory")
+        })
+        .collect();
+    paths.sort();
+    let mut sites = BTreeSet::new();
+    for path in paths {
+        let module = path
+            .file_stem()
+            .expect("a Rust source has a stem")
+            .to_string_lossy();
+        let source = fs::read_to_string(&path).expect("read conformance source");
+        let mut function = "<module>".to_owned();
+        let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            for prefix in ["fn ", "async fn ", "pub fn ", "pub async fn "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    function = rest
+                        .split(['(', '<', ' '])
+                        .next()
+                        .unwrap_or(rest)
+                        .to_owned();
+                    break;
+                }
+            }
+            let calls = line.matches("nano_conformance::skip_gate(").count()
+                + usize::from(trimmed.starts_with("skip_gate("));
+            for _ in 0..calls {
+                let ordinal = ordinals.entry(function.clone()).or_default();
+                *ordinal += 1;
+                sites.insert(format!("{module}::{function}#{ordinal}"));
+            }
+        }
+    }
+    sites
+}
+
+fn task_statuses(root: &Path, found: &mut BTreeMap<String, String>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            task_statuses(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "md")
+            && let Ok(text) = fs::read_to_string(path)
+        {
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+                    .map(|value| value.trim().trim_matches('"').to_owned())
+            };
+            if let (Some(id), Some(status)) = (field("id"), field("status")) {
+                found.insert(id, status);
+            }
+        }
+    }
+}
+
+fn asserted_engine_differences(root: &Path, found: &mut BTreeSet<String>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            asserted_engine_differences(&path, found);
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        let mut function = "<module>".to_owned();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            for prefix in ["fn ", "async fn ", "pub fn ", "pub async fn "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    function = rest
+                        .split(['(', '<', ' '])
+                        .next()
+                        .unwrap_or(rest)
+                        .to_owned();
+                    break;
+                }
+            }
+            if trimmed.starts_with("assert_ne!(") {
+                let assertion = lines[index..lines.len().min(index + 10)].join(" ");
+                if assertion.contains("compiled, interpreted")
+                    || assertion.contains("close the accounting")
+                {
+                    found.insert(function.clone());
+                }
+            }
+        }
+    }
+}
+
+fn known_differentials() -> BTreeSet<String> {
+    fs::read_to_string(workspace_root().join("known-differentials.toml"))
+        .expect("known-differentials.toml is part of the release gate")
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("test = \"")?.strip_suffix('"'))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 fn every_ignored_test_is_named_in_the_inventory() {
     let root = workspace_root();
@@ -174,5 +355,84 @@ fn the_inventory_names_no_test_that_is_gone() {
         "ignored-tests.toml accounts for {} test(s) that are no longer ignored; remove them:\n  {}",
         stale.len(),
         stale.join("\n  ")
+    );
+}
+
+#[test]
+fn every_conditional_gate_is_owned_by_the_inventory() {
+    let live = conditional_sites();
+    assert!(!live.is_empty(), "the conditional-gate scan found nothing");
+    let entries = conditional_inventory();
+    let known: BTreeSet<String> = entries.iter().map(|entry| entry.site.clone()).collect();
+    let missing: Vec<&String> = live.difference(&known).collect();
+    let stale: Vec<&String> = known.difference(&live).collect();
+    assert!(
+        missing.is_empty(),
+        "{} conditional gate(s) are absent from conditional-tests.toml:\n  {}",
+        missing.len(),
+        missing
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} conditional inventory entries no longer exist:\n  {}",
+        stale.len(),
+        stale
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+#[test]
+fn every_conditional_gate_has_release_policy_and_an_open_owner() {
+    let entries = conditional_inventory();
+    let mut statuses = BTreeMap::new();
+    task_statuses(&workspace_root().join("tasks"), &mut statuses);
+    let invalid: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let status = statuses.get(&entry.owner).map(String::as_str);
+            (entry.site.is_empty()
+                || entry.class != "infrastructure"
+                || entry.job.is_empty()
+                || entry.requires.is_empty()
+                || entry.policy != "required"
+                || matches!(status, None | Some("completed" | "cancelled")))
+            .then(|| {
+                format!(
+                    "{}: class={:?}, owner={} ({status:?}), job={:?}, requires={:?}, policy={:?}",
+                    entry.site, entry.class, entry.owner, entry.job, entry.requires, entry.policy,
+                )
+            })
+        })
+        .collect();
+    assert!(
+        invalid.is_empty(),
+        "conditional gate entries need an explicit release policy and open owner:\n  {}",
+        invalid.join("\n  ")
+    );
+}
+
+#[test]
+fn every_asserted_engine_difference_is_a_declared_release_blocker() {
+    let mut live = BTreeSet::new();
+    asserted_engine_differences(
+        &workspace_root().join("crates/nano-conformance/tests/conformance"),
+        &mut live,
+    );
+    asserted_engine_differences(
+        &workspace_root().join("vendor/clarity-wasm/clar2wasm"),
+        &mut live,
+    );
+    let known = known_differentials();
+    assert_eq!(
+        live, known,
+        "tests that assert compiled and interpreted answers differ must be declared in \
+         known-differentials.toml, and stale declarations must be removed"
     );
 }

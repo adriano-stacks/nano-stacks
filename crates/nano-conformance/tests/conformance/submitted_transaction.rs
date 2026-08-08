@@ -228,7 +228,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         .expect("the burn context of the dropped block");
     let mut candidate = dropped.clone();
     candidate.transactions.clear();
-    let parent = chainstate.tip();
+    let parent = chainstate.tip().expect("read the parent tip");
     // A mid-tenure candidate is born empty and is filled by the pool, so the
     // emptiness that matters is the *assembled* block's. Both halves, because
     // this is exactly what was wrong: the check ran before the pool had its turn,

@@ -320,6 +320,11 @@ fn state_after_two_blocks(
     );
     let (chainstate, _) =
         durable_replay_chainstate(&fixtures(), directory).expect("reopen the replayed state");
-    let tip = chainstate.tip();
-    (tip, tip.and_then(|tip| chainstate.state_content_root(tip)))
+    let tip = chainstate.tip().expect("read the imported tip");
+    let root = tip.and_then(|tip| {
+        chainstate
+            .state_content_root(tip)
+            .expect("read the imported content root")
+    });
+    (tip, root)
 }

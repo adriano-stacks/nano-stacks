@@ -65,6 +65,8 @@ pub struct WasmGenerator {
     pub(crate) used_traits: HashMap<TraitIdentifier, (u32, u32)>,
     /// The names of defined functions
     pub(crate) defined_functions: HashSet<String>,
+    /// User functions, kept separate from same-named host and stdlib functions.
+    user_functions: HashMap<ClarityName, FunctionId>,
 
     /// The locals for the current function.
     pub(crate) bindings: Bindings,
@@ -841,6 +843,7 @@ impl WasmGenerator {
             nft_types: HashMap::new(),
             used_traits: HashMap::new(),
             defined_functions: HashSet::new(),
+            user_functions: HashMap::new(),
         })
     }
 
@@ -1462,7 +1465,9 @@ impl WasmGenerator {
             .max_live_locals
             .insert(name.as_str().to_string(), peak);
 
-        Ok(func_builder.finish(param_locals, &mut self.module.funcs))
+        let function = func_builder.finish(param_locals, &mut self.module.funcs);
+        self.user_functions.insert(name.clone(), function);
+        Ok(function)
     }
 
     /// Generates the wasm code for a ShortReturn error.
@@ -2997,7 +3002,10 @@ impl WasmGenerator {
         builder: &mut InstrSeqBuilder,
         name: &ClarityName,
     ) -> Result<(), GeneratorError> {
-        builder.call(self.func_by_name(name.as_str()));
+        let function = self.user_functions.get(name).copied().ok_or_else(|| {
+            GeneratorError::InternalError(format!("function {name} was not defined"))
+        })?;
+        builder.call(function);
 
         Ok(())
     }

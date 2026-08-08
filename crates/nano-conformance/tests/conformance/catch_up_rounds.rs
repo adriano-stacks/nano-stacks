@@ -169,7 +169,10 @@ fn resumed(
     burnchain: MovableBurnchain,
 ) -> CheckpointExecutor<MovableBurnchain> {
     let (chainstate, _) = crate::restart::open(directory);
-    let tip = chainstate.tip().expect("the state is sealed at a block");
+    let tip = chainstate
+        .tip()
+        .expect("read the sealed tip")
+        .expect("the state is sealed at a block");
     let block = chain
         .iter()
         .find(|block| *block.block_id().as_bytes() == tip)
@@ -345,7 +348,8 @@ async fn close_the_gap(run: Run<'_>) -> (Progress, Closed) {
         header_root: tip.header.state_index_root,
         content_root: executor
             .chainstate_mut()
-            .state_content_root(*tip.block_id().as_bytes()),
+            .state_content_root(*tip.block_id().as_bytes())
+            .expect("read the closed content root"),
         canonical: crate::restart::canonical(executor.chainstate_mut(), &tenures),
     };
     task.abort();

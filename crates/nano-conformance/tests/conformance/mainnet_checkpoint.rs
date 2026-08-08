@@ -166,9 +166,11 @@ fn nano_reports_a_key_at_a_block() {
 fn stacks_core_finds_the_contract_nano_cannot() {
     let (Ok(path), Ok(block)) = (
         env::var("NANO_MAINNET_MARF"),
-        env::var("NANO_MAINNET_BLOCK"),
+        env::var("NANO_MAINNET_CHECKPOINT_BLOCK"),
     ) else {
-        nano_conformance::skip_gate("NANO_MAINNET_MARF and NANO_MAINNET_BLOCK are needed");
+        nano_conformance::skip_gate(
+            "NANO_MAINNET_MARF and NANO_MAINNET_CHECKPOINT_BLOCK are needed",
+        );
         return;
     };
     let block = StacksBlockId::from_hex(&block).expect("the block identifier is hexadecimal");

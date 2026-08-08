@@ -727,7 +727,7 @@ where
         let operations = bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
-        let parent = chainstate.tip();
+        let parent = chainstate.tip()?;
         chainstate.append_nakamoto_block_with_bitcoin_operations(
             bitcoin_context,
             &operations.operations,

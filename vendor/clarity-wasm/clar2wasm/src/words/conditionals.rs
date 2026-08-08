@@ -220,9 +220,14 @@ impl<'a> ShortReturnable<'a> {
     ) -> Result<(), GeneratorError> {
         match self {
             // for an optional, we need to push the full value to the stack
-            ShortReturnable::Optional { inner_type, .. } => {
+            ShortReturnable::Optional { .. } => {
+                let TypeSignature::OptionalType(expected_inner) = expected_type else {
+                    return Err(GeneratorError::TypeError(format!(
+                        "Expected Optional type in short return, got {expected_type}"
+                    )));
+                };
                 builder.i32_const(0);
-                add_placeholder_for_clarity_type(builder, inner_type);
+                add_placeholder_for_clarity_type(builder, expected_inner);
             }
             // for a response, we need to create the full value:
             // - 0 for err
@@ -1709,6 +1714,16 @@ mod tests {
         crosscheck(
             &format!("{TRY_FN_OPT} (tryharder none)"),
             Ok(Some(Value::none())),
+        );
+    }
+
+    #[test]
+    fn try_optional_uses_the_enclosing_functions_layout() {
+        crosscheck(
+            "(define-private (narrow (x (optional { a: uint, b: uint })))
+               (some (get a (try! x))))
+             (list (narrow (some { a: u1, b: u2 })) (narrow none))",
+            evaluate("(list (some u1) none)"),
         );
     }
 

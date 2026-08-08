@@ -70,6 +70,7 @@ pub fn open(directory: &Path) -> (ChainState, [u8; 32]) {
     .expect("open the checkpoint durably");
     let recovered = chainstate
         .tip()
+        .expect("read the durable tip")
         .filter(|tip| *tip != source)
         .is_some_and(|tip| {
             chainstate
@@ -101,11 +102,14 @@ fn beside_the_marf(chainstate: &mut ChainState) -> BesideTheMarf {
             .accounting_mut()
             .to_json()
             .expect("encode the accounting"),
-        tenure: chainstate.tip().and_then(|tip| {
-            chainstate
-                .recorded_header(tip)
-                .map(|header| (header.tenure_height, header.tenure_start_height))
-        }),
+        tenure: chainstate
+            .tip()
+            .expect("read the sealed tip")
+            .and_then(|tip| {
+                chainstate
+                    .recorded_header(tip)
+                    .map(|header| (header.tenure_height, header.tenure_start_height))
+            }),
         parent_tenure_proof: chainstate.parent_tenure_proof(),
         executed: chainstate.executed_blocks(),
     }
@@ -158,7 +162,7 @@ fn a_replay_stopped_halfway_resumes_to_the_same_state() {
         "the uninterrupted run replays every block: {:?}",
         whole.first_divergence
     );
-    let expected_tip = chainstate.tip();
+    let expected_tip = chainstate.tip().expect("read the uninterrupted tip");
     assert!(
         expected_tip.is_some_and(|tip| tip != source),
         "the run sealed a tip of its own, so the comparison below means something"
@@ -208,7 +212,7 @@ fn a_replay_stopped_halfway_resumes_to_the_same_state() {
     );
 
     assert_eq!(
-        chainstate.tip(),
+        chainstate.tip().expect("read the restarted tip"),
         expected_tip,
         "a restart reaches the same sealed tip"
     );
@@ -455,7 +459,10 @@ fn stacks_fork(
 ) -> (Canonical, nano_marf::StateRoot, [u8; 32]) {
     let (mut chainstate, blocks) = replayed(directory, across_a_restart);
     let (start, tenures) = last_tenure_start(&chainstate, &blocks);
-    let abandoned_tip = chainstate.tip().expect("the replay sealed a tip");
+    let abandoned_tip = chainstate
+        .tip()
+        .expect("read the replay tip")
+        .expect("the replay sealed a tip");
     let ancestor = *blocks[start - 1].block_id().as_bytes();
 
     // A Stacks fork names the ancestor directly: the sortitions still stand and
@@ -464,7 +471,7 @@ fn stacks_fork(
     assert_eq!(retraction.resume_from, Some(ancestor));
     assert_eq!(retraction.discarded.len(), blocks.len() - start);
     assert_eq!(
-        chainstate.tip(),
+        chainstate.tip().expect("read the abandoned tip"),
         Some(abandoned_tip),
         "the MARF tip is still the block being abandoned: a state is addressed by the \
          block that sealed it, so nothing is deleted and a crash here resumes on the \
@@ -559,7 +566,10 @@ fn a_retraction_leaves_the_disk_where_it_found_it() {
     let directory = tempfile::tempdir().expect("a directory");
     let (mut chainstate, blocks) = replayed(directory.path(), false);
     let (start, _) = last_tenure_start(&chainstate, &blocks);
-    let abandoned_tip = chainstate.tip().expect("the replay sealed a tip");
+    let abandoned_tip = chainstate
+        .tip()
+        .expect("read the replay tip")
+        .expect("the replay sealed a tip");
     let abandoned_chain = chainstate.executed_blocks();
 
     let retraction = chainstate.retract_to(*blocks[start - 1].block_id().as_bytes());
@@ -568,7 +578,7 @@ fn a_retraction_leaves_the_disk_where_it_found_it() {
 
     let (mut reopened, _) = open(directory.path());
     assert_eq!(
-        reopened.tip(),
+        reopened.tip().expect("read the reopened tip"),
         Some(abandoned_tip),
         "the deepest sealed block is still the abandoned one: a retraction deletes no state"
     );

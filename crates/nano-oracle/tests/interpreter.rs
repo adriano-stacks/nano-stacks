@@ -68,7 +68,7 @@ fn persists_clarity_data_variables_in_the_marf_store() {
 
     assert_eq!(value, Some(Value::UInt(2)));
     store.seal().expect("seal state");
-    assert!(store.root(block).is_some());
+    assert!(store.root(block).expect("read the sealed root").is_some());
 }
 
 /// Reading a length out of a buffer, which decides how much work follows.

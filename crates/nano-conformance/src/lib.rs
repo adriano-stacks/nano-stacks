@@ -6,7 +6,7 @@ use std::{
 };
 
 use nano_bitcoin::{
-    BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block_with_pre_stx,
+    BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block, decode_block_with_pre_stx,
 };
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
 use nano_primitives::{Network, TrieHash};
@@ -188,13 +188,15 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
         return Err(FixtureValidationError::EmptyCapture);
     }
 
-    let requirements = [
+    let mut requirements = vec![
         // Several Nakamoto blocks can share one burn block in the same tenure.
         ("bitcoin/blocks", 1),
         ("nakamoto/blocks", manifest.replay_blocks),
-        ("events/new_block", manifest.replay_blocks),
         ("stacker_set", 1),
     ];
+    if manifest.receipts {
+        requirements.push(("events/new_block", manifest.replay_blocks));
+    }
     for (relative_path, minimum_files) in requirements {
         let path = root.join(relative_path);
         let found = count_files(&path)?;
@@ -230,7 +232,7 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             root.join("sortition/snapshots.json"),
         ));
     }
-    for snapshot in snapshots {
+    for snapshot in &snapshots {
         let block = root
             .join("bitcoin/blocks")
             .join(format!("{}.hex", snapshot.burn_header_hash));
@@ -238,6 +240,35 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             return Err(FixtureValidationError::MissingOrEmptyFile(block));
         }
     }
+
+    let sortition = root.join("sortition");
+    let mut tracker =
+        nano_node::sortition::SortitionTracker::from_capture(&sortition).map_err(|error| {
+            FixtureValidationError::InvalidSortitionSeed {
+                path: sortition.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    tracker
+        .recover_seed(|height| {
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot.block_height == height)
+                .ok_or_else(|| format!("no captured Bitcoin snapshot at burn {height}"))?;
+            let path = root
+                .join("bitcoin/blocks")
+                .join(format!("{}.hex", snapshot.burn_header_hash));
+            let encoded = fs::read_to_string(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let raw = hex::decode(encoded.trim())
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            decode_block(height, &raw, captured_magic(root))
+                .map_err(|error| format!("{}: {error}", path.display()))
+        })
+        .map_err(|error| FixtureValidationError::InvalidSortitionSeed {
+            path: sortition,
+            reason: error.to_string(),
+        })?;
 
     let checkpoint = root.join("chainstate/checkpoint-H");
     if count_files_recursively(&checkpoint)? == 0 {
@@ -327,6 +358,10 @@ pub enum FixtureValidationError {
     InvalidCheckpointManifest(PathBuf),
     InvalidNativeAccounting(PathBuf),
     InvalidSnapshotFile(PathBuf),
+    InvalidSortitionSeed {
+        path: PathBuf,
+        reason: String,
+    },
     EmptyCapture,
     Metadata {
         path: PathBuf,
@@ -377,6 +412,11 @@ impl std::fmt::Display for FixtureValidationError {
                     path.display()
                 )
             }
+            Self::InvalidSortitionSeed { path, reason } => write!(
+                formatter,
+                "invalid checkpoint sortition seed under {}: {reason}",
+                path.display()
+            ),
             Self::EmptyCapture => {
                 formatter.write_str("captured fixtures must contain at least one replay block")
             }
@@ -559,8 +599,8 @@ fn mainnet_rows() -> String {
 /// names, and reports that.
 fn mainnet_executed_height(state: &Path) -> Option<(u64, u64)> {
     let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite")).ok()?;
-    let tip = executed_tip(state, &marf, marf.tip()?);
-    let height = marf.height(tip)?;
+    let tip = executed_tip(state, &marf, marf.tip().ok()??)?;
+    let height = marf.height(tip).ok()??;
     // A checkpointed state's ancestry arrives with the import, so the anchor is the
     // first height this node sealed itself: the checkpoint's own height plus one.
     // `marf.first_sealed_height` is not a thing the MARF records, and the capture
@@ -611,20 +651,19 @@ pub fn derive_sortitions<S>(
 ///
 /// The same rule the node resumes by, and bounded the same way: a run seals at most
 /// a catch-up round's worth of blocks before it commits one, so a walk longer than
-/// that has nothing to find. A state whose side store cannot be opened at all is
-/// reported at its seal rather than not at all — the row is a progress signal, and
-/// refusing to answer would read as zero.
+/// that has nothing to find. A state whose side store or MARF cannot be read is
+/// omitted rather than reported at a plausible but unverified seal.
 fn executed_tip(
     state: &Path,
     marf: &nano_marf::VersionedMarf,
     tip: nano_marf::MarfBlockId,
-) -> nano_marf::MarfBlockId {
+) -> Option<nano_marf::MarfBlockId> {
     const REACH: usize = 1000;
     let Ok(side_store) = rusqlite::Connection::open_with_flags(
         state.join("chainstate/clarity.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else {
-        return tip;
+        return None;
     };
     let mut walk = tip;
     for _ in 0..REACH {
@@ -634,18 +673,19 @@ fn executed_tip(
                 statement.query_row(rusqlite::params![&walk[..]], |row| row.get::<_, u32>(0))
             });
         match named {
-            Ok(1..) => return walk,
+            Ok(1..) => return Some(walk),
             Ok(0) => {}
             // No table, no column, no readable database: the walk cannot tell a seal
             // from a commit here, so it does not pretend to.
-            Err(_) => return tip,
+            Err(_) => return None,
         }
         match marf.parent(walk) {
-            Some(Some(parent)) => walk = parent,
-            _ => return tip,
+            Ok(Some(Some(parent))) => walk = parent,
+            Ok(_) => return Some(tip),
+            Err(_) => return None,
         }
     }
-    tip
+    Some(tip)
 }
 
 /// How many blocks the frozen mainnet regression slice pins, and which.
@@ -820,7 +860,15 @@ pub fn replay_into(
     let mut parent = if skip == 0 {
         Some(source)
     } else {
-        chainstate.tip()
+        match chainstate.tip() {
+            Ok(tip) => tip,
+            Err(error) => {
+                return replay_fixture_failure(
+                    manifest,
+                    &format!("the resumed state tip cannot be read: {error}"),
+                );
+            }
+        }
     };
     let mut bitcoin_view = String::new();
     let mut first_cost_divergence = None;
@@ -941,7 +989,11 @@ pub fn durable_replay_chainstate(
         state_root,
     )
     .map_err(|error| format!("the checkpoint cannot be opened: {error}"))?;
-    let recovered = match chainstate.tip().filter(|tip| *tip != source) {
+    let recovered = match chainstate
+        .tip()
+        .map_err(|error| format!("the state tip cannot be read: {error}"))?
+        .filter(|tip| *tip != source)
+    {
         Some(tip) => chainstate
             .recover_ledger_at(tip)
             .map_err(|error| format!("the ledger cannot be read back: {error}"))?,
@@ -961,17 +1013,24 @@ pub fn durable_replay_chainstate(
 ///
 /// Counted from the fixtures rather than passed in, because a process that is
 /// killed cannot report where it got to.
-#[must_use]
-pub fn captured_blocks_sealed(root: &Path, chainstate: &ChainState) -> usize {
-    captured_block_paths(root)
-        .iter()
-        .take_while(|path| {
-            fs::read(path)
-                .ok()
-                .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
-                .is_some_and(|block| chainstate.has_block_state(*block.block_id().as_bytes()))
-        })
-        .count()
+pub fn captured_blocks_sealed(root: &Path, chainstate: &ChainState) -> Result<usize, String> {
+    let mut sealed = 0;
+    for path in captured_block_paths(root) {
+        let Some(block) = fs::read(path)
+            .ok()
+            .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
+        else {
+            break;
+        };
+        if !chainstate
+            .has_block_state(*block.block_id().as_bytes())
+            .map_err(|error| format!("the block state cannot be read: {error}"))?
+        {
+            break;
+        }
+        sealed += 1;
+    }
+    Ok(sealed)
 }
 
 fn replay_fixture_failure(manifest: FixtureManifest, message: &str) -> ReplayDepth {
@@ -1098,15 +1157,15 @@ pub fn reject_captured_block(
     root: &Path,
     manifest: FixtureManifest,
     skip: usize,
-) -> bool {
+) -> Result<bool, String> {
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
-        return false;
+        return Ok(false);
     };
     let Some(bitcoin_operations) = captured_bitcoin_operations(root) else {
-        return false;
+        return Ok(false);
     };
     let Ok(entries) = fs::read_dir(root.join("nakamoto/blocks")) else {
-        return false;
+        return Ok(false);
     };
     let mut paths = entries
         .filter_map(Result::ok)
@@ -1114,7 +1173,7 @@ pub fn reject_captured_block(
         .collect::<Vec<_>>();
     paths.sort();
     let Some(path) = paths.into_iter().nth(skip) else {
-        return false;
+        return Ok(false);
     };
 
     let capture = ReplayInputs {
@@ -1124,11 +1183,13 @@ pub fn reject_captured_block(
         receipts: manifest.receipts,
     };
     let mut bitcoin_view = String::new();
-    let parent = chainstate.tip();
+    let parent = chainstate
+        .tip()
+        .map_err(|error| format!("the state tip cannot be read: {error}"))?;
     // The replay path accepts whatever root execution produces and compares
     // afterwards, which seals the block. A node following a chain verifies
     // before sealing, and that is the path whose rollback is in question.
-    apply_captured_block(
+    Ok(apply_captured_block(
         &capture,
         chainstate,
         parent,
@@ -1144,7 +1205,7 @@ pub fn reject_captured_block(
         },
         ChainState::append_nakamoto_block_with_bitcoin_operations,
     )
-    .is_err()
+    .is_err())
 }
 
 /// How a captured block is executed: the replay accepts whatever root it
@@ -1793,8 +1854,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
-        baseline_replay, captured_accounting, captured_bitcoin_operations,
+        ChainState, FixtureManifest, FixtureMode, FixtureStatus, FixtureValidationError,
+        apply_captured_block, baseline_replay, captured_accounting, captured_bitcoin_operations,
         captured_bitcoin_snapshots, captured_chainstate, captured_checkpoint_block,
         captured_network, captured_signer_set, captured_signer_sets, checkpoint_manifest,
         checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
@@ -2080,7 +2141,10 @@ mod tests {
         );
         let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite"))
             .expect("open the marf");
-        let sealed = marf.height(marf.tip().expect("a tip")).expect("a height");
+        let sealed = marf
+            .height(marf.tip().expect("read the tip").expect("a tip"))
+            .expect("read the height")
+            .expect("a height");
         assert_eq!(
             u64::from(sealed) - tip,
             2,
@@ -2323,7 +2387,10 @@ mod tests {
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let checkpoint = fixture.join("chainstate/checkpoint-H/marf.sqlite");
         let imported = import_checkpoint(checkpoint, source, root).expect("imports checkpoint");
-        assert_eq!(imported.root(source), Some(root));
+        assert_eq!(
+            imported.root(source).expect("read imported root"),
+            Some(root)
+        );
     }
 
     /// A checkpoint is trusted because signers signed its root, not because it
@@ -2890,8 +2957,14 @@ mod tests {
             block.header.state_index_root,
         )
         .expect("import expected state");
-        let expected_leaves = expected.leaves(block_id).expect("expected leaves");
-        let actual_leaves = chainstate.state_leaves(block_id).expect("actual leaves");
+        let expected_leaves = expected
+            .leaves(block_id)
+            .expect("read expected leaves")
+            .expect("expected leaves");
+        let actual_leaves = chainstate
+            .state_leaves(block_id)
+            .expect("read actual leaves")
+            .expect("actual leaves");
         let expected_only = expected_leaves
             .iter()
             .filter(|leaf| !actual_leaves.contains(leaf))
@@ -3129,7 +3202,7 @@ mod tests {
             ),
         )?;
         let imported = import_pcs(&root)?;
-        assert!(imported.root(source).is_some());
+        assert!(imported.root(source).expect("read imported root").is_some());
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -3181,7 +3254,11 @@ mod tests {
         for (block, (name, contract_source)) in blocks.iter().zip(programs) {
             let mut reopened =
                 nano_vm::Vm::open_from_checkpoint(network, &directory, &checkpoint, source, root)?;
-            assert_eq!(reopened.tip(), Some(parent), "resumes from the tip on disk");
+            assert_eq!(
+                reopened.tip().expect("read reopened tip"),
+                Some(parent),
+                "resumes from the tip on disk"
+            );
             reopened.begin_block(Some(parent), *block)?;
             reopened
                 .deploy_contract(
@@ -3455,7 +3532,7 @@ mod tests {
         // From the tip, every ancestor back to the checkpoint, in order.
         let mut walked = Vec::new();
         let mut block = *executed.last().expect("executed blocks");
-        while let Some(parent) = chainstate.parent_of(block) {
+        while let Some(parent) = chainstate.parent_of(block).expect("read block parent") {
             walked.push(parent);
             block = parent;
         }
@@ -4126,6 +4203,7 @@ mod tests {
                 .expect("read the recipient's balance");
             let supply = chainstate
                 .state_leaves(*block.block_id().as_bytes())
+                .expect("read the block's leaves")
                 .expect("the block sealed its leaves")
                 .into_iter()
                 .find(|(path, _)| *path == nano_marf::key_path(LIQUID_SUPPLY.as_bytes()))
@@ -4437,7 +4515,8 @@ mod tests {
     }
 
     #[test]
-    fn captured_fixture_requires_every_oracle_input() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_capture_without_a_recoverable_sortition_seed_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = temporary_fixture_root()?;
         write_file(
             &root.join("manifest.toml"),
@@ -4472,9 +4551,13 @@ mod tests {
         )?;
         write_file(&root.join("provenance.toml"), "hacknet_commit = \"test\"\n")?;
 
-        assert_eq!(
-            validate_fixture_tree(&root)?,
-            FixtureStatus::Captured { replay_blocks: 1 }
+        assert!(
+            matches!(
+                validate_fixture_tree(&root),
+                Err(FixtureValidationError::InvalidSortitionSeed { .. })
+            ),
+            "a structurally complete capture cannot be evidence without the history and seed \
+             that let the production tracker start"
         );
         fs::remove_dir_all(root)?;
         Ok(())

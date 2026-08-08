@@ -50,7 +50,13 @@ fn main() -> ExitCode {
     if journal.is_some() {
         chainstate.vm_mut().record_writes();
     }
-    let sealed = captured_blocks_sealed(fixtures, &chainstate);
+    let sealed = match captured_blocks_sealed(fixtures, &chainstate) {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let depth = replay_into(
         &mut chainstate,
         source,

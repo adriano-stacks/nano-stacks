@@ -60,6 +60,7 @@ struct Ledger {
 fn ledger_of(chainstate: &mut ChainState) -> Ledger {
     let tenure_start = chainstate
         .tip()
+        .expect("read the ledger tip")
         .and_then(|tip| chainstate.recorded_header(tip))
         .and_then(|header| chainstate.tenure_start_height(header.tenure_height));
     Ledger {
@@ -99,8 +100,13 @@ fn reference(directory: &Path) -> Vec<([u8; 32], Ledger, Option<nano_primitives:
             offset + 1,
             depth.first_divergence
         );
-        let tip = chainstate.tip().expect("the reference run sealed a block");
-        let root = chainstate.state_content_root(tip);
+        let tip = chainstate
+            .tip()
+            .expect("read the reference tip")
+            .expect("the reference run sealed a block");
+        let root = chainstate
+            .state_content_root(tip)
+            .expect("read the reference content root");
         fingerprints.push((tip, ledger_of(&mut chainstate), root));
     }
     fingerprints
@@ -187,10 +193,15 @@ fn survived(
 ) -> usize {
     let (mut chainstate, source) =
         durable_replay_chainstate(&fixtures(), killed).expect("reopen after the kill");
-    let tip = chainstate.tip().expect("the state has a tip");
+    let tip = chainstate
+        .tip()
+        .expect("read the surviving tip")
+        .expect("the state has a tip");
     assert_ne!(tip, source, "the run before the kills sealed blocks");
     assert!(
-        chainstate.has_block_state(tip),
+        chainstate
+            .has_block_state(tip)
+            .expect("read the tip's state"),
         "the tip is a block whose state is really there"
     );
     assert!(
@@ -214,7 +225,9 @@ fn survived(
          at the same block"
     );
     assert_eq!(
-        chainstate.state_content_root(tip),
+        chainstate
+            .state_content_root(tip)
+            .expect("read the tip's content root"),
         *expected_root,
         "as does the state it sealed"
     );
@@ -290,7 +303,8 @@ fn a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent() {
     // block whose root does not match the captured header.
     let (chainstate, _) =
         durable_replay_chainstate(&fixtures(), killed.path()).expect("reopen at the end");
-    let sealed = captured_blocks_sealed(&fixtures(), &chainstate);
+    let sealed =
+        captured_blocks_sealed(&fixtures(), &chainstate).expect("read the number of sealed blocks");
     drop(chainstate);
     let remaining = u64::try_from(
         REFERENCE_BLOCKS
@@ -307,8 +321,16 @@ fn a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent() {
     let (expected_tip, expected_ledger, expected_root) = reference
         .last()
         .expect("the reference reached its last block");
-    assert_eq!(chainstate.tip(), Some(*expected_tip));
-    assert_eq!(chainstate.state_content_root(*expected_tip), *expected_root);
+    assert_eq!(
+        chainstate.tip().expect("read the final tip"),
+        Some(*expected_tip)
+    );
+    assert_eq!(
+        chainstate
+            .state_content_root(*expected_tip)
+            .expect("read the final content root"),
+        *expected_root
+    );
     assert_eq!(ledger_of(&mut chainstate), *expected_ledger);
 }
 
@@ -384,7 +406,8 @@ fn a_kill_inside_a_tenure_transition_leaves_the_complete_parent() {
     // run reached, which is what says the interrupted tenures were left whole.
     let (chainstate, _) =
         durable_replay_chainstate(&fixtures(), killed.path()).expect("reopen at the end");
-    let sealed = captured_blocks_sealed(&fixtures(), &chainstate);
+    let sealed =
+        captured_blocks_sealed(&fixtures(), &chainstate).expect("read the number of sealed blocks");
     drop(chainstate);
     let remaining = u64::try_from(
         REFERENCE_BLOCKS
@@ -401,7 +424,15 @@ fn a_kill_inside_a_tenure_transition_leaves_the_complete_parent() {
     let (expected_tip, expected_ledger, expected_root) = reference
         .last()
         .expect("the reference reached its last block");
-    assert_eq!(chainstate.tip(), Some(*expected_tip));
-    assert_eq!(chainstate.state_content_root(*expected_tip), *expected_root);
+    assert_eq!(
+        chainstate.tip().expect("read the final tip"),
+        Some(*expected_tip)
+    );
+    assert_eq!(
+        chainstate
+            .state_content_root(*expected_tip)
+            .expect("read the final content root"),
+        *expected_root
+    );
     assert_eq!(ledger_of(&mut chainstate), *expected_ledger);
 }

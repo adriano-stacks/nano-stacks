@@ -16,10 +16,10 @@ use std::{
 
 use fs2::FileExt as _;
 
-use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource};
+use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource as _};
 use nano_chainstate::{
-    BitcoinBlockContext, ChainState, MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet,
-    TenureAccounting,
+    BitcoinBlockContext, ChainState, ChainStateError, MINER_REWARD_MATURITY, NakamotoBlock, Signer,
+    SignerSet, TenureAccounting,
 };
 use nano_crypto::StacksPublicKey;
 use nano_p2p::Discovered;
@@ -748,7 +748,7 @@ async fn follow(follower: Follower) -> Role {
         execute: config.node.max_sync_blocks,
     };
     let mut pox = pox;
-    prepare_to_follow(executor.as_ref(), &config, &peer, &pox, source).await?;
+    prepare_to_follow(executor.as_ref(), &peer, &pox, source).await?;
     let mut rounds = Rounds::new(peer);
     loop {
         rounds.history.refresh(&config, discovered.as_ref());
@@ -830,14 +830,13 @@ async fn follow(follower: Follower) -> Role {
     }
 }
 
-/// What a follower does once, before its first round.
+/// Backfill the checkpoint's missing ancestor headers before the first round.
 ///
-/// Both halves are the executor's and neither belongs in the loop: a sortition
-/// chain is seeded from the checkpoint once, and the ancestor headers a state was
-/// written without are written down once. Extracted so the loop below is the loop.
+/// The sortition chain is already seeded while the executor is constructed: that
+/// has to happen before its anchor can be applied, whereas these headers are fetched
+/// through the peer the follower has selected.
 async fn prepare_to_follow(
     executor: Option<&SharedExecutor>,
-    config: &Config,
     peer: &SyncClient,
     pox: &PoxInfo,
     source: [u8; 32],
@@ -845,21 +844,6 @@ async fn prepare_to_follow(
     let Some(executor) = executor else {
         return Ok(());
     };
-    // A node that executes derives its own sortitions, or it does not run. The
-    // checkpoint has to carry the history to seed one from, and a configuration
-    // without it is refused here rather than at the first block -- which is the
-    // difference between a node that will not start and a node that starts and
-    // takes a stranger's word for every burn view it executes under.
-    let Some(directory) = config.checkpoint.sortition.as_ref() else {
-        return Err(
-            "this node executes blocks and has no checkpoint sortition history to derive burn              views from: set `checkpoint.sortition` to a directory holding snapshots.json,              consensus-hashes.json and leader-keys.json, which `cargo xtask export-sortition`              writes"
-                .to_owned(),
-        );
-    };
-    let phase = Phase::start("seeding the local sortition chain");
-    let seeded = start_deriving_sortitions(executor, directory, &config.node.working_dir).await;
-    drop(phase);
-    seeded?;
     backfill_ancestors(executor, peer, pox, source).await;
     Ok(())
 }
@@ -1452,13 +1436,64 @@ pub async fn open_executor(
 ) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
     let (chainstate, anchor, context) =
         open_chainstate(config, network, pox, peers, directory).await?;
-    let bitcoin = bitcoin_source(config)?;
-    match context {
-        Some(context) => Ok(CheckpointExecutor::from_chainstate(
-            chainstate, anchor, context, bitcoin,
-        )?),
-        None => Ok(CheckpointExecutor::resume(chainstate, anchor, bitcoin)),
+    // Seed and validate the local sortition chain before applying the anchor. A
+    // contradictory checkpoint used to start its RPC and p2p roles, apply one
+    // Stacks block, and discover only on its first execution-driven walk that the
+    // next sortition would be sampled against zero.
+    let capture = config.checkpoint.sortition.as_ref().ok_or(
+        "this node executes blocks and has no checkpoint sortition history to derive burn \
+         views from: set `checkpoint.sortition` to a directory holding snapshots.json, \
+         consensus-hashes.json and leader-keys.json, which `cargo xtask export-sortition` writes",
+    )?;
+    let executed_burn_view = context.as_ref().map_or_else(
+        || {
+            chainstate
+                .recorded_header(*anchor.block_id().as_bytes())
+                .map_or(0, |header| u64::from(header.burn_block_height))
+        },
+        |context| context.height,
+    );
+    let mut tracker = SortitionTracker::resume_or_capture_below(
+        &config.node.working_dir,
+        capture,
+        executed_burn_view,
+    )
+    .map_err(|error| {
+        format!(
+            "this node cannot derive sortitions of its own, and will not execute blocks under \
+             a burn view a peer chose: {error}"
+        )
+    })?;
+    if tracker.leader_keys() == 0 {
+        return Err(format!(
+            "this checkpoint carries no leader-key registry, so this node could check no \
+             tenure's coinbase proof and no miner's signature against the key that won the \
+             sortition -- and would accept every tenure without checking either. \
+             `cargo xtask export-leader-keys` writes one into {}",
+            capture.display()
+        )
+        .into());
     }
+    let mut bitcoin = bitcoin_source(config)?;
+    tracker
+        .recover_seed(|height| bitcoin.block_at(height))
+        .map_err(|error| {
+            format!(
+                "this node cannot recover the checkpoint's effective winner seed before \
+                 execution: {error}"
+            )
+        })?;
+    println!(
+        "deriving sortitions locally from burn {} on PoX history {}",
+        tracker.tip().bitcoin_height,
+        tracker.tip().pox_id
+    );
+    let mut executor = match context {
+        Some(context) => CheckpointExecutor::from_chainstate(chainstate, anchor, context, bitcoin)?,
+        None => CheckpointExecutor::resume(chainstate, anchor, bitcoin),
+    };
+    executor.track_sortitions(tracker, config.node.working_dir.clone());
+    Ok(executor)
 }
 
 /// The chainstate a role executes from, and the block it is sealed at.
@@ -1482,7 +1517,7 @@ pub async fn open_chainstate(
         config.checkpoint.state_root()?,
     )?;
 
-    let Some(tip) = chainstate.tip().filter(|tip| *tip != source) else {
+    let Some(tip) = chainstate.tip()?.filter(|tip| *tip != source) else {
         // Nothing has been sealed here, so there is no ledger to recover: the
         // first tenures a node executes pay out rewards earned before it
         // existed, and only the checkpoint knows them.
@@ -1492,7 +1527,7 @@ pub async fn open_chainstate(
         context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
         return Ok((chainstate, anchor, Some(context)));
     };
-    let tip = deepest_block_a_ledger_names(&chainstate, tip, config.node.max_sync_blocks);
+    let tip = deepest_block_a_ledger_names(&chainstate, tip, config.node.max_sync_blocks)?;
     // A peer that does not have this block yet is usually one still catching
     // up, not a chain that moved: it is worth waiting for. A peer that never
     // produces it means this state descends from a block the network dropped,
@@ -1507,7 +1542,7 @@ pub async fn open_chainstate(
     let mut ancestors = Vec::new();
     let mut walk = tip;
     while ancestors.len() < RESUME_ANCESTORS {
-        let Some(parent) = chainstate.parent_of(walk) else {
+        let Some(parent) = chainstate.parent_of(walk)? else {
             break;
         };
         ancestors.push(parent);
@@ -1561,7 +1596,11 @@ pub async fn open_chainstate(
 /// The reach is a catch-up round's worth of blocks, because that is how deep a run
 /// can seal before it fails: past that there is nothing to find, since every block
 /// sealed writes a ledger first.
-fn deepest_block_a_ledger_names(chainstate: &ChainState, tip: [u8; 32], reach: usize) -> [u8; 32] {
+fn deepest_block_a_ledger_names(
+    chainstate: &ChainState,
+    tip: [u8; 32],
+    reach: usize,
+) -> Result<[u8; 32], ChainStateError> {
     let mut walk = tip;
     for walked in 0..reach {
         if chainstate.has_ledger(walk) {
@@ -1574,9 +1613,9 @@ fn deepest_block_a_ledger_names(chainstate: &ChainState, tip: [u8; 32], reach: u
                     hex::encode(walk)
                 );
             }
-            return walk;
+            return Ok(walk);
         }
-        let Some(parent) = chainstate.parent_of(walk) else {
+        let Some(parent) = chainstate.parent_of(walk)? else {
             break;
         };
         walk = parent;
@@ -1589,7 +1628,7 @@ fn deepest_block_a_ledger_names(chainstate: &ChainState, tip: [u8; 32], reach: u
          cannot stand on one",
         hex::encode(tip)
     );
-    tip
+    Ok(tip)
 }
 
 /// Stand on the state the run that sealed this block kept beside the MARF.
@@ -2117,62 +2156,6 @@ async fn backfill_one_header(
          which this node never executed",
         hex::encode(block)
     );
-}
-
-/// Derive sortitions alongside the peer's answers, when the checkpoint carries
-/// the history that makes it possible.
-async fn start_deriving_sortitions(
-    executor: &SharedExecutor,
-    capture: &Path,
-    state: &Path,
-) -> Role {
-    // No `PoxId` is passed: the seed's own sortition identifier states the bit
-    // vector it was produced under, so the tracker reads it off the checkpoint.
-    // A failure here is fatal rather than reported. It used to be printed and
-    // passed over, and what followed was a node that executed every block under a
-    // burn view a *peer* handed it -- the Bitcoin height, the burn header hash, the
-    // timestamp and the VRF seed, three of which Clarity reads back and so move a
-    // state root. A node that cannot derive its own sortitions has nothing to
-    // execute against ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
-    // The burn view execution has reached, so a saved chain seeded above it is
-    // refused rather than adopted: a chain only walks forward, and one seeded too
-    // high can never answer for the blocks still staged below it.
-    let executed_burn_view = executor.lock().await.bitcoin_height();
-    let tracker = SortitionTracker::resume_or_capture_below(state, capture, executed_burn_view)
-        .map_err(|error| {
-        format!(
-            "this node cannot derive sortitions of its own, and will not execute blocks under              a burn view a peer chose: {error}"
-            )
-        })?;
-    // A node that executes checks every tenure's coinbase proof and every miner
-    // signature against the leader key that won the sortition, and a leader key is
-    // registered once and named for years afterwards -- tens of thousands of burn
-    // blocks below any window a checkpointed node holds. Without the registry those
-    // two rules cannot run at all, and a rule that never runs looks exactly like one
-    // that always passes.
-    //
-    // The tracker warns and carries on, which is right for a harness walking a
-    // captured window where the registrations are inside it. It is not right for a
-    // node ([[076-refuse-blocks-when-consensus-authentication-inputs]]).
-    if tracker.leader_keys() == 0 {
-        return Err(format!(
-            "this checkpoint carries no leader-key registry, so this node could check no \
-             tenure's coinbase proof and no miner's signature against the key that won the \
-             sortition -- and would accept every tenure without checking either. \
-             `cargo xtask export-leader-keys` writes one into {}",
-            capture.display()
-        ));
-    }
-    println!(
-        "deriving sortitions locally from burn {} on PoX history {}",
-        tracker.tip().bitcoin_height,
-        tracker.tip().pox_id
-    );
-    executor
-        .lock()
-        .await
-        .track_sortitions(tracker, state.to_path_buf());
-    Ok(())
 }
 
 /// Check the checkpoint against a signed header before any of it is opened.
@@ -3583,14 +3566,22 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
             parent = Some(block(height));
         }
 
-        assert_eq!(chainstate.tip(), Some(block(5)), "the deepest seal");
         assert_eq!(
-            super::deepest_block_a_ledger_names(&chainstate, block(5), 500),
+            chainstate.tip().expect("read the deepest seal"),
+            Some(block(5)),
+            "the deepest seal"
+        );
+        assert_eq!(
+            super::deepest_block_a_ledger_names(&chainstate, block(5), 500)
+                .expect("walk sealed parents"),
             block(3),
             "and the deepest block a ledger names is two below it"
         );
         // Which is what makes the give-back reach them at all.
-        let height = chainstate.height_of(block(3)).expect("a sealed height");
+        let height = chainstate
+            .height_of(block(3))
+            .expect("read the sealed height")
+            .expect("a sealed height");
         assert_eq!(chainstate.discard_above(height).expect("give back"), 2);
     }
 
@@ -3625,7 +3616,8 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
         chainstate.vm_mut().seal_block_to([2; 32]).expect("seal");
 
         assert_eq!(
-            super::deepest_block_a_ledger_names(&chainstate, [2; 32], 1),
+            super::deepest_block_a_ledger_names(&chainstate, [2; 32], 1)
+                .expect("walk sealed parents"),
             [2; 32]
         );
     }

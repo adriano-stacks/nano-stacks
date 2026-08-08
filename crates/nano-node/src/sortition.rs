@@ -319,6 +319,14 @@ impl SortitionTracker {
         block: &BitcoinBlock,
         payouts: PayoutSchedule,
     ) -> Result<&SortitionSnapshot, TrackerError> {
+        if self.engine.snapshots().effective_winner_seed().is_none() {
+            return Err(TrackerError::Seed(format!(
+                "the chain at burn {} has no effective winner seed, so burn {} cannot be \
+                 sampled without substituting an all-zero seed",
+                self.tip().bitcoin_height,
+                block.height
+            )));
+        }
         // A reward cycle opening adds a bit to the `PoX` history, and the consensus
         // hash mixes that history, so getting this wrong derives a wrong hash for
         // every block after it and reports nothing.
@@ -524,36 +532,76 @@ impl SortitionTracker {
             walk.reading += read.elapsed();
             walk.primed += 1;
             self.register_keys(&block);
-            // Only where the seed does not already carry one: a chain this node
-            // saved states the seed exactly, and the recovery below is a
-            // capture's fallback that holds only because a capture whose seed
-            // elected nobody is refused when it is loaded.
-            if height == tip
-                && self.tip().winner_vrf_seed.is_none()
-                && let Some(winner) = self.tip().winner_txid
-            {
-                // Refused rather than reported. Sampling the next sortition against
-                // a zero seed names miners that did not win, and the only sign of
-                // it is their tenures' coinbase proofs being refused hundreds of
-                // blocks later — a chain derived from a seed nobody can name is not
-                // a rougher answer, it is a different one.
-                let seed = winner_seed(&block, winner).ok_or_else(|| {
-                    TrackerError::Seed(format!(
-                        "the sortition seed at burn {height} says commitment {} won, and \
-                         neither that commitment nor an agreement between the block's \
-                         eligible ones says which VRF seed it carried -- so the seed the \
-                         next sortition mixes cannot be recovered. A checkpoint has to \
-                         carry `winner_vrf_seed` for a seed row that elected somebody.",
-                        hex::encode(winner)
-                    ))
-                })?;
-                self.engine.adopt_root_winner_seed(seed);
+            if height == tip {
+                self.recover_seed_from(&block)?;
             }
             let commitments =
                 commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
             self.engine.prime(height, commitments);
         }
         self.primed = true;
+        Ok(())
+    }
+
+    /// Recover and adopt the checkpoint seed before the node starts following.
+    ///
+    /// A chain this node saved already carries the effective seed and costs no
+    /// Bitcoin read. A capture that starts on a sortition reads its seed block and
+    /// recovers the winning commitment's seed. Every other case is refused here,
+    /// before a caller can persist or execute against the tracker.
+    pub fn recover_seed<E: Display>(
+        &mut self,
+        mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
+    ) -> Result<(), TrackerError> {
+        if self.engine.snapshots().effective_winner_seed().is_some() {
+            return Ok(());
+        }
+        let height = self.tip().bitcoin_height;
+        let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+        self.recover_seed_from(&block)
+    }
+
+    fn recover_seed_from(&mut self, block: &BitcoinBlock) -> Result<(), TrackerError> {
+        if self.engine.snapshots().effective_winner_seed().is_some() {
+            return Ok(());
+        }
+        let tip = self.tip();
+        if block.height != tip.bitcoin_height || block.hash != *tip.bitcoin_header_hash.as_bytes() {
+            return Err(TrackerError::Seed(format!(
+                "the seed snapshot names burn {} with header {}, but its Bitcoin source \
+                 returned burn {} with header {}",
+                tip.bitcoin_height,
+                tip.bitcoin_header_hash,
+                block.height,
+                hex::encode(block.hash)
+            )));
+        }
+        let winner = tip.winner_txid.ok_or_else(|| {
+            TrackerError::Seed(format!(
+                "the sortition seed at burn {} carries no effective winner seed and names no \
+                 winning commitment",
+                tip.bitcoin_height
+            ))
+        })?;
+        // Refused rather than reported. Sampling the next sortition against a zero
+        // seed names miners that did not win, and the only sign of it is their
+        // tenures' coinbase proofs being refused hundreds of blocks later.
+        let seed = winner_seed(block, winner).ok_or_else(|| {
+            TrackerError::Seed(format!(
+                "the sortition seed at burn {} says commitment {} won, and neither that \
+                 eligible commitment nor an agreement between the block's eligible ones \
+                 says which VRF seed it carried -- so the seed the next sortition mixes \
+                 cannot be recovered. A checkpoint has to carry `winner_vrf_seed` for a \
+                 seed row that elected somebody.",
+                tip.bitcoin_height,
+                hex::encode(winner)
+            ))
+        })?;
+        if !self.engine.adopt_root_winner_seed(seed) {
+            return Err(TrackerError::Seed(
+                "the checkpoint seed can only be adopted before the chain advances".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -676,8 +724,12 @@ fn winner_seed(block: &BitcoinBlock, winner_txid: [u8; 32]) -> Option<[u8; 32]> 
         .operations
         .iter()
         .find_map(|operation| match &operation.kind {
-            BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }
-                if operation.txid == winner_txid =>
+            BitcoinOperationKind::LeaderBlockCommit {
+                new_seed,
+                parent_modulus,
+                ..
+            } if operation.txid == winner_txid
+                && commitment_is_on_time(*parent_modulus, block.height) =>
             {
                 Some(*new_seed)
             }
@@ -1299,11 +1351,14 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
 
 #[cfg(test)]
 mod tests {
+    use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind};
     use nano_primitives::ConsensusHash;
-    use nano_sortition::{OpsHash, PoxId, SortitionHash, SortitionSnapshot};
+    use nano_sortition::{
+        OpsHash, PayoutSchedule, PoxId, RewardCycleSchedule, SortitionHash, SortitionSnapshot,
+    };
     use nano_sync::BurnView as _;
 
-    use super::SortitionTracker;
+    use super::{CapturedSnapshot, SortitionTracker, TrackerError, seed_snapshot};
 
     /// A chain standing on one snapshot, with one hash behind it.
     pub(super) fn a_chain() -> SortitionTracker {
@@ -1311,6 +1366,14 @@ mod tests {
     }
 
     fn tracker(total_burn: u64) -> SortitionTracker {
+        tracker_with_seed(None, Some([9; 32]), total_burn)
+    }
+
+    fn tracker_with_seed(
+        winner_txid: Option<[u8; 32]>,
+        winner_vrf_seed: Option<[u8; 32]>,
+        total_burn: u64,
+    ) -> SortitionTracker {
         let behind = ConsensusHash::from_bytes([0xbe; 20]);
         let seed = SortitionSnapshot {
             bitcoin_height: 100,
@@ -1322,8 +1385,8 @@ mod tests {
             consensus_hash: ConsensusHash::from_bytes([0x7f; 20]),
             total_burn,
             sortition_hash: SortitionHash::from_bytes([4; 32]),
-            winner_txid: None,
-            winner_vrf_seed: None,
+            winner_txid,
+            winner_vrf_seed,
             winner_vrf_public_key: None,
             winner_signing_key_hash: None,
             committed_block_hash: None,
@@ -1333,6 +1396,35 @@ mod tests {
         };
         let history = vec![behind, seed.consensus_hash];
         SortitionTracker::new(seed, history).expect("the history ends at the seed")
+    }
+
+    fn block_with(height: u64, operations: Vec<BitcoinOperation>) -> BitcoinBlock {
+        BitcoinBlock {
+            height,
+            hash: [1; 32],
+            timestamp: 0,
+            operations,
+        }
+    }
+
+    fn commitment(txid: [u8; 32], seed: [u8; 32], height: u64, on_time: bool) -> BitcoinOperation {
+        let timely = u8::try_from((height + 4) % 5).expect("modulo five fits u8");
+        BitcoinOperation {
+            txid,
+            transaction_index: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            kind: BitcoinOperationKind::LeaderBlockCommit {
+                block_header_hash: [0; 32],
+                new_seed: seed,
+                parent_block_height: 0,
+                parent_transaction_index: 0,
+                key_block_height: 0,
+                key_transaction_index: 0,
+                memo: 0,
+                parent_modulus: if on_time { timely } else { (timely + 1) % 5 },
+            },
+        }
     }
 
     /// Where a candidate's burn total places it against this chain.
@@ -1362,6 +1454,117 @@ mod tests {
             "a candidate at this chain's own total may be a sortition-less block ahead of it"
         );
         assert_eq!(tracker.derived(foreign, 8_000_000), None);
+    }
+
+    #[test]
+    fn a_named_eligible_winner_recovers_its_seed_despite_disagreeing_candidates() {
+        let height = 100;
+        let winner = [0x11; 32];
+        let mut tracker = tracker_with_seed(Some(winner), None, 1_000);
+        let block = block_with(
+            height,
+            vec![
+                commitment(winner, [0xaa; 32], height, true),
+                commitment([0x22; 32], [0xbb; 32], height, true),
+            ],
+        );
+
+        tracker
+            .recover_seed(|_| Ok::<_, String>(block.clone()))
+            .expect("the named winner makes disagreement irrelevant");
+        assert_eq!(tracker.tip().winner_vrf_seed, Some([0xaa; 32]));
+    }
+
+    #[test]
+    fn disagreeing_candidates_cannot_recover_an_absent_winner() {
+        let height = 100;
+        let mut tracker = tracker_with_seed(Some([0x33; 32]), None, 1_000);
+        let block = block_with(
+            height,
+            vec![
+                commitment([0x11; 32], [0xaa; 32], height, true),
+                commitment([0x22; 32], [0xbb; 32], height, true),
+            ],
+        );
+
+        assert!(matches!(
+            tracker.recover_seed(|_| Ok::<_, String>(block.clone())),
+            Err(TrackerError::Seed(_))
+        ));
+        assert_eq!(tracker.tip().winner_vrf_seed, None);
+    }
+
+    #[test]
+    fn no_eligible_commitment_cannot_recover_a_seed() {
+        let height = 100;
+        let winner = [0x11; 32];
+        let mut tracker = tracker_with_seed(Some(winner), None, 1_000);
+        let block = block_with(height, vec![commitment(winner, [0xaa; 32], height, false)]);
+
+        assert!(matches!(
+            tracker.recover_seed(|_| Ok::<_, String>(block.clone())),
+            Err(TrackerError::Seed(_))
+        ));
+    }
+
+    #[test]
+    fn unanimous_eligible_candidates_recover_an_undecoded_winner() {
+        let height = 100;
+        let mut tracker = tracker_with_seed(Some([0x33; 32]), None, 1_000);
+        let block = block_with(
+            height,
+            vec![
+                commitment([0x11; 32], [0xaa; 32], height, true),
+                commitment([0x22; 32], [0xaa; 32], height, true),
+            ],
+        );
+
+        tracker
+            .recover_seed(|_| Ok::<_, String>(block.clone()))
+            .expect("unanimity is an unambiguous fallback");
+        assert_eq!(tracker.tip().winner_vrf_seed, Some([0xaa; 32]));
+    }
+
+    #[test]
+    fn a_sortitionless_capture_without_its_predecessor_seed_is_refused() {
+        let captured = CapturedSnapshot {
+            block_height: 100,
+            burn_header_hash: String::new(),
+            burn_header_timestamp: 0,
+            sortition_id: String::new(),
+            consensus_hash: String::new(),
+            sortition_hash: String::new(),
+            total_burn: String::new(),
+            sortition: Some(0),
+            winning_block_txid: None,
+            winner_vrf_seed: None,
+            last_sortition_height: None,
+            sortitions_below_window: Vec::new(),
+            parent_sortition_id: None,
+            miner_pk_hash: None,
+            winning_stacks_block_hash: None,
+        };
+
+        assert!(matches!(
+            seed_snapshot(&captured),
+            Err(TrackerError::Seed(_))
+        ));
+    }
+
+    #[test]
+    fn a_tracker_with_no_effective_seed_never_advances_against_zero() {
+        let mut tracker = tracker_with_seed(None, None, 1_000);
+        let payouts = PayoutSchedule::new(
+            RewardCycleSchedule::new(0, 10, None).expect("a schedule"),
+            2,
+        )
+        .expect("payouts");
+
+        assert!(matches!(
+            tracker.advance(&block_with(101, Vec::new()), payouts),
+            Err(TrackerError::Seed(_))
+        ));
+        assert_eq!(tracker.tip().bitcoin_height, 100);
     }
 }
 

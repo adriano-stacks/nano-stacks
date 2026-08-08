@@ -21,18 +21,18 @@ fail.
 
 ## Tasks
 
-- [~] Replace production `expect("trie storage")` read paths with typed results
+- [x] Replace production `expect("trie storage")` read paths with typed results
       through `nano-marf`, `nano-vm`, chainstate and RPC callers.
 - [x] Preserve `MarfError` and side-store I/O errors through `MarfStore::get`,
       `value_of` and every `ClarityBackingStore` caller. Never convert a failed read
       to `None`, because corruption and a key that never existed are different
       consensus-visible inputs.
-- [ ] Either verify the complete reachable trie graph at startup or preserve
+- [x] Either verify the complete reachable trie graph at startup or preserve
       typed errors for nodes not covered by the bounded startup check.
 - [x] Add a fixture whose tip record and root survive while a reachable non-root
       trie node is missing; opening or reading it must return an actionable error
       without a panic.
-- [ ] Cover storage I/O failure after a successful open and prove no partial
+- [x] Cover storage I/O failure after a successful open and prove no partial
       block or repair write is committed.
 - [ ] Retain the clean restart, SIGKILL and commit-boundary recovery gates from
       tasks 057 and 065.
@@ -119,3 +119,23 @@ than being made in `nano-marf` by an `expect`.
 
 That is a real refactor (`tip` alone has callers everywhere) and it is not the
 dangerous direction, which is closed. Left visible rather than half-done.
+
+## Typed read propagation completed, 2026-08-08
+
+The remaining `VersionedMarf` reads now return `Result` through `MarfStore`,
+`Vm`, `ChainState`, node startup and the diagnostic callers. Errors are never
+converted into an absent block, root, pointer set or key. Clarity's fixed
+`get_block_at_height -> Option` trait remains the one explicit fail-closed
+boundary: storage failure reaches that boundary as `MarfError` and stops the
+evaluation with a message naming the height instead of returning `None`.
+
+File-backed MARFs retain their path in read errors. The regression output names
+the state path, requested block and missing trie node without naming the key or
+value. `a_storage_failure_after_open_seals_no_partial_block` opens a coherent
+store, deletes a reachable node afterwards, begins a child, observes the typed
+refusal, aborts, and proves both the last coherent tip and sealed-block count are
+unchanged.
+
+Verified with the workspace all-target check and the focused missing-node and
+post-open failure tests. The crash/restart gates remain open here until their
+serialized release run completes.

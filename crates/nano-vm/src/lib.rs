@@ -1364,8 +1364,7 @@ impl Vm {
     }
 
     /// The deepest state on disk, which is where a restart resumes.
-    #[must_use]
-    pub fn tip(&self) -> Option<[u8; 32]> {
+    pub fn tip(&self) -> Result<Option<[u8; 32]>, MarfStoreError> {
         self.store.tip()
     }
 
@@ -1421,7 +1420,7 @@ impl Vm {
 
     /// The state a block was built on, as the store recorded it.
     #[must_use]
-    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
+    pub fn parent_of(&self, block: [u8; 32]) -> Result<Option<[u8; 32]>, MarfStoreError> {
         self.store.parent_of(block)
     }
 
@@ -1429,7 +1428,7 @@ impl Vm {
     /// The Stacks height of a block, from the block index the checkpoint
     /// imports — which covers every block, including ones with no state.
     #[must_use]
-    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
+    pub fn height_of(&self, block: [u8; 32]) -> Result<Option<u32>, MarfStoreError> {
         self.store.height_of(block)
     }
 
@@ -1603,8 +1602,12 @@ impl Vm {
     }
 
     /// Record the Stacks height of an imported checkpoint when it is not stored in the MARF.
-    pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
-        self.store.set_checkpoint_height(block, height);
+    pub fn set_checkpoint_height(
+        &mut self,
+        block: [u8; 32],
+        height: u32,
+    ) -> Result<(), MarfStoreError> {
+        self.store.set_checkpoint_height(block, height)
     }
 
     /// Store the timestamp supplied by the current Nakamoto block header.
@@ -1977,25 +1980,31 @@ impl Vm {
 
     /// Access the state root for a sealed block.
     #[must_use]
-    pub fn root(&self, block: [u8; 32]) -> Option<StateRoot> {
+    pub fn root(&self, block: [u8; 32]) -> Result<Option<StateRoot>, MarfStoreError> {
         self.store.root(block)
     }
 
     /// Return the MARF content hash before ancestry is incorporated.
     #[must_use]
-    pub fn content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
+    pub fn content_root(&self, block: [u8; 32]) -> Result<Option<TrieHash>, MarfStoreError> {
         self.store.content_root(block)
     }
 
     /// Return the committed MARF leaves for a block state.
     #[must_use]
-    pub fn state_leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
+    pub fn state_leaves(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<(TrieHash, MarfValue)>>, MarfStoreError> {
         self.store.leaves(block)
     }
 
     /// Return the root pointers in their consensus serialization order.
     #[must_use]
-    pub fn root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
+    pub fn root_pointers(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<TriePointer>>, MarfStoreError> {
         self.store.root_pointers(block)
     }
 
@@ -2005,7 +2014,7 @@ impl Vm {
         &self,
         block: [u8; 32],
         prefix: &[u8],
-    ) -> Option<Vec<(TriePointer, nano_primitives::TrieHash)>> {
+    ) -> Result<Option<Vec<(TriePointer, nano_primitives::TrieHash)>>, MarfStoreError> {
         self.store.pointers_at(block, prefix)
     }
 
@@ -2358,7 +2367,7 @@ impl MarfStore {
         // question is whether the import that put it there ran to the end.
         UnfinishedImport::refuse(directory)?;
         if VersionedMarf::open(directory.join(MARF_FILE))?
-            .tip()
+            .tip()?
             .is_none()
         {
             import(directory, checkpoint.as_ref(), source, expected_root)?;
@@ -2416,9 +2425,8 @@ impl MarfStore {
     }
 
     /// The deepest sealed state, which is where a reopened store resumes.
-    #[must_use]
-    pub fn tip(&self) -> Option<[u8; 32]> {
-        self.marf.tip()
+    pub fn tip(&self) -> Result<Option<[u8; 32]>, MarfStoreError> {
+        Ok(self.marf.tip()?)
     }
 
     /// The chain this state belongs to.
@@ -2428,9 +2436,8 @@ impl MarfStore {
     }
 
     /// The state a block was built on, as the store recorded it.
-    #[must_use]
-    pub fn parent_of(&self, block: [u8; 32]) -> Option<[u8; 32]> {
-        self.marf.parent(block).flatten()
+    pub fn parent_of(&self, block: [u8; 32]) -> Result<Option<[u8; 32]>, MarfStoreError> {
+        Ok(self.marf.parent(block)?.flatten())
     }
 
     /// Create a Clarity database backed by this store.
@@ -2445,9 +2452,10 @@ impl MarfStore {
         block: [u8; 32],
     ) -> Result<(), MarfStoreError> {
         self.marf.begin(parent, block)?;
-        let height = parent
-            .and_then(|parent| self.height_of(parent))
-            .map_or(0, |height| height + 1);
+        let height = match parent {
+            Some(parent) => self.height_of(parent)?.map_or(0, |height| height + 1),
+            None => 0,
+        };
         // The MARF's own height, not the store's: the height keys the trie holds
         // were derived from that one, and a recorder that computed a different
         // answer would record keys nothing wrote.
@@ -2477,11 +2485,11 @@ impl MarfStore {
         Ok(())
     }
 
-    #[must_use]
-    pub fn height_of(&self, block: [u8; 32]) -> Option<u32> {
-        self.marf
-            .height(block)
-            .or_else(|| self.checkpoint_heights.get(&block).copied())
+    pub fn height_of(&self, block: [u8; 32]) -> Result<Option<u32>, MarfStoreError> {
+        Ok(self
+            .marf
+            .height(block)?
+            .or_else(|| self.checkpoint_heights.get(&block).copied()))
     }
 
     /// Start an atomic transaction within the active block state.
@@ -2901,36 +2909,44 @@ impl MarfStore {
     }
 
     /// Return a sealed state's MARF root.
-    #[must_use]
-    pub fn root(&self, block: [u8; 32]) -> Option<StateRoot> {
-        self.marf
-            .root(block)
-            .map(|root: TrieHash| StateRoot(*root.as_bytes()))
+    pub fn root(&self, block: [u8; 32]) -> Result<Option<StateRoot>, MarfStoreError> {
+        Ok(self
+            .marf
+            .root(block)?
+            .map(|root: TrieHash| StateRoot(*root.as_bytes())))
     }
 
     /// Record an imported checkpoint's Stacks height for Clarity balance history lookups.
-    pub fn set_checkpoint_height(&mut self, block: [u8; 32], height: u32) {
-        if self.marf.height(block).is_none() {
+    pub fn set_checkpoint_height(
+        &mut self,
+        block: [u8; 32],
+        height: u32,
+    ) -> Result<(), MarfStoreError> {
+        if self.marf.height(block)?.is_none() {
             self.checkpoint_heights.entry(block).or_insert(height);
         }
+        Ok(())
     }
 
     /// Return the MARF content hash before ancestry is incorporated.
-    #[must_use]
-    pub fn content_root(&self, block: [u8; 32]) -> Option<TrieHash> {
-        self.marf.content_root(block)
+    pub fn content_root(&self, block: [u8; 32]) -> Result<Option<TrieHash>, MarfStoreError> {
+        Ok(self.marf.content_root(block)?)
     }
 
     /// Return the committed MARF leaves for a block state.
-    #[must_use]
-    pub fn leaves(&self, block: [u8; 32]) -> Option<Vec<(TrieHash, MarfValue)>> {
-        self.marf.leaves(block)
+    pub fn leaves(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<(TrieHash, MarfValue)>>, MarfStoreError> {
+        Ok(self.marf.leaves(block)?)
     }
 
     /// Return the root pointers in their consensus serialization order.
-    #[must_use]
-    pub fn root_pointers(&self, block: [u8; 32]) -> Option<Vec<TriePointer>> {
-        self.marf.root_pointers(block)
+    pub fn root_pointers(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<Vec<TriePointer>>, MarfStoreError> {
+        Ok(self.marf.root_pointers(block)?)
     }
 
     /// Return the pointers and child hashes stored under a path prefix.
@@ -2939,8 +2955,8 @@ impl MarfStore {
         &self,
         block: [u8; 32],
         prefix: &[u8],
-    ) -> Option<Vec<(TriePointer, nano_primitives::TrieHash)>> {
-        self.marf.pointers_at(block, prefix)
+    ) -> Result<Option<Vec<(TriePointer, nano_primitives::TrieHash)>>, MarfStoreError> {
+        Ok(self.marf.pointers_at(block, prefix)?)
     }
 
     /// Whether reads currently see the state being written.
@@ -2949,14 +2965,15 @@ impl MarfStore {
             .is_some_and(|active| self.read_block.is_none_or(|block| block == active.block))
     }
 
-    fn block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
+    fn block_at_height(&self, block: [u8; 32], height: u32) -> Result<Option<[u8; 32]>, MarfError> {
         if let Some(active) = self.active.filter(|active| active.block == block) {
             if active.height == height {
-                return Some(block);
+                return Ok(Some(block));
             }
-            return active
-                .parent
-                .and_then(|parent| self.marf.block_at_height(parent, height));
+            return match active.parent {
+                Some(parent) => self.marf.block_at_height(parent, height),
+                None => Ok(None),
+            };
         }
         self.marf.block_at_height(block, height)
     }
@@ -3023,6 +3040,10 @@ impl MarfStore {
 /// The files a durable store keeps in its directory.
 const MARF_FILE: &str = "marf.sqlite";
 const CLARITY_FILE: &str = "clarity.sqlite";
+
+fn marf_vm_error(error: MarfError) -> VmExecutionError {
+    VmInternalError::Expect(format!("MARF storage failed: {error}")).into()
+}
 
 const SIDE_STORE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS data_table (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -3576,8 +3597,8 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn set_block_hash(&mut self, block: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
-        if !self.marf.contains(block.0) && self.active.is_none_or(|active| active.block != block.0)
-        {
+        let sealed = self.marf.contains(block.0).map_err(marf_vm_error)?;
+        if !sealed && self.active.is_none_or(|active| active.block != block.0) {
             return Err(RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(block.0)).into());
         }
         let previous = self.current_block().unwrap_or([0; 32]);
@@ -3586,10 +3607,14 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
-        let found = self
-            .current_block()
-            .and_then(|block| self.block_at_height(block, height))
-            .map(StacksBlockId);
+        let found = match self.current_block() {
+            Some(block) => self.block_at_height(block, height),
+            None => Ok(None),
+        }
+        .unwrap_or_else(|error| {
+            panic!("MARF storage failed while resolving block height {height}: {error}")
+        })
+        .map(StacksBlockId);
         if found.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
             println!("no block at height {height}");
         }
@@ -3608,7 +3633,13 @@ impl ClarityBackingStore for MarfStore {
             .map(|active| active.height)
             .or_else(|| {
                 self.current_block()
-                    .and_then(|block| self.height_of(block))
+                    .and_then(|block| {
+                        self.height_of(block).unwrap_or_else(|error| {
+                            panic!(
+                                "MARF storage failed while resolving the current height: {error}"
+                            )
+                        })
+                    })
                     .map(|height| height + 1)
             })
             .unwrap_or(0)
@@ -3703,7 +3734,10 @@ impl ClarityBackingStore for MarfStore {
     ) -> Result<Option<String>, VmExecutionError> {
         let block = self
             .current_block()
-            .and_then(|block| self.block_at_height(block, height))
+            .map(|block| self.block_at_height(block, height))
+            .transpose()
+            .map_err(marf_vm_error)?
+            .flatten()
             .ok_or_else(|| RuntimeError::BadBlockHeight(height.to_string()))?;
         if self.active.is_some_and(|active| active.block == block)
             && let Some(value) = self.pending_metadata(contract, key)
@@ -5024,6 +5058,72 @@ mod tests {
     }
 
     #[test]
+    fn a_storage_failure_after_open_seals_no_partial_block() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let first = [1; 32];
+        let second = [2; 32];
+        let unsealed = [3; 32];
+        {
+            let mut store =
+                MarfStore::open(Network::TESTNET, directory.path()).expect("create a store");
+            store.begin(None, first).expect("begin first state");
+            for index in 0..64_u8 {
+                store
+                    .put(&format!("key-{index}"), &format!("value-{index}"))
+                    .expect("write first state");
+            }
+            store.seal().expect("seal first state");
+            store
+                .begin(Some(first), second)
+                .expect("begin second state");
+            store.put("other", "two").expect("write second state");
+            store.seal().expect("seal second state");
+        }
+
+        let mut store =
+            MarfStore::open(Network::TESTNET, directory.path()).expect("open coherent state");
+        store
+            .begin(Some(second), unsealed)
+            .expect("begin an unsealed child");
+        let connection = rusqlite::Connection::open(directory.path().join(crate::MARF_FILE))
+            .expect("open the MARF beside the running store");
+        let removed = connection
+            .execute(
+                "DELETE FROM marf_node WHERE block = (SELECT id FROM marf_block WHERE hash = ?1) \
+                 AND idx = (SELECT MAX(idx) FROM marf_node WHERE block = (SELECT id FROM \
+                 marf_block WHERE hash = ?1))",
+                rusqlite::params![&first[..]],
+            )
+            .expect("remove a reachable node after open");
+        assert_eq!(removed, 1);
+        let blocks_before: u32 = connection
+            .query_row("SELECT COUNT(*) FROM marf_block", [], |row| row.get(0))
+            .expect("count sealed blocks");
+        drop(connection);
+
+        let error = (0..64_u8)
+            .find_map(|index| store.get(first, &format!("key-{index}")).err())
+            .expect("the removed node makes a read fail");
+        let message = error.to_string();
+        assert!(message.contains(&directory.path().display().to_string()));
+        assert!(message.contains(&hex::encode(first)));
+        assert!(message.contains("trie node"));
+        store.abort().expect("discard the failed block");
+
+        assert_eq!(
+            store.tip().expect("read the last coherent tip"),
+            Some(second)
+        );
+        assert_eq!(store.root(unsealed).expect("look for a partial seal"), None);
+        let connection = rusqlite::Connection::open(directory.path().join(crate::MARF_FILE))
+            .expect("reopen the MARF");
+        let blocks_after: u32 = connection
+            .query_row("SELECT COUNT(*) FROM marf_block", [], |row| row.get(0))
+            .expect("count sealed blocks after refusal");
+        assert_eq!(blocks_after, blocks_before);
+    }
+
+    #[test]
     fn marf_store_keeps_forked_values_and_roots() {
         let first = [1; 32];
         let second = [2; 32];
@@ -5067,9 +5167,15 @@ mod tests {
                 .as_deref(),
             Some("fork")
         );
-        assert_eq!(store.root(first), Some(first_root));
-        assert_eq!(store.root(second), Some(second_root));
-        assert_eq!(store.root(fork), Some(fork_root));
+        assert_eq!(
+            store.root(first).expect("read first root"),
+            Some(first_root)
+        );
+        assert_eq!(
+            store.root(second).expect("read second root"),
+            Some(second_root)
+        );
+        assert_eq!(store.root(fork).expect("read fork root"), Some(fork_root));
         assert_ne!(second_root, fork_root);
 
         store
@@ -5307,7 +5413,7 @@ mod tests {
         }
 
         let vm = Vm::open(Network::MAINNET, directory.path()).expect("reopen");
-        assert_eq!(vm.tip(), Some([1; 32]));
+        assert_eq!(vm.tip().expect("read tip"), Some([1; 32]));
         assert_eq!(vm.recorded_header([1; 32]), Some(header));
         assert_eq!(
             vm.recorded_ledger([1; 32]).as_deref(),
@@ -5356,7 +5462,7 @@ mod tests {
 
         let store = MarfStore::open(Network::MAINNET, directory.path()).expect("reopen");
         assert_eq!(
-            store.tip(),
+            store.tip().expect("read tip"),
             Some([1; 32]),
             "the child never committed, so the parent is the tip"
         );
@@ -5855,7 +5961,7 @@ mod tests {
         let root = vm.seal_block().expect("seal block");
 
         assert_eq!(value, Value::UInt(2));
-        assert_eq!(vm.root(block), Some(root));
+        assert_eq!(vm.root(block).expect("read root"), Some(root));
     }
 
     #[test]
@@ -6003,7 +6109,10 @@ mod tests {
             .expect("load checkpoint");
 
         assert_eq!(
-            store.root(source).map(|root| root.0),
+            store
+                .root(source)
+                .expect("read imported root")
+                .map(|root| root.0),
             Some(*root.as_bytes())
         );
         assert!(

@@ -192,7 +192,8 @@ fn closed(executor: &mut CheckpointExecutor<MovableBurnchain>) -> Closed {
         signed_root: *tip.header.state_index_root.as_bytes(),
         content_root: executor
             .chainstate_mut()
-            .state_content_root(*tip.block_id().as_bytes()),
+            .state_content_root(*tip.block_id().as_bytes())
+            .expect("read the closed content root"),
     }
 }
 

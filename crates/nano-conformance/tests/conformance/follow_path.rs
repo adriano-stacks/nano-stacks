@@ -1292,7 +1292,8 @@ async fn reference_roots(
         tip.header.state_index_root,
         executor
             .chainstate_mut()
-            .state_content_root(*tip.block_id().as_bytes()),
+            .state_content_root(*tip.block_id().as_bytes())
+            .expect("read the reference content root"),
     );
     task.abort();
     roots
@@ -1408,7 +1409,8 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
             tip.header.state_index_root,
             executor
                 .chainstate_mut()
-                .state_content_root(*tip.block_id().as_bytes()),
+                .state_content_root(*tip.block_id().as_bytes())
+                .expect("read the derived content root"),
         ),
         reference_closed,
         "the node that derived its own burn views sealed a different chain from the one \

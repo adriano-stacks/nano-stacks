@@ -1,4 +1,8 @@
-use std::{fmt, path::Path, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use nano_primitives::{TrieHash, sha512_256};
 
@@ -954,6 +958,7 @@ pub type MarfBlockId = [u8; 32];
 pub struct VersionedMarf {
     storage: TrieStorage,
     active: Option<ActiveVersion>,
+    path: Option<PathBuf>,
 }
 
 impl Default for VersionedMarf {
@@ -980,7 +985,8 @@ pub struct MarfSnapshot(Option<ActiveVersion>);
 impl VersionedMarf {
     /// Open, creating if absent, the MARF held in `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MarfError> {
-        Ok(Self::from_storage(TrieStorage::open(path.as_ref())?))
+        let path = path.as_ref();
+        Ok(Self::from_path(TrieStorage::open(path)?, path))
     }
 
     /// Open a MARF that is already there, creating and writing nothing.
@@ -997,14 +1003,38 @@ impl VersionedMarf {
             )));
         }
         refuse_uncommitted(path)?;
-        Ok(Self::from_storage(TrieStorage::open_existing(path)?))
+        Ok(Self::from_path(TrieStorage::open_existing(path)?, path))
     }
 
     pub(crate) const fn from_storage(storage: TrieStorage) -> Self {
         Self {
             storage,
             active: None,
+            path: None,
         }
+    }
+
+    fn from_path(storage: TrieStorage, path: &Path) -> Self {
+        Self {
+            storage,
+            active: None,
+            path: Some(path.to_path_buf()),
+        }
+    }
+
+    fn read_error(&self, block: Option<MarfBlockId>, error: MarfError) -> MarfError {
+        let MarfError::Storage(reason) = error else {
+            return error;
+        };
+        let path = self.path.as_deref().map_or_else(
+            || "in-memory MARF".to_owned(),
+            |path| path.display().to_string(),
+        );
+        let block = block.map_or_else(
+            || "unknown block".to_owned(),
+            |block| format!("block {}", hex::encode(block)),
+        );
+        MarfError::Storage(format!("{path}, {block}: {reason}"))
     }
 
     /// Copy the unsealed state so it can be restored after a rollback.
@@ -1019,9 +1049,10 @@ impl VersionedMarf {
     }
 
     /// The deepest sealed state, which is where a reopened MARF resumes.
-    #[must_use]
-    pub fn tip(&self) -> Option<MarfBlockId> {
-        self.storage.tip().expect("trie storage")
+    pub fn tip(&self) -> Result<Option<MarfBlockId>, MarfError> {
+        self.storage
+            .tip()
+            .map_err(|error| self.read_error(None, error))
     }
 
     /// Give back every sealed state above a height.
@@ -1076,9 +1107,11 @@ impl VersionedMarf {
     }
 
     /// Whether a sealed state exists.
-    #[must_use]
-    pub fn contains(&self, block: MarfBlockId) -> bool {
-        self.storage.block(block).expect("trie storage").is_some()
+    pub fn contains(&self, block: MarfBlockId) -> Result<bool, MarfError> {
+        self.storage
+            .block(block)
+            .map(|record| record.is_some())
+            .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// The state currently being written.
@@ -1208,10 +1241,10 @@ impl VersionedMarf {
         block: MarfBlockId,
         active: &ActiveVersion,
     ) -> Result<TrieHash, MarfError> {
-        let parent = active
-            .parent
-            .and_then(|parent| self.record(parent))
-            .map(|record| record.id);
+        let parent = match active.parent {
+            Some(parent) => self.record(parent)?.map(|record| record.id),
+            None => None,
+        };
         let jumps = self.jumps(active.parent, active.height)?;
         let ancestor_roots = self.ancestor_roots_for(&jumps)?;
 
@@ -1257,10 +1290,13 @@ impl VersionedMarf {
         block: MarfBlockId,
         path: [u8; 32],
     ) -> Result<Option<MarfValue>, MarfError> {
-        let Some(root) = self.sealed_root(block)? else {
-            return Ok(None);
-        };
-        root.get(&self.storage, &path)
+        (|| {
+            let Some(root) = self.sealed_root(block)? else {
+                return Ok(None);
+            };
+            root.get(&self.storage, &path)
+        })()
+        .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Read a logical key from the state being written.
@@ -1281,90 +1317,121 @@ impl VersionedMarf {
             return Ok(None);
         };
         find_path(&self.storage, &active.root_children, path)
+            .map_err(|error| self.read_error(Some(active.block), error))
     }
 
     /// Return a sealed state root.
-    #[must_use]
-    pub fn root(&self, block: MarfBlockId) -> Option<TrieHash> {
-        self.record(block).map(|record| record.root)
+    pub fn root(&self, block: MarfBlockId) -> Result<Option<TrieHash>, MarfError> {
+        self.record(block)
+            .map(|record| record.map(|record| record.root))
+            .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Return the content hash before ancestry is incorporated into the state root.
-    #[must_use]
-    pub fn content_root(&self, block: MarfBlockId) -> Option<TrieHash> {
-        self.record(block).map(|record| record.content)
+    pub fn content_root(&self, block: MarfBlockId) -> Result<Option<TrieHash>, MarfError> {
+        self.record(block)
+            .map(|record| record.map(|record| record.content))
+            .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Return all leaves stored for a sealed state.
-    #[must_use]
-    pub fn leaves(&self, block: MarfBlockId) -> Option<Vec<(TrieHash, MarfValue)>> {
-        let root = self.sealed_root(block).expect("trie storage")?;
-        let TrieNode::Internal { children, .. } = &*root else {
-            return None;
-        };
-        Some(collect_leaves(&self.storage, children).expect("trie storage"))
+    pub fn leaves(
+        &self,
+        block: MarfBlockId,
+    ) -> Result<Option<Vec<(TrieHash, MarfValue)>>, MarfError> {
+        (|| {
+            let Some(root) = self.sealed_root(block)? else {
+                return Ok(None);
+            };
+            let TrieNode::Internal { children, .. } = &*root else {
+                return Ok(None);
+            };
+            Ok(Some(collect_leaves(&self.storage, children)?))
+        })()
+        .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Return the root pointers for a sealed state.
-    #[must_use]
-    pub fn root_pointers(&self, block: MarfBlockId) -> Option<Vec<TriePointer>> {
-        Some(
-            self.pointers_at(block, &[])?
-                .into_iter()
-                .map(|(pointer, _)| pointer)
-                .collect(),
-        )
+    pub fn root_pointers(&self, block: MarfBlockId) -> Result<Option<Vec<TriePointer>>, MarfError> {
+        let Some(pointers) = self.pointers_at(block, &[])? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            pointers.into_iter().map(|(pointer, _)| pointer).collect(),
+        ))
     }
 
     /// Return the pointers and child hashes a sealed state holds under a prefix.
-    #[must_use]
     pub fn pointers_at(
         &self,
         block: MarfBlockId,
         prefix: &[u8],
-    ) -> Option<Vec<(TriePointer, TrieHash)>> {
-        let root = self.sealed_root(block).expect("trie storage")?;
-        let TrieNode::Internal { children, .. } = &*root else {
-            return None;
-        };
-        pointers_under_root(&self.storage, children, prefix).expect("trie storage")
+    ) -> Result<Option<Vec<(TriePointer, TrieHash)>>, MarfError> {
+        (|| {
+            let Some(root) = self.sealed_root(block)? else {
+                return Ok(None);
+            };
+            let TrieNode::Internal { children, .. } = &*root else {
+                return Ok(None);
+            };
+            Ok(pointers_under_root(&self.storage, children, prefix)?)
+        })()
+        .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Return a sealed state's parent block, if the state exists.
-    #[must_use]
-    pub fn parent(&self, block: MarfBlockId) -> Option<Option<MarfBlockId>> {
-        let record = self.record(block)?;
-        Some(
-            record
-                .parent
-                .map(|parent| self.storage.block_hash(parent).expect("trie storage")),
-        )
+    pub fn parent(&self, block: MarfBlockId) -> Result<Option<Option<MarfBlockId>>, MarfError> {
+        (|| {
+            let Some(record) = self.record(block)? else {
+                return Ok(None);
+            };
+            let parent = match record.parent {
+                Some(parent) => Some(self.storage.block_hash(parent)?),
+                None => None,
+            };
+            Ok(Some(parent))
+        })()
+        .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Return a sealed state's height.
-    #[must_use]
-    pub fn height(&self, block: MarfBlockId) -> Option<u32> {
-        self.record(block).map(|record| record.height)
+    pub fn height(&self, block: MarfBlockId) -> Result<Option<u32>, MarfError> {
+        self.record(block)
+            .map(|record| record.map(|record| record.height))
+            .map_err(|error| self.read_error(Some(block), error))
     }
 
     /// Find an ancestor at `height` from a sealed state.
     ///
     /// The walk descends the state's power-of-two ancestor table, so it costs a
     /// logarithmic number of hops rather than one per intervening block.
-    #[must_use]
-    pub fn block_at_height(&self, block: MarfBlockId, height: u32) -> Option<MarfBlockId> {
-        let mut record = self.record(block)?;
-        while record.height > height {
-            let distance = record.height - height;
-            let jumps = self.storage.jumps(record.hash).expect("trie storage");
-            let step = jumps.get(distance.ilog2() as usize)?;
-            record = self.record(*step)?;
-        }
-        (record.height == height).then_some(record.hash)
+    pub fn block_at_height(
+        &self,
+        block: MarfBlockId,
+        height: u32,
+    ) -> Result<Option<MarfBlockId>, MarfError> {
+        (|| {
+            let Some(mut record) = self.record(block)? else {
+                return Ok(None);
+            };
+            while record.height > height {
+                let distance = record.height - height;
+                let jumps = self.storage.jumps(record.hash)?;
+                let Some(step) = jumps.get(distance.ilog2() as usize) else {
+                    return Ok(None);
+                };
+                let Some(next) = self.record(*step)? else {
+                    return Ok(None);
+                };
+                record = next;
+            }
+            Ok((record.height == height).then_some(record.hash))
+        })()
+        .map_err(|error| self.read_error(Some(block), error))
     }
 
-    fn record(&self, block: MarfBlockId) -> Option<BlockRecord> {
-        self.storage.block(block).expect("trie storage")
+    fn record(&self, block: MarfBlockId) -> Result<Option<BlockRecord>, MarfError> {
+        self.storage.block(block)
     }
 
     fn sealed_root(&self, block: MarfBlockId) -> Result<Option<Arc<TrieNode>>, MarfError> {
@@ -1680,12 +1747,26 @@ mod tests {
             .expect("the test store reads"),
             Some(1.into())
         );
-        assert_eq!(trie.root(first), Some(first_root));
-        assert_eq!(trie.root(second), Some(second_root));
+        assert_eq!(
+            trie.root(first).expect("the test store reads"),
+            Some(first_root)
+        );
+        assert_eq!(
+            trie.root(second).expect("the test store reads"),
+            Some(second_root)
+        );
         assert_ne!(third_root, second_root);
-        assert_eq!(trie.tip(), Some(third));
-        assert_eq!(trie.block_at_height(third, 0), Some(first));
-        assert_eq!(trie.block_at_height(third, 1), Some(second));
+        assert_eq!(trie.tip().expect("the test store reads"), Some(third));
+        assert_eq!(
+            trie.block_at_height(third, 0)
+                .expect("the test store reads"),
+            Some(first)
+        );
+        assert_eq!(
+            trie.block_at_height(third, 1)
+                .expect("the test store reads"),
+            Some(second)
+        );
     }
 
     #[test]
@@ -1700,7 +1781,7 @@ mod tests {
             .expect("writes active state");
         trie.abort().expect("discards active state");
 
-        assert_eq!(trie.root(block), None);
+        assert_eq!(trie.root(block).expect("the test store reads"), None);
         trie.begin(None, replacement)
             .expect("starts replacement state");
         trie.seal().expect("seals replacement state");
@@ -1732,8 +1813,11 @@ mod tests {
         };
 
         let reopened = VersionedMarf::open(&path).expect("reopen MARF");
-        assert_eq!(reopened.tip(), Some(second));
-        assert_eq!(reopened.root(second), Some(expected));
+        assert_eq!(reopened.tip().expect("the test store reads"), Some(second));
+        assert_eq!(
+            reopened.root(second).expect("the test store reads"),
+            Some(expected)
+        );
         assert_eq!(
             reopened.get(second, key).expect("the test store reads"),
             Some(MarfValue::from_value(b"two"))

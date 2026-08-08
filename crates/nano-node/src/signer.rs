@@ -54,7 +54,7 @@ pub async fn open(
     context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
     if let Some(pending) = pending {
         let operations = bitcoin.block_at(pending.height)?;
-        let parent = chainstate.tip();
+        let parent = chainstate.tip()?;
         chainstate.append_nakamoto_block_with_bitcoin_operations(
             pending,
             &operations.operations,

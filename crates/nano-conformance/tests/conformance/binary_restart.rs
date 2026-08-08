@@ -391,7 +391,7 @@ fn durable_tip(directory: &Path) -> Option<[u8; 32]> {
         directory.join("chainstate"),
     )
     .expect("the state directory opens after a kill");
-    chainstate.tip()
+    chainstate.tip().expect("read the durable tip")
 }
 
 /// What one kill and the restart after it has to leave behind.

@@ -17,12 +17,18 @@
 # same as `semantic`: a failed gate. That is the source-level gate task 085 asks
 # for -- a new ignore cannot be added without appearing here with an owner.
 #
+# `class` is also the release policy. `infrastructure`, `semantic` and
+# `unclassified` are blocking; `covered`, `out-of-scope` and `tool` are allowed
+# only with the evidence named below.
+#
 # class:
 #   infrastructure  a required behaviour that needs a service, network or fixture
 #                   this machine does not have. Names the job that supplies it,
 #                   and that job must have run before task 053 can pass.
 #   out-of-scope    the behaviour does not exist in epoch 4.0, and nano's own gate
 #                   for what 4.0 *does* do is named. Not blocking.
+#   covered         this harness cannot express the behaviour, and an unconditional
+#                   replacement gate is named. Not blocking.
 #   semantic        a disagreement about what Clarity means, or any consensus,
 #                   cost, receipt or state differential. A failed release gate now.
 #   tool            a developer aid that asserts no required behaviour.
@@ -70,9 +76,8 @@ durable store.
 
 [[ignored]]
 test = "get_tenure_info_block_reward"
-class = "infrastructure"
+class = "covered"
 owner = "060"
-job = "covered elsewhere"
 covered_by = "nano-conformance tenure_block_reward"
 measured = """
 `(get-tenure-info? block-reward u0)` answers `none` against an expected
@@ -152,6 +157,7 @@ covered_by = "nano-conformance at_block_refusal"
 test = "get_block_info_block_reward"
 class = "out-of-scope"
 owner = "066"
+covered_by = "nano-conformance tenure_block_reward"
 measured = """
 `use of unresolved function 'get-block-info?'`. Clarity 6 replaced it with
 `get-stacks-block-info?` and `get-tenure-info?`. The `block-reward` field itself
@@ -163,6 +169,7 @@ classified `semantic`.
 test = "crossprop_blockinfo_within_controlled_range"
 class = "out-of-scope"
 owner = "066"
+covered_by = "nano-conformance at_block_refusal, tenure_block_reward"
 measured = "`use of unresolved function 'get-block-info?'`, in both engines."
 
 [[ignored]]
@@ -194,109 +201,127 @@ measured = "A search over generated programs. It asserts no required behaviour."
 test = "reads_a_mainnet_burn_block"
 class = "infrastructure"
 owner = "053"
-job = "network"
+job = "release-qualification"
+requires = "network access to https://mempool.space/api"
 
 [[ignored]]
 test = "a_stock_signer_answers_proposals_through_nano"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "NANO_HOSTED_RPC, NANO_HACKNET_PEER, NANO_HOSTED_SIGNER_PUBLIC_KEY, NANO_EVENT_DIR and NANO_STOCK_EVENT_DIR"
 note = "One of the stock-signer journeys task 053 requires by name."
 
 [[ignored]]
 test = "a_transaction_posted_to_nano_is_admitted_and_reported"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "hosted-signer inputs plus NANO_FUNDED_KEY"
 note = "The stock-client journey task 053 requires by name."
 
 [[ignored]]
 test = "an_observer_on_nano_is_told_what_stacks_core_tells_its_own"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "NANO_HOSTED_RPC, NANO_HACKNET_PEER, NANO_HOSTED_SIGNER_PUBLIC_KEY, NANO_EVENT_DIR and NANO_STOCK_EVENT_DIR"
 
 [[ignored]]
 test = "hacknet_keeps_working_with_a_nano_participant"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet, NANO_SIGNER_PUBLIC_KEY and the NANO_HACKNET_* qualification parameters"
 
 [[ignored]]
 test = "serves_a_validated_hacknet_block"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_accepts_a_nano_mined_block"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 and NANO_MINER_BLOCK_ID"
 
 [[ignored]]
 test = "hacknet_accepts_a_nano_signature_in_a_block"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 and NANO_SIGNER_PUBLIC_KEY"
 
 [[ignored]]
 test = "hacknet_commitment_matches_the_stock_miners"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
 
 [[ignored]]
 test = "hacknet_follower_retains_an_authenticated_tenure"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_follower_spans_prepare_phase_and_reward_cycle_rollover"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 spanning at least two reward cycles"
 note = "The ≥2 reward cycles including prepare/rollover that task 053 requires."
 
 [[ignored]]
 test = "hacknet_miners_stackerdb_is_readable"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_pox_calendar_is_available"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_sortition_authenticates_the_current_tenure"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_sortition_hash_verifies_the_winning_vrf_proof"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
 
 [[ignored]]
 test = "hacknet_tenure_downloads_and_links"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_tip_block_downloads_and_validates"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443"
 
 [[ignored]]
 test = "hacknet_total_burn_continues_the_parent_tenure"
 class = "infrastructure"
 owner = "053"
-job = "hacknet"
+job = "release-qualification"
+requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
