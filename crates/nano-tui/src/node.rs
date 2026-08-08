@@ -46,6 +46,29 @@ pub struct Sortition {
     pub stacks_parent_ch: Option<String>,
     pub committed_block_hash: Option<String>,
     pub vrf_seed: Option<String>,
+    pub mining_competition: Option<MiningCompetition>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MiningCompetition {
+    pub winner_txid: Option<String>,
+    pub block_burn_sats: u64,
+    pub window_median_burn_sats: u64,
+    pub sampled_window_blocks: u8,
+    #[serde(default)]
+    pub participants: Vec<SortitionParticipant>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SortitionParticipant {
+    pub txid: String,
+    pub signing_key_hash: Option<String>,
+    pub vrf_public_key: Option<String>,
+    pub committed_block_hash: String,
+    pub burn_sats: u64,
+    pub effective_burn_sats: u64,
+    pub median_burn_sats: u64,
+    pub frequency: u8,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -1345,6 +1345,8 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
         // Filled by `prime`, which reads the seed's own burn block: the two spends
         // come out of the commitment window, not out of a captured row.
         burn_spends: None,
+        // Rebuilt by the same priming walk from the seed's commitment window.
+        mining_competition: None,
         pox_id,
     })
 }
@@ -1392,6 +1394,7 @@ mod tests {
             committed_block_hash: None,
             parent_bitcoin_height: None,
             burn_spends: None,
+            mining_competition: None,
             pox_id: PoxId::initial(),
         };
         let history = vec![behind, seed.consensus_hash];

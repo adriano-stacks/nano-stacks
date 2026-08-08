@@ -236,6 +236,7 @@ pub fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         winner_vrf_public_key: None,
         winner_signing_key_hash: None,
         burn_spends: None,
+        mining_competition: None,
         pox_id: mainnet_pox_id(),
     }
 }

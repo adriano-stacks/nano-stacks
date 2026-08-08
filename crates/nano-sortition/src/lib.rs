@@ -462,6 +462,31 @@ pub struct BurnSample {
     pub range_end: Uint256,
 }
 
+/// One candidate commitment as it appeared in a locally derived sortition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortitionParticipant {
+    pub txid: [u8; 32],
+    pub signing_key_hash: Option<[u8; 20]>,
+    pub vrf_public_key: Option<[u8; 32]>,
+    pub committed_block_hash: [u8; 32],
+    /// What this commitment paid in the electing Bitcoin block.
+    pub burn_sats: u64,
+    /// The burn used to assign its relative range after the window median cap.
+    pub effective_burn_sats: u64,
+    pub median_burn_sats: u64,
+    pub frequency: u8,
+}
+
+/// The local inputs that explain one burnchain election.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MiningCompetition {
+    pub winner_txid: Option<[u8; 32]>,
+    pub block_burn_sats: u64,
+    pub window_median_burn_sats: u64,
+    pub sampled_window_blocks: u8,
+    pub participants: Vec<SortitionParticipant>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitmentBurnStatistics {
     pub block_burn: u64,
@@ -591,6 +616,34 @@ pub fn commitment_distribution(
         .collect::<Result<Vec<_>, _>>()?;
     assign_ranges(&mut samples)?;
     Ok(samples)
+}
+
+fn mining_competition(
+    distribution: &[BurnSample],
+    statistics: CommitmentBurnStatistics,
+    sampled_window_blocks: usize,
+    winner_txid: Option<[u8; 32]>,
+) -> MiningCompetition {
+    MiningCompetition {
+        winner_txid,
+        block_burn_sats: statistics.block_burn,
+        window_median_burn_sats: statistics.window_median_burn,
+        sampled_window_blocks: u8::try_from(sampled_window_blocks)
+            .expect("commitment window fits u8"),
+        participants: distribution
+            .iter()
+            .map(|sample| SortitionParticipant {
+                txid: sample.candidate.txid,
+                signing_key_hash: sample.candidate.signing_key_hash,
+                vrf_public_key: sample.candidate.vrf_public_key,
+                committed_block_hash: sample.candidate.committed_block_hash,
+                burn_sats: sample.candidate.burn_sats,
+                effective_burn_sats: sample.burn_sats,
+                median_burn_sats: sample.median_burn_sats,
+                frequency: sample.frequency,
+            })
+            .collect(),
+    }
 }
 
 #[must_use]
@@ -931,6 +984,8 @@ pub struct SortitionSnapshot {
     /// window has not been primed. See [`BurnSpends`] for why the pair never
     /// splits.
     pub burn_spends: Option<BurnSpends>,
+    /// Candidate commitments and the weights this node derived for them.
+    pub mining_competition: Option<MiningCompetition>,
     pub pox_id: PoxId,
 }
 
@@ -954,6 +1009,7 @@ impl SortitionSnapshot {
             committed_block_hash: None,
             parent_bitcoin_height: None,
             burn_spends: None,
+            mining_competition: None,
             pox_id: PoxId::initial(),
         }
     }
@@ -1303,6 +1359,7 @@ impl SnapshotChain {
             // weighed over, which is `SortitionEngine::append`: this chain is given
             // a total burn and a winner and never sees a commitment.
             burn_spends: None,
+            mining_competition: None,
             pox_id,
         };
         self.consensus_hashes.push(snapshot.consensus_hash);
@@ -1319,6 +1376,12 @@ impl SnapshotChain {
     pub fn record_tip_burn_spends(&mut self, spends: Option<BurnSpends>) {
         if let Some(tip) = self.snapshots.last_mut() {
             tip.burn_spends = spends;
+        }
+    }
+
+    pub fn record_tip_mining_competition(&mut self, competition: Option<MiningCompetition>) {
+        if let Some(tip) = self.snapshots.last_mut() {
+            tip.mining_competition = competition;
         }
     }
 
@@ -1569,6 +1632,11 @@ impl SortitionEngine {
     /// spends: a chain resumed from a checkpoint executes the tenure standing on its
     /// seed's burn view before it advances once, and the two spends are Clarity's to
     /// read at that block like any other.
+    ///
+    /// Competition diagnostics remain absent on the seed. Its previous winner's VRF
+    /// seed is outside this window, so the seed's winner cannot be selected locally;
+    /// copying the checkpoint's asserted winner into a derived distribution would
+    /// mislabel an attested boundary as a locally reproduced election.
     pub fn prime(&mut self, bitcoin_height: u64, commitments: CommitmentWindowBlock) {
         self.commitment_window.push(commitments);
         if self.commitment_window.len() > RETAINED_COMMITMENT_BLOCKS {
@@ -1707,7 +1775,7 @@ impl SortitionEngine {
             .sortition_hash
             .mix_bitcoin_header(BitcoinHeaderHash::from_bytes(block.hash));
         let previous_vrf_seed = self.snapshots.effective_winner_seed().unwrap_or([0; 32]);
-        let winner = (statistics.block_burn != 0)
+        let winner_index = (statistics.block_burn != 0)
             .then(|| {
                 select_epoch4_winner(
                     &distribution,
@@ -1719,7 +1787,13 @@ impl SortitionEngine {
                 )
             })
             .flatten();
-        let winner = winner.and_then(|index| {
+        let competition = mining_competition(
+            &distribution,
+            statistics,
+            window.len(),
+            winner_index.map(|index| distribution[index].candidate.txid),
+        );
+        let winner = winner_index.and_then(|index| {
             self.snapshots
                 .tip()
                 .total_burn
@@ -1759,6 +1833,8 @@ impl SortitionEngine {
         // under this burn view the chain may stand several blocks further on.
         let spends = self.spends_at_tip();
         self.snapshots.record_tip_burn_spends(spends);
+        self.snapshots
+            .record_tip_mining_competition(Some(competition));
         Ok(self.snapshots.tip())
     }
 }
@@ -2035,6 +2111,79 @@ mod tests {
     }
 
     #[test]
+    fn priming_keeps_checkpoint_seed_competition_unavailable() {
+        let candidate = commitment(1, 0, 10);
+        let mut seed = SortitionSnapshot::genesis(5, super::BitcoinHeaderHash::from_bytes([0; 32]));
+        seed.winner_txid = Some(candidate.txid);
+        let mut engine = SortitionEngine::new(seed);
+        for height in 0..5 {
+            engine.prime(
+                height,
+                CommitmentWindowBlock {
+                    commitments: Vec::new(),
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+            );
+        }
+        engine.prime(
+            5,
+            CommitmentWindowBlock {
+                commitments: vec![candidate],
+                missed_commitments: Vec::new(),
+                requires_single_commit: false,
+            },
+        );
+
+        assert!(engine.snapshots().tip().burn_spends.is_some());
+        assert_eq!(engine.snapshots().tip().mining_competition, None);
+    }
+
+    #[test]
+    fn a_sortition_with_candidates_and_no_eligible_winner_retains_the_candidates() {
+        let seed = SortitionSnapshot::genesis(5, super::BitcoinHeaderHash::from_bytes([0; 32]));
+        let mut engine = SortitionEngine::new(seed);
+        for height in 0..=5 {
+            engine.prime(
+                height,
+                CommitmentWindowBlock {
+                    commitments: Vec::new(),
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+            );
+        }
+        let candidate = commitment(1, 0, 10);
+        let snapshot = engine
+            .append(
+                &bitcoin_block(6, 1),
+                &[candidate.txid],
+                CommitmentWindowBlock {
+                    commitments: vec![candidate.clone()],
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+                super::PoxId::initial(),
+                MINING_COMMITMENT_WINDOW,
+            )
+            .expect("the no-winner sortition is still a snapshot");
+        let competition = snapshot
+            .mining_competition
+            .as_ref()
+            .expect("locally derived candidates remain diagnostic");
+
+        assert_eq!(snapshot.winner_txid, None);
+        assert_eq!(competition.winner_txid, None);
+        assert_eq!(competition.participants.len(), 1);
+        assert_eq!(competition.participants[0].txid, candidate.txid);
+        assert_eq!(competition.participants[0].frequency, 1);
+        assert_eq!(
+            competition.sampled_window_blocks,
+            u8::try_from(MINING_COMMITMENT_WINDOW).expect("the mining window fits")
+        );
+    }
+
+    #[test]
     fn engine_keeps_winner_and_total_across_bitcoin_blocks() {
         let genesis = SortitionSnapshot::genesis(0, super::BitcoinHeaderHash::from_bytes([0; 32]));
         let mut engine = SortitionEngine::new(genesis);
@@ -2056,6 +2205,16 @@ mod tests {
         assert_eq!(snapshot.total_burn, 10);
         assert_eq!(snapshot.winner_txid, Some(first.txid));
         assert_eq!(snapshot.winner_vrf_seed, Some(first.vrf_seed));
+        let competition = snapshot
+            .mining_competition
+            .as_ref()
+            .expect("the election inputs are retained");
+        assert_eq!(competition.winner_txid, Some(first.txid));
+        assert_eq!(competition.block_burn_sats, 10);
+        assert_eq!(competition.sampled_window_blocks, 1);
+        assert_eq!(competition.participants.len(), 1);
+        assert_eq!(competition.participants[0].burn_sats, 10);
+        assert_eq!(competition.participants[0].effective_burn_sats, 10);
         assert_eq!(
             snapshot.operations_hash,
             super::OpsHash::from_txids(&[first.txid])
@@ -2079,6 +2238,41 @@ mod tests {
         assert_eq!(snapshot.winner_txid, Some(second.txid));
         assert_eq!(snapshot.winner_vrf_seed, Some(second.vrf_seed));
         assert_eq!(engine.commitment_window().len(), 2);
+    }
+
+    #[test]
+    fn engine_retains_every_participant_in_the_electing_block() {
+        let genesis = SortitionSnapshot::genesis(0, super::BitcoinHeaderHash::from_bytes([0; 32]));
+        let mut engine = SortitionEngine::new(genesis);
+        let participants = [commitment(1, 0, 10), commitment(2, 0, 20)];
+        let snapshot = engine
+            .append(
+                &bitcoin_block(1, 1),
+                &[participants[0].txid, participants[1].txid],
+                CommitmentWindowBlock {
+                    commitments: participants.to_vec(),
+                    missed_commitments: Vec::new(),
+                    requires_single_commit: false,
+                },
+                super::PoxId::initial(),
+                1,
+            )
+            .expect("sortition snapshot");
+        let competition = snapshot
+            .mining_competition
+            .as_ref()
+            .expect("mining competition");
+
+        assert_eq!(competition.block_burn_sats, 30);
+        assert_eq!(competition.participants.len(), 2);
+        assert_eq!(competition.participants[0].burn_sats, 10);
+        assert_eq!(competition.participants[1].burn_sats, 20);
+        assert!(
+            competition
+                .participants
+                .iter()
+                .any(|participant| { competition.winner_txid == Some(participant.txid) })
+        );
     }
 
     /// A chain walked ahead of execution answers for the burn block it is asked

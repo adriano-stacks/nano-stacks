@@ -328,6 +328,7 @@ mod tests {
             last_sortition_consensus_hash: None,
             committed_block_hash: Some(BlockHeaderHash::from_bytes([7; 32])),
             vrf_seed: Some([8; 32]),
+            mining_competition: None,
         }
     }
 

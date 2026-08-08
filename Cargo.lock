@@ -3034,6 +3034,7 @@ dependencies = [
  "nano-crypto",
  "nano-mempool",
  "nano-primitives",
+ "nano-sortition",
  "reqwest",
  "serde",
  "serde_json",

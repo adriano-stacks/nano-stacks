@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| "http://127.0.0.1:20443".to_owned());
     if url == "--help" || url == "-h" {
         println!(
-            "usage: nano-tui [rpc-url] [--once]\n               ↑/↓ select   enter/→ open   esc/← back   r refresh   q quit/back\n               --once renders one frame as text and exits, for a script or a log"
+            "usage: nano-tui [rpc-url] [--once]\n               ↑/↓ select   enter/→ open   m mining   esc/← back   r refresh   q quit/back\n               --once renders one frame as text and exits, for a script or a log"
         );
         return Ok(());
     }
@@ -119,6 +119,7 @@ struct State {
     blocks: Vec<node::Block>,
     selected_block: ListState,
     selected_transaction: ListState,
+    selected_participant: ListState,
     screen: Screen,
     transaction_scroll: u16,
     /// The last poll that answered at all, so a node that has just gone away is
@@ -141,6 +142,7 @@ impl State {
         self.tenure = node.tenure().or_else(|| self.tenure.take());
         if let Some(sortitions) = node.sortitions() {
             self.sortitions = sortitions;
+            select_current_participant(self);
         }
         // Only the executed tip, and only when it moved: the explorer is a record of
         // what this node ran, so a block enters it by having been executed here.
@@ -204,6 +206,7 @@ enum Screen {
     Blocks,
     Block,
     Transaction,
+    Mining,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,10 +246,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
 
 fn handle_key(state: &mut State, key: KeyCode) -> Action {
     match key {
+        KeyCode::Char('m') => {
+            state.screen = if state.screen == Screen::Mining {
+                Screen::Blocks
+            } else {
+                Screen::Mining
+            };
+            select_current_participant(state);
+        }
         KeyCode::Char('q' | 'h') | KeyCode::Esc | KeyCode::Left => {
             match state.screen {
                 Screen::Blocks => return Action::Quit,
-                Screen::Block => state.screen = Screen::Blocks,
+                Screen::Block | Screen::Mining => state.screen = Screen::Blocks,
                 Screen::Transaction => state.screen = Screen::Block,
             }
             state.transaction_scroll = 0;
@@ -263,7 +274,7 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
                 state.transaction_scroll = 0;
                 state.screen = Screen::Transaction;
             }
-            Screen::Blocks | Screen::Block | Screen::Transaction => {}
+            Screen::Blocks | Screen::Block | Screen::Transaction | Screen::Mining => {}
         },
         KeyCode::Down | KeyCode::Char('j') => move_selection(state, 1),
         KeyCode::Up | KeyCode::Char('k') => move_selection(state, -1),
@@ -289,6 +300,11 @@ fn move_selection(state: &mut State, by: isize) {
                 .transaction_scroll
                 .saturating_add_signed(i16::try_from(by).expect("key movement fits in i16"));
         }
+        Screen::Mining => {
+            let participants =
+                mining_competition(state).map_or(0, |competition| competition.participants.len());
+            move_list_selection(&mut state.selected_participant, participants, by);
+        }
     }
 }
 
@@ -311,6 +327,11 @@ fn move_to_edge(state: &mut State, end: bool) {
             select_edge(&mut state.selected_transaction, transactions, end);
         }
         Screen::Transaction => state.transaction_scroll = if end { u16::MAX } else { 0 },
+        Screen::Mining => {
+            let participants =
+                mining_competition(state).map_or(0, |competition| competition.participants.len());
+            select_edge(&mut state.selected_participant, participants, end);
+        }
     }
 }
 
@@ -331,6 +352,102 @@ fn select_first_transaction(state: &mut State) {
     {
         state.selected_transaction.select(Some(0));
     }
+}
+
+fn latest_sortition(state: &State) -> Option<&Sortition> {
+    state.sortitions.first()
+}
+
+fn active_sortition(state: &State) -> Option<&Sortition> {
+    state
+        .sortitions
+        .iter()
+        .find(|sortition| sortition.elected == Some(true))
+}
+
+fn mining_competition(state: &State) -> Option<&node::MiningCompetition> {
+    latest_sortition(state)?.mining_competition.as_ref()
+}
+
+fn competition_winner(
+    competition: &node::MiningCompetition,
+) -> Option<&node::SortitionParticipant> {
+    let winner = competition.winner_txid.as_deref()?;
+    competition
+        .participants
+        .iter()
+        .find(|participant| same_id(&participant.txid, winner))
+}
+
+fn miner_identity(sortition: &Sortition) -> (Option<&str>, &'static str) {
+    if let Some(hash) = sortition.miner_pk_hash160.as_deref() {
+        return (Some(hash), " · signing key");
+    }
+    let winner = sortition
+        .mining_competition
+        .as_ref()
+        .and_then(competition_winner);
+    winner
+        .and_then(|winner| winner.signing_key_hash.as_deref())
+        .map_or_else(
+            || {
+                (
+                    winner.and_then(|winner| winner.vrf_public_key.as_deref()),
+                    " · VRF key",
+                )
+            },
+            |hash| (Some(hash), " · signing key"),
+        )
+}
+
+fn participant_weight(
+    participant: &node::SortitionParticipant,
+    competition: &node::MiningCompetition,
+) -> String {
+    let total: u128 = competition
+        .participants
+        .iter()
+        .map(|participant| u128::from(participant.effective_burn_sats))
+        .sum();
+    if total == 0 {
+        return "unavailable".to_owned();
+    }
+    let tenths = u128::from(participant.effective_burn_sats) * 1_000 / total;
+    format!("{}.{}%", tenths / 10, tenths % 10)
+}
+
+fn select_current_participant(state: &mut State) {
+    let Some(competition) = mining_competition(state) else {
+        state.selected_participant.select(None);
+        return;
+    };
+    if competition.participants.is_empty() {
+        state.selected_participant.select(None);
+        return;
+    }
+    let selected = state.selected_participant.selected();
+    if selected.is_some_and(|index| index < competition.participants.len()) {
+        return;
+    }
+    let winner = competition.winner_txid.as_deref();
+    let selected = winner
+        .and_then(|winner| {
+            competition
+                .participants
+                .iter()
+                .position(|participant| same_id(&participant.txid, winner))
+        })
+        .unwrap_or_default();
+    state.selected_participant.select(Some(selected));
+}
+
+fn selected_participant(state: &State) -> Option<&node::SortitionParticipant> {
+    let competition = mining_competition(state)?;
+    state
+        .selected_participant
+        .selected()
+        .and_then(|index| competition.participants.get(index))
+        .or_else(|| competition.participants.first())
 }
 
 fn selected_block(state: &State) -> Option<&node::Block> {
@@ -364,6 +481,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         match state.screen {
             Screen::Block => draw_block(frame, areas[1], state),
             Screen::Transaction => draw_transaction(frame, areas[1], state),
+            Screen::Mining => draw_mining(frame, areas[1], state),
             Screen::Blocks => unreachable!("handled by the dashboard layout"),
         }
         draw_keys(frame, areas[2], state);
@@ -572,7 +690,7 @@ fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'s
 
 /// The burn view this node executed under, as *it* derived it.
 fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
-    let Some(latest) = state.sortitions.first() else {
+    let Some(latest) = latest_sortition(state) else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "waiting for this node to derive a burnchain decision",
@@ -588,6 +706,43 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
         Some(false) => ("no election · current tenure continued", Color::DarkGray),
         None => ("election result unavailable", Color::Red),
     };
+    let active = active_sortition(state);
+    let (miner, miner_kind) = active.map_or((None, ""), miner_identity);
+    let competition = latest.mining_competition.as_ref();
+    let winner = competition.and_then(competition_winner);
+    let participants = competition.map_or_else(
+        || "participant data unavailable · press m".to_owned(),
+        |competition| match competition.participants.len() {
+            0 => "0 candidate commitments".to_owned(),
+            1 => "1 candidate commitment".to_owned(),
+            2 => "2 candidates · 1 other".to_owned(),
+            count => format!("{count} candidates · {} others", count - 1),
+        },
+    );
+    let winner_burn = winner.map_or_else(
+        || "no winning commitment".to_owned(),
+        |winner| {
+            format!(
+                "{} of {} sats",
+                thousands(winner.burn_sats),
+                thousands(competition.map_or(0, |competition| competition.block_burn_sats))
+            )
+        },
+    );
+    let relative_weight = winner.map_or_else(
+        || "unavailable".to_owned(),
+        |winner| participant_weight(winner, competition.expect("a winner has a competition")),
+    );
+    let sampling = competition.map_or_else(
+        || "unavailable".to_owned(),
+        |competition| {
+            format!(
+                "{} burn blocks · median {} sats",
+                competition.sampled_window_blocks,
+                thousands(competition.window_median_burn_sats)
+            )
+        },
+    );
     let lines = vec![
         Line::from(vec![
             label("bitcoin block  "),
@@ -599,47 +754,247 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
             ),
         ]),
         Line::from(vec![
-            label("burn block     "),
-            value(latest.burn_block_hash.as_deref()),
-        ]),
-        Line::from(vec![
             label("outcome        "),
             Span::styled(outcome, Style::default().fg(colour)),
         ]),
         Line::from(vec![
-            label("chosen tenure  "),
-            value(latest.consensus_hash.as_deref()),
+            label("current miner  "),
+            value(miner),
+            label(miner_kind),
         ]),
         Line::from(vec![
-            label("winning miner  "),
-            value(latest.miner_pk_hash160.as_deref()),
-        ]),
-        Line::from(vec![
-            label("block commit   "),
-            value(latest.committed_block_hash.as_deref()),
-        ]),
-        Line::from(vec![
-            label("Stacks parent  "),
-            value(latest.stacks_parent_ch.as_deref()),
-        ]),
-        Line::from(vec![
-            label("VRF seed       "),
-            value(latest.vrf_seed.as_deref()),
-        ]),
-        Line::from(vec![
-            label("last miner win "),
+            label("tenure elected "),
             number(
-                state
-                    .sortitions
-                    .get(1)
-                    .and_then(|sortition| sortition.burn_block_height),
+                active.and_then(|sortition| sortition.burn_block_height),
                 Color::DarkGray,
             ),
             label("  bitcoin block"),
         ]),
+        Line::from(vec![label("competition    "), Span::raw(participants)]),
+        Line::from(vec![label("winner burn    "), Span::raw(winner_burn)]),
+        Line::from(vec![label("relative weight"), Span::raw(relative_weight)]),
+        Line::from(vec![label("sample window  "), Span::raw(sampling)]),
+        Line::from(vec![
+            label("tenure commit  "),
+            value(active.and_then(|sortition| sortition.committed_block_hash.as_deref())),
+        ]),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(bordered(" latest burnchain decision ")),
+        Paragraph::new(lines).block(bordered(" current miner & latest sortition ")),
+        area,
+    );
+}
+
+fn draw_mining(frame: &mut Frame, area: Rect, state: &mut State) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(6),
+            Constraint::Length(8),
+        ])
+        .split(area);
+    draw_mining_summary(frame, areas[0], state);
+    draw_participants(frame, areas[1], state);
+    draw_participant(frame, areas[2], state);
+}
+
+fn draw_mining_summary(frame: &mut Frame, area: Rect, state: &State) {
+    let latest = latest_sortition(state);
+    let active = active_sortition(state);
+    let competition = latest.and_then(|sortition| sortition.mining_competition.as_ref());
+    let winner = competition.and_then(competition_winner);
+    let (miner, miner_kind) = active.map_or((None, ""), miner_identity);
+    let election = latest.and_then(|sortition| sortition.elected).map_or_else(
+        || "unavailable".to_owned(),
+        |elected| {
+            if elected {
+                "new tenure elected".to_owned()
+            } else {
+                "no election; active tenure continues".to_owned()
+            }
+        },
+    );
+    let participant_count = competition.map_or_else(
+        || "unavailable".to_owned(),
+        |competition| competition.participants.len().to_string(),
+    );
+    let winner_burn = winner.map_or_else(
+        || "no winning commitment".to_owned(),
+        |winner| {
+            format!(
+                "{} / {} sats · {} relative weight",
+                thousands(winner.burn_sats),
+                thousands(competition.map_or(0, |competition| competition.block_burn_sats)),
+                participant_weight(winner, competition.expect("a winner has a competition"))
+            )
+        },
+    );
+    let sample = competition.map_or_else(
+        || "unavailable".to_owned(),
+        |competition| {
+            format!(
+                "{} burn blocks · block total {} sats · window median {} sats",
+                competition.sampled_window_blocks,
+                thousands(competition.block_burn_sats),
+                thousands(competition.window_median_burn_sats)
+            )
+        },
+    );
+    let lines = vec![
+        Line::from(vec![
+            label("active tenure   "),
+            value(active.and_then(|sortition| sortition.consensus_hash.as_deref())),
+            label(" · elected at bitcoin "),
+            number(
+                active.and_then(|sortition| sortition.burn_block_height),
+                Color::Cyan,
+            ),
+            label(" · parent "),
+            value(active.and_then(|sortition| sortition.stacks_parent_ch.as_deref())),
+        ]),
+        Line::from(vec![
+            label("current miner   "),
+            value(miner),
+            label(miner_kind),
+        ]),
+        Line::from(vec![
+            label("latest decision "),
+            Span::raw(election),
+            label(" · bitcoin "),
+            number(
+                latest.and_then(|sortition| sortition.burn_block_height),
+                Color::Cyan,
+            ),
+            label(" · "),
+            Span::raw(participant_count),
+            label(" candidate commitments in the latest decision"),
+        ]),
+        Line::from(vec![label("winner burn     "), Span::raw(winner_burn)]),
+        Line::from(vec![label("sample          "), Span::raw(sample)]),
+        Line::from(vec![
+            label("weight meaning  "),
+            Span::raw("relative share among candidate commitments; not win probability"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(bordered(" active tenure miner & election ")),
+        area,
+    );
+}
+
+fn draw_participants(frame: &mut Frame, area: Rect, state: &mut State) {
+    let Some(competition) = mining_competition(state).cloned() else {
+        state.selected_participant.select(None);
+        frame.render_widget(
+            Paragraph::new("this node has no retained participant data for this sortition")
+                .block(bordered(" sortition participants ")),
+            area,
+        );
+        return;
+    };
+    if competition.participants.is_empty() {
+        state.selected_participant.select(None);
+        frame.render_widget(
+            Paragraph::new("no candidate commitments were present in this Bitcoin block")
+                .block(bordered(" sortition participants ")),
+            area,
+        );
+        return;
+    }
+    let winner = competition.winner_txid.as_deref();
+    let items = competition
+        .participants
+        .iter()
+        .map(|participant| {
+            let won = winner.is_some_and(|winner| same_id(&participant.txid, winner));
+            let identity = participant
+                .signing_key_hash
+                .as_deref()
+                .or(participant.vrf_public_key.as_deref())
+                .map_or_else(|| "key unavailable".to_owned(), short);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if won { "WIN " } else { "    " },
+                    Style::default().fg(if won { Color::Green } else { Color::DarkGray }),
+                ),
+                Span::styled(format!("{identity:<18}"), Style::default().fg(Color::White)),
+                Span::raw(format!(" {:>12} sat", thousands(participant.burn_sats))),
+                label("  effective "),
+                Span::raw(format!(
+                    "{:>12}",
+                    thousands(participant.effective_burn_sats)
+                )),
+                label("  "),
+                Span::styled(
+                    participant_weight(participant, &competition),
+                    Style::default().fg(Color::Yellow),
+                ),
+                label(&format!(
+                    "  active {}/{}",
+                    participant.frequency, competition.sampled_window_blocks
+                )),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(bordered(
+                " sortition participants — miner key · burn · effective weight · activity ",
+            ))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▍"),
+        area,
+        &mut state.selected_participant,
+    );
+}
+
+fn draw_participant(frame: &mut Frame, area: Rect, state: &State) {
+    let Some(participant) = selected_participant(state) else {
+        frame.render_widget(
+            Paragraph::new("select a participant to inspect its commitment")
+                .block(bordered(" participant details ")),
+            area,
+        );
+        return;
+    };
+    let competition = mining_competition(state).expect("a selected participant has a competition");
+    let won = competition
+        .winner_txid
+        .as_deref()
+        .is_some_and(|winner| same_id(&participant.txid, winner));
+    let lines = vec![
+        field("signing key", participant.signing_key_hash.as_deref()),
+        field("leader VRF", participant.vrf_public_key.as_deref()),
+        field("commit txid", Some(&participant.txid)),
+        field("Stacks block", Some(&participant.committed_block_hash)),
+        Line::from(vec![
+            label("weight       "),
+            Span::raw(format!(
+                "{} effective / {} raw sats · median {} · active {}/{} · {}",
+                thousands(participant.effective_burn_sats),
+                thousands(participant.burn_sats),
+                thousands(participant.median_burn_sats),
+                participant.frequency,
+                competition.sampled_window_blocks,
+                participant_weight(participant, competition)
+            )),
+        ]),
+        Line::from(vec![
+            label("burn block   "),
+            value(
+                latest_sortition(state).and_then(|sortition| sortition.burn_block_hash.as_deref()),
+            ),
+            label(" · sortition seed "),
+            value(latest_sortition(state).and_then(|sortition| sortition.vrf_seed.as_deref())),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(bordered(if won {
+            " winning participant details "
+        } else {
+            " participant details "
+        })),
         area,
     );
 }
@@ -940,11 +1295,14 @@ fn transaction_colour(kind: &str) -> Color {
 
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
-        Screen::Blocks => "enter/→ open block   ↑/↓ select   r refresh   q quit",
-        Screen::Block => "enter/→ open transaction   ↑/↓ select   esc/← back   r refresh",
-        Screen::Transaction => {
-            "↑/↓ scroll   pgup/pgdn page   home/end edges   esc/← back   r refresh"
+        Screen::Blocks => "enter/→ open block   m mining   ↑/↓ select   r refresh   q quit",
+        Screen::Block => {
+            "enter/→ open transaction   m mining   ↑/↓ select   esc/← back   r refresh"
         }
+        Screen::Transaction => {
+            "↑/↓ scroll   m mining   pgup/pgdn page   home/end edges   esc/← back   r refresh"
+        }
+        Screen::Mining => "↑/↓ select participant   home/end edges   m/esc/← overview   r refresh",
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray)))
@@ -1261,11 +1619,78 @@ mod tests {
             rendered.contains("reset at block 8,716,524 after 12 tenure blocks · runtime only")
         );
         assert!(rendered.contains("not exposed by this node's RPC"));
-        assert!(rendered.contains("latest burnchain decision"));
+        assert!(rendered.contains("current miner & latest sortition"));
         assert!(rendered.contains("miner elected · new Stacks tenure"));
-        assert!(rendered.contains("winning miner"));
-        assert!(rendered.contains("block commit"));
+        assert!(rendered.contains("current miner"));
+        assert!(rendered.contains("2 candidates · 1 other"));
+        assert!(rendered.contains("60,000 of 100,000 sats"));
+        assert!(rendered.contains("tenure commit"));
         assert!(!rendered.contains("state root"));
+    }
+
+    #[test]
+    fn mining_view_lists_and_inspects_every_participant() {
+        let mut state = dashboard_state();
+
+        handle_key(&mut state, KeyCode::Char('m'));
+        assert_eq!(state.screen, Screen::Mining);
+        assert_eq!(state.selected_participant.selected(), Some(0));
+        let winner = render(&mut state);
+        assert!(winner.contains("active tenure miner & election"));
+        assert!(winner.contains("2 candidate commitments"));
+        assert!(winner.contains("sortition participants"));
+        assert!(winner.contains("WIN"));
+        assert!(winner.contains("winning participant details"));
+        assert!(winner.contains("50,000 effective / 60,000 raw sats"));
+        assert!(winner.contains("relative share among candidate commitments; not win probability"));
+
+        handle_key(&mut state, KeyCode::Down);
+        assert_eq!(state.selected_participant.selected(), Some(1));
+        let competitor = render(&mut state);
+        assert!(competitor.contains("participant details"));
+        assert!(competitor.contains("bbbbbbbbbb…bbbbbb"));
+        assert!(competitor.contains("40,000 effective / 40,000 raw sats"));
+
+        handle_key(&mut state, KeyCode::Esc);
+        assert_eq!(state.screen, Screen::Blocks);
+    }
+
+    #[test]
+    fn mining_view_distinguishes_missing_data_from_no_commitments() {
+        let mut missing = dashboard_state();
+        missing.sortitions[0].mining_competition = None;
+        handle_key(&mut missing, KeyCode::Char('m'));
+        assert!(
+            render(&mut missing)
+                .contains("this node has no retained participant data for this sortition")
+        );
+
+        let mut empty = dashboard_state();
+        empty.sortitions[0].mining_competition = Some(node::MiningCompetition::default());
+        handle_key(&mut empty, KeyCode::Char('m'));
+        assert!(
+            render(&mut empty)
+                .contains("no candidate commitments were present in this Bitcoin block")
+        );
+    }
+
+    #[test]
+    fn a_sortitionless_burn_block_keeps_the_last_elected_miner_current() {
+        let mut state = dashboard_state();
+        state.sortitions[0].elected = Some(false);
+        state.sortitions[0].miner_pk_hash160 = None;
+        state.sortitions[0]
+            .mining_competition
+            .as_mut()
+            .expect("competition")
+            .winner_txid = None;
+        state.sortitions[1].miner_pk_hash160 =
+            Some("9999999999999999999999999999999999999999".to_owned());
+
+        let rendered = render(&mut state);
+        assert!(rendered.contains("no election · current tenure continued"));
+        assert!(rendered.contains("9999999999…999999"));
+        assert!(rendered.contains("960,238  bitcoin block"));
     }
 
     fn dashboard_state() -> State {
@@ -1349,6 +1774,53 @@ mod tests {
                 vrf_seed: Some(
                     "1212121212121212121212121212121212121212121212121212121212121212".to_owned(),
                 ),
+                mining_competition: Some(node::MiningCompetition {
+                    winner_txid: Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    ),
+                    block_burn_sats: 100_000,
+                    window_median_burn_sats: 95_000,
+                    sampled_window_blocks: 6,
+                    participants: vec![
+                        node::SortitionParticipant {
+                            txid:
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                    .to_owned(),
+                            signing_key_hash: Some(
+                                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+                            ),
+                            vrf_public_key: Some(
+                                "1313131313131313131313131313131313131313131313131313131313131313"
+                                    .to_owned(),
+                            ),
+                            committed_block_hash:
+                                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                                    .to_owned(),
+                            burn_sats: 60_000,
+                            effective_burn_sats: 50_000,
+                            median_burn_sats: 50_000,
+                            frequency: 6,
+                        },
+                        node::SortitionParticipant {
+                            txid:
+                                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                    .to_owned(),
+                            signing_key_hash: None,
+                            vrf_public_key: Some(
+                                "3333333333333333333333333333333333333333333333333333333333333333"
+                                    .to_owned(),
+                            ),
+                            committed_block_hash:
+                                "4444444444444444444444444444444444444444444444444444444444444444"
+                                    .to_owned(),
+                            burn_sats: 40_000,
+                            effective_burn_sats: 40_000,
+                            median_burn_sats: 45_000,
+                            frequency: 5,
+                        },
+                    ],
+                }),
             },
             node::Sortition {
                 burn_block_height: Some(960_238),

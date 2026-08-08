@@ -41,6 +41,7 @@ use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId,
     StacksBlockId,
 };
+pub use nano_sortition::{MiningCompetition, SortitionParticipant};
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
@@ -140,6 +141,8 @@ pub struct SortitionInfo {
     pub committed_block_hash: Option<BlockHeaderHash>,
     /// The winning commitment's new seed, which seeds the next sortition hash.
     pub vrf_seed: Option<[u8; 32]>,
+    /// Local diagnostic inputs for the election, absent from stock-node replies.
+    pub mining_competition: Option<MiningCompetition>,
 }
 
 /// A locally validated tenure downloaded from a peer.
@@ -927,6 +930,7 @@ impl SyncClient {
                 .as_deref()
                 .map(parse_prefixed_hex)
                 .transpose()?,
+            mining_competition: None,
         })
     }
 

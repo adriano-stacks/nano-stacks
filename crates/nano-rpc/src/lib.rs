@@ -1762,6 +1762,28 @@ struct SortitionInfoWire {
     /// to be present: `prefix_opt_hex` deserializes a field, and a missing one is
     /// an error rather than a `None`.
     vrf_seed: Option<String>,
+    mining_competition: Option<MiningCompetitionWire>,
+}
+
+#[derive(Serialize)]
+struct MiningCompetitionWire {
+    winner_txid: Option<String>,
+    block_burn_sats: u64,
+    window_median_burn_sats: u64,
+    sampled_window_blocks: u8,
+    participants: Vec<SortitionParticipantWire>,
+}
+
+#[derive(Serialize)]
+struct SortitionParticipantWire {
+    txid: String,
+    signing_key_hash: Option<String>,
+    vrf_public_key: Option<String>,
+    committed_block_hash: String,
+    burn_sats: u64,
+    effective_burn_sats: u64,
+    median_burn_sats: u64,
+    frequency: u8,
 }
 
 impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
@@ -1789,6 +1811,37 @@ impl From<nano_sync::SortitionInfo> for SortitionInfoWire {
             vrf_seed: sortition
                 .vrf_seed
                 .map(|seed| format!("0x{}", hex::encode(seed))),
+            mining_competition: sortition.mining_competition.map(|competition| {
+                MiningCompetitionWire {
+                    winner_txid: competition
+                        .winner_txid
+                        .map(|txid| format!("0x{}", hex::encode(txid))),
+                    block_burn_sats: competition.block_burn_sats,
+                    window_median_burn_sats: competition.window_median_burn_sats,
+                    sampled_window_blocks: competition.sampled_window_blocks,
+                    participants: competition
+                        .participants
+                        .into_iter()
+                        .map(|participant| SortitionParticipantWire {
+                            txid: format!("0x{}", hex::encode(participant.txid)),
+                            signing_key_hash: participant
+                                .signing_key_hash
+                                .map(|hash| format!("0x{}", hex::encode(hash))),
+                            vrf_public_key: participant
+                                .vrf_public_key
+                                .map(|key| format!("0x{}", hex::encode(key))),
+                            committed_block_hash: format!(
+                                "0x{}",
+                                hex::encode(participant.committed_block_hash)
+                            ),
+                            burn_sats: participant.burn_sats,
+                            effective_burn_sats: participant.effective_burn_sats,
+                            median_burn_sats: participant.median_burn_sats,
+                            frequency: participant.frequency,
+                        })
+                        .collect(),
+                }
+            }),
         }
     }
 }
@@ -2220,8 +2273,28 @@ mod tests {
                     last_sortition_consensus_hash: None,
                     committed_block_hash: None,
                     vrf_seed: None,
+                    mining_competition: None,
                 },
                 blocks: Vec::new(),
+            }],
+        }
+    }
+
+    fn mining_competition() -> nano_sync::MiningCompetition {
+        nano_sync::MiningCompetition {
+            winner_txid: Some([0x55; 32]),
+            block_burn_sats: 100_000,
+            window_median_burn_sats: 90_000,
+            sampled_window_blocks: 6,
+            participants: vec![nano_sync::SortitionParticipant {
+                txid: [0x55; 32],
+                signing_key_hash: Some([0xee; 20]),
+                vrf_public_key: Some([0x66; 32]),
+                committed_block_hash: [0x33; 32],
+                burn_sats: 60_000,
+                effective_burn_sats: 50_000,
+                median_burn_sats: 50_000,
+                frequency: 6,
             }],
         }
     }
@@ -2253,6 +2326,7 @@ mod tests {
             last_sortition_consensus_hash: Some(ConsensusHash::from_bytes([0x22; 20])),
             committed_block_hash: Some(BlockHeaderHash::from_bytes([0x33; 32])),
             vrf_seed: Some([0x44; 32]),
+            mining_competition: Some(mining_competition()),
         };
         let previous = SortitionInfo {
             consensus_hash: ConsensusHash::from_bytes([0x22; 20]),
@@ -2297,6 +2371,18 @@ mod tests {
             latest[0]["committed_block_hash"],
             json!(format!("0x{}", "33".repeat(32))),
             "a derived sortition states the block its winner committed to"
+        );
+        assert_eq!(
+            latest[0]["mining_competition"]["sampled_window_blocks"],
+            json!(6)
+        );
+        assert_eq!(
+            latest[0]["mining_competition"]["participants"][0]["txid"],
+            json!(format!("0x{}", "55".repeat(32)))
+        );
+        assert_eq!(
+            latest[0]["mining_competition"]["participants"][0]["effective_burn_sats"],
+            json!(50_000)
         );
 
         // The pair, because a signer refuses a first entry whose predecessor is

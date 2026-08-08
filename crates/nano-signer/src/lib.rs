@@ -128,7 +128,7 @@ impl<V> ActiveSortitionValidator<V> {
     }
 
     /// Replace the active Bitcoin sortition and reward-cycle context.
-    pub const fn set_context(&mut self, sortition: SortitionInfo, reward_cycle: u64) {
+    pub fn set_context(&mut self, sortition: SortitionInfo, reward_cycle: u64) {
         self.context = Some(SortitionProposalValidator::new(sortition, reward_cycle));
     }
 
@@ -1687,6 +1687,7 @@ mod tests {
             last_sortition_consensus_hash: None,
             committed_block_hash: None,
             vrf_seed: None,
+            mining_competition: None,
         };
         (proposal, sortition)
     }

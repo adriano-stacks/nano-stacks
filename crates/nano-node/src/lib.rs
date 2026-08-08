@@ -2556,6 +2556,7 @@ where
                 .committed_block_hash
                 .map(nano_primitives::BlockHeaderHash::from_bytes),
             vrf_seed: snapshot.winner_vrf_seed,
+            mining_competition: snapshot.mining_competition.clone(),
         }
     }
 }
