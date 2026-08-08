@@ -3044,7 +3044,9 @@ dependencies = [
 name = "nano-tui"
 version = "0.1.0"
 dependencies = [
+ "clarity",
  "crossterm 0.29.0",
+ "hex",
  "nano-chainstate",
  "nano-codec",
  "nano-primitives",

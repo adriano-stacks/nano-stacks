@@ -15,8 +15,10 @@ path = "src/main.rs"
 nano-codec = { path = "../nano-codec" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-primitives = { path = "../nano-primitives" }
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 crossterm = "0.29"
-ratatui = "0.29"
+hex = "0.4.3"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 ureq = { version = "2.12", default-features = false, features = ["json", "gzip"] }

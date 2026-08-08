@@ -18,7 +18,7 @@ mod node;
 
 use std::{
     io,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -32,7 +32,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use node::{Node, Sortition, SyncStatus};
@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| "http://127.0.0.1:20443".to_owned());
     if url == "--help" || url == "-h" {
         println!(
-            "usage: nano-tui [rpc-url] [--once]\n               q quit   ↑/↓ select a block   enter inspect it   r refresh\n               --once renders one frame as text and exits, for a script or a log"
+            "usage: nano-tui [rpc-url] [--once]\n               ↑/↓ select   enter/→ open   esc/← back   r refresh   q quit/back\n               --once renders one frame as text and exits, for a script or a log"
         );
         return Ok(());
     }
@@ -117,8 +117,10 @@ struct State {
     tenure: Option<node::TenureInfo>,
     sortitions: Vec<Sortition>,
     blocks: Vec<node::Block>,
-    selected: ListState,
-    inspecting: bool,
+    selected_block: ListState,
+    selected_transaction: ListState,
+    screen: Screen,
+    transaction_scroll: u16,
     /// The last poll that answered at all, so a node that has just gone away is
     /// visibly stale rather than silently frozen.
     polled: Option<Instant>,
@@ -143,8 +145,12 @@ impl State {
         // Only the executed tip, and only when it moved: the explorer is a record of
         // what this node ran, so a block enters it by having been executed here.
         let (Some(height), Some(tip)) = (
-            self.sync.as_ref().and_then(|sync| sync.executed_stacks_height),
-            self.sync.as_ref().and_then(|sync| sync.executed_stacks_tip.clone()),
+            self.sync
+                .as_ref()
+                .and_then(|sync| sync.executed_stacks_height),
+            self.sync
+                .as_ref()
+                .and_then(|sync| sync.executed_stacks_tip.clone()),
         ) else {
             return;
         };
@@ -181,24 +187,33 @@ impl State {
         self.blocks.truncate(HISTORY);
         // Keep the cursor on the block it was on, rather than letting new tips slide
         // the selection out from under the reader.
-        if let Some(index) = self.selected.selected() {
-            self.selected
+        if let Some(index) = self.selected_block.selected() {
+            self.selected_block
                 .select(Some((index + added).min(self.blocks.len() - 1)));
         }
     }
 
-    fn behind(&self) -> u64 {
-        self.sync
-            .as_ref()
-            .and_then(|sync| sync.blocks_behind)
-            .unwrap_or_default()
+    fn behind(&self) -> Option<u64> {
+        self.sync.as_ref().and_then(|sync| sync.blocks_behind)
     }
 }
 
-fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    node: &Node,
-) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Screen {
+    #[default]
+    Blocks,
+    Block,
+    Transaction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Action {
+    None,
+    Refresh,
+    Quit,
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io::Result<()> {
     let mut state = State::default();
     // `None` rather than a time in the past: the first pass polls, and a clock that
     // cannot go back that far is not a thing to reason about.
@@ -218,57 +233,165 @@ fn run(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc if !state.inspecting => return Ok(()),
-            KeyCode::Esc | KeyCode::Char('q') => state.inspecting = false,
-            KeyCode::Enter => state.inspecting = !state.inspecting,
-            KeyCode::Down | KeyCode::Char('j') => move_selection(&mut state, 1),
-            KeyCode::Up | KeyCode::Char('k') => move_selection(&mut state, -1),
-            KeyCode::Char('r') => last = None,
-            _ => {}
+        match handle_key(&mut state, key.code) {
+            Action::Quit => return Ok(()),
+            Action::Refresh => last = None,
+            Action::None => {}
         }
     }
 }
 
+fn handle_key(state: &mut State, key: KeyCode) -> Action {
+    match key {
+        KeyCode::Char('q' | 'h') | KeyCode::Esc | KeyCode::Left => {
+            match state.screen {
+                Screen::Blocks => return Action::Quit,
+                Screen::Block => state.screen = Screen::Blocks,
+                Screen::Transaction => state.screen = Screen::Block,
+            }
+            state.transaction_scroll = 0;
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match state.screen {
+            Screen::Blocks if !state.blocks.is_empty() => {
+                if state.selected_block.selected().is_none() {
+                    state.selected_block.select(Some(0));
+                }
+                select_first_transaction(state);
+                state.screen = Screen::Block;
+            }
+            Screen::Block if selected_transaction(state).is_some() => {
+                state.transaction_scroll = 0;
+                state.screen = Screen::Transaction;
+            }
+            Screen::Blocks | Screen::Block | Screen::Transaction => {}
+        },
+        KeyCode::Down | KeyCode::Char('j') => move_selection(state, 1),
+        KeyCode::Up | KeyCode::Char('k') => move_selection(state, -1),
+        KeyCode::PageDown => move_selection(state, 10),
+        KeyCode::PageUp => move_selection(state, -10),
+        KeyCode::Home => move_to_edge(state, false),
+        KeyCode::End => move_to_edge(state, true),
+        KeyCode::Char('r') => return Action::Refresh,
+        _ => {}
+    }
+    Action::None
+}
+
 fn move_selection(state: &mut State, by: isize) {
-    if state.blocks.is_empty() {
+    match state.screen {
+        Screen::Blocks => move_list_selection(&mut state.selected_block, state.blocks.len(), by),
+        Screen::Block => {
+            let transactions = selected_block(state).map_or(0, |block| block.transactions.len());
+            move_list_selection(&mut state.selected_transaction, transactions, by);
+        }
+        Screen::Transaction => {
+            state.transaction_scroll = state
+                .transaction_scroll
+                .saturating_add_signed(i16::try_from(by).expect("key movement fits in i16"));
+        }
+    }
+}
+
+fn move_list_selection(selected: &mut ListState, length: usize, by: isize) {
+    if length == 0 {
         return;
     }
-    let last = state.blocks.len() - 1;
-    let next = state
-        .selected
+    let last = length - 1;
+    let next = selected
         .selected()
         .map_or(0, |index| index.saturating_add_signed(by).min(last));
-    state.selected.select(Some(next));
+    selected.select(Some(next));
+}
+
+fn move_to_edge(state: &mut State, end: bool) {
+    match state.screen {
+        Screen::Blocks => select_edge(&mut state.selected_block, state.blocks.len(), end),
+        Screen::Block => {
+            let transactions = selected_block(state).map_or(0, |block| block.transactions.len());
+            select_edge(&mut state.selected_transaction, transactions, end);
+        }
+        Screen::Transaction => state.transaction_scroll = if end { u16::MAX } else { 0 },
+    }
+}
+
+fn select_edge(selected: &mut ListState, length: usize, end: bool) {
+    if length > 0 {
+        selected.select(Some(if end { length - 1 } else { 0 }));
+    }
+}
+
+fn select_first_transaction(state: &mut State) {
+    let transactions = selected_block(state).map_or(0, |block| block.transactions.len());
+    if transactions == 0 {
+        state.selected_transaction.select(None);
+    } else if state
+        .selected_transaction
+        .selected()
+        .is_none_or(|index| index >= transactions)
+    {
+        state.selected_transaction.select(Some(0));
+    }
+}
+
+fn selected_block(state: &State) -> Option<&node::Block> {
+    state
+        .selected_block
+        .selected()
+        .and_then(|index| state.blocks.get(index))
+        .or_else(|| state.blocks.first())
+}
+
+fn selected_transaction(state: &State) -> Option<&node::Transaction> {
+    let block = selected_block(state)?;
+    state
+        .selected_transaction
+        .selected()
+        .and_then(|index| block.transactions.get(index))
+        .or_else(|| block.transactions.first())
 }
 
 fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
+    if state.screen != Screen::Blocks {
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Min(6),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        draw_sync_status(frame, areas[0], state, node);
+        match state.screen {
+            Screen::Block => draw_block(frame, areas[1], state),
+            Screen::Transaction => draw_transaction(frame, areas[1], state),
+            Screen::Blocks => unreachable!("handled by the dashboard layout"),
+        }
+        draw_keys(frame, areas[2], state);
+        return;
+    }
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(7),
+            Constraint::Length(11),
             Constraint::Length(6),
-            Constraint::Length(10),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_heights(frame, areas[0], state, node);
+    draw_sync_status(frame, areas[0], state, node);
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(areas[1]);
     draw_tenure(frame, middle[0], state);
     draw_sortition(frame, middle[1], state);
-    if state.inspecting {
-        draw_block(frame, areas[2], state);
-    } else {
-        draw_blocks(frame, areas[2], state);
-    }
-    draw_keys(frame, areas[3], state);
+    draw_tenure_budget(frame, areas[2], state);
+    draw_blocks(frame, areas[3], state);
+    draw_keys(frame, areas[4], state);
 }
 
-/// The three heights, and the gap between the last two.
-fn draw_heights(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
+fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
     let sync = state.sync.clone().unwrap_or_default();
     let info = state.info.clone().unwrap_or_default();
     let title = format!(
@@ -288,84 +411,52 @@ fn draw_heights(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
         }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            label("executed "),
+    let source_status = if state.unreachable {
+        "node unreachable".to_owned()
+    } else {
+        state.polled.map_or_else(
+            || "waiting for first poll".to_owned(),
+            |at| format!("polled {}s ago", at.elapsed().as_secs()),
+        )
+    };
+    let (lag, lag_colour) = sync_lag(state.behind(), state.unreachable);
+    let lines = vec![
+        Line::from(vec![
+            label("verified locally  "),
             number(sync.executed_stacks_height, Color::Green),
-            // Both of the others are snapshots, and neither is refreshed on the
-            // round that execution is. Fork choice is remade every sixty rounds, and
-            // a node at the tip stops asking peers for a full view at all -- so
-            // `executed` above `selected` is the ordinary state of a caught-up node
-            // and not a contradiction. Said on the screen, because two numbers side
-            // by side in the same style are a claim that they are equally fresh.
-            label("   chose (60 rounds) "),
+            label("  executed and checked by this node"),
+        ]),
+        Line::from(vec![
+            label("last fork choice  "),
             number(sync.selected_stacks_height, Color::Yellow),
-            label("   peer last said "),
-            number(sync.followed_stacks_height, Color::DarkGray),
-            label("   burn "),
-            number(info.burn_block_height, Color::Cyan),
-        ])),
-        rows[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            label("tip  "),
-            value(sync.executed_stacks_tip.as_deref()),
-            label("  root "),
-            value(sync.executed_state_index_root.as_deref()),
-            label("  tenure "),
-            value(info.stacks_tip_consensus_hash.as_deref()),
-        ])),
-        rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            label("following "),
-            value(sync.selected_from_peer.as_deref()),
-            label("   "),
+            label("  selected from peer candidates; updates periodically"),
+        ]),
+        Line::from(vec![
+            label("last peer report  "),
+            number(sync.followed_stacks_height, Color::White),
+            label("  height most recently advertised by the sync peer"),
+        ]),
+        Line::from(vec![
+            label("sync source       "),
+            plain_value(sync.selected_from_peer.as_deref(), "no peer selected"),
+            label("  ·  "),
             Span::styled(
-                if state.unreachable {
-                    "node unreachable".to_owned()
+                source_status,
+                Style::default().fg(if state.unreachable {
+                    Color::Red
                 } else {
-                    state
-                        .polled
-                        .map_or_else(String::new, |at| format!("polled {}s ago", at.elapsed().as_secs()))
-                },
-                Style::default().fg(if state.unreachable { Color::Red } else { Color::DarkGray }),
+                    Color::DarkGray
+                }),
             ),
-        ])),
-        rows[2],
-    );
-    // Behind by zero is the whole claim, so it is the one thing drawn as a bar: a
-    // number that reads 0 and a bar that is full say the same thing, and the bar
-    // says it from across a room.
-    let behind = state.behind();
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(match behind {
-                0 => Color::Green,
-                1..=10 => Color::Yellow,
-                _ => Color::Red,
-            }))
-            // Not a percentage of anything: there is no ceiling to be behind by, so
-            // the bar reads full at the tip and shrinks as the gap grows.
-            .ratio(match behind {
-                0 => 1.0,
-                behind => (1.0 / (f64::from(u32::try_from(behind).unwrap_or(u32::MAX)) + 1.0))
-                    .clamp(0.02, 0.99),
-            })
-            .label(match behind {
-                0 => "at the tip".to_owned(),
-                1 => "1 block behind".to_owned(),
-                behind => format!("{behind} blocks behind"),
-            }),
-        rows[3],
-    );
+        ]),
+        Line::from(vec![
+            label("sync lag          "),
+            Span::styled(lag, Style::default().fg(lag_colour)),
+            label("   bitcoin block "),
+            number(info.burn_block_height, Color::Cyan),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
@@ -373,30 +464,22 @@ fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
     let pox = state.pox.clone().unwrap_or_default();
     let cycle = pox.current_cycle.unwrap_or_default();
     let next = pox.next_cycle.unwrap_or_default();
-    let lines = vec![
-        field("consensus", tenure.consensus_hash.as_deref()),
-        field("start block", tenure.tenure_start_block_id.as_deref()),
-        field("parent", tenure.parent_consensus_hash.as_deref()),
+    let mut lines = tenure_history_lines(state, &tenure);
+    lines.extend([
         Line::from(vec![
-            label("tip height   "),
-            number(tenure.tip_height, Color::White),
+            label("cycle        "),
+            number(cycle.id.or(tenure.reward_cycle), Color::Magenta),
+            label(" → "),
+            number(next.id, Color::DarkGray),
         ]),
         Line::from(vec![
-            label("reward cycle "),
-            number(cycle.id.or(tenure.reward_cycle), Color::Magenta),
-            label("   next "),
-            number(next.id, Color::DarkGray),
-            label(" in "),
+            label("phases       "),
             Span::styled(
-                next.blocks_until_reward_phase
-                    .map_or_else(|| "?".to_owned(), |blocks| format!("{blocks}")),
-                Style::default().fg(Color::DarkGray),
-            ),
-            label("   prepare in "),
-            Span::styled(
-                next.blocks_until_prepare_phase
-                    .map_or_else(|| "?".to_owned(), |blocks| format!("{blocks}")),
-                Style::default().fg(Color::DarkGray),
+                cycle_phases(
+                    next.blocks_until_prepare_phase,
+                    next.blocks_until_reward_phase,
+                ),
+                Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
@@ -409,11 +492,82 @@ fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
                 Style::default().fg(Color::White),
             ),
         ]),
-    ];
+    ]);
     frame.render_widget(
-        Paragraph::new(lines).block(bordered(" tenure ")),
+        Paragraph::new(lines).block(bordered(" current tenure ")),
         area,
     );
+}
+
+fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'static>> {
+    let blocks = tenure
+        .consensus_hash
+        .as_deref()
+        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
+    let start_height = tenure
+        .tenure_start_block_id
+        .as_deref()
+        .and_then(|start| blocks.iter().find(|block| same_id(&block.id, start)))
+        .map(|block| block.height);
+    let extensions = tenure_extensions(&blocks);
+    let span = tenure_span(tenure.tip_height, start_height, blocks.len());
+    let extension_count = if blocks.is_empty() {
+        "waiting for tenure blocks".to_owned()
+    } else if start_height.is_some() {
+        format!("{} observed in the full loaded tenure", extensions.len())
+    } else {
+        format!(
+            "{} observed in {} loaded blocks",
+            extensions.len(),
+            blocks.len()
+        )
+    };
+    let latest_extension = extensions.first().map_or_else(
+        || {
+            if start_height.is_some() {
+                "none observed · tenure-start budget".to_owned()
+            } else {
+                "none loaded · earlier reset unknown".to_owned()
+            }
+        },
+        |(height, change)| {
+            format!(
+                "{} · block {} after {} · reset {}",
+                change.cause,
+                thousands(*height),
+                change.previous_blocks,
+                change.reset
+            )
+        },
+    );
+    vec![
+        Line::from(vec![
+            label("span         "),
+            Span::styled(span, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            label("tenure ID    "),
+            value(tenure.consensus_hash.as_deref()),
+        ]),
+        Line::from(vec![
+            label("started at   "),
+            value(tenure.tenure_start_block_id.as_deref()),
+        ]),
+        Line::from(vec![
+            label("parent       "),
+            value(tenure.parent_consensus_hash.as_deref()),
+            label(" · start "),
+            value(tenure.parent_tenure_start_block_id.as_deref()),
+        ]),
+        Line::from(vec![
+            label("extensions   "),
+            Span::styled(extension_count, Style::default().fg(Color::Magenta)),
+        ]),
+        Line::from(vec![
+            label("latest reset "),
+            Span::styled(latest_extension, Style::default().fg(Color::White)),
+        ]),
+    ]
 }
 
 /// The burn view this node executed under, as *it* derived it.
@@ -421,32 +575,147 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
     let Some(latest) = state.sortitions.first() else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "this node derives no sortitions yet",
+                "waiting for this node to derive a burnchain decision",
                 Style::default().fg(Color::DarkGray),
             )))
-            .block(bordered(" sortition ")),
+            .block(bordered(" latest burnchain decision ")),
             area,
         );
         return;
     };
-    let won = latest.elected.unwrap_or_default();
+    let (outcome, colour) = match latest.elected {
+        Some(true) => ("miner elected · new Stacks tenure", Color::Green),
+        Some(false) => ("no election · current tenure continued", Color::DarkGray),
+        None => ("election result unavailable", Color::Red),
+    };
     let lines = vec![
         Line::from(vec![
-            label("burn "),
+            label("bitcoin block  "),
             number(latest.burn_block_height, Color::Cyan),
-            label("   "),
+            label(" · "),
             Span::styled(
-                if won { "elected a miner" } else { "elected nobody" },
-                Style::default().fg(if won { Color::Green } else { Color::DarkGray }),
+                relative_time(latest.burn_header_timestamp),
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
-        field("consensus", latest.consensus_hash.as_deref()),
-        field("miner key", latest.miner_pk_hash160.as_deref()),
-        field("committed", latest.committed_block_hash.as_deref()),
-        field("previous", latest.last_sortition_ch.as_deref()),
-        field("vrf seed", latest.vrf_seed.as_deref()),
+        Line::from(vec![
+            label("burn block     "),
+            value(latest.burn_block_hash.as_deref()),
+        ]),
+        Line::from(vec![
+            label("outcome        "),
+            Span::styled(outcome, Style::default().fg(colour)),
+        ]),
+        Line::from(vec![
+            label("chosen tenure  "),
+            value(latest.consensus_hash.as_deref()),
+        ]),
+        Line::from(vec![
+            label("winning miner  "),
+            value(latest.miner_pk_hash160.as_deref()),
+        ]),
+        Line::from(vec![
+            label("block commit   "),
+            value(latest.committed_block_hash.as_deref()),
+        ]),
+        Line::from(vec![
+            label("Stacks parent  "),
+            value(latest.stacks_parent_ch.as_deref()),
+        ]),
+        Line::from(vec![
+            label("VRF seed       "),
+            value(latest.vrf_seed.as_deref()),
+        ]),
+        Line::from(vec![
+            label("last miner win "),
+            number(
+                state
+                    .sortitions
+                    .get(1)
+                    .and_then(|sortition| sortition.burn_block_height),
+                Color::DarkGray,
+            ),
+            label("  bitcoin block"),
+        ]),
     ];
-    frame.render_widget(Paragraph::new(lines).block(bordered(" sortition ")), area);
+    frame.render_widget(
+        Paragraph::new(lines).block(bordered(" latest burnchain decision ")),
+        area,
+    );
+}
+
+fn draw_tenure_budget(frame: &mut Frame, area: Rect, state: &State) {
+    let budget = state.pox.as_ref().and_then(node::Pox::current_budget);
+    let tenure = state.tenure.as_ref();
+    let blocks = tenure
+        .and_then(|tenure| tenure.consensus_hash.as_deref())
+        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
+    let start = tenure.and_then(|tenure| tenure.tenure_start_block_id.as_deref());
+    let start_loaded =
+        start.is_some_and(|start| blocks.iter().any(|block| same_id(&block.id, start)));
+    let window = tenure_extensions(&blocks).first().map_or_else(
+        || {
+            if start_loaded {
+                format!(
+                    "tenure start {} · all dimensions",
+                    short(start.expect("a loaded start is present"))
+                )
+            } else if blocks.is_empty() {
+                "unavailable".to_owned()
+            } else {
+                "earlier reset outside loaded block history".to_owned()
+            }
+        },
+        |(height, change)| {
+            let reset = if change.reset == "all dimensions" {
+                change.reset.clone()
+            } else {
+                format!("{} only", change.reset)
+            };
+            format!(
+                "reset at block {} after {} tenure blocks · {reset}",
+                thousands(*height),
+                change.previous_blocks
+            )
+        },
+    );
+    let limits = budget.map_or_else(
+        || "unavailable from PoX info".to_owned(),
+        |budget| {
+            format!(
+                "{} runtime · {} reads · {} writes",
+                compact_limit(budget.runtime),
+                count_limit(budget.read_count),
+                count_limit(budget.write_count)
+            )
+        },
+    );
+    let data = budget.map_or_else(
+        || "unavailable from PoX info".to_owned(),
+        |budget| {
+            format!(
+                "{} read · {} written",
+                byte_limit(budget.read_length),
+                byte_limit(budget.write_length)
+            )
+        },
+    );
+    let lines = vec![
+        Line::from(vec![label("budget window    "), Span::raw(window)]),
+        Line::from(vec![label("operation limits "), Span::raw(limits)]),
+        Line::from(vec![label("data limits      "), Span::raw(data)]),
+        Line::from(vec![
+            label("used / remaining "),
+            Span::styled(
+                "not exposed by this node's RPC",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(bordered(" current tenure execution budget ")),
+        area,
+    );
 }
 
 /// The blocks this node has executed while the dashboard watched.
@@ -504,61 +773,178 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▍"),
         area,
-        &mut state.selected,
+        &mut state.selected_block,
     );
 }
 
 /// One block, opened.
-fn draw_block(frame: &mut Frame, area: Rect, state: &State) {
-    let Some(block) = state
-        .selected
-        .selected()
-        .and_then(|index| state.blocks.get(index))
-        .or_else(|| state.blocks.first())
-    else {
+fn draw_block(frame: &mut Frame, area: Rect, state: &mut State) {
+    let Some(block) = selected_block(state).cloned() else {
         return;
     };
-    let mut lines = vec![
+    let title = format!(" block {} / transactions ", block.height);
+    let outer = bordered(&title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(inner);
+    let lines = vec![
         field("block", Some(&block.id)),
+        field("parent", Some(&block.parent_id)),
         field("consensus", Some(&block.consensus_hash)),
         field("state root", Some(&block.state_index_root)),
         Line::from(vec![
             label("signatures   "),
-            Span::styled(block.signatures.to_string(), Style::default().fg(Color::White)),
-            label("   timestamp "),
-            Span::styled(block.timestamp.to_string(), Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(""),
-    ];
-    for transaction in &block.transactions {
-        lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<9}", transaction.kind),
-                Style::default().fg(match transaction.kind.as_str() {
-                    "coinbase" => Color::Magenta,
-                    "tenure" => Color::Yellow,
-                    "deploy" => Color::Cyan,
-                    _ => Color::White,
-                }),
+                block.signatures.to_string(),
+                Style::default().fg(Color::White),
             ),
-            Span::styled(short(&transaction.txid), Style::default().fg(Color::DarkGray)),
-            Span::raw("  "),
-            Span::raw(transaction.detail.clone()),
-        ]));
+            label("   timestamp "),
+            Span::styled(
+                block.timestamp.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), areas[0]);
+
+    if block.transactions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "this block has no transactions",
+                Style::default().fg(Color::DarkGray),
+            )),
+            areas[1],
+        );
+        return;
     }
+    let items: Vec<ListItem> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(index, transaction)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>3}  {:<9}", index, transaction.kind),
+                    Style::default().fg(transaction_colour(&transaction.kind)),
+                ),
+                Span::styled(
+                    short(&transaction.txid),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("  "),
+                Span::raw(transaction.summary.clone()),
+            ]))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▍"),
+        areas[1],
+        &mut state.selected_transaction,
+    );
+}
+
+/// One transaction, opened from its block.
+fn draw_transaction(frame: &mut Frame, area: Rect, state: &mut State) {
+    let Some(transaction) = selected_transaction(state).cloned() else {
+        state.screen = Screen::Block;
+        return;
+    };
+    let block_height = selected_block(state).map_or(0, |block| block.height);
+    let transaction_index = state.selected_transaction.selected().unwrap_or_default();
+    let transaction_count = selected_block(state).map_or(0, |block| block.transactions.len());
+    let mut lines = vec![
+        detail("txid", transaction.txid),
+        detail("type", transaction.kind),
+        detail(
+            "sender",
+            transaction
+                .origin
+                .unwrap_or_else(|| "unavailable".to_owned()),
+        ),
+        detail(
+            "sponsor",
+            transaction.sponsor.unwrap_or_else(|| "none".to_owned()),
+        ),
+        detail("origin nonce", transaction.origin_nonce.to_string()),
+        detail(
+            "sponsor nonce",
+            transaction
+                .sponsor_nonce
+                .map_or_else(|| "none".to_owned(), |nonce| nonce.to_string()),
+        ),
+        detail("fee", format!("{} uSTX", transaction.fee)),
+        detail("authorization", transaction.authorization),
+        detail(
+            "network",
+            format!(
+                "{} / chain {:#010x}",
+                transaction.version, transaction.chain_id
+            ),
+        ),
+        detail("anchor mode", transaction.anchor_mode),
+        detail(
+            "post conditions",
+            format!(
+                "{} / {} condition(s)",
+                transaction.post_condition_mode, transaction.post_conditions
+            ),
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "payload",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    lines.extend(
+        transaction
+            .fields
+            .into_iter()
+            .flat_map(|(name, value)| detail_lines(&name, &value)),
+    );
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let visible = usize::from(area.height.saturating_sub(2));
+    let content = paragraph.line_count(area.width.saturating_sub(2));
+    let max_scroll = u16::try_from(content.saturating_sub(visible)).unwrap_or(u16::MAX);
+    state.transaction_scroll = state.transaction_scroll.min(max_scroll);
+    let title = format!(
+        " block {block_height} / transaction {}/{} — scroll {}/{} ",
+        transaction_index + 1,
+        transaction_count,
+        state.transaction_scroll,
+        max_scroll
+    );
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(bordered(&format!(" block {} ", block.height)))
-            .wrap(Wrap { trim: true }),
+        paragraph
+            .block(bordered(&title))
+            .scroll((state.transaction_scroll, 0)),
         area,
     );
 }
 
+fn transaction_colour(kind: &str) -> Color {
+    match kind {
+        "coinbase" => Color::Magenta,
+        "tenure" => Color::Yellow,
+        "deploy" => Color::Cyan,
+        _ => Color::White,
+    }
+}
+
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
-    let keys = if state.inspecting {
-        "enter/esc back   ↑/↓ select   r refresh   q quit"
-    } else {
-        "enter inspect a block   ↑/↓ select   r refresh   q quit"
+    let keys = match state.screen {
+        Screen::Blocks => "enter/→ open block   ↑/↓ select   r refresh   q quit",
+        Screen::Block => "enter/→ open transaction   ↑/↓ select   esc/← back   r refresh",
+        Screen::Transaction => {
+            "↑/↓ scroll   pgup/pgdn page   home/end edges   esc/← back   r refresh"
+        }
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray)))
@@ -578,8 +964,170 @@ fn field<'a>(name: &'a str, value: Option<&'a str>) -> Line<'a> {
     Line::from(vec![label(&format!("{name:<13}")), self::value(value)])
 }
 
+fn detail(name: &str, value: String) -> Line<'static> {
+    Line::from(vec![label(&format!("{name:<18}")), Span::raw(value)])
+}
+
+fn detail_lines(name: &str, value: &str) -> Vec<Line<'static>> {
+    value
+        .split('\n')
+        .enumerate()
+        .map(|(index, value)| detail(if index == 0 { name } else { "" }, value.to_owned()))
+        .collect()
+}
+
 fn label(text: &str) -> Span<'static> {
     Span::styled(text.to_owned(), Style::default().fg(Color::DarkGray))
+}
+
+fn plain_value(text: Option<&str>, missing: &str) -> Span<'static> {
+    text.map_or_else(
+        || Span::styled(missing.to_owned(), Style::default().fg(Color::Red)),
+        |text| Span::styled(text.to_owned(), Style::default().fg(Color::White)),
+    )
+}
+
+fn sync_lag(behind: Option<u64>, unreachable: bool) -> (String, Color) {
+    if unreachable {
+        return (
+            "unknown while the node is unreachable".to_owned(),
+            Color::Red,
+        );
+    }
+    match behind {
+        Some(0) => (
+            "caught up with the last peer report".to_owned(),
+            Color::Green,
+        ),
+        Some(1) => (
+            "1 verified block behind the last peer report".to_owned(),
+            Color::Yellow,
+        ),
+        Some(blocks) => (
+            format!("{blocks} verified blocks behind the last peer report"),
+            Color::Red,
+        ),
+        None => ("waiting for a peer comparison".to_owned(), Color::DarkGray),
+    }
+}
+
+fn cycle_phases(prepare: Option<i64>, reward: Option<i64>) -> String {
+    match (prepare, reward) {
+        (Some(prepare), Some(reward)) => format!(
+            "prepare {} · reward {} burn blocks",
+            phase_distance(prepare),
+            phase_distance(reward)
+        ),
+        (Some(prepare), None) => {
+            format!("prepare {} · reward unavailable", phase_distance(prepare))
+        }
+        (None, Some(reward)) => format!("prepare unavailable · reward {}", phase_distance(reward)),
+        (None, None) => "timing unavailable".to_owned(),
+    }
+}
+
+fn phase_distance(blocks: i64) -> String {
+    match blocks {
+        0 => "now".to_owned(),
+        blocks if blocks > 0 => format!("+{blocks}"),
+        blocks => format!("{} ago", blocks.unsigned_abs()),
+    }
+}
+
+fn tenure_blocks<'a>(state: &'a State, tenure: &str) -> Vec<&'a node::Block> {
+    state
+        .blocks
+        .iter()
+        .filter(|block| same_id(&block.consensus_hash, tenure))
+        .collect()
+}
+
+fn tenure_extensions<'a>(blocks: &[&'a node::Block]) -> Vec<(u64, &'a node::TenureChange)> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            block.transactions.iter().filter_map(|transaction| {
+                transaction
+                    .tenure_change
+                    .as_ref()
+                    .filter(|change| change.is_extension)
+                    .map(|change| (block.height, change))
+            })
+        })
+        .collect()
+}
+
+fn same_id(left: &str, right: &str) -> bool {
+    left.trim_start_matches("0x")
+        .eq_ignore_ascii_case(right.trim_start_matches("0x"))
+}
+
+fn tenure_span(tip: Option<u64>, start: Option<u64>, loaded: usize) -> String {
+    match (tip, start) {
+        (Some(tip), Some(start)) => format!(
+            "{}→{} · loaded {}/{}",
+            thousands(start),
+            thousands(tip),
+            loaded,
+            thousands(tip.saturating_sub(start) + 1)
+        ),
+        (Some(tip), None) if loaded > 0 => {
+            format!("tip {} · loaded {loaded}; no start", thousands(tip))
+        }
+        (Some(tip), None) => format!("tip {} · no blocks loaded", thousands(tip)),
+        (None, _) => "unavailable".to_owned(),
+    }
+}
+
+fn relative_time(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "time unavailable".to_owned();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(timestamp, |duration| duration.as_secs());
+    if timestamp > now {
+        return format!("{}s from now", timestamp - now);
+    }
+    let elapsed = now - timestamp;
+    if elapsed < 60 {
+        format!("{elapsed}s ago")
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    }
+}
+
+fn compact_limit(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "—".to_owned();
+    };
+    for (divisor, suffix) in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")] {
+        if value >= divisor && value.is_multiple_of(divisor) {
+            return format!("{}{suffix}", value / divisor);
+        }
+    }
+    thousands(value)
+}
+
+fn count_limit(value: Option<u64>) -> String {
+    value.map_or_else(|| "—".to_owned(), thousands)
+}
+
+fn byte_limit(value: Option<u64>) -> String {
+    value.map_or_else(
+        || "—".to_owned(),
+        |value| {
+            if value.is_multiple_of(1_000_000) {
+                format!("{} MB", value / 1_000_000)
+            } else {
+                format!("{} bytes", thousands(value))
+            }
+        },
+    )
 }
 
 /// A field the node could not answer says so, rather than rendering as empty.
@@ -632,7 +1180,10 @@ fn thousands_u128(value: u128) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{short, thousands};
+    use crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::{Action, Screen, State, draw, handle_key, node, short, thousands};
 
     #[test]
     fn a_height_is_read_as_a_magnitude() {
@@ -651,5 +1202,244 @@ mod tests {
         // Short enough to show whole is shown whole rather than padded with an
         // ellipsis that hides nothing.
         assert_eq!(short("a06c505c"), "a06c505c");
+    }
+
+    #[test]
+    fn explorer_navigation_keeps_each_selection_level() {
+        let mut state = explorer_state();
+
+        assert_eq!(handle_key(&mut state, KeyCode::Enter), Action::None);
+        assert_eq!(state.screen, Screen::Block);
+        assert_eq!(state.selected_block.selected(), Some(0));
+        assert_eq!(state.selected_transaction.selected(), Some(0));
+
+        handle_key(&mut state, KeyCode::Enter);
+        assert_eq!(state.screen, Screen::Transaction);
+        handle_key(&mut state, KeyCode::Down);
+        assert_eq!(state.transaction_scroll, 1);
+
+        handle_key(&mut state, KeyCode::Esc);
+        assert_eq!(state.screen, Screen::Block);
+        handle_key(&mut state, KeyCode::Esc);
+        assert_eq!(state.screen, Screen::Blocks);
+        assert_eq!(handle_key(&mut state, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn transaction_page_renders_the_call() {
+        let mut state = explorer_state();
+        state.screen = Screen::Transaction;
+        state.selected_block.select(Some(0));
+        state.selected_transaction.select(Some(0));
+        let rendered = render(&mut state);
+
+        assert!(rendered.contains("SP123.contract"));
+        assert!(rendered.contains("function"));
+        assert!(rendered.contains("argument 0"));
+        assert!(rendered.contains("u42"));
+    }
+
+    #[test]
+    fn dashboard_explains_sync_state_and_shows_the_whole_peer() {
+        let mut state = dashboard_state();
+        let rendered = render(&mut state);
+
+        assert!(rendered.contains("verified locally"));
+        assert!(rendered.contains("executed and checked by this node"));
+        assert!(rendered.contains("last fork choice"));
+        assert!(rendered.contains("last peer report"));
+        assert!(rendered.contains("http://192.0.2.123:20443"));
+        assert!(rendered.contains("2 verified blocks behind"));
+        assert!(rendered.contains("current tenure"));
+        assert!(rendered.contains("tip 8,716,524 · loaded 1; no start"));
+        assert!(rendered.contains("extensions"));
+        assert!(rendered.contains("runtime limit reached"));
+        assert!(rendered.contains("prepare +10 · reward +110 burn blocks"));
+        assert!(rendered.contains("current tenure execution budget"));
+        assert!(rendered.contains("5B runtime"));
+        assert!(
+            rendered.contains("reset at block 8,716,524 after 12 tenure blocks · runtime only")
+        );
+        assert!(rendered.contains("not exposed by this node's RPC"));
+        assert!(rendered.contains("latest burnchain decision"));
+        assert!(rendered.contains("miner elected · new Stacks tenure"));
+        assert!(rendered.contains("winning miner"));
+        assert!(rendered.contains("block commit"));
+        assert!(!rendered.contains("state root"));
+    }
+
+    fn dashboard_state() -> State {
+        State {
+            sync: Some(node::SyncStatus {
+                followed_stacks_height: Some(8_716_526),
+                selected_stacks_height: Some(8_716_525),
+                selected_from_peer: Some("http://192.0.2.123:20443".to_owned()),
+                executed_stacks_height: Some(8_716_524),
+                blocks_behind: Some(2),
+                ..node::SyncStatus::default()
+            }),
+            info: Some(node::NodeInfo {
+                burn_block_height: Some(960_240),
+                server_version: Some("nano-stacks".to_owned()),
+                network_id: Some(1),
+            }),
+            tenure: Some(tenure_info()),
+            pox: Some(pox()),
+            sortitions: sortitions(),
+            blocks: vec![tenure_block()],
+            ..State::default()
+        }
+    }
+
+    fn tenure_info() -> node::TenureInfo {
+        node::TenureInfo {
+            consensus_hash: Some("0x1111111111111111111111111111111111111111".to_owned()),
+            tenure_start_block_id: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            parent_consensus_hash: Some("0x2222222222222222222222222222222222222222".to_owned()),
+            parent_tenure_start_block_id: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            tip_height: Some(8_716_524),
+            reward_cycle: Some(140),
+        }
+    }
+
+    fn pox() -> node::Pox {
+        node::Pox {
+            current_cycle: Some(node::Cycle {
+                id: Some(140),
+                stacked_ustx: Some(1_000_000),
+            }),
+            next_cycle: Some(node::NextCycle {
+                id: Some(141),
+                blocks_until_prepare_phase: Some(10),
+                blocks_until_reward_phase: Some(110),
+            }),
+            current_epoch: Some("Epoch40".to_owned()),
+            epochs: vec![node::Epoch {
+                epoch_id: Some("Epoch40".to_owned()),
+                block_limit: Some(node::ExecutionBudget {
+                    write_length: Some(15_000_000),
+                    write_count: Some(15_000),
+                    read_length: Some(200_000_000),
+                    read_count: Some(30_000),
+                    runtime: Some(5_000_000_000),
+                }),
+            }],
+        }
+    }
+
+    fn sortitions() -> Vec<node::Sortition> {
+        vec![
+            node::Sortition {
+                burn_block_hash: Some(
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                ),
+                burn_block_height: Some(960_240),
+                burn_header_timestamp: Some(1_700_000_000),
+                consensus_hash: Some("0x1111111111111111111111111111111111111111".to_owned()),
+                elected: Some(true),
+                miner_pk_hash160: Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()),
+                stacks_parent_ch: Some("0x2222222222222222222222222222222222222222".to_owned()),
+                committed_block_hash: Some(
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+                ),
+                vrf_seed: Some(
+                    "1212121212121212121212121212121212121212121212121212121212121212".to_owned(),
+                ),
+            },
+            node::Sortition {
+                burn_block_height: Some(960_238),
+                elected: Some(true),
+                ..node::Sortition::default()
+            },
+        ]
+    }
+
+    fn render(state: &mut State) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, state, &node::Node::new("http://node")))
+            .expect("render state");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn explorer_state() -> State {
+        let mut state = State::default();
+        state.blocks.push(node::Block {
+            height: 42,
+            id: "block".to_owned(),
+            parent_id: "parent".to_owned(),
+            consensus_hash: "consensus".to_owned(),
+            state_index_root: "root".to_owned(),
+            transactions: vec![node::Transaction {
+                txid: "transaction".to_owned(),
+                kind: "call".to_owned(),
+                summary: "contract::function".to_owned(),
+                origin: Some("sender".to_owned()),
+                sponsor: None,
+                origin_nonce: 1,
+                sponsor_nonce: None,
+                fee: 2,
+                authorization: "single signature".to_owned(),
+                version: "Mainnet".to_owned(),
+                chain_id: 1,
+                anchor_mode: "Any".to_owned(),
+                post_condition_mode: "Deny".to_owned(),
+                post_conditions: 0,
+                tenure_change: None,
+                fields: vec![
+                    ("contract".to_owned(), "SP123.contract".to_owned()),
+                    ("function".to_owned(), "method".to_owned()),
+                    ("argument 0".to_owned(), "u42".to_owned()),
+                ],
+            }],
+            signatures: 1,
+            timestamp: 2,
+        });
+        state
+    }
+
+    fn tenure_block() -> node::Block {
+        node::Block {
+            height: 8_716_524,
+            id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            parent_id: "parent".to_owned(),
+            consensus_hash: "1111111111111111111111111111111111111111".to_owned(),
+            state_index_root: "root".to_owned(),
+            transactions: vec![node::Transaction {
+                txid: "extension".to_owned(),
+                kind: "tenure".to_owned(),
+                summary: "runtime extension".to_owned(),
+                origin: None,
+                sponsor: None,
+                origin_nonce: 0,
+                sponsor_nonce: None,
+                fee: 0,
+                authorization: "single signature".to_owned(),
+                version: "Mainnet".to_owned(),
+                chain_id: 1,
+                anchor_mode: "OnChainOnly".to_owned(),
+                post_condition_mode: "Deny".to_owned(),
+                post_conditions: 0,
+                tenure_change: Some(node::TenureChange {
+                    is_extension: true,
+                    cause: "runtime limit reached".to_owned(),
+                    reset: "runtime".to_owned(),
+                    previous_blocks: 12,
+                }),
+                fields: Vec::new(),
+            }],
+            signatures: 1,
+            timestamp: 2,
+        }
     }
 }
