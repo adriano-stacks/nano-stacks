@@ -82,6 +82,7 @@ fn main() -> ExitCode {
         }
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("sweep-contracts") => sweep_contracts(&env::args().skip(2).collect::<Vec<_>>()),
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both-tx") => call_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
@@ -130,6 +131,119 @@ fn main() -> ExitCode {
             );
             ExitCode::from(2)
         }
+    }
+}
+
+
+/// Compile **and load** every contract a state holds, and name what refuses.
+///
+/// Task 073 swept the imported mainnet state for peak locals and reported
+/// 137,332 of 137,340 compiling. That sweep called `clar2wasm::compile` and never
+/// handed the result to wasmtime, which matters: the arity limit task 084 is about
+/// is a *validator* limit, so a module that exceeds it compiles cleanly and fails
+/// to load. The sweep could not have seen one.
+///
+/// This runs the production path -- `Vm::check_module`, which is `compile_under`
+/// followed by `loadable` -- over every contract in the state, in one process and
+/// read-only. So it answers both questions at once: which contracts clarity-wasm
+/// cannot compile, and which produce a module the engine will not accept.
+fn sweep_contracts(arguments: &[String]) -> ExitCode {
+    let [state] = arguments else {
+        eprintln!(
+            "usage: cargo xtask sweep-contracts <state-dir>\n\
+             compiles and loads every contract the state holds, and names every refusal\n\
+             reads only, and refuses a path that is not already a state\n\
+             the node must not be running: its uncommitted pages are not readable"
+        );
+        return ExitCode::from(2);
+    };
+    let chainstate = Path::new(state).join("chainstate");
+    let mut vm = match open_state_vm(&chainstate) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(tip) = vm.tip() else {
+        eprintln!("the state is sealed at no block, so it holds no contracts to compile");
+        return ExitCode::FAILURE;
+    };
+    if let Err(error) = vm.begin_block(Some(tip), [0xc5; 32]) {
+        eprintln!("cannot open a block on the tip: {error:?}");
+        return ExitCode::FAILURE;
+    }
+
+    // The analyses name every contract the state holds, which is what a checkpoint
+    // carries and what a replay can be asked to run.
+    let contracts = match sqlite(
+        &chainstate.join("clarity.sqlite"),
+        "SELECT key FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis'",
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("cannot list the state's contracts: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let contracts: Vec<String> = contracts
+        .lines()
+        .filter_map(|key| {
+            Some(
+                key.strip_prefix("clr-meta::")?
+                    .strip_suffix("::analysis")?
+                    .to_owned(),
+            )
+        })
+        .collect();
+    if contracts.is_empty() {
+        eprintln!("the state names no contracts");
+        return ExitCode::FAILURE;
+    }
+
+    let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut checked = 0_usize;
+    for contract in &contracts {
+        let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
+            continue;
+        };
+        let Ok((source, version)) = vm.contract_source(&identifier) else {
+            continue;
+        };
+        checked += 1;
+        if let Err(error) =
+            vm.check_module(&identifier, version, &source, clarity::types::StacksEpochId::Epoch40)
+        {
+            // Grouped by the refusal rather than listed one per line: eight
+            // failures over 137,340 contracts is three defects, and a flat list
+            // of eight hides that.
+            let reason = format!("{error:?}");
+            let reason = reason
+                .split("contract analysis failed: ")
+                .nth(1)
+                .unwrap_or(&reason)
+                .chars()
+                .take(90)
+                .collect::<String>();
+            refused.entry(reason).or_default().push(contract.clone());
+        }
+    }
+
+    println!(
+        "{}/{checked} contracts compile and load ({} named by the state)",
+        checked - refused.values().map(Vec::len).sum::<usize>(),
+        contracts.len()
+    );
+    for (reason, contracts) in &refused {
+        println!("\n  {} x {reason}", contracts.len());
+        for contract in contracts.iter().take(8) {
+            println!("      {contract}");
+        }
+    }
+    if refused.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
