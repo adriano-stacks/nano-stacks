@@ -1,13 +1,14 @@
 use clarity::vm::types::TypeSignature;
 use clarity::vm::{ClarityName, SymbolicExpression};
-use walrus::ir::InstrSeqType;
+use walrus::ir::IfElse;
+use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
 use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::wasm_generator::{
-    clar2wasm_ty, drop_value, ArgumentsExt, GeneratorError, WasmGenerator,
+    clar2wasm_ty, drop_value, uses_packed_value, ArgumentsExt, GeneratorError, WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -87,9 +88,41 @@ impl ComplexWord for DefaultTo {
         }
         let opt_val_locals = generator.save_to_locals(builder, &expr_type, true);
 
+        if uses_packed_value(&expr_type) {
+            generator.note_control_arity(
+                clar2wasm_ty(&expr_type).len(),
+                clar2wasm_ty(&expr_type).len(),
+            );
+            let indicator = generator.module.locals.add(ValType::I32);
+            builder.local_set(indicator);
+            let default_locals = generator.save_to_locals(builder, &expr_type, true);
+            let (result_offset, _) =
+                generator.create_call_stack_local(builder, &expr_type, true, false);
+            let mut then = builder.dangling_instr_seq(None);
+            for local in &opt_val_locals {
+                then.local_get(*local);
+            }
+            generator.write_to_memory(&mut then, result_offset, 0, &expr_type)?;
+            let then = then.id();
+            let mut else_ = builder.dangling_instr_seq(None);
+            for local in &default_locals {
+                else_.local_get(*local);
+            }
+            generator.write_to_memory(&mut else_, result_offset, 0, &expr_type)?;
+            let else_ = else_.id();
+            builder.local_get(indicator).instr(IfElse {
+                consequent: then,
+                alternative: else_,
+            });
+            generator.release_locals(opt_val_locals);
+            generator.release_locals(default_locals);
+            generator.read_from_memory(builder, result_offset, 0, &expr_type)?;
+            return Ok(());
+        }
+
         // Params and result types for the if_else branch
         let out_types = clar2wasm_ty(&expr_type);
-        let block_type = InstrSeqType::new(&mut generator.module.types, &out_types, &out_types);
+        let block_type = generator.bounded_control_type(&out_types, &out_types)?;
 
         builder.if_else(
             block_type,

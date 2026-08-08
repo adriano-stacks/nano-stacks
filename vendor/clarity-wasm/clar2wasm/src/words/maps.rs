@@ -4,7 +4,7 @@ use clarity::types::StacksEpochId;
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use clarity_types::ClarityTypeError;
-use walrus::ir::{BinaryOp, IfElse, InstrSeqType};
+use walrus::ir::{BinaryOp, IfElse};
 use walrus::ValType;
 
 use super::{ComplexWord, Word};
@@ -12,7 +12,8 @@ use crate::check_args;
 use crate::cost::WordCharge;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
-    clar2wasm_ty, ArgumentsExt, GeneratorError, LiteralMemoryEntry, WasmGenerator,
+    clar2wasm_ty, drop_value, uses_packed_value, ArgumentsExt, GeneratorError, LiteralMemoryEntry,
+    WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -166,8 +167,14 @@ impl ComplexWord for MapGet {
         generator.read_from_memory(builder, return_offset, 0, &return_type)?;
 
         let ty = clar2wasm_ty(&return_type);
-
-        let block_ty = InstrSeqType::new(&mut generator.module.types, &ty.clone(), &ty);
+        let packed_return = uses_packed_value(&return_type);
+        let return_locals =
+            packed_return.then(|| generator.save_to_locals(builder, &return_type, true));
+        let block_ty = if packed_return {
+            generator.lowered_control_type(&ty, &ty)
+        } else {
+            generator.bounded_control_type(&ty, &ty)?
+        };
         // In > 2.05 we have three different costs depending if
         //      - an error occurred in the interpreter
         //      - no error occurred
@@ -177,6 +184,11 @@ impl ComplexWord for MapGet {
             // When the linked operation does not fail due to an interpreter error
             let mut success_block = builder.dangling_instr_seq(block_ty);
             if let Some(cost_local) = &post205_cost_local {
+                if let Some(return_locals) = &return_locals {
+                    for local in return_locals {
+                        success_block.local_get(*local);
+                    }
+                }
                 generator.serialization_size(&mut success_block, &return_type)?;
                 let value_serialization_size = generator.borrow_local(ValType::I32);
                 // We check if the serialized size of the returned value is different than 1, aka the serialization size of a none
@@ -195,6 +207,9 @@ impl ComplexWord for MapGet {
                     .binop(BinaryOp::I32Add)
                     .local_set(**cost_local);
                 self.charge(generator, &mut success_block, **cost_local)?;
+                if packed_return {
+                    drop_value(&mut success_block, &return_type);
+                }
             }
             success_block.id()
         };
@@ -226,6 +241,12 @@ impl ComplexWord for MapGet {
                 consequent: success_block_id,
                 alternative: error_block_id,
             });
+        if let Some(return_locals) = return_locals {
+            for local in &return_locals {
+                builder.local_get(*local);
+            }
+            generator.release_locals(return_locals);
+        }
 
         Ok(())
     }
@@ -481,11 +502,7 @@ impl ComplexWord for MapInsert {
         // Call the host interface function, `map_set`
         builder.call(generator.func_by_name("stdlib.map_insert"));
 
-        let block_ty = InstrSeqType::new(
-            &mut generator.module.types,
-            &[ValType::I32],
-            &[ValType::I32],
-        );
+        let block_ty = generator.bounded_control_type(&[ValType::I32], &[ValType::I32])?;
 
         // In > 2.05 we have three different costs depending if
         //      - an error occurred in the interpreter

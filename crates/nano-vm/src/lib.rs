@@ -4955,7 +4955,8 @@ fn set_tenure_height_in_context(
 mod tests {
     use std::path::Path;
 
-    use clar2wasm::ModuleCache;
+    use clar2wasm::{CompiledContract, ModuleCache};
+    use clarity::vm::analysis::ContractAnalysis;
     use clarity::vm::database::clarity_store::make_contract_hash_key;
     use clarity::vm::database::{ClarityBackingStore, HeadersDB};
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
@@ -4976,8 +4977,37 @@ mod tests {
 
     use super::{
         AnalysisDatabase, CLARITY_FILE, MarfStoreError, StaticCheckError, compile_under,
-        ensure_wasm_module, recorded_network, reports_analysis_failure,
+        ensure_wasm_module, loadable, recorded_network, reports_analysis_failure,
     };
+
+    #[test]
+    fn malformed_wasm_fixture_exercises_the_production_module_load_refusal() {
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.bad-wasm")
+            .expect("a contract identifier");
+        let analysis = ContractAnalysis::new(
+            contract.clone(),
+            Vec::new(),
+            LimitedCostTracker::new_free(),
+            StacksEpochId::Epoch40,
+            ClarityVersion::Clarity6,
+        );
+        let malformed = b"\0asm\x01\0\0\0\x01\x01\xff".to_vec();
+        let refused = loadable(
+            &contract,
+            CompiledContract::new(malformed, analysis),
+            &wasmtime::Engine::default(),
+        )
+        .expect_err("the runtime rejects malformed Wasm")
+        .to_string();
+        assert!(
+            refused.contains("compiles to a module that will not load"),
+            "the production load boundary did not classify the fixture: {refused}"
+        );
+        assert!(
+            refused.contains(&contract.to_string()),
+            "the production load refusal did not name its contract: {refused}"
+        );
+    }
 
     /// Read a Clarity expression the only way this node evaluates anything:
     /// through a deployed contract, compiled and run by clarity-wasm.

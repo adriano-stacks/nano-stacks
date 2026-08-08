@@ -10,6 +10,7 @@ use clarity::vm::ClarityVersion;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 pub use walrus::Module;
+pub use wasm_generator::ArityReport;
 use wasm_generator::{GeneratorError, LocalsReport, WasmGenerator};
 
 use crate::error::WasmError;
@@ -58,6 +59,8 @@ pub struct CompileResult {
     /// during generation. Measurement only: nothing refuses compilation
     /// based on it.
     pub locals_report: LocalsReport,
+    /// Maximum flattened function and control arities before packed lowering.
+    pub arity_report: ArityReport,
 }
 
 #[derive(Debug)]
@@ -301,6 +304,7 @@ pub fn compile_for_cost_epoch(
     // The generator is consumed by `generate`, so keep a handle on the
     // report it fills in as it works.
     let locals_report = generator.locals_report.clone();
+    let arity_report = generator.arity_report.clone();
 
     match generator.generate() {
         Ok(module) => Ok(CompileResult {
@@ -309,6 +313,7 @@ pub fn compile_for_cost_epoch(
             module,
             contract_analysis,
             locals_report: locals_report.borrow().clone(),
+            arity_report: arity_report.borrow().clone(),
         }),
         Err(e) => {
             diagnostics.push(Diagnostic::err(&e));

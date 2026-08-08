@@ -157,8 +157,53 @@ mod tests {
     use clarity_types::ClarityName;
 
     use crate::tools::{
-        crosscheck, crosscheck_expect_failure, crosscheck_multi_contract, evaluate, TestEnvironment,
+        crosscheck, crosscheck_cost, crosscheck_expect_failure, crosscheck_multi_contract,
+        evaluate, TestEnvironment,
     };
+
+    const ARITY_INT_FIELDS: u32 = 499;
+
+    fn arity_tuple_fields(with_flag: bool) -> String {
+        let mut fields = (0..ARITY_INT_FIELDS)
+            .map(|index| format!("f{index}: {index}"))
+            .collect::<Vec<_>>();
+        fields.push("bytes: 0x01".to_owned());
+        if with_flag {
+            fields.push("flag: true".to_owned());
+        }
+        fields.join(", ")
+    }
+
+    fn arity_tuple_type(with_flag: bool) -> String {
+        let mut fields = (0..ARITY_INT_FIELDS)
+            .map(|index| format!("f{index}: int"))
+            .collect::<Vec<_>>();
+        fields.push("bytes: (buff 1)".to_owned());
+        if with_flag {
+            fields.push("flag: bool".to_owned());
+        }
+        fields.join(", ")
+    }
+
+    fn arity_tuple_value(with_flag: bool) -> Value {
+        let mut fields = (0..ARITY_INT_FIELDS)
+            .map(|index| {
+                (
+                    ClarityName::try_from(format!("f{index}"))
+                        .expect("generated tuple field name is valid"),
+                    Value::Int(index.into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        fields.push((
+            ClarityName::from_literal("bytes"),
+            Value::buff_from(vec![1]).expect("one byte is a valid buffer"),
+        ));
+        if with_flag {
+            fields.push((ClarityName::from_literal("flag"), Value::Bool(true)));
+        }
+        Value::Tuple(TupleData::from_data(fields).expect("generated tuple is valid"))
+    }
 
     //
     // Module with tests that should only be executed
@@ -669,13 +714,19 @@ mod tests {
             (define-read-only (first (value {{{field_types}}})) (get f0 value))
             (define-read-only (local-first) (first {{{fields}}}))
             (define-private (map-wide (value int)) {{{fields}}})
+            (define-private (typed-int-list (empty bool))
+                (if empty (list) (list 1)))
             (define-read-only (mapped-wide-length) (len (map map-wide (list 1))))
+            (define-read-only (mapped-wide-empty-length)
+                (len (map map-wide (typed-int-list true))))
             (define-private (map-first (value {{{field_types}}})) (get f0 value))
             (define-read-only (mapped-first)
                 (is-eq (map map-first (list {{{fields}}})) (list 0)))
             (define-private (fold-wide (value int) (total {{{field_types}}})) total)
             (define-read-only (folded-wide-first)
                 (get f0 (fold fold-wide (list 1) {{{fields}}})))
+            (define-read-only (folded-wide-empty-first)
+                (get f0 (fold fold-wide (typed-int-list true) {{{fields}}})))
             (define-public (early)
                 (begin
                     (asserts! false (err u7))
@@ -697,6 +748,10 @@ mod tests {
             .expect("generated tuple is valid"),
         );
 
+        crosscheck_expect_failure(
+            "(define-private (map-int (value int)) value) (map map-int (list))",
+        );
+
         let mut compiled = TestEnvironment::default();
         let mut interpreted = TestEnvironment::default();
         assert_eq!(
@@ -710,8 +765,10 @@ mod tests {
             ("first", vec![tuple.clone()], Value::Int(0)),
             ("local-first", Vec::new(), Value::Int(0)),
             ("mapped-wide-length", Vec::new(), Value::UInt(1)),
+            ("mapped-wide-empty-length", Vec::new(), Value::UInt(0)),
             ("mapped-first", Vec::new(), Value::Bool(true)),
             ("folded-wide-first", Vec::new(), Value::Int(0)),
+            ("folded-wide-empty-first", Vec::new(), Value::Int(0)),
             ("early", Vec::new(), Value::err_uint(7)),
         ] {
             let compiled_result = compiled.call_contract("wide-abi", function, &arguments);
@@ -725,6 +782,159 @@ mod tests {
                 compiled_result.expect("compiled call succeeds"),
                 expected,
                 "unexpected result from {function}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_values_cross_control_and_consensus_boundaries() {
+        let at_limit_fields = arity_tuple_fields(false);
+        let at_limit_type = arity_tuple_type(false);
+        let wide_fields = arity_tuple_fields(true);
+        let snippet = format!(
+            r#"
+            (define-map wide-map uint {{{at_limit_type}}})
+            (map-set wide-map u1 {{{at_limit_fields}}})
+            (define-read-only (through-if)
+                (if true {{{wide_fields}}} {{{wide_fields}}}))
+            (define-read-only (through-match)
+                (match (some true) present {{{wide_fields}}} {{{wide_fields}}}))
+            (define-read-only (through-match-none)
+                (match (if true none (some true)) present {{{wide_fields}}} {{{wide_fields}}}))
+            (define-read-only (through-default)
+                (default-to {{{wide_fields}}} (some {{{wide_fields}}})))
+            (define-read-only (through-default-none)
+                (default-to {{{wide_fields}}} none))
+            (define-read-only (through-element)
+                (element-at? (list {{{at_limit_fields}}}) u0))
+            (define-read-only (through-element-none)
+                (element-at? (list {{{at_limit_fields}}}) u1))
+            (define-read-only (through-replace)
+                (replace-at? (list {{{wide_fields}}}) u0 {{{wide_fields}}}))
+            (define-read-only (through-index)
+                (index-of? (list {{{wide_fields}}}) {{{wide_fields}}}))
+            (define-read-only (through-map-get)
+                (map-get? wide-map u1))
+            (define-public (delete-wide-map)
+                (ok (map-delete wide-map u1)))
+            (define-read-only (deleted-value)
+                (map-get? wide-map u1))
+            (define-public (write-and-print)
+                (begin
+                    (map-set wide-map u2 {{{at_limit_fields}}})
+                    (print {{{wide_fields}}})
+                    (ok {{{wide_fields}}})))
+            (define-read-only (written-value) (map-get? wide-map u2))
+            (define-public (write-then-abort)
+                (begin (map-set wide-map u3 {{{at_limit_fields}}}) (err u9)))
+            (define-read-only (rolled-back-value) (map-get? wide-map u3))
+            (define-read-only (through-consensus)
+                (from-consensus-buff? {{{at_limit_type}}}
+                    (unwrap-panic (to-consensus-buff? {{{at_limit_fields}}}))))
+            (define-read-only (through-nested-optional-consensus)
+                (from-consensus-buff? (optional {{{at_limit_type}}})
+                    (unwrap-panic (to-consensus-buff? (some {{{at_limit_fields}}})))))
+            (define-read-only (through-response-consensus)
+                (from-consensus-buff? (response {{{at_limit_type}}} bool)
+                    (unwrap-panic (to-consensus-buff? (ok {{{at_limit_fields}}})))))
+            (print (through-if))
+            "#
+        );
+        let at_limit = arity_tuple_value(false);
+        let wide = arity_tuple_value(true);
+        let optional_at_limit = Value::some(at_limit.clone()).expect("an optional tuple");
+        let ok_wide = Value::okay(wide.clone()).expect("an ok response");
+        let nested_optional = Value::some(optional_at_limit.clone()).expect("nested optional");
+        let optional_response = Value::some(
+            Value::okay(at_limit.clone()).expect("an ok response containing the tuple"),
+        )
+        .expect("an optional response");
+        let replaced = Value::some(
+            Value::cons_list_unsanitized(vec![wide.clone()]).expect("a one-element list"),
+        )
+        .expect("an optional list");
+
+        let mut compiled = TestEnvironment::default();
+        let mut interpreted = TestEnvironment::default();
+        assert_eq!(
+            compiled.init_contract_with_snippet("wide-controls", &snippet),
+            interpreted.interpret_contract_with_snippet("wide-controls", &snippet)
+        );
+        for (function, expected) in [
+            ("through-if", wide.clone()),
+            ("through-match", wide.clone()),
+            ("through-match-none", wide.clone()),
+            ("through-default", wide.clone()),
+            ("through-default-none", wide),
+            ("through-element", optional_at_limit.clone()),
+            ("through-element-none", Value::none()),
+            ("through-replace", replaced),
+            (
+                "through-index",
+                Value::some(Value::UInt(0)).expect("an optional uint"),
+            ),
+            ("through-map-get", optional_at_limit.clone()),
+            ("delete-wide-map", Value::okay_true()),
+            ("deleted-value", Value::none()),
+            ("through-consensus", optional_at_limit),
+            ("through-nested-optional-consensus", nested_optional),
+            ("through-response-consensus", optional_response),
+            ("write-and-print", ok_wide),
+            (
+                "written-value",
+                Value::some(at_limit).expect("an optional tuple"),
+            ),
+            ("write-then-abort", Value::err_uint(9)),
+            ("rolled-back-value", Value::none()),
+        ] {
+            let compiled_result = compiled.call_contract("wide-controls", function, &[]);
+            let interpreted_result =
+                interpreted.interpret_call_contract("wide-controls", function, &[]);
+            assert_eq!(
+                compiled_result, interpreted_result,
+                "compiled and interpreted calls diverged for {function}"
+            );
+            assert_eq!(
+                compiled_result.expect("compiled call succeeds"),
+                expected,
+                "unexpected result from {function}"
+            );
+        }
+        assert_eq!(
+            format!("{:?}", compiled.get_events()),
+            format!("{:?}", interpreted.get_events()),
+            "compiled and interpreted wide events diverged"
+        );
+
+        crosscheck_cost(&snippet, "write-and-print", &[]);
+    }
+
+    #[test]
+    fn cross_contract_parameters_and_results_cross_the_exact_arity_boundary() {
+        for (name, with_flag) in [("exact", false), ("packed", true)] {
+            let fields = arity_tuple_fields(with_flag);
+            let field_type = arity_tuple_type(with_flag);
+            let callee_name = ContractName::try_from(format!("{name}-callee"))
+                .expect("generated contract name is valid");
+            let caller_name = ContractName::try_from(format!("{name}-caller"))
+                .expect("generated contract name is valid");
+            let callee = format!(
+                r#"
+                (define-read-only (wide) {{{fields}}})
+                (define-read-only (accept (value {{{field_type}}}))
+                    (is-eq (get bytes value) 0x01))
+                "#
+            );
+            let caller = format!(
+                r#"
+                (and
+                    (contract-call? .{callee_name} accept {{{fields}}})
+                    (is-eq (get bytes (contract-call? .{callee_name} wide)) 0x01))
+                "#
+            );
+            crosscheck_multi_contract(
+                &[(callee_name, &callee), (caller_name, &caller)],
+                Ok(Some(Value::Bool(true))),
             );
         }
     }

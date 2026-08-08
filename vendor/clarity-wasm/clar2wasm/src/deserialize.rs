@@ -4,14 +4,30 @@ use clarity::vm::types::{
     ListTypeData, SequenceSubtype, StringSubtype, TupleTypeSignature, TypeSignature,
 };
 use walrus::ir::{
-    BinaryOp, Block, Const, ExtendedLoad, IfElse, InstrSeqType, LoadKind, Loop, MemArg, StoreKind,
-    UnaryOp,
+    BinaryOp, Block, Const, ExtendedLoad, IfElse, LoadKind, Loop, MemArg, StoreKind, UnaryOp,
 };
 use walrus::{InstrSeqBuilder, LocalId, MemoryId, ValType};
 
 use crate::wasm_generator::{
-    add_placeholder_for_clarity_type, clar2wasm_ty, GeneratorError, WasmGenerator,
+    add_placeholder_for_clarity_type, clar2wasm_ty, uses_packed_slots, GeneratorError,
+    WasmGenerator, MAX_WASM_TYPE_ARITY,
 };
+
+fn store_lowered_result(builder: &mut InstrSeqBuilder, locals: &Option<Vec<LocalId>>) {
+    if let Some(locals) = locals {
+        for local in locals.iter().rev() {
+            builder.local_set(*local);
+        }
+    }
+}
+
+fn load_lowered_result(builder: &mut InstrSeqBuilder, locals: &Option<Vec<LocalId>>) {
+    if let Some(locals) = locals {
+        for local in locals {
+            builder.local_get(*local);
+        }
+    }
+}
 
 impl WasmGenerator {
     /// Deserialize an integer (`int` or `uint`) from memory using consensus
@@ -33,11 +49,8 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block that returns `none` if 17 bytes from offset is
         // beyond the end of the buffer.
-        let block_ty = InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32, ValType::I64, ValType::I64],
-        );
+        let block_ty =
+            self.bounded_control_type(&[], &[ValType::I32, ValType::I64, ValType::I64])?;
         let mut none_block = builder.dangling_instr_seq(block_ty);
 
         // Return `none`
@@ -85,16 +98,16 @@ impl WasmGenerator {
                         },
                     );
                     // Convert from big-endian to little
-                    let tmp_v128 = self.module.locals.add(ValType::V128);
+                    let tmp_v128 = self.borrow_local(ValType::V128);
                     then.instr(Const {
                         value: walrus::ir::Value::V128(0x000102030405060708090a0b0c0d0e0f),
                     })
                     .i8x16_swizzle()
-                    .local_tee(tmp_v128);
+                    .local_tee(*tmp_v128);
 
                     // Push the two i64s onto the stack
                     then.unop(UnaryOp::I64x2ExtractLane { idx: 0 });
-                    then.local_get(tmp_v128)
+                    then.local_get(*tmp_v128)
                         .unop(UnaryOp::I64x2ExtractLane { idx: 1 });
 
                     // Increment the offset by 17
@@ -144,11 +157,8 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block for the body of this operation, so that we can
         // early exit as needed.
-        let block_ty = InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32, ValType::I32, ValType::I32],
-        );
+        let block_ty =
+            self.bounded_control_type(&[], &[ValType::I32, ValType::I32, ValType::I32])?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -330,8 +340,7 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block for the body of this operation, so that we can
         // early exit as needed.
-        let block_ty =
-            InstrSeqType::new(&mut self.module.types, &[], &[ValType::I32, ValType::I32]);
+        let block_ty = self.bounded_control_type(&[], &[ValType::I32, ValType::I32])?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -441,7 +450,13 @@ impl WasmGenerator {
         // optionals.
         let mut wasm_val_ty = vec![ValType::I32, ValType::I32];
         wasm_val_ty.append(&mut clar2wasm_ty(value_ty));
-        let block_ty = InstrSeqType::new(&mut self.module.types, &[], &wasm_val_ty);
+        let result_locals = uses_packed_slots(0, wasm_val_ty.len())
+            .then(|| wasm_val_ty.iter().map(|ty| self.alloc_local(*ty)).collect());
+        let block_ty = if result_locals.is_some() {
+            self.lowered_control_type(&[], &wasm_val_ty)
+        } else {
+            self.bounded_control_type(&[], &wasm_val_ty)?
+        };
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -456,6 +471,7 @@ impl WasmGenerator {
                     // Return none
                     then.i32_const(0).i32_const(0);
                     add_placeholder_for_clarity_type(then, value_ty);
+                    store_lowered_result(then, &result_locals);
                     then.br(block_id);
                 },
                 |_| {},
@@ -496,6 +512,7 @@ impl WasmGenerator {
                         .local_set(offset_local);
 
                     // Break out of the block
+                    store_lowered_result(then, &result_locals);
                     then.br(block_id);
                 },
                 |_| {},
@@ -533,6 +550,7 @@ impl WasmGenerator {
                 // Return none
                 then.i32_const(0).i32_const(0);
                 add_placeholder_for_clarity_type(then, value_ty);
+                store_lowered_result(then, &result_locals);
                 then.br(block_id);
             },
             |_| {},
@@ -547,6 +565,7 @@ impl WasmGenerator {
         for local in inner_locals {
             some_block.local_get(local);
         }
+        store_lowered_result(&mut some_block, &result_locals);
 
         // Build the block for the case of an invalid type prefix
         let mut invalid_block = block.dangling_instr_seq(block_ty);
@@ -555,6 +574,7 @@ impl WasmGenerator {
         // Invalid prefix, return `none`.
         invalid_block.i32_const(0).i32_const(0);
         add_placeholder_for_clarity_type(&mut invalid_block, value_ty);
+        store_lowered_result(&mut invalid_block, &result_locals);
 
         // Check for the `some` prefix (0x0a)
         block
@@ -568,6 +588,10 @@ impl WasmGenerator {
 
         // Add our main block to the builder.
         builder.instr(walrus::ir::Block { seq: block_id });
+        load_lowered_result(builder, &result_locals);
+        if let Some(result_locals) = result_locals {
+            self.release_locals(result_locals);
+        }
 
         Ok(())
     }
@@ -599,7 +623,13 @@ impl WasmGenerator {
         let mut wasm_val_ty = vec![ValType::I32, ValType::I32];
         wasm_val_ty.append(&mut clar2wasm_ty(ok_ty));
         wasm_val_ty.append(&mut clar2wasm_ty(err_ty));
-        let block_ty = InstrSeqType::new(&mut self.module.types, &[], &wasm_val_ty);
+        let result_locals = uses_packed_slots(0, wasm_val_ty.len())
+            .then(|| wasm_val_ty.iter().map(|ty| self.alloc_local(*ty)).collect());
+        let block_ty = if result_locals.is_some() {
+            self.lowered_control_type(&[], &wasm_val_ty)
+        } else {
+            self.bounded_control_type(&[], &wasm_val_ty)?
+        };
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -615,6 +645,7 @@ impl WasmGenerator {
                     then.i32_const(0).i32_const(0);
                     add_placeholder_for_clarity_type(then, ok_ty);
                     add_placeholder_for_clarity_type(then, err_ty);
+                    store_lowered_result(then, &result_locals);
                     then.br(block_id);
                 },
                 |_| {},
@@ -661,6 +692,7 @@ impl WasmGenerator {
                 then.i32_const(0).i32_const(0);
                 add_placeholder_for_clarity_type(then, ok_ty);
                 add_placeholder_for_clarity_type(then, err_ty);
+                store_lowered_result(then, &result_locals);
                 then.br(block_id);
             },
             |_| {},
@@ -678,6 +710,7 @@ impl WasmGenerator {
 
         // Push a placeholder for the err value
         add_placeholder_for_clarity_type(&mut ok_block, err_ty);
+        store_lowered_result(&mut ok_block, &result_locals);
 
         // Build the block for the case where the prefix is `err`
         let mut err_block = block.dangling_instr_seq(block_ty);
@@ -695,6 +728,7 @@ impl WasmGenerator {
                     then.i32_const(0).i32_const(0);
                     add_placeholder_for_clarity_type(then, ok_ty);
                     add_placeholder_for_clarity_type(then, err_ty);
+                    store_lowered_result(then, &result_locals);
                     then.br(block_id);
                 },
                 |_| {},
@@ -727,6 +761,7 @@ impl WasmGenerator {
                 then.i32_const(0).i32_const(0);
                 add_placeholder_for_clarity_type(then, ok_ty);
                 add_placeholder_for_clarity_type(then, err_ty);
+                store_lowered_result(then, &result_locals);
                 then.br(block_id);
             },
             |_| {},
@@ -744,6 +779,7 @@ impl WasmGenerator {
         for local in inner_locals {
             err_block.local_get(local);
         }
+        store_lowered_result(&mut err_block, &result_locals);
 
         // Check for the `ok` prefix (0x0a)
         block
@@ -756,6 +792,10 @@ impl WasmGenerator {
 
         // Add our main block to the builder.
         builder.instr(walrus::ir::Block { seq: block_id });
+        load_lowered_result(builder, &result_locals);
+        if let Some(result_locals) = result_locals {
+            self.release_locals(result_locals);
+        }
 
         Ok(())
     }
@@ -783,7 +823,7 @@ impl WasmGenerator {
         // These I32s are the some indicator for the outer optional and
         // the offset and length of the list.
         let wasm_val_ty = vec![ValType::I32, ValType::I32, ValType::I32];
-        let block_ty = InstrSeqType::new(&mut self.module.types, &[], &wasm_val_ty);
+        let block_ty = self.bounded_control_type(&[], &wasm_val_ty)?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -980,12 +1020,13 @@ impl WasmGenerator {
     fn deserialize_tuple(
         &mut self,
         builder: &mut InstrSeqBuilder,
-        memory: MemoryId,
         offset_local: LocalId,
         end_local: LocalId,
         offset_result: LocalId,
         tuple_ty: &TupleTypeSignature,
+        output: Option<(LocalId, u32)>,
     ) -> Result<(), GeneratorError> {
+        let memory = self.get_memory()?;
         // We need to be able to parse the keys coming in a random order, only one occurence of each key.
         // We should ignore a valid key and value that is not specified in the result type.
         // Here is what is generated in pseudo-code:
@@ -1040,6 +1081,20 @@ impl WasmGenerator {
         };
 
         let ty = TypeSignature::TupleType(tuple_ty.clone());
+        let bounded_output = output.is_some();
+        let (tuple_output, tuple_output_offset) = if let Some(output) = output {
+            output
+        } else {
+            let tuple_output = self.module.locals.add(ValType::I32);
+            builder
+                .local_get(offset_result)
+                .local_set(tuple_output)
+                .local_get(offset_result)
+                .i32_const(get_type_size(&ty))
+                .binop(BinaryOp::I32Add)
+                .local_set(offset_result);
+            (tuple_output, 0)
+        };
 
         // bitset which will indicate if a field was defined or not
         let result_len = tm.len();
@@ -1047,25 +1102,34 @@ impl WasmGenerator {
             .map(|_| self.module.locals.add(ValType::I32))
             .collect();
 
-        // locals that will hold the tuple values, in the same order as the tuple type map
-        let values_locals: Vec<Vec<LocalId>> = tm
+        let field_offsets = tm
             .values()
-            .map(|ty_| {
-                clar2wasm_ty(ty_)
-                    .into_iter()
-                    .map(|local_ty| self.module.locals.add(local_ty))
-                    .collect()
+            .scan(0_u32, |offset, field_ty| {
+                let field_offset = *offset;
+                *offset += get_type_size(field_ty) as u32;
+                Some(field_offset)
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         // This locale will contain the remaining number of fields to deserialize
         let remaining_fields = self.module.locals.add(ValType::I32);
 
         // Create a main block for the body of this operation, so that we can
         // early exit as needed.
-        let mut wasm_val_ty = vec![ValType::I32];
-        wasm_val_ty.extend(clar2wasm_ty(&ty));
-        let return_ty = InstrSeqType::new(&mut self.module.types, &[], &wasm_val_ty);
+        let wasm_val_ty = if bounded_output {
+            vec![ValType::I32]
+        } else {
+            let mut value_ty = vec![ValType::I32];
+            value_ty.extend(clar2wasm_ty(&ty));
+            value_ty
+        };
+        let result_locals = (!bounded_output && uses_packed_slots(0, wasm_val_ty.len()))
+            .then(|| wasm_val_ty.iter().map(|ty| self.alloc_local(*ty)).collect());
+        let return_ty = if result_locals.is_some() {
+            self.lowered_control_type(&[], &wasm_val_ty)
+        } else {
+            self.bounded_control_type(&[], &wasm_val_ty)?
+        };
 
         // Main block creation
         let main_block_id = {
@@ -1211,10 +1275,10 @@ impl WasmGenerator {
                     }
 
                     // switch case for valid fields
-                    for (((&case, field_ty), field_locals), case_idx) in switch_case_blocks[1..]
+                    for (((&case, field_ty), field_offset), case_idx) in switch_case_blocks[1..]
                         .iter()
                         .zip(tm.values())
-                        .zip(values_locals.iter())
+                        .zip(&field_offsets)
                         .zip(0usize..)
                     {
                         let mut case_block = loop_.instr_seq(case);
@@ -1233,16 +1297,32 @@ impl WasmGenerator {
                             .binop(BinaryOp::I32And)
                             .br_if(done_block_id);
 
-                        // try to deserialize the value and add the result to locals
-                        self.deserialize_from_memory(
-                            &mut case_block,
-                            offset_local,
-                            end_local,
-                            offset_result,
-                            field_ty,
-                        )?;
-                        for &l in field_locals.iter().rev() {
-                            case_block.local_set(l);
+                        // Deserialize directly into the tuple's bounded
+                        // representation instead of retaining every field in
+                        // the native frame.
+                        if clar2wasm_ty(field_ty).len() >= MAX_WASM_TYPE_ARITY {
+                            self.deserialize_into_memory(
+                                &mut case_block,
+                                offset_local,
+                                end_local,
+                                offset_result,
+                                (tuple_output, tuple_output_offset + *field_offset),
+                                field_ty,
+                            )?;
+                        } else {
+                            self.deserialize_from_memory(
+                                &mut case_block,
+                                offset_local,
+                                end_local,
+                                offset_result,
+                                field_ty,
+                            )?;
+                            self.write_to_memory(
+                                &mut case_block,
+                                tuple_output,
+                                tuple_output_offset + *field_offset,
+                                field_ty,
+                            )?;
                         }
 
                         // last value after deserialization is for success/failure
@@ -1338,24 +1418,34 @@ impl WasmGenerator {
                 .binop(BinaryOp::I32Eq)
                 .binop(BinaryOp::I32And);
 
-            main_block.if_else(
-                return_ty,
-                |then| {
-                    then.i32_const(1);
-                    for l in values_locals.into_iter().flatten() {
-                        then.local_get(l);
-                    }
-                },
-                |else_| {
-                    else_.i32_const(0);
-                    add_placeholder_for_clarity_type(else_, &ty);
-                },
-            );
+            let mut success = main_block.dangling_instr_seq(return_ty);
+            success.i32_const(1);
+            if !bounded_output {
+                self.read_from_memory(&mut success, tuple_output, tuple_output_offset, &ty)?;
+                store_lowered_result(&mut success, &result_locals);
+            }
+            let success = success.id();
+
+            let mut failure = main_block.dangling_instr_seq(return_ty);
+            failure.i32_const(0);
+            if !bounded_output {
+                add_placeholder_for_clarity_type(&mut failure, &ty);
+                store_lowered_result(&mut failure, &result_locals);
+            }
+            let failure = failure.id();
+            main_block.instr(IfElse {
+                consequent: success,
+                alternative: failure,
+            });
 
             main_block.id()
         };
 
         builder.instr(Block { seq: main_block_id });
+        load_lowered_result(builder, &result_locals);
+        if let Some(result_locals) = result_locals {
+            self.release_locals(result_locals);
+        }
         Ok(())
     }
 
@@ -1375,11 +1465,8 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block for the body of this operation, so that we can
         // early exit as needed.
-        let block_ty = InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32, ValType::I32, ValType::I32],
-        );
+        let block_ty =
+            self.bounded_control_type(&[], &[ValType::I32, ValType::I32, ValType::I32])?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -1508,11 +1595,8 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block for the body of this operation, so that we can
         // early exit as needed.
-        let block_ty = InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32, ValType::I32, ValType::I32],
-        );
+        let block_ty =
+            self.bounded_control_type(&[], &[ValType::I32, ValType::I32, ValType::I32])?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
 
@@ -1692,7 +1776,7 @@ impl WasmGenerator {
             .i32_const(TypePrefix::StringUTF8 as i32)
             .binop(BinaryOp::I32Eq);
 
-        let return_type = InstrSeqType::new(&mut self.module.types, &[], &[ValType::I32; 3]);
+        let return_type = self.bounded_control_type(&[], &[ValType::I32; 3])?;
 
         // If both previous conditions are met, we can try deserializing.
         // Otherwise, it's a failure.
@@ -1750,6 +1834,215 @@ impl WasmGenerator {
         );
 
         Ok(())
+    }
+
+    /// Deserialize a wide value directly into its bounded linear-memory
+    /// representation, leaving only a success indicator on the operand stack.
+    pub(crate) fn deserialize_into_memory(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        offset_local: LocalId,
+        end_local: LocalId,
+        offset_result: LocalId,
+        output: (LocalId, u32),
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let (output, output_offset) = output;
+        let memory = self.get_memory()?;
+        match ty {
+            TypeSignature::TupleType(tuple_ty) => self.deserialize_tuple(
+                builder,
+                offset_local,
+                end_local,
+                offset_result,
+                tuple_ty,
+                Some((output, output_offset)),
+            ),
+            TypeSignature::OptionalType(inner) => {
+                let block_type = self.bounded_control_type(&[], &[ValType::I32])?;
+                let mut block = builder.dangling_instr_seq(block_type);
+                let block_id = block.id();
+                block
+                    .local_get(offset_local)
+                    .local_get(end_local)
+                    .binop(BinaryOp::I32GeU)
+                    .if_else(
+                        None,
+                        |then| {
+                            then.i32_const(0).br(block_id);
+                        },
+                        |_| {},
+                    );
+                let prefix = self.borrow_local(ValType::I32);
+                block.local_get(offset_local).load(
+                    memory,
+                    LoadKind::I32_8 {
+                        kind: ExtendedLoad::ZeroExtend,
+                    },
+                    MemArg {
+                        align: 1,
+                        offset: 0,
+                    },
+                );
+                block
+                    .local_tee(*prefix)
+                    .i32_const(TypePrefix::OptionalNone as i32)
+                    .binop(BinaryOp::I32Eq)
+                    .if_else(
+                        None,
+                        |then| {
+                            then.local_get(output).i32_const(0).store(
+                                memory,
+                                StoreKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 4,
+                                    offset: output_offset,
+                                },
+                            );
+                            then.local_get(offset_local)
+                                .i32_const(1)
+                                .binop(BinaryOp::I32Add)
+                                .local_set(offset_local)
+                                .i32_const(1)
+                                .br(block_id);
+                        },
+                        |_| {},
+                    );
+                block
+                    .local_get(*prefix)
+                    .i32_const(TypePrefix::OptionalSome as i32)
+                    .binop(BinaryOp::I32Ne)
+                    .if_else(
+                        None,
+                        |then| {
+                            then.i32_const(0).br(block_id);
+                        },
+                        |_| {},
+                    );
+                block
+                    .local_get(output)
+                    .i32_const(1)
+                    .store(
+                        memory,
+                        StoreKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: output_offset,
+                        },
+                    )
+                    .local_get(offset_local)
+                    .i32_const(1)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(offset_local);
+                self.deserialize_into_memory(
+                    &mut block,
+                    offset_local,
+                    end_local,
+                    offset_result,
+                    (output, output_offset + 4),
+                    inner,
+                )?;
+                builder.instr(Block { seq: block_id });
+                Ok(())
+            }
+            TypeSignature::ResponseType(types) => {
+                let block_type = self.bounded_control_type(&[], &[ValType::I32])?;
+                let mut block = builder.dangling_instr_seq(block_type);
+                let block_id = block.id();
+                block
+                    .local_get(offset_local)
+                    .local_get(end_local)
+                    .binop(BinaryOp::I32GeU)
+                    .if_else(
+                        None,
+                        |then| {
+                            then.i32_const(0).br(block_id);
+                        },
+                        |_| {},
+                    );
+                let prefix = self.borrow_local(ValType::I32);
+                block.local_get(offset_local).load(
+                    memory,
+                    LoadKind::I32_8 {
+                        kind: ExtendedLoad::ZeroExtend,
+                    },
+                    MemArg {
+                        align: 1,
+                        offset: 0,
+                    },
+                );
+                let mut ok = block.dangling_instr_seq(block_type);
+                ok.local_get(output).i32_const(1).store(
+                    memory,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 4,
+                        offset: output_offset,
+                    },
+                );
+                self.deserialize_into_memory(
+                    &mut ok,
+                    offset_local,
+                    end_local,
+                    offset_result,
+                    (output, output_offset + 4),
+                    &types.0,
+                )?;
+                let ok = ok.id();
+
+                let mut not_ok = block.dangling_instr_seq(block_type);
+                not_ok
+                    .local_get(*prefix)
+                    .i32_const(TypePrefix::ResponseErr as i32)
+                    .binop(BinaryOp::I32Eq);
+                let mut err = not_ok.dangling_instr_seq(block_type);
+                err.local_get(output).i32_const(0).store(
+                    memory,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 4,
+                        offset: output_offset,
+                    },
+                );
+                self.deserialize_into_memory(
+                    &mut err,
+                    offset_local,
+                    end_local,
+                    offset_result,
+                    (output, output_offset + 4 + get_type_size(&types.0) as u32),
+                    &types.1,
+                )?;
+                let err = err.id();
+                let mut invalid = not_ok.dangling_instr_seq(block_type);
+                invalid.i32_const(0);
+                let invalid = invalid.id();
+                not_ok.instr(IfElse {
+                    consequent: err,
+                    alternative: invalid,
+                });
+                let not_ok = not_ok.id();
+
+                block
+                    .local_tee(*prefix)
+                    .local_get(offset_local)
+                    .i32_const(1)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(offset_local)
+                    .i32_const(TypePrefix::ResponseOk as i32)
+                    .binop(BinaryOp::I32Eq)
+                    .instr(IfElse {
+                        consequent: ok,
+                        alternative: not_ok,
+                    });
+                builder.instr(Block { seq: block_id });
+                Ok(())
+            }
+            _ => {
+                self.deserialize_from_memory(builder, offset_local, end_local, offset_result, ty)?;
+                self.write_to_memory(builder, output, output_offset, ty)?;
+                Ok(())
+            }
+        }
     }
 
     /// Deserialize a buffer in memory using the consensus serialization rules.
@@ -1830,11 +2123,11 @@ impl WasmGenerator {
                 ),
             TupleType(tuple_ty) => self.deserialize_tuple(
                 builder,
-                memory,
                 offset_local,
                 end_local,
                 offset_result,
                 tuple_ty,
+                None,
             ),
             NoType => unreachable!("NoType should not be deserialized"),
         }

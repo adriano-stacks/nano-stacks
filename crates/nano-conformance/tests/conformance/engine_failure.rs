@@ -3,9 +3,10 @@
 //! `one_engine_in_the_artifact` proves the shipped binary has no second engine
 //! to fall through to. That is the structural half. This is the behavioural
 //! half: each of the three ways clarity-wasm can refuse a piece of work is
-//! forced through the production boundary — `nano_vm::Vm`, the type
-//! `nano-chainstate` executes every transaction with — and each has to refuse
-//! without answering and without leaving anything behind.
+//! forced through the production implementation. Compile and runtime failures
+//! enter through `nano_vm::Vm`, the type `nano-chainstate` executes every
+//! transaction with; malformed Wasm enters the same validator helper the VM
+//! uses before instantiation.
 //!
 //! The three classes, and how each is forced. None needs a compiler bug, which
 //! matters: a gate that could only be exercised while a divergence was open
@@ -14,28 +15,12 @@
 //! | class | forced by |
 //! |---|---|
 //! | compile refusal | a source naming a function that does not exist |
-//! | module-load refusal | a function returning a 600-field tuple — flattens to 1,200 wasm results, past wasmparser's function-type limit of 1,000 |
+//! | module-load refusal | malformed Wasm bytes passed through nano-vm's production `loadable` boundary in its unit suite |
 //! | runtime trap | `(- u0 u1)`, after a write |
 //!
-//! The module-load case took some finding. wasmtime's own limits are the only
-//! way to make `clar2wasm` emit a module the runtime refuses without breaking
-//! `clar2wasm`, and most are out of reach: a contract cannot be planted into
-//! state as bytes because its metadata is written once, and locals — a `let`
-//! binding becomes one — no longer reach the 50,000-per-function limit, now
-//! that clar2wasm frees a binding's locals at its last read and spills a wide
-//! scope's bindings to the frame. What still refuses is a function *type*
-//! wider than the reader's limits: one composite parameter or return value
-//! flattens to more than 1,000 wasm parameters or results, and nothing
-//! between the analyzer and the validator counts them.
-//!
-//! ## Falling through would have changed the answer
-//!
-//! The 600-field tuple is a positive control as well as a failure
-//! case: the reference interpreter compiles nothing, so it **deploys and runs
-//! that contract perfectly well**. Same source, same state, one engine refuses
-//! and the other answers — which is exactly the shape of a compiler gap. nano
-//! refusing it is nano declining to answer from the engine the chain does not
-//! run on.
+//! A valid Clarity program is deliberately not used to force module-load
+//! failure. Keeping one would preserve a known compiler differential as a test
+//! fixture and make fixing the compiler break the failure-path suite.
 
 use clarity::vm::analysis::{AnalysisDatabase, ContractAnalysis};
 use clarity::vm::contexts::ContractContext;
@@ -44,7 +29,7 @@ use clarity::vm::database::ClaritySerializable;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::{ClarityVersion, Value};
 use nano_primitives::Network;
-use nano_vm::{ContractCallOutcome, MarfStore, Vm};
+use nano_vm::{ContractCallOutcome, Vm};
 use stacks_common::types::StacksEpochId;
 
 /// A source the compiler refuses: `no-such-word` resolves to nothing.
@@ -61,22 +46,6 @@ const TRAP: &str = "\
 /// execute for as long as it runs, so "leaves nothing behind" has to hold on the
 /// twentieth attempt as well as the first.
 const ATTEMPTS: usize = 20;
-
-/// A source that compiles and produces a module wasmtime will not load.
-///
-/// clar2wasm flattens a composite value to one wasm local — and one wasm
-/// function-type slot — per leaf value, and wasmparser's reader refuses a
-/// function type with more than 1,000 results. A 600-field tuple return
-/// flattens to 1,200, so this is a module the compiler emits and the
-/// runtime refuses — the one failure class that is otherwise only reachable
-/// through a compiler bug.
-fn too_many_returns() -> String {
-    let fields = (0..600_u32)
-        .map(|index| format!("f{index}: 1"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("(define-public (f) (ok {{{fields}}}))")
-}
 
 fn contract(name: &str) -> QualifiedContractIdentifier {
     QualifiedContractIdentifier::parse(&format!("ST000000000000000000002AMW42H.{name}"))
@@ -180,70 +149,36 @@ fn failure(outcome: ContractCallOutcome) -> String {
 /// A deployment the compiler refuses is refused, repeatedly, and writes nothing.
 #[test]
 fn a_deployment_the_compiler_refuses_leaves_no_state() {
-    for (name, source) in [
-        ("unresolved", UNRESOLVED.to_owned()),
-        ("unloadable", too_many_returns()),
-    ] {
-        let mut vm = started();
-        let empty = pending(&vm);
-        for attempt in 0..ATTEMPTS {
-            let refused = vm
-                .deploy_contract(
-                    contract(name),
-                    ClarityVersion::Clarity6,
-                    &source,
-                    LimitedCostTracker::new_free(),
-                )
-                .expect_err("the compiler refuses this source");
-            let complaint = refused.to_string();
-            assert!(
-                nano_vm::is_contract_analysis_failure_message(&complaint),
-                "attempt {attempt} on {name} failed for a reason the boundary does \
-                 not recognize as the compiler's: {complaint}"
-            );
-            assert_eq!(
-                hex::encode(pending(&vm)),
-                hex::encode(empty),
-                "attempt {attempt} on {name} left state behind"
-            );
-        }
-        // And the contract is not in state under any guise: a deployment that
-        // half-happened would leave a readable source or a contract analysis, and
-        // the next block's call into it would find something.
+    let name = "unresolved";
+    let mut vm = started();
+    let empty = pending(&vm);
+    for attempt in 0..ATTEMPTS {
+        let refused = vm
+            .deploy_contract(
+                contract(name),
+                ClarityVersion::Clarity6,
+                UNRESOLVED,
+                LimitedCostTracker::new_free(),
+            )
+            .expect_err("the compiler refuses this source");
+        let complaint = refused.to_string();
         assert!(
-            vm.contract_source(&contract(name)).is_err(),
-            "{name} is readable from state after a refused deployment"
+            nano_vm::is_contract_analysis_failure_message(&complaint),
+            "attempt {attempt} on {name} failed for a reason the boundary does \
+             not recognize as the compiler's: {complaint}"
+        );
+        assert_eq!(
+            hex::encode(pending(&vm)),
+            hex::encode(empty),
+            "attempt {attempt} on {name} left state behind"
         );
     }
-}
-
-/// The module-load refusal is a real one, distinct from the compile refusal.
-///
-/// Both are the compiler's business and the boundary treats them the same way,
-/// which is why they are easy to conflate — so this pins that the second source
-/// gets past analysis and codegen and is stopped by the *runtime*, naming the
-/// module. Otherwise a change that made `too_many_returns` fail analysis instead
-/// would leave the load path untested and everything above still green.
-#[test]
-fn a_module_the_runtime_will_not_load_is_named_as_a_module() {
-    let mut vm = started();
-    let refused = vm
-        .deploy_contract(
-            contract("unloadable_named"),
-            ClarityVersion::Clarity6,
-            &too_many_returns(),
-            LimitedCostTracker::new_free(),
-        )
-        .expect_err("the runtime refuses this module")
-        .to_string();
+    // And the contract is not in state under any guise: a deployment that
+    // half-happened would leave a readable source or a contract analysis, and
+    // the next block's call into it would find something.
     assert!(
-        refused.contains("compiles to a module that will not load"),
-        "this source no longer reaches the module-load check, so that class of \
-         failure is no longer being forced: {refused}"
-    );
-    assert!(
-        refused.contains("function returns size is out of bounds"),
-        "the module-load refusal does not say what the runtime objected to: {refused}"
+        vm.contract_source(&contract(name)).is_err(),
+        "{name} is readable from state after a refused deployment"
     );
 }
 
@@ -251,35 +186,30 @@ fn a_module_the_runtime_will_not_load_is_named_as_a_module() {
 ///
 /// This is the shape a compiler gap actually takes on a running node: the
 /// contract is already in state, the network ran it, and this build cannot
-/// produce its module. Both refusal classes are forced, because a checkpointed
-/// node meets both.
+/// produce its module.
 #[test]
 fn a_call_the_compiler_cannot_build_answers_nothing_and_writes_nothing() {
-    for (name, source) in [
-        ("planted_unresolved", UNRESOLVED.to_owned()),
-        ("planted_unloadable", too_many_returns()),
-    ] {
-        let mut vm = started();
-        plant(&mut vm, &contract(name), &source);
-        let planted = pending(&vm);
-        for attempt in 0..ATTEMPTS {
-            let complaint = failure(call(&mut vm, &contract(name), "f"));
-            assert!(
-                nano_vm::is_contract_analysis_failure_message(&complaint),
-                "attempt {attempt} on {name} failed for a reason the boundary does \
-                 not recognize as the compiler's: {complaint}"
-            );
-            assert!(
-                complaint.contains(&contract(name).to_string()),
-                "attempt {attempt} on {name} does not name the contract that could \
-                 not be built: {complaint}"
-            );
-            assert_eq!(
-                hex::encode(pending(&vm)),
-                hex::encode(planted),
-                "attempt {attempt} on {name} left state behind"
-            );
-        }
+    let name = "planted_unresolved";
+    let mut vm = started();
+    plant(&mut vm, &contract(name), UNRESOLVED);
+    let planted = pending(&vm);
+    for attempt in 0..ATTEMPTS {
+        let complaint = failure(call(&mut vm, &contract(name), "f"));
+        assert!(
+            nano_vm::is_contract_analysis_failure_message(&complaint),
+            "attempt {attempt} on {name} failed for a reason the boundary does \
+             not recognize as the compiler's: {complaint}"
+        );
+        assert!(
+            complaint.contains(&contract(name).to_string()),
+            "attempt {attempt} on {name} does not name the contract that could \
+             not be built: {complaint}"
+        );
+        assert_eq!(
+            hex::encode(pending(&vm)),
+            hex::encode(planted),
+            "attempt {attempt} on {name} left state behind"
+        );
     }
 }
 
@@ -322,65 +252,6 @@ fn a_runtime_trap_rolls_back_the_writes_that_preceded_it() {
             "attempt {attempt} left state behind"
         );
     }
-}
-
-/// The interpreter would have answered, and nano did not ask it.
-///
-/// The positive control for the whole file. `too_many_returns` is a contract the
-/// reference interpreter deploys and runs without complaint — it compiles
-/// nothing, so wasmtime's limit does not exist for it — and the production
-/// boundary refuses. That is a real disagreement between the two engines,
-/// manufactured rather than waited for, and nano's answer to it is "no".
-///
-/// Without this, every assertion above is consistent with a boundary that
-/// refuses everything.
-#[test]
-fn the_engine_the_node_does_not_have_would_have_answered() {
-    let source = too_many_returns();
-    let identifier = contract("would_have_worked");
-
-    // The oracle, on the same store type and the same block.
-    let mut store = MarfStore::new(Network::TESTNET).expect("create store");
-    store.begin(None, [9; 32]).expect("begin block");
-    nano_oracle::deploy_contract(
-        &mut store,
-        identifier.clone(),
-        ClarityVersion::Clarity6,
-        &source,
-        LimitedCostTracker::new_free(),
-    )
-    .expect("the interpreter deploys a contract returning a six-hundred-field tuple");
-    let interpreted = nano_oracle::execute_contract_call_outcome(
-        &mut store,
-        sender(&identifier),
-        None,
-        identifier.clone(),
-        "f",
-        &[],
-        LimitedCostTracker::new_free(),
-    )
-    .expect("the interpreter runs it");
-    assert!(
-        matches!(interpreted, ContractCallOutcome::Success(_)),
-        "the interpreter did not succeed either, so this control says nothing: \
-         {interpreted:?}"
-    );
-
-    // And the engine the node ships with refuses, on both paths into it.
-    let mut vm = started();
-    vm.deploy_contract(
-        identifier.clone(),
-        ClarityVersion::Clarity6,
-        &source,
-        LimitedCostTracker::new_free(),
-    )
-    .expect_err("the shipped engine refuses the deployment the interpreter accepted");
-    plant(&mut vm, &identifier, &source);
-    let complaint = failure(call(&mut vm, &identifier, "f"));
-    assert!(
-        nano_vm::is_contract_analysis_failure_message(&complaint),
-        "the shipped engine did not refuse the call the interpreter answered: {complaint}"
-    );
 }
 
 /// What a sealed root cannot tell you, written down because it decides which

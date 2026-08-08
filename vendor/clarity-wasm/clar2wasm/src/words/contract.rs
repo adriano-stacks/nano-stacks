@@ -4,14 +4,15 @@ use crate::layout::get_type_size;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{PrincipalData, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType, Value};
-use walrus::ir::{BinaryOp, Block, InstrSeqType};
-use walrus::{LocalId, ValType};
+use walrus::ir::{BinaryOp, Block, IfElse};
+use walrus::{InstrSeqBuilder, LocalId, ValType};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
 use crate::wasm_generator::{
-    add_placeholder_for_clarity_type, clar2wasm_ty, ArgumentsExt, GeneratorError, WasmGenerator,
+    add_placeholder_for_clarity_type, clar2wasm_ty, uses_packed_value, ArgumentsExt,
+    GeneratorError, WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::SimpleWord;
@@ -24,6 +25,68 @@ use crate::words::SimpleWord;
 // generation (not at runtime) and is only used within this module.
 thread_local! {
     static ALLOWANCE_CONTEXT: Cell<Option<LocalId>> = const { Cell::new(None) };
+}
+
+/// Turn the allowance host's `(success, error)` result into the Clarity
+/// response, keeping a wide response out of the Wasm `if` signature.
+fn finish_safe_contract_result(
+    generator: &mut WasmGenerator,
+    builder: &mut InstrSeqBuilder,
+    return_ty: &TypeSignature,
+    inner_ty: &TypeSignature,
+    result_locals: &[LocalId],
+    result_offset: Option<LocalId>,
+) -> Result<(), GeneratorError> {
+    let wasm_return = clar2wasm_ty(return_ty);
+    if let Some(result_offset) = result_offset {
+        generator.note_control_arity(2, wasm_return.len());
+        let condition = generator.module.locals.add(ValType::I32);
+        let hi = generator.module.locals.add(ValType::I64);
+        let lo = generator.module.locals.add(ValType::I64);
+        builder.local_set(condition).local_set(hi).local_set(lo);
+
+        let mut success = builder.dangling_instr_seq(None);
+        success.i32_const(1);
+        for local in result_locals {
+            success.local_get(*local);
+        }
+        success.i64_const(0).i64_const(0);
+        generator.write_to_memory(&mut success, result_offset, 0, return_ty)?;
+        let success = success.id();
+
+        let mut error = builder.dangling_instr_seq(None);
+        error.i32_const(0);
+        add_placeholder_for_clarity_type(&mut error, inner_ty);
+        error.local_get(lo).local_get(hi);
+        generator.write_to_memory(&mut error, result_offset, 0, return_ty)?;
+        let error = error.id();
+
+        builder.local_get(condition).instr(IfElse {
+            consequent: success,
+            alternative: error,
+        });
+    } else {
+        let block_type =
+            generator.bounded_control_type(&[ValType::I64, ValType::I64], &wasm_return)?;
+        builder.if_else(
+            block_type,
+            |then| {
+                then.drop().drop().i32_const(1);
+                for local in result_locals {
+                    then.local_get(*local);
+                }
+                then.i64_const(0).i64_const(0);
+            },
+            |else_| {
+                let hi = generator.module.locals.add(ValType::I64);
+                let lo = generator.module.locals.add(ValType::I64);
+                else_.local_set(hi).local_set(lo).i32_const(0);
+                add_placeholder_for_clarity_type(else_, inner_ty);
+                else_.local_get(lo).local_get(hi);
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Runs `f` with the [`LocalId`] of the current `as-contract?` allowance
@@ -166,22 +229,27 @@ impl ComplexWord for AsContractSafe {
             generator.traverse_expr(builder, allowance)?;
         }
 
+        let result_offset = uses_packed_value(&return_ty).then(|| {
+            generator
+                .create_call_stack_local(builder, &return_ty, true, false)
+                .0
+        });
+
         // Block that will contain the entire traversal of the inner expressions.
         let exprs_block_id = {
-            let mut exprs_block = builder.dangling_instr_seq(InstrSeqType::new(
-                &mut generator.module.types,
-                &[],
-                &clar2wasm_ty(&return_ty),
-            ));
+            let exprs_type = if result_offset.is_some() {
+                generator.lowered_control_type(&[], &clar2wasm_ty(&return_ty))
+            } else {
+                generator.bounded_control_type(&[], &clar2wasm_ty(&return_ty))?
+            };
+            let mut exprs_block = builder.dangling_instr_seq(exprs_type);
             let exprs_id = exprs_block.id();
 
             // In this subblock, we traverse the inner expressions. If one of them fail, we jump to the end of it
             // to execute a cleanup of the current context.
             let fail_block_id = {
                 let fail_block_ty = match generator.current_function_wasm_return_types() {
-                    Some(return_ty) => {
-                        InstrSeqType::new(&mut generator.module.types, &[], &return_ty)
-                    }
+                    Some(return_ty) => generator.bounded_control_type(&[], &return_ty)?,
                     None => None.into(),
                 };
                 let mut fail_block = exprs_block.dangling_instr_seq(fail_block_ty);
@@ -206,36 +274,14 @@ impl ComplexWord for AsContractSafe {
 
                 // Now on stack, we have either (int - 0) if an error occured with int the error index, or (0int - 1) if
                 // allowances returned no error
-                fail_block.if_else(
-                    InstrSeqType::new(
-                        &mut generator.module.types,
-                        &[ValType::I64, ValType::I64],
-                        &clar2wasm_ty(&return_ty),
-                    ),
-                    |then| {
-                        // if allowances all checked, we return Ok - result - 0
-
-                        // we drop the 0 on the stack
-                        then.drop().drop();
-
-                        then.i32_const(1);
-                        for l in result_locals {
-                            then.local_get(l);
-                        }
-                        then.i64_const(0).i64_const(0);
-                    },
-                    |else_| {
-                        // otherwise we return the Err - placeholder - the number on the stack
-                        let hi_local = generator.borrow_local(ValType::I64);
-                        let lo_local = generator.borrow_local(ValType::I64);
-                        else_.local_set(*hi_local);
-                        else_.local_set(*lo_local);
-
-                        else_.i32_const(0);
-                        add_placeholder_for_clarity_type(else_, inner_ty);
-                        else_.local_get(*lo_local).local_get(*hi_local);
-                    },
-                );
+                finish_safe_contract_result(
+                    generator,
+                    &mut fail_block,
+                    &return_ty,
+                    inner_ty,
+                    &result_locals,
+                    result_offset,
+                )?;
 
                 // If we arrived here, we need to skip the cleanup and set back the early_return.
                 generator.early_return_block_id = old_early_return;
@@ -265,6 +311,9 @@ impl ComplexWord for AsContractSafe {
         builder.instr(Block {
             seq: exprs_block_id,
         });
+        if let Some(result_offset) = result_offset {
+            generator.read_from_memory(builder, result_offset, 0, &return_ty)?;
+        }
 
         Ok(())
     }
@@ -341,22 +390,27 @@ impl ComplexWord for RestrictAssets {
             generator.traverse_expr(builder, allowance)?;
         }
 
+        let result_offset = uses_packed_value(&return_ty).then(|| {
+            generator
+                .create_call_stack_local(builder, &return_ty, true, false)
+                .0
+        });
+
         // Block that will contain the entire traversal of the inner expressions.
         let exprs_block_id = {
-            let mut exprs_block = builder.dangling_instr_seq(InstrSeqType::new(
-                &mut generator.module.types,
-                &[],
-                &clar2wasm_ty(&return_ty),
-            ));
+            let exprs_type = if result_offset.is_some() {
+                generator.lowered_control_type(&[], &clar2wasm_ty(&return_ty))
+            } else {
+                generator.bounded_control_type(&[], &clar2wasm_ty(&return_ty))?
+            };
+            let mut exprs_block = builder.dangling_instr_seq(exprs_type);
             let exprs_id = exprs_block.id();
 
             // In this subblock, we traverse the inner expressions. If one of them fail, we jump to the end of it
             // to execute a cleanup of the current context.
             let fail_block_id = {
                 let fail_block_ty = match generator.current_function_wasm_return_types() {
-                    Some(return_ty) => {
-                        InstrSeqType::new(&mut generator.module.types, &[], &return_ty)
-                    }
+                    Some(return_ty) => generator.bounded_control_type(&[], &return_ty)?,
                     None => None.into(),
                 };
                 let mut fail_block = exprs_block.dangling_instr_seq(fail_block_ty);
@@ -384,36 +438,14 @@ impl ComplexWord for RestrictAssets {
 
                 // Now on stack, we have either (int - 0) if an error occured with int the error index, or (0int - 1) if
                 // allowances returned no error
-                fail_block.if_else(
-                    InstrSeqType::new(
-                        &mut generator.module.types,
-                        &[ValType::I64, ValType::I64],
-                        &clar2wasm_ty(&return_ty),
-                    ),
-                    |then| {
-                        // if allowances all checked, we return Ok - result - 0
-
-                        // we drop the 0 on the stack
-                        then.drop().drop();
-
-                        then.i32_const(1);
-                        for l in result_locals {
-                            then.local_get(l);
-                        }
-                        then.i64_const(0).i64_const(0);
-                    },
-                    |else_| {
-                        // otherwise we return the Err - placeholder - the number on the stack
-                        let hi_local = generator.borrow_local(ValType::I64);
-                        let lo_local = generator.borrow_local(ValType::I64);
-                        else_.local_set(*hi_local);
-                        else_.local_set(*lo_local);
-
-                        else_.i32_const(0);
-                        add_placeholder_for_clarity_type(else_, inner_ty);
-                        else_.local_get(*lo_local).local_get(*hi_local);
-                    },
-                );
+                finish_safe_contract_result(
+                    generator,
+                    &mut fail_block,
+                    &return_ty,
+                    inner_ty,
+                    &result_locals,
+                    result_offset,
+                )?;
 
                 // If we arrived here, we need to skip the cleanup and set back the early_return.
                 generator.early_return_block_id = old_early_return;
@@ -443,6 +475,9 @@ impl ComplexWord for RestrictAssets {
         builder.instr(Block {
             seq: exprs_block_id,
         });
+        if let Some(result_offset) = result_offset {
+            generator.read_from_memory(builder, result_offset, 0, &return_ty)?;
+        }
 
         Ok(())
     }
@@ -1750,6 +1785,39 @@ mod tests {
                     )
                 "#,
                 Ok(Some(Value::Bool(true))),
+            );
+        }
+
+        #[test]
+        fn safe_contract_controls_return_a_value_past_the_wasm_block_limit() {
+            const FIELD_COUNT: u32 = 499;
+            let fields = (0..FIELD_COUNT)
+                .map(|index| format!("f{index}: {index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tuple = Value::Tuple(
+                clarity::vm::types::TupleData::from_data(
+                    (0..FIELD_COUNT)
+                        .map(|index| {
+                            (
+                                ClarityName::try_from(format!("f{index}"))
+                                    .expect("generated field name is valid"),
+                                Value::Int(index.into()),
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("generated tuple is valid"),
+            );
+            let expected = Value::okay(tuple).expect("an ok response");
+
+            crosscheck(
+                &format!("(as-contract? () {{{fields}}})"),
+                Ok(Some(expected.clone())),
+            );
+            crosscheck(
+                &format!("(restrict-assets? tx-sender () {{{fields}}})"),
+                Ok(Some(expected)),
             );
         }
 

@@ -3,12 +3,12 @@ use clarity::vm::costs::CostErrors;
 use clarity::vm::errors::{
     CommonCheckErrorKind, EarlyReturnError, RuntimeCheckErrorKind, RuntimeError, VmExecutionError,
 };
-use clarity::vm::types::ResponseData;
+use clarity::vm::types::{ResponseData, TypeSignature};
 use clarity::vm::{ClarityVersion, SymbolicExpression, Value};
 use clarity_types::types::{ASCIIData, CharType};
 use clarity_types::{ClarityName, ClarityTypeError};
 use std::sync::Mutex;
-use walrus::ir::{InstrSeqId, InstrSeqType};
+use walrus::ir::InstrSeqId;
 use walrus::InstrSeqBuilder;
 use wasmtime::{AsContextMut, Instance, Trap};
 
@@ -539,13 +539,31 @@ impl WasmGenerator {
         let return_type = clar2wasm_ty(self.get_expr_type(expr).ok_or_else(|| {
             GeneratorError::TypeError("Expression results must be typed".to_owned())
         })?);
-        let mut block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &return_type,
-        ));
+        let block_type = self.bounded_control_type(&[], &return_type)?;
+        let mut block = builder.dangling_instr_seq(block_type);
         generate_name_already_used_error(self, &mut block, binding)?;
 
+        Ok(block.id())
+    }
+
+    /// Memory-backed counterpart to [`Self::block_from_bound_expr`] for a
+    /// control value too wide for a Wasm block result.
+    pub(crate) fn block_from_bound_expr_into_memory(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+        binding: &ClarityName,
+        already_used: bool,
+        result_offset: walrus::LocalId,
+        result_type: &TypeSignature,
+    ) -> Result<InstrSeqId, GeneratorError> {
+        if !already_used {
+            return self.block_from_expr_into_memory(builder, expr, result_offset, result_type);
+        }
+
+        self.note_control_arity(0, clar2wasm_ty(result_type).len());
+        let mut block = builder.dangling_instr_seq(None);
+        generate_name_already_used_error(self, &mut block, binding)?;
         Ok(block.id())
     }
 

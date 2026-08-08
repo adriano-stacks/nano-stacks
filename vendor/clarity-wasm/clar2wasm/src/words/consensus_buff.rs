@@ -1,13 +1,14 @@
 use clarity::vm::types::{TypeSignature, MAX_VALUE_SIZE};
 use clarity_types::ClarityName;
-use walrus::ir::{BinaryOp, InstrSeqType};
+use walrus::ir::BinaryOp;
+use walrus::{FunctionBuilder, InstrSeqBuilder, LocalId, ValType};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
 use crate::wasm_generator::{
-    add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, ArgumentsExt, GeneratorError,
-    WasmGenerator,
+    add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, uses_packed_value, ArgumentsExt,
+    GeneratorError, WasmGenerator, MAX_WASM_TYPE_ARITY,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -20,6 +21,71 @@ impl Word for ToConsensusBuff {
     }
 }
 
+impl ToConsensusBuff {
+    fn finish_buffer(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut InstrSeqBuilder,
+        offset: LocalId,
+        length: LocalId,
+    ) -> Result<(), GeneratorError> {
+        let branch_type =
+            generator.bounded_control_type(&[], &[ValType::I32, ValType::I32, ValType::I32])?;
+        builder
+            .local_get(length)
+            .i32_const(MAX_VALUE_SIZE as i32)
+            .binop(BinaryOp::I32LeU)
+            .if_else(
+                branch_type,
+                |then| {
+                    then.local_get(offset)
+                        .local_get(length)
+                        .binop(BinaryOp::I32Add)
+                        .global_set(generator.stack_pointer);
+                    then.i32_const(1).local_get(offset).local_get(length);
+                },
+                |else_| {
+                    else_.i32_const(0).i32_const(0).i32_const(0);
+                },
+            );
+        Ok(())
+    }
+
+    fn serialize_value(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        expr_ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let length = generator.borrow_local(ValType::I32);
+        generator.serialization_size(builder, ty)?;
+        builder.local_set(*length);
+
+        self.charge(generator, builder, *length)?;
+        let (offset, _) = generator.create_call_stack_local(builder, expr_ty, false, true);
+        generator.serialize_to_memory(builder, offset, 0, ty)?;
+        builder.drop();
+        self.finish_buffer(generator, builder, offset, *length)
+    }
+
+    fn serialize_memory_value(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut InstrSeqBuilder,
+        value_offset: LocalId,
+        ty: &TypeSignature,
+        expr_ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let length = generator.borrow_local(ValType::I32);
+        let (output, _) = generator.create_call_stack_local(builder, expr_ty, false, true);
+        generator.serialize_from_memory(builder, value_offset, 0, output, 0, ty)?;
+        builder.local_set(*length);
+        self.charge(generator, builder, *length)?;
+        self.finish_buffer(generator, builder, output, *length)
+    }
+}
+
 impl ComplexWord for ToConsensusBuff {
     fn traverse(
         &self,
@@ -29,8 +95,6 @@ impl ComplexWord for ToConsensusBuff {
         args: &[clarity::vm::SymbolicExpression],
     ) -> Result<(), crate::wasm_generator::GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
-        let length = generator.borrow_local(walrus::ValType::I32);
-
         generator.traverse_args(builder, args)?;
 
         let ty = generator
@@ -42,14 +106,6 @@ impl ComplexWord for ToConsensusBuff {
             })?
             .clone();
         let ty = generator.type_for_serialization(&ty);
-
-        generator.serialization_size(builder, &ty)?;
-        builder.local_set(*length);
-
-        // to-consensus-buff has been added in Clarity2 which has epoch > 2.05 by default.
-        // Therefore we do not need to do difference charge for different epochs.
-        self.charge(generator, builder, *length)?;
-
         let expr_ty = generator
             .get_expr_type(expr)
             .ok_or_else(|| {
@@ -58,39 +114,25 @@ impl ComplexWord for ToConsensusBuff {
                 )
             })?
             .clone();
-        let (offset, _) = generator.create_call_stack_local(builder, &expr_ty, false, true);
 
-        // Write the serialized value to the top of the call stack
-        generator.serialize_to_memory(builder, offset, 0, &ty)?;
-        builder.drop();
+        if clar2wasm_ty(&ty).len() >= MAX_WASM_TYPE_ARITY {
+            let (value_offset, _) = generator.create_call_stack_local(builder, &ty, true, false);
+            generator.write_to_memory(builder, value_offset, 0, &ty)?;
 
-        // Check if the serialized value size < MAX_VALUE_SIZE
-        builder
-            .local_get(*length)
-            .i32_const(MAX_VALUE_SIZE as i32)
-            .binop(walrus::ir::BinaryOp::I32LeU)
-            .if_else(
-                InstrSeqType::new(
-                    &mut generator.module.types,
-                    &[],
-                    &[
-                        walrus::ValType::I32,
-                        walrus::ValType::I32,
-                        walrus::ValType::I32,
-                    ],
-                ),
-                |then| {
-                    then.local_get(offset)
-                        .local_get(*length)
-                        .binop(walrus::ir::BinaryOp::I32Add)
-                        .global_set(generator.stack_pointer);
-
-                    then.i32_const(1).local_get(offset).local_get(*length);
-                },
-                |else_| {
-                    else_.i32_const(0).i32_const(0).i32_const(0);
-                },
+            let value_param = generator.module.locals.add(ValType::I32);
+            let mut helper = FunctionBuilder::new(
+                &mut generator.module.types,
+                &[ValType::I32],
+                &[ValType::I32, ValType::I32, ValType::I32],
             );
+            helper.name(format!(".to-consensus-buff-{}", expr.id));
+            let mut helper_body = helper.func_body();
+            self.serialize_memory_value(generator, &mut helper_body, value_param, &ty, &expr_ty)?;
+            let helper = helper.finish(vec![value_param], &mut generator.module.funcs);
+            builder.local_get(value_offset).call(helper);
+        } else {
+            self.serialize_value(generator, builder, &ty, &expr_ty)?;
+        }
 
         Ok(())
     }
@@ -102,6 +144,107 @@ pub struct FromConsensusBuff;
 impl Word for FromConsensusBuff {
     fn name(&self) -> clarity::vm::ClarityName {
         ClarityName::from_literal("from-consensus-buff?")
+    }
+}
+
+impl FromConsensusBuff {
+    fn deserialize_value(
+        &self,
+        generator: &mut WasmGenerator,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        offset: LocalId,
+        length: LocalId,
+        result_offset: Option<LocalId>,
+    ) -> Result<(), GeneratorError> {
+        let TypeSignature::OptionalType(value_ty) = ty else {
+            return Err(GeneratorError::TypeError(
+                "from-consensus-buff? value expression must be an optional type".to_owned(),
+            ));
+        };
+        let (decoded_offset, _) = generator.create_call_stack_local(builder, ty, true, true);
+        let end = generator.module.locals.add(ValType::I32);
+        builder
+            .local_get(offset)
+            .local_get(length)
+            .binop(BinaryOp::I32Add)
+            .local_set(end);
+
+        if let Some(result_offset) = result_offset {
+            generator.deserialize_into_memory(
+                builder,
+                offset,
+                end,
+                decoded_offset,
+                (result_offset, 4),
+                value_ty,
+            )?;
+            let success = generator.borrow_local(ValType::I32);
+            builder
+                .local_set(*success)
+                .local_get(*success)
+                .local_get(end)
+                .local_get(offset)
+                .binop(BinaryOp::I32Eq)
+                .binop(BinaryOp::I32And)
+                .local_set(*success)
+                .local_get(result_offset)
+                .local_get(*success)
+                .store(
+                    generator.get_memory()?,
+                    walrus::ir::StoreKind::I32 { atomic: false },
+                    walrus::ir::MemArg {
+                        align: 4,
+                        offset: 0,
+                    },
+                );
+            return Ok(());
+        }
+
+        generator.deserialize_from_memory(builder, offset, end, decoded_offset, value_ty)?;
+
+        let wasm_result_ty = clar2wasm_ty(ty);
+        if uses_packed_value(ty) {
+            generator.note_control_arity(wasm_result_ty.len(), wasm_result_ty.len());
+            let result_locals = generator.save_to_locals(builder, ty, true);
+            let none = {
+                let mut none = builder.dangling_instr_seq(None);
+                add_placeholder_for_clarity_type(&mut none, ty);
+                for local in result_locals.iter().rev() {
+                    none.local_set(*local);
+                }
+                none.id()
+            };
+            let consumed = builder.dangling_instr_seq(None).id();
+            builder
+                .local_get(end)
+                .local_get(offset)
+                .binop(BinaryOp::I32Eq)
+                .instr(walrus::ir::IfElse {
+                    consequent: consumed,
+                    alternative: none,
+                });
+            for local in &result_locals {
+                builder.local_get(*local);
+            }
+            generator.release_locals(result_locals);
+        } else {
+            let branch_type = generator.bounded_control_type(&wasm_result_ty, &wasm_result_ty)?;
+            builder
+                .local_get(end)
+                .local_get(offset)
+                .binop(BinaryOp::I32Eq)
+                .if_else(
+                    branch_type,
+                    |_| {},
+                    |else_| {
+                        drop_value(else_, ty);
+                        add_placeholder_for_clarity_type(else_, ty);
+                    },
+                );
+        }
+
+        Ok(())
     }
 }
 
@@ -125,56 +268,50 @@ impl ComplexWord for FromConsensusBuff {
                 )
             })?
             .clone();
-        let wasm_result_ty = clar2wasm_ty(&ty);
-        let value_ty = if let TypeSignature::OptionalType(ref inner) = ty {
-            *inner.clone()
-        } else {
-            return Err(GeneratorError::TypeError(
-                "from-consensus-buff? value expression must be an optional type".to_string(),
-            ));
-        };
-
         // Traverse the input buffer, leaving the offset and length on the stack.
         generator.traverse_expr(builder, args.get_expr(1)?)?;
 
-        let length = generator.module.locals.add(walrus::ValType::I32);
+        let length = generator.module.locals.add(ValType::I32);
         builder.local_tee(length);
         self.charge(generator, builder, length)?;
+        builder.local_set(length);
+        let offset = generator.module.locals.add(ValType::I32);
+        builder.local_set(offset);
 
-        // TODO: true, true is too big; see issue: #593
-        let (offset_result, _len) = generator.create_call_stack_local(builder, &ty, true, true);
-        let offset = generator.module.locals.add(walrus::ValType::I32);
-        let end = generator.module.locals.add(walrus::ValType::I32);
-        builder
-            .local_set(end)
-            .local_tee(offset)
-            .local_get(end)
-            .binop(BinaryOp::I32Add)
-            .local_set(end);
-
-        // Write the deserialized value on the stack at offset_result
-        generator.deserialize_from_memory(builder, offset, end, offset_result, &value_ty)?;
-
-        // If the entire buffer was not consumed, return none.
-        builder
-            .local_get(end)
-            .local_get(offset)
-            .binop(BinaryOp::I32Eq)
-            .if_else(
-                InstrSeqType::new(
-                    &mut generator.module.types,
-                    &wasm_result_ty,
-                    &wasm_result_ty,
-                ),
-                |_| {
-                    // Do nothing, leave the result as-is
-                },
-                |else_| {
-                    // Drop the result and return none
-                    drop_value(else_, &ty);
-                    add_placeholder_for_clarity_type(else_, &ty);
-                },
+        if uses_packed_value(&ty) {
+            let result_offset = generator
+                .create_call_stack_local(builder, &ty, true, false)
+                .0;
+            let offset_param = generator.module.locals.add(ValType::I32);
+            let length_param = generator.module.locals.add(ValType::I32);
+            let result_param = generator.module.locals.add(ValType::I32);
+            let mut helper = FunctionBuilder::new(
+                &mut generator.module.types,
+                &[ValType::I32, ValType::I32, ValType::I32],
+                &[],
             );
+            helper.name(format!(".from-consensus-buff-{}", _expr.id));
+            self.deserialize_value(
+                generator,
+                &mut helper.func_body(),
+                &ty,
+                offset_param,
+                length_param,
+                Some(result_param),
+            )?;
+            let helper = helper.finish(
+                vec![offset_param, length_param, result_param],
+                &mut generator.module.funcs,
+            );
+            builder
+                .local_get(offset)
+                .local_get(length)
+                .local_get(result_offset)
+                .call(helper);
+            generator.read_from_memory(builder, result_offset, 0, &ty)?;
+        } else {
+            self.deserialize_value(generator, builder, &ty, offset, length, None)?;
+        }
 
         Ok(())
     }
@@ -182,6 +319,28 @@ impl ComplexWord for FromConsensusBuff {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::crosscheck_compare_only;
+
+    #[test]
+    fn exact_width_tuple_round_trips_through_consensus_bytes() {
+        let mut fields = (0..499_u32)
+            .map(|index| format!("f{index}: {index}"))
+            .collect::<Vec<_>>();
+        fields.push("bytes: 0x01".to_owned());
+        let fields = fields.join(", ");
+
+        let mut field_types = (0..499_u32)
+            .map(|index| format!("f{index}: int"))
+            .collect::<Vec<_>>();
+        field_types.push("bytes: (buff 1)".to_owned());
+        let field_types = field_types.join(", ");
+
+        crosscheck_compare_only(&format!(
+            "(from-consensus-buff? {{{field_types}}} \
+                (unwrap-panic (to-consensus-buff? {{{fields}}})))"
+        ));
+    }
+
     //
     // Module with tests that should only be executed
     // when running Clarity::V2 or Clarity::V3.

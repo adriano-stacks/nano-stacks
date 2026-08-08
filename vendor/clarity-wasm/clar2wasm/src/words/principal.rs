@@ -5,7 +5,7 @@ use stacks_common::address::{
     C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
     C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
-use walrus::ir::{BinaryOp, ExtendedLoad, InstrSeqType, LoadKind, MemArg};
+use walrus::ir::{BinaryOp, ExtendedLoad, LoadKind, MemArg};
 use walrus::{LocalId, ValType};
 
 use super::{ComplexWord, SimpleWord, Word};
@@ -59,12 +59,9 @@ impl SimpleWord for IsStandard {
         // Check if we are in mainnet (leaves a boolean on the stack)
         builder.call(generator.func_by_name("stdlib.is_in_mainnet"));
 
+        let branch_type = generator.bounded_control_type(&[ValType::I32], &[ValType::I32])?;
         builder.if_else(
-            InstrSeqType::new(
-                &mut generator.module.types,
-                &[ValType::I32],
-                &[ValType::I32],
-            ),
+            branch_type,
             |then| {
                 then.i32_const(C32_ADDRESS_VERSION_MAINNET_MULTISIG as i32)
                     .binop(BinaryOp::I32Eq);
@@ -269,8 +266,9 @@ impl SimpleWord for Destruct {
         );
 
         let return_types = clar2wasm_ty(return_type);
+        let branch_type = generator.bounded_control_type(&[], &return_types)?;
         builder.if_else(
-            InstrSeqType::new(&mut generator.module.types, &[], &return_types),
+            branch_type,
             |then| {
                 // Push the indicator
                 then.i32_const(1);

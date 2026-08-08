@@ -1,7 +1,7 @@
 use clarity::types::StacksEpochId;
 use clarity::vm::types::{SequenceSubtype, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
-use walrus::ir::{BinaryOp, IfElse, InstrSeqType, Loop, UnaryOp};
+use walrus::ir::{BinaryOp, IfElse, Loop, UnaryOp};
 use walrus::ValType;
 
 use super::{ComplexWord, Word};
@@ -143,11 +143,8 @@ impl ComplexWord for IndexOf {
         builder.local_tee(seq_size).unop(UnaryOp::I32Eqz);
         // STACK: [size]
 
-        let ty = InstrSeqType::new(
-            &mut generator.module.types,
-            &[],
-            &[ValType::I32, ValType::I64, ValType::I64],
-        );
+        let result_types = [ValType::I32, ValType::I64, ValType::I64];
+        let ty = generator.bounded_control_type(&[], &result_types)?;
 
         let if_id = {
             let mut if_case = builder.dangling_instr_seq(ty);
@@ -168,11 +165,7 @@ impl ComplexWord for IndexOf {
             // STACK: []
 
             // Loop through the sequence.
-            let loop_body_ty = InstrSeqType::new(
-                &mut generator.module.types,
-                &[],
-                &[ValType::I32, ValType::I64, ValType::I64],
-            );
+            let loop_body_ty = generator.bounded_control_type(&[], &result_types)?;
 
             let loop_body = &mut else_case.dangling_instr_seq(loop_body_ty);
             let loop_body_id = {
@@ -218,12 +211,10 @@ impl ComplexWord for IndexOf {
                 wasm_equal(&item_ty, generator, loop_body, &item_locals, &elem_locals)?;
                 // STACK: [wasm_equal_result]
 
+                let found_type = generator.bounded_control_type(&[], &result_types)?;
+                let exhausted_type = generator.bounded_control_type(&[], &result_types)?;
                 loop_body.if_else(
-                    InstrSeqType::new(
-                        &mut generator.module.types,
-                        &[],
-                        &[ValType::I32, ValType::I64, ValType::I64],
-                    ),
+                    found_type,
                     |then| {
                         then.i32_const(1).local_get(index).i64_const(0);
                         // STACK: [1, index_lo, index_hi]
@@ -241,11 +232,7 @@ impl ComplexWord for IndexOf {
                         // STACK: [offset, end_offset]
 
                         else_.binop(BinaryOp::I32GeU).if_else(
-                            InstrSeqType::new(
-                                &mut generator.module.types,
-                                &[],
-                                &[ValType::I32, ValType::I64, ValType::I64],
-                            ),
+                            exhausted_type,
                             |then| {
                                 // Reached the end of the sequence
                                 // and not found the element.

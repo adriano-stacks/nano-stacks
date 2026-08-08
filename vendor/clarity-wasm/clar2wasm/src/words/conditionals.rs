@@ -8,7 +8,7 @@ use crate::cost::{ChargeGenerator, WordCharge};
 use crate::duck_type::dt_needed_workspace;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
-    add_placeholder_for_clarity_type, drop_value, ArgumentsExt, GeneratorError,
+    add_placeholder_for_clarity_type, drop_value, uses_packed_value, ArgumentsExt, GeneratorError,
     SequenceElementType, WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
@@ -327,7 +327,7 @@ impl ComplexWord for If {
             .ok_or_else(|| GeneratorError::TypeError("if expression must be typed".to_owned()))?
             .clone();
         generator.set_expr_type(true_branch, expr_ty.clone())?;
-        generator.set_expr_type(false_branch, expr_ty)?;
+        generator.set_expr_type(false_branch, expr_ty.clone())?;
 
         // The condition is generated first because it *runs* first, and a
         // binding's locals are freed at its last generated read: branches
@@ -343,13 +343,41 @@ impl ComplexWord for If {
         // to be copied.
         generator.traverse_expr_as_borrowed_value(builder, conditional)?;
 
-        let id_true = generator.block_from_expr(builder, true_branch)?;
-        let id_false = generator.block_from_expr(builder, false_branch)?;
+        let packed_result = uses_packed_value(&expr_ty);
+        let result_offset = packed_result.then(|| {
+            generator
+                .create_call_stack_local(builder, &expr_ty, true, false)
+                .0
+        });
+        let (id_true, id_false) = if let Some(result_offset) = result_offset {
+            (
+                generator.block_from_expr_into_memory(
+                    builder,
+                    true_branch,
+                    result_offset,
+                    &expr_ty,
+                )?,
+                generator.block_from_expr_into_memory(
+                    builder,
+                    false_branch,
+                    result_offset,
+                    &expr_ty,
+                )?,
+            )
+        } else {
+            (
+                generator.block_from_expr(builder, true_branch)?,
+                generator.block_from_expr(builder, false_branch)?,
+            )
+        };
 
         builder.instr(ir::IfElse {
             consequent: id_true,
             alternative: id_false,
         });
+        if let Some(result_offset) = result_offset {
+            generator.read_from_memory(builder, result_offset, 0, &expr_ty)?;
+        }
 
         Ok(())
     }
@@ -397,6 +425,11 @@ impl ComplexWord for Match {
         let success_name_used = generator.binding_name_already_used(success_binding);
 
         generator.traverse_expr(builder, match_on)?;
+        let result_offset = uses_packed_value(&expr_ty).then(|| {
+            generator
+                .create_call_stack_local(builder, &expr_ty, true, false)
+                .0
+        });
         generator.bindings.enter_scope()?;
 
         match generator.get_expr_type(match_on).cloned() {
@@ -406,7 +439,7 @@ impl ComplexWord for Match {
                 let none_body = args.get_expr(3)?;
 
                 // WORKAROUND: set type on none body
-                generator.set_expr_type(none_body, expr_ty)?;
+                generator.set_expr_type(none_body, expr_ty.clone())?;
 
                 let some_locals = generator.save_to_locals(builder, &inner_type, true);
 
@@ -417,22 +450,45 @@ impl ComplexWord for Match {
                     generator.binding_id(args.get_expr(1)?),
                 );
 
-                let some_block = generator.block_from_bound_expr(
-                    builder,
-                    success_body,
-                    success_binding,
-                    success_name_used,
-                )?;
+                let some_block = if let Some(result_offset) = result_offset {
+                    generator.block_from_bound_expr_into_memory(
+                        builder,
+                        success_body,
+                        success_binding,
+                        success_name_used,
+                        result_offset,
+                        &expr_ty,
+                    )?
+                } else {
+                    generator.block_from_bound_expr(
+                        builder,
+                        success_body,
+                        success_binding,
+                        success_name_used,
+                    )?
+                };
 
                 // we can restore early, since the none branch does not bind anything
                 generator.bindings = saved_bindings;
 
-                let none_block = generator.block_from_expr(builder, none_body)?;
+                let none_block = if let Some(result_offset) = result_offset {
+                    generator.block_from_expr_into_memory(
+                        builder,
+                        none_body,
+                        result_offset,
+                        &expr_ty,
+                    )?
+                } else {
+                    generator.block_from_expr(builder, none_body)?
+                };
 
                 builder.instr(ir::IfElse {
                     consequent: some_block,
                     alternative: none_block,
                 });
+                if let Some(result_offset) = result_offset {
+                    generator.read_from_memory(builder, result_offset, 0, &expr_ty)?;
+                }
 
                 Ok(())
             }
@@ -444,7 +500,7 @@ impl ComplexWord for Match {
                 let err_binding = args.get_name(3)?;
                 let err_body = args.get_expr(4)?;
                 // Workaround: set type on err body
-                generator.set_expr_type(err_body, expr_ty)?;
+                generator.set_expr_type(err_body, expr_ty.clone())?;
 
                 let err_name_used = generator.binding_name_already_used(err_binding);
 
@@ -457,12 +513,23 @@ impl ComplexWord for Match {
                     ok_locals,
                     generator.binding_id(args.get_expr(1)?),
                 );
-                let ok_block = generator.block_from_bound_expr(
-                    builder,
-                    success_body,
-                    success_binding,
-                    success_name_used,
-                )?;
+                let ok_block = if let Some(result_offset) = result_offset {
+                    generator.block_from_bound_expr_into_memory(
+                        builder,
+                        success_body,
+                        success_binding,
+                        success_name_used,
+                        result_offset,
+                        &expr_ty,
+                    )?
+                } else {
+                    generator.block_from_bound_expr(
+                        builder,
+                        success_body,
+                        success_binding,
+                        success_name_used,
+                    )?
+                };
 
                 // restore named locals
                 generator.bindings.clone_from(&saved_bindings);
@@ -475,12 +542,23 @@ impl ComplexWord for Match {
                     generator.binding_id(args.get_expr(3)?),
                 );
 
-                let err_block = generator.block_from_bound_expr(
-                    builder,
-                    err_body,
-                    err_binding,
-                    err_name_used,
-                )?;
+                let err_block = if let Some(result_offset) = result_offset {
+                    generator.block_from_bound_expr_into_memory(
+                        builder,
+                        err_body,
+                        err_binding,
+                        err_name_used,
+                        result_offset,
+                        &expr_ty,
+                    )?
+                } else {
+                    generator.block_from_bound_expr(
+                        builder,
+                        err_body,
+                        err_binding,
+                        err_name_used,
+                    )?
+                };
 
                 // restore named locals again
                 generator.bindings = saved_bindings;
@@ -489,6 +567,9 @@ impl ComplexWord for Match {
                     consequent: ok_block,
                     alternative: err_block,
                 });
+                if let Some(result_offset) = result_offset {
+                    generator.read_from_memory(builder, result_offset, 0, &expr_ty)?;
+                }
 
                 Ok(())
             }

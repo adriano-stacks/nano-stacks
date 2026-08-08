@@ -3,10 +3,10 @@ use clarity::vm::types::serialization::TypePrefix;
 use clarity::vm::types::{
     ListTypeData, SequenceSubtype, StringSubtype, TupleTypeSignature, TypeSignature,
 };
-use walrus::ir::{BinaryOp, IfElse, InstrSeqType, Loop, MemArg, StoreKind};
+use walrus::ir::{BinaryOp, IfElse, Loop, MemArg, StoreKind};
 use walrus::{InstrSeqBuilder, LocalId, MemoryId, ValType};
 
-use crate::wasm_generator::{clar2wasm_ty, GeneratorError, WasmGenerator};
+use crate::wasm_generator::{clar2wasm_ty, GeneratorError, WasmGenerator, MAX_WASM_TYPE_ARITY};
 
 impl WasmGenerator {
     /// Serialize an integer (`int` or `uint`) to memory using consensus
@@ -30,21 +30,21 @@ impl WasmGenerator {
 
         // Data stack: TOP | High | Low |
         // Save the high/low to locals.
-        let high = self.module.locals.add(ValType::I64);
-        let low = self.module.locals.add(ValType::I64);
-        builder.local_set(high).local_set(low);
+        let high = self.borrow_local(ValType::I64);
+        let low = self.borrow_local(ValType::I64);
+        builder.local_set(*high).local_set(*low);
 
         // Create a local for the write pointer by adjusting the
         // offset local by the offset amount.
-        let write_ptr = self.module.locals.add(ValType::I32);
+        let write_ptr = self.borrow_local(ValType::I32);
         if offset > 0 {
             builder
                 .local_get(offset_local)
                 .i32_const(offset as i32)
                 .binop(BinaryOp::I32Add)
-                .local_tee(write_ptr);
+                .local_tee(*write_ptr);
         } else {
-            builder.local_get(offset_local).local_tee(write_ptr);
+            builder.local_get(offset_local).local_tee(*write_ptr);
         }
 
         // Write the type prefix first
@@ -64,28 +64,28 @@ impl WasmGenerator {
 
         // Adjust the write pointer
         builder
-            .local_get(write_ptr)
+            .local_get(*write_ptr)
             .i32_const(1)
             .binop(BinaryOp::I32Add)
-            .local_tee(write_ptr);
+            .local_tee(*write_ptr);
         written += 1;
 
         // Serialize the high to memory.
         builder
-            .local_get(high)
+            .local_get(*high)
             .call(self.func_by_name("stdlib.store-i64-be"));
 
         // Adjust the write pointer
         builder
-            .local_get(write_ptr)
+            .local_get(*write_ptr)
             .i32_const(8)
             .binop(BinaryOp::I32Add)
-            .local_tee(write_ptr);
+            .local_tee(*write_ptr);
         written += 8;
 
         // Adjust the offset by 8, then serialize the low to memory.
         builder
-            .local_get(low)
+            .local_get(*low)
             .call(self.func_by_name("stdlib.store-i64-be"));
         written += 8;
 
@@ -143,12 +143,13 @@ impl WasmGenerator {
         // If `plength` is greater than STANDARD_PRINCIPAL_BYTES, then
         // this is a contract principal, else, it's a standard
         // principal.
+        let branch_type = self.bounded_control_type(&[], &[ValType::I32])?;
         builder
             .local_get(plength)
             .i32_const(STANDARD_PRINCIPAL_BYTES as i32)
             .binop(BinaryOp::I32GtS)
             .if_else(
-                InstrSeqType::new(&mut self.module.types, &[], &[ValType::I32]),
+                branch_type,
                 |then| {
                     // Write the total length of the contract to the buffer
                     then
@@ -248,11 +249,8 @@ impl WasmGenerator {
         let ok_locals = self.save_to_locals(builder, &types.0, true);
 
         // Create a block for the ok case
-        let mut ok_block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32],
-        ));
+        let branch_type = self.bounded_control_type(&[], &[ValType::I32])?;
+        let mut ok_block = builder.dangling_instr_seq(branch_type);
         let ok_block_id = ok_block.id();
 
         // Write the type prefix to memory
@@ -274,11 +272,7 @@ impl WasmGenerator {
         self.serialize_to_memory(&mut ok_block, offset_local, offset + 1, &types.0)?;
 
         // Create a block for the err case
-        let mut err_block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32],
-        ));
+        let mut err_block = builder.dangling_instr_seq(branch_type);
         let err_block_id = err_block.id();
 
         // Write the type prefix to memory
@@ -375,11 +369,8 @@ impl WasmGenerator {
         let locals = self.save_to_locals(builder, value_ty, true);
 
         // Create a block for the some case
-        let mut some_block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32],
-        ));
+        let branch_type = self.bounded_control_type(&[], &[ValType::I32])?;
+        let mut some_block = builder.dangling_instr_seq(branch_type);
         let some_block_id = some_block.id();
 
         // Write the type prefix to memory
@@ -404,11 +395,7 @@ impl WasmGenerator {
         some_block.i32_const(1).binop(BinaryOp::I32Add);
 
         // Create a block for the none case
-        let mut none_block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &[ValType::I32],
-        ));
+        let mut none_block = builder.dangling_instr_seq(branch_type);
         let none_block_id = none_block.id();
 
         // Write the type prefix to memory
@@ -860,14 +847,17 @@ impl WasmGenerator {
                 .local_set(write_ptr);
 
             // Push the next value back onto the stack
-            let wasm_types = clar2wasm_ty(value_ty);
-            for _ in 0..wasm_types.len() {
-                builder.local_get(
-                    locals.pop().ok_or_else(|| {
-                        GeneratorError::InternalError("invalid tuple value".into())
-                    })?,
-                );
+            let value_locals = (0..clar2wasm_ty(value_ty).len())
+                .map(|_| {
+                    locals
+                        .pop()
+                        .ok_or_else(|| GeneratorError::InternalError("invalid tuple value".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for local in &value_locals {
+                builder.local_get(*local);
             }
+            self.release_locals(value_locals);
 
             // Serialize the value
             self.serialize_to_memory(builder, write_ptr, 0, value_ty)?;
@@ -886,6 +876,209 @@ impl WasmGenerator {
             .binop(BinaryOp::I32Add)
             .binop(BinaryOp::I32Sub);
 
+        Ok(())
+    }
+
+    /// Serialize a wide value from its bounded linear-memory representation.
+    pub(crate) fn serialize_from_memory(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        input: LocalId,
+        input_offset: u32,
+        output: LocalId,
+        output_offset: u32,
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        let memory = self.get_memory()?;
+        match ty {
+            TypeSignature::OptionalType(inner) if clar2wasm_ty(ty).len() >= MAX_WASM_TYPE_ARITY => {
+                let branch_type = self.bounded_control_type(&[], &[ValType::I32])?;
+                let mut some = builder.dangling_instr_seq(branch_type);
+                some.local_get(output)
+                    .i32_const(TypePrefix::OptionalSome as i32)
+                    .store(
+                        memory,
+                        StoreKind::I32_8 { atomic: false },
+                        MemArg {
+                            align: 1,
+                            offset: output_offset,
+                        },
+                    );
+                self.serialize_from_memory(
+                    &mut some,
+                    input,
+                    input_offset + 4,
+                    output,
+                    output_offset + 1,
+                    inner,
+                )?;
+                some.i32_const(1).binop(BinaryOp::I32Add);
+                let some = some.id();
+
+                let mut none = builder.dangling_instr_seq(branch_type);
+                none.local_get(output)
+                    .i32_const(TypePrefix::OptionalNone as i32)
+                    .store(
+                        memory,
+                        StoreKind::I32_8 { atomic: false },
+                        MemArg {
+                            align: 1,
+                            offset: output_offset,
+                        },
+                    )
+                    .i32_const(1);
+                let none = none.id();
+                builder
+                    .local_get(input)
+                    .load(
+                        memory,
+                        walrus::ir::LoadKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: input_offset,
+                        },
+                    )
+                    .instr(IfElse {
+                        consequent: some,
+                        alternative: none,
+                    });
+            }
+            TypeSignature::ResponseType(types) if clar2wasm_ty(ty).len() >= MAX_WASM_TYPE_ARITY => {
+                let branch_type = self.bounded_control_type(&[], &[ValType::I32])?;
+                let mut ok = builder.dangling_instr_seq(branch_type);
+                ok.local_get(output)
+                    .i32_const(TypePrefix::ResponseOk as i32)
+                    .store(
+                        memory,
+                        StoreKind::I32_8 { atomic: false },
+                        MemArg {
+                            align: 1,
+                            offset: output_offset,
+                        },
+                    );
+                self.serialize_from_memory(
+                    &mut ok,
+                    input,
+                    input_offset + 4,
+                    output,
+                    output_offset + 1,
+                    &types.0,
+                )?;
+                ok.i32_const(1).binop(BinaryOp::I32Add);
+                let ok = ok.id();
+
+                let mut err = builder.dangling_instr_seq(branch_type);
+                err.local_get(output)
+                    .i32_const(TypePrefix::ResponseErr as i32)
+                    .store(
+                        memory,
+                        StoreKind::I32_8 { atomic: false },
+                        MemArg {
+                            align: 1,
+                            offset: output_offset,
+                        },
+                    );
+                self.serialize_from_memory(
+                    &mut err,
+                    input,
+                    input_offset + 4 + get_type_size(&types.0) as u32,
+                    output,
+                    output_offset + 1,
+                    &types.1,
+                )?;
+                err.i32_const(1).binop(BinaryOp::I32Add);
+                let err = err.id();
+                builder
+                    .local_get(input)
+                    .load(
+                        memory,
+                        walrus::ir::LoadKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: input_offset,
+                        },
+                    )
+                    .instr(IfElse {
+                        consequent: ok,
+                        alternative: err,
+                    });
+            }
+            TypeSignature::TupleType(tuple_ty) if clar2wasm_ty(ty).len() >= MAX_WASM_TYPE_ARITY => {
+                let write_ptr = self.borrow_local(ValType::I32);
+                builder
+                    .local_get(output)
+                    .i32_const(TypePrefix::Tuple as i32)
+                    .store(
+                        memory,
+                        StoreKind::I32_8 { atomic: false },
+                        MemArg {
+                            align: 1,
+                            offset: output_offset,
+                        },
+                    )
+                    .local_get(output)
+                    .i32_const(output_offset as i32 + 1)
+                    .binop(BinaryOp::I32Add)
+                    .local_tee(*write_ptr)
+                    .i32_const(tuple_ty.get_type_map().len() as i32)
+                    .call(self.func_by_name("stdlib.store-i32-be"))
+                    .local_get(*write_ptr)
+                    .i32_const(4)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(*write_ptr);
+
+                let mut field_offset = input_offset;
+                for (name, field_ty) in tuple_ty.get_type_map() {
+                    builder
+                        .local_get(*write_ptr)
+                        .i32_const(name.len() as i32)
+                        .store(
+                            memory,
+                            StoreKind::I32_8 { atomic: false },
+                            MemArg {
+                                align: 1,
+                                offset: 0,
+                            },
+                        );
+                    let (name_offset, name_length) = self.add_string_literal(name)?;
+                    builder
+                        .local_get(*write_ptr)
+                        .i32_const(1)
+                        .binop(BinaryOp::I32Add)
+                        .local_tee(*write_ptr)
+                        .i32_const(name_offset as i32)
+                        .i32_const(name_length as i32)
+                        .memory_copy(memory, memory)
+                        .local_get(*write_ptr)
+                        .i32_const(name_length as i32)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(*write_ptr);
+                    self.serialize_from_memory(
+                        builder,
+                        input,
+                        field_offset,
+                        *write_ptr,
+                        0,
+                        field_ty,
+                    )?;
+                    builder
+                        .local_get(*write_ptr)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(*write_ptr);
+                    field_offset += get_type_size(field_ty) as u32;
+                }
+                builder
+                    .local_get(*write_ptr)
+                    .local_get(output)
+                    .i32_const(output_offset as i32)
+                    .binop(BinaryOp::I32Add)
+                    .binop(BinaryOp::I32Sub);
+            }
+            _ => {
+                self.read_from_memory(builder, input, input_offset, ty)?;
+                self.serialize_to_memory(builder, output, output_offset, ty)?;
+            }
+        }
         Ok(())
     }
 
@@ -956,9 +1149,10 @@ impl WasmGenerator {
 
             builder.local_set(*size);
 
-            for v in value {
-                builder.local_get(v);
+            for v in &value {
+                builder.local_get(*v);
             }
+            self.release_locals(value);
             builder.local_get(*size);
         }
         Ok(())

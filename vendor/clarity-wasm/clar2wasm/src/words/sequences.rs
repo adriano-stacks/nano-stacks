@@ -3,7 +3,7 @@ use clarity::vm::types::{
     FixedFunction, FunctionType, ListTypeData, SequenceSubtype, StringSubtype, TypeSignature,
 };
 use clarity::vm::{ClarityName, SymbolicExpression};
-use walrus::ir::{self, BinaryOp, IfElse, InstrSeqType, Loop, UnaryOp};
+use walrus::ir::{self, BinaryOp, IfElse, Loop, UnaryOp};
 use walrus::ValType;
 
 use crate::check_args;
@@ -13,7 +13,8 @@ use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
     add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, get_global, has_in_memory_type,
-    ArgumentsExt, BorrowedLocal, GeneratorError, SequenceElementType, WasmGenerator,
+    uses_packed_value, ArgumentsExt, BorrowedLocal, GeneratorError, SequenceElementType,
+    WasmGenerator,
 };
 use crate::wasm_utils::{get_type_in_memory_size, ArgumentCountCheck};
 use crate::words::{self, ComplexWord, Word};
@@ -1307,19 +1308,34 @@ impl ComplexWord for ElementAt {
         // value at the specified index and return `(some value)`.
         let result_ty = generator
             .get_expr_type(expr)
-            .ok_or_else(|| GeneratorError::TypeError("append result must be typed".to_string()))?;
-        let result_wasm_types = clar2wasm_ty(result_ty);
-
-        let branch_ty = InstrSeqType::new(
-            &mut generator.module.types,
-            &[ValType::I32],
-            &result_wasm_types,
-        );
+            .ok_or_else(|| GeneratorError::TypeError("append result must be typed".to_string()))?
+            .clone();
+        let result_wasm_types = clar2wasm_ty(&result_ty);
+        let packed_result = uses_packed_value(&result_ty);
+        let (sequence_offset, result_offset) = if packed_result {
+            let condition = generator.module.locals.add(ValType::I32);
+            let sequence_offset = generator.module.locals.add(ValType::I32);
+            builder.local_set(condition).local_set(sequence_offset);
+            let result_offset = generator
+                .create_call_stack_local(builder, &result_ty, true, false)
+                .0;
+            builder.local_get(condition);
+            (Some(sequence_offset), Some(result_offset))
+        } else {
+            (None, None)
+        };
+        let branch_ty = if packed_result {
+            generator.lowered_control_type(&[ValType::I32], &result_wasm_types)
+        } else {
+            generator.bounded_control_type(&[ValType::I32], &result_wasm_types)?
+        };
         let mut then = builder.dangling_instr_seq(branch_ty);
         let then_id = then.id();
 
         // First, drop the offset.
-        then.drop();
+        if sequence_offset.is_none() {
+            then.drop();
+        }
 
         // Push the `none` indicator.
         then.i32_const(0);
@@ -1336,6 +1352,9 @@ impl ComplexWord for ElementAt {
                 add_placeholder_for_clarity_type(&mut then, elem_ty)
             }
         }
+        if let Some(result_offset) = result_offset {
+            generator.write_to_memory(&mut then, result_offset, 0, &result_ty)?;
+        }
 
         let mut else_ = builder.dangling_instr_seq(branch_ty);
         let else_id = else_.id();
@@ -1347,9 +1366,11 @@ impl ComplexWord for ElementAt {
             .local_get(index_local)
             // We know this offset is in range, so it must be a 32-bit
             // value, so this operation is safe.
-            .unop(UnaryOp::I32WrapI64)
-            .binop(BinaryOp::I32Add)
-            .local_set(offset_local);
+            .unop(UnaryOp::I32WrapI64);
+        if let Some(sequence_offset) = sequence_offset {
+            else_.local_get(sequence_offset);
+        }
+        else_.binop(BinaryOp::I32Add).local_set(offset_local);
 
         // Push the `some` indicator
         else_.i32_const(1);
@@ -1371,11 +1392,17 @@ impl ComplexWord for ElementAt {
                 generator.read_from_memory(&mut else_, offset_local, 0, elem_ty)?;
             }
         }
+        if let Some(result_offset) = result_offset {
+            generator.write_to_memory(&mut else_, result_offset, 0, &result_ty)?;
+        }
 
         builder.instr(ir::IfElse {
             consequent: then_id,
             alternative: else_id,
         });
+        if let Some(result_offset) = result_offset {
+            generator.read_from_memory(builder, result_offset, 0, &result_ty)?;
+        }
 
         Ok(())
     }
@@ -1561,10 +1588,15 @@ impl ComplexWord for ReplaceAt {
             builder.local_get(repl_len);
         }
 
-        let input_ty = generator.get_expr_type(replacement).ok_or_else(|| {
-            GeneratorError::TypeError("replace-at? value must be typed".to_string())
-        })?;
-        let input_wasm_types = clar2wasm_ty(input_ty);
+        let input_ty = generator
+            .get_expr_type(replacement)
+            .ok_or_else(|| {
+                GeneratorError::TypeError("replace-at? value must be typed".to_string())
+            })?
+            .clone();
+        let input_wasm_types = clar2wasm_ty(&input_ty);
+        let packed_input = uses_packed_value(&input_ty);
+        let input_locals = packed_input.then(|| generator.save_to_locals(builder, &input_ty, true));
 
         // Push the overflow result to the stack for `if_else`.
         builder.local_get(overflow_local);
@@ -1576,35 +1608,41 @@ impl ComplexWord for ReplaceAt {
             .ok_or_else(|| GeneratorError::TypeError("append result must be typed".to_string()))?;
         let result_wasm_types = clar2wasm_ty(result_ty);
 
-        let mut then = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut generator.module.types,
-            &input_wasm_types,
-            &result_wasm_types,
-        ));
+        let branch_ty = if packed_input {
+            generator.note_control_arity(input_wasm_types.len(), result_wasm_types.len());
+            generator.bounded_control_type(&[], &result_wasm_types)?
+        } else {
+            generator.bounded_control_type(&input_wasm_types, &result_wasm_types)?
+        };
+        let mut then = builder.dangling_instr_seq(branch_ty);
         let then_id = then.id();
 
         // First, drop the value.
-        match &element_ty {
-            SequenceElementType::Other(elem_ty) => {
-                // Read the element type from the list.
-                drop_value(&mut then, elem_ty);
-            }
-            SequenceElementType::Byte | SequenceElementType::UnicodeScalar => {
-                // The value is a byte or 32-bit scalar, but it's represented by an offset
-                // and length, so drop those.
-                then.drop().drop();
+        if !packed_input {
+            match &element_ty {
+                SequenceElementType::Other(elem_ty) => {
+                    // Read the element type from the list.
+                    drop_value(&mut then, elem_ty);
+                }
+                SequenceElementType::Byte | SequenceElementType::UnicodeScalar => {
+                    // The value is a byte or 32-bit scalar, but it's represented by an offset
+                    // and length, so drop those.
+                    then.drop().drop();
+                }
             }
         }
 
         // Push the `none` indicator and placeholders for offset/length
         then.i32_const(0).i32_const(0).i32_const(0);
 
-        let mut else_ = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut generator.module.types,
-            &input_wasm_types,
-            &result_wasm_types,
-        ));
+        let mut else_ = builder.dangling_instr_seq(branch_ty);
         let else_id = else_.id();
+
+        if let Some(input_locals) = &input_locals {
+            for local in input_locals {
+                else_.local_get(*local);
+            }
+        }
 
         let offset_local = generator.module.locals.add(ValType::I32);
 
@@ -1666,6 +1704,9 @@ impl ComplexWord for ReplaceAt {
             consequent: then_id,
             alternative: else_id,
         });
+        if let Some(input_locals) = input_locals {
+            generator.release_locals(input_locals);
+        }
 
         Ok(())
     }
@@ -2836,6 +2877,17 @@ mod tests {
     fn test_large_list() {
         let n = 50000 / 2 + 1;
         crosscheck_compare_only(&format!("(list {})", "9922 ".repeat(n)));
+    }
+
+    #[test]
+    fn replace_at_wide_input_keeps_its_narrow_list_result() {
+        let fields = (0..501_u32)
+            .map(|index| format!("f{index}: {index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        crosscheck_compare_only(&format!(
+            "(replace-at? (list {{{fields}}}) u0 {{{fields}}})"
+        ));
     }
 
     //

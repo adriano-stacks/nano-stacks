@@ -1,10 +1,12 @@
 use clarity::vm::{ClarityName, SymbolicExpression};
-use walrus::ir::{Block, InstrSeqType};
+use walrus::ir::Block;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
-use crate::wasm_generator::{clar2wasm_ty, ArgumentsExt, GeneratorError, WasmGenerator};
+use crate::wasm_generator::{
+    clar2wasm_ty, uses_packed_value, ArgumentsExt, GeneratorError, WasmGenerator,
+};
 use crate::wasm_utils::ArgumentCountCheck;
 
 #[derive(Debug)]
@@ -208,20 +210,30 @@ impl ComplexWord for AtBlock {
         let ty = generator.get_expr_type(expr).cloned().ok_or_else(|| {
             GeneratorError::TypeError("at-block expression should be typed".to_owned())
         })?;
-        let wasm_ty = InstrSeqType::new(&mut generator.module.types, &[], &clar2wasm_ty(&ty));
+        let packed_result = uses_packed_value(&ty);
+        let wasm_ty = if packed_result {
+            generator.lowered_control_type(&[], &clar2wasm_ty(&ty))
+        } else {
+            generator.bounded_control_type(&[], &clar2wasm_ty(&ty))?
+        };
 
         self.charge(generator, builder, 0)?;
+        let result_offset = packed_result.then(|| {
+            generator
+                .create_call_stack_local(builder, &ty, true, false)
+                .0
+        });
 
         let block_hash = args.get_expr(0)?;
         let e = args.get_expr(1)?;
-        generator.set_expr_type(e, ty)?;
+        generator.set_expr_type(e, ty.clone())?;
 
         let e_block_id = {
             let mut e_block = builder.dangling_instr_seq(wasm_ty);
             let e_block_id = e_block.id();
 
             let fail_block_ty = match generator.current_function_wasm_return_types() {
-                Some(wasm_ty) => InstrSeqType::new(&mut generator.module.types, &[], &wasm_ty),
+                Some(wasm_ty) => generator.bounded_control_type(&[], &wasm_ty)?,
                 None => None.into(),
             };
             let fail_block_id = {
@@ -238,6 +250,9 @@ impl ComplexWord for AtBlock {
 
                 // Traverse the inner expression
                 generator.traverse_expr(&mut fail_block, e)?;
+                if let Some(result_offset) = result_offset {
+                    generator.write_to_memory(&mut fail_block, result_offset, 0, &ty)?;
+                }
 
                 // we can restore the original early return block now
                 generator.early_return_block_id = former_early_return;
@@ -266,6 +281,9 @@ impl ComplexWord for AtBlock {
         };
 
         builder.instr(Block { seq: e_block_id });
+        if let Some(result_offset) = result_offset {
+            generator.read_from_memory(builder, result_offset, 0, &ty)?;
+        }
 
         Ok(())
     }
@@ -469,6 +487,23 @@ mod tests {
     use clarity_types::ClarityName;
 
     use crate::tools::{evaluate, TestEnvironment};
+
+    #[test]
+    fn at_block_wide_result_emits_a_loadable_module() {
+        let fields = (0..501_u32)
+            .map(|index| format!("f{index}: {index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let snippet = format!(
+            "(define-read-only (wide) \
+                (at-block \
+                    0x0000000000000000000000000000000000000000000000000000000000000000 \
+                    {{{fields}}}))"
+        );
+        let mut env = TestEnvironment::new(StacksEpochId::Epoch30, ClarityVersion::Clarity3);
+        env.init_contract_with_snippet("wide-at-block", &snippet)
+            .expect("the wide at-block contract compiles and loads");
+    }
 
     #[cfg(any(
         feature = "test-clarity-v1",

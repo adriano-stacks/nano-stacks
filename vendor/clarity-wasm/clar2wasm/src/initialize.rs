@@ -18,7 +18,7 @@ use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
 use crate::error_mapping;
 use crate::linker::{link_cost_globals, link_host_functions};
-use crate::wasm_generator::uses_packed_abi;
+use crate::wasm_generator::{uses_packed_abi, uses_packed_value};
 use crate::wasm_utils::*;
 use crate::{CompiledContract, ModuleCache};
 
@@ -425,16 +425,46 @@ pub fn initialize_contract(
         .get_func(&mut store, ".top-level")
         .ok_or(crate::error::wasm_error(WasmError::DefinesNotFound))?;
 
-    // Get the return type of the top-level expressions function
-    let ty = top_level.ty(&mut store);
-    let results_iter = ty.results();
-    let mut results = vec![];
-    for result_ty in results_iter {
-        results.push(placeholder_for_type(result_ty));
-    }
+    // Get the type of the last top-level expression with a return value.
+    let return_type = contract_analysis.expressions.iter().rev().find_map(|expr| {
+        contract_analysis
+            .type_map
+            .as_ref()
+            .and_then(|type_map| type_map.get_type_expected(expr))
+    });
+    let packed_top_level = return_type.is_some_and(uses_packed_value);
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    let packed_return_offset =
+        if let Some(return_type) = return_type.filter(|_| packed_top_level) {
+            let stack_pointer = instance.get_global(&mut store, "stack-pointer").ok_or(
+                crate::error::wasm_error(WasmError::GlobalNotFound("stack-pointer".into())),
+            )?;
+            let offset = stack_pointer
+                .get(&mut store)
+                .i32()
+                .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+            stack_pointer
+                .set(&mut store, Val::I32(offset + get_type_size(return_type)))
+                .map_err(|error| crate::error::wasm_error(WasmError::Runtime(error)))?;
+            Some(offset)
+        } else {
+            None
+        };
+    let arguments = packed_return_offset.map_or_else(Vec::new, |offset| vec![Val::I32(offset)]);
+    let mut results = if packed_top_level {
+        Vec::new()
+    } else {
+        top_level
+            .ty(&mut store)
+            .results()
+            .map(placeholder_for_type)
+            .collect()
+    };
 
     top_level
-        .call(&mut store, &[], results.as_mut_slice())
+        .call(&mut store, &arguments, results.as_mut_slice())
         .map_err(|e| {
             error_mapping::resolve_error(e, instance, &mut store, &epoch, &clarity_version)
         })?;
@@ -444,21 +474,19 @@ pub fn initialize_contract(
     // unobservable.
     store.data_mut().contract_context_mut()?.is_deploying = false;
 
-    // Get the type of the last top-level expression with a return value
-    // or default to `None`.
-    let return_type = contract_analysis.expressions.iter().rev().find_map(|expr| {
-        contract_analysis
-            .type_map
-            .as_ref()
-            .and_then(|type_map| type_map.get_type_expected(expr))
-    });
-
     let ret = if let Some(return_type) = return_type {
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-        wasm_to_clarity_value(return_type, 0, &results, memory, &mut &mut store, epoch)
-            .map(|(val, _offset)| val)?
+        if let Some(return_offset) = packed_return_offset {
+            Some(read_from_wasm_indirect(
+                memory,
+                &mut store,
+                return_type,
+                return_offset,
+                epoch,
+            )?)
+        } else {
+            wasm_to_clarity_value(return_type, 0, &results, memory, &mut &mut store, epoch)
+                .map(|(val, _offset)| val)?
+        }
     } else {
         None
     };

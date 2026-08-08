@@ -90,6 +90,8 @@ pub struct WasmGenerator {
     local_pool: Rc<RefCell<LocalPool>>,
     /// Peak live locals measured per generated function.
     pub(crate) locals_report: Rc<RefCell<LocalsReport>>,
+    /// Maximum flattened arities encountered before wide values are packed.
+    pub(crate) arity_report: Rc<RefCell<ArityReport>>,
     /// Reads remaining per `let`/`match` binding, by binding id, counted by a
     /// pre-pass over the contract's expressions; a binding's locals return
     /// to the pool when its last read is emitted.
@@ -536,18 +538,26 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
     }
 }
 
-/// wasmparser rejects function types above 1,000 parameters or results.
-/// Functions beyond either boundary pass their values through linear memory.
-pub(crate) fn uses_packed_abi(function: &FixedFunction) -> bool {
-    const MAX_WASM_FUNCTION_ARITY: usize = 1_000;
+/// wasmparser rejects function and block types above this many inputs or outputs.
+pub(crate) const MAX_WASM_TYPE_ARITY: usize = 1_000;
 
-    function
+pub(crate) fn uses_packed_slots(params: usize, results: usize) -> bool {
+    params > MAX_WASM_TYPE_ARITY || results > MAX_WASM_TYPE_ARITY
+}
+
+/// Whether a Clarity value is too wide to cross a Wasm function or block type.
+pub(crate) fn uses_packed_value(ty: &TypeSignature) -> bool {
+    uses_packed_slots(0, clar2wasm_ty(ty).len())
+}
+
+/// Functions beyond either Wasm boundary pass their values through linear memory.
+pub(crate) fn uses_packed_abi(function: &FixedFunction) -> bool {
+    let params = function
         .args
         .iter()
         .map(|arg| clar2wasm_ty(&arg.signature).len())
-        .sum::<usize>()
-        > MAX_WASM_FUNCTION_ARITY
-        || clar2wasm_ty(&function.returns).len() > MAX_WASM_FUNCTION_ARITY
+        .sum::<usize>();
+    uses_packed_slots(params, clar2wasm_ty(&function.returns).len())
 }
 
 /// One step of reading a stored value out as a wider type.
@@ -811,6 +821,19 @@ pub struct LocalsReport {
     pub max_live_locals: HashMap<String, u32>,
 }
 
+/// Maximum flattened WebAssembly arities in a compiled Clarity contract.
+///
+/// These are the source-level widths before memory-backed lowering, so a
+/// contract inventory can measure its margin without inspecting emitted Wasm.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ArityReport {
+    pub max_function_params: usize,
+    pub max_function_results: usize,
+    pub max_control_params: usize,
+    pub max_control_results: usize,
+    pub top_level_results: usize,
+}
+
 impl WasmGenerator {
     fn charge_reserved_variable_fetch(
         &self,
@@ -851,6 +874,7 @@ impl WasmGenerator {
             maps_types: HashMap::new(),
             local_pool: Rc::new(RefCell::new(LocalPool::default())),
             locals_report: Rc::new(RefCell::new(LocalsReport::default())),
+            arity_report: Rc::new(RefCell::new(ArityReport::default())),
             binding_uses: Vec::new(),
             binding_ids: HashMap::new(),
             spilled_scopes: HashSet::new(),
@@ -939,15 +963,27 @@ impl WasmGenerator {
         self.spilled_scopes = binding_uses.spilled;
         self.spill_sizes = binding_uses.spill_sizes;
 
-        // Get the type of the last top-level expression with a return value
-        // or default to `None`.
-        let return_ty = expressions
+        // Get the type of the last top-level expression with a return value.
+        let return_type = expressions
             .iter()
             .rev()
             .find_map(|expr| self.get_expr_type(expr))
-            .map_or_else(Vec::new, clar2wasm_ty);
+            .cloned();
+        let flattened_results = return_type.as_ref().map_or(0, |ty| clar2wasm_ty(ty).len());
+        self.arity_report.borrow_mut().top_level_results = flattened_results;
+        let packed_top_level = return_type.as_ref().is_some_and(uses_packed_value);
+        let return_offset = packed_top_level.then(|| self.module.locals.add(ValType::I32));
+        let params = return_offset.map_or_else(Vec::new, |_| vec![ValType::I32]);
+        let results = if packed_top_level {
+            Vec::new()
+        } else {
+            return_type.as_ref().map_or_else(Vec::new, clar2wasm_ty)
+        };
+        if let Some(return_type) = return_type.as_ref().filter(|_| packed_top_level) {
+            self.frame_size += get_type_size(return_type);
+        }
 
-        let mut current_function = FunctionBuilder::new(&mut self.module.types, &[], &return_ty);
+        let mut current_function = FunctionBuilder::new(&mut self.module.types, &params, &results);
 
         if !expressions.is_empty() {
             let mut body = current_function.func_body();
@@ -968,6 +1004,9 @@ impl WasmGenerator {
             }
 
             self.traverse_statement_list(&mut body, &expressions)?;
+            if let (Some(return_offset), Some(return_type)) = (return_offset, &return_type) {
+                self.write_to_memory(&mut body, return_offset, 0, return_type)?;
+            }
         }
 
         // Defined functions save and restore the live-local counts around
@@ -980,7 +1019,8 @@ impl WasmGenerator {
 
         self.contract_analysis.expressions = expressions;
 
-        let top_level = current_function.finish(vec![], &mut self.module.funcs);
+        let top_level =
+            current_function.finish(return_offset.into_iter().collect(), &mut self.module.funcs);
         self.module.exports.add(".top-level", top_level);
 
         self.set_memory_pages()?;
@@ -1254,6 +1294,18 @@ impl WasmGenerator {
         };
 
         self.current_function_type = Some(function_type.clone());
+        {
+            let mut report = self.arity_report.borrow_mut();
+            let params = function_type
+                .args
+                .iter()
+                .map(|argument| clar2wasm_ty(&argument.signature).len())
+                .sum::<usize>();
+            report.max_function_params = report.max_function_params.max(params);
+            report.max_function_results = report
+                .max_function_results
+                .max(clar2wasm_ty(&function_type.returns).len());
+        }
         let packed_abi = uses_packed_abi(&function_type);
 
         // Count live locals from zero for this function; the caller's counts
@@ -1451,11 +1503,8 @@ impl WasmGenerator {
             binding_locals + u32::from(packed_abi) * 2 + 1 + u32::from(switches_sender) * 2,
         );
 
-        let mut block = func_body.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            results_types.as_slice(),
-        ));
+        let block_type = self.bounded_control_type(&[], results_types.as_slice())?;
+        let mut block = func_body.dangling_instr_seq(block_type);
         let block_id = block.id();
 
         self.early_return_block_id = Some(block_id);
@@ -2032,13 +2081,60 @@ impl WasmGenerator {
             GeneratorError::TypeError("Expression results must be typed".to_owned())
         })?);
 
-        let mut block = builder.dangling_instr_seq(InstrSeqType::new(
-            &mut self.module.types,
-            &[],
-            &return_type,
-        ));
+        let block_type = self.bounded_control_type(&[], &return_type)?;
+        let mut block = builder.dangling_instr_seq(block_type);
         self.traverse_expr(&mut block, expr)?;
 
+        Ok(block.id())
+    }
+
+    /// Record a control signature and construct it only when Wasm can encode it.
+    /// Wide callers must carry their value through memory and use an empty type.
+    pub(crate) fn bounded_control_type(
+        &mut self,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> Result<InstrSeqType, GeneratorError> {
+        self.note_control_arity(params.len(), results.len());
+        if uses_packed_slots(params.len(), results.len()) {
+            return Err(GeneratorError::InternalError(format!(
+                "a {}/{}-slot control value was not lowered through memory",
+                params.len(),
+                results.len()
+            )));
+        }
+        Ok(InstrSeqType::new(&mut self.module.types, params, results))
+    }
+
+    /// Record the source signature for a value deliberately lowered through
+    /// locals or memory, and return an empty Wasm control signature.
+    pub(crate) fn lowered_control_type(
+        &self,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> InstrSeqType {
+        self.note_control_arity(params.len(), results.len());
+        None.into()
+    }
+
+    pub(crate) fn note_control_arity(&self, params: usize, results: usize) {
+        let mut report = self.arity_report.borrow_mut();
+        report.max_control_params = report.max_control_params.max(params);
+        report.max_control_results = report.max_control_results.max(results);
+    }
+
+    /// Build an empty control arm that evaluates `expr` into `result_offset`.
+    pub(crate) fn block_from_expr_into_memory(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+        result_offset: LocalId,
+        result_type: &TypeSignature,
+    ) -> Result<InstrSeqId, GeneratorError> {
+        self.note_control_arity(0, clar2wasm_ty(result_type).len());
+        let mut block = builder.dangling_instr_seq(None);
+        self.traverse_expr(&mut block, expr)?;
+        self.write_to_memory(&mut block, result_offset, 0, result_type)?;
         Ok(block.id())
     }
 
@@ -3677,6 +3773,88 @@ mod tests {
 
         wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
             .expect("wasmtime loads the packed-ABI module");
+    }
+
+    #[test]
+    fn arity_report_measures_exact_and_packed_nested_boundaries() {
+        fn tuple(ints: u32, with_bool: bool, values: bool) -> String {
+            let mut fields = (0..ints)
+                .map(|index| {
+                    if values {
+                        format!("f{index}: {index}")
+                    } else {
+                        format!("f{index}: int")
+                    }
+                })
+                .collect::<Vec<_>>();
+            if with_bool {
+                fields.push(if values {
+                    "flag: true".to_owned()
+                } else {
+                    "flag: bool".to_owned()
+                });
+            }
+            fields.join(", ")
+        }
+
+        for (
+            name,
+            boundary,
+            tuple_ints,
+            tuple_bool,
+            optional_ints,
+            optional_bool,
+            ok_ints,
+            ok_bool,
+        ) in [
+            ("exact", 1_000, 500, false, 499, true, 498, true),
+            ("packed", 1_001, 500, true, 500, false, 499, false),
+        ] {
+            let tuple_type = tuple(tuple_ints, tuple_bool, false);
+            let tuple_value = tuple(tuple_ints, tuple_bool, true);
+            let optional_value = tuple(optional_ints, optional_bool, true);
+            let response_value = tuple(ok_ints, ok_bool, true);
+            let source = format!(
+                r#"
+                (define-read-only (tuple-result) {{{tuple_value}}})
+                (define-read-only (optional-result) (some {{{optional_value}}}))
+                (define-read-only (tuple-param (value {{{tuple_type}}})) value)
+                (define-public (response-result)
+                    (if true (ok {{{response_value}}}) (err 0)))
+                {{{tuple_value}}}
+                "#
+            );
+            let mut compiled = compile(
+                &source,
+                &QualifiedContractIdentifier::new(
+                    StandardPrincipalData::transient(),
+                    ContractName::try_from(format!("arity-{name}"))
+                        .expect("generated contract name is valid"),
+                ),
+                LimitedCostTracker::new_free(),
+                ClarityVersion::latest(),
+                StacksEpochId::latest(),
+                &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{name} boundary contract compiles: {error:?}"));
+
+            assert_eq!(
+                compiled.arity_report.max_function_params, boundary,
+                "{name}"
+            );
+            assert_eq!(
+                compiled.arity_report.max_function_results, boundary,
+                "{name}"
+            );
+            assert_eq!(
+                compiled.arity_report.max_control_results, boundary,
+                "{name}"
+            );
+            assert_eq!(compiled.arity_report.top_level_results, boundary, "{name}");
+            wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
+                .unwrap_or_else(|error| panic!("{name} boundary module loads: {error}"));
+        }
     }
 
     #[test]
