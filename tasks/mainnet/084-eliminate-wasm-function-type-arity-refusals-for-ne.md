@@ -103,15 +103,27 @@ compile to a module wasmtime will not load**, which is the class this task is
 about and which no previous sweep could see — 073's called `clar2wasm::compile`
 and never handed the result to an engine, and every one of these compiles fine.
 
-Two of the six are the arity limit itself, and one of them is a **boot contract**:
+Two of the six are the arity limit itself:
 
 | contract | refusal |
 |---|---|
 | `SPXGT7ADNZNARR4SVSJN56QGSZFHGATJEQMFPMJW.pox-4` | `function returns size is out of bounds (at offset 0x651)` |
 | `SP33WGC0P4HRB395QXWKEWAP27SH47F9CDQX6FXW2.mix-sender-dope` | `function params size is out of bounds (at offset 0x123)` |
 
-So the arity wall is not a manufactured case. It is reached by a deployed
-contract carrying the name of a boot contract, and the network accepted both.
+So the arity wall is not a manufactured case: two deployed contracts reach it and
+the network accepted both.
+
+**They are not boot contracts, and an earlier note here said one was.**
+`SPXGT7ADNZNARR4SVSJN56QGSZFHGATJEQMFPMJW.pox-4` is a user contract that shares
+the name; the boot `SP000000000000000000002Q6VF78.pox-4` and `.pox-5` were
+checked afterwards and both compile and load. Reading a boot contract out of a
+name was the mistake, and it briefly turned a real conformance bug into a
+foundational emergency it is not.
+
+What both actually are is aggregators: four lines, a `define-read-only` returning
+one 55-field tuple built from a dozen cross-contract calls — a "give me
+everything" view function. That is the shape to reduce from, and it is a shape
+the network will keep producing.
 
 The remaining four are a **different defect and probably not this task's**:
 
