@@ -2,7 +2,7 @@
 id: "082"
 group: mainnet
 title: "Cross a reward cycle boundary with a locally derived sortition chain"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["049", "077"]

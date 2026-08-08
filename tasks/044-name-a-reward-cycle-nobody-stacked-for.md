@@ -2,14 +2,13 @@
 id: "044"
 group: mainnet
 title: "Name a reward cycle nobody stacked for"
-status: completed
+status: in-progress
 priority: medium
 effort: small
 type: bug
 dependencies: ["043"]
 tags: ["chainstate", "signer", "hacknet"]
 created_at: 2026-07-30
-completed_at: 2026-07-30
 ---
 
 # Name a reward cycle nobody stacked for

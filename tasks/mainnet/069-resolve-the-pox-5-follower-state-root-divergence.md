@@ -1,7 +1,7 @@
 ---
 id: "069"
 title: "Resolve the PoX-5 follower state-root divergence"
-status: completed
+status: in-progress
 priority: critical
 effort: large
 dependencies: []

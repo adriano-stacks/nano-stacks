@@ -1,7 +1,7 @@
 ---
 id: "064"
 title: "Compile a contract under the epoch it was deployed in"
-status: completed
+status: in-progress
 priority: high
 effort: medium
 type: bug
@@ -9,7 +9,6 @@ group: mainnet
 dependencies: ["060"]
 tags: ["mainnet", "vm", "clarity", "conformance"]
 created_at: 2026-08-06
-completed_at: 2026-08-06
 ---
 
 # Compile a contract under the epoch it was deployed in

@@ -1,7 +1,7 @@
 ---
 title: "Refuse an unrecoverable checkpoint winner seed before sortition"
 id: "083"
-status: completed
+status: in-progress
 priority: critical
 effort: medium
 type: bug
