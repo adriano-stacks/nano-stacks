@@ -56,7 +56,8 @@ def browser_report(browser: str, deck: Path, width: int, height: int) -> dict:
         "--disable-background-networking",
         "--disable-component-update",
         "--host-resolver-rules=MAP * ~NOTFOUND",
-        f"--window-size={width},{height}",
+        # Headless Chromium reserves 87 pixels for its synthetic window frame.
+        f"--window-size={width},{height + 87}",
         "--dump-dom",
         f"{deck.as_uri()}?selftest=1#1",
     )
@@ -64,6 +65,10 @@ def browser_report(browser: str, deck: Path, width: int, height: int) -> dict:
     if match is None:
         raise AssertionError(f"headless browser did not return the self-test at {width}x{height}")
     report = json.loads(html.unescape(match.group(1)))
+    if report["viewport"] != [width, height]:
+        raise AssertionError(
+            f"headless browser produced viewport {report['viewport']}, not {width}x{height}"
+        )
     if report["navigation_failures"] or report["overflow"]:
         raise AssertionError(f"deck failed at {width}x{height}: {report}")
     return report

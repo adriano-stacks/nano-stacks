@@ -235,6 +235,17 @@ blockquote cite { display: block; margin-top: 1rem; color: #747d88; font: normal
 .progress { position: fixed; left: 0; right: 0; bottom: 0; z-index: 21; height: .18rem; background: #1a1f27; }
 .progress i { display: block; height: 100%; width: 0; background: var(--cyan); transition: width .2s; }
 
+@media (max-height: 760px) and (min-aspect-ratio: 4/3) {
+  :root { --slide-pad: 2.4rem; }
+  .slide header { margin-bottom: 1rem; }
+  h2 { font-size: clamp(2.3rem, 4.3vw, 4rem); }
+  .loc-row { margin: 1rem 0; }
+  .metric-grid.slim { margin: .8rem 0; }
+  .metric-grid.slim article { min-height: 5.2rem; }
+  .timeline p { min-height: 6em; }
+  .token-row { margin: .7rem 0; }
+}
+
 @media (max-width: 900px), (max-aspect-ratio: 4/3) {
   :root { --slide-pad: 2rem; }
   .architecture { grid-template-columns: 1fr; align-content: center; }
@@ -244,6 +255,19 @@ blockquote cite { display: block; margin-top: 1rem; color: #747d88; font: normal
   .method-flow { grid-template-columns: 1fr 1fr; }
   .timeline { grid-template-columns: repeat(5, minmax(8rem, 1fr)); overflow-x: hidden; }
   .quote-strip { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-height: 800px) and (min-aspect-ratio: 4/3) {
+  :root { --slide-pad: 2.2rem; }
+  .slide header { margin-bottom: .8rem; }
+  h2 { font-size: clamp(2.4rem, 4.5vw, 4rem); }
+  .loc-row { margin: 1rem 0; }
+  .metric-grid.slim { margin: .8rem 0; }
+  .metric-grid.slim article { min-height: 5rem; padding: .8rem; }
+  .timeline { margin-bottom: .8rem; }
+  .timeline p { min-height: 5.5em; }
+  .token-row { margin: .65rem 0; }
+  .token-track { height: 2rem; }
 }
 
 @media print {

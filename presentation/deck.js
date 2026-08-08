@@ -57,7 +57,11 @@
     slides.forEach((slide, at) => {
       show(at, false);
       if (slide.scrollWidth > slide.clientWidth + 1 || slide.scrollHeight > slide.clientHeight + 1) {
-        overflow.push(`${at + 1}: ${slide.dataset.title}`);
+        overflow.push({
+          slide: `${at + 1}: ${slide.dataset.title}`,
+          horizontal: slide.scrollWidth - slide.clientWidth,
+          vertical: slide.scrollHeight - slide.clientHeight,
+        });
       }
     });
     show(start, false);
