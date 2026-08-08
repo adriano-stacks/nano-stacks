@@ -880,6 +880,136 @@ struct ExecutedBlock {
     tenure_height: u32,
 }
 
+/// One locally contextualized block in the authenticated history behind a checkpoint.
+#[derive(Clone, Debug)]
+pub struct CheckpointHistoryBlock {
+    pub block: NakamotoBlock,
+    pub bitcoin_context: BitcoinBlockContext,
+    pub operations: Vec<BitcoinOperation>,
+}
+
+/// The parent-tenure proof at the finite boundary of a checkpoint history.
+///
+/// The consensus hash names its locally derived sortition. The proof is checked
+/// against that sortition before it is allowed to seed validation of the first
+/// tenure in the suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointBoundaryProof {
+    pub parent_tenure_consensus_hash: ConsensusHash,
+    pub coinbase_vrf_proof: [u8; 80],
+    pub sortition_hash: [u8; 32],
+    pub winner_vrf_public_key: [u8; 32],
+}
+
+/// A bounded checkpoint history is large enough to cover long tenures while
+/// remaining a startup artifact rather than an unbounded second chain database.
+pub const CHECKPOINT_HISTORY_LIMIT: usize = 4_096;
+
+/// Why a checkpoint's claimed execution history cannot authenticate its state.
+#[derive(Debug)]
+pub enum CheckpointHistoryError {
+    Empty,
+    TooLong(usize),
+    Source {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    StateRoot {
+        expected: TrieHash,
+        actual: TrieHash,
+    },
+    Link {
+        height: u64,
+    },
+    Height {
+        previous: u64,
+        next: u64,
+    },
+    FirstBlockIsNotTenureStart,
+    BoundaryTenure,
+    BoundaryProof(TenureVrfError),
+    Vrf {
+        height: u64,
+        error: TenureVrfError,
+    },
+    Block {
+        height: u64,
+        error: ChainStateError,
+    },
+    TenureHeight,
+}
+
+impl std::fmt::Display for CheckpointHistoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("checkpoint authentication history is empty"),
+            Self::TooLong(blocks) => write!(
+                formatter,
+                "checkpoint authentication history has {blocks} blocks, above the bounded limit of {CHECKPOINT_HISTORY_LIMIT}"
+            ),
+            Self::Source { expected, actual } => write!(
+                formatter,
+                "checkpoint authentication history ends at {}, not checkpoint source {}",
+                hex::encode(actual),
+                hex::encode(expected)
+            ),
+            Self::StateRoot { expected, actual } => write!(
+                formatter,
+                "checkpoint authentication history publishes root {actual}, not checkpoint root {expected}"
+            ),
+            Self::Link { height } => write!(
+                formatter,
+                "checkpoint authentication history is not parent-chained at Stacks height {height}"
+            ),
+            Self::Height { previous, next } => write!(
+                formatter,
+                "checkpoint authentication history jumps from Stacks height {previous} to {next}"
+            ),
+            Self::FirstBlockIsNotTenureStart => formatter.write_str(
+                "checkpoint authentication history must begin at a tenure-start block",
+            ),
+            Self::BoundaryTenure => formatter.write_str(
+                "checkpoint boundary parent-tenure proof names a different tenure than the first history block",
+            ),
+            Self::BoundaryProof(error) => {
+                write!(formatter, "checkpoint boundary parent-tenure proof: {error}")
+            }
+            Self::Vrf { height, error } => write!(
+                formatter,
+                "checkpoint authentication history block {height}: {error}"
+            ),
+            Self::Block { height, error } => write!(
+                formatter,
+                "checkpoint authentication history block {height}: {error}"
+            ),
+            Self::TenureHeight => formatter.write_str(
+                "checkpoint authentication history cannot be assigned to the tenure height committed in state",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointHistoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BoundaryProof(error) | Self::Vrf { error, .. } => Some(error),
+            Self::Block { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn history_block(height: u64) -> impl FnOnce(ChainStateError) -> CheckpointHistoryError {
+    move |error| CheckpointHistoryError::Block { height, error }
+}
+
+fn history_consensus(height: u64, error: ConsensusError) -> CheckpointHistoryError {
+    CheckpointHistoryError::Block {
+        height,
+        error: ChainStateError::InvalidTransaction(error.to_string()),
+    }
+}
+
 /// What a Bitcoin reorganization took off nano's executed chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainRetraction {
@@ -1095,6 +1225,188 @@ impl ChainState {
         &mut self.ledger.accounting
     }
 
+    fn validate_checkpoint_history_shape<'a>(
+        &self,
+        source: [u8; 32],
+        state_root: TrieHash,
+        history: &'a [CheckpointHistoryBlock],
+    ) -> Result<&'a NakamotoBlock, CheckpointHistoryError> {
+        let last = history
+            .last()
+            .ok_or(CheckpointHistoryError::Empty)
+            .map(|entry| &entry.block)?;
+        if history.len() > CHECKPOINT_HISTORY_LIMIT {
+            return Err(CheckpointHistoryError::TooLong(history.len()));
+        }
+        let actual_source = *last.block_id().as_bytes();
+        if actual_source != source || self.tip().map_err(history_block(0))? != Some(source) {
+            return Err(CheckpointHistoryError::Source {
+                expected: source,
+                actual: actual_source,
+            });
+        }
+        if last.header.state_index_root != state_root {
+            return Err(CheckpointHistoryError::StateRoot {
+                expected: state_root,
+                actual: last.header.state_index_root,
+            });
+        }
+        if !block_starts_new_tenure(&history[0].block) {
+            return Err(CheckpointHistoryError::FirstBlockIsNotTenureStart);
+        }
+        for pair in history.windows(2) {
+            let previous = &pair[0].block;
+            let next = &pair[1].block;
+            if next.header.parent_block_id != previous.block_id() {
+                return Err(CheckpointHistoryError::Link {
+                    height: next.header.chain_length,
+                });
+            }
+            if next.header.chain_length != previous.header.chain_length.saturating_add(1) {
+                return Err(CheckpointHistoryError::Height {
+                    previous: previous.header.chain_length,
+                    next: next.header.chain_length,
+                });
+            }
+        }
+        Ok(last)
+    }
+
+    fn authenticate_checkpoint_history_block(
+        &mut self,
+        ledger: &mut ChainLedger,
+        entry: &CheckpointHistoryBlock,
+        index: usize,
+        tenure_height: u32,
+        parent_proof: &mut [u8; 80],
+    ) -> Result<(), CheckpointHistoryError> {
+        let block = &entry.block;
+        let height = block.header.chain_length;
+        authenticate::authenticate_block(
+            block,
+            self.vm.network(),
+            authenticate::Signatures::Present,
+        )
+        .map_err(|error| history_consensus(height, error))?;
+        if index > 0 {
+            check_tenure_continuity(
+                ledger,
+                block,
+                Some(*block.header.parent_block_id.as_bytes()),
+            )
+            .map_err(|error| history_consensus(height, error))?;
+        }
+        Self::check_miner_won_the_sortition(block, entry.bitcoin_context, &entry.operations)
+            .map_err(|error| history_consensus(height, error))?;
+        if block_starts_new_tenure(block) {
+            let key = entry
+                .bitcoin_context
+                .winner_vrf_public_key
+                .ok_or(TenureVrfError::MissingLeaderKey)
+                .map_err(|error| CheckpointHistoryError::Vrf { height, error })?;
+            verify_coinbase_vrf_proof(block, &key, &entry.bitcoin_context.sortition_hash)
+                .map_err(|error| CheckpointHistoryError::Vrf { height, error })?;
+            verify_committed_vrf_seed(&entry.bitcoin_context.vrf_seed, parent_proof)
+                .map_err(|error| CheckpointHistoryError::Vrf { height, error })?;
+            *parent_proof = coinbase_vrf_proof(block)
+                .ok_or(TenureVrfError::MissingProof)
+                .map_err(|error| CheckpointHistoryError::Vrf { height, error })?;
+            let stacks_height =
+                u32::try_from(height).map_err(|_| CheckpointHistoryError::TenureHeight)?;
+            ledger
+                .tenure_start_heights
+                .insert(tenure_height, stacks_height);
+        }
+        self.check_signer_signatures(block, entry.bitcoin_context)
+            .map_err(history_block(height))?;
+        ledger.executed.push(ExecutedBlock {
+            block_id: *block.block_id().as_bytes(),
+            consensus_hash: block.header.consensus_hash,
+            tenure_height,
+        });
+        Ok(())
+    }
+
+    /// Authenticate and adopt the bounded block history ending at a checkpoint.
+    ///
+    /// No block is executed here: the imported MARF already contains the state.
+    /// The suffix instead reconstructs the reorganization ledger, tenure starts
+    /// and latest coinbase proof from blocks whose chain, signer weight, miner and
+    /// VRF claims are all checked. The explicit boundary proof closes the one
+    /// parent-tenure dependency a finite suffix cannot contain.
+    pub fn authenticate_checkpoint_history(
+        &mut self,
+        source: [u8; 32],
+        state_root: TrieHash,
+        boundary: CheckpointBoundaryProof,
+        history: &[CheckpointHistoryBlock],
+    ) -> Result<(), CheckpointHistoryError> {
+        let last = self.validate_checkpoint_history_shape(source, state_root, history)?;
+        verify_vrf_proof(
+            &boundary.coinbase_vrf_proof,
+            &boundary.winner_vrf_public_key,
+            &boundary.sortition_hash,
+        )
+        .map_err(CheckpointHistoryError::BoundaryProof)?;
+        let first_payload = authenticate::tenure_change_payload(&history[0].block)
+            .ok_or(CheckpointHistoryError::FirstBlockIsNotTenureStart)?;
+        if first_payload.previous_tenure_consensus_hash != boundary.parent_tenure_consensus_hash {
+            return Err(CheckpointHistoryError::BoundaryTenure);
+        }
+
+        let starts = history
+            .iter()
+            .filter(|entry| block_starts_new_tenure(&entry.block))
+            .count();
+        let current_tenure =
+            self.vm
+                .tenure_height()
+                .map_err(|error| CheckpointHistoryError::Block {
+                    height: last.header.chain_length,
+                    error: ChainStateError::Execution(error),
+                })?;
+        let earlier = u32::try_from(starts.saturating_sub(1))
+            .map_err(|_| CheckpointHistoryError::TenureHeight)?;
+        let mut tenure_height = current_tenure
+            .checked_sub(earlier)
+            .ok_or(CheckpointHistoryError::TenureHeight)?;
+        let mut ledger = ChainLedger {
+            accounting: self.ledger.accounting.clone(),
+            ..ChainLedger::default()
+        };
+        let mut parent_proof = boundary.coinbase_vrf_proof;
+
+        for (index, entry) in history.iter().enumerate() {
+            if index > 0 && block_starts_new_tenure(&entry.block) {
+                tenure_height = tenure_height
+                    .checked_add(1)
+                    .ok_or(CheckpointHistoryError::TenureHeight)?;
+            }
+            self.authenticate_checkpoint_history_block(
+                &mut ledger,
+                entry,
+                index,
+                tenure_height,
+                &mut parent_proof,
+            )?;
+        }
+        if tenure_height != current_tenure {
+            return Err(CheckpointHistoryError::TenureHeight);
+        }
+        if let Some(over) = ledger.executed.len().checked_sub(REORG_REACH) {
+            ledger.executed.drain(..over);
+        }
+        ledger.parent_tenure_proof = Some(parent_proof);
+        self.vm.stand_on_tenure_starts(
+            ledger
+                .tenure_start_heights
+                .iter()
+                .map(|(tenure, height)| (*tenure, *height)),
+        );
+        self.adopt(ledger);
+        Ok(())
+    }
+
     /// Stand on the ledger the run that sealed `block` committed with it.
     ///
     /// Answers whether one was found, and changes nothing when none was: a state
@@ -1183,7 +1495,6 @@ impl ChainState {
     }
 
     /// Return the pointers and child hashes a block state holds under a prefix.
-    #[must_use]
     pub fn state_pointers_at(
         &self,
         block: [u8; 32],
@@ -1352,6 +1663,29 @@ impl ChainState {
                 parent,
                 root: RootPolicy::Trust,
                 effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::UnauthenticatedFixture,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn execute_unauthenticated_fixture_block_with_effects(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        effects: NativeBlockEffects,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            &mut block,
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Trust,
+                effects,
                 candidates: &[],
                 authentication: BlockAuthentication::UnauthenticatedFixture,
             },
@@ -1674,34 +2008,7 @@ impl ChainState {
         block: &NakamotoBlock,
         parent: Option<[u8; 32]>,
     ) -> Result<(), ConsensusError> {
-        let Some(payload) = authenticate::tenure_change_payload(block) else {
-            return Ok(());
-        };
-        let parent = parent.ok_or(ConsensusError::TenureChangeParentUnavailable)?;
-        let recorded = self
-            .recorded_header(parent)
-            .ok_or(ConsensusError::TenureChangeParentUnavailable)?;
-        if payload.previous_tenure_consensus_hash.as_bytes() != &recorded.consensus_hash {
-            return Err(ConsensusError::TenureChangeParentTenure);
-        }
-        let start = u64::from(recorded.tenure_start_height);
-        let parent_height = block
-            .header
-            .chain_length
-            .checked_sub(1)
-            .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
-        let blocks = parent_height
-            .checked_sub(start)
-            .and_then(|distance| distance.checked_add(1))
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
-        if blocks != payload.previous_tenure_blocks {
-            return Err(ConsensusError::TenureChangeBlockCount {
-                claimed: payload.previous_tenure_blocks,
-                executed: blocks,
-            });
-        }
-        Ok(())
+        check_tenure_continuity(&self.ledger, block, parent)
     }
 
     /// Check the block was signed by the miner whose leader key won its sortition.
@@ -2821,6 +3128,48 @@ impl ChainState {
     }
 }
 
+fn check_tenure_continuity(
+    ledger: &ChainLedger,
+    block: &NakamotoBlock,
+    parent: Option<[u8; 32]>,
+) -> Result<(), ConsensusError> {
+    let Some(payload) = authenticate::tenure_change_payload(block) else {
+        return Ok(());
+    };
+    let parent = parent.ok_or(ConsensusError::TenureChangeParentUnavailable)?;
+    let executed = ledger
+        .executed
+        .iter()
+        .rev()
+        .find(|executed| executed.block_id == parent)
+        .ok_or(ConsensusError::TenureChangeParentUnavailable)?;
+    if payload.previous_tenure_consensus_hash != executed.consensus_hash {
+        return Err(ConsensusError::TenureChangeParentTenure);
+    }
+    let start = ledger
+        .tenure_start_heights
+        .get(&executed.tenure_height)
+        .copied()
+        .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
+    let parent_height = block
+        .header
+        .chain_length
+        .checked_sub(1)
+        .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
+    let blocks = parent_height
+        .checked_sub(u64::from(start))
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(ConsensusError::TenureChangeLengthUnavailable)?;
+    if blocks != payload.previous_tenure_blocks {
+        return Err(ConsensusError::TenureChangeBlockCount {
+            claimed: payload.previous_tenure_blocks,
+            executed: blocks,
+        });
+    }
+    Ok(())
+}
+
 /// Note a block in the ledger and build the header Clarity may read about it.
 ///
 /// The header is returned rather than written, because building it needs the
@@ -3070,9 +3419,18 @@ pub fn verify_coinbase_vrf_proof(
     sortition_hash: &[u8; 32],
 ) -> Result<(), TenureVrfError> {
     let proof = coinbase_vrf_proof(block).ok_or(TenureVrfError::MissingProof)?;
+    verify_vrf_proof(&proof, leader_vrf_public_key, sortition_hash)
+}
+
+/// Verify a raw coinbase proof carried as a checkpoint boundary witness.
+pub fn verify_vrf_proof(
+    proof: &[u8; 80],
+    leader_vrf_public_key: &[u8; 32],
+    sortition_hash: &[u8; 32],
+) -> Result<(), TenureVrfError> {
     let public_key = VrfPublicKey::from_bytes(*leader_vrf_public_key)
         .map_err(|_| TenureVrfError::MalformedProof)?;
-    let proof = VrfProof::from_bytes(&proof).map_err(|_| TenureVrfError::MalformedProof)?;
+    let proof = VrfProof::from_bytes(proof).map_err(|_| TenureVrfError::MalformedProof)?;
     match Vrf::verify(&public_key, &proof, sortition_hash) {
         Ok(true) => Ok(()),
         Ok(false) | Err(_) => Err(TenureVrfError::ProofNotFromLeaderKey),
@@ -3631,7 +3989,7 @@ mod tests {
     use nano_primitives::{Hash160, Network, TrieHash};
 
     use super::{
-        BitcoinBlockContext, ChainLedger, ChainState, ChainStateError, NakamotoBlock,
+        AppliedBlock, BitcoinBlockContext, ChainLedger, ChainState, ChainStateError, NakamotoBlock,
         NativeBlockEffects, NativeStxCredit, TenureAccounting, TenureAccountingError,
         TransactionStatus, block_fees, check_postconditions, principal_from_address,
     };
@@ -3733,10 +4091,12 @@ mod tests {
         let (checkpoint, source, root, bitcoin_height) = captured_checkpoint();
         let block = captured_first_block();
         let context = BitcoinBlockContext::at_height(bitcoin_height);
-        let baseline = ChainState::from_checkpoint(Network::TESTNET, &checkpoint, source, root)
-            .expect("open checkpoint")
-            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
-            .expect("execute baseline block");
+        let mut baseline_state =
+            ChainState::from_checkpoint(Network::TESTNET, &checkpoint, source, root)
+                .expect("open checkpoint");
+        let baseline =
+            execute_unauthenticated_fixture(&mut baseline_state, context, source, &block)
+                .expect("execute baseline block");
         let effects = NativeBlockEffects {
             credits: vec![NativeStxCredit {
                 recipient: PrincipalData::parse("ST000000000000000000002AMW42H")
@@ -3747,7 +4107,12 @@ mod tests {
         };
         let applied = ChainState::from_checkpoint(Network::TESTNET, checkpoint, source, root)
             .expect("open checkpoint")
-            .execute_nakamoto_block_with_effects(context, Some(source), &block, effects)
+            .execute_unauthenticated_fixture_block_with_effects(
+                context,
+                Some(source),
+                &block,
+                effects,
+            )
             .expect("execute native effects");
 
         assert_ne!(baseline.execution.state_root, applied.execution.state_root);
@@ -3852,6 +4217,47 @@ mod tests {
         )
     }
 
+    fn execute_unauthenticated_fixture(
+        chainstate: &mut ChainState,
+        context: BitcoinBlockContext,
+        parent: [u8; 32],
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        chainstate.execute_unauthenticated_fixture_block_with_bitcoin_operations(
+            context,
+            &[],
+            Some(parent),
+            block,
+        )
+    }
+
+    fn append_unauthenticated_fixture(
+        chainstate: &mut ChainState,
+        context: BitcoinBlockContext,
+        parent: [u8; 32],
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        chainstate.append_unauthenticated_fixture_block_with_bitcoin_operations(
+            context,
+            &[],
+            Some(parent),
+            block,
+        )
+    }
+
+    fn captured_block_with_wrong_root() -> (NakamotoBlock, NakamotoBlock, u128, [u8; 32]) {
+        let block = captured_first_block();
+        let fees = block_fees(&block);
+        assert!(
+            fees > 0,
+            "the captured block has to pay a fee, or a rejection has no fees to leak"
+        );
+        let mut rejected = block.clone();
+        rejected.header.state_index_root = TrieHash::from_bytes([0xff; 32]);
+        let rejected_id = *rejected.block_id().as_bytes();
+        (block, rejected, fees, rejected_id)
+    }
+
     /// Rejecting the same block again and again must leave nothing behind.
     ///
     /// Fees reach the tenure accounting *before* the state root is checked, that
@@ -3871,18 +4277,10 @@ mod tests {
         let (mut chainstate, source, context) = open_captured(directory.path());
         *chainstate.accounting_mut() = accounting_counting_fees();
 
-        let block = captured_first_block();
-        let fees = block_fees(&block);
-        assert!(
-            fees > 0,
-            "the captured block has to pay a fee, or a rejection has no fees to leak"
-        );
         // A root this block cannot produce, so it is rejected in
         // `settle_state_root` — after its transactions ran and after its fees
         // were counted, which is where the live divergence was rejected too.
-        let mut rejected = block.clone();
-        rejected.header.state_index_root = TrieHash::from_bytes([0xff; 32]);
-        let rejected_id = *rejected.block_id().as_bytes();
+        let (block, rejected, fees, rejected_id) = captured_block_with_wrong_root();
 
         let before = chainstate.ledger.clone();
         let owed = before.accounting.to_json().expect("encode the accounting");
@@ -3891,8 +4289,7 @@ mod tests {
             .expect("read checkpoint content root");
 
         for attempt in 0..REJECTED_ATTEMPTS {
-            let error = chainstate
-                .append_nakamoto_block_with_bitcoin_context(context, Some(source), &rejected)
+            let error = append_unauthenticated_fixture(&mut chainstate, context, source, &rejected)
                 .expect_err("the block commits to a root it cannot produce");
             assert!(
                 matches!(error, ChainStateError::StateRootMismatch { .. }),
@@ -3958,8 +4355,7 @@ mod tests {
         // And an accepted block after all those rejections owes exactly what it
         // would have owed had none of them happened.
         *chainstate.accounting_mut() = accounting_counting_fees();
-        let applied = chainstate
-            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+        let applied = execute_unauthenticated_fixture(&mut chainstate, context, source, &block)
             .expect("the pristine block executes");
         assert_eq!(
             chainstate
@@ -3974,8 +4370,7 @@ mod tests {
         let pristine = tempfile::tempdir().expect("a directory");
         let (mut untouched, source, context) = open_captured(pristine.path());
         *untouched.accounting_mut() = accounting_counting_fees();
-        let expected = untouched
-            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+        let expected = execute_unauthenticated_fixture(&mut untouched, context, source, &block)
             .expect("the pristine block executes");
         assert_eq!(
             applied.execution.state_root, expected.execution.state_root,
@@ -4006,8 +4401,7 @@ mod tests {
 
         let block = captured_first_block();
         let id = *block.block_id().as_bytes();
-        chainstate
-            .execute_nakamoto_block_with_bitcoin_context(context, Some(source), &block)
+        execute_unauthenticated_fixture(&mut chainstate, context, source, &block)
             .expect("the captured block executes");
         assert_eq!(chainstate.tip().expect("read tip"), Some(id));
         let content_root = chainstate

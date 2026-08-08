@@ -124,9 +124,8 @@ pub(crate) struct LocalSortition {
 impl LocalSortition {
     /// Fill in everything a block's execution reads from its burn block.
     ///
-    /// A field the derivation has no answer for is left as it was rather than
-    /// zeroed: the peer's answer stands until this node can better it, and a zero
-    /// would be a wrong answer offered to a contract rather than a missing one.
+    /// Optional validation fields stay absent when local derivation has no
+    /// answer. No peer value is present to preserve or substitute.
     /// Everything about one burn block, as this node's own sortition chain derived
     /// it.
     pub(crate) const fn from_snapshot(snapshot: &nano_sortition::SortitionSnapshot) -> Self {
@@ -1014,94 +1013,24 @@ where
             .collect()
     }
 
-    /// Ask a peer for something, waiting out the limits it answers with.
+    /// Refuse a legacy state whose sealed tip has no local execution header.
     ///
-    /// A node writing down the headers it is missing cannot execute anything
-    /// until it has them, so it has nothing better to do than wait — unlike a
-    /// round of following, which gives up early and asks again next poll.
-    async fn wait_out_limits<T, F, Ask>(mut ask: F) -> Result<T, SyncError>
-    where
-        F: FnMut() -> Ask,
-        Ask: std::future::Future<Output = Result<T, SyncError>>,
-    {
-        let mut wait = std::time::Duration::from_secs(1);
-        loop {
-            match ask().await {
-                Err(error)
-                    if error.is_rate_limited() && wait < std::time::Duration::from_secs(32) =>
-                {
-                    tokio::time::sleep(wait).await;
-                    wait = wait.saturating_mul(2);
-                }
-                outcome => return outcome,
-            }
-        }
-    }
-
-    /// Write down the headers of blocks this node executed before it kept any.
-    ///
-    /// A contract reading the block it is standing on gets `none` otherwise,
-    /// and the transaction carrying it fails against a network that answered.
-    /// Refetching the blocks is far cheaper than executing them again.
-    pub async fn backfill_headers(
-        &mut self,
-        node: &SyncClient,
-        pox: &PoxInfo,
-        from: [u8; 32],
-    ) -> Result<usize, NodeExecutionError> {
+    /// A peer can supply the block bytes but not the consensus context under
+    /// which this node executed them. Fresh checkpoint histories and every block
+    /// nano seals carry the header; an older state needs explicit migration.
+    pub fn backfill_headers(&self) -> Result<usize, NodeExecutionError> {
         if self
             .chainstate
             .has_recorded_header(*self.tip.block_id().as_bytes())
         {
             return Ok(0);
         }
-        let mut walk = Vec::new();
-        let mut cursor = self.tip.block_id();
-        while *cursor.as_bytes() != from {
-            let block = match Self::wait_out_limits(|| node.block(cursor)).await {
-                Ok(block) => block,
-                // A peer that is rate limiting has not refused: what was walked
-                // stands, and the next start carries on from the tip again.
-                Err(error) if error.is_rate_limited() => {
-                    // Says so rather than passing silently: the walk stops at
-                    // the tip's own header being present, so a run cut short
-                    // here leaves the deeper ones for the checkpoint export.
-                    eprintln!(
-                        "the peer cut the header backfill short at {cursor}, \
-                         leaving the blocks below it unrecorded"
-                    );
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            cursor = block.header.parent_block_id;
-            walk.push(block);
-        }
-        let mut recorded = 0;
-        for block in walk.iter().rev() {
-            let sortition =
-                match Self::wait_out_limits(|| node.sortition(block.header.consensus_hash)).await {
-                    Ok(sortition) => sortition,
-                    Err(error) if error.is_rate_limited() => break,
-                    Err(error) => return Err(error.into()),
-                };
-            let mut bitcoin_context = pox.bitcoin_context();
-            bitcoin_context.move_to_burn_block(sortition.bitcoin_height);
-            bitcoin_context.burn_header_hash = *sortition.bitcoin_block_hash.as_bytes();
-            self.seed_burn_headers(sortition.bitcoin_height);
-            bitcoin_context.burn_block_time = sortition.bitcoin_timestamp;
-            bitcoin_context.vrf_seed = sortition.vrf_seed.unwrap_or_default();
-            // No sortition hash or leader key here, deliberately: this walk
-            // writes down headers for blocks already executed and validates
-            // nothing, and a header records neither field. Deriving sortitions
-            // backwards from the tip would also run the tracker in the one
-            // direction its consensus-hash skip-list cannot go.
-            self.chainstate
-                .backfill_block_header(block, bitcoin_context)
-                .map_err(CheckpointExecutionError::from)?;
-            recorded += 1;
-        }
-        Ok(recorded)
+        Err(NodeExecutionError::Execution(
+            CheckpointExecutionError::Link(format!(
+                "sealed tip {} has no locally recorded execution header; peer sortitions are not authentication evidence. Re-open from a checkpoint carrying `authentication_history` or migrate this legacy state before synchronization",
+                self.tip.block_id()
+            )),
+        ))
     }
 
     /// Extend the staged descent toward this node's tip, then execute what it
@@ -2065,52 +1994,30 @@ where
     /// executor holds `RefCell`s and a sqlite connection, so a shared borrow of it
     /// crossing the await inside would make the whole follower future non-`Send`. A
     /// unique borrow is what keeps it spawnable.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn record_tenure_burn_height(
-        &mut self,
-        peers: &mut TenureSource,
+    fn record_tenure_burn_height(
+        &self,
         block: &NakamotoBlock,
         bitcoin_context: &mut BitcoinBlockContext,
-    ) {
-        // Read off `self` before the await, so no borrow of the executor crosses it.
-        let derived = self
+    ) -> Result<(), CheckpointExecutionError> {
+        let tenure = self
             .sortition
             .as_ref()
-            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash));
+            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash))
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain cannot place tenure {} for block {} at a burn height",
+                    block.header.consensus_hash, block.header.chain_length
+                ))
+            })?;
         let view_has_moved = self
             .bitcoin_view
             .is_some_and(|view| view != block.header.consensus_hash);
-        let tenure =
-            Self::tenure_burn_height(derived, view_has_moved, peers, block.header.consensus_hash)
-                .await;
-        if let Some(tenure) = tenure.filter(|tenure| *tenure != bitcoin_context.height) {
+        if view_has_moved && tenure != bitcoin_context.height {
             let view = bitcoin_context.height;
             bitcoin_context.move_to_burn_block(tenure);
             bitcoin_context.extend_view_to(view);
         }
-    }
-
-    async fn tenure_burn_height(
-        derived: Option<u64>,
-        view_has_moved: bool,
-        peers: &mut TenureSource,
-        tenure: nano_primitives::ConsensusHash,
-    ) -> Option<u64> {
-        if let Some(height) = derived {
-            return Some(height);
-        }
-        // Only worth a request when the view has actually moved off the tenure, which
-        // is what an extend does -- and it stays moved for every block after it until
-        // the next tenure change, so the carried view says so and not this block's
-        // own payload.
-        if !view_has_moved {
-            return None;
-        }
-        peers
-            .sortition(tenure)
-            .await
-            .ok()
-            .map(|sortition| sortition.bitcoin_height)
+        Ok(())
     }
 
     /// Tell the VM the header hash of the burn blocks just behind this one.
@@ -2236,8 +2143,7 @@ where
         // Exactly one rule reads it: the prepare-phase signer-set update, which
         // stacks-core drives from the tenure's sortition. Reading the view there is
         // what parted the roots at pox-5 height 931.
-        self.record_tenure_burn_height(peers, block, &mut bitcoin_context)
-            .await;
+        self.record_tenure_burn_height(block, &mut bitcoin_context)?;
         let phase = std::time::Instant::now();
         self.seed_burn_headers(bitcoin_height);
         timing.headers += phase.elapsed();
@@ -2594,6 +2500,27 @@ where
             walk = tracker.previous_sortition_height(at);
         }
         sortitions
+    }
+
+    /// Place an ancestor's tenure on this node's burnchain for a partial header backfill.
+    pub(crate) fn local_ancestor_burn_context(
+        &self,
+        tenure: nano_primitives::ConsensusHash,
+    ) -> Result<(u64, [u8; 32]), CheckpointExecutionError> {
+        let height = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.height_of_consensus_hash(tenure))
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "ancestor tenure {tenure} is absent from the local sortition history"
+                ))
+            })?;
+        let hash = self
+            .bitcoin
+            .block_hash_at(height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        Ok((height, hash))
     }
 
     /// One derived snapshot, in the shape stacks-core's own readers expect.

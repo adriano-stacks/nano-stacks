@@ -126,7 +126,7 @@ impl ComplexWord for TupleGet {
         &self,
         generator: &mut WasmGenerator,
         builder: &mut walrus::InstrSeqBuilder,
-        _expr: &SymbolicExpression,
+        expr: &SymbolicExpression,
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
@@ -135,18 +135,18 @@ impl ComplexWord for TupleGet {
             .match_atom()
             .ok_or_else(|| GeneratorError::InternalError("expected key name".into()))?;
 
-        let tuple_ty = generator
+        let (tuple_ty, tuple_is_optional) = generator
             .get_expr_type(&args[1])
             .ok_or_else(|| GeneratorError::TypeError("tuple expression must be typed".to_string()))
             .and_then(|lhs_ty| match lhs_ty {
-                TypeSignature::TupleType(tuple) => Ok(tuple),
+                TypeSignature::TupleType(tuple) => Ok((tuple, false)),
                 TypeSignature::OptionalType(boxed) => match **boxed {
-                    TypeSignature::TupleType(ref tuple) => Ok(tuple),
+                    TypeSignature::TupleType(ref tuple) => Ok((tuple, true)),
                     _ => Err(GeneratorError::TypeError("expected tuple type".to_string())),
                 },
                 _ => Err(GeneratorError::TypeError("expected tuple type".to_string())),
-            })?
-            .clone();
+            })?;
+        let tuple_ty = tuple_ty.clone();
 
         // Traverse the tuple argument, leaving it on top of the stack.
         generator.traverse_expr(builder, &args[1])?;
@@ -157,9 +157,15 @@ impl ComplexWord for TupleGet {
         self.charge(generator, builder, field_types.iter().len() as u32)?;
 
         // Create locals for the target field
-        let wasm_types = clar2wasm_ty(field_types.get(target_field_name).ok_or_else(|| {
-            GeneratorError::InternalError(format!("missing field '{target_field_name}' in tuple"))
-        })?);
+        let field_ty = field_types
+            .get(target_field_name)
+            .ok_or_else(|| {
+                GeneratorError::InternalError(format!(
+                    "missing field '{target_field_name}' in tuple"
+                ))
+            })?
+            .clone();
+        let wasm_types = clar2wasm_ty(&field_ty);
         let mut val_locals = Vec::with_capacity(wasm_types.len());
         for local_ty in wasm_types.iter().rev() {
             let local = generator.alloc_local(*local_ty);
@@ -186,6 +192,17 @@ impl ComplexWord for TupleGet {
             builder.local_get(*local);
         }
         generator.release_locals(val_locals);
+
+        let result_ty = generator
+            .get_expr_type(expr)
+            .ok_or_else(|| GeneratorError::TypeError("get expression must be typed".to_owned()))?
+            .clone();
+        let extracted_ty = if tuple_is_optional {
+            TypeSignature::OptionalType(Box::new(field_ty))
+        } else {
+            field_ty
+        };
+        generator.duck_type(builder, &extracted_ty, &result_ty, None)?;
 
         Ok(())
     }

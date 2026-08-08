@@ -123,52 +123,19 @@ pub enum ConsensusError {
 
 impl std::fmt::Display for ConsensusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(result) = fmt_transaction_shape(self, formatter) {
+            return result;
+        }
         match self {
-            Self::HeaderVersion(version) => {
-                write!(
-                    formatter,
-                    "block header version {version} is not epoch 4.0's"
-                )
-            }
-            Self::EmptyBlock => formatter.write_str("block carries no transactions"),
-            Self::TransactionNetwork { txid } => write!(
-                formatter,
-                "transaction {} is for another network",
-                hex::encode(txid)
-            ),
-            Self::TransactionChainId { txid, chain_id } => write!(
-                formatter,
-                "transaction {} names chain {chain_id:#010x}",
-                hex::encode(txid)
-            ),
-            Self::TransactionAnchorMode { txid } => write!(
-                formatter,
-                "transaction {} is anchored off-chain, which 4.0 has no place for",
-                hex::encode(txid)
-            ),
-            Self::CoinbaseWithoutVrfProof { txid } => write!(
-                formatter,
-                "coinbase {} carries no VRF proof, which every Nakamoto coinbase does",
-                hex::encode(txid)
-            ),
-            Self::TenureTransactionCount {
-                coinbases,
-                tenure_changes,
-            } => write!(
-                formatter,
-                "block carries {coinbases} coinbases and {tenure_changes} tenure changes"
-            ),
-            Self::CoinbaseWithoutTenureChange => {
-                formatter.write_str("block carries a coinbase without a tenure change")
-            }
-            Self::TenureTransactionPosition {
-                tenure_change,
-                coinbase,
-            } => write!(
-                formatter,
-                "the tenure change is transaction {tenure_change} and the coinbase is {coinbase:?}, \
-                 where a tenure starts with the change first and the coinbase second"
-            ),
+            Self::HeaderVersion(_)
+            | Self::EmptyBlock
+            | Self::TransactionNetwork { .. }
+            | Self::TransactionChainId { .. }
+            | Self::TransactionAnchorMode { .. }
+            | Self::CoinbaseWithoutVrfProof { .. }
+            | Self::TenureTransactionCount { .. }
+            | Self::CoinbaseWithoutTenureChange
+            | Self::TenureTransactionPosition { .. } => unreachable!(),
             Self::TenureChangeCause(cause) => {
                 write!(
                     formatter,
@@ -237,6 +204,58 @@ impl std::fmt::Display for ConsensusError {
             ),
         }
     }
+}
+
+fn fmt_transaction_shape(
+    error: &ConsensusError,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> Option<std::fmt::Result> {
+    Some(match error {
+        ConsensusError::HeaderVersion(version) => write!(
+            formatter,
+            "block header version {version} is not epoch 4.0's"
+        ),
+        ConsensusError::EmptyBlock => formatter.write_str("block carries no transactions"),
+        ConsensusError::TransactionNetwork { txid } => write!(
+            formatter,
+            "transaction {} is for another network",
+            hex::encode(txid)
+        ),
+        ConsensusError::TransactionChainId { txid, chain_id } => write!(
+            formatter,
+            "transaction {} names chain {chain_id:#010x}",
+            hex::encode(txid)
+        ),
+        ConsensusError::TransactionAnchorMode { txid } => write!(
+            formatter,
+            "transaction {} is anchored off-chain, which 4.0 has no place for",
+            hex::encode(txid)
+        ),
+        ConsensusError::CoinbaseWithoutVrfProof { txid } => write!(
+            formatter,
+            "coinbase {} carries no VRF proof, which every Nakamoto coinbase does",
+            hex::encode(txid)
+        ),
+        ConsensusError::TenureTransactionCount {
+            coinbases,
+            tenure_changes,
+        } => write!(
+            formatter,
+            "block carries {coinbases} coinbases and {tenure_changes} tenure changes"
+        ),
+        ConsensusError::CoinbaseWithoutTenureChange => {
+            formatter.write_str("block carries a coinbase without a tenure change")
+        }
+        ConsensusError::TenureTransactionPosition {
+            tenure_change,
+            coinbase,
+        } => write!(
+            formatter,
+            "the tenure change is transaction {tenure_change} and the coinbase is {coinbase:?}, \
+             where a tenure starts with the change first and the coinbase second"
+        ),
+        _ => return None,
+    })
 }
 
 impl std::error::Error for ConsensusError {

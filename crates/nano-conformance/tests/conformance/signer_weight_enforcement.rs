@@ -181,6 +181,38 @@ fn a_block_the_reward_set_signed_is_accepted() {
     execute(&block, context, &operations).expect("the block the network accepted");
 }
 
+/// A missing set is an incomplete checkpoint, not a signature check that passed.
+#[test]
+fn a_block_without_an_authenticated_signer_set_is_rejected() {
+    let Some((block, context, operations)) = first_captured_block() else {
+        nano_conformance::skip_gate("the capture has no block above its checkpoint");
+        return;
+    };
+    let mut reader = checkpoint().expect("the captured checkpoint opens");
+    let cycle_length =
+        u64::from(context.prepare_phase_length) + u64::from(context.reward_phase_length);
+    let missing = (1..=1_000)
+        .find_map(|cycles| {
+            let mut candidate = context;
+            candidate.move_to_burn_block(
+                context
+                    .height
+                    .saturating_add(cycle_length.saturating_mul(cycles)),
+            );
+            reader
+                .recorded_signer_set(candidate)
+                .is_err()
+                .then_some(candidate)
+        })
+        .expect("a cycle beyond the checkpoint has no recorded signer set");
+    let error = execute(&block, missing, &operations)
+        .expect_err("a missing signer set must refuse the followed block");
+    assert!(
+        error.contains("no authenticated signer set"),
+        "the refusal names the absent checkpoint evidence: {error}"
+    );
+}
+
 /// Drop the last signature: the block is otherwise untouched, including its
 /// identifier and its state root, and it must still be refused.
 #[test]

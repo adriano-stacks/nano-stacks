@@ -239,11 +239,10 @@ fn conditional_sites() -> BTreeSet<String> {
             let trimmed = line.trim_start();
             for prefix in ["fn ", "async fn ", "pub fn ", "pub async fn "] {
                 if let Some(rest) = trimmed.strip_prefix(prefix) {
-                    function = rest
-                        .split(['(', '<', ' '])
+                    rest.split(['(', '<', ' '])
                         .next()
                         .unwrap_or(rest)
-                        .to_owned();
+                        .clone_into(&mut function);
                     break;
                 }
             }
@@ -306,11 +305,10 @@ fn asserted_engine_differences(root: &Path, found: &mut BTreeSet<String>) {
             let trimmed = line.trim_start();
             for prefix in ["fn ", "async fn ", "pub fn ", "pub async fn "] {
                 if let Some(rest) = trimmed.strip_prefix(prefix) {
-                    function = rest
-                        .split(['(', '<', ' '])
+                    rest.split(['(', '<', ' '])
                         .next()
                         .unwrap_or(rest)
-                        .to_owned();
+                        .clone_into(&mut function);
                     break;
                 }
             }

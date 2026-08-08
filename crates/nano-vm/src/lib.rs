@@ -1419,7 +1419,6 @@ impl Vm {
     }
 
     /// The state a block was built on, as the store recorded it.
-    #[must_use]
     pub fn parent_of(&self, block: [u8; 32]) -> Result<Option<[u8; 32]>, MarfStoreError> {
         self.store.parent_of(block)
     }
@@ -1427,7 +1426,6 @@ impl Vm {
     /// Record what Clarity may later read about a block nano has executed.
     /// The Stacks height of a block, from the block index the checkpoint
     /// imports — which covers every block, including ones with no state.
-    #[must_use]
     pub fn height_of(&self, block: [u8; 32]) -> Result<Option<u32>, MarfStoreError> {
         self.store.height_of(block)
     }
@@ -1979,19 +1977,16 @@ impl Vm {
     }
 
     /// Access the state root for a sealed block.
-    #[must_use]
     pub fn root(&self, block: [u8; 32]) -> Result<Option<StateRoot>, MarfStoreError> {
         self.store.root(block)
     }
 
     /// Return the MARF content hash before ancestry is incorporated.
-    #[must_use]
     pub fn content_root(&self, block: [u8; 32]) -> Result<Option<TrieHash>, MarfStoreError> {
         self.store.content_root(block)
     }
 
     /// Return the committed MARF leaves for a block state.
-    #[must_use]
     pub fn state_leaves(
         &self,
         block: [u8; 32],
@@ -2000,7 +1995,6 @@ impl Vm {
     }
 
     /// Return the root pointers in their consensus serialization order.
-    #[must_use]
     pub fn root_pointers(
         &self,
         block: [u8; 32],
@@ -2009,7 +2003,6 @@ impl Vm {
     }
 
     /// Return the pointers and child hashes stored under a path prefix.
-    #[must_use]
     pub fn pointers_at(
         &self,
         block: [u8; 32],
@@ -2950,7 +2943,6 @@ impl MarfStore {
     }
 
     /// Return the pointers and child hashes stored under a path prefix.
-    #[must_use]
     pub fn pointers_at(
         &self,
         block: [u8; 32],
@@ -2970,10 +2962,9 @@ impl MarfStore {
             if active.height == height {
                 return Ok(Some(block));
             }
-            return match active.parent {
-                Some(parent) => self.marf.block_at_height(parent, height),
-                None => Ok(None),
-            };
+            return active
+                .parent
+                .map_or(Ok(None), |parent| self.marf.block_at_height(parent, height));
         }
         self.marf.block_at_height(block, height)
     }
@@ -3041,7 +3032,7 @@ impl MarfStore {
 const MARF_FILE: &str = "marf.sqlite";
 const CLARITY_FILE: &str = "clarity.sqlite";
 
-fn marf_vm_error(error: MarfError) -> VmExecutionError {
+fn marf_vm_error(error: &MarfError) -> VmExecutionError {
     VmInternalError::Expect(format!("MARF storage failed: {error}")).into()
 }
 
@@ -3597,7 +3588,10 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn set_block_hash(&mut self, block: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
-        let sealed = self.marf.contains(block.0).map_err(marf_vm_error)?;
+        let sealed = self
+            .marf
+            .contains(block.0)
+            .map_err(|error| marf_vm_error(&error))?;
         if !sealed && self.active.is_none_or(|active| active.block != block.0) {
             return Err(RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(block.0)).into());
         }
@@ -3607,14 +3601,13 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_block_at_height(&mut self, height: u32) -> Option<StacksBlockId> {
-        let found = match self.current_block() {
-            Some(block) => self.block_at_height(block, height),
-            None => Ok(None),
-        }
-        .unwrap_or_else(|error| {
-            panic!("MARF storage failed while resolving block height {height}: {error}")
-        })
-        .map(StacksBlockId);
+        let found = self
+            .current_block()
+            .map_or(Ok(None), |block| self.block_at_height(block, height))
+            .unwrap_or_else(|error| {
+                panic!("MARF storage failed while resolving block height {height}: {error}")
+            })
+            .map(StacksBlockId);
         if found.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
             println!("no block at height {height}");
         }
@@ -3736,7 +3729,7 @@ impl ClarityBackingStore for MarfStore {
             .current_block()
             .map(|block| self.block_at_height(block, height))
             .transpose()
-            .map_err(marf_vm_error)?
+            .map_err(|error| marf_vm_error(&error))?
             .flatten()
             .ok_or_else(|| RuntimeError::BadBlockHeight(height.to_string()))?;
         if self.active.is_some_and(|active| active.block == block)

@@ -1070,6 +1070,25 @@ mod tests {
     }
 
     #[test]
+    fn static_call_widens_a_tuple_field_argument() {
+        crosscheck_multi_contract(
+            &[
+                (
+                    ContractName::from_literal("callee"),
+                    "(define-public (take (value (optional uint))) (ok value))",
+                ),
+                (
+                    ContractName::from_literal("caller"),
+                    "(let ((order { min-amount-out-fixed: none }))
+                       (contract-call? .callee take
+                         (get min-amount-out-fixed order)))",
+                ),
+            ],
+            Ok(Some(Value::okay(Value::none()).unwrap())),
+        );
+    }
+
+    #[test]
     fn static_one_arg() {
         let mut env = TestEnvironment::default();
         env.init_contract_with_snippet(

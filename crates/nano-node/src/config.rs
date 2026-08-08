@@ -165,6 +165,13 @@ pub struct CheckpointConfig {
     /// Without it a node has to ask a peer what the sortition was, which lets
     /// that peer choose its consensus hashes and its fork.
     pub sortition: Option<PathBuf>,
+    /// A bounded canonical block suffix ending at `source_state_id`.
+    ///
+    /// Its `boundary.json` carries the immediately preceding tenure's coinbase
+    /// proof. Startup authenticates the suffix against locally derived sortitions
+    /// and signer sets, then derives the execution ledger from it. A fresh
+    /// executing node refuses a checkpoint without this artifact.
+    pub authentication_history: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

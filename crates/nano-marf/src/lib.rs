@@ -1374,7 +1374,7 @@ impl VersionedMarf {
             let TrieNode::Internal { children, .. } = &*root else {
                 return Ok(None);
             };
-            Ok(pointers_under_root(&self.storage, children, prefix)?)
+            pointers_under_root(&self.storage, children, prefix)
         })()
         .map_err(|error| self.read_error(Some(block), error))
     }

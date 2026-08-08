@@ -18,7 +18,8 @@ use fs2::FileExt as _;
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource as _};
 use nano_chainstate::{
-    BitcoinBlockContext, ChainState, ChainStateError, MINER_REWARD_MATURITY, NakamotoBlock, Signer,
+    BitcoinBlockContext, CHECKPOINT_HISTORY_LIMIT, ChainState, ChainStateError,
+    CheckpointBoundaryProof, CheckpointHistoryBlock, MINER_REWARD_MATURITY, NakamotoBlock, Signer,
     SignerSet, TenureAccounting,
 };
 use nano_crypto::StacksPublicKey;
@@ -481,17 +482,20 @@ fn batch_report(from: u64, executed: usize, tip: &NakamotoBlock, detail: &str) -
 /// cannot read the one it stands on.
 async fn backfill_ancestors(
     executor: &SharedExecutor,
-    peer: &SyncClient,
-    pox: &PoxInfo,
-    source: [u8; 32],
-) {
+    _peer: &SyncClient,
+    _pox: &PoxInfo,
+    _source: [u8; 32],
+) -> Result<(), String> {
     let _phase = Phase::start("backfilling ancestor headers");
-    let mut executor = executor.lock().await;
-    match executor.backfill_headers(peer, pox, source).await {
+    let executor = executor.lock().await;
+    let result = executor.backfill_headers();
+    drop(executor);
+    match result {
         Ok(0) => {}
         Ok(recorded) => println!("wrote down {recorded} headers this state was missing"),
-        Err(error) => eprintln!("writing down the missing headers failed: {error}"),
+        Err(error) => return Err(format!("writing down the missing headers failed: {error}")),
     }
+    Ok(())
 }
 
 /// What one round of execution left behind for the loop around it.
@@ -844,8 +848,7 @@ async fn prepare_to_follow(
     let Some(executor) = executor else {
         return Ok(());
     };
-    backfill_ancestors(executor, peer, pox, source).await;
-    Ok(())
+    backfill_ancestors(executor, peer, pox, source).await
 }
 
 /// Take the blocks the public API admitted and stage them.
@@ -1427,25 +1430,253 @@ async fn open_executed_state(
 /// The first start imports the checkpoint and applies the block after it. Every
 /// later start finds the store sealed at a block of its own and carries on from
 /// there, importing and replaying nothing.
-pub async fn open_executor(
+#[derive(Clone, Copy, Debug)]
+struct LoadedBoundaryProof {
+    parent_tenure_consensus_hash: nano_primitives::ConsensusHash,
+    coinbase_vrf_proof: [u8; 80],
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryProofRecord {
+    parent_tenure_consensus_hash: String,
+    coinbase_vrf_proof: String,
+}
+
+fn fixed_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], Box<dyn Error>> {
+    let bytes = hex::decode(value).map_err(|_| format!("{field} is not hexadecimal"))?;
+    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| format!("{field} is not {N} bytes").into())
+}
+
+fn load_checkpoint_authentication_history(
     config: &Config,
-    network: Network,
+) -> Result<(LoadedBoundaryProof, Vec<NakamotoBlock>), Box<dyn Error>> {
+    let root = config.checkpoint.authentication_history.as_ref().ok_or(
+        "this fresh executing node has no authenticated checkpoint block suffix: set \
+         `checkpoint.authentication_history` to a directory containing boundary.json and \
+         blocks/*.bin",
+    )?;
+    let boundary_path = root.join("boundary.json");
+    let record: BoundaryProofRecord = serde_json::from_slice(&fs::read(&boundary_path)?)
+        .map_err(|error| format!("{}: {error}", boundary_path.display()))?;
+    let boundary = LoadedBoundaryProof {
+        parent_tenure_consensus_hash: nano_primitives::ConsensusHash::from_bytes(fixed_hex(
+            "authentication boundary parent_tenure_consensus_hash",
+            &record.parent_tenure_consensus_hash,
+        )?),
+        coinbase_vrf_proof: fixed_hex(
+            "authentication boundary coinbase_vrf_proof",
+            &record.coinbase_vrf_proof,
+        )?,
+    };
+
+    let blocks_directory = root.join("blocks");
+    let mut paths = fs::read_dir(&blocks_directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.retain(|path| path.extension().is_some_and(|extension| extension == "bin"));
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!(
+            "checkpoint authentication history {} contains no block files",
+            blocks_directory.display()
+        )
+        .into());
+    }
+    if paths.len() > CHECKPOINT_HISTORY_LIMIT {
+        return Err(format!(
+            "checkpoint authentication history has {} blocks, above the bounded limit of {CHECKPOINT_HISTORY_LIMIT}",
+            paths.len()
+        )
+        .into());
+    }
+    let mut by_id = HashMap::with_capacity(paths.len());
+    for path in paths {
+        let block = NakamotoBlock::decode(&fs::read(&path)?)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let id = *block.block_id().as_bytes();
+        if by_id.insert(id, block).is_some() {
+            return Err(format!(
+                "checkpoint authentication history contains block {} more than once",
+                hex::encode(id)
+            )
+            .into());
+        }
+    }
+    let source = config.checkpoint.source_state_id()?;
+    let mut cursor = source;
+    let mut reversed = Vec::with_capacity(by_id.len());
+    while let Some(block) = by_id.remove(&cursor) {
+        cursor = *block.header.parent_block_id.as_bytes();
+        reversed.push(block);
+    }
+    if reversed.is_empty() {
+        return Err(format!(
+            "checkpoint authentication history contains no source block {}",
+            hex::encode(source)
+        )
+        .into());
+    }
+    if !by_id.is_empty() {
+        return Err(format!(
+            "checkpoint authentication history has {} block(s) disconnected from source {}",
+            by_id.len(),
+            hex::encode(source)
+        )
+        .into());
+    }
+    reversed.reverse();
+    Ok((boundary, reversed))
+}
+
+fn contextualize_checkpoint_history<S: nano_bitcoin::BitcoinSource>(
     pox: &PoxInfo,
-    peers: &mut TenureSource,
-    directory: &Path,
-) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
-    let (chainstate, anchor, context) =
-        open_chainstate(config, network, pox, peers, directory).await?;
-    // Seed and validate the local sortition chain before applying the anchor. A
-    // contradictory checkpoint used to start its RPC and p2p roles, apply one
-    // Stacks block, and discover only on its first execution-driven walk that the
-    // next sortition would be sampled against zero.
+    tracker: &SortitionTracker,
+    bitcoin: &mut S,
+    boundary: LoadedBoundaryProof,
+    blocks: &[NakamotoBlock],
+) -> Result<(CheckpointBoundaryProof, Vec<CheckpointHistoryBlock>), Box<dyn Error>>
+where
+    S::Error: std::fmt::Display,
+{
+    let boundary_height = tracker
+        .height_of_consensus_hash(boundary.parent_tenure_consensus_hash)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint boundary parent tenure {} is absent from local sortition history",
+                boundary.parent_tenure_consensus_hash
+            )
+        })?;
+    let boundary_snapshot = tracker.snapshot_at(boundary_height).ok_or_else(|| {
+        format!(
+            "local sortition chain retained no snapshot for checkpoint boundary parent tenure {} at burn {boundary_height}",
+            boundary.parent_tenure_consensus_hash
+        )
+    })?;
+    let boundary_key = boundary_snapshot.winner_vrf_public_key.ok_or_else(|| {
+        format!(
+            "local sortition at burn {boundary_height} has no winning VRF key for the checkpoint boundary parent-tenure proof"
+        )
+    })?;
+    let boundary = CheckpointBoundaryProof {
+        parent_tenure_consensus_hash: boundary.parent_tenure_consensus_hash,
+        coinbase_vrf_proof: boundary.coinbase_vrf_proof,
+        sortition_hash: *boundary_snapshot.sortition_hash.as_bytes(),
+        winner_vrf_public_key: boundary_key,
+    };
+
+    let mut current_view = None;
+    let mut history = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if let Some(view) = block.bitcoin_view_consensus_hash() {
+            current_view = Some(view);
+        }
+        let view = current_view.unwrap_or(block.header.consensus_hash);
+        let view_height = tracker.height_of_consensus_hash(view).ok_or_else(|| {
+            format!(
+                "checkpoint history block {} names burn view {view}, which the local sortition chain does not hold",
+                block.header.chain_length
+            )
+        })?;
+        let snapshot = tracker.snapshot_at(view_height).ok_or_else(|| {
+            format!(
+                "checkpoint history block {} needs local sortition snapshot at burn {view_height}, which was not retained",
+                block.header.chain_length
+            )
+        })?;
+        if snapshot.total_burn != block.header.bitcoin_spent {
+            return Err(format!(
+                "checkpoint history block {} says {} burn has been spent, local sortition at burn {view_height} derives {}",
+                block.header.chain_length, block.header.bitcoin_spent, snapshot.total_burn
+            )
+            .into());
+        }
+        let tenure_height = tracker
+            .height_of_consensus_hash(block.header.consensus_hash)
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint history block {} names tenure {}, which the local sortition chain does not hold",
+                    block.header.chain_length, block.header.consensus_hash
+                )
+            })?;
+        let mut context = pox.bitcoin_context();
+        crate::LocalSortition::from_snapshot(snapshot).record(&mut context);
+        if tenure_height != view_height {
+            context.move_to_burn_block(tenure_height);
+            context.extend_view_to(view_height);
+        }
+        let operations = bitcoin
+            .block_at(tenure_height)
+            .map_err(|error| format!("Bitcoin block {tenure_height}: {error}"))?
+            .operations;
+        history.push(CheckpointHistoryBlock {
+            block: block.clone(),
+            bitcoin_context: context,
+            operations,
+        });
+    }
+    Ok((boundary, history))
+}
+
+fn local_anchor_context(
+    pox: &PoxInfo,
+    tracker: &SortitionTracker,
+    chainstate: &mut ChainState,
+    anchor: &NakamotoBlock,
+    view_height: u64,
+) -> Result<BitcoinBlockContext, Box<dyn Error>> {
+    if let Some(view) = anchor.bitcoin_view_consensus_hash()
+        && tracker.height_of_consensus_hash(view) != Some(view_height)
+    {
+        return Err(format!(
+            "anchor names burn view {view}, which the local sortition chain does not place at configured burn {view_height}"
+        )
+        .into());
+    }
+    let snapshot = tracker.snapshot_at(view_height).ok_or_else(|| {
+        format!("the local sortition chain retained no snapshot for anchor burn {view_height}")
+    })?;
+    if snapshot.total_burn != anchor.header.bitcoin_spent {
+        return Err(format!(
+            "anchor says {} burn has been spent, local sortition at burn {view_height} derives {}",
+            anchor.header.bitcoin_spent, snapshot.total_burn
+        )
+        .into());
+    }
+    let tenure_height = tracker
+        .height_of_consensus_hash(anchor.header.consensus_hash)
+        .ok_or_else(|| "the anchor's tenure is absent from the local sortition chain".to_owned())?;
+    let mut context = pox.bitcoin_context();
+    crate::LocalSortition::from_snapshot(snapshot).record(&mut context);
+    if tenure_height != view_height {
+        context.move_to_burn_block(tenure_height);
+        context.extend_view_to(view_height);
+    }
+    if nano_chainstate::starts_new_tenure(anchor)
+        && let Some(schedule) = chainstate.accounting_mut().schedule()
+    {
+        let previous = tracker.previous_sortition_height(view_height).ok_or_else(|| {
+            format!(
+                "the local sortition chain cannot derive accumulated coinbase for anchor burn {view_height}"
+            )
+        })?;
+        context.accumulated_coinbase = schedule.accumulated_at(view_height, Some(previous));
+    }
+    Ok(context)
+}
+
+fn checkpoint_sortition_tracker(
+    config: &Config,
+    chainstate: &ChainState,
+    anchor: &NakamotoBlock,
+    context: Option<BitcoinBlockContext>,
+) -> Result<(SortitionTracker, BurnchainSource), Box<dyn Error>> {
     let capture = config.checkpoint.sortition.as_ref().ok_or(
         "this node executes blocks and has no checkpoint sortition history to derive burn \
          views from: set `checkpoint.sortition` to a directory holding snapshots.json, \
          consensus-hashes.json and leader-keys.json, which `cargo xtask export-sortition` writes",
     )?;
-    let executed_burn_view = context.as_ref().map_or_else(
+    let executed_burn_view = context.map_or_else(
         || {
             chainstate
                 .recorded_header(*anchor.block_id().as_bytes())
@@ -1483,13 +1714,106 @@ pub async fn open_executor(
                  execution: {error}"
             )
         })?;
+    Ok((tracker, bitcoin))
+}
+
+fn authenticate_fresh_checkpoint(
+    config: &Config,
+    pox: &PoxInfo,
+    chainstate: &mut ChainState,
+    tracker: &mut SortitionTracker,
+    bitcoin: &mut BurnchainSource,
+    boundary: LoadedBoundaryProof,
+    history: &[NakamotoBlock],
+) -> Result<(), Box<dyn Error>> {
+    let capture = config
+        .checkpoint
+        .sortition
+        .as_ref()
+        .ok_or("checkpoint sortition history disappeared during startup")?;
+    let earliest = tracker
+        .height_of_consensus_hash(boundary.parent_tenure_consensus_hash)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint authentication boundary tenure {} is absent from the local sortition history",
+                boundary.parent_tenure_consensus_hash
+            )
+        })?;
+    if tracker.tip().bitcoin_height > earliest {
+        *tracker = SortitionTracker::from_capture(capture).map_err(|error| {
+            format!(
+                "the saved sortition chain starts above checkpoint authentication history at burn {earliest}, and the checkpoint chain cannot replace it: {error}"
+            )
+        })?;
+        tracker.recover_seed(|height| bitcoin.block_at(height))?;
+        if tracker.tip().bitcoin_height > earliest {
+            return Err(format!(
+                "checkpoint sortition seed at burn {} is above boundary parent tenure at burn {earliest}; recapture the sortition artifact from at or below the authentication boundary",
+                tracker.tip().bitcoin_height
+            )
+            .into());
+        }
+    }
+    tracker.keep_from(earliest);
+    let target = config.checkpoint.anchor_bitcoin_height;
+    let payouts = crate::payout_schedule(pox).ok_or(
+        "the checkpoint authentication history cannot be checked without a PoX payout calendar",
+    )?;
+    let limit = target.saturating_sub(tracker.tip().bitcoin_height);
+    tracker.catch_up(|height| bitcoin.block_at(height), target, payouts, limit)?;
+    let (boundary, history) =
+        contextualize_checkpoint_history(pox, tracker, bitcoin, boundary, history)?;
+    chainstate.authenticate_checkpoint_history(
+        config.checkpoint.source_state_id()?,
+        config.checkpoint.state_root()?,
+        boundary,
+        &history,
+    )?;
+    Ok(())
+}
+
+pub async fn open_executor(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peers: &mut TenureSource,
+    directory: &Path,
+) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
+    let (mut chainstate, anchor, context) =
+        open_chainstate(config, network, pox, peers, directory).await?;
+    let checkpoint_history = context
+        .as_ref()
+        .map(|_| load_checkpoint_authentication_history(config))
+        .transpose()?;
+    let (mut tracker, mut bitcoin) =
+        checkpoint_sortition_tracker(config, &chainstate, &anchor, context)?;
+    if let Some((boundary, history)) = checkpoint_history {
+        authenticate_fresh_checkpoint(
+            config,
+            pox,
+            &mut chainstate,
+            &mut tracker,
+            &mut bitcoin,
+            boundary,
+            &history,
+        )?;
+    }
     println!(
         "deriving sortitions locally from burn {} on PoX history {}",
         tracker.tip().bitcoin_height,
         tracker.tip().pox_id
     );
     let mut executor = match context {
-        Some(context) => CheckpointExecutor::from_chainstate(chainstate, anchor, context, bitcoin)?,
+        Some(_) => {
+            let context = local_anchor_context(
+                pox,
+                &tracker,
+                &mut chainstate,
+                &anchor,
+                config.checkpoint.anchor_bitcoin_height,
+            )?;
+            CheckpointExecutor::from_chainstate(chainstate, anchor, context, bitcoin)?
+        }
         None => CheckpointExecutor::resume(chainstate, anchor, bitcoin),
     };
     executor.track_sortitions(tracker, config.node.working_dir.clone());
@@ -2121,22 +2445,24 @@ async fn backfill_one_header(
         return;
     }
     let id = nano_primitives::StacksBlockId::from_bytes(block);
-    let fetched = async {
-        let header = peer.block(id).await?.header;
-        let sortition = peer.sortition(header.consensus_hash).await?;
-        Ok::<_, nano_sync::SyncError>((header, sortition))
-    }
-    .await;
-    let Ok((header, sortition)) = fetched else {
+    let Ok(header) = peer.block(id).await.map(|block| block.header) else {
         eprintln!("cannot fetch the header of {}", hex::encode(block));
         return;
     };
-    let Ok(burn_block_height) = u32::try_from(sortition.bitcoin_height) else {
+    let Ok((burn_height, burn_hash)) = executor.local_ancestor_burn_context(header.consensus_hash)
+    else {
+        eprintln!(
+            "cannot place ancestor {} on this node's local burnchain",
+            hex::encode(block)
+        );
+        return;
+    };
+    let Ok(burn_block_height) = u32::try_from(burn_height) else {
         return;
     };
     if let Err(error) = executor.chainstate.backfill_ancestor_header(
         block,
-        *sortition.bitcoin_block_hash.as_bytes(),
+        burn_hash,
         burn_block_height,
         header.timestamp,
         *header.block_hash().as_bytes(),
@@ -3360,6 +3686,7 @@ mod tests {
             attesting_block: None,
             attesting_reward_set: Some(document),
             sortition: None,
+            authentication_history: None,
         };
         let mut context = nano_chainstate::BitcoinBlockContext::at_height(961_300);
         context.first_height = 666_050;

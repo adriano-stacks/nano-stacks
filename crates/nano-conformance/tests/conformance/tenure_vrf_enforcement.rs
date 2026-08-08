@@ -35,16 +35,17 @@ struct Tenure {
     target: Captured,
 }
 
-/// The first captured tenure-start block above the checkpoint anchor.
+/// The selected captured tenure-start block above the checkpoint anchor.
 ///
 /// A tenure-start block cannot be executed on its own — the checkpoint's own
 /// anchor block is not one — so the blocks before it come along, and run with
 /// the contexts the network gave them.
-fn captured_tenure() -> Option<Tenure> {
+fn captured_tenure(number: usize) -> Option<Tenure> {
     let fixture = capture();
     let snapshots = nano_conformance::captured_bitcoin_snapshots(&fixture)?;
     let operations = nano_conformance::captured_bitcoin_operations(&fixture)?;
     let mut prefix = Vec::new();
+    let mut tenure_starts = 0;
     for path in nano_conformance::captured_block_paths(&fixture) {
         let block = NakamotoBlock::decode(&fs::read(&path).ok()?).ok()?;
         let view = block.header.consensus_hash.to_string();
@@ -63,10 +64,13 @@ fn captured_tenure() -> Option<Tenure> {
             continue;
         }
         if nano_chainstate::starts_new_tenure(&captured.block) {
-            return Some(Tenure {
-                prefix,
-                target: captured,
-            });
+            tenure_starts += 1;
+            if tenure_starts == number {
+                return Some(Tenure {
+                    prefix,
+                    target: captured,
+                });
+            }
         }
         prefix.push(captured);
     }
@@ -243,7 +247,7 @@ fn accepts_with(
     let mut parent = Some(source);
     for captured in &tenure.prefix {
         chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_unauthenticated_fixture_block_with_bitcoin_operations(
                 captured.context,
                 &captured.operations,
                 parent,
@@ -276,23 +280,26 @@ fn stranger_key() -> [u8; 32] {
 /// worth anything beside the rejection below.
 #[test]
 fn a_tenure_with_its_own_leader_key_is_accepted() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
-    let Some(key) = winning_key(&tenure) else {
+    let (Some(key), Some(registration)) = (winning_key(&tenure), winning_registration(&tenure))
+    else {
         nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
         return;
     };
     let mut context = tenure.target.context;
     context.winner_vrf_public_key = Some(key);
-    accepts(&tenure, context).expect("the tenure the network accepted");
+    let mut operations = tenure.target.operations.clone();
+    operations.push(registration);
+    accepts_with(&tenure, context, &operations).expect("the tenure the network accepted");
 }
 
 /// A proof that is not the winning miner's is rejected before anything executes.
 #[test]
 fn a_tenure_with_another_miners_leader_key_is_rejected() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -308,7 +315,7 @@ fn a_tenure_with_another_miners_leader_key_is_rejected() {
 /// A key that is not a curve point at all is rejected too, and differently.
 #[test]
 fn a_tenure_with_a_malformed_leader_key_is_rejected() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -317,21 +324,20 @@ fn a_tenure_with_a_malformed_leader_key_is_rejected() {
     accepts(&tenure, context).expect_err("a malformed key must be rejected");
 }
 
-/// An unknown leader key does not silently pass as "checked".
-///
-/// This is the case a node in its first tenures after a checkpoint is in, and it
-/// is the one worth being careful about: the block *is* accepted, because there
-/// is nothing to check it against, and that has to be visible rather than
-/// indistinguishable from a proof that verified.
+/// An unknown leader key is incomplete checkpoint evidence, not acceptance.
 #[test]
-fn an_unknown_leader_key_accepts_the_block_and_says_so() {
-    let Some(tenure) = captured_tenure() else {
+fn an_unknown_leader_key_refuses_the_block() {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
     let mut context = tenure.target.context;
     context.winner_vrf_public_key = None;
-    accepts(&tenure, context).expect("an uncheckable proof is not a failed one");
+    let error = accepts(&tenure, context).expect_err("an uncheckable proof must be refused");
+    assert!(
+        error.contains("winning VRF key"),
+        "the refusal names the missing local winner: {error}"
+    );
 }
 
 /// The capture says the two halves of a leader key belong together.
@@ -344,7 +350,7 @@ fn an_unknown_leader_key_accepts_the_block_and_says_so() {
 /// the chain itself saying what `verify_miner_signature` is allowed to assume.
 #[test]
 fn the_winning_registration_names_the_key_that_signed_the_tenure() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -376,7 +382,7 @@ fn the_winning_registration_names_the_key_that_signed_the_tenure() {
 /// block-signing hash, and the block the network accepted.
 #[test]
 fn a_tenure_signed_by_the_winning_miner_is_accepted() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -399,7 +405,7 @@ fn a_tenure_signed_by_the_winning_miner_is_accepted() {
 /// which forged a whole coherent block for a sortition it did not win.
 #[test]
 fn a_tenure_signed_by_a_miner_that_did_not_win_is_rejected() {
-    let Some(tenure) = captured_tenure() else {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -429,16 +435,10 @@ fn a_tenure_signed_by_a_miner_that_did_not_win_is_rejected() {
     );
 }
 
-/// Without the registration the signature is unchecked, and that is said out loud.
-///
-/// The state a node is actually in today, on every tenure: it can name the
-/// winning leader key, and the burn block that registered that key is far below
-/// the operations it is handed, so there is no block-signing hash to check
-/// against. The block is accepted — there is nothing to check it against — and
-/// the difference between that and a signature that verified has to be visible.
+/// Without the registration the miner signature is not authenticated.
 #[test]
-fn an_unregistered_signing_key_accepts_the_block_and_says_so() {
-    let Some(tenure) = captured_tenure() else {
+fn an_unregistered_signing_key_refuses_the_block() {
+    let Some(tenure) = captured_tenure(2) else {
         nano_conformance::skip_gate("the capture has no tenure-start block on the checkpoint");
         return;
     };
@@ -448,5 +448,11 @@ fn an_unregistered_signing_key_accepts_the_block_and_says_so() {
     };
     let mut context = tenure.target.context;
     context.winner_vrf_public_key = Some(key);
-    accepts(&tenure, context).expect("an uncheckable signature is not a failed one");
+    context.winner_signing_key_hash = None;
+    let error =
+        accepts_with(&tenure, context, &[]).expect_err("an uncheckable signature must be refused");
+    assert!(
+        error.contains("block-signing key hash"),
+        "the refusal names the missing winning signing key: {error}"
+    );
 }

@@ -188,6 +188,19 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
         return Err(FixtureValidationError::EmptyCapture);
     }
 
+    validate_capture_layout(root, &manifest)?;
+    validate_sortition_seed(root)?;
+    validate_checkpoint(root)?;
+
+    Ok(FixtureStatus::Captured {
+        replay_blocks: manifest.replay_blocks,
+    })
+}
+
+fn validate_capture_layout(
+    root: &Path,
+    manifest: &FixtureManifest,
+) -> Result<(), FixtureValidationError> {
     let mut requirements = vec![
         // Several Nakamoto blocks can share one burn block in the same tenure.
         ("bitcoin/blocks", 1),
@@ -219,18 +232,18 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             return Err(FixtureValidationError::MissingOrEmptyFile(path));
         }
     }
+    Ok(())
+}
+
+fn validate_sortition_seed(root: &Path) -> Result<(), FixtureValidationError> {
+    let snapshots_path = root.join("sortition/snapshots.json");
     let snapshots: Vec<CapturedBitcoinSnapshot> = serde_json::from_slice(
-        &fs::read(root.join("sortition/snapshots.json")).map_err(|_| {
-            FixtureValidationError::InvalidSnapshotFile(root.join("sortition/snapshots.json"))
-        })?,
+        &fs::read(&snapshots_path)
+            .map_err(|_| FixtureValidationError::InvalidSnapshotFile(snapshots_path.clone()))?,
     )
-    .map_err(|_| {
-        FixtureValidationError::InvalidSnapshotFile(root.join("sortition/snapshots.json"))
-    })?;
+    .map_err(|_| FixtureValidationError::InvalidSnapshotFile(snapshots_path.clone()))?;
     if snapshots.is_empty() {
-        return Err(FixtureValidationError::InvalidSnapshotFile(
-            root.join("sortition/snapshots.json"),
-        ));
+        return Err(FixtureValidationError::InvalidSnapshotFile(snapshots_path));
     }
     for snapshot in &snapshots {
         let block = root
@@ -269,7 +282,10 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             path: sortition,
             reason: error.to_string(),
         })?;
+    Ok(())
+}
 
+fn validate_checkpoint(root: &Path) -> Result<(), FixtureValidationError> {
     let checkpoint = root.join("chainstate/checkpoint-H");
     if count_files_recursively(&checkpoint)? == 0 {
         return Err(FixtureValidationError::EmptyCheckpoint(checkpoint));
@@ -294,10 +310,7 @@ pub fn validate_fixture_tree(root: &Path) -> Result<FixtureStatus, FixtureValida
             .map_err(|_| FixtureValidationError::MissingOrEmptyFile(accounting_path.clone()))?,
     )
     .map_err(|_| FixtureValidationError::InvalidNativeAccounting(accounting_path))?;
-
-    Ok(FixtureStatus::Captured {
-        replay_blocks: manifest.replay_blocks,
-    })
+    Ok(())
 }
 
 fn is_nonempty_file(path: &Path) -> Result<bool, FixtureValidationError> {
