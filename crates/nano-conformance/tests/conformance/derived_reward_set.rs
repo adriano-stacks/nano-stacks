@@ -39,7 +39,9 @@ fn state_and_context() -> Option<(ChainState, BitcoinBlockContext)> {
         .into_iter()
         .find_map(|path| {
             let block = NakamotoBlock::decode(&fs::read(&path).ok()?).ok()?;
-            snapshots.get(&block.header.consensus_hash.to_string()).copied()
+            snapshots
+                .get(&block.header.consensus_hash.to_string())
+                .copied()
         })?;
     let (chainstate, _) = nano_conformance::replay_chainstate(&fixtures).ok()?;
     Some((chainstate, context))
@@ -92,10 +94,16 @@ fn the_derived_reward_set_is_the_document_the_network_published() {
     let signers = served["signers"].as_array().expect("the derived signers");
     assert_eq!(
         signers.len(),
-        expected["signers"].as_array().expect("published signers").len(),
+        expected["signers"]
+            .as_array()
+            .expect("published signers")
+            .len(),
         "the number of signers"
     );
-    assert!(!signers.is_empty(), "an empty signer set agrees with nothing");
+    assert!(
+        !signers.is_empty(),
+        "an empty signer set agrees with nothing"
+    );
     for (derived, published) in signers.iter().zip(
         expected["signers"]
             .as_array()
@@ -107,11 +115,13 @@ fn the_derived_reward_set_is_the_document_the_network_published() {
         assert_eq!(derived["signing_key"], published["signing_key"]);
         assert_eq!(
             derived["stacked_amt"], published["stacked_amt"],
-            "what {} stacked", published["signing_key"]
+            "what {} stacked",
+            published["signing_key"]
         );
         assert_eq!(
             derived["weight"], published["weight"],
-            "the weight apportioned to {}", published["signing_key"]
+            "the weight apportioned to {}",
+            published["signing_key"]
         );
     }
 }

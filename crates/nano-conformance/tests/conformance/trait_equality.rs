@@ -83,11 +83,7 @@ fn describe(outcome: Result<nano_vm::ContractCallOutcome, impl std::fmt::Debug>)
 
 /// What each engine answers, for one call.
 fn answers(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
-    let deployments = [
-        (token_a(), TOKEN),
-        (token_b(), TOKEN),
-        (market(), MARKET),
-    ];
+    let deployments = [(token_a(), TOKEN), (token_b(), TOKEN), (market(), MARKET)];
     let mut wasm = Vm::new(Network::TESTNET).expect("create the compiling VM");
     wasm.begin_block(None, [0x71; 32]).expect("begin");
     for (contract, source) in deployments.clone() {
@@ -138,7 +134,10 @@ fn answers(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
 #[test]
 fn both_engines_agree_two_traits_naming_one_contract_are_equal() {
     let (compiled, interpreted) = answers("same", &[encode(&token_a()), encode(&token_a())]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `is-eq` over traits");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `is-eq` over traits"
+    );
     assert!(
         compiled.contains("true"),
         "two references to the same contract compared unequal: {compiled}"
@@ -150,7 +149,10 @@ fn both_engines_agree_two_traits_naming_one_contract_are_equal() {
 #[test]
 fn both_engines_agree_two_traits_naming_different_contracts_differ() {
     let (compiled, interpreted) = answers("same", &[encode(&token_a()), encode(&token_b())]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `is-eq` over traits");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `is-eq` over traits"
+    );
     assert!(
         compiled.contains("false"),
         "two references to different contracts compared equal: {compiled}"
@@ -158,8 +160,14 @@ fn both_engines_agree_two_traits_naming_different_contracts_differ() {
 
     let (negated, negated_interpreted) =
         answers("different", &[encode(&token_a()), encode(&token_b())]);
-    assert_eq!(negated, negated_interpreted, "the engines disagree about `not is-eq`");
-    assert!(negated.contains("true"), "`not is-eq` disagreed with `is-eq`: {negated}");
+    assert_eq!(
+        negated, negated_interpreted,
+        "the engines disagree about `not is-eq`"
+    );
+    assert!(
+        negated.contains("true"),
+        "`not is-eq` disagreed with `is-eq`: {negated}"
+    );
 }
 
 /// The comparison and `contract-of` are about the same principal.
@@ -172,10 +180,16 @@ fn both_engines_agree_two_traits_naming_different_contracts_differ() {
 fn a_traits_equality_and_its_contract_of_name_the_same_contract() {
     let (compiled, interpreted) = answers("matches-contract-of", &[encode(&token_a())]);
     assert_eq!(compiled, interpreted, "the engines disagree");
-    assert!(compiled.contains("true"), "a trait is not equal to itself: {compiled}");
+    assert!(
+        compiled.contains("true"),
+        "a trait is not equal to itself: {compiled}"
+    );
 
     let (named, named_interpreted) = answers("named", &[encode(&token_a())]);
-    assert_eq!(named, named_interpreted, "the engines disagree about `contract-of`");
+    assert_eq!(
+        named, named_interpreted,
+        "the engines disagree about `contract-of`"
+    );
     assert!(
         named.contains("token-a"),
         "`contract-of` named something other than the trait's contract: {named}"

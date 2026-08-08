@@ -1,4 +1,6 @@
-use clar2wasm::tools::{crosscheck, crosscheck_compare_only, crosscheck_compare_only_with_expected_error};
+use clar2wasm::tools::{
+    crosscheck, crosscheck_compare_only, crosscheck_compare_only_with_expected_error,
+};
 use clarity::vm::errors::{EarlyReturnError, VmExecutionError};
 use clarity::vm::types::{ListTypeData, SequenceData, SequenceSubtype, TypeSignature};
 use clarity::vm::Value;

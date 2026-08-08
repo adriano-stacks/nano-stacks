@@ -35,9 +35,10 @@ fn state_network(chainstate: &Path) -> Network {
         .ok()
         .and_then(|value| {
             let value = value.trim();
-            let parsed = value
-                .strip_prefix("0x")
-                .map_or_else(|| value.parse::<u32>().ok(), |hex| u32::from_str_radix(hex, 16).ok());
+            let parsed = value.strip_prefix("0x").map_or_else(
+                || value.parse::<u32>().ok(),
+                |hex| u32::from_str_radix(hex, 16).ok(),
+            );
             if parsed.is_none() {
                 eprintln!("NANO_NETWORK={value} is not a chain identifier; assuming mainnet");
             }
@@ -77,9 +78,7 @@ fn main() -> ExitCode {
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
-        Some("verify-block") => {
-            verify_block(&env::args().skip(2).collect::<Vec<_>>())
-        }
+        Some("verify-block") => verify_block(&env::args().skip(2).collect::<Vec<_>>()),
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
         Some("sweep-contracts") => sweep_contracts(&env::args().skip(2).collect::<Vec<_>>()),
@@ -96,18 +95,14 @@ fn main() -> ExitCode {
         Some("export-headers") => export_headers(&env::args().skip(2).collect::<Vec<_>>()),
         Some("import-headers") => import_headers(&env::args().skip(2).collect::<Vec<_>>()),
         Some("export-sortition") => export_sortition(&env::args().skip(2).collect::<Vec<_>>()),
-        Some("export-leader-keys") => {
-            export_leader_keys(&env::args().skip(2).collect::<Vec<_>>())
-        }
+        Some("export-leader-keys") => export_leader_keys(&env::args().skip(2).collect::<Vec<_>>()),
         Some("leader-keys-from-blocks") => {
             leader_keys_from_blocks(&env::args().skip(2).collect::<Vec<_>>())
         }
         Some("block-info") => block_info(&env::args().skip(2).collect::<Vec<_>>()),
         Some("freeze-receipts") => freeze_receipts(&env::args().skip(2).collect::<Vec<_>>()),
         Some("compiler-identity") => compiler_identity(&env::args().skip(2).collect::<Vec<_>>()),
-        Some("rebuild-accounting") => {
-            rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>())
-        }
+        Some("rebuild-accounting") => rebuild_accounting(&env::args().skip(2).collect::<Vec<_>>()),
         _ => {
             // Split by what they do to a state directory, because that is the
             // distinction an operator has to get right: the readers refuse a path
@@ -133,7 +128,6 @@ fn main() -> ExitCode {
         }
     }
 }
-
 
 /// Compile **and load** every contract a state holds, and name what refuses.
 ///
@@ -204,7 +198,8 @@ fn sweep_contracts(arguments: &[String]) -> ExitCode {
     let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut checked = 0_usize;
     for contract in &contracts {
-        let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
+        let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract)
+        else {
             continue;
         };
         let Ok((source, version)) = vm.contract_source(&identifier) else {
@@ -259,53 +254,69 @@ fn sweep_contracts(arguments: &[String]) -> ExitCode {
 /// rather than right. Only the fields the rebuild claims are compared — a field
 /// it does not claim has no value to compare.
 fn compare_headers(rebuilt: &nano_vm::BlockHeader, recorded: &nano_vm::BlockHeader) -> ExitCode {
-        let mut wrong = 0;
-        let mut check = |field: &str, same: bool, detail: String| {
-            if !same {
-                wrong += 1;
-            }
-            println!("  {field:20} {} {detail}", if same { "==" } else { "!=" });
-        };
-        check(
-            "burn_header_hash",
-            rebuilt.burn_header_hash == recorded.burn_header_hash,
-            String::new(),
-        );
-        check(
-            "burn_block_height",
-            rebuilt.burn_block_height == recorded.burn_block_height,
-            format!("{} vs {}", rebuilt.burn_block_height, recorded.burn_block_height),
-        );
-        check(
-            "burn_block_time",
-            rebuilt.burn_block_time == recorded.burn_block_time,
-            format!("{} vs {}", rebuilt.burn_block_time, recorded.burn_block_time),
-        );
-        check(
-            "stacks_block_time",
-            rebuilt.stacks_block_time == recorded.stacks_block_time,
-            format!("{} vs {}", rebuilt.stacks_block_time, recorded.stacks_block_time),
-        );
-        check(
-            "block_header_hash",
-            rebuilt.block_header_hash == recorded.block_header_hash,
-            String::new(),
-        );
-        check(
-            "consensus_hash",
-            rebuilt.consensus_hash == recorded.consensus_hash,
-            String::new(),
-        );
-        check("vrf_seed", rebuilt.vrf_seed == recorded.vrf_seed, String::new());
-        check(
-            "burn_spend_total",
-            rebuilt.burn_spend_total == recorded.burn_spend_total,
-            format!("{} vs {}", rebuilt.burn_spend_total, recorded.burn_spend_total),
-        );
-        println!(
-            "{wrong} of the 8 compared fields disagree with the recorded header \
+    let mut wrong = 0;
+    let mut check = |field: &str, same: bool, detail: String| {
+        if !same {
+            wrong += 1;
+        }
+        println!("  {field:20} {} {detail}", if same { "==" } else { "!=" });
+    };
+    check(
+        "burn_header_hash",
+        rebuilt.burn_header_hash == recorded.burn_header_hash,
+        String::new(),
+    );
+    check(
+        "burn_block_height",
+        rebuilt.burn_block_height == recorded.burn_block_height,
+        format!(
+            "{} vs {}",
+            rebuilt.burn_block_height, recorded.burn_block_height
+        ),
+    );
+    check(
+        "burn_block_time",
+        rebuilt.burn_block_time == recorded.burn_block_time,
+        format!(
+            "{} vs {}",
+            rebuilt.burn_block_time, recorded.burn_block_time
+        ),
+    );
+    check(
+        "stacks_block_time",
+        rebuilt.stacks_block_time == recorded.stacks_block_time,
+        format!(
+            "{} vs {}",
+            rebuilt.stacks_block_time, recorded.stacks_block_time
+        ),
+    );
+    check(
+        "block_header_hash",
+        rebuilt.block_header_hash == recorded.block_header_hash,
+        String::new(),
+    );
+    check(
+        "consensus_hash",
+        rebuilt.consensus_hash == recorded.consensus_hash,
+        String::new(),
+    );
+    check(
+        "vrf_seed",
+        rebuilt.vrf_seed == recorded.vrf_seed,
+        String::new(),
+    );
+    check(
+        "burn_spend_total",
+        rebuilt.burn_spend_total == recorded.burn_spend_total,
+        format!(
+            "{} vs {}",
+            rebuilt.burn_spend_total, recorded.burn_spend_total
+        ),
+    );
+    println!(
+        "{wrong} of the 8 compared fields disagree with the recorded header \
              (nothing was written: this block already has one)"
-        );
+    );
     if wrong == 0 {
         ExitCode::SUCCESS
     } else {
@@ -421,35 +432,36 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let rebuilt = nano_vm::BlockHeader {
-            burn_header_hash: *sortition.bitcoin_block_hash.as_bytes(),
-            burn_block_height,
-            stacks_block_time: block.header.timestamp,
-            block_header_hash: *block.header.block_hash().as_bytes(),
-            consensus_hash: *block.header.consensus_hash.as_bytes(),
-            // The oracle below caught all three of these being wrong. The
-            // sortition's seed is not the one nano records; the header's
-            // `bitcoin_spent` is a *running* total, not the per-tenure burn
-            // `burn_spend_total` means; and nano leaves burn_block_time zero
-            // for blocks it executes itself. Matching nano's own convention is
-            // what keeps a backfilled header indistinguishable from a recorded
-            // one — filling them from a peer would make this block answer
-            // differently from every block beside it.
-            burn_block_time: 0,
-            vrf_seed: [0; 32],
-            burn_spend_total: 0,
-            // Not recoverable from these two calls either. Named below, because
-            // a header has no way to say a field is absent and a zero read as a
-            // real answer is worse than the stall this replaces.
-            miner_address: (0, [0; 20]),
-            burn_spend_winner: 0,
-            block_reward: 0,
-            tenure_height: 0,
-            tenure_start_height: 0,
+        burn_header_hash: *sortition.bitcoin_block_hash.as_bytes(),
+        burn_block_height,
+        stacks_block_time: block.header.timestamp,
+        block_header_hash: *block.header.block_hash().as_bytes(),
+        consensus_hash: *block.header.consensus_hash.as_bytes(),
+        // The oracle below caught all three of these being wrong. The
+        // sortition's seed is not the one nano records; the header's
+        // `bitcoin_spent` is a *running* total, not the per-tenure burn
+        // `burn_spend_total` means; and nano leaves burn_block_time zero
+        // for blocks it executes itself. Matching nano's own convention is
+        // what keeps a backfilled header indistinguishable from a recorded
+        // one — filling them from a peer would make this block answer
+        // differently from every block beside it.
+        burn_block_time: 0,
+        vrf_seed: [0; 32],
+        burn_spend_total: 0,
+        // Not recoverable from these two calls either. Named below, because
+        // a header has no way to say a field is absent and a zero read as a
+        // real answer is worse than the stall this replaces.
+        miner_address: (0, [0; 20]),
+        burn_spend_winner: 0,
+        block_reward: 0,
+        tenure_height: 0,
+        tenure_start_height: 0,
     };
     if let Some(recorded) = recorded {
         return compare_headers(&rebuilt, &recorded.header);
     }
-    if let Err(error) = vm.record_partial_header(id, rebuilt, nano_vm::HeaderFields::PEER_BURN_CONTEXT)
+    if let Err(error) =
+        vm.record_partial_header(id, rebuilt, nano_vm::HeaderFields::PEER_BURN_CONTEXT)
     {
         eprintln!("recording the header failed: {error}");
         return ExitCode::FAILURE;
@@ -461,7 +473,9 @@ fn backfill_header(arguments: &[String]) -> ExitCode {
          NOT KNOWN: {} -- a Clarity read of one of these now stops the node and \
          names the field, rather than answering with the zero in its place",
         hex::encode(id),
-        nano_vm::HeaderFields::PEER_BURN_CONTEXT.absent_names().join(", ")
+        nano_vm::HeaderFields::PEER_BURN_CONTEXT
+            .absent_names()
+            .join(", ")
     );
     ExitCode::SUCCESS
 }
@@ -586,7 +600,9 @@ fn print_block_info(database: &mut clarity::vm::database::ClarityDatabase<'_>, h
     );
     say(
         "time",
-        database.get_block_time(height).map(|value| value.to_string()),
+        database
+            .get_block_time(height)
+            .map(|value| value.to_string()),
     );
     let tenure_height = database.get_tenure_height().unwrap_or(0);
     println!(
@@ -1153,7 +1169,8 @@ fn export_rows(
     let mut exported = 0;
     while let Some(row) = rows.next().map_err(|error| error.to_string())? {
         let text = |index: usize| -> Result<String, String> {
-            row.get(index).map_err(|error: rusqlite::Error| error.to_string())
+            row.get(index)
+                .map_err(|error: rusqlite::Error| error.to_string())
         };
         let block_id = text(0)?;
         let stacks_height: u64 = row.get(1).map_err(|error| error.to_string())?;
@@ -1166,7 +1183,8 @@ fn export_rows(
         } else {
             None
         };
-        let tenure_start_id = tenure.map_or_else(|| block_id.clone(), |start| start.block_id.clone());
+        let tenure_start_id =
+            tenure.map_or_else(|| block_id.clone(), |start| start.block_id.clone());
         if !facts.contains_key(&tenure_start_id) {
             let computed = read_tenure_facts(source, &tenure_start_id, nakamoto, tenures)?;
             facts.insert(tenure_start_id.clone(), computed);
@@ -1307,7 +1325,9 @@ fn read_tenure_facts(
     Ok(TenureFacts {
         start_height: u32::try_from(start_height).map_err(|_| "height overflows u32".to_owned())?,
         vrf_seed: proof.as_deref().and_then(vrf_seed_of_proof),
-        miner: payment.as_ref().and_then(|(address, _, _)| miner_address(address)),
+        miner: payment
+            .as_ref()
+            .and_then(|(address, _, _)| miner_address(address)),
         spends: payment.map(|(_, sortition, commit)| (u128::from(sortition), u128::from(commit))),
         reward: read_matured_reward(source, tenure_start_id, &parent_block_id, tenures)?,
     })
@@ -1512,8 +1532,8 @@ fn probe_header(arguments: &[String]) -> ExitCode {
                     }
                 );
                 if let Some(recorded) = recorded
-                    && let Some(tenure_height) =
-                        recorded.field(nano_vm::HeaderFields::TENURE_HEIGHT, |header| {
+                    && let Some(tenure_height) = recorded
+                        .field(nano_vm::HeaderFields::TENURE_HEIGHT, |header| {
                             header.tenure_height
                         })
                 {
@@ -1590,9 +1610,10 @@ fn verify_block(arguments: &[String]) -> ExitCode {
         eprintln!("usage: cargo xtask verify-block <block.bin> <stacker_set.json>");
         return ExitCode::from(2);
     };
-    let block = match fs::read(block_path).map_err(|error| error.to_string()).and_then(
-        |bytes| NakamotoBlock::decode(&bytes).map_err(|error| error.to_string()),
-    ) {
+    let block = match fs::read(block_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| NakamotoBlock::decode(&bytes).map_err(|error| error.to_string()))
+    {
         Ok(block) => block,
         Err(error) => {
             eprintln!("{block_path}: {error}");
@@ -1802,7 +1823,10 @@ fn decode_blocks(path: Option<&str>) -> ExitCode {
             }
             Err(error) => {
                 eprintln!("block {decoded} at byte {offset} does not decode: {error}");
-                eprintln!("next 64 bytes: {}", hex::encode(&bytes[offset..(offset + 64).min(bytes.len())]));
+                eprintln!(
+                    "next 64 bytes: {}",
+                    hex::encode(&bytes[offset..(offset + 64).min(bytes.len())])
+                );
                 return ExitCode::FAILURE;
             }
         }
@@ -1984,9 +2008,10 @@ impl CaptureConfig {
         if self.checkpoint_height >= self.first_height {
             return Err("--checkpoint-height must precede --first-height".to_owned());
         }
-        let node_root = self.node_root.clone().unwrap_or_else(|| {
-            self.state_dir.join("stacks-miner-1/nakamoto-neon")
-        });
+        let node_root = self
+            .node_root
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("stacks-miner-1/nakamoto-neon"));
         let blocks_db = node_root.join("chainstate/blocks/nakamoto.sqlite");
         let sortition_db = node_root.join("burnchain/sortition/marf.sqlite");
         let blocks = self.blocks(&blocks_db)?;
@@ -2182,7 +2207,10 @@ impl CaptureConfig {
         for bitcoin_block in Self::bitcoin_blocks(snapshots)? {
             let burn_hash = bitcoin_block.hash;
             let encoded = if let Some(rest) = self.bitcoin_rest.as_ref() {
-                let raw = http_get(&format!("{}/block/{burn_hash}/raw", rest.trim_end_matches('/')))?;
+                let raw = http_get(&format!(
+                    "{}/block/{burn_hash}/raw",
+                    rest.trim_end_matches('/')
+                ))?;
                 encode_hex(&raw)
             } else {
                 let rpc = self
@@ -2280,8 +2308,11 @@ impl CaptureConfig {
         // canonical snapshot at each height. A chain with forks has more than
         // one row per height, and a chain with a million burn blocks does not
         // want all of them in a fixture.
-        let (first_burn, last_burn) =
-            Self::burn_span(sortition_db, &node_root.join("chainstate/vm/index.sqlite"), blocks)?;
+        let (first_burn, last_burn) = Self::burn_span(
+            sortition_db,
+            &node_root.join("chainstate/vm/index.sqlite"),
+            blocks,
+        )?;
         let snapshot_query = format!(
             "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
         );
@@ -2305,7 +2336,12 @@ impl CaptureConfig {
         // alternative is asking the peer that supplied the block for the input
         // that decides whether to believe it.
         let (keys, signing) = read_leader_keys(sortition_db, last_burn).and_then(|keys| {
-            write_leader_keys(&staging.join("sortition").join(nano_node::sortition::LEADER_KEY_FILE), &keys)
+            write_leader_keys(
+                &staging
+                    .join("sortition")
+                    .join(nano_node::sortition::LEADER_KEY_FILE),
+                &keys,
+            )
         })?;
         println!(
             "captured {keys} leader-key registrations up to burn {last_burn}, {signing} with a \
@@ -2547,7 +2583,7 @@ impl CaptureConfig {
             "tenures": tenures,
             "coinbase_schedule": schedule,
         }))
-            .map_err(|error| format!("serialize native accounting: {error}"))?;
+        .map_err(|error| format!("serialize native accounting: {error}"))?;
         write_file(&checkpoint_dir.join("native-effects.json"), &contents)
     }
 
@@ -2925,10 +2961,7 @@ fn parse_u128(field: &str, value: Option<&str>) -> Result<u128, String> {
 /// has to reach it: a checkpoint whose earnings stop short of its own tip owes
 /// nothing for the tenures between. One short of it is not, because a tenure's
 /// entry needs its successor's row and the deepest tenure has none yet.
-fn refuse_a_short_earnings_window(
-    tenures: &[serde_json::Value],
-    last: u64,
-) -> Result<(), String> {
+fn refuse_a_short_earnings_window(tenures: &[serde_json::Value], last: u64) -> Result<(), String> {
     let heights: Vec<u64> = tenures
         .iter()
         .filter_map(|tenure| tenure.get("coinbase_height")?.as_u64())
@@ -3329,7 +3362,10 @@ fn snapshot_state(arguments: &[String]) -> ExitCode {
     }
     // A `-wal` beside the database means the node is running or was killed, and
     // either way the copy would be of a state nothing has committed.
-    for stray in ["chainstate/marf.sqlite-wal", "chainstate/clarity.sqlite-wal"] {
+    for stray in [
+        "chainstate/marf.sqlite-wal",
+        "chainstate/clarity.sqlite-wal",
+    ] {
         let path = source.join(stray);
         if path.metadata().is_ok_and(|data| data.len() > 0) {
             eprintln!(
@@ -3347,7 +3383,11 @@ fn snapshot_state(arguments: &[String]) -> ExitCode {
         .status();
     match status {
         Ok(status) if status.success() => {
-            println!("{} is now a snapshot of {}", destination.display(), source.display());
+            println!(
+                "{} is now a snapshot of {}",
+                destination.display(),
+                source.display()
+            );
             println!(
                 "it shares every block with the original until one of them is written to, \
                  so it costs no disk until it diverges"
@@ -3484,7 +3524,10 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
         eprintln!("cannot parse {}", path.display());
         return ExitCode::FAILURE;
     };
-    let Some(tenures) = accounting.get("tenures").and_then(serde_json::Value::as_array) else {
+    let Some(tenures) = accounting
+        .get("tenures")
+        .and_then(serde_json::Value::as_array)
+    else {
         eprintln!("the accounting names no tenures");
         return ExitCode::FAILURE;
     };
@@ -3503,9 +3546,15 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
     };
 
     let mut corrected = 0;
-    if let Some(tenures) = accounting.get_mut("tenures").and_then(serde_json::Value::as_array_mut) {
+    if let Some(tenures) = accounting
+        .get_mut("tenures")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for tenure in tenures.iter_mut() {
-            let Some(height) = tenure.get("coinbase_height").and_then(serde_json::Value::as_u64) else {
+            let Some(height) = tenure
+                .get("coinbase_height")
+                .and_then(serde_json::Value::as_u64)
+            else {
                 continue;
             };
             // A tenure the walk did not reach in full is left alone: counting
@@ -3513,7 +3562,10 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
             let Some(fees) = counted.get(&height) else {
                 continue;
             };
-            let recorded = tenure.get("fees").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let recorded = tenure
+                .get("fees")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
             if recorded != *fees {
                 println!("tenure {height}: {recorded} recorded, {fees} counted");
                 tenure["fees"] = serde_json::json!(fees);
@@ -3527,12 +3579,9 @@ fn rebuild_accounting(arguments: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let backup = path.with_extension("json.before-rebuild");
-    if let Err(error) = fs::copy(&path, &backup).and_then(|_| {
-        fs::write(
-            &path,
-            serde_json::to_vec(&accounting).unwrap_or_default(),
-        )
-    }) {
+    if let Err(error) = fs::copy(&path, &backup)
+        .and_then(|_| fs::write(&path, serde_json::to_vec(&accounting).unwrap_or_default()))
+    {
         eprintln!("cannot write the corrected accounting: {error}");
         return ExitCode::FAILURE;
     }
@@ -3896,7 +3945,14 @@ fn call_both(arguments: &[String]) -> ExitCode {
             .unwrap_or_else(|_| identifier.issuer.clone().into()),
         None => identifier.issuer.clone().into(),
     };
-    match ask_both_engines(chain.vm_mut(), tip, &caller, &identifier, function, &encoded) {
+    match ask_both_engines(
+        chain.vm_mut(),
+        tip,
+        &caller,
+        &identifier,
+        function,
+        &encoded,
+    ) {
         Ok([compiler, interpreter]) => {
             println!("compiler     {compiler}");
             println!("interpreter  {interpreter}");
@@ -3921,9 +3977,7 @@ fn call_both(arguments: &[String]) -> ExitCode {
 /// where the chain answers a height — which made the interpreter look like the
 /// engine that was wrong about mainnet block 8,706,194 when it was the only one
 /// right.
-fn open_state_as_the_node_left_it(
-    directory: &Path,
-) -> Result<nano_chainstate::ChainState, String> {
+fn open_state_as_the_node_left_it(directory: &Path) -> Result<nano_chainstate::ChainState, String> {
     // The chain the state names, not an assumption: a diagnostic opened as the
     // wrong network reads different boot principals and answers a different
     // `(chain-id)`, which is exactly the confusion these tools exist to remove.
@@ -3956,7 +4010,11 @@ fn ask_both_engines(
         // diverge in — which the returned value alone never does.
         println!(
             "--- {} {contract}::{function}",
-            if interpreted { "interpreter" } else { "compiler" }
+            if interpreted {
+                "interpreter"
+            } else {
+                "compiler"
+            }
         );
         vm.begin_block(Some(tip), [0xca; 32])
             .map_err(|error| format!("cannot begin a block: {error:?}"))?;
@@ -4168,7 +4226,6 @@ fn heal_contracts(state: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-
 /// Fill one ledger row's holes and restate its fee totals, or say why it could
 /// not be.
 ///
@@ -4183,24 +4240,24 @@ fn repair_ledger_row(
 ) -> Result<(Vec<u64>, usize), ()> {
     let Some(bytes) = decode_hex(data.trim()) else {
         eprintln!("the ledger committed with {block} is not hexadecimal");
-        return Err(())
+        return Err(());
     };
     let Ok(mut ledger) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         eprintln!("the ledger committed with {block} does not read as JSON");
-        return Err(())
+        return Err(());
     };
     let missing = match missing_tenures(&ledger) {
         Ok(missing) => missing,
         Err(error) => {
             eprintln!("{error}");
-            return Err(())
+            return Err(());
         }
     };
     let restated = match restate_tenure_fees(&mut ledger, archive) {
         Ok(restated) => restated,
         Err(error) => {
             eprintln!("{error}");
-            return Err(())
+            return Err(());
         }
     };
     if missing.is_empty() && restated == 0 {
@@ -4211,11 +4268,11 @@ fn repair_ledger_row(
             Ok(Some(entry)) => entry,
             Ok(None) => {
                 eprintln!("the archive has no scheduled payment for tenure {height}");
-                return Err(())
+                return Err(());
             }
             Err(error) => {
                 eprintln!("{error}");
-                return Err(())
+                return Err(());
             }
         };
         let Some(tenures) = ledger
@@ -4224,7 +4281,7 @@ fn repair_ledger_row(
             .and_then(serde_json::Value::as_array_mut)
         else {
             eprintln!("the ledger names no tenures");
-            return Err(())
+            return Err(());
         };
         tenures.push(entry);
         tenures.sort_by_key(|tenure| {
@@ -4238,16 +4295,18 @@ fn repair_ledger_row(
     // hole, has to fail here rather than at the next start.
     let accounting = ledger.get("accounting").cloned().unwrap_or_default();
     match nano_chainstate::TenureAccounting::from_json(
-        serde_json::to_string(&accounting).unwrap_or_default().as_bytes(),
+        serde_json::to_string(&accounting)
+            .unwrap_or_default()
+            .as_bytes(),
     ) {
         Ok(accounting) => {
             if !missing_tenures(&ledger).is_ok_and(|missing| missing.is_empty()) {
                 eprintln!("the repaired ledger for {block} still has a hole");
-                return Err(())
+                return Err(());
             }
             let Some((first, last)) = accounting.known_earnings_span() else {
                 eprintln!("the repaired ledger for {block} owes nothing");
-                return Err(())
+                return Err(());
             };
             println!(
                 "{block}: filled {} tenures, restated {restated} fee totals, window {first}..{last}",
@@ -4256,7 +4315,7 @@ fn repair_ledger_row(
         }
         Err(error) => {
             eprintln!("the repaired accounting for {block} does not read back: {error}");
-            return Err(())
+            return Err(());
         }
     }
     write_ledger_row(side_store, block, &ledger)?;
@@ -4264,11 +4323,7 @@ fn repair_ledger_row(
 }
 
 /// Write one repaired ledger row back, and prove it went in as the node reads it.
-fn write_ledger_row(
-    side_store: &Path,
-    block: &str,
-    ledger: &serde_json::Value,
-) -> Result<(), ()> {
+fn write_ledger_row(side_store: &Path, block: &str, ledger: &serde_json::Value) -> Result<(), ()> {
     let encoded = serde_json::to_vec(ledger).unwrap_or_default();
     if let Err(error) = sqlite_script(
         side_store,
@@ -4278,27 +4333,29 @@ fn write_ledger_row(
         ),
     ) {
         eprintln!("cannot write the repaired ledger for {block}: {error}");
-        return Err(())
+        return Err(());
     }
     // Read back from the database, not from memory. The first attempt at
     // this validated what it was about to write and wrote it as the wrong
     // SQLite type, so every row passed and none could be read afterwards.
     match sqlite(
         side_store,
-        &format!("SELECT typeof(data), hex(data) FROM chain_ledger WHERE hex(block_id) = '{block}'"),
+        &format!(
+            "SELECT typeof(data), hex(data) FROM chain_ledger WHERE hex(block_id) = '{block}'"
+        ),
     ) {
         Ok(written) => {
             let Some((kind, hex)) = written.trim().split_once('|') else {
                 eprintln!("the repaired row for {block} did not read back");
-                return Err(())
+                return Err(());
             };
             if kind != "blob" {
                 eprintln!("the repaired row for {block} is a {kind} where the node reads bytes");
-                return Err(())
+                return Err(());
             }
             if decode_hex(hex.trim()).as_deref() != Some(encoded.as_slice()) {
                 eprintln!("the repaired row for {block} did not come back as it went in");
-                return Err(())
+                return Err(());
             }
             Ok(())
         }
@@ -4779,15 +4836,28 @@ fn locked_version(crate_name: &str) -> String {
 
 fn report_revision() {
     println!("\nrevision");
-    println!("  nano-stacks          {}", captured("git", &["rev-parse", "HEAD"]));
+    println!(
+        "  nano-stacks          {}",
+        captured("git", &["rev-parse", "HEAD"])
+    );
     let dirty = !captured("git", &["status", "--porcelain"]).is_empty();
     println!(
         "  branch               {} ({})",
         captured("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
-        if dirty { "UNCOMMITTED CHANGES" } else { "clean" }
+        if dirty {
+            "UNCOMMITTED CHANGES"
+        } else {
+            "clean"
+        }
     );
-    println!("  rustc                {}", captured("rustc", &["--version"]));
-    println!("  cargo                {}", captured("cargo", &["--version"]));
+    println!(
+        "  rustc                {}",
+        captured("rustc", &["--version"])
+    );
+    println!(
+        "  cargo                {}",
+        captured("cargo", &["--version"])
+    );
 }
 
 /// The engine, named by content.
@@ -4805,7 +4875,10 @@ fn report_engines() {
     );
     println!(
         "  clarity-wasm change  {}",
-        captured("git", &["log", "-1", "--format=%h %s", "--", "vendor/clarity-wasm"])
+        captured(
+            "git",
+            &["log", "-1", "--format=%h %s", "--", "vendor/clarity-wasm"]
+        )
     );
     // The identity the *binary* carries, which is the one a state and a fixture
     // can be bound to. The tree hash above is a claim about the repository; this
@@ -4855,11 +4928,9 @@ fn report_differentials() -> usize {
                 Some("infrastructure") => infrastructure += 1,
                 Some("tool" | "out-of-scope") => tools += 1,
                 Some(class) => blocking.push((path, format!("{name}: {reason}"), class.to_owned())),
-                None => blocking.push((
-                    path,
-                    format!("{name}: {reason}"),
-                    "unclassified".to_owned(),
-                )),
+                None => {
+                    blocking.push((path, format!("{name}: {reason}"), "unclassified".to_owned()));
+                }
             }
         }
     }
@@ -4985,7 +5056,12 @@ fn ignored_tests(root: &Path) -> Vec<(String, String, String)> {
                     let rest = ["fn ", "async fn ", "pub fn ", "pub async fn "]
                         .into_iter()
                         .find_map(|prefix| next.strip_prefix(prefix))?;
-                    Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest).to_owned())
+                    Some(
+                        rest.split(['(', '<', ' '])
+                            .next()
+                            .unwrap_or(rest)
+                            .to_owned(),
+                    )
                 })
                 .unwrap_or_else(|| format!("{shown}:{}", line + 1));
             found.push((format!("{shown}:{}", line + 1), name, reason));
@@ -5024,13 +5100,14 @@ fn report_checkpoint(state: Option<&Path>) {
     // Both are accepted rather than making the caller know which.
     let found = [directory.to_path_buf(), directory.join("chainstate")]
         .into_iter()
-        .find_map(|candidate| match nano_marf::CheckpointProvenance::load(&candidate) {
-            Ok(Some(provenance)) => Some((candidate, Ok(Some(provenance)))),
-            Ok(None) => None,
-            Err(error) => Some((candidate, Err(error))),
-        });
-    let (directory, loaded) =
-        found.unwrap_or_else(|| (directory.to_path_buf(), Ok(None)));
+        .find_map(
+            |candidate| match nano_marf::CheckpointProvenance::load(&candidate) {
+                Ok(Some(provenance)) => Some((candidate, Ok(Some(provenance)))),
+                Ok(None) => None,
+                Err(error) => Some((candidate, Err(error))),
+            },
+        );
+    let (directory, loaded) = found.unwrap_or_else(|| (directory.to_path_buf(), Ok(None)));
     match loaded {
         Ok(Some(provenance)) => {
             let checkpoint = &provenance.checkpoint;
@@ -5130,7 +5207,10 @@ fn report_scoreboard() {
     println!("\nscoreboard");
     let manifest_path = fixture_root().join("manifest.toml");
     if let Err(error) = FixtureManifest::load(&manifest_path) {
-        println!("  no fixture manifest at {}: {error}", manifest_path.display());
+        println!(
+            "  no fixture manifest at {}: {error}",
+            manifest_path.display()
+        );
         return;
     }
     let Ok(binary) = env::current_exe() else {
@@ -5243,7 +5323,14 @@ fn report_gates(capture: Option<&str>) -> bool {
         ),
         run_gate(
             "cargo",
-            &["test", "--release", "-p", "nano-conformance", "--test", "conformance"],
+            &[
+                "test",
+                "--release",
+                "-p",
+                "nano-conformance",
+                "--test",
+                "conformance",
+            ],
             &environment,
         ),
         run_gate(
@@ -5256,7 +5343,11 @@ fn report_gates(capture: Option<&str>) -> bool {
     for gate in &gates {
         all_passed &= gate.passed;
         println!("\n  {}", gate.command);
-        println!("    {:<6} {}", if gate.passed { "pass" } else { "FAIL" }, gate.detail);
+        println!(
+            "    {:<6} {}",
+            if gate.passed { "pass" } else { "FAIL" },
+            gate.detail
+        );
     }
     all_passed
 }
@@ -5383,14 +5474,19 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    let first: u64 = rest.first().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let first: u64 = rest
+        .first()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let count: usize = rest
         .get(1)
         .and_then(|value| value.parse().ok())
         .unwrap_or(500);
     let directory = PathBuf::from(observer).join("new_block");
     let mut paths: Vec<PathBuf> = match fs::read_dir(&directory) {
-        Ok(entries) => entries.filter_map(|entry| Some(entry.ok()?.path())).collect(),
+        Ok(entries) => entries
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .collect(),
         Err(error) => {
             eprintln!("cannot read {}: {error}", directory.display());
             return ExitCode::FAILURE;
@@ -5414,7 +5510,10 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
         }
     }
     if frozen.is_empty() {
-        eprintln!("no payloads at or above height {first} under {}", directory.display());
+        eprintln!(
+            "no payloads at or above height {first} under {}",
+            directory.display()
+        );
         return ExitCode::FAILURE;
     }
     let document = json!({
@@ -5428,7 +5527,10 @@ fn freeze_receipts(arguments: &[String]) -> ExitCode {
         "last_height": frozen.last().map(|entry| entry.height),
         "blocks": frozen,
     });
-    match fs::write(output, serde_json::to_vec_pretty(&document).unwrap_or_default()) {
+    match fs::write(
+        output,
+        serde_json::to_vec_pretty(&document).unwrap_or_default(),
+    ) {
         Ok(()) => {
             println!(
                 "froze {} blocks, {} to {}, into {output}",
@@ -5499,8 +5601,8 @@ mod tests {
         let last = 8_665_600;
         let missing = last - 27;
         let tenures = window((last - 200..last).filter(|height| *height != missing));
-        let error = refuse_a_short_earnings_window(&tenures, last)
-            .expect_err("a holed window was written");
+        let error =
+            refuse_a_short_earnings_window(&tenures, last).expect_err("a holed window was written");
         assert!(
             error.contains(&missing.to_string()),
             "the refusal names the missing tenure: {error}"
@@ -5530,8 +5632,8 @@ mod tests {
     fn a_short_window_is_refused() {
         let last = 8_665_600;
         let tenures = window(last - 2..last);
-        let error = refuse_a_short_earnings_window(&tenures, last)
-            .expect_err("a short window was written");
+        let error =
+            refuse_a_short_earnings_window(&tenures, last).expect_err("a short window was written");
         assert!(
             error.contains(&format!("{} tenures", MINER_REWARD_MATURITY + 1)),
             "the refusal says how many a checkpoint needs: {error}"

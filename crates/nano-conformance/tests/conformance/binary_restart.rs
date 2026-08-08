@@ -142,21 +142,27 @@ pub async fn serve_burnchain() -> (String, tokio::task::JoinHandle<()>) {
     let router = Router::new()
         .route(
             "/block-height/{height}",
-            get(|State(state): State<Burnchain>, axum::extract::Path(height): axum::extract::Path<u64>| async move {
-                state.0.get(&height).map_or_else(
-                    || (StatusCode::NOT_FOUND, String::new()),
-                    |hash| (StatusCode::OK, hash.clone()),
-                )
-            }),
+            get(
+                |State(state): State<Burnchain>,
+                 axum::extract::Path(height): axum::extract::Path<u64>| async move {
+                    state.0.get(&height).map_or_else(
+                        || (StatusCode::NOT_FOUND, String::new()),
+                        |hash| (StatusCode::OK, hash.clone()),
+                    )
+                },
+            ),
         )
         .route(
             "/block/{hash}/raw",
-            get(|State(state): State<Burnchain>, axum::extract::Path(hash): axum::extract::Path<String>| async move {
-                state.1.get(&hash.to_lowercase()).map_or_else(
-                    || (StatusCode::NOT_FOUND, Vec::new()),
-                    |raw| (StatusCode::OK, raw.clone()),
-                )
-            }),
+            get(
+                |State(state): State<Burnchain>,
+                 axum::extract::Path(hash): axum::extract::Path<String>| async move {
+                    state.1.get(&hash.to_lowercase()).map_or_else(
+                        || (StatusCode::NOT_FOUND, Vec::new()),
+                        |raw| (StatusCode::OK, raw.clone()),
+                    )
+                },
+            ),
         )
         // Where this burnchain ends, which is what bounds the node's walk forward.
         // Without it the walk is skipped entirely and the node cannot name a burn
@@ -458,10 +464,8 @@ async fn stand_up() -> Environment {
     // Two peers over the same chain, and a burnchain of this chain's own Bitcoin
     // blocks. The peers are honest here on purpose: `follow_path` is where a peer
     // lies, and this test is about the process rather than about the choice.
-    let (first, first_task) = serve(Served::honest(served.clone(), snapshots()))
-    .await;
-    let (second, second_task) = serve(Served::honest(served.clone(), snapshots()))
-    .await;
+    let (first, first_task) = serve(Served::honest(served.clone(), snapshots())).await;
+    let (second, second_task) = serve(Served::honest(served.clone(), snapshots())).await;
     let (burnchain, burnchain_task) = serve_burnchain().await;
 
     let directory = tempfile::tempdir().expect("a directory");

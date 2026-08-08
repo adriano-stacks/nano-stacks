@@ -546,11 +546,7 @@ impl fmt::Display for SyncError {
             Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
             Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
             Self::TenureLink(error) => write!(formatter, "invalid tenure link: {error}"),
-            Self::TenureGap {
-                tenure,
-                have,
-                want,
-            } => write!(
+            Self::TenureGap { tenure, have, want } => write!(
                 formatter,
                 "tenure {tenure} answered up to height {have} but its tip is {want}"
             ),
@@ -1161,9 +1157,9 @@ impl SyncClient {
                 return Err(SyncError::TenureGap {
                     tenure: known,
                     have: blocks.last().map_or(0, |block| block.header.chain_length),
-                    want: walked.last().map_or(0, |block: &NakamotoBlock| {
-                        block.header.chain_length
-                    }),
+                    want: walked
+                        .last()
+                        .map_or(0, |block: &NakamotoBlock| block.header.chain_length),
                 });
             }
             let block = self.block(cursor).await?;
@@ -1219,12 +1215,7 @@ impl SyncClient {
             tokio::time::sleep(retry_after(response.headers()).unwrap_or(wait)).await;
             wait = wait.saturating_mul(2).min(RATE_LIMIT_CEILING);
         }
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?)
+        Ok(self.client.get(url).send().await?.error_for_status()?)
     }
 }
 
@@ -1350,7 +1341,10 @@ impl TenureSource {
     pub fn prefer(&mut self, endpoints: &[String]) {
         // Stable, so peers the inventory said nothing about keep their order rather
         // than being shuffled by whichever claim arrived first.
-        let preferred: BTreeSet<Url> = endpoints.iter().filter_map(|url| Url::parse(url).ok()).collect();
+        let preferred: BTreeSet<Url> = endpoints
+            .iter()
+            .filter_map(|url| Url::parse(url).ok())
+            .collect();
         self.peers
             .sort_by_key(|peer| u8::from(!preferred.contains(peer.base_url())));
         self.next = 0;
@@ -1385,7 +1379,11 @@ impl TenureSource {
     ///
     /// An endpoint that is not in the pool leaves the cursor alone, which is the right
     /// answer for a peer discovery found and this pool was not rebuilt from yet.
-    async fn spread_from<T, A, F>(&mut self, first: Option<&str>, mut ask: A) -> Result<T, SyncError>
+    async fn spread_from<T, A, F>(
+        &mut self,
+        first: Option<&str>,
+        mut ask: A,
+    ) -> Result<T, SyncError>
     where
         A: FnMut(SyncClient) -> F,
         F: Future<Output = Result<T, SyncError>>,
@@ -1450,9 +1448,10 @@ impl TenureSource {
         from: Option<&str>,
         consensus_hash: ConsensusHash,
     ) -> Result<Vec<NakamotoBlock>, SyncError> {
-        self.spread_from(from, |peer| async move {
-            peer.tenure_at(consensus_hash).await
-        })
+        self.spread_from(
+            from,
+            |peer| async move { peer.tenure_at(consensus_hash).await },
+        )
         .await
     }
 
@@ -1483,7 +1482,8 @@ impl TenureSource {
     /// got back is the block it asked for. That is what makes spreading a repair over
     /// strangers safe in a way spreading a *choice* over them would not be.
     pub async fn block(&mut self, id: StacksBlockId) -> Result<NakamotoBlock, SyncError> {
-        self.spread(|peer| async move { peer.block(id).await }).await
+        self.spread(|peer| async move { peer.block(id).await })
+            .await
     }
 
     /// Look up one burn view's sortition, from whichever peer is next and willing.
@@ -2372,11 +2372,11 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, BlockUploadWire, BurnView, CandidateTip, Signer,
+        BlockUploadWire, BurnView, CandidateTip, RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, Signer,
         SignerSet, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
-        choose_canonical_tip,
-        parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
-        parse_stacker_set, retry_after, validate_tenure, validate_tenure_transition,
+        choose_canonical_tip, parse_block_hash, parse_block_id, parse_consensus_hash,
+        parse_prefixed_hash160, parse_stacker_set, retry_after, validate_tenure,
+        validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -2466,14 +2466,12 @@ mod tests {
         let view = block.header.consensus_hash;
         let mut bytes = 1u32.to_be_bytes().to_vec();
         bytes.extend(block.encode());
-        let encoded = bytes
-            .iter()
-            .fold("0x".to_owned(), |mut hex, byte| {
-                use std::fmt::Write;
+        let encoded = bytes.iter().fold("0x".to_owned(), |mut hex, byte| {
+            use std::fmt::Write;
 
-                write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
-                hex
-            });
+            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+            hex
+        });
         let decoded = super::decode_tenure_blocks(&encoded).expect("the block vector decodes");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].header.consensus_hash, view);
@@ -2557,10 +2555,9 @@ mod tests {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
             }
         });
-        let client = SyncClient::new(
-            Url::parse(&format!("http://{address}/")).expect("a base url"),
-        )
-        .expect("a client");
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
 
         let limited = client.node_info().await.expect_err("the peer said 429");
         assert!(limited.is_rate_limited(), "{limited}");
@@ -2696,11 +2693,8 @@ mod tests {
         // Under the old cap the three retries took ~6s in total and returned.
         // Honouring the header they take 30s each, so the call is still running
         // when a generous bound on the old behaviour has passed.
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            client.node_info(),
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(15), client.node_info()).await;
         assert!(
             outcome.is_err(),
             "the peer asked for 30s and was waited for, rather than asked again in 2"
@@ -2731,7 +2725,11 @@ mod tests {
             .expect("the cache is not poisoned")
             .put(block.block_id(), block.clone());
         assert_eq!(
-            client.block(block.block_id()).await.expect("cached").block_id(),
+            client
+                .block(block.block_id())
+                .await
+                .expect("cached")
+                .block_id(),
             block.block_id()
         );
     }

@@ -185,7 +185,6 @@ fn compact_size(output: &mut Vec<u8>, value: usize) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{

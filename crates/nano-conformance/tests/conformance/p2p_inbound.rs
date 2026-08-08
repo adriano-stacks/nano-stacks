@@ -58,9 +58,9 @@ impl Service for NanoNode {
 
     fn neighbors(&self) -> Vec<nano_p2p::NeighborAddress> {
         vec![nano_p2p::NeighborAddress {
-            address: nano_p2p::PeerAddress::from_ip(std::net::IpAddr::V4(
-                std::net::Ipv4Addr::new(203, 0, 113, 7),
-            )),
+            address: nano_p2p::PeerAddress::from_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 7,
+            ))),
             port: 20444,
             public_key_hash: Hash160::from_bytes([0x77; 20]),
         }]
@@ -109,7 +109,10 @@ impl Reference {
             .expect("send");
 
         let mut header = vec![0; PREAMBLE_ENCODED_SIZE as usize];
-        self.stream.read_exact(&mut header).await.expect("read a preamble");
+        self.stream
+            .read_exact(&mut header)
+            .await
+            .expect("read a preamble");
         let preamble =
             CorePreamble::consensus_deserialize(&mut &header[..]).expect("stacks-core decodes it");
         assert!(
@@ -121,7 +124,10 @@ impl Reference {
         // fresh one would be treated as unsolicited and dropped.
         assert_eq!(preamble.seq, self.seq, "nano's reply is not paired");
         let mut frame = vec![0; preamble.payload_len as usize];
-        self.stream.read_exact(&mut frame).await.expect("read the frame");
+        self.stream
+            .read_exact(&mut frame)
+            .await
+            .expect("read the frame");
         let mut whole = header;
         whole.extend_from_slice(&frame);
         StacksMessage::consensus_deserialize(&mut &whole[..])
@@ -135,14 +141,16 @@ async fn dial_nano() -> (Reference, Secp256k1PublicKey) {
         .await
         .expect("bind");
     let address = listener.local_addr().expect("the bound address");
-    let mut local = LocalPeer::quiet(StacksPrivateKey::from_seed(b"nano listener"), address.port());
+    let mut local = LocalPeer::quiet(
+        StacksPrivateKey::from_seed(b"nano listener"),
+        address.port(),
+    );
     local.address = nano_p2p::PeerAddress::from_ip(address.ip());
     local.data_url = format!("http://{address}");
     local.services = services::RPC | services::RELAY;
-    let nano_key = Secp256k1PublicKey::from_slice(
-        &local.private_key.public_key().to_bytes_compressed(),
-    )
-    .expect("nano's key is a secp256k1 key");
+    let nano_key =
+        Secp256k1PublicKey::from_slice(&local.private_key.public_key().to_bytes_compressed())
+            .expect("nano's key is a secp256k1 key");
 
     tokio::spawn(async move {
         let mut conversations = tokio::task::JoinSet::new();
@@ -227,7 +235,10 @@ async fn stacks_core_handshakes_with_nano_and_exchanges_inventory() {
             .host_str()
             .is_some()
     );
-    assert_eq!(accept.heartbeat_interval, nano_p2p::inbound::HEARTBEAT_INTERVAL_SECS);
+    assert_eq!(
+        accept.heartbeat_interval,
+        nano_p2p::inbound::HEARTBEAT_INTERVAL_SECS
+    );
     assert_eq!(
         accept.handshake.services & u16::from(blockstack_lib::net::ServiceFlags::RPC as u8),
         u16::from(blockstack_lib::net::ServiceFlags::RPC as u8)
@@ -252,14 +263,19 @@ async fn stacks_core_handshakes_with_nano_and_exchanges_inventory() {
             assert_eq!(neighbors.neighbors.len(), 1);
             assert_eq!(neighbors.neighbors[0].port, 20444);
         }
-        ref other => panic!("nano answered GetNeighbors with a {}", other.get_message_name()),
+        ref other => panic!(
+            "nano answered GetNeighbors with a {}",
+            other.get_message_name()
+        ),
     }
 
     // ---- Inventory, in both directions: nano's answer decoded as a
     // `NakamotoInvData` by the implementation that defines what one is.
     let reply = peer
         .exchange(StacksMessageType::GetNakamotoInv(GetNakamotoInvData {
-            consensus_hash: blockstack_lib::chainstate::burn::ConsensusHash(*KNOWN_CYCLE.as_bytes()),
+            consensus_hash: blockstack_lib::chainstate::burn::ConsensusHash(
+                *KNOWN_CYCLE.as_bytes(),
+            ),
         }))
         .await;
     match reply.payload {

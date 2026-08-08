@@ -19,10 +19,10 @@
 
 use nano_marf::{MarfValue, VersionedMarf};
 
+use blockstack_lib::chainstate::stacks::index::ClarityMarfTrieId;
 use blockstack_lib::chainstate::stacks::index::MARFValue as CoreMarfValue;
 use blockstack_lib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash as CoreTrieHash};
-use blockstack_lib::chainstate::stacks::index::ClarityMarfTrieId;
 
 /// A deterministic pseudo-random source: tests must not vary run to run.
 struct Rng(u64);
@@ -210,4 +210,3 @@ fn a_fork_seals_the_same_root_on_both_branches() {
     );
     assert_eq!(nano_root, core_root, "extending one branch agrees");
 }
-

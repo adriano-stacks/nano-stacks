@@ -148,5 +148,9 @@ fn a_clean_state_directory_still_opens() {
     let state = directory.path().join("chainstate");
     let tip = opened_state(&state).tip().expect("a sealed state");
     let reopened = ChainState::open(captured_network(), &state).expect("a clean directory opens");
-    assert_eq!(reopened.tip(), Some(tip), "the reopened tip is the sealed one");
+    assert_eq!(
+        reopened.tip(),
+        Some(tip),
+        "the reopened tip is the sealed one"
+    );
 }

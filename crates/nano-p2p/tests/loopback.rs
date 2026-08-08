@@ -189,7 +189,9 @@ async fn chatty(
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let request = read_message(&mut stream).await.expect("a handshake arrives");
+        let request = read_message(&mut stream)
+            .await
+            .expect("a handshake arrives");
         let accept = nano_p2p::wire::HandshakeAccept {
             handshake: nano_p2p::Handshake {
                 address: nano_p2p::PeerAddress::from_bytes([0; 16]),
@@ -358,9 +360,15 @@ async fn a_peer_we_dialled_gets_its_own_requests_answered() {
     .await;
 
     let dialler = LocalPeer::quiet(StacksPrivateKey::from_seed(b"dialler"), 20444);
-    let mut session = Session::open(address, &dialler, Protocol::testnet(), view(900_001), TIMEOUT)
-        .await
-        .expect("the handshake completes");
+    let mut session = Session::open(
+        address,
+        &dialler,
+        Protocol::testnet(),
+        view(900_001),
+        TIMEOUT,
+    )
+    .await
+    .expect("the handshake completes");
     // Without a service there is nothing to answer `GetNeighbors` with, which is
     // correct for a node that serves nothing and is not what this test is about.
     session.serving(Arc::new(TestService {
@@ -530,8 +538,7 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
         height: 900_000,
         ..TestService::default()
     });
-    let (first, _, first_task) =
-        listening(service.clone(), Some("http://127.0.0.1:20443")).await;
+    let (first, _, first_task) = listening(service.clone(), Some("http://127.0.0.1:20443")).await;
     let (second, _, _second_task) =
         listening(service.clone(), Some("http://127.0.0.1:20543")).await;
     // A third peer that serves no HTTP: it should be a session, and not an
@@ -585,7 +592,11 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     // this tenure" unanswerable.
     let published = discovered.claims();
     assert_eq!(published.len(), 3);
-    assert!(published.iter().all(|claim| claim.tenures.get(0) == Some(true)));
+    assert!(
+        published
+            .iter()
+            .all(|claim| claim.tenures.get(0) == Some(true))
+    );
     assert_eq!(
         nano_p2p::assign_tenures(&published, &[0]).len(),
         1,
@@ -594,11 +605,20 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
 
     // Every peer answers the same inventory question, because one peer's inventory
     // is one peer's claim.
-    let claims = swarm.tenure_claims(KNOWN_CYCLE, &mut nano_p2p::Round::default()).await;
+    let claims = swarm
+        .tenure_claims(KNOWN_CYCLE, &mut nano_p2p::Round::default())
+        .await;
     assert_eq!(claims.len(), 3);
-    assert!(claims.iter().all(|claim| claim.tenures.get(0) == Some(true)));
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim.tenures.get(0) == Some(true))
+    );
     assert_eq!(
-        claims.iter().filter(|claim| claim.endpoint.is_some()).count(),
+        claims
+            .iter()
+            .filter(|claim| claim.endpoint.is_some())
+            .count(),
         2
     );
     // A nack is an answer and not a fault, so nobody is dropped for it.
@@ -626,7 +646,11 @@ async fn a_swarm_holds_several_peers_and_notices_one_leaving() {
     // it.
     assert_eq!(round.claiming, 1);
     assert_eq!(discovered.connected(), 2);
-    assert!(!discovered.endpoints().contains(&"http://127.0.0.1:20443".to_owned()));
+    assert!(
+        !discovered
+            .endpoints()
+            .contains(&"http://127.0.0.1:20443".to_owned())
+    );
     // And it is still known, with a failure against it rather than forgotten.
     let known = swarm
         .peer_table()

@@ -93,7 +93,8 @@ fn reference(directory: &Path) -> Vec<([u8; 32], Ledger, Option<nano_primitives:
             &mut |_, _| {},
         );
         assert_eq!(
-            depth.completed, 1,
+            depth.completed,
+            1,
             "the reference run replays block {}: {:?}",
             offset + 1,
             depth.first_divergence
@@ -303,8 +304,9 @@ fn a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent() {
     );
     let (mut chainstate, _) =
         durable_replay_chainstate(&fixtures(), killed.path()).expect("reopen at the end");
-    let (expected_tip, expected_ledger, expected_root) =
-        reference.last().expect("the reference reached its last block");
+    let (expected_tip, expected_ledger, expected_root) = reference
+        .last()
+        .expect("the reference reached its last block");
     assert_eq!(chainstate.tip(), Some(*expected_tip));
     assert_eq!(chainstate.state_content_root(*expected_tip), *expected_root);
     assert_eq!(ledger_of(&mut chainstate), *expected_ledger);
@@ -373,10 +375,7 @@ fn a_kill_inside_a_tenure_transition_leaves_the_complete_parent() {
     // way to see that this hit eight different ones rather than one eight times.
     println!("tenure-start blocks interrupted: {interrupted:?}");
     assert_eq!(
-        interrupted
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .len(),
+        interrupted.iter().collect::<BTreeSet<_>>().len(),
         TENURE_KILLS,
         "each kill interrupted a different tenure transition: {interrupted:?}"
     );
@@ -399,8 +398,9 @@ fn a_kill_inside_a_tenure_transition_leaves_the_complete_parent() {
     );
     let (mut chainstate, _) =
         durable_replay_chainstate(&fixtures(), killed.path()).expect("reopen at the end");
-    let (expected_tip, expected_ledger, expected_root) =
-        reference.last().expect("the reference reached its last block");
+    let (expected_tip, expected_ledger, expected_root) = reference
+        .last()
+        .expect("the reference reached its last block");
     assert_eq!(chainstate.tip(), Some(*expected_tip));
     assert_eq!(chainstate.state_content_root(*expected_tip), *expected_root);
     assert_eq!(ledger_of(&mut chainstate), *expected_ledger);

@@ -89,7 +89,10 @@ async fn nano_finds_mainnet_peers_to_fetch_from_without_a_hosted_api() {
         // A fresh identity, so the peers' own backoff tables are not part of the
         // test, and no services: this node serves nothing yet, and saying otherwise
         // would have peers spend connection slots on it.
-        LocalPeer::quiet(StacksPrivateKey::from_seed(b"nano-conformance discovery"), 20444),
+        LocalPeer::quiet(
+            StacksPrivateKey::from_seed(b"nano-conformance discovery"),
+            20444,
+        ),
         Protocol::mainnet(),
         SwarmLimits {
             outbound: 8,
@@ -263,7 +266,10 @@ async fn bulk_history_comes_from_several_mainnet_peers() {
         }
         cursor = next;
     }
-    println!("{fetched} tenures, {blocks} blocks, over {} peers", history.len());
+    println!(
+        "{fetched} tenures, {blocks} blocks, over {} peers",
+        history.len()
+    );
     assert!(
         fetched >= 3,
         "only {fetched} tenures came back, so nothing was measured"
@@ -344,7 +350,10 @@ async fn mainnet_inventories_schedule_a_forward_download() {
                 && (0..claim.tenures.len()).any(|bit| claim.tenures.get(bit) == Some(true))
         })
         .count();
-    println!("{} peers answered, {claiming} claiming tenures of it", claims.len());
+    println!(
+        "{} peers answered, {claiming} claiming tenures of it",
+        claims.len()
+    );
     assert!(
         claiming >= 2,
         "only {claiming} peer(s) claimed any of the cycle, so no schedule can be spread"
@@ -403,7 +412,9 @@ async fn mainnet_inventories_schedule_a_forward_download() {
 ///
 /// The consensus hash naming it comes from the peer, which production would not do —
 /// see the caller. What is under test here is the download.
-async fn name_the_cycle(peer: &nano_sync::SyncClient) -> (u64, u64, nano_primitives::ConsensusHash) {
+async fn name_the_cycle(
+    peer: &nano_sync::SyncClient,
+) -> (u64, u64, nano_primitives::ConsensusHash) {
     let pox = peer.pox_info().await.expect("a peer states the calendar");
     let payouts = nano_node::payout_schedule(&pox).expect("a payout schedule");
     let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);

@@ -75,7 +75,9 @@ impl ComplexWord for Let {
                 // checks still see it; its empty locals are never read.
                 Some(id) if generator.binding_uses[id as usize] == 0 => {
                     drop_value(builder, &ty);
-                    generator.bindings.insert(name.clone(), ty, Vec::new(), binding);
+                    generator
+                        .bindings
+                        .insert(name.clone(), ty, Vec::new(), binding);
                 }
                 _ if spilled => {
                     let delta = generator.spill_cursor;

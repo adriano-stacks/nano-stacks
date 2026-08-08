@@ -10,12 +10,12 @@ use crate::runtime::BurnchainSource;
 use nano_bitcoin::BitcoinSource as _;
 use nano_chainstate::SignerSet;
 use nano_crypto::StacksPrivateKey;
+use nano_p2p::Discovered;
 use nano_primitives::Network;
 use nano_signer::{
     AccumulatedCoinbase, ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner,
     LiveSigner, SignerConfig as EmbeddedSignerConfig, SignerService, StateAnnouncer,
 };
-use nano_p2p::Discovered;
 use nano_stackerdb::StackerDbContract;
 use nano_sync::{PoxInfo, TenureSource};
 use tokio::time::sleep;
@@ -168,8 +168,12 @@ async fn start(
             eprintln!("signer state announcement failed: {error}");
             replicas.rotate();
         }
-        if let Err(error) =
-            catch_up(&mut peers, live.validator_mut(), config.node.max_sync_blocks).await
+        if let Err(error) = catch_up(
+            &mut peers,
+            live.validator_mut(),
+            config.node.max_sync_blocks,
+        )
+        .await
         {
             eprintln!("signer chainstate sync failed: {error}");
             sleep(interval).await;

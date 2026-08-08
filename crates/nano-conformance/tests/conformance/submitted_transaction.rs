@@ -88,7 +88,9 @@ fn published_receipt(block: &NakamotoBlock, txid: Sha256Sum) -> Option<serde_jso
         .as_array()?
         .iter()
         .find(|transaction| {
-            transaction["txid"].as_str().map(|id| id.trim_start_matches("0x"))
+            transaction["txid"]
+                .as_str()
+                .map(|id| id.trim_start_matches("0x"))
                 == Some(&txid.to_string())
         })
         .cloned()
@@ -121,7 +123,10 @@ async fn post_to_the_rpc(state: RpcState, transaction: &Transaction) {
 }
 
 /// The accounts a mempool has to be able to ask about, read out of the state.
-fn tip_accounts(chainstate: &mut ChainState, transaction: &Transaction) -> HashMap<nano_address::StacksAddress, Account> {
+fn tip_accounts(
+    chainstate: &mut ChainState,
+    transaction: &Transaction,
+) -> HashMap<nano_address::StacksAddress, Account> {
     let mut accounts = HashMap::new();
     if let Some(address) = transaction.origin_address()
         && let Ok(principal) = clarity::vm::types::PrincipalData::parse(&address.to_string())
@@ -170,7 +175,9 @@ fn replay_below(fixtures: &Path, position: usize) -> Option<ChainState> {
 async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     let fixtures = fixtures();
     let Some((position, dropped)) = first_mempool_block() else {
-        nano_conformance::skip_gate("the capture holds no mid-tenure block of mempool transactions");
+        nano_conformance::skip_gate(
+            "the capture holds no mid-tenure block of mempool transactions",
+        );
         return;
     };
     let Some(chainstate) = replay_below(&fixtures, position) else {
@@ -188,9 +195,9 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     // One chainstate, two roles, the way the node holds it: the RPC reads
     // accounts through it and the miner builds on it, under one lock.
     let shared = Arc::new(Mutex::new(chainstate));
-    let mempool = Arc::new(Mutex::new(Mempool::new(nano_conformance::captured_network(
-        &fixtures,
-    ))));
+    let mempool = Arc::new(Mutex::new(Mempool::new(
+        nano_conformance::captured_network(&fixtures),
+    )));
     let state = RpcState::new(nano_conformance::captured_network(&fixtures))
         .with_chain(shared.clone() as Arc<Mutex<dyn ChainAccess>>)
         .with_mempool(mempool.clone());
@@ -229,8 +236,14 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     // carrying nothing — and moving the check has to leave the block a miner
     // should not publish still refused.
     let miner = nano_crypto::StacksPrivateKey::from_seed(b"nano miner");
-    let nothing_offered = chainstate
-        .assemble_nakamoto_block_selecting(context, &[], parent, candidate.clone(), &[], &miner);
+    let nothing_offered = chainstate.assemble_nakamoto_block_selecting(
+        context,
+        &[],
+        parent,
+        candidate.clone(),
+        &[],
+        &miner,
+    );
     assert!(
         nothing_offered
             .err()
@@ -243,14 +256,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         "the replay did not stop on the parent of the block being replaced"
     );
     let (built, applied) = chainstate
-        .assemble_nakamoto_block_selecting(
-            context,
-            &[],
-            parent,
-            candidate,
-            &selected,
-            &miner,
-        )
+        .assemble_nakamoto_block_selecting(context, &[], parent, candidate, &selected, &miner)
         .expect("the block assembles");
     drop(chainstate);
 
@@ -275,7 +281,8 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
 
     // Emitted: the payload an observer is sent names it, with the result and the
     // cost stacks-core published for the same execution.
-    let payload = nano_rpc::new_block_payload(&built, &applied, &nano_rpc::BlockEventContext::default());
+    let payload =
+        nano_rpc::new_block_payload(&built, &applied, &nano_rpc::BlockEventContext::default());
     let emitted = payload["transactions"]
         .as_array()
         .expect("the payload lists its transactions")

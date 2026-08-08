@@ -238,9 +238,7 @@ impl ComplexWord for TupleMerge {
                 let fields: Vec<_> = rhs
                     .get_type_map()
                     .keys()
-                    .filter_map(|name| {
-                        Some((name.clone(), result_tuple.field_type(name)?.clone()))
-                    })
+                    .filter_map(|name| Some((name.clone(), result_tuple.field_type(name)?.clone())))
                     .collect();
                 clarity::vm::types::TupleTypeSignature::try_from(fields).ok()
             }

@@ -346,7 +346,11 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
         return;
     };
     assert_eq!(
-        recorded.entries().iter().copied().collect::<BTreeMap<_, _>>(),
+        recorded
+            .entries()
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>(),
         published
     );
 }

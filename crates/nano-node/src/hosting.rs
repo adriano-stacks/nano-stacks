@@ -28,10 +28,7 @@
 //! over now, rebuilt as peer discovery finds more, and each says which peer served
 //! it so a run can show that no single one was load bearing.
 
-use std::{
-    collections::BTreeSet,
-    time::Duration,
-};
+use std::{collections::BTreeSet, time::Duration};
 
 use nano_bitcoin::BitcoinSource as _;
 use nano_p2p::Discovered;
@@ -73,7 +70,13 @@ pub async fn validate_proposals(
         // round is one proposal: forgiving them here is what stops a peer that was
         // unreachable once from being written off for the life of the node.
         peers.forgive_throttles();
-        refresh_pool(&config, discovered.as_ref(), &mut peers, &mut endpoints, "validating proposals");
+        refresh_pool(
+            &config,
+            discovered.as_ref(),
+            &mut peers,
+            &mut endpoints,
+            "validating proposals",
+        );
         let request = tokio::select! {
             request = requests.recv() => request,
             // A validator that only catches up when asked would execute the whole
@@ -126,7 +129,11 @@ fn refresh_pool(
     if rebuilt.is_empty() {
         return;
     }
-    println!("{what} over {} peers: {}", rebuilt.len(), rebuilt.endpoints().join(", "));
+    println!(
+        "{what} over {} peers: {}",
+        rebuilt.len(),
+        rebuilt.endpoints().join(", ")
+    );
     *peers = TenureSource::new(rebuilt.into_clients());
     *endpoints = found;
 }
@@ -426,7 +433,10 @@ impl Replicas {
             .collect::<Vec<_>>();
         Self {
             requested: endpoints.to_vec(),
-            endpoints: peers.iter().map(|peer| peer.base_url().to_string()).collect(),
+            endpoints: peers
+                .iter()
+                .map(|peer| peer.base_url().to_string())
+                .collect(),
             peers,
             clients,
             cursor: 0,
@@ -470,7 +480,10 @@ impl Replicas {
     /// Answers nothing while the turn has not moved, so an ordinary round keeps the
     /// connections it had rather than rebuilding them every poll; `serving` is
     /// updated to whatever it hands back.
-    pub fn retargeted(&mut self, serving: &mut Option<String>) -> Option<(SyncClient, StackerDbClient)> {
+    pub fn retargeted(
+        &mut self,
+        serving: &mut Option<String>,
+    ) -> Option<(SyncClient, StackerDbClient)> {
         let (peer, client) = self.current()?;
         let endpoint = peer.base_url().to_string();
         if serving.as_deref() == Some(endpoint.as_str()) {

@@ -274,10 +274,7 @@ impl BitcoinWallet {
         if outputs.is_empty() {
             return Err(MinerError::MissingInputs);
         }
-        Ok(outputs
-            .iter()
-            .map(|output| output.amount.to_sat())
-            .sum())
+        Ok(outputs.iter().map(|output| output.amount.to_sat()).sum())
     }
 
     /// Locate a confirmed transaction by the Bitcoin block and position that contain it.

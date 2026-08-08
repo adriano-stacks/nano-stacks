@@ -143,7 +143,10 @@ fn the_capture_states_the_pox_bit_at_every_boundary_it_crosses() {
         }
         previous = Some(bits);
     }
-    assert_eq!(boundaries, 5, "the capture crosses five reward cycle boundaries");
+    assert_eq!(
+        boundaries, 5,
+        "the capture crosses five reward cycle boundaries"
+    );
 }
 
 /// Derive from burn 360 to 479 and match the capture at every block.
@@ -169,12 +172,8 @@ fn a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain() {
     // too (`SortitionTracker` reads it off the checkpoint rather than being
     // configured with one), so it is read off here the same way.
     let mut snapshot = seed_from(seed);
-    snapshot.pox_id = unbroken_pox_id_for(
-        snapshot.bitcoin_header_hash,
-        snapshot.sortition_id,
-        64,
-    )
-    .expect("the seed's identifier states an unbroken PoX history");
+    snapshot.pox_id = unbroken_pox_id_for(snapshot.bitcoin_header_hash, snapshot.sortition_id, 64)
+        .expect("the seed's identifier states an unbroken PoX history");
     // The seed's winning VRF seed, recovered from its own Bitcoin block. A capture's
     // `snapshots.json` names the winning commitment by txid but does not carry the
     // seed it put up, and the next sortition mixes that seed -- so without it the
@@ -188,13 +187,14 @@ fn a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain() {
         .expect("the capture holds the seed's Bitcoin block")
         .operations
         .iter()
-        .find_map(|operation| match (operation.txid == winning, &operation.kind) {
-            (
-                true,
-                nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit { new_seed, .. },
-            ) => Some(*new_seed),
-            _ => None,
-        });
+        .find_map(
+            |operation| match (operation.txid == winning, &operation.kind) {
+                (true, nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }) => {
+                    Some(*new_seed)
+                }
+                _ => None,
+            },
+        );
     assert!(
         snapshot.winner_vrf_seed.is_some(),
         "the seed's winning commitment is in its own Bitcoin block"
@@ -259,7 +259,10 @@ fn a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain() {
     }
 
     assert_eq!(crossed, vec![380, 400, 420, 440, 460]);
-    assert_eq!(u64::try_from(checked).expect("a count fits u64"), LAST - SEED);
+    assert_eq!(
+        u64::try_from(checked).expect("a count fits u64"),
+        LAST - SEED
+    );
     assert_eq!(
         tracker.tip().pox_id,
         PoxId::from_bits(vec![true; 25]),

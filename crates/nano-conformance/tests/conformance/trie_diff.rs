@@ -22,8 +22,8 @@
 
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
-use blockstack_lib::chainstate::stacks::index::TrieMerkleProofType;
 use blockstack_lib::chainstate::stacks::index::TrieMerkleProof;
+use blockstack_lib::chainstate::stacks::index::TrieMerkleProofType;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::StacksBlockId;
 
@@ -87,12 +87,15 @@ fn the_networks_root_children_name_the_missing_write() {
         setting("NANO_TRIE_PARENT"),
         setting("NANO_TRIE_WRITES"),
     ) else {
-        nano_conformance::skip_gate("NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES are needed");
+        nano_conformance::skip_gate(
+            "NANO_TRIE_PROOF, NANO_TRIE_STATE, NANO_TRIE_PARENT and NANO_TRIE_WRITES are needed",
+        );
         return;
     };
 
     let document: serde_json::Value =
-        serde_json::from_slice(&fs::read(&proof).expect("read the proof")).expect("parse the proof");
+        serde_json::from_slice(&fs::read(&proof).expect("read the proof"))
+            .expect("parse the proof");
     let encoded = document
         .get("proof")
         .and_then(serde_json::Value::as_str)
@@ -128,9 +131,7 @@ fn the_networks_root_children_name_the_missing_write() {
             differing.push(*character);
         }
     }
-    println!(
-        "root children of ours the network's proof does not contain: {differing:?}"
-    );
+    println!("root children of ours the network's proof does not contain: {differing:?}");
 
     // The proof descends through one child and omits it, so that one always
     // looks different. Naming it leaves the real divergence.

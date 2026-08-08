@@ -21,13 +21,16 @@ use blockstack_lib::chainstate::nakamoto::{NakamotoBlock as CoreBlock, TxToProce
 use stacks_common::codec::StacksMessageCodec;
 
 /// The transactions of a block, however stacks-core wraps them.
-fn core_transactions(block: &CoreBlock) -> Vec<&blockstack_lib::chainstate::stacks::StacksTransaction> {
+fn core_transactions(
+    block: &CoreBlock,
+) -> Vec<&blockstack_lib::chainstate::stacks::StacksTransaction> {
     block
         .txs()
         .map(|transaction| match transaction {
-            TxToProcess::Execute(transaction) | TxToProcess::Skip { tx: transaction, .. } => {
-                transaction
-            }
+            TxToProcess::Execute(transaction)
+            | TxToProcess::Skip {
+                tx: transaction, ..
+            } => transaction,
         })
         .collect()
 }

@@ -19,8 +19,8 @@ use nano_primitives::Network;
 use nano_vm::{MarfStore, Vm};
 
 use clarity::vm::ClarityVersion;
-use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::Value;
+use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::types::QualifiedContractIdentifier;
 use stacks_common::codec::StacksMessageCodec;
 

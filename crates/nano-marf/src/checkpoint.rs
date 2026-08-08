@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use crate::{
     CheckpointManifest, ChildTarget, MarfBlockId, MarfError, MarfValue, TrieChild, TrieHash,
-    TrieNode, TrieNodeId, VersionedMarf, internal_node_hash, leaf_hash, node_id_for_children, slots,
-    state_root, storage::TrieStorage,
+    TrieNode, TrieNodeId, VersionedMarf, internal_node_hash, leaf_hash, node_id_for_children,
+    slots, state_root, storage::TrieStorage,
 };
 
 const ROOT_OFFSET: usize = 36;
@@ -449,9 +449,8 @@ impl<'a> Records<'a> {
     }
 
     fn record(&self, block_id: u32, offset: u64) -> Result<Record, CheckpointError> {
-        let offset = usize::try_from(offset).map_err(|_| {
-            CheckpointError::InvalidCheckpoint("blob offset exceeds address space")
-        })?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| CheckpointError::InvalidCheckpoint("blob offset exceeds address space"))?;
         let header = self.blobs.read(offset, ROOT_OFFSET + 32)?;
         let root = TrieHash::from_bytes(fixed(&header[ROOT_OFFSET..])?);
         Ok(Record {
@@ -598,7 +597,11 @@ impl Importer<'_> {
         let (children, hashes) = self.import_children(record.block_id, &pointers)?;
         let (slot_pointers, slot_hashes) = slots(TrieNodeId::Node256, &children, &hashes);
         let hash = internal_node_hash(TrieNodeId::Node256, &slot_pointers, &[], &slot_hashes)?;
-        let index = self.write(record.block_id, hash, &TrieNode::Internal { path, children })?;
+        let index = self.write(
+            record.block_id,
+            hash,
+            &TrieNode::Internal { path, children },
+        )?;
         Ok((index, hash))
     }
 
@@ -695,9 +698,12 @@ impl Importer<'_> {
     }
 
     fn identifier(&self, block_id: u32) -> Result<u32, CheckpointError> {
-        self.identifiers.get(&block_id).copied().ok_or(
-            CheckpointError::InvalidCheckpoint("node points to unknown block ID"),
-        )
+        self.identifiers
+            .get(&block_id)
+            .copied()
+            .ok_or(CheckpointError::InvalidCheckpoint(
+                "node points to unknown block ID",
+            ))
     }
 
     fn decode_node(
@@ -806,9 +812,11 @@ impl Importer<'_> {
     }
 
     fn block_for_id(&self, id: u32) -> Result<MarfBlockId, CheckpointError> {
-        self.records.hash_for_id(id)?.ok_or(
-            CheckpointError::InvalidCheckpoint("node points to unknown block ID"),
-        )
+        self.records
+            .hash_for_id(id)?
+            .ok_or(CheckpointError::InvalidCheckpoint(
+                "node points to unknown block ID",
+            ))
     }
 }
 

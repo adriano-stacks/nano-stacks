@@ -107,7 +107,9 @@ impl fmt::Display for WireError {
             Self::UnknownMessage(id) => write!(formatter, "unknown message identifier {id}"),
             Self::InvalidUtf8 => formatter.write_str("string is not valid UTF-8"),
             Self::InvalidContractName => formatter.write_str("invalid contract name"),
-            Self::PayloadTooLong(length) => write!(formatter, "payload of {length} bytes is too long"),
+            Self::PayloadTooLong(length) => {
+                write!(formatter, "payload of {length} bytes is too long")
+            }
             Self::DuplicateBlock => formatter.write_str("block pushed twice in one message"),
             Self::Block(error) => write!(formatter, "invalid pushed block: {error}"),
             Self::Transaction(error) => write!(formatter, "invalid transaction: {error}"),
@@ -495,7 +497,15 @@ impl Message {
     ) -> Result<Self, WireError> {
         // An originated message has no relayers, so the frame opens with a
         // zero-length vector rather than being able to skip the field.
-        Self::relay(peer_version, network_id, view, seq, Vec::new(), payload, private_key)
+        Self::relay(
+            peer_version,
+            network_id,
+            view,
+            seq,
+            Vec::new(),
+            payload,
+            private_key,
+        )
     }
 
     /// Build and sign a message this node is passing on.
@@ -705,9 +715,9 @@ fn decode_payload(reader: &mut Reader<'_>) -> Result<Payload, WireError> {
                 },
             ))
         }
-        id::GET_NAKAMOTO_INVENTORY => Ok(Payload::GetNakamotoInventory(
-            ConsensusHash::from_bytes(reader.array()?),
-        )),
+        id::GET_NAKAMOTO_INVENTORY => Ok(Payload::GetNakamotoInventory(ConsensusHash::from_bytes(
+            reader.array()?,
+        ))),
         id::NAKAMOTO_INVENTORY => Ok(Payload::NakamotoInventory(reader.bit_vec()?)),
         id::NAKAMOTO_BLOCKS => Ok(Payload::NakamotoBlocks(read_pushed_blocks(reader)?)),
         _ if id::UNHANDLED.contains(&id) => Ok(Payload::Unhandled(id)),

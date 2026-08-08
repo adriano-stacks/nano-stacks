@@ -124,7 +124,10 @@ impl std::fmt::Debug for LocalPeer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LocalPeer")
-            .field("public_key", &hex(&self.private_key.public_key().to_bytes_compressed()))
+            .field(
+                "public_key",
+                &hex(&self.private_key.public_key().to_bytes_compressed()),
+            )
             .field("address", &self.address)
             .field("port", &self.port)
             .field("services", &self.services)
@@ -205,7 +208,10 @@ pub enum SessionError {
     /// The peer did not answer within the deadline.
     Timeout,
     /// The peer is on another network, or speaks another major version.
-    WrongNetwork { peer_version: u32, network_id: u32 },
+    WrongNetwork {
+        peer_version: u32,
+        network_id: u32,
+    },
     /// The peer supports an older epoch than nano does, so it cannot serve a 4.0
     /// chain even if it is honest.
     StaleEpoch(u32),
@@ -456,10 +462,7 @@ impl Framed {
     }
 
     /// Read one message, waiting no later than `until` for it.
-    async fn read_until(
-        &mut self,
-        until: tokio::time::Instant,
-    ) -> Result<Message, SessionError> {
+    async fn read_until(&mut self, until: tokio::time::Instant) -> Result<Message, SessionError> {
         loop {
             if let Some(message) = self.take_message()? {
                 return Ok(message);
@@ -502,7 +505,8 @@ impl Framed {
             }
             let held = self.reserve();
             let outcome = self.stream.try_read(&mut self.buffer[held..]);
-            self.buffer.truncate(held + outcome.as_ref().copied().unwrap_or(0));
+            self.buffer
+                .truncate(held + outcome.as_ref().copied().unwrap_or(0));
             match outcome {
                 // A clean close is not an error here: whatever the peer managed to
                 // send is still worth having, and the next read will report the end.
@@ -549,8 +553,9 @@ impl Framed {
             // and services this node fetches from stay the ones from the handshake it
             // dialled into, so a peer cannot redirect our fetches mid-conversation.
             Payload::Handshake(handshake) => {
-                let key = StacksPublicKey::from_bytes(&handshake.public_key)
-                    .map_err(|error| SessionError::Wire(crate::wire::WireError::Signature(error)))?;
+                let key = StacksPublicKey::from_bytes(&handshake.public_key).map_err(|error| {
+                    SessionError::Wire(crate::wire::WireError::Signature(error))
+                })?;
                 if message.verify(&key).is_err() {
                     return Err(SessionError::Unauthenticated);
                 }
@@ -953,7 +958,10 @@ fn initial_seq() -> u32 {
         .map_or(0, |since| since.subsec_nanos())
 }
 
-pub(crate) async fn deadline<F: Future>(timeout: Duration, future: F) -> Result<F::Output, SessionError> {
+pub(crate) async fn deadline<F: Future>(
+    timeout: Duration,
+    future: F,
+) -> Result<F::Output, SessionError> {
     tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| SessionError::Timeout)

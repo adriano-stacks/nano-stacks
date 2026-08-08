@@ -17,14 +17,14 @@ use std::{
 use fs2::FileExt as _;
 
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource};
-use nano_crypto::StacksPublicKey;
 use nano_chainstate::{
-    MINER_REWARD_MATURITY, Signer, SignerSet,
-    BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting,
+    BitcoinBlockContext, ChainState, MINER_REWARD_MATURITY, NakamotoBlock, Signer, SignerSet,
+    TenureAccounting,
 };
+use nano_crypto::StacksPublicKey;
+use nano_p2p::Discovered;
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
-use nano_p2p::Discovered;
 use nano_sync::{Node, PeerPool, PoxInfo, SyncClient, SyncError, TenureSource};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
@@ -207,9 +207,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // to be discovered gets no transport, and falls back to what it always did.
     let phase = Phase::start("joining the peer network");
     let discovered = match config.network() {
-        Some(network) => {
-            start_transport(&config, network, &advertised, &relay, &mut roles).await
-        }
+        Some(network) => start_transport(&config, network, &advertised, &relay, &mut roles).await,
         None => None,
     };
     drop(phase);
@@ -247,8 +245,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // reads what a caller asks for, and a node that keeps blocks nothing serves
     // is only using disk.
     let archive = keep_executed_blocks(&config, executor.as_ref()).await;
-    let (wiring, api_to_loop, hosted) =
-        ApiWiring::new(executor.clone(), mempool.clone(), archive);
+    let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone(), archive);
     let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
     publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
@@ -455,7 +452,8 @@ fn round_report(from: u64, round: &CatchUpRound, tip: &NakamotoBlock) -> String 
 /// eighty-three blocks claiming twenty-two — and left a node executing *nothing*,
 /// round after round, saying so only in an error whose wording is about the peer.
 fn failed_round_report(from: u64, tip: &NakamotoBlock) -> String {
-    let executed = usize::try_from(tip.header.chain_length.saturating_sub(from)).unwrap_or(usize::MAX);
+    let executed =
+        usize::try_from(tip.header.chain_length.saturating_sub(from)).unwrap_or(usize::MAX);
     batch_report(from, executed, tip, ", then the round failed")
 }
 
@@ -638,8 +636,12 @@ async fn take_admitted(inputs: AdmittedInputs<'_>) {
 
 /// The store staged blocks wait in, or the role's own failure.
 fn open_staging(config: &Config) -> Result<Staging, Role> {
-    Staging::open(&config.chainstate_dir(NODE_CHAINSTATE).join("staging.sqlite"))
-        .map_err(|error| Err(format!("cannot open the staging store: {error}")))
+    Staging::open(
+        &config
+            .chainstate_dir(NODE_CHAINSTATE)
+            .join("staging.sqlite"),
+    )
+    .map_err(|error| Err(format!("cannot open the staging store: {error}")))
 }
 
 /// What the follow loop carries from one round to the next.
@@ -751,18 +753,22 @@ async fn follow(follower: Follower) -> Role {
     loop {
         rounds.history.refresh(&config, discovered.as_ref());
         rounds
-            .choose_peer(&config, discovered.as_ref(), executor.as_ref(), &pox, state.as_ref())
+            .choose_peer(
+                &config,
+                discovered.as_ref(),
+                executor.as_ref(),
+                &pox,
+                state.as_ref(),
+            )
             .await;
-        take_admitted(
-            AdmittedInputs {
-                offered: &mut offered,
-                submitted: &mut submitted,
-                executor: executor.as_ref(),
-                mempool: &mempool,
-                relay: &relay,
-                staging: &staging,
-            },
-        )
+        take_admitted(AdmittedInputs {
+            offered: &mut offered,
+            submitted: &mut submitted,
+            executor: executor.as_ref(),
+            mempool: &mempool,
+            relay: &relay,
+            staging: &staging,
+        })
         .await;
         // Following the peer's current tenure is pointless while this node is
         // far from it — the tenure descends from blocks it has not executed, so
@@ -787,7 +793,10 @@ async fn follow(follower: Follower) -> Role {
                 staging: &staging,
                 budget,
                 advertised: &advertised,
-                claims: discovered.as_ref().map(Discovered::claims).unwrap_or_default(),
+                claims: discovered
+                    .as_ref()
+                    .map(Discovered::claims)
+                    .unwrap_or_default(),
             };
             let round = execute_round(executor, inputs).await;
             rounds.executed_height = round.executed_height;
@@ -900,7 +909,10 @@ fn relay_admitted_transactions(
     relay: &nano_p2p::Relay,
 ) {
     while let Ok(transaction) = submitted.try_recv() {
-        println!("relaying the transaction {} this node admitted", transaction.txid());
+        println!(
+            "relaying the transaction {} this node admitted",
+            transaction.txid()
+        );
         relay.announce(nano_p2p::Offer::transaction(None, Box::new(transaction)));
     }
 }
@@ -990,7 +1002,10 @@ async fn admit_relayed(
     executor: &SharedExecutor,
     mempool: &Arc<Mutex<nano_mempool::Mempool>>,
     relay: &nano_p2p::Relay,
-    transactions: Vec<(Option<nano_primitives::Hash160>, Box<nano_codec::Transaction>)>,
+    transactions: Vec<(
+        Option<nano_primitives::Hash160>,
+        Box<nano_codec::Transaction>,
+    )>,
 ) -> usize {
     if transactions.is_empty() {
         return 0;
@@ -1251,7 +1266,10 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         "derived the reward set for cycle {cycle} from this node's own state: {} signers, \
          {} of weight, replicating their StackerDB contracts",
         entries.len(),
-        entries.iter().map(|entry| u64::from(entry.weight)).sum::<u64>()
+        entries
+            .iter()
+            .map(|entry| u64::from(entry.weight))
+            .sum::<u64>()
     );
 }
 
@@ -2184,7 +2202,10 @@ fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<
         .into());
     }
     if let Some(recorded) = CheckpointProvenance::load(directory)? {
-        already_adopted(recorded.checkpoint.source_state_id, manifest.source_state_id)?;
+        already_adopted(
+            recorded.checkpoint.source_state_id,
+            manifest.source_state_id,
+        )?;
         return Ok(());
     }
 
@@ -2192,9 +2213,11 @@ fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<
         config.checkpoint.attesting_block.as_ref(),
         config.checkpoint.attesting_reward_set.as_ref(),
     ) else {
-        return Err("a checkpoint needs an attesting block and the reward set that \
+        return Err(
+            "a checkpoint needs an attesting block and the reward set that \
                     signed it before it can be imported"
-            .into());
+                .into(),
+        );
     };
     let block = NakamotoBlock::decode(&fs::read(block)?)?;
     let signers = attesting_reward_set(&fs::read(reward_set)?)?;
@@ -2241,9 +2264,7 @@ fn attesting_reward_set(bytes: &[u8]) -> Result<SignerSet, Box<dyn Error>> {
                     key.trim_start_matches("0x"),
                 )?)
                 .map_err(|error| format!("a signing key is not a public key: {error:?}"))?,
-                weight: u32::try_from(
-                    entry["weight"].as_u64().ok_or("a signer has no weight")?,
-                )?,
+                weight: u32::try_from(entry["weight"].as_u64().ok_or("a signer has no weight")?)?,
             })
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -2754,7 +2775,11 @@ struct LocalAnnouncement {
     cycle_start: Option<nano_primitives::ConsensusHash>,
     /// The burn height the cycle opens at, the hash naming it, and which of its
     /// tenures this node has executed and so will serve.
-    inventory: Option<(u64, nano_primitives::ConsensusHash, nano_primitives::BitVec<2100>)>,
+    inventory: Option<(
+        u64,
+        nano_primitives::ConsensusHash,
+        nano_primitives::BitVec<2100>,
+    )>,
 }
 
 impl Advertised {
@@ -2883,10 +2908,8 @@ async fn start_transport(
     };
     let bind = config.node.p2p_bind;
     let advertise = config.node.p2p_address.or(bind);
-    let mut local = nano_p2p::LocalPeer::quiet(
-        identity,
-        advertise.map_or(20444, |address| address.port()),
-    );
+    let mut local =
+        nano_p2p::LocalPeer::quiet(identity, advertise.map_or(20444, |address| address.port()));
     if let Some(address) = advertise
         && !address.ip().is_unspecified()
     {
@@ -3279,7 +3302,10 @@ mod tests {
         // A round that executed nothing has no root to name and must not be
         // mistakable for one that did.
         let still = super::round_report(1_100, &round(0, false), &tip);
-        assert_eq!(still, "executed nothing: sealed at 1100, 9 staged, 40 fetched");
+        assert_eq!(
+            still,
+            "executed nothing: sealed at 1100, 9 staged, 40 fetched"
+        );
         assert!(!still.contains("state root"));
 
         // The peer asking a node to slow down is not the node failing to move.
@@ -3413,7 +3439,10 @@ mod tests {
         super::check_maturity_window(&earnings(50, 200)).expect("a full window is enough");
         let refused = super::check_maturity_window(&earnings(50, 60))
             .expect_err("a window that neither reaches back nor spans the horizon is refused");
-        assert!(refused.to_string().contains("tenures 50 to 60"), "{refused}");
+        assert!(
+            refused.to_string().contains("tenures 50 to 60"),
+            "{refused}"
+        );
     }
 
     /// The reward set that attests a checkpoint is read from what a node serves.
@@ -3427,7 +3456,11 @@ mod tests {
         let signers = super::attesting_reward_set(document).expect("the reward set reads");
         assert_eq!(signers.signers().len(), 2);
         assert_eq!(
-            signers.signers().iter().map(|signer| signer.weight).sum::<u32>(),
+            signers
+                .signers()
+                .iter()
+                .map(|signer| signer.weight)
+                .sum::<u32>(),
             4
         );
 

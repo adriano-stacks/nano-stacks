@@ -187,9 +187,9 @@ fn handshake() -> impl Strategy<Value = HandshakeData> {
             addrbytes: CorePeerAddress(address),
             port,
             services,
-            node_public_key: StacksPublicKeyBuffer::from_public_key(&Secp256k1PublicKey::from_private(
-                &core_key(),
-            )),
+            node_public_key: StacksPublicKeyBuffer::from_public_key(
+                &Secp256k1PublicKey::from_private(&core_key()),
+            ),
             expire_block_height: expire,
             data_url: UrlString::try_from(url.to_string()).expect("a valid URL"),
         })
@@ -204,13 +204,13 @@ fn accept() -> impl Strategy<Value = HandshakeAcceptData> {
 
 fn neighbors() -> impl Strategy<Value = NeighborsData> {
     prop::collection::vec(
-        (any::<[u8; 16]>(), any::<u16>(), any::<[u8; 20]>()).prop_map(
-            |(address, port, hash)| CoreNeighborAddress {
+        (any::<[u8; 16]>(), any::<u16>(), any::<[u8; 20]>()).prop_map(|(address, port, hash)| {
+            CoreNeighborAddress {
                 addrbytes: CorePeerAddress(address),
                 port,
                 public_key_hash: CoreHash160(hash),
-            },
-        ),
+            }
+        }),
         // 128 is `MAX_NEIGHBORS_DATA_LEN`, and the empty reply is what a peer
         // that knows nobody sends.
         0..=128_usize,
@@ -268,9 +268,11 @@ fn payload() -> impl Strategy<Value = StacksMessageType> {
         }),
         (accept(), stackerdb_handshake())
             .prop_map(|(accept, db)| StacksMessageType::StackerDBHandshakeAccept(accept, db)),
-        any::<[u8; 20]>().prop_map(|hash| StacksMessageType::GetNakamotoInv(GetNakamotoInvData {
-            consensus_hash: CoreConsensusHash(hash),
-        })),
+        any::<[u8; 20]>().prop_map(
+            |hash| StacksMessageType::GetNakamotoInv(GetNakamotoInvData {
+                consensus_hash: CoreConsensusHash(hash),
+            })
+        ),
         tenure_inventory().prop_map(StacksMessageType::NakamotoInv),
     ]
 }
@@ -488,9 +490,9 @@ fn pushed_blocks_and_transactions_round_trip_with_stacks_core() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         transactions.extend(block.txs().map(|transaction| match transaction {
             blockstack_lib::chainstate::nakamoto::TxToProcess::Execute(transaction)
-            | blockstack_lib::chainstate::nakamoto::TxToProcess::Skip { tx: transaction, .. } => {
-                transaction.clone()
-            }
+            | blockstack_lib::chainstate::nakamoto::TxToProcess::Skip {
+                tx: transaction, ..
+            } => transaction.clone(),
         }));
         blocks.push(block);
     }

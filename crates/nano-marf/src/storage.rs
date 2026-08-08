@@ -248,10 +248,9 @@ impl TrieStorage {
                 "DELETE FROM marf_node WHERE block IN (SELECT id FROM marf_block WHERE height > ?1)",
                 params![height],
             )?;
-            Ok(self.connection.execute(
-                "DELETE FROM marf_block WHERE height > ?1",
-                params![height],
-            )?)
+            Ok(self
+                .connection
+                .execute("DELETE FROM marf_block WHERE height > ?1", params![height])?)
         })();
         match removed {
             Ok(removed) => {
@@ -381,10 +380,12 @@ impl TrieStorage {
         jumps: &[MarfBlockId],
     ) -> Result<u32, MarfError> {
         let jumps: Vec<u8> = jumps.iter().flatten().copied().collect();
-        self.connection.prepare_cached(
-            "INSERT INTO marf_block (hash, parent, height, root, content, node, jumps) \
+        self.connection
+            .prepare_cached(
+                "INSERT INTO marf_block (hash, parent, height, root, content, node, jumps) \
              VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5)",
-        )?.execute(params![&hash[..], parent, height, &[0u8; 32][..], jumps])?;
+            )?
+            .execute(params![&hash[..], parent, height, &[0u8; 32][..], jumps])?;
         u32::try_from(self.connection.last_insert_rowid())
             .map_err(|_| MarfError::Storage("block identifier overflowed".to_owned()))
     }
@@ -399,7 +400,9 @@ impl TrieStorage {
         node: Option<u32>,
     ) -> Result<(), MarfError> {
         self.connection
-            .prepare_cached("UPDATE marf_block SET root = ?2, content = ?3, node = ?4 WHERE id = ?1")?
+            .prepare_cached(
+                "UPDATE marf_block SET root = ?2, content = ?3, node = ?4 WHERE id = ?1",
+            )?
             .execute(params![
                 id,
                 &root.as_bytes()[..],
@@ -422,9 +425,12 @@ impl TrieStorage {
         } else {
             "INSERT OR REPLACE INTO marf_node (block, idx, hash, data) VALUES (?1, ?2, ?3, ?4)"
         };
-        self.connection
-            .prepare_cached(statement)?
-            .execute(params![block, index, &hash.as_bytes()[..], encode(node)?])?;
+        self.connection.prepare_cached(statement)?.execute(params![
+            block,
+            index,
+            &hash.as_bytes()[..],
+            encode(node)?
+        ])?;
         Ok(())
     }
 
@@ -533,7 +539,11 @@ impl TrieStorage {
                 character,
                 referenced_block,
                 target: ChildTarget::Stored {
-                    block: if flags & BACK_POINTER == 0 { block } else { target },
+                    block: if flags & BACK_POINTER == 0 {
+                        block
+                    } else {
+                        target
+                    },
                     index,
                     kind,
                 },
@@ -562,12 +572,7 @@ fn encode(node: &TrieNode) -> Result<Vec<u8>, MarfError> {
                 u16::try_from(children.len()).map_err(|_| corrupt("node has too many children"))?;
             bytes.extend_from_slice(&count.to_le_bytes());
             for child in children {
-                let ChildTarget::Stored {
-                    block,
-                    index,
-                    kind,
-                } = child.target
-                else {
+                let ChildTarget::Stored { block, index, kind } = child.target else {
                     return Err(MarfError::Storage(
                         "trie child was not persisted before its parent".to_owned(),
                     ));

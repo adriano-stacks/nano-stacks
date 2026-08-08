@@ -7,10 +7,10 @@ use walrus::ir::{self, BinaryOp, IfElse, InstrSeqType, Loop, UnaryOp};
 use walrus::ValType;
 
 use crate::check_args;
+use crate::cost::ChargeGenerator;
 use crate::cost::WordCharge;
 use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::error_mapping::ErrorMap;
-use crate::cost::ChargeGenerator;
 use crate::wasm_generator::{
     add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, get_global, has_in_memory_type,
     ArgumentsExt, BorrowedLocal, GeneratorError, SequenceElementType, WasmGenerator,
@@ -499,7 +499,6 @@ impl ComplexWord for Append {
                 .size()
                 .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
         )?;
-
 
         // Store the element at the write pointer.
         generator.write_to_memory(builder, write_ptr, 0, &elem_ty)?;

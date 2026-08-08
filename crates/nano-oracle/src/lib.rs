@@ -97,8 +97,7 @@ pub fn defined_functions(
             let Atom(argument_name) = &argument_name.expr else {
                 continue;
             };
-            let Ok(signature) =
-                TypeSignature::parse_type_repr(epoch, argument_type, &mut tracker)
+            let Ok(signature) = TypeSignature::parse_type_repr(epoch, argument_type, &mut tracker)
             else {
                 continue;
             };
@@ -131,7 +130,10 @@ fn interpretable_contract(
     contract: &QualifiedContractIdentifier,
     version: ClarityVersion,
     source: &str,
-    dependencies: Vec<(QualifiedContractIdentifier, clarity::vm::contracts::Contract)>,
+    dependencies: Vec<(
+        QualifiedContractIdentifier,
+        clarity::vm::contracts::Contract,
+    )>,
 ) -> Result<clarity::vm::contracts::Contract, ClarityEvalError> {
     let mut backing_store = MemoryBackingStore::new();
     let mut database = backing_store.as_clarity_db();
@@ -488,7 +490,10 @@ fn execute_contract_call_outcome_in_context(
         // reports whatever that is. Left unexplained it reads as a type error
         // in the contract, which is three days of looking in the wrong place.
         return Err(result.err().map_or_else(
-            || VmInternalError::Expect(format!("{called} left the database in an invalid state")).into(),
+            || {
+                VmInternalError::Expect(format!("{called} left the database in an invalid state"))
+                    .into()
+            },
             |error| {
                 let hint = if error.to_string().contains("must return response") {
                     " (this contract was deployed by the compiler, which stores \

@@ -20,9 +20,7 @@ use clarity::vm::database::{
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::representations::SymbolicExpression;
-use clarity::vm::types::{
-    BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData,
-};
+use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value};
 use nano_marf::{
     CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, UnfinishedImport,
@@ -734,7 +732,8 @@ impl BitcoinContext {
         // The block about to execute can be asked about its own burn block,
         // which no header records until it has been executed.
         if context.burn_header_hash != [0; 32] {
-            self.burn_headers.insert(self.height, context.burn_header_hash);
+            self.burn_headers
+                .insert(self.height, context.burn_header_hash);
         }
         Ok(())
     }
@@ -839,7 +838,10 @@ impl BitcoinContext {
                 // chain. Whatever resolved a height to this identifier is the
                 // fault, and the `Expect` this produces is where it surfaces.
                 if std::env::var_os("NANO_TRACE_WRITES").is_some() {
-                    println!("block {id} is not on this fork, so it has no {}", field.name());
+                    println!(
+                        "block {id} is not on this fork, so it has no {}",
+                        field.name()
+                    );
                 }
                 None
             }
@@ -1876,10 +1878,7 @@ impl Vm {
     }
 
     /// Read an account's spendable STX.
-    pub fn account_balance(
-        &mut self,
-        principal: &PrincipalData,
-    ) -> Result<u128, VmExecutionError> {
+    pub fn account_balance(&mut self, principal: &PrincipalData) -> Result<u128, VmExecutionError> {
         let Self { store, context, .. } = self;
         account_balance_in_context(store, context, principal)
     }
@@ -2168,7 +2167,10 @@ pub enum MarfStoreError {
     /// for. Refused, because executing on it would fork: the boot address sits
     /// inside every principal a block writes and the identifier is what
     /// `(chain-id)` reads.
-    WrongNetwork { stored: Network, opened: Network },
+    WrongNetwork {
+        stored: Network,
+        opened: Network,
+    },
 }
 
 impl std::fmt::Display for MarfStoreError {
@@ -2190,9 +2192,8 @@ impl std::fmt::Display for MarfStoreError {
             Self::BitcoinHeightOverflow(height) => {
                 write!(formatter, "Bitcoin height {height} exceeds u32")
             }
-            Self::MalformedHeaderExport => {
-                formatter.write_str("the checkpoint's header export holds a row that is not a header")
-            }
+            Self::MalformedHeaderExport => formatter
+                .write_str("the checkpoint's header export holds a row that is not a header"),
             Self::WrongNetwork { stored, opened } => write!(
                 formatter,
                 "this state was created for chain {:#010x} ({}) and was opened as chain {:#010x} ({})",
@@ -2294,7 +2295,9 @@ impl MarfStore {
                 return Err(MarfStoreError::NotAState(format!(
                     "{} holds no {}",
                     directory.display(),
-                    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
                 )));
             }
         }
@@ -2354,7 +2357,10 @@ impl MarfStore {
         // leave behind, so "there is state here" is not the question. The
         // question is whether the import that put it there ran to the end.
         UnfinishedImport::refuse(directory)?;
-        if VersionedMarf::open(directory.join(MARF_FILE))?.tip().is_none() {
+        if VersionedMarf::open(directory.join(MARF_FILE))?
+            .tip()
+            .is_none()
+        {
             import(directory, checkpoint.as_ref(), source, expected_root)?;
         }
         // Reopened rather than continued on the import's own connections. Those
@@ -2666,9 +2672,7 @@ impl MarfStore {
     ) -> Result<(), MarfStoreError> {
         let key = format!("clr-meta::{contract}::vm-metadata::9::contract");
         self.side_store
-            .prepare_cached(
-                "UPDATE metadata_table SET value = ?2 WHERE key = ?1",
-            )?
+            .prepare_cached("UPDATE metadata_table SET value = ?2 WHERE key = ?1")?
             .execute(params![key, definition])?;
         Ok(())
     }
@@ -2941,10 +2945,8 @@ impl MarfStore {
 
     /// Whether reads currently see the state being written.
     fn reads_active_state(&self) -> bool {
-        self.active.is_some_and(|active| {
-            self.read_block
-                .is_none_or(|block| block == active.block)
-        })
+        self.active
+            .is_some_and(|active| self.read_block.is_none_or(|block| block == active.block))
     }
 
     fn block_at_height(&self, block: [u8; 32], height: u32) -> Option<[u8; 32]> {
@@ -3151,7 +3153,10 @@ fn reconcile_network(
     }
     connection.execute(
         "INSERT INTO chain_identity (only_row, chain_id, mainnet) VALUES (0, ?1, ?2)",
-        rusqlite::params![i64::from(network.chain_id()), i64::from(network.is_mainnet())],
+        rusqlite::params![
+            i64::from(network.chain_id()),
+            i64::from(network.is_mainnet())
+        ],
     )?;
     Ok(())
 }
@@ -3327,9 +3332,7 @@ fn import_block_headers(
         // above it, so the only row this can land on is a peer reconstruction of
         // the same block — which knows five fields where this knows the chain's.
         destination
-            .prepare_cached(
-                "INSERT OR REPLACE INTO block_header (block_id, data) VALUES (?1, ?2)",
-            )?
+            .prepare_cached("INSERT OR REPLACE INTO block_header (block_id, data) VALUES (?1, ?2)")?
             .execute(params![block.as_slice(), encode_recorded_header(&recorded)])?;
         // The tenure mapping beside it, from the blocks that know their tenure.
         // Ignored rather than replaced: a tenure's start is its lowest block, and
@@ -3521,8 +3524,9 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
-        let found = self
-            .get_data_from_path(&ReferenceTrieHash(*nano_marf::key_path(key.as_bytes()).as_bytes()));
+        let found = self.get_data_from_path(&ReferenceTrieHash(
+            *nano_marf::key_path(key.as_bytes()).as_bytes(),
+        ));
         // A value that is wrong rather than missing is only visible by reading
         // it, so this says what every read answered.
         if std::env::var_os("NANO_TRACE_READS").is_some() {
@@ -3572,8 +3576,7 @@ impl ClarityBackingStore for MarfStore {
     }
 
     fn set_block_hash(&mut self, block: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
-        if !self.marf.contains(block.0)
-            && self.active.is_none_or(|active| active.block != block.0)
+        if !self.marf.contains(block.0) && self.active.is_none_or(|active| active.block != block.0)
         {
             return Err(RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(block.0)).into());
         }
@@ -3659,9 +3662,10 @@ impl ClarityBackingStore for MarfStore {
         value: &str,
     ) -> Result<(), VmExecutionError> {
         if self.active.is_none() {
-            return Err(
-                VmInternalError::Expect("metadata write without an active state".to_owned()).into(),
-            );
+            return Err(VmInternalError::Expect(
+                "metadata write without an active state".to_owned(),
+            )
+            .into());
         }
         self.metadata
             .insert((contract.to_string(), key.to_owned()), value.to_owned());
@@ -3987,9 +3991,9 @@ pub fn analyse_for_deployment(
             Ok(())
         })
         .map_err(|error: StaticCheckError| {
-            ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(format!(
-                "{ANALYSIS_FAILED}: {error}"
-            ))))
+            ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
+                format!("{ANALYSIS_FAILED}: {error}"),
+            )))
         })
 }
 
@@ -4025,10 +4029,12 @@ fn deploy_contract_with_wasm_in_context(
                 // or the deploy leaves an analysis behind for a contract that
                 // was never stored, and the interpreter fallback below deploys
                 // on top of it.
-                Ok(
-                    loadable(&contract, compiled.into_compiled_contract(), modules.engine())
-                        .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?,
+                Ok(loadable(
+                    &contract,
+                    compiled.into_compiled_contract(),
+                    modules.engine(),
                 )
+                .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?)
             })
             .map_err(|error: StaticCheckError| {
                 ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
@@ -4949,10 +4955,9 @@ mod tests {
     /// Read a Clarity expression the only way this node evaluates anything:
     /// through a deployed contract, compiled and run by clarity-wasm.
     fn read_through_a_contract(vm: &mut Vm, name: &str, body: &str) -> Value {
-        let contract = QualifiedContractIdentifier::parse(&format!(
-            "ST000000000000000000002AMW42H.{name}"
-        ))
-        .expect("a contract identifier");
+        let contract =
+            QualifiedContractIdentifier::parse(&format!("ST000000000000000000002AMW42H.{name}"))
+                .expect("a contract identifier");
         vm.deploy_contract(
             contract.clone(),
             ClarityVersion::Clarity6,
@@ -5003,7 +5008,10 @@ mod tests {
                 rusqlite::params![&first[..]],
             )
             .expect("the first block's nodes are removable");
-        assert!(removed > 0, "the fixture removed nothing, so it is not corruption");
+        assert!(
+            removed > 0,
+            "the fixture removed nothing, so it is not corruption"
+        );
         drop(connection);
 
         let store = MarfStore::open(Network::TESTNET, directory.path()).expect("reopen");
@@ -5023,9 +5031,7 @@ mod tests {
         let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
 
         store.begin(None, first).expect("begin first state");
-        store
-            .put("counter", "one")
-            .expect("write first state");
+        store.put("counter", "one").expect("write first state");
         let pending_first_root = store.pending_root().expect("derive first state root");
         let first_root = store.seal().expect("seal first state");
         assert_eq!(pending_first_root.as_bytes(), &first_root.0);
@@ -5033,20 +5039,34 @@ mod tests {
         store
             .begin(Some(first), second)
             .expect("begin second state");
-        store
-            .put("counter", "two")
-            .expect("write second state");
+        store.put("counter", "two").expect("write second state");
         let second_root = store.seal().expect("seal second state");
 
         store.begin(Some(first), fork).expect("begin fork state");
-        store
-            .put("counter", "fork")
-            .expect("write fork state");
+        store.put("counter", "fork").expect("write fork state");
         let fork_root = store.seal().expect("seal fork state");
 
-        assert_eq!(store.get(first, "counter").expect("the store answers").as_deref(), Some("one"));
-        assert_eq!(store.get(second, "counter").expect("the store answers").as_deref(), Some("two"));
-        assert_eq!(store.get(fork, "counter").expect("the store answers").as_deref(), Some("fork"));
+        assert_eq!(
+            store
+                .get(first, "counter")
+                .expect("the store answers")
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            store
+                .get(second, "counter")
+                .expect("the store answers")
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            store
+                .get(fork, "counter")
+                .expect("the store answers")
+                .as_deref(),
+            Some("fork")
+        );
         assert_eq!(store.root(first), Some(first_root));
         assert_eq!(store.root(second), Some(second_root));
         assert_eq!(store.root(fork), Some(fork_root));
@@ -5060,7 +5080,6 @@ mod tests {
             Some("one".to_owned())
         );
     }
-
 
     #[test]
     fn credits_liquid_stx_without_a_transaction_event() {
@@ -5086,15 +5105,12 @@ mod tests {
         assert_eq!(value, Value::UInt(42));
     }
 
-
     #[test]
     fn transaction_rollback_restores_active_state() {
         let block = [1; 32];
         let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
         store.begin(None, block).expect("begin block");
-        store
-            .put("counter", "one")
-            .expect("write baseline value");
+        store.put("counter", "one").expect("write baseline value");
 
         store.begin_transaction().expect("begin transaction");
         store
@@ -5103,7 +5119,13 @@ mod tests {
         store.rollback_transaction().expect("roll back transaction");
         store.seal().expect("seal block");
 
-        assert_eq!(store.get(block, "counter").expect("the store answers").as_deref(), Some("one"));
+        assert_eq!(
+            store
+                .get(block, "counter")
+                .expect("the store answers")
+                .as_deref(),
+            Some("one")
+        );
     }
 
     /// A block executes at its own height, not one past it.
@@ -5126,11 +5148,6 @@ mod tests {
         // Genesis is 0, its child 1, this one 2.
         assert_eq!(height, Value::UInt(2));
     }
-
-
-
-
-
 
     /// A state directory whose import did not finish opens no way at all.
     ///
@@ -5215,9 +5232,8 @@ mod tests {
     fn a_cached_module_answers_what_a_compiled_one_does() {
         let directory = tempfile::tempdir().expect("a directory");
         let entries = directory.path().join("native-modules").join("1");
-        let contract =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
-                .expect("a contract identifier");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
+            .expect("a contract identifier");
         let sender: PrincipalData = contract.issuer.clone().into();
         let ask = |vm: &mut Vm| {
             vm.call_contract_values(&sender, &contract, "answer", &[])
@@ -5248,14 +5264,16 @@ mod tests {
 
         let cached = {
             let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen");
-            vm.begin_block(Some([21; 32]), [22; 32]).expect("begin a block");
+            vm.begin_block(Some([21; 32]), [22; 32])
+                .expect("begin a block");
             ask(&mut vm)
         };
 
         std::fs::remove_dir_all(&entries).expect("delete the cache");
         let recompiled = {
             let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen");
-            vm.begin_block(Some([21; 32]), [23; 32]).expect("begin a block");
+            vm.begin_block(Some([21; 32]), [23; 32])
+                .expect("begin a block");
             ask(&mut vm)
         };
 
@@ -5322,7 +5340,9 @@ mod tests {
                 .expect("commit the parent");
 
             // The child, prepared and then abandoned where a SIGKILL would land.
-            store.begin(Some([1; 32]), [2; 32]).expect("begin the child");
+            store
+                .begin(Some([1; 32]), [2; 32])
+                .expect("begin the child");
             store
                 .prepare_commit(
                     [2; 32],
@@ -5408,7 +5428,10 @@ mod tests {
             );
         }
         assert!(store.has_ledger(block(8)));
-        assert!(!store.has_ledger(block(64)), "a block never written has none");
+        assert!(
+            !store.has_ledger(block(64)),
+            "a block never written has none"
+        );
     }
 
     /// The size at which a contract of trait calls stops compiling.
@@ -5468,9 +5491,8 @@ mod tests {
     /// payload width against its indicator's.
     #[test]
     fn a_trait_returning_a_list_of_responses_compiles() {
-        let caller =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.caller")
-                .expect("valid contract identifier");
+        let caller = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.caller")
+            .expect("valid contract identifier");
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [9; 32]).expect("begin block");
 
@@ -5493,9 +5515,8 @@ mod tests {
     /// response's payload width against its indicator's.
     #[test]
     fn an_empty_list_of_responses_compiles() {
-        let contract =
-            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.empty")
-                .expect("valid contract identifier");
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.empty")
+            .expect("valid contract identifier");
         let mut vm = Vm::new(Network::TESTNET).expect("create VM");
         vm.begin_block(None, [9; 32]).expect("begin block");
 
@@ -5660,7 +5681,10 @@ mod tests {
             None
         );
         assert_eq!(context.get_vrf_seed_for_block(&id, &id, &epoch), None);
-        assert_eq!(context.get_burn_block_time_for_block(&id, Some(&epoch)), None);
+        assert_eq!(
+            context.get_burn_block_time_for_block(&id, Some(&epoch)),
+            None
+        );
         assert_eq!(
             context.get_stacks_height_for_tenure_height(&id, 0),
             None,
@@ -5942,9 +5966,6 @@ mod tests {
         assert_eq!(result.value, Some(Value::err_uint(1)));
     }
 
-
-
-
     /// The captured corpus is recaptured wholesale, so tests read its checkpoint
     /// identity from the manifest rather than pinning one capture's hashes.
     fn captured_checkpoint() -> (std::path::PathBuf, [u8; 32], TrieHash) {
@@ -5978,8 +5999,8 @@ mod tests {
         let (checkpoint, source, root) = captured_checkpoint();
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
             .expect("valid boot contract identifier");
-        let mut store =
-            MarfStore::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("load checkpoint");
+        let mut store = MarfStore::from_checkpoint(Network::TESTNET, checkpoint, source, root)
+            .expect("load checkpoint");
 
         assert_eq!(
             store.root(source).map(|root| root.0),
@@ -6019,7 +6040,8 @@ mod tests {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox-5")
             .expect("valid checkpoint contract identifier");
         let sender = contract.issuer.clone().into();
-        let mut vm = Vm::from_checkpoint(Network::TESTNET, checkpoint, source, root).expect("load checkpoint");
+        let mut vm = Vm::from_checkpoint(Network::TESTNET, checkpoint, source, root)
+            .expect("load checkpoint");
         vm.begin_block(Some(source), [0x43; 32])
             .expect("extend checkpoint state");
 
@@ -6171,7 +6193,11 @@ mod tests {
             + stored[value..]
                 .find('"')
                 .expect("the epoch field is a string");
-        let rewritten = format!("{}{MARKER}{epoch:?}{}", &stored[..field], &stored[closing..]);
+        let rewritten = format!(
+            "{}{MARKER}{epoch:?}{}",
+            &stored[..field],
+            &stored[closing..]
+        );
         assert!(
             rewritten.ends_with(&format!(
                 r#"{MARKER}{epoch:?}","clarity_version":"Clarity2"}}"#
@@ -6304,8 +6330,9 @@ mod tests {
             let directory = tempfile::tempdir().expect("a directory");
             let (mut vm, contract) = imported_contract(directory.path(), USES_AT_BLOCK, recorded);
 
-            let refused = ensure_wasm_module(&mut vm.store, &vm.context, &mut vm.modules, &contract)
-                .expect_err("the recorded epoch refuses it, and no other is tried");
+            let refused =
+                ensure_wasm_module(&mut vm.store, &vm.context, &mut vm.modules, &contract)
+                    .expect_err("the recorded epoch refuses it, and no other is tried");
 
             // An older epoch does accept it, which is what a search would have
             // found and used.
@@ -6338,8 +6365,7 @@ mod tests {
     #[test]
     fn a_contract_with_no_recorded_analysis_stops_the_block() {
         let directory = tempfile::tempdir().expect("a directory");
-        let (mut vm, contract) =
-            imported_contract(directory.path(), PLAIN, StacksEpochId::Epoch40);
+        let (mut vm, contract) = imported_contract(directory.path(), PLAIN, StacksEpochId::Epoch40);
         vm.store
             .side_store
             .execute(
@@ -6515,4 +6541,3 @@ mod tests {
         );
     }
 }
-

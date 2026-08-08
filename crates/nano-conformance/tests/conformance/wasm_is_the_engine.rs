@@ -50,7 +50,15 @@ fn workspace() -> &'static Path {
 #[test]
 fn the_node_does_not_depend_on_the_interpreter_oracle() {
     let output = Command::new(env!("CARGO"))
-        .args(["tree", "--package", "nano-node", "--edges", "normal", "--prefix", "none"])
+        .args([
+            "tree",
+            "--package",
+            "nano-node",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+        ])
         .current_dir(workspace())
         .output()
         .expect("cargo tree runs");
@@ -132,10 +140,7 @@ fn the_historical_interpreter_switches_are_absent() {
     // shipped binary's data. Spelled out rather than derived from `file!()`,
     // because the second one is the release-gate half of the same question and a
     // reader should see both named here.
-    const FORBIDDING: [&str; 2] = [
-        "wasm_is_the_engine.rs",
-        "one_engine_in_the_artifact.rs",
-    ];
+    const FORBIDDING: [&str; 2] = ["wasm_is_the_engine.rs", "one_engine_in_the_artifact.rs"];
     for directory in [workspace().join("crates"), workspace().join("xtask")] {
         for entry in walk(&directory) {
             if entry

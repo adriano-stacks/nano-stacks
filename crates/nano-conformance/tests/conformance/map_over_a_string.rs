@@ -130,7 +130,10 @@ fn answers(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
 fn both_engines_map_over_a_string_ascii() {
     let text = Value::string_ascii_from_bytes(b"abcd".to_vec()).expect("ascii");
     let (compiled, interpreted) = answers("over-ascii", &[encode(&text)]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `map` over a string");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `map` over a string"
+    );
     // Four characters back, each its own one-character string. A wrong element
     // type that laid out compatibly would still return *something*.
     assert!(
@@ -143,19 +146,27 @@ fn both_engines_map_over_a_string_ascii() {
 fn both_engines_map_over_a_buffer_and_a_utf8_string() {
     let buffer = Value::buff_from(vec![1, 2, 3]).expect("a buff");
     let (compiled, interpreted) = answers("over-buff", &[encode(&buffer)]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `map` over a buffer");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `map` over a buffer"
+    );
 
     let text = Value::string_utf8_from_bytes(b"ab".to_vec()).expect("utf8");
     let (compiled, interpreted) = answers("over-utf8", &[encode(&text)]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `map` over a utf8 string");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `map` over a utf8 string"
+    );
 }
 
 #[test]
 fn both_engines_map_over_a_list_and_over_a_list_beside_a_string() {
-    let list = Value::cons_list_unsanitized(vec![Value::UInt(1), Value::UInt(2)])
-        .expect("a list");
+    let list = Value::cons_list_unsanitized(vec![Value::UInt(1), Value::UInt(2)]).expect("a list");
     let (compiled, interpreted) = answers("over-list", &[encode(&list)]);
-    assert_eq!(compiled, interpreted, "the engines disagree about `map` over a list");
+    assert_eq!(
+        compiled, interpreted,
+        "the engines disagree about `map` over a list"
+    );
 
     // The mainnet shape: a list and a string in one `map`.
     let text = Value::string_ascii_from_bytes(b"xy".to_vec()).expect("ascii");

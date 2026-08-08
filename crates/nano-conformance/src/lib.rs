@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nano_bitcoin::{BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block_with_pre_stx};
+use nano_bitcoin::{
+    BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block_with_pre_stx,
+};
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
 use nano_primitives::{Network, TrieHash};
 use serde::Deserialize;
@@ -797,7 +799,6 @@ pub fn replay_into(
     skip: usize,
     visit: &mut dyn FnMut(&NakamotoBlock, &nano_chainstate::AppliedBlock),
 ) -> ReplayDepth {
-
     let Some(snapshots) = captured_bitcoin_snapshots(root) else {
         return replay_fixture_failure(manifest, "captured Bitcoin snapshots are unavailable");
     };
@@ -816,7 +817,11 @@ pub fn replay_into(
 
     let mut completed = 0;
     // A resumed run stands on what the previous one sealed.
-    let mut parent = if skip == 0 { Some(source) } else { chainstate.tip() };
+    let mut parent = if skip == 0 {
+        Some(source)
+    } else {
+        chainstate.tip()
+    };
     let mut bitcoin_view = String::new();
     let mut first_cost_divergence = None;
     for (offset, path) in paths.into_iter().enumerate() {
@@ -879,7 +884,8 @@ pub fn replay_into(
 /// carries no leader-key registry, and the chain it came from is gone.
 #[must_use]
 pub fn capture_root(default: &Path) -> std::path::PathBuf {
-    std::env::var_os("NANO_FIXTURES").map_or_else(|| default.to_path_buf(), std::path::PathBuf::from)
+    std::env::var_os("NANO_FIXTURES")
+        .map_or_else(|| default.to_path_buf(), std::path::PathBuf::from)
 }
 
 /// Every captured block, in height order.
@@ -986,7 +992,6 @@ struct ReplayInputs<'a> {
     receipts: bool,
 }
 
-
 /// One block's receipts, reduced to what a regression has to notice.
 ///
 /// Kept as a digest rather than as the payload because 500 mainnet blocks of
@@ -1023,7 +1028,10 @@ pub fn receipt_digest(payload: &serde_json::Value) -> ReceiptDigest {
             .to_owned()
     };
     let mut preimage = Vec::new();
-    let transactions = payload["transactions"].as_array().cloned().unwrap_or_default();
+    let transactions = payload["transactions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for transaction in &transactions {
         preimage.extend_from_slice(strip(&transaction["txid"]).as_bytes());
         preimage.extend_from_slice(strip(&transaction["status"]).as_bytes());
@@ -1046,9 +1054,7 @@ pub fn receipt_digest(payload: &serde_json::Value) -> ReceiptDigest {
         preimage.extend_from_slice(event["committed"].to_string().as_bytes());
         // Whatever payload the event carries, canonically: an event's shape is
         // per type and enumerating them here would be a second definition of it.
-        preimage.extend_from_slice(
-            serde_json::to_vec(event).unwrap_or_default().as_slice(),
-        );
+        preimage.extend_from_slice(serde_json::to_vec(event).unwrap_or_default().as_slice());
     }
     ReceiptDigest {
         height: payload["block_height"].as_u64().unwrap_or_default(),
@@ -1150,7 +1156,6 @@ type ExecuteBlock = fn(
     Option<[u8; 32]>,
     &NakamotoBlock,
 ) -> Result<nano_chainstate::AppliedBlock, nano_chainstate::ChainStateError>;
-
 
 /// Whether to put every contract call through both engines before sealing.
 ///
@@ -1291,11 +1296,14 @@ fn apply_captured_block(
     // The view's snapshot carries everything Clarity reads. The tenure's carries the
     // one thing the prepare-phase rule reads, and they are the same snapshot unless
     // this block extends its tenure past the burn block that elected it.
-    let mut bitcoin_context = *capture.snapshots.get(bitcoin_view.as_str()).ok_or_else(|| {
-        ReplayDivergence::Fixture(
-            "block Bitcoin view is absent from captured Bitcoin snapshots".to_owned(),
-        )
-    })?;
+    let mut bitcoin_context = *capture
+        .snapshots
+        .get(bitcoin_view.as_str())
+        .ok_or_else(|| {
+            ReplayDivergence::Fixture(
+                "block Bitcoin view is absent from captured Bitcoin snapshots".to_owned(),
+            )
+        })?;
     if let Some(tenure) = capture
         .snapshots
         .get(block.header.consensus_hash.to_string().as_str())
@@ -1339,7 +1347,8 @@ fn apply_captured_block(
         bitcoin_context.pox_5_activation_height = height("pox_v4_unlock_height")?;
         None
     };
-    let operations = capture.bitcoin_operations
+    let operations = capture
+        .bitcoin_operations
         .get(&block.header.consensus_hash.to_string())
         .ok_or_else(|| {
             ReplayDivergence::Fixture(
@@ -1493,9 +1502,10 @@ fn provenance_field(root: &Path, name: &str) -> Option<String> {
 pub fn captured_network(root: &Path) -> Network {
     provenance_field(root, "chain_id")
         .and_then(|value| {
-            value
-                .strip_prefix("0x")
-                .map_or_else(|| value.parse().ok(), |hex| u32::from_str_radix(hex, 16).ok())
+            value.strip_prefix("0x").map_or_else(
+                || value.parse().ok(),
+                |hex| u32::from_str_radix(hex, 16).ok(),
+            )
         })
         .map_or(Network::TESTNET, Network::from_chain_id)
 }
@@ -1611,7 +1621,8 @@ fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
     paths.sort();
     let path = paths.first().expect("a captured reward set");
     let reward_set: StackerSetWire =
-        serde_json::from_slice(&fs::read(path).expect("read reward set")).expect("decode reward set");
+        serde_json::from_slice(&fs::read(path).expect("read reward set"))
+            .expect("decode reward set");
     let signers = reward_set
         .stacker_set
         .signers
@@ -1673,8 +1684,7 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
             // a commitment of 30,000 sats read as the 16-23 million behind it, the
             // same trap `nano_sortition::PayoutSchedule` exists to avoid one layer
             // down.
-            let (payout_outputs, burn_spend_total) =
-                captured_pox_payouts(&snapshot.pox_payouts)?;
+            let (payout_outputs, burn_spend_total) = captured_pox_payouts(&snapshot.pox_payouts)?;
             let burn = |operation: &BitcoinOperation| -> u128 {
                 operation
                     .outputs
@@ -1695,29 +1705,25 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                     })
                 })
                 .unwrap_or(([0; 32], 0));
-            Some((
-                snapshot.consensus_hash.clone(),
-                {
-                    // Through `at_height`, so this snapshot's burn block is both the
-                    // tenure and the view. A replayed block carrying an extend moves
-                    // the view on afterwards, in `execute_captured_block`.
-                    let mut context = BitcoinBlockContext::at_height(snapshot.block_height);
-                    context.first_height = first_height;
-                    context.prepare_phase_length = prepare_phase_length;
-                    context.reward_phase_length = reward_phase_length;
-                    context.burn_header_hash = decode_hash(&snapshot.burn_header_hash)?;
-                    context.burn_block_time = snapshot.burn_header_timestamp;
-                    context.vrf_seed = vrf_seed;
-                    context.burn_spend_total = burn_spend_total;
-                    context.burn_spend_winner = burn_spend_winner;
-                    // Validation only, and absent from a capture written before it
-                    // was recorded: zero then, which reads as "cannot check" at the
-                    // rule rather than as a wrong answer.
-                    context.sortition_hash =
-                        decode_hash(&snapshot.sortition_hash).unwrap_or_default();
-                    context
-                },
-            ))
+            Some((snapshot.consensus_hash.clone(), {
+                // Through `at_height`, so this snapshot's burn block is both the
+                // tenure and the view. A replayed block carrying an extend moves
+                // the view on afterwards, in `execute_captured_block`.
+                let mut context = BitcoinBlockContext::at_height(snapshot.block_height);
+                context.first_height = first_height;
+                context.prepare_phase_length = prepare_phase_length;
+                context.reward_phase_length = reward_phase_length;
+                context.burn_header_hash = decode_hash(&snapshot.burn_header_hash)?;
+                context.burn_block_time = snapshot.burn_header_timestamp;
+                context.vrf_seed = vrf_seed;
+                context.burn_spend_total = burn_spend_total;
+                context.burn_spend_winner = burn_spend_winner;
+                // Validation only, and absent from a capture written before it
+                // was recorded: zero then, which reads as "cannot check" at the
+                // rule rather than as a wrong answer.
+                context.sortition_hash = decode_hash(&snapshot.sortition_hash).unwrap_or_default();
+                context
+            }))
         })
         .collect()
 }
@@ -1788,13 +1794,11 @@ mod tests {
 
     use super::{
         ChainState, FixtureManifest, FixtureMode, FixtureStatus, apply_captured_block,
-        baseline_replay, captured_bitcoin_operations, captured_bitcoin_snapshots, captured_network,
-        captured_accounting, captured_chainstate, captured_checkpoint_block, captured_signer_set,
-        captured_signer_sets, checkpoint_manifest,
-        checkpoint_state,
-        decode_hash, scoreboard, validate_fixture_tree,
+        baseline_replay, captured_accounting, captured_bitcoin_operations,
+        captured_bitcoin_snapshots, captured_chainstate, captured_checkpoint_block,
+        captured_network, captured_signer_set, captured_signer_sets, checkpoint_manifest,
+        checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
     };
-    use nano_sortition::BURN_BLOCK_MINED_AT_MODULUS;
     use blockstack_lib::burnchains::{
         MagicBytes,
         bitcoin::{BitcoinNetworkType, BitcoinTxInput, blocks::BitcoinBlockParser},
@@ -1855,6 +1859,7 @@ mod tests {
     };
     use nano_primitives::{BitVec, Network, TrieHash, hash160, sha256, sha512, sha512_256};
     use nano_signer::{ChainstateProposalValidator, ProposalValidator};
+    use nano_sortition::BURN_BLOCK_MINED_AT_MODULUS;
     use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, Chunk, SignerMessage};
     use proptest::prelude::*;
     use serde::Deserialize;
@@ -1897,7 +1902,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| format!("missing captured Bitcoin block at height {height}"))
         }
-    
+
         fn block_hash_at(&self, _height: u64) -> Result<[u8; 32], Self::Error> {
             unimplemented!("this source is only asked for blocks")
         }
@@ -1909,7 +1914,7 @@ mod tests {
                 .copied()
                 .ok_or_else(|| "this source holds no Bitcoin blocks".to_owned())
         }
-}
+    }
     use stacks_common::{
         deps_common::bitcoin::network::serialize::deserialize as reference_bitcoin_deserialize,
         types::chainstate::{
@@ -2025,7 +2030,7 @@ mod tests {
         let report = scoreboard(FixtureManifest {
             mode: FixtureMode::Baseline,
             replay_blocks: 1,
-                receipts: true,
+            receipts: true,
         });
         assert!(report.contains("0/1"));
         assert!(report.contains("block 1"));
@@ -2044,8 +2049,9 @@ mod tests {
         let state = directory.path();
         fs::create_dir_all(state.join("chainstate")).expect("a chainstate directory");
         {
-            let mut vm = nano_vm::Vm::open(nano_primitives::Network::MAINNET, state.join("chainstate"))
-                .expect("open");
+            let mut vm =
+                nano_vm::Vm::open(nano_primitives::Network::MAINNET, state.join("chainstate"))
+                    .expect("open");
             let mut parent = None;
             for height in 1..=3u8 {
                 vm.begin_block(parent, [height; 32]).expect("begin");
@@ -2068,7 +2074,10 @@ mod tests {
         }
 
         let (anchor, tip) = super::mainnet_executed_height(state).expect("a height");
-        assert_eq!(anchor, tip, "no anchor is set, so the row reports the tip alone");
+        assert_eq!(
+            anchor, tip,
+            "no anchor is set, so the row reports the tip alone"
+        );
         let marf = nano_marf::VersionedMarf::open(state.join("chainstate/marf.sqlite"))
             .expect("open the marf");
         let sealed = marf.height(marf.tip().expect("a tip")).expect("a height");
@@ -2094,7 +2103,10 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = FixtureManifest::load(&root.join("manifest.toml")).expect("manifest");
         let (_, passed) = super::scoreboard_result(&root, manifest);
-        assert!(passed, "the checked-in capture has to pass before tampering means anything");
+        assert!(
+            passed,
+            "the checked-in capture has to pass before tampering means anything"
+        );
 
         let directory = tempfile::tempdir().expect("a directory");
         let copy = directory.path().join("fixtures");
@@ -2126,7 +2138,10 @@ mod tests {
                 break;
             }
         }
-        assert!(tampered, "no receipt in the capture states a successful status to tamper with");
+        assert!(
+            tampered,
+            "no receipt in the capture states a successful status to tamper with"
+        );
 
         let manifest = FixtureManifest::load(&copy.join("manifest.toml")).expect("manifest");
         let (board, passed) = super::scoreboard_result(&copy, manifest);
@@ -2175,8 +2190,7 @@ mod tests {
     /// the node's decider is built so that only a *positively* recorded set decides
     /// anything — an unmeasured converse can therefore leave a boundary uncrossed,
     /// but cannot produce a wrong hash.
-    const MAINNET_POX_HISTORY_AT_THE_CHECKPOINT: &str =
-        "1111111111111111111111111111111111111111111111111111111111111111111111\
+    const MAINNET_POX_HISTORY_AT_THE_CHECKPOINT: &str = "1111111111111111111111111111111111111111111111111111111111111111111111\
          111111111111111111111111111111111111111111111111111111111111111111111111";
 
     #[test]
@@ -2189,8 +2203,8 @@ mod tests {
         struct Set {
             signers: Vec<serde_json::Value>,
         }
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/mainnet/stacker_set-140.json");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainnet/stacker_set-140.json");
         let document: Document =
             serde_json::from_slice(&fs::read(&path).expect("the cycle 140 set"))
                 .expect("a reward set document");
@@ -2208,7 +2222,11 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect();
-        assert_eq!(bits.len(), 142, "mainnet had 142 reward cycles at the checkpoint");
+        assert_eq!(
+            bits.len(),
+            142,
+            "mainnet had 142 reward cycles at the checkpoint"
+        );
         assert!(
             !bits.contains('0'),
             "a cycle that selected no anchor would be the case this rule cannot yet decide"
@@ -2253,8 +2271,7 @@ mod tests {
             "the checkpoint carries contracts to look for"
         );
 
-        let imported =
-            import_checkpoint(&checkpoint, source, root).expect("imports checkpoint");
+        let imported = import_checkpoint(&checkpoint, source, root).expect("imports checkpoint");
         let missing: Vec<&String> = contracts
             .iter()
             .filter(|contract| {
@@ -2331,8 +2348,12 @@ mod tests {
             (block, published)
         } else {
             let block = NanoNakamotoBlock::decode(
-                &fs::read(captured_block_paths(&fixture).first().expect("captured block"))
-                    .expect("read block"),
+                &fs::read(
+                    captured_block_paths(&fixture)
+                        .first()
+                        .expect("captured block"),
+                )
+                .expect("read block"),
             )
             .expect("decode block");
             let manifest = nano_marf::CheckpointManifest {
@@ -3158,22 +3179,18 @@ mod tests {
         let mut parent = source;
         let mut reopened_roots = Vec::new();
         for (block, (name, contract_source)) in blocks.iter().zip(programs) {
-            let mut reopened = nano_vm::Vm::open_from_checkpoint(
-                network,
-                &directory,
-                &checkpoint,
-                source,
-                root,
-            )?;
+            let mut reopened =
+                nano_vm::Vm::open_from_checkpoint(network, &directory, &checkpoint, source, root)?;
             assert_eq!(reopened.tip(), Some(parent), "resumes from the tip on disk");
             reopened.begin_block(Some(parent), *block)?;
-            reopened.deploy_contract(
-                deployed_contract(name),
-                clarity::vm::ClarityVersion::Clarity6,
-                contract_source,
-                LimitedCostTracker::new_free(),
-            )
-            .expect("deploy in block");
+            reopened
+                .deploy_contract(
+                    deployed_contract(name),
+                    clarity::vm::ClarityVersion::Clarity6,
+                    contract_source,
+                    LimitedCostTracker::new_free(),
+                )
+                .expect("deploy in block");
             reopened_roots.push(reopened.seal_block()?);
             parent = *block;
         }
@@ -3497,8 +3514,8 @@ mod tests {
             "an unsigned header carries no weight however long it claims to be"
         );
 
-        let tip = |peer: usize, header: nano_chainstate::NakamotoBlockHeader| {
-            nano_sync::CandidateTip {
+        let tip =
+            |peer: usize, header: nano_chainstate::NakamotoBlockHeader| nano_sync::CandidateTip {
                 peer,
                 info: nano_sync::TenureInfo {
                     consensus_hash: header.consensus_hash,
@@ -3510,8 +3527,7 @@ mod tests {
                     reward_cycle: 0,
                 },
                 header,
-            }
-        };
+            };
         let candidates = vec![tip(0, forged), tip(1, signed.header.clone())];
 
         let chosen = nano_sync::choose_canonical_tip(&candidates, Some(&signers), None)
@@ -3559,8 +3575,10 @@ mod tests {
         let backwards = vec![tip(1), tip(0)];
 
         assert_eq!(
-            nano_sync::choose_canonical_tip(&forwards, Some(&signers), None).map(|tip| tip.header.block_id()),
-            nano_sync::choose_canonical_tip(&backwards, Some(&signers), None).map(|tip| tip.header.block_id()),
+            nano_sync::choose_canonical_tip(&forwards, Some(&signers), None)
+                .map(|tip| tip.header.block_id()),
+            nano_sync::choose_canonical_tip(&backwards, Some(&signers), None)
+                .map(|tip| tip.header.block_id()),
             "the order the peers answered in must not decide the tip"
         );
     }
@@ -3674,8 +3692,7 @@ mod tests {
         let chosen = nano_sync::choose_canonical_tip(&candidates, None, Some(&view))
             .expect("one of two tips is canonical");
         assert_eq!(
-            chosen.header.consensus_hash,
-            later.header.consensus_hash,
+            chosen.header.consensus_hash, later.header.consensus_hash,
             "the tip whose sortition is at the higher burn height wins the tie, as \
              stacks-core's `sn_current.block_height < sn_accepted.block_height` does"
         );
@@ -3768,9 +3785,7 @@ mod tests {
         );
         assert_eq!(
             retraction.resume_from,
-            retracted_from
-                .checked_sub(1)
-                .map(|index| executed[index]),
+            retracted_from.checked_sub(1).map(|index| executed[index]),
             "execution resumes from the last surviving block"
         );
         assert_eq!(chainstate.executed_blocks(), executed[..retracted_from]);
@@ -3963,7 +3978,9 @@ mod tests {
                     nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
                         vrf_public_key,
                         ..
-                    } if operation.transaction_index == u32::from(key_index) => Some(vrf_public_key),
+                    } if operation.transaction_index == u32::from(key_index) => {
+                        Some(vrf_public_key)
+                    }
                     _ => None,
                 })
                 .expect("the leader key registration is in the captured Bitcoin block");
@@ -4069,7 +4086,10 @@ mod tests {
         // boundary nor zero.
         let bitcoin_height = 71_525 + 360 * 2;
         let expected = nano_chainstate::sip_031_emission(network, bitcoin_height);
-        assert!(expected > 0, "the chosen height must be inside the schedule");
+        assert!(
+            expected > 0,
+            "the chosen height must be inside the schedule"
+        );
 
         let recipient = clarity::vm::types::PrincipalData::Contract(
             clarity::vm::types::QualifiedContractIdentifier::parse(
@@ -5431,9 +5451,9 @@ mod tests {
                 snapshot.block_height
             );
             assert_eq!(
-                nano_sortition::OpsHash::from_txids(
-                    &nano_sortition::accepted_operation_txids(&block),
-                )
+                nano_sortition::OpsHash::from_txids(&nano_sortition::accepted_operation_txids(
+                    &block
+                ),)
                 .as_bytes(),
                 &hex_array(&snapshot.ops_hash),
                 "operation hash at Bitcoin height {}",

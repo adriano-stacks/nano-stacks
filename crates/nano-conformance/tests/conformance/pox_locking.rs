@@ -20,9 +20,7 @@ use clarity::{
         costs::LimitedCostTracker,
         database::MemoryBackingStore,
         events::{STXEventType, StacksTransactionEvent},
-        types::{
-            PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData,
-        },
+        types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData},
     },
 };
 
@@ -196,7 +194,13 @@ fn reference(
     result: &Value,
 ) -> Result<(), clarity::vm::errors::VmExecutionError> {
     pox_locking::handle_contract_call_special_cases(
-        global, sender, None, contract, function, &[], result,
+        global,
+        sender,
+        None,
+        contract,
+        function,
+        &[],
+        result,
     )
 }
 
@@ -359,7 +363,10 @@ fn a_contract_error_locks_nothing() {
 fn a_malformed_response_is_refused() {
     let cases = [
         ("not a response", Value::UInt(1)),
-        ("ok payload not a tuple", Value::okay(Value::UInt(1)).expect("a response")),
+        (
+            "ok payload not a tuple",
+            Value::okay(Value::UInt(1)).expect("a response"),
+        ),
         (
             "err payload not a uint",
             Value::error(Value::Bool(false)).expect("a response"),

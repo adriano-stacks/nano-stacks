@@ -19,7 +19,11 @@
 //! hiding them behind a green test is the failure mode this whole file exists to
 //! prevent. Task 053's report is where that count has to reach zero.
 
-use std::{collections::BTreeSet, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,7 +84,12 @@ fn ignored_reasons(root: &Path, found: &mut Vec<(String, String, String)>) {
                     let rest = ["fn ", "async fn ", "pub fn ", "pub async fn "]
                         .into_iter()
                         .find_map(|prefix| next.strip_prefix(prefix))?;
-                    Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest).to_owned())
+                    Some(
+                        rest.split(['(', '<', ' '])
+                            .next()
+                            .unwrap_or(rest)
+                            .to_owned(),
+                    )
                 })
                 .unwrap_or_else(|| format!("{shown}:{}", line + 1));
             found.push((format!("{shown}:{}", line + 1), name, reason));

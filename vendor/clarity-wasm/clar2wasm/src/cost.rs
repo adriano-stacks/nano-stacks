@@ -1961,9 +1961,7 @@ mod crosscheck {
             ),
             (
                 "(define-public (f (a (string-ascii 128))) (ok a))",
-                vec![
-                    Value::string_ascii_from_bytes(b"short".to_vec()).expect("ascii"),
-                ],
+                vec![Value::string_ascii_from_bytes(b"short".to_vec()).expect("ascii")],
             ),
             (
                 "(define-private (g (a (buff 64))) a) \
@@ -1987,9 +1985,7 @@ mod crosscheck {
             ),
             (
                 "(define-public (f (a (optional (buff 500)))) (ok a))",
-                vec![
-                    Value::some(Value::buff_from(vec![3, 4]).expect("buffer")).expect("optional"),
-                ],
+                vec![Value::some(Value::buff_from(vec![3, 4]).expect("buffer")).expect("optional")],
             ),
             (
                 "(define-public (f (a (response uint (buff 400)))) (ok a))",

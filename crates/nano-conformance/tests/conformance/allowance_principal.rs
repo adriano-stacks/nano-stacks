@@ -220,8 +220,7 @@ fn answers(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
 #[test]
 fn an_allowance_reads_the_principal_its_let_bound() {
     for (feeds, bytes) in [(0, 0), (1, 1), (1, 2_048), (2, 2_048), (3, 8_192)] {
-        let (compiled, interpreted) =
-            answers("supply-collateral-add", &arguments(feeds, bytes));
+        let (compiled, interpreted) = answers("supply-collateral-add", &arguments(feeds, bytes));
         assert_eq!(
             compiled, interpreted,
             "the engines agree on `supply-collateral-add` with {feeds} feed(s) of {bytes} bytes"

@@ -115,7 +115,8 @@ fn a_block_id_is_the_hash_the_network_serves_it_under() {
 /// state it describes checks nothing. The Bitcoin height is not part of the
 /// claim the header can settle, so it is only carried.
 const CHECKPOINT_HEIGHT: u64 = 8_665_600;
-const CHECKPOINT_STATE_ID: &str = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d";
+const CHECKPOINT_STATE_ID: &str =
+    "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d";
 const CHECKPOINT_STATE_ROOT: &str =
     "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec";
 const CHECKPOINT_BITCOIN_HEIGHT: u64 = 960_231;

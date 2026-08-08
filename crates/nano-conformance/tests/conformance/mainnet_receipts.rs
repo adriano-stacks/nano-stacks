@@ -91,7 +91,9 @@ fn the_frozen_mainnet_slice_names_its_compiler() {
         "a compiler identity hashes the sources that were compiled, so {compiler:?} is not one"
     );
     assert!(
-        digest.chars().all(|character| character.is_ascii_hexdigit()),
+        digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()),
         "a compiler identity is hexadecimal, not {compiler:?}"
     );
     if compiler != nano_vm::COMPILER_IDENTITY {
@@ -117,14 +119,30 @@ fn the_frozen_mainnet_slice_is_a_run_of_blocks() {
         "a slice of {} blocks is too short to catch a compiler regression",
         frozen.blocks.len()
     );
-    assert_eq!(frozen.blocks.first().map(|block| block.height), Some(frozen.first_height));
-    assert_eq!(frozen.blocks.last().map(|block| block.height), Some(frozen.last_height));
+    assert_eq!(
+        frozen.blocks.first().map(|block| block.height),
+        Some(frozen.first_height)
+    );
+    assert_eq!(
+        frozen.blocks.last().map(|block| block.height),
+        Some(frozen.last_height)
+    );
     let mut previous = None;
     let mut transactions = 0;
     let mut events = 0;
     for block in &frozen.blocks {
-        assert_eq!(block.block.len(), 64, "block {} has no identity", block.height);
-        assert_eq!(block.digest.len(), 64, "block {} has no digest", block.height);
+        assert_eq!(
+            block.block.len(),
+            64,
+            "block {} has no identity",
+            block.height
+        );
+        assert_eq!(
+            block.digest.len(),
+            64,
+            "block {} has no digest",
+            block.height
+        );
         if let Some(previous) = previous {
             assert!(
                 block.height > previous,
@@ -182,7 +200,12 @@ fn a_run_reproduces_the_frozen_mainnet_receipts() {
             continue;
         };
         assert_eq!(
-            (&digest.block, digest.transactions, digest.events, &digest.digest),
+            (
+                &digest.block,
+                digest.transactions,
+                digest.events,
+                &digest.digest
+            ),
             (
                 &frozen.block,
                 frozen.transactions,

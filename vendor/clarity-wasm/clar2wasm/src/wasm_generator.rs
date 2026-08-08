@@ -329,7 +329,9 @@ pub(crate) enum BindingStorage {
     /// A constant byte offset into the function's frame spill area, used by
     /// scopes wide enough that one wasm local per leaf would hit the
     /// runtime's locals limit. The binding declares no wasm locals.
-    Spilled { delta: u32 },
+    Spilled {
+        delta: u32,
+    },
 }
 
 impl Bindings {
@@ -384,13 +386,9 @@ impl Bindings {
         &self,
         name: &ClarityName,
     ) -> Option<(BindingStorage, TypeSignature, Option<u32>)> {
-        self.values.get(name).map(|binding| {
-            (
-                binding.storage.clone(),
-                binding.ty.clone(),
-                binding.binding,
-            )
-        })
+        self.values
+            .get(name)
+            .map(|binding| (binding.storage.clone(), binding.ty.clone(), binding.binding))
     }
 
     pub(crate) fn get_trait_identifier(&self, name: &ClarityName) -> Option<&TraitIdentifier> {
@@ -914,7 +912,8 @@ impl WasmGenerator {
         // generation can return a binding's locals to the pool at its last
         // read instead of keeping them to the end of its scope, and mark the
         // scopes wide enough that their bindings spill to the frame.
-        let binding_uses = BindingUses::compute(&expressions, |expr| self.get_expr_type(expr).cloned());
+        let binding_uses =
+            BindingUses::compute(&expressions, |expr| self.get_expr_type(expr).cloned());
         self.binding_uses = binding_uses.uses;
         self.binding_ids = binding_uses.ids;
         self.spilled_scopes = binding_uses.spilled;
@@ -1283,7 +1282,12 @@ impl WasmGenerator {
             };
             // Parameters are not counted by the use pre-pass: they stay live
             // for the whole body.
-            bindings.insert(param.name.clone(), param.signature.clone(), plocals.clone(), None);
+            bindings.insert(
+                param.name.clone(),
+                param.signature.clone(),
+                plocals.clone(),
+                None,
+            );
             parameters.push((param.signature.clone(), value_ty, plocals));
         }
 
@@ -1647,7 +1651,9 @@ impl WasmGenerator {
                     .if_else(
                         ValType::I32,
                         |then| {
-                            then.local_get(*inner_size).i32_const(1).binop(BinaryOp::I32Add);
+                            then.local_get(*inner_size)
+                                .i32_const(1)
+                                .binop(BinaryOp::I32Add);
                         },
                         |else_| {
                             else_.i32_const(2);
@@ -1666,10 +1672,15 @@ impl WasmGenerator {
                     .if_else(
                         ValType::I32,
                         |then| {
-                            then.local_get(*ok_size).i32_const(1).binop(BinaryOp::I32Add);
+                            then.local_get(*ok_size)
+                                .i32_const(1)
+                                .binop(BinaryOp::I32Add);
                         },
                         |else_| {
-                            else_.local_get(*err_size).i32_const(1).binop(BinaryOp::I32Add);
+                            else_
+                                .local_get(*err_size)
+                                .i32_const(1)
+                                .binop(BinaryOp::I32Add);
                         },
                     )
                     .local_set(size);
@@ -2129,19 +2140,25 @@ impl WasmGenerator {
                 builder.local_set(*seq_length).local_set(*seq_offset);
 
                 // Store the offset/length to memory.
-                builder.local_get(offset_local).local_get(*seq_offset).store(
-                    memory,
-                    StoreKind::I32 { atomic: false },
-                    MemArg { align: 4, offset },
-                );
-                builder.local_get(offset_local).local_get(*seq_length).store(
-                    memory,
-                    StoreKind::I32 { atomic: false },
-                    MemArg {
-                        align: 4,
-                        offset: offset + 4,
-                    },
-                );
+                builder
+                    .local_get(offset_local)
+                    .local_get(*seq_offset)
+                    .store(
+                        memory,
+                        StoreKind::I32 { atomic: false },
+                        MemArg { align: 4, offset },
+                    );
+                builder
+                    .local_get(offset_local)
+                    .local_get(*seq_length)
+                    .store(
+                        memory,
+                        StoreKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: offset + 4,
+                        },
+                    );
                 Ok(8)
             }
             TypeSignature::BoolType => {
@@ -3572,7 +3589,10 @@ mod tests {
         assert_eq!(binding_use_counts("(let ((a u1) (b a)) b)"), [1, 1]);
         // A shadowed binding keeps its own count: the outer `a` is unread,
         // the inner one is read once.
-        assert_eq!(binding_use_counts("(let ((a u1)) (let ((a u2)) a))"), [0, 1]);
+        assert_eq!(
+            binding_use_counts("(let ((a u1)) (let ((a u2)) a))"),
+            [0, 1]
+        );
         // Uses after the scope closes resolve to the outer binding.
         assert_eq!(
             binding_use_counts("(let ((a u1)) (let ((b a)) b) a)"),
@@ -3582,10 +3602,7 @@ mod tests {
 
     #[test]
     fn binding_uses_match() {
-        assert_eq!(
-            binding_use_counts("(match (some u1) x (+ x u1) u0)"),
-            [1]
-        );
+        assert_eq!(binding_use_counts("(match (some u1) x (+ x u1) u0)"), [1]);
         // Each arm's binding is counted separately.
         assert_eq!(
             binding_use_counts("(match (ok u1) ok-v ok-v err-v (+ err-v err-v))"),

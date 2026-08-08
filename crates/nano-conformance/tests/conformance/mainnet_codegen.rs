@@ -68,7 +68,8 @@ fn check_loads(version: ClarityVersion) {
     // A resumed process holds no module for it and has to rebuild one from the
     // source on disk, which is the compilation that goes wrong.
     let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen VM");
-    vm.begin_block(Some([9; 32]), [10; 32]).expect("begin block");
+    vm.begin_block(Some([9; 32]), [10; 32])
+        .expect("begin block");
 
     let mut buffer = Vec::new();
     Value::buff_from(vec![0])

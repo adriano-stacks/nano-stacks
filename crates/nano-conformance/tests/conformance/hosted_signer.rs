@@ -64,7 +64,9 @@ impl Hosted {
             .expect("the hosted signer key must be a public key"),
             nano_events: PathBuf::from(env::var("NANO_EVENT_DIR").ok()?),
             stock_events: PathBuf::from(env::var("NANO_STOCK_EVENT_DIR").ok()?),
-            funded: env::var("NANO_FUNDED_KEY").ok().map(|key| private_key(key.trim())),
+            funded: env::var("NANO_FUNDED_KEY")
+                .ok()
+                .map(|key| private_key(key.trim())),
         })
     }
 }
@@ -166,21 +168,19 @@ async fn a_stock_signer_answers_proposals_through_nano() {
             SignerMessage::BlockPushed(_) => "pushed block",
             SignerMessage::StateMachineUpdate(_) => "state machine update",
             SignerMessage::BlockPreCommit(_) => "block pre-commit",
-            SignerMessage::BlockResponse(response) => {
-                match response {
-                    BlockResponse::Accepted(acceptance) => {
-                        accepted = Some(acceptance.clone());
-                        "accepted block response"
-                    }
-                    BlockResponse::Rejected(rejection) => {
-                        println!(
-                            "the hosted signer rejected block {} through nano: {}",
-                            rejection.signer_signature_hash, rejection.reason
-                        );
-                        "rejected block response"
-                    }
+            SignerMessage::BlockResponse(response) => match response {
+                BlockResponse::Accepted(acceptance) => {
+                    accepted = Some(acceptance.clone());
+                    "accepted block response"
                 }
-            }
+                BlockResponse::Rejected(rejection) => {
+                    println!(
+                        "the hosted signer rejected block {} through nano: {}",
+                        rejection.signer_signature_hash, rejection.reason
+                    );
+                    "rejected block response"
+                }
+            },
         };
         *kinds.entry(kind).or_default() += 1;
         // Every one of them is authenticated against the writer nano assigned the
@@ -190,7 +190,10 @@ async fn a_stock_signer_answers_proposals_through_nano() {
             "a chunk nano took for {contract} was not signed by the signer it hosts"
         );
     }
-    println!("nano took {} chunks from the signer it hosts: {kinds:?}", posted.len());
+    println!(
+        "nano took {} chunks from the signer it hosts: {kinds:?}",
+        posted.len()
+    );
 
     let Some(acceptance) = accepted else {
         println!(
@@ -242,7 +245,10 @@ fn chunks_nano_took(events: &std::path::Path) -> Vec<(String, nano_stackerdb::Ch
             .to_owned();
         for slot in payload["modified_slots"].as_array().unwrap_or(&Vec::new()) {
             let signature: Option<[u8; 65]> = hex::decode(
-                slot["sig"].as_str().unwrap_or_default().trim_start_matches("0x"),
+                slot["sig"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_start_matches("0x"),
             )
             .ok()
             .and_then(|bytes| bytes.try_into().ok());
@@ -414,7 +420,10 @@ fn an_observer_on_nano_is_told_what_stacks_core_tells_its_own() {
 
     let ours = blocks_by_hash(&run.nano_events.join("new_block"));
     let theirs = blocks_by_hash(&run.stock_events.join("new_block"));
-    let shared: Vec<&String> = ours.keys().filter(|hash| theirs.contains_key(*hash)).collect();
+    let shared: Vec<&String> = ours
+        .keys()
+        .filter(|hash| theirs.contains_key(*hash))
+        .collect();
     assert!(
         !shared.is_empty(),
         "nano and stacks-core announced no block in common: {} of ours, {} of theirs",
@@ -447,7 +456,11 @@ fn blocks_by_hash(directory: &PathBuf) -> BTreeMap<String, Value> {
 
 /// The transaction receipts of one block, as the two observers were told them.
 fn compare_receipts(ours: &Value, theirs: &Value, hash: &str) {
-    for field in ["block_height", "index_block_hash", "parent_index_block_hash"] {
+    for field in [
+        "block_height",
+        "index_block_hash",
+        "parent_index_block_hash",
+    ] {
         assert_eq!(
             ours.get(field),
             theirs.get(field),

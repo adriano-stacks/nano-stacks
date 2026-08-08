@@ -1396,7 +1396,8 @@ impl SnapshotChain {
     #[must_use]
     pub fn snapshot_at(&self, bitcoin_height: u64) -> Option<&SortitionSnapshot> {
         let back = usize::try_from(self.tip().bitcoin_height.checked_sub(bitcoin_height)?).ok()?;
-        self.snapshots.get(self.snapshots.len().checked_sub(back + 1)?)
+        self.snapshots
+            .get(self.snapshots.len().checked_sub(back + 1)?)
     }
 
     /// The last burn height at or below this one that elected somebody.
@@ -1911,11 +1912,7 @@ mod tests {
         chain.keep_from(961_206);
         for height in 961_207..=961_488 {
             chain
-                .append(
-                    &bitcoin_block(height, 4),
-                    0,
-                    super::PoxId::initial(),
-                )
+                .append(&bitcoin_block(height, 4), 0, super::PoxId::initial())
                 .expect("append a derived burn block");
         }
 
@@ -2116,10 +2113,7 @@ mod tests {
             Some(won[0]),
             "a row written down at burn 1 states the seed won by burn 1"
         );
-        assert_eq!(
-            snapshots.effective_winner_seed_at_or_below(2),
-            Some(won[1])
-        );
+        assert_eq!(snapshots.effective_winner_seed_at_or_below(2), Some(won[1]));
         assert_eq!(
             snapshots.effective_winner_seed_at_or_below(0),
             None,
@@ -2200,7 +2194,9 @@ mod tests {
         );
 
         let depth = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64");
-        let reorg = engine.retract_above(20 - depth).expect("retract the branch");
+        let reorg = engine
+            .retract_above(20 - depth)
+            .expect("retract the branch");
         assert_eq!(reorg.depth(), MINING_COMMITMENT_WINDOW);
         assert!(
             engine.commitment_window().len() + 1 >= MINING_COMMITMENT_WINDOW,
@@ -2295,7 +2291,10 @@ mod tests {
         assert_eq!(schedule.outputs_at(962_150), 1, "the waterfall pays one");
         // Past the waterfall the cycle phase no longer decides it.
         assert_eq!(schedule.outputs_at(963_000), 1);
-        assert!(schedule.starts_reward_cycle(962_150), "cycle 141 opens here");
+        assert!(
+            schedule.starts_reward_cycle(962_150),
+            "cycle 141 opens here"
+        );
         assert!(!schedule.starts_reward_cycle(962_151));
         assert!(super::PayoutSchedule::new(cycles, 2100).is_err());
     }
@@ -2550,7 +2549,8 @@ mod leader_key_tests {
         // against it: the VRF key produces the coinbase proof and the signing
         // hash signs the tenure's blocks.
         assert_eq!(
-            keys.registration(100, 7).and_then(|key| key.signing_key_hash),
+            keys.registration(100, 7)
+                .and_then(|key| key.signing_key_hash),
             Some([0xcd; 20])
         );
 

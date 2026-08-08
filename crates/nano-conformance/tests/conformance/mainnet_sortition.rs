@@ -256,19 +256,12 @@ const DERIVED_FLOOR: usize = 14;
 /// Mainnet's magic bytes, which decide what counts as a burnchain transaction.
 const MAINNET_MAGIC: [u8; 2] = *b"X2";
 
-#[test]
-fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
-    let Some(root) = capture() else {
-        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
-        return;
-    };
-    let captured: Vec<Captured> = serde_json::from_slice(
-        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
-    )
-    .expect("parse the snapshots");
-    assert!(captured.len() > 1, "the capture holds a window to replay");
-
-    let blocks: BTreeMap<u64, BitcoinBlock> = captured
+/// The Bitcoin block behind each captured snapshot, by burn height.
+fn captured_bitcoin_blocks(
+    root: &std::path::Path,
+    captured: &[Captured],
+) -> BTreeMap<u64, BitcoinBlock> {
+    captured
         .iter()
         .map(|snapshot| {
             let raw = fs::read_to_string(
@@ -284,12 +277,26 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
             .expect("decode the captured Bitcoin block");
             (snapshot.block_height, block)
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
+    let Some(root) = capture() else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+    let captured: Vec<Captured> = serde_json::from_slice(
+        &fs::read(root.join("sortition/snapshots.json")).expect("read the snapshots"),
+    )
+    .expect("parse the snapshots");
+    assert!(captured.len() > 1, "the capture holds a window to replay");
+
+    let blocks = captured_bitcoin_blocks(&root, &captured);
 
     // The first captured snapshot is taken as given; everything after it is
     // derived, which is the claim being checked.
     let mut chain = chain_from(&root, &seed_from(&captured[0]));
-
 
     println!(
         "{} leader keys registered inside the window",
@@ -310,12 +317,15 @@ fn mainnet_sortitions_derive_from_mainnet_bitcoin_blocks() {
             .then(|| {
                 block.operations.iter().find_map(|operation| {
                     match (operation.txid == winning, &operation.kind) {
-                        (true, nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
-                            block_header_hash,
-                            new_seed,
-                            parent_block_height,
-                            ..
-                        }) => Some(SortitionWinner {
+                        (
+                            true,
+                            nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                                block_header_hash,
+                                new_seed,
+                                parent_block_height,
+                                ..
+                            },
+                        ) => Some(SortitionWinner {
                             signing_key_hash: None,
                             vrf_public_key: None,
                             txid: operation.txid,
@@ -383,7 +393,8 @@ fn priming_blocks(root: &std::path::Path, seed: &Captured) -> Option<Vec<Bitcoin
     let mut height = seed.block_height;
     let mut blocks = Vec::new();
     for _ in 0..nano_sortition::MINING_COMMITMENT_WINDOW {
-        let raw = fs::read_to_string(root.join("bitcoin/blocks").join(format!("{hash}.hex"))).ok()?;
+        let raw =
+            fs::read_to_string(root.join("bitcoin/blocks").join(format!("{hash}.hex"))).ok()?;
         let bytes = hex::decode(raw.trim()).expect("the block is hexadecimal");
         // A Bitcoin header is version(4) then the previous block hash, stored in
         // the reverse of the order it is written in.
@@ -416,7 +427,10 @@ pub fn mainnet_payouts() -> nano_sortition::PayoutSchedule {
 }
 
 /// Every Bitcoin block the window needs, including the six behind its seed.
-fn window_blocks(root: &std::path::Path, captured: &[Captured]) -> Option<BTreeMap<u64, BitcoinBlock>> {
+fn window_blocks(
+    root: &std::path::Path,
+    captured: &[Captured],
+) -> Option<BTreeMap<u64, BitcoinBlock>> {
     Some(
         priming_blocks(root, &captured[0])?
             .into_iter()
@@ -891,7 +905,9 @@ fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
     };
     let Some(position) = captured
         .iter()
-        .position(|snapshot| snapshot.sortition == 0 && snapshot.block_height > captured[0].block_height)
+        .position(|snapshot| {
+            snapshot.sortition == 0 && snapshot.block_height > captured[0].block_height
+        })
         .filter(|position| position + 1 < captured.len())
     else {
         nano_conformance::skip_gate("the captured window holds no sortition-less burn block");
@@ -939,7 +955,9 @@ fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
         .expect("the chain walks to the pause");
     assert_eq!(stopping.tip().bitcoin_height, pause);
     let saved = tempfile::tempdir().expect("a directory to save into");
-    stopping.save(saved.path()).expect("the chain is written down");
+    stopping
+        .save(saved.path())
+        .expect("the chain is written down");
 
     let mut resumed = nano_node::sortition::SortitionTracker::from_capture(saved.path())
         .expect("the saved chain seeds a new one");
@@ -977,9 +995,7 @@ fn a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner() {
         "burn {next} elected somebody, so a resumed chain has to state what its miners \
          spent: `get-tenure-info? miner-spend-total` reads it back"
     );
-    println!(
-        "resumed at burn {pause} with no sortition and named the same winner at burn {next}"
-    );
+    println!("resumed at burn {pause} with no sortition and named the same winner at burn {next}");
 }
 
 /// What the tracker derived about one sortition, in what a validator reads.
@@ -1031,7 +1047,9 @@ fn derive_window(
         let block = blocks
             .get(&snapshot.block_height)
             .expect("every captured snapshot has its Bitcoin block");
-        let snapshot = tracker.advance(block, payouts).expect("the tracker advances");
+        let snapshot = tracker
+            .advance(block, payouts)
+            .expect("the tracker advances");
         if snapshot.winner_txid.is_some() {
             derived.insert(
                 snapshot.consensus_hash.to_string(),
@@ -1099,7 +1117,10 @@ fn the_carried_registry_names_the_key_that_proved_each_tenure() {
         );
         return;
     }
-    println!("{registry} leader-key registrations carried, {} sortitions", derived.len());
+    println!(
+        "{registry} leader-key registrations carried, {} sortitions",
+        derived.len()
+    );
     let unresolved: Vec<u64> = derived
         .values()
         .filter(|derived| derived.winner_vrf_public_key.is_none())
@@ -1127,7 +1148,9 @@ fn the_carried_registry_names_the_key_that_proved_each_tenure() {
             bitcoin_height,
             sortition_hash,
             winner_vrf_public_key: Some(key),
-        }) = derived.get(&block.header.consensus_hash.to_string()).copied()
+        }) = derived
+            .get(&block.header.consensus_hash.to_string())
+            .copied()
         else {
             continue;
         };

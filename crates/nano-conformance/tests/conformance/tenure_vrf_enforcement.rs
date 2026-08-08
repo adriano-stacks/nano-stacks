@@ -110,7 +110,6 @@ fn winning_key(tenure: &Tenure) -> Option<[u8; 32]> {
     found
 }
 
-
 fn capture() -> std::path::PathBuf {
     nano_conformance::capture_root(&Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
 }

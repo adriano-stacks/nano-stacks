@@ -334,9 +334,7 @@ fn read_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnownPeer> {
     let public_key: Option<Vec<u8>> = row.get(2)?;
     let public_key_hash: Option<Vec<u8>> = row.get(3)?;
     Ok(KnownPeer {
-        address: PeerAddress::from_bytes(
-            address.try_into().unwrap_or([0; 16]),
-        ),
+        address: PeerAddress::from_bytes(address.try_into().unwrap_or([0; 16])),
         port: row.get(1)?,
         public_key: public_key.and_then(|bytes| bytes.try_into().ok()),
         public_key_hash: public_key_hash
@@ -369,7 +367,9 @@ mod tests {
     use super::*;
 
     fn address(last: u8) -> PeerAddress {
-        PeerAddress::from_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last)))
+        PeerAddress::from_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            203, 0, 113, last,
+        )))
     }
 
     fn handshake(key: u8) -> Handshake {
@@ -394,7 +394,10 @@ mod tests {
             .record_handshake(address(1), 20444, &handshake(7), 0x1800_0010, 1)
             .expect("record");
         peers.seed(address(1), 20444).expect("seed");
-        let known = peers.get(address(1), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(1), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.public_key, Some([7; 33]));
         assert_eq!(known.services, 0x03);
         assert_eq!(known.peer_version, 0x1800_0010);
@@ -424,7 +427,10 @@ mod tests {
             ])
             .expect("learn");
         assert_eq!(learned, 2);
-        let known = peers.get(address(2), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(2), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.public_key, None);
         assert_eq!(known.public_key_hash, Some(Hash160::from_bytes([2; 20])));
         assert!(known.last_seen.is_none());
@@ -434,15 +440,19 @@ mod tests {
             .record_handshake(address(2), 20444, &handshake(9), 0x1800_0010, 1)
             .expect("record");
         assert_eq!(
-            peers.learn(&[NeighborAddress {
-                address: address(2),
-                port: 20444,
-                public_key_hash: Hash160::from_bytes([0xaa; 20]),
-            }])
-            .expect("learn"),
+            peers
+                .learn(&[NeighborAddress {
+                    address: address(2),
+                    port: 20444,
+                    public_key_hash: Hash160::from_bytes([0xaa; 20]),
+                }])
+                .expect("learn"),
             0
         );
-        let known = peers.get(address(2), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(2), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.public_key, Some([9; 33]));
     }
 
@@ -456,7 +466,10 @@ mod tests {
         peers.record_failure(address(4), 20444).expect("fail");
         // Still inside the first backoff window, so not yet worth dialling.
         assert!(peers.candidates(10).expect("candidates").is_empty());
-        let known = peers.get(address(4), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(4), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.consecutive_failures, 1);
         // A failure is never fatal: the peer stays known, and comes back when its
         // wait is up.
@@ -464,7 +477,10 @@ mod tests {
         assert!(!known.is_due(Some(now()), now()));
 
         peers.record_failure(address(4), 20444).expect("fail");
-        let known = peers.get(address(4), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(4), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.consecutive_failures, 2);
         // Doubling: one backoff period is no longer enough.
         assert!(!known.is_due(Some(now() - BASE_BACKOFF.as_secs()), now()));
@@ -477,7 +493,10 @@ mod tests {
         peers
             .record_handshake(address(4), 20444, &handshake(4), 0x1800_0010, 1)
             .expect("record");
-        let known = peers.get(address(4), 20444).expect("read").expect("present");
+        let known = peers
+            .get(address(4), 20444)
+            .expect("read")
+            .expect("present");
         assert_eq!(known.consecutive_failures, 0);
         assert_eq!(peers.candidates(10).expect("candidates").len(), 1);
     }
@@ -497,7 +516,10 @@ mod tests {
         let candidates = peers.candidates(10).expect("candidates");
         // 11 handshaked, 12 is untried, and 10 is inside its backoff.
         assert_eq!(
-            candidates.iter().map(|peer| peer.address).collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|peer| peer.address)
+                .collect::<Vec<_>>(),
             vec![address(11), address(12)]
         );
     }
@@ -514,9 +536,9 @@ mod tests {
         for index in 0..=u32::try_from(MAX_KNOWN_PEERS).expect("bound fits u32") + 100 {
             let octets = index.to_be_bytes();
             gossip.push(NeighborAddress {
-                address: PeerAddress::from_ip(std::net::IpAddr::V4(
-                    std::net::Ipv4Addr::new(10, octets[1], octets[2], octets[3]),
-                )),
+                address: PeerAddress::from_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    10, octets[1], octets[2], octets[3],
+                ))),
                 port: 20444,
                 public_key_hash: Hash160::from_bytes([0; 20]),
             });

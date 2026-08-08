@@ -130,14 +130,13 @@ async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) {
     let router = Router::new()
         .route(
             "/v3/tenures/info",
-            get(|State(state): State<Arc<Served>>| async move {
-                axum::Json(state.info.clone())
-            }),
+            get(|State(state): State<Arc<Served>>| async move { axum::Json(state.info.clone()) }),
         )
         .route(
             "/v3/blocks/{id}",
             get(
-                |State(state): State<Arc<Served>>, axum::extract::Path(id): axum::extract::Path<String>| async move {
+                |State(state): State<Arc<Served>>,
+                 axum::extract::Path(id): axum::extract::Path<String>| async move {
                     let id = id.trim_start_matches("0x").to_lowercase();
                     state.blocks.get(&id).map_or_else(
                         || (StatusCode::NOT_FOUND, Vec::new()),
@@ -341,4 +340,3 @@ async fn a_peer_substituting_a_block_for_the_one_asked_for_changes_nothing() {
     honest_task.abort();
     substituting_task.abort();
 }
-

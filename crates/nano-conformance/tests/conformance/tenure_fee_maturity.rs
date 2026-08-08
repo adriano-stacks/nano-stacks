@@ -65,10 +65,7 @@ fn a_tenure_start_pays_one_coinbase_and_the_previous_tenures_fees() {
         .expect("tenure 251,421 pays out from tenures 251,320 and 251,321");
     assert_eq!(
         effects.credits,
-        vec![
-            credit(MINER_A, 1_000_000_000),
-            credit(MINER_B, 15_114),
-        ],
+        vec![credit(MINER_A, 1_000_000_000), credit(MINER_B, 15_114),],
         "tenure 251,321's coinbase and tenure 251,320's fees"
     );
     // Only the coinbase is new money; the fees already existed.
@@ -81,10 +78,7 @@ fn a_tenure_start_pays_one_coinbase_and_the_previous_tenures_fees() {
         .expect("tenure 251,422 pays out from tenures 251,321 and 251,322");
     assert_eq!(
         next.credits,
-        vec![
-            credit(MINER_B, 1_000_000_000),
-            credit(MINER_A, 22_539_119),
-        ],
+        vec![credit(MINER_B, 1_000_000_000), credit(MINER_A, 22_539_119),],
         "tenure 251,322's coinbase and tenure 251,321's fees"
     );
 }

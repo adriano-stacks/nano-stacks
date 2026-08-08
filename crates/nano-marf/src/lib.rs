@@ -201,7 +201,9 @@ impl fmt::Display for MarfError {
             }
             Self::UnknownVersion => formatter.write_str("MARF version does not exist"),
             Self::VersionAlreadyExists => formatter.write_str("MARF version already exists"),
-            Self::WriteInProgress => formatter.write_str("MARF version write is already in progress"),
+            Self::WriteInProgress => {
+                formatter.write_str("MARF version write is already in progress")
+            }
             Self::WriteNotBegun => formatter.write_str("MARF version write has not begun"),
             Self::HeightOverflow => formatter.write_str("MARF version height overflowed"),
             Self::Storage(reason) => write!(formatter, "MARF storage error: {reason}"),
@@ -488,10 +490,7 @@ impl MarfTrie {
 
 /// Take over the sealed state `parent`, turning every child it owns into a
 /// back-pointer to it.
-fn extend_root(
-    storage: &TrieStorage,
-    parent: &BlockRecord,
-) -> Result<Vec<TrieChild>, MarfError> {
+fn extend_root(storage: &TrieStorage, parent: &BlockRecord) -> Result<Vec<TrieChild>, MarfError> {
     let mut children = match parent.node {
         Some(index) => match &*storage.node(parent.id, index)? {
             TrieNode::Internal { children, .. } => children.clone(),
@@ -705,9 +704,12 @@ impl TrieNode {
     fn hash(&self, storage: &TrieStorage) -> Result<TrieHash, MarfError> {
         match self {
             Self::Leaf { path, value } => leaf_hash(path, *value),
-            Self::Internal { path, children } => {
-                hash_children(storage, node_id_for_children(children.len()), path, children)
-            }
+            Self::Internal { path, children } => hash_children(
+                storage,
+                node_id_for_children(children.len()),
+                path,
+                children,
+            ),
         }
     }
 
@@ -756,7 +758,10 @@ fn find_path(
     root_children: &[TrieChild],
     path: [u8; 32],
 ) -> Result<Option<MarfValue>, MarfError> {
-    let Some(child) = root_children.iter().find(|child| child.character == path[0]) else {
+    let Some(child) = root_children
+        .iter()
+        .find(|child| child.character == path[0])
+    else {
         return Ok(None);
     };
     child.node(storage)?.get(storage, &path[1..])
@@ -900,11 +905,9 @@ fn persist_node(
     next: &mut u32,
 ) -> Result<(u32, TrieHash, TrieNodeId), MarfError> {
     let (hash, record, id) = match &**node {
-        TrieNode::Leaf { path, value } => (
-            leaf_hash(path, *value)?,
-            Arc::clone(node),
-            TrieNodeId::Leaf,
-        ),
+        TrieNode::Leaf { path, value } => {
+            (leaf_hash(path, *value)?, Arc::clone(node), TrieNodeId::Leaf)
+        }
         TrieNode::Internal { path, children } => {
             let (children, hashes) = persist_children(storage, block, children, next)?;
             let id = node_id_for_children(children.len());
@@ -988,7 +991,10 @@ impl VersionedMarf {
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, MarfError> {
         let path = path.as_ref();
         if !path.is_file() {
-            return Err(MarfError::Storage(format!("{} is not there", path.display())));
+            return Err(MarfError::Storage(format!(
+                "{} is not there",
+                path.display()
+            )));
         }
         refuse_uncommitted(path)?;
         Ok(Self::from_storage(TrieStorage::open_existing(path)?))
@@ -1072,10 +1078,7 @@ impl VersionedMarf {
     /// Whether a sealed state exists.
     #[must_use]
     pub fn contains(&self, block: MarfBlockId) -> bool {
-        self.storage
-            .block(block)
-            .expect("trie storage")
-            .is_some()
+        self.storage.block(block).expect("trie storage").is_some()
     }
 
     /// The state currently being written.
@@ -1114,7 +1117,10 @@ impl VersionedMarf {
                     .ok_or(MarfError::UnknownVersion)?;
                 (
                     extend_root(&self.storage, &record)?,
-                    record.height.checked_add(1).ok_or(MarfError::HeightOverflow)?,
+                    record
+                        .height
+                        .checked_add(1)
+                        .ok_or(MarfError::HeightOverflow)?,
                 )
             }
             None => (Vec::new(), 0),
@@ -1165,7 +1171,12 @@ impl VersionedMarf {
     pub fn pending_root(&self) -> Result<TrieHash, MarfError> {
         let active = self.active.as_ref().ok_or(MarfError::WriteNotBegun)?;
         Ok(state_root(
-            hash_children(&self.storage, TrieNodeId::Node256, &[], &active.root_children)?,
+            hash_children(
+                &self.storage,
+                TrieNodeId::Node256,
+                &[],
+                &active.root_children,
+            )?,
             &self.ancestor_roots(active.parent, active.height)?,
         ))
     }
@@ -1429,10 +1440,7 @@ pub fn height_keys(
     height: u32,
 ) -> Vec<(String, MarfValue)> {
     let mut entries = vec![
-        (
-            OWN_BLOCK_HEIGHT_KEY.to_owned(),
-            MarfValue::from_u32(height),
-        ),
+        (OWN_BLOCK_HEIGHT_KEY.to_owned(), MarfValue::from_u32(height)),
         (
             format!("{BLOCK_HEIGHT_TO_HASH_KEY}::{height}"),
             MarfValue::from_block_id(block),
@@ -1566,21 +1574,31 @@ mod tests {
         for index in 0_u8..=48 {
             let mut path = [0; 32];
             path[0] = index;
-            trie.insert_path(path, MarfValue::from_u32(u32::from(index))).expect("the test trie stores");
+            trie.insert_path(path, MarfValue::from_u32(u32::from(index)))
+                .expect("the test trie stores");
         }
         let root_before_overwrite = trie.root_hash().expect("the test trie hashes");
         let mut overwritten_path = [0; 32];
         overwritten_path[0] = 9;
-        trie.insert_path(overwritten_path, MarfValue::from_u32(100)).expect("the test trie stores");
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100))
+            .expect("the test trie stores");
         let overwritten_root = trie.root_hash().expect("the test trie hashes");
         assert_ne!(overwritten_root, root_before_overwrite);
-        trie.insert_path(overwritten_path, MarfValue::from_u32(100)).expect("the test trie stores");
-        assert_eq!(trie.root_hash().expect("the test trie hashes"), overwritten_root);
+        trie.insert_path(overwritten_path, MarfValue::from_u32(100))
+            .expect("the test trie stores");
         assert_eq!(
-            trie.get_path(overwritten_path).expect("the test trie reads"),
+            trie.root_hash().expect("the test trie hashes"),
+            overwritten_root
+        );
+        assert_eq!(
+            trie.get_path(overwritten_path)
+                .expect("the test trie reads"),
             Some(MarfValue::from_u32(100))
         );
-        assert_eq!(trie.get_path([0xff; 32]).expect("the test trie reads"), None);
+        assert_eq!(
+            trie.get_path([0xff; 32]).expect("the test trie reads"),
+            None
+        );
     }
 
     #[test]
@@ -1589,7 +1607,8 @@ mod tests {
         let path = [7; 32];
         let first_value = MarfValue::from_u32(1);
         let mut trie = MarfTrie::default();
-        trie.insert_path(path, first_value).expect("the test trie stores");
+        trie.insert_path(path, first_value)
+            .expect("the test trie stores");
         super::prepare_root_for_copy(&mut trie.root_children, first);
         let mut pointers = vec![
             TriePointer {
@@ -1635,14 +1654,22 @@ mod tests {
         trie.insert_path(path, replacement)
             .expect("overwrites copied leaf");
         let third_root = trie.seal().expect("seals updated state");
-        assert_eq!(trie.get_path(first, path).expect("the test store reads"), Some(first_value));
-        assert_eq!(trie.get_path(third, path).expect("the test store reads"), Some(replacement));
         assert_eq!(
-            trie.get(third, OWN_BLOCK_HEIGHT_KEY.as_bytes()).expect("the test store reads"),
+            trie.get_path(first, path).expect("the test store reads"),
+            Some(first_value)
+        );
+        assert_eq!(
+            trie.get_path(third, path).expect("the test store reads"),
+            Some(replacement)
+        );
+        assert_eq!(
+            trie.get(third, OWN_BLOCK_HEIGHT_KEY.as_bytes())
+                .expect("the test store reads"),
             Some(2.into())
         );
         assert_eq!(
-            trie.get(third, format!("{BLOCK_HEIGHT_TO_HASH_KEY}::0").as_bytes()).expect("the test store reads"),
+            trie.get(third, format!("{BLOCK_HEIGHT_TO_HASH_KEY}::0").as_bytes())
+                .expect("the test store reads"),
             Some(MarfValue::from_block_id(first))
         );
         assert_eq!(
@@ -1695,10 +1722,12 @@ mod tests {
         let expected = {
             let mut marf = VersionedMarf::open(&path).expect("open MARF");
             marf.begin(None, first).expect("begin");
-            marf.insert(key, MarfValue::from_value(b"one")).expect("insert");
+            marf.insert(key, MarfValue::from_value(b"one"))
+                .expect("insert");
             marf.seal().expect("seal");
             marf.begin(Some(first), second).expect("begin");
-            marf.insert(key, MarfValue::from_value(b"two")).expect("insert");
+            marf.insert(key, MarfValue::from_value(b"two"))
+                .expect("insert");
             marf.seal().expect("seal")
         };
 
@@ -1750,7 +1779,8 @@ mod missing_node_tests {
             let mut marf = VersionedMarf::open(&path).expect("open MARF");
             marf.begin(None, block).expect("begin");
             for key in &keys {
-                marf.insert(key, MarfValue::from_value(key)).expect("insert");
+                marf.insert(key, MarfValue::from_value(key))
+                    .expect("insert");
             }
             marf.seal().expect("seal");
         }

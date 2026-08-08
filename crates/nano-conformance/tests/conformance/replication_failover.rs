@@ -132,22 +132,13 @@ async fn serve(peer: Peer) -> String {
     let bound: SocketAddr = listener.local_addr().expect("an address");
     let app = Router::new()
         .route("/v3/tenures/info", get(serve_tenure_info))
-        .route(
-            "/v2/stackerdb/{address}/{name}",
-            get(serve_metadata),
-        )
-        .route(
-            "/v2/stackerdb/{address}/{name}/chunks",
-            post(take_chunk),
-        )
+        .route("/v2/stackerdb/{address}/{name}", get(serve_metadata))
+        .route("/v2/stackerdb/{address}/{name}/chunks", post(take_chunk))
         .route(
             "/v2/stackerdb/{address}/{name}/{slot}/{version}",
             get(serve_chunk),
         )
-        .route(
-            "/v2/stackerdb/{address}/{name}/{slot}",
-            get(serve_chunk),
-        )
+        .route("/v2/stackerdb/{address}/{name}/{slot}", get(serve_chunk))
         .with_state(peer);
     tokio::spawn(async move {
         drop(axum::serve(listener, app).await);

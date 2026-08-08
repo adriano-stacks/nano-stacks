@@ -96,7 +96,10 @@ async fn a_real_peer_completes_the_handshake() {
         .expect("the peer resolves to an address");
     // A fresh key each run: nano has no identity to defend here, and reusing one
     // across runs would make the peer's rate limiting part of the test.
-    let local = LocalPeer::quiet(StacksPrivateKey::from_seed(&address.to_string().into_bytes()), 20444);
+    let local = LocalPeer::quiet(
+        StacksPrivateKey::from_seed(&address.to_string().into_bytes()),
+        20444,
+    );
     let mut session = Session::open(address, &local, Protocol::mainnet(), view(), TIMEOUT)
         .await
         .unwrap_or_else(|error| panic!("{peer} refused the handshake: {error}"));
@@ -129,7 +132,10 @@ async fn a_real_peer_completes_the_handshake() {
     // all is proof the peer is both alive and the same peer.
     session.ping().await.expect("the peer answers a ping");
 
-    let neighbors = session.neighbors().await.expect("the peer names its neighbors");
+    let neighbors = session
+        .neighbors()
+        .await
+        .expect("the peer names its neighbors");
     eprintln!("  it knows {} neighbors", neighbors.len());
 
     // The peer table is the point of asking: a node that has run before should

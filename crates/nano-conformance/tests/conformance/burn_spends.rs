@@ -230,7 +230,9 @@ fn the_captured_snapshots_state_the_payout_output_count() {
     if let Some(root) = mainnet_sortition::capture() {
         captures.push(("mainnet", root, mainnet_sortition::mainnet_payouts()));
     } else {
-        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE would add the chain that pays two outputs");
+        nano_conformance::skip_gate(
+            "NANO_MAINNET_CAPTURE would add the chain that pays two outputs",
+        );
     }
     for (label, root, schedule) in captures {
         let rows = snapshots(&root);

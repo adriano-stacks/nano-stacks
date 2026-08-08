@@ -148,7 +148,11 @@ fn plant(vm: &mut Vm, contract: &QualifiedContractIdentifier, source: &str) {
     database.commit().expect("commit the planted contract");
 }
 
-fn call(vm: &mut Vm, contract: &QualifiedContractIdentifier, function: &str) -> ContractCallOutcome {
+fn call(
+    vm: &mut Vm,
+    contract: &QualifiedContractIdentifier,
+    function: &str,
+) -> ContractCallOutcome {
     vm.execute_contract_call_outcome(
         sender(contract),
         None,
@@ -157,7 +161,9 @@ fn call(vm: &mut Vm, contract: &QualifiedContractIdentifier, function: &str) -> 
         &[],
         &LimitedCostTracker::new_free(),
     )
-    .unwrap_or_else(|error| panic!("the boundary reports {function} rather than raising: {error:?}"))
+    .unwrap_or_else(|error| {
+        panic!("the boundary reports {function} rather than raising: {error:?}")
+    })
 }
 
 /// The failure a `RuntimeFailure` outcome carries, or a panic naming what came

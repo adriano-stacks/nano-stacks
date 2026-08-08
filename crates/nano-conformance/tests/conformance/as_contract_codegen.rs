@@ -163,7 +163,6 @@ fn merging_none_over_an_optional_field_compiles_to_a_module_that_loads() {
     .expect("merging none over an optional field compiles");
 }
 
-
 /// An allowance amount bound by a `let` and read nowhere else.
 ///
 /// The read is inside `((with-ft …))` — a list whose first element is a list

@@ -341,12 +341,10 @@ impl NodeConfig {
     pub fn bootstrap_seeds(&self) -> Vec<String> {
         match &self.p2p_seeds {
             Some(seeds) => seeds.clone(),
-            None if matches!(self.network, Some(NetworkName::Mainnet)) => {
-                nano_p2p::MAINNET_SEEDS
-                    .iter()
-                    .map(|seed| (*seed).to_owned())
-                    .collect()
-            }
+            None if matches!(self.network, Some(NetworkName::Mainnet)) => nano_p2p::MAINNET_SEEDS
+                .iter()
+                .map(|seed| (*seed).to_owned())
+                .collect(),
             None => Vec::new(),
         }
     }

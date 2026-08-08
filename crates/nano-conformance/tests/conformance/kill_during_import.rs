@@ -136,17 +136,15 @@ struct Wreckage {
 
 fn wreckage(directory: &Path) -> Wreckage {
     let marf = directory.join("marf.sqlite");
-    let blocks = rusqlite::Connection::open_with_flags(
-        &marf,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()
-    .and_then(|connection| {
-        connection
-            .query_row("SELECT count(*) FROM marf_block", [], |row| row.get(0))
+    let blocks =
+        rusqlite::Connection::open_with_flags(&marf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()
-    })
-    .unwrap_or(0);
+            .and_then(|connection| {
+                connection
+                    .query_row("SELECT count(*) FROM marf_block", [], |row| row.get(0))
+                    .ok()
+            })
+            .unwrap_or(0);
     Wreckage {
         marked: UnfinishedImport::marker(directory).exists(),
         blocks,
@@ -211,9 +209,7 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
         cold_trie.min(warm_trie),
         cold_side_store.min(warm_side_store),
     );
-    println!(
-        "import phases: trie {trie_window:?}, side store {side_store_window:?}"
-    );
+    println!("import phases: trie {trie_window:?}, side store {side_store_window:?}");
 
     let mut refused = 0_usize;
     let mut resumable = 0_usize;
@@ -246,7 +242,11 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
             "the refusal says the import did not finish: {message}"
         );
         assert!(
-            message.contains(&UnfinishedImport::marker(directory.path()).display().to_string()),
+            message.contains(
+                &UnfinishedImport::marker(directory.path())
+                    .display()
+                    .to_string()
+            ),
             "and names the file that says so: {message}"
         );
         assert!(
@@ -302,7 +302,9 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
 }
 
 /// The tip and sealed root a directory holds after replaying two blocks.
-fn state_after_two_blocks(directory: &Path) -> (Option<[u8; 32]>, Option<nano_primitives::TrieHash>) {
+fn state_after_two_blocks(
+    directory: &Path,
+) -> (Option<[u8; 32]>, Option<nano_primitives::TrieHash>) {
     assert!(
         Command::new(env!("CARGO_BIN_EXE_replay-blocks"))
             .arg(fixtures())

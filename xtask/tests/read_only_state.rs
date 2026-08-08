@@ -118,7 +118,11 @@ fn a_path_that_is_not_there_creates_nothing() {
         absent.to_str().expect("utf-8"),
         "a path that is not there",
     );
-    assert!(!absent.exists(), "the inspection created {}", absent.display());
+    assert!(
+        !absent.exists(),
+        "the inspection created {}",
+        absent.display()
+    );
 }
 
 #[test]
@@ -222,7 +226,10 @@ fn a_state_a_node_still_owns_is_refused() {
         "tip",
         "vm-epoch::epoch-version",
     ]);
-    assert!(!output.status.success(), "a state with an uncommitted wal was read");
+    assert!(
+        !output.status.success(),
+        "a state with an uncommitted wal was read"
+    );
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(
         said.contains("committed"),

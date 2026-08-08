@@ -142,8 +142,8 @@ impl SortitionTracker {
     pub fn history_from(directory: &Path) -> Result<Vec<ConsensusHash>, TrackerError> {
         let bytes = fs::read(directory.join("consensus-hashes.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let history: History =
-            serde_json::from_slice(&bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let history: History = serde_json::from_slice(&bytes)
+            .map_err(|error| TrackerError::Seed(error.to_string()))?;
         history
             .hashes
             .iter()
@@ -190,10 +190,7 @@ impl SortitionTracker {
     /// against at all.
     #[must_use]
     pub fn holds_consensus_hash(&self, consensus_hash: ConsensusHash) -> bool {
-        self.engine
-            .snapshots()
-            .history()
-            .contains(&consensus_hash)
+        self.engine.snapshots().history().contains(&consensus_hash)
     }
 
     /// The Bitcoin height a burn view sits at, from this chain's own history.
@@ -272,9 +269,7 @@ impl SortitionTracker {
     #[must_use]
     pub fn previous_sortition_height(&self, bitcoin_height: u64) -> Option<u64> {
         let parent = bitcoin_height.checked_sub(1)?;
-        self.engine
-            .snapshots()
-            .last_sortition_at_or_below(parent)
+        self.engine.snapshots().last_sortition_at_or_below(parent)
     }
 
     /// Where this chain and Bitcoin's own history part company, if they do.
@@ -441,7 +436,9 @@ impl SortitionTracker {
         // The walk cannot outrun the lookup behind it: it advances at most `limit`
         // blocks and `height_of_consensus_hash` looks back over the same window, so
         // a view found on the way is still addressable when the walk stops.
-        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| false)?;
+        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| {
+            false
+        })?;
         let found = self.height_of_consensus_hash(view);
         Ok((found, walk))
     }
@@ -467,7 +464,9 @@ impl SortitionTracker {
             self.prime(&mut block_at, payouts, &mut walk)?;
         }
         let room = burnchain_tip.saturating_sub(self.tip().bitcoin_height);
-        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| false)?;
+        self.walk(&mut block_at, payouts, limit.min(room), &mut walk, |_| {
+            false
+        })?;
         Ok(walk)
     }
 
@@ -493,7 +492,8 @@ impl SortitionTracker {
                 .checked_add(1)
                 .ok_or(SortitionError::HeightOverflow)?;
             let read = std::time::Instant::now();
-            let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            let block =
+                block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
             walk.reading += read.elapsed();
             let derive = std::time::Instant::now();
             self.advance(&block, payouts)?;
@@ -519,7 +519,8 @@ impl SortitionTracker {
         let behind = u64::try_from(MINING_COMMITMENT_WINDOW).expect("window fits u64") - 1;
         for height in tip.saturating_sub(behind)..=tip {
             let read = std::time::Instant::now();
-            let block = block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
+            let block =
+                block_at(height).map_err(|error| TrackerError::Bitcoin(error.to_string()))?;
             walk.reading += read.elapsed();
             walk.primed += 1;
             self.register_keys(&block);
@@ -620,10 +621,8 @@ impl SortitionTracker {
         let Ok(bytes) = fs::read(&path) else {
             return Ok(0);
         };
-        let records: Vec<CapturedLeaderKey> =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                TrackerError::Seed(format!("{}: {error}", path.display()))
-            })?;
+        let records: Vec<CapturedLeaderKey> = serde_json::from_slice(&bytes)
+            .map_err(|error| TrackerError::Seed(format!("{}: {error}", path.display())))?;
         let loaded = records.len();
         for record in records {
             self.keys
@@ -631,7 +630,6 @@ impl SortitionTracker {
         }
         Ok(loaded)
     }
-
 }
 
 /// What this chain says about a tip a peer is offering, for the fork choice.
@@ -689,16 +687,17 @@ fn winner_seed(block: &BitcoinBlock, winner_txid: [u8; 32]) -> Option<[u8; 32]> 
 }
 
 fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
-    let mut seeds = block.operations.iter().filter_map(|operation| {
-        match &operation.kind {
+    let mut seeds = block
+        .operations
+        .iter()
+        .filter_map(|operation| match &operation.kind {
             BitcoinOperationKind::LeaderBlockCommit {
                 new_seed,
                 parent_modulus,
                 ..
             } if commitment_is_on_time(*parent_modulus, block.height) => Some(*new_seed),
             _ => None,
-        }
-    });
+        });
     let first = seeds.next()?;
     seeds.all(|seed| seed == first).then_some(first)
 }
@@ -1034,11 +1033,7 @@ impl SortitionTracker {
             // so one height answers for everything at or above itself and for
             // nothing below, and the run is what makes the resumed chain able to
             // answer what an unrestarted one could.
-            sortitions_below_window: self
-                .engine
-                .snapshots()
-                .sortitions_below_window()
-                .to_vec(),
+            sortitions_below_window: self.engine.snapshots().sortitions_below_window().to_vec(),
             // Written down for the same reason the two above are: the next start is
             // seeded on this row, and a seed that cannot state its winner's key or
             // the block it committed to answers `/v3/sortitions` with nulls.
@@ -1053,10 +1048,9 @@ impl SortitionTracker {
             // re-derives them by walking forward.
             hashes: {
                 let history = self.engine.snapshots().history();
-                let ahead = usize::try_from(
-                    self.tip().bitcoin_height.saturating_sub(tip.bitcoin_height),
-                )
-                .unwrap_or(0);
+                let ahead =
+                    usize::try_from(self.tip().bitcoin_height.saturating_sub(tip.bitcoin_height))
+                        .unwrap_or(0);
                 history[..history.len().saturating_sub(ahead)]
                     .iter()
                     .map(ToString::to_string)
@@ -1074,7 +1068,10 @@ impl SortitionTracker {
                 block_height,
                 vtxindex,
                 public_key: hex::encode(registration.vrf_public_key),
-                memo: registration.signing_key_hash.map(hex::encode).unwrap_or_default(),
+                memo: registration
+                    .signing_key_hash
+                    .map(hex::encode)
+                    .unwrap_or_default(),
             })
             .collect();
         write(
@@ -1087,15 +1084,16 @@ impl SortitionTracker {
         )?;
         write(
             "snapshots.json",
-            serde_json::to_vec(&snapshots).map_err(|error| TrackerError::Seed(error.to_string()))?,
+            serde_json::to_vec(&snapshots)
+                .map_err(|error| TrackerError::Seed(error.to_string()))?,
         )
     }
 
     pub fn from_capture(directory: &Path) -> Result<Self, TrackerError> {
         let bytes = fs::read(directory.join("snapshots.json"))
             .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let snapshots: Vec<CapturedSnapshot> =
-            serde_json::from_slice(&bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
+            .map_err(|error| TrackerError::Seed(error.to_string()))?;
         // The one snapshot a history can seed is the one it ends at: the
         // consensus hash of every block after it has to be derived, not stated,
         // or the chain would be quoting the capture rather than checking it.
@@ -1164,9 +1162,9 @@ fn seed_committed_block_hash(seed: &CapturedSnapshot) -> Result<Option<[u8; 32]>
     let bytes = hex::decode(hash).map_err(|_| {
         TrackerError::Seed("the winning stacks block hash is not hexadecimal".to_owned())
     })?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map(Some).map_err(|_| {
-        TrackerError::Seed("the winning stacks block hash is not 32 bytes".to_owned())
-    })
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map(Some)
+        .map_err(|_| TrackerError::Seed("the winning stacks block hash is not 32 bytes".to_owned()))
 }
 
 fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerError> {
@@ -1223,13 +1221,13 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
     // that reason alone, however right the rest of the arithmetic was.
     let pox_id = unbroken_pox_id_for(bitcoin_header_hash, sortition_id, POX_HISTORY_SEARCH_LIMIT)
         .ok_or_else(|| {
-            TrackerError::Seed(format!(
-                "the seed's sortition identifier {} is not the burn header hash and an \
+        TrackerError::Seed(format!(
+            "the seed's sortition identifier {} is not the burn header hash and an \
                  unbroken PoX history hashed together, so this node cannot tell which \
                  reward-cycle history the checkpoint stands on",
-                seed.sortition_id
-            ))
-        })?;
+            seed.sortition_id
+        ))
+    })?;
     Ok(SortitionSnapshot {
         bitcoin_height: seed.block_height,
         bitcoin_header_hash,

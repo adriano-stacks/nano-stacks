@@ -38,8 +38,7 @@ fn open(directory: &Path) -> (ChainState, [u8; 32]) {
             .to_owned()
     };
     let decode = |value: &str| -> [u8; 32] {
-        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice())
-            .expect("32 bytes")
+        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice()).expect("32 bytes")
     };
     let source = decode(&field("source_state_id"));
     let mut chainstate = ChainState::open_from_checkpoint(
@@ -219,4 +218,3 @@ fn a_forks_own_view_is_the_tenures_it_executed() {
         "the fork view is the executed tenures, newest first, without repeats"
     );
 }
-

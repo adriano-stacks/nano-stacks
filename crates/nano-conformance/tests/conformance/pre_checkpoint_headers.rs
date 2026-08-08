@@ -26,10 +26,15 @@
 //! gave, and the slice of the export they were checked against, are written into
 //! `fixtures/mainnet/headers/` and checked offline by the second test here.
 
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use blockstack_lib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts};
-use blockstack_lib::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
+use blockstack_lib::chainstate::stacks::index::storage::{
+    TrieFileStorage, TrieHashCalculationMode,
+};
 use clarity::vm::database::HeadersDB;
 use nano_primitives::Network;
 use nano_vm::{HeaderFields, HeaderKnowledge};
@@ -151,11 +156,7 @@ fn fixture_dir() -> PathBuf {
 /// Rows rather than the file, because the export of a mainnet ancestry is two
 /// gigabytes and a fixture is a few kilobytes: the slice is what makes the
 /// offline half of this possible.
-fn slice_export(
-    export: &Path,
-    into: &Path,
-    blocks: &[Vec<u8>],
-) -> Result<(), rusqlite::Error> {
+fn slice_export(export: &Path, into: &Path, blocks: &[Vec<u8>]) -> Result<(), rusqlite::Error> {
     let connection = rusqlite::Connection::open(into)?;
     connection.execute_batch(nano_vm::HEADER_EXPORT_SCHEMA)?;
     connection.execute(
@@ -243,7 +244,9 @@ fn every_exported_field_matches_stacks_cores_own_headers_db() {
         );
         return;
     };
-    let export = capture.join("chainstate/checkpoint-H").join(nano_vm::HEADER_EXPORT_FILE);
+    let export = capture
+        .join("chainstate/checkpoint-H")
+        .join(nano_vm::HEADER_EXPORT_FILE);
     if !export.exists() {
         nano_conformance::skip_gate("the capture carries no header export yet");
         return;
@@ -334,7 +337,10 @@ fn the_export_answers_offline_what_stacks_core_answered() {
         <[u8; 32]>::try_from(blocks.last().expect("a sample").0.as_slice()).expect("32 bytes"),
     );
     let found = nano_answers(&export, &blocks, &tip);
-    assert_eq!(found, expected, "the export answers what the chain answered");
+    assert_eq!(
+        found, expected,
+        "the export answers what the chain answered"
+    );
 }
 
 /// A block the export never carried is distinguishable from one off this fork.
@@ -373,7 +379,8 @@ fn a_header_never_carried_is_not_a_block_that_does_not_exist() {
     );
     // A block in the index whose header was never written: what a checkpoint
     // without an export leaves behind for all of history.
-    vm.begin_block(Some([1; 32]), [2; 32]).expect("begin a block");
+    vm.begin_block(Some([1; 32]), [2; 32])
+        .expect("begin a block");
     vm.seal_block().expect("seal it");
     assert_eq!(
         vm.header_knowledge([2; 32]),

@@ -228,7 +228,10 @@ fn parse_signature(value: Option<&str>) -> MessageSignature {
     value
         .and_then(|value| hex::decode(value.trim_start_matches("0x")).ok())
         .and_then(|bytes| <[u8; 65]>::try_from(bytes).ok())
-        .map_or_else(|| MessageSignature::from_bytes([0; 65]), MessageSignature::from_bytes)
+        .map_or_else(
+            || MessageSignature::from_bytes([0; 65]),
+            MessageSignature::from_bytes,
+        )
 }
 
 #[derive(Deserialize)]

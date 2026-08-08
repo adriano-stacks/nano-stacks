@@ -37,12 +37,12 @@ fn main() {
             block_id,
             block.header.state_index_root,
         )
-            .expect("open the captured block state")
-            .state_leaves(block_id)
-            .expect("captured leaves")
-            .into_iter()
-            .map(|(key, value)| (hex::encode(key.as_bytes()), hex::encode(value.as_bytes())))
-            .collect::<BTreeSet<_>>()
+        .expect("open the captured block state")
+        .state_leaves(block_id)
+        .expect("captured leaves")
+        .into_iter()
+        .map(|(key, value)| (hex::encode(key.as_bytes()), hex::encode(value.as_bytes())))
+        .collect::<BTreeSet<_>>()
     };
     let index = blocks
         .iter()

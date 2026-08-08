@@ -141,9 +141,7 @@ pub(super) fn wasm_equal(
         // `.pool`s, each answering "Not implemented: equality over
         // CallableType(Trait(..))". See task 093.
         TypeSignature::PrincipalType
-        | TypeSignature::CallableType(
-            CallableSubtype::Principal(_) | CallableSubtype::Trait(_),
-        )
+        | TypeSignature::CallableType(CallableSubtype::Principal(_) | CallableSubtype::Trait(_))
         | TypeSignature::ListUnionType(_) => wasm_equal_bytes(generator, builder, first_op, nth_op),
         TypeSignature::OptionalType(some_ty) => {
             wasm_equal_optional(generator, builder, first_op, nth_op, some_ty)

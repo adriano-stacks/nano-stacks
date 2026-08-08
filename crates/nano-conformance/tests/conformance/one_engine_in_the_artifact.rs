@@ -161,7 +161,10 @@ fn the_artifact_holds_no_interpreter_entry_point() {
     // interpreted execution.
     let present: std::collections::BTreeSet<&str> = symbols
         .lines()
-        .filter_map(|line| line.split("<clarity::vm::contexts::OwnedEnvironment>::").nth(1))
+        .filter_map(|line| {
+            line.split("<clarity::vm::contexts::OwnedEnvironment>::")
+                .nth(1)
+        })
         .collect();
     assert_eq!(
         present,
@@ -203,8 +206,14 @@ fn the_artifact_cannot_enter_the_interpreters_evaluator() {
     // reference annotations carry. `v0`'s hash differs per build, so the crate
     // and path components are what is spelled out.
     const UNREACHABLE: [(&str, &str); 3] = [
-        ("lookup_reserved_functions", "9functions25lookup_reserved_functions"),
-        ("clarity::vm::lookup_function", "7clarity2vm15lookup_function"),
+        (
+            "lookup_reserved_functions",
+            "9functions25lookup_reserved_functions",
+        ),
+        (
+            "clarity::vm::lookup_function",
+            "7clarity2vm15lookup_function",
+        ),
         ("clarity::vm::apply", "7clarity2vm5apply"),
     ];
     let patterns: Vec<&str> = UNREACHABLE.iter().map(|(_, mangled)| *mangled).collect();

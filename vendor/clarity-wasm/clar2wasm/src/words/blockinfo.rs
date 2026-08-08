@@ -531,8 +531,8 @@ mod tests {
     #[cfg(test)]
     mod clarity_v1_v2 {
         use clarity::types::StacksEpochId;
-        use clarity::vm::ClarityVersion;
         use clarity::vm::errors::VmExecutionError;
+        use clarity::vm::ClarityVersion;
 
         use super::*;
         use crate::tools::crosscheck_with_epoch;

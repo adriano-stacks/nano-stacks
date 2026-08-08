@@ -103,7 +103,9 @@ async fn a_node_that_follows_to_the_tip_and_executes_nothing_says_both() {
         .executed_height()
         .await
         .expect("the node answers /v2/info from its executed tip");
-    let status = sync_status(rpc).await.expect("the node answers its own status");
+    let status = sync_status(rpc)
+        .await
+        .expect("the node answers its own status");
     let log = fs::read_to_string(&node.log).unwrap_or_default();
     node.kill();
     peer_task.abort();
@@ -124,13 +126,19 @@ async fn a_node_that_follows_to_the_tip_and_executes_nothing_says_both() {
         "the peer was not followed to its tip, so nothing here is about a disagreement"
     );
     assert_eq!(
-        status["followed_stacks_height"].as_u64().map(|followed| followed
-            - status["executed_stacks_height"].as_u64().unwrap_or_default()),
+        status["followed_stacks_height"]
+            .as_u64()
+            .map(|followed| followed
+                - status["executed_stacks_height"]
+                    .as_u64()
+                    .unwrap_or_default()),
         status["blocks_behind"].as_u64(),
         "the gap is not the difference between the two heights it is derived from"
     );
     assert!(
-        status["blocks_behind"].as_u64().is_some_and(|behind| behind > 0),
+        status["blocks_behind"]
+            .as_u64()
+            .is_some_and(|behind| behind > 0),
         "a node at its checkpoint with a peer {peer_tip} blocks up reported no gap: {status}"
     );
 

@@ -153,9 +153,15 @@ mod tests {
     fn a_v4_address_comes_back_as_v4() {
         let original: std::net::IpAddr = "203.0.113.9".parse().expect("a v4 address");
         let address = PeerAddress::from_ip(original);
-        assert_eq!(address.as_bytes()[..12], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
+        assert_eq!(
+            address.as_bytes()[..12],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+        );
         assert_eq!(address.to_ip(), original);
-        assert_eq!(address.to_socket_addr(20444).to_string(), "203.0.113.9:20444");
+        assert_eq!(
+            address.to_socket_addr(20444).to_string(),
+            "203.0.113.9:20444"
+        );
 
         let v6: std::net::IpAddr = "2001:db8::1".parse().expect("a v6 address");
         assert_eq!(PeerAddress::from_ip(v6).to_ip(), v6);

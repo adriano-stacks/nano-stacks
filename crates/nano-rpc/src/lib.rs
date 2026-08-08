@@ -353,7 +353,11 @@ impl RpcState {
     /// The snapshot is built here, from the latest followed view bounded at this
     /// tip, and written once — so a caller reading a block and a caller reading
     /// the tip are told about the same state.
-    pub async fn publish_executed(&self, tip: SealedTip, sortitions: Vec<nano_sync::SortitionInfo>) {
+    pub async fn publish_executed(
+        &self,
+        tip: SealedTip,
+        sortitions: Vec<nano_sync::SortitionInfo>,
+    ) {
         let followed = self.followed.read().await.clone();
         let pox = followed.as_ref().map(|view| view.pox_info.clone());
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
@@ -2281,8 +2285,14 @@ mod tests {
         .await;
         // The peer's tenure names consensus hash `0202..` and no winner key; this
         // node derived `dddd..` and one.
-        assert_eq!(latest[0]["consensus_hash"], json!(format!("0x{}", "dd".repeat(20))));
-        assert_eq!(latest[0]["miner_pk_hash160"], json!(format!("0x{}", "ee".repeat(20))));
+        assert_eq!(
+            latest[0]["consensus_hash"],
+            json!(format!("0x{}", "dd".repeat(20)))
+        );
+        assert_eq!(
+            latest[0]["miner_pk_hash160"],
+            json!(format!("0x{}", "ee".repeat(20)))
+        );
         assert_eq!(
             latest[0]["committed_block_hash"],
             json!(format!("0x{}", "33".repeat(32))),
@@ -2304,7 +2314,10 @@ mod tests {
         )
         .await;
         assert_eq!(pair.as_array().map(Vec::len), Some(2));
-        assert_eq!(pair[1]["consensus_hash"], json!(format!("0x{}", "22".repeat(20))));
+        assert_eq!(
+            pair[1]["consensus_hash"],
+            json!(format!("0x{}", "22".repeat(20)))
+        );
 
         // And the peer's own burn view is not served, however well formed it is.
         let peers = router(state)
@@ -2419,14 +2432,17 @@ mod tests {
             })
             .await;
         state
-            .publish_executed(SealedTip {
-                stacks_height: 4,
-                stacks_tip: StacksBlockId::from_bytes([4; 32]),
-                stacks_block_hash: BlockHeaderHash::from_bytes([5; 32]),
-                consensus_hash: ConsensusHash::from_bytes([6; 20]),
-                bitcoin_height: 3,
-                state_index_root: TrieHash::from_bytes([7; 32]),
-            }, Vec::new())
+            .publish_executed(
+                SealedTip {
+                    stacks_height: 4,
+                    stacks_tip: StacksBlockId::from_bytes([4; 32]),
+                    stacks_block_hash: BlockHeaderHash::from_bytes([5; 32]),
+                    consensus_hash: ConsensusHash::from_bytes([6; 20]),
+                    bitcoin_height: 3,
+                    state_index_root: TrieHash::from_bytes([7; 32]),
+                },
+                Vec::new(),
+            )
             .await;
 
         let status = body_json(
@@ -2559,7 +2575,9 @@ mod tests {
         let (view, blocks) = view_with_blocks(3);
         let state = RpcState::new(NETWORK);
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
+        state
+            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
             app.oneshot(
@@ -2658,7 +2676,9 @@ mod tests {
             RpcState::new(NETWORK).with_executed_blocks(Arc::new(KeptBlocks(blocks.clone())));
         // No followed view at all, and an executed tip the view could not have
         // reached: exactly the node that used to serve nothing.
-        state.publish_executed(sealed_at(&blocks[2]), Vec::new()).await;
+        state
+            .publish_executed(sealed_at(&blocks[2]), Vec::new())
+            .await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
             app.oneshot(
@@ -2827,7 +2847,9 @@ mod tests {
             .with_block_admission(Arc::new(Mutex::new(refusing.clone())))
             .with_block_sink(blocks_out);
         state.publish(view.clone()).await;
-        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
+        state
+            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .await;
         let upload = |block: &NakamotoBlock, app: Router| {
             let body = block.encode();
             async move {
@@ -2859,7 +2881,9 @@ mod tests {
             .with_block_admission(Arc::new(Mutex::new(accepting)))
             .with_block_sink(blocks_out);
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
+        state
+            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .await;
 
         let taken = body_json(upload(&blocks[2], router(state.clone())).await).await;
         assert_eq!(taken["accepted"], json!(true));
@@ -2895,7 +2919,9 @@ mod tests {
             .with_observers(EventDispatcher::new(vec![url]))
             .with_proposal_token("t0ken".to_owned());
         state.publish(view).await;
-        state.publish_executed(sealed_at(&blocks[1]), Vec::new()).await;
+        state
+            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .await;
         ProposalNode {
             app: router(state),
             blocks,

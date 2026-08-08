@@ -173,7 +173,12 @@ fn resumed(
     let block = chain
         .iter()
         .find(|block| *block.block_id().as_bytes() == tip)
-        .unwrap_or_else(|| panic!("the sealed tip {} is not a captured block", hex::encode(tip)))
+        .unwrap_or_else(|| {
+            panic!(
+                "the sealed tip {} is not a captured block",
+                hex::encode(tip)
+            )
+        })
         .clone();
     let mut executor = CheckpointExecutor::resume(chainstate, block, burnchain);
     // The burn views this rig executes under are derived here, from the capture,
@@ -269,7 +274,11 @@ async fn close_the_gap(run: Run<'_>) -> (Progress, Closed) {
     } = run;
     let chain = captured_chain();
     let blocks: Vec<NakamotoBlock> = chain[..served].to_vec();
-    let target = blocks.last().expect("the peer serves a tip").header.chain_length;
+    let target = blocks
+        .last()
+        .expect("the peer serves a tip")
+        .header
+        .chain_length;
     let (mut client, task) =
         serve(Served::honest(blocks.clone(), snapshots()).under(policy.clone())).await;
 
@@ -363,7 +372,10 @@ async fn a_gap_inside_one_tenure_closes_across_rounds() {
          says nothing about chunking",
         progress.rounds
     );
-    assert_eq!(progress.rate_limited, 0, "the honest peer refused something");
+    assert_eq!(
+        progress.rate_limited, 0,
+        "the honest peer refused something"
+    );
 }
 
 /// A gap across many tenures closes under deterministic 429s and short pages.
@@ -430,7 +442,10 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     let committed = executor.tip().block_id();
     let height = executor.tip().header.chain_length;
     let staged = staging.len().expect("the staging store answers");
-    assert!(staged > 0, "nothing is staged for the next round to resume from");
+    assert!(
+        staged > 0,
+        "nothing is staged for the next round to resume from"
+    );
 
     // Now the peer refuses everything, for one whole round.
     policy.refusing.store(true, Ordering::SeqCst);

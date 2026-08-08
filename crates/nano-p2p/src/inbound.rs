@@ -96,11 +96,12 @@ pub(crate) fn answer_request<S: Service + ?Sized>(
         // vector this node guessed at would make it look like it was withholding
         // tenures it has, or offering ones it does not. A stock node reads the nack as
         // "ask somebody else" rather than "it has nothing".
-        Payload::GetNakamotoInventory(cycle_start) => Some(
-            service
-                .tenure_inventory(*cycle_start)
-                .map_or(Payload::Nack(nack::NO_SUCH_BITCOIN_BLOCK), Payload::NakamotoInventory),
-        ),
+        Payload::GetNakamotoInventory(cycle_start) => {
+            Some(service.tenure_inventory(*cycle_start).map_or(
+                Payload::Nack(nack::NO_SUCH_BITCOIN_BLOCK),
+                Payload::NakamotoInventory,
+            ))
+        }
         _ => None,
     }
 }
@@ -205,9 +206,7 @@ pub async fn serve_peer<S: Service + ?Sized>(
             // A peer that closes cleanly is not a peer that did anything wrong,
             // and treating a hang-up as a fault is how an honest neighbour ends up
             // in the backoff table.
-            Err(SessionError::Io(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(SessionError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(served);
             }
             Err(error) => return Err(error),

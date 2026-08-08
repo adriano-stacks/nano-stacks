@@ -393,7 +393,6 @@ pub struct CatchUpRound {
     pub rate_limited: bool,
 }
 
-
 #[derive(Debug)]
 pub enum NodeExecutionError {
     Sync(SyncError),
@@ -2607,9 +2606,8 @@ where
         snapshot: &nano_sortition::SortitionSnapshot,
     ) -> nano_sync::SortitionInfo {
         let tracker = self.sortition.as_ref();
-        let hash_at = |height: Option<u64>| {
-            height.and_then(|height| tracker?.consensus_hash_at(height))
-        };
+        let hash_at =
+            |height: Option<u64>| height.and_then(|height| tracker?.consensus_hash_at(height));
         let stacks_parent = hash_at(snapshot.parent_bitcoin_height);
         nano_sync::SortitionInfo {
             bitcoin_block_hash: snapshot.bitcoin_header_hash,
@@ -2624,9 +2622,8 @@ where
                 .map(nano_primitives::Hash160::from_bytes),
             stacks_parent_consensus_hash: stacks_parent,
             last_sortition_consensus_hash: hash_at(
-                tracker.and_then(|tracker| {
-                    tracker.previous_sortition_height(snapshot.bitcoin_height)
-                }),
+                tracker
+                    .and_then(|tracker| tracker.previous_sortition_height(snapshot.bitcoin_height)),
             ),
             committed_block_hash: snapshot
                 .committed_block_hash
@@ -2653,7 +2650,6 @@ impl<S: Send> nano_rpc::ChainAccess for CheckpointExecutor<S> {
         nano_rpc::ChainAccess::call_read_only(&mut self.chainstate, call)
     }
 }
-
 
 #[cfg(test)]
 mod peer_boundary_tests {

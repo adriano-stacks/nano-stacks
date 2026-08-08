@@ -132,7 +132,11 @@ async fn ready_node(
         seed,
         "the node did not reach the burn view its sortition chain is seeded at"
     );
-    let top = served.iter().map(burn_of).max().expect("a served burn view");
+    let top = served
+        .iter()
+        .map(burn_of)
+        .max()
+        .expect("a served burn view");
     let tracker = derived_chain(seed, top, burnchain, &directory.join("capture"));
     executor.track_sortitions(tracker, directory.join("sortitions"));
     (executor, staging, top)
@@ -210,15 +214,7 @@ async fn an_inventory_drives_a_forward_download_the_first_round_executes() {
     let (mut executor, staging, _) = ready_node(backward.path(), &burnchain, &served).await;
     let (peer, task) = serve(Served::honest(served.clone(), snapshots())).await;
     let mut history = TenureSource::only(peer.clone());
-    let descent = run(
-        &mut executor,
-        &peer,
-        &mut history,
-        &staging,
-        &[],
-        target,
-    )
-    .await;
+    let descent = run(&mut executor, &peer, &mut history, &staging, &[], target).await;
     let descended = closed(&mut executor);
     task.abort();
 
@@ -227,7 +223,8 @@ async fn an_inventory_drives_a_forward_download_the_first_round_executes() {
     let burnchain = MovableBurnchain::new(captured_burnchain());
     let (mut executor, staging, _) = ready_node(forward.path(), &burnchain, &served).await;
     let asked = Policy::default();
-    let (peer, task) = serve(Served::honest(served.clone(), snapshots()).under(asked.clone())).await;
+    let (peer, task) =
+        serve(Served::honest(served.clone(), snapshots()).under(asked.clone())).await;
     let mut history = TenureSource::only(peer.clone());
     let claims = vec![claims_everything(1, peer.base_url().as_str())];
     let scheduled = run(
@@ -273,10 +270,8 @@ async fn an_inventory_drives_a_forward_download_the_first_round_executes() {
     for view in asked.tenures_asked_by_view() {
         *asked_for.entry(view).or_default() += 1;
     }
-    let repeated: Vec<(&String, &usize)> = asked_for
-        .iter()
-        .filter(|(_, times)| **times > 2)
-        .collect();
+    let repeated: Vec<(&String, &usize)> =
+        asked_for.iter().filter(|(_, times)| **times > 2).collect();
     assert!(
         repeated.is_empty(),
         "the schedule asked for the same tenure over and over, so it is re-downloading \
@@ -383,10 +378,8 @@ async fn a_peer_that_claimed_nothing_is_asked_only_for_absent_tenures() {
 async fn a_tenure_answered_for_another_burn_view_is_refused() {
     let served = served_chain();
     let rows = snapshots();
-    let (peer, task) = serve(
-        Served::honest(served.clone(), snapshots()).lying_about_tenures(),
-    )
-    .await;
+    let (peer, task) =
+        serve(Served::honest(served.clone(), snapshots()).lying_about_tenures()).await;
     // A burn view whose tenure this peer really does hold, so the refusal is about the
     // answer and not about the peer having nothing.
     let block = served.last().expect("a served tip");
@@ -404,8 +397,7 @@ async fn a_tenure_answered_for_another_burn_view_is_refused() {
         .await
         .expect("an honest peer answers the tenure it was asked for");
     assert!(
-        good.iter()
-            .all(|block| block.header.consensus_hash == view),
+        good.iter().all(|block| block.header.consensus_hash == view),
         "the honest answer carries another view's blocks, so the fixture is wrong"
     );
     honest.1.abort();

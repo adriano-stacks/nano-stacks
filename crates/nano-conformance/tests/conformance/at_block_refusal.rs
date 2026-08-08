@@ -171,7 +171,10 @@ fn answer(outcome: Result<ContractCallOutcome, VmExecutionError>) -> Answer {
 /// not a hand-written stand-in for what the chain holds. It is also the
 /// assertion that 3.3 *accepts* this source: an `expect` here would fire if the
 /// analysis-time half of the pair were what refused.
-fn analysed_when_deployed(contract: &QualifiedContractIdentifier, source: &str) -> ContractAnalysis {
+fn analysed_when_deployed(
+    contract: &QualifiedContractIdentifier,
+    source: &str,
+) -> ContractAnalysis {
     let mut backing = MemoryBackingStore::new();
     let expressions = build_ast(
         contract,
@@ -439,7 +442,10 @@ fn a_hash_argument_that_can_return_does_not_get_to_run() {
 #[test]
 fn a_branch_that_never_reaches_at_block_still_answers() {
     for (engine, answer) in [
-        ("compiler", compiled(UNTAKEN_BRANCH, "maybe", &[Value::Bool(false)])),
+        (
+            "compiler",
+            compiled(UNTAKEN_BRANCH, "maybe", &[Value::Bool(false)]),
+        ),
         (
             "interpreter",
             interpreted(UNTAKEN_BRANCH, "maybe", &[Value::Bool(false)]),
@@ -456,7 +462,10 @@ fn a_branch_that_never_reaches_at_block_still_answers() {
     // And the branch that does reach it refuses, so the test above is not
     // passing because the word became harmless.
     for (engine, answer) in [
-        ("compiler", compiled(UNTAKEN_BRANCH, "maybe", &[Value::Bool(true)])),
+        (
+            "compiler",
+            compiled(UNTAKEN_BRANCH, "maybe", &[Value::Bool(true)]),
+        ),
         (
             "interpreter",
             interpreted(UNTAKEN_BRANCH, "maybe", &[Value::Bool(true)]),

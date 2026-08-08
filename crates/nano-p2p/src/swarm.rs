@@ -141,7 +141,11 @@ fn endpoint_is_reachable(endpoint: &str, peer: PeerAddress) -> bool {
         .split("//")
         .nth(1)
         .and_then(|rest| rest.split('/').next())
-        .map(|authority| authority.rsplit_once(':').map_or(authority, |(host, _)| host))
+        .map(|authority| {
+            authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _)| host)
+        })
     else {
         return true;
     };
@@ -287,12 +291,7 @@ pub struct Swarm {
 impl Swarm {
     /// Build a swarm over an existing peer table.
     #[must_use]
-    pub fn new(
-        peers: PeerDb,
-        local: LocalPeer,
-        protocol: Protocol,
-        limits: SwarmLimits,
-    ) -> Self {
+    pub fn new(peers: PeerDb, local: LocalPeer, protocol: Protocol, limits: SwarmLimits) -> Self {
         Self {
             peers,
             local,
@@ -418,7 +417,10 @@ impl Swarm {
         // learned from gossip that have never answered, and a batch that is exactly
         // slot-sized would spend every round on the same dead ones.
         let wanted = self.limits.outbound.saturating_sub(self.connected.len());
-        let Ok(candidates) = self.peers.candidates(wanted + self.limits.dials_per_round * 4) else {
+        let Ok(candidates) = self
+            .peers
+            .candidates(wanted + self.limits.dials_per_round * 4)
+        else {
             return;
         };
         let mut attempts = 0;
@@ -547,7 +549,9 @@ impl Swarm {
         // from until the cycle moves.
         let claiming: Vec<String> = claims
             .iter()
-            .filter(|claim| (0..claim.tenures.len()).any(|bit| claim.tenures.get(bit) == Some(true)))
+            .filter(|claim| {
+                (0..claim.tenures.len()).any(|bit| claim.tenures.get(bit) == Some(true))
+            })
             .filter_map(|claim| claim.endpoint.clone())
             .collect();
         let answered = claiming.len();
@@ -782,7 +786,11 @@ mod tests {
             // A name resolves to whatever it resolves to; guessing would reject
             // legitimate hosts.
             ("34.150.184.50", "https://node.example.com/", true),
-            ("34.150.184.50", "http://node.example.com:20443/v2/info", true),
+            (
+                "34.150.184.50",
+                "http://node.example.com:20443/v2/info",
+                true,
+            ),
             ("34.150.184.50", "http://[2001:db8::1]:20443", true),
             ("34.150.184.50", "http://[::1]:20443", false),
             ("34.150.184.50", "http://[fc00::1]:20443", false),

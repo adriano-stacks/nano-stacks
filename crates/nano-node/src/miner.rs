@@ -12,17 +12,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::runtime::BurnchainSource;
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoincore_rpc::Auth;
 use nano_address::StacksAddress;
-use crate::runtime::BurnchainSource;
 use nano_chainstate::{NakamotoBlock, SignerSetError};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use std::sync::Arc;
 
 use nano_mempool::Mempool;
-use nano_sync::TenureSource;
-use tokio::sync::Mutex;
 use nano_miner::{
     BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError, RegisteredLeaderKey,
     SortitionHashPoint, TenureExtension, TenureTip, build_tenure_continuation_block,
@@ -32,7 +30,9 @@ use nano_miner::{
 use nano_primitives::{ConsensusHash, Hash160, Network, hash160};
 use nano_rpc::{EventDispatcher, EventKind, mined_nakamoto_block_payload};
 use nano_stackerdb::{BlockProposal, StackerDbClient};
+use nano_sync::TenureSource;
 use nano_sync::{PoxInfo, SortitionInfo, SyncClient};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::{

@@ -265,15 +265,20 @@ mod tests {
                 .cloned()
                 .ok_or(CommitmentPlanError::ParentCommitmentNotFound)
         }
-    
+
         fn block_hash_at(&self, _height: u64) -> Result<[u8; 32], Self::Error> {
             unimplemented!("this source is only asked for blocks")
         }
 
         fn tip_height(&self) -> Result<u64, Self::Error> {
-            Ok(self.0.iter().map(|block| block.height).max().unwrap_or_default())
+            Ok(self
+                .0
+                .iter()
+                .map(|block| block.height)
+                .max()
+                .unwrap_or_default())
         }
-}
+    }
 
     fn commitment(transaction_index: u32, key_transaction_index: u16) -> BitcoinOperation {
         BitcoinOperation {

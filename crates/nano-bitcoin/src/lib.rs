@@ -334,9 +334,9 @@ impl BitcoinRestSource {
     pub fn invalidate_from(&mut self, height: u64) {
         self.pre_stx.invalidate_from(height);
         self.last_block = self.last_block.take().filter(|block| block.height < height);
-        self.last_height = self.last_height.and_then(|last| {
-            (last < height).then_some(last)
-        });
+        self.last_height = self
+            .last_height
+            .and_then(|last| (last < height).then_some(last));
     }
 
     fn check_last_read(&mut self) -> Result<(), BitcoinRpcSourceError> {
@@ -1430,8 +1430,8 @@ mod rest_tests {
     #[test]
     #[ignore = "reads mempool.space"]
     fn reads_a_mainnet_burn_block() {
-        let mut source = BitcoinRestSource::new("https://mempool.space/api", *b"X2")
-            .expect("build the source");
+        let mut source =
+            BitcoinRestSource::new("https://mempool.space/api", *b"X2").expect("build the source");
         // A burn block just past the epoch 4.0 boundary.
         let block = source.block_at(960_240).expect("read the block");
         assert_eq!(block.height, 960_240);

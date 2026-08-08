@@ -105,7 +105,10 @@ pub enum ConsensusError {
     SignerWeight(SignerSetError),
     /// The header's cumulative burn is not the total this node derived from its
     /// own burnchain for the same burn view.
-    BitcoinSpent { header: u64, derived: u64 },
+    BitcoinSpent {
+        header: u64,
+        derived: u64,
+    },
 }
 
 impl std::fmt::Display for ConsensusError {

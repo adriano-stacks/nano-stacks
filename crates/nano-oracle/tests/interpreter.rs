@@ -18,15 +18,16 @@ use nano_vm::{ContractCallOutcome, MarfStore, Vm};
 
 #[test]
 fn evaluates_clarity_six_programs() {
-    let value = evaluate(Network::TESTNET, "(+ u20 u22)").expect("Clarity 6 program should evaluate");
+    let value =
+        evaluate(Network::TESTNET, "(+ u20 u22)").expect("Clarity 6 program should evaluate");
 
     assert_eq!(value, Some(Value::UInt(42)));
 }
 
 #[test]
 fn supports_epoch_four_clarity_six_words() {
-    let concatenated =
-        evaluate(Network::TESTNET, "(concat 0x01 0x02 0x03)").expect("variadic concat should evaluate");
+    let concatenated = evaluate(Network::TESTNET, "(concat 0x01 0x02 0x03)")
+        .expect("variadic concat should evaluate");
     let parsed_bitcoin = evaluate(Network::TESTNET, "(get-bitcoin-tx-output? 0x00 u0)")
         .expect("bitcoin transaction parser should evaluate");
 
@@ -47,8 +48,7 @@ fn evaluates_against_an_active_marf_store() {
     let mut store = MarfStore::new(Network::TESTNET).expect("create MARF store");
     store.begin(None, [1; 32]).expect("begin state");
 
-    let value =
-        evaluate_in_store(&mut store, "(+ u20 u22)").expect("evaluate against MARF store");
+    let value = evaluate_in_store(&mut store, "(+ u20 u22)").expect("evaluate against MARF store");
 
     assert_eq!(value, Some(Value::UInt(42)));
     store.seal().expect("seal state");
@@ -81,10 +81,19 @@ fn persists_clarity_data_variables_in_the_marf_store() {
 fn a_length_read_from_a_buffer_is_what_the_bytes_say() {
     for (program, expected) in [
         // One byte at an offset, as `read-uint-8` does it.
-        ("(buff-to-uint-be (unwrap-panic (slice? 0x00000000000d u5 u6)))", "u13"),
-        ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000000ff u5 u6)))", "u255"),
+        (
+            "(buff-to-uint-be (unwrap-panic (slice? 0x00000000000d u5 u6)))",
+            "u13",
+        ),
+        (
+            "(buff-to-uint-be (unwrap-panic (slice? 0x0000000000ff u5 u6)))",
+            "u255",
+        ),
         // Four bytes, as `read-uint-32` does it.
-        ("(buff-to-uint-be (unwrap-panic (slice? 0x0000000007ff u1 u5)))", "u7"),
+        (
+            "(buff-to-uint-be (unwrap-panic (slice? 0x0000000007ff u1 u5)))",
+            "u7",
+        ),
         // A buffer slice at its exact end is still in range.
         ("(unwrap-panic (slice? 0x0102 u0 u2))", "0x0102"),
         // And one starting at the end is not, the same as for a list.
@@ -138,7 +147,10 @@ fn slice_over_a_list_with_a_runtime_bound() {
 #[test]
 fn map_across_two_lists_pairs_them_in_order() {
     for (program, expected) in [
-        ("(map + (list u1 u2 u3) (list u10 u20 u30))", "(u11 u22 u33)"),
+        (
+            "(map + (list u1 u2 u3) (list u10 u20 u30))",
+            "(u11 u22 u33)",
+        ),
         // The shorter list decides how far it goes.
         ("(map + (list u1 u2 u3) (list u10 u20))", "(u11 u22)"),
         ("(map + (list u1) (list u10 u20 u30))", "(u11)"),
@@ -197,10 +209,8 @@ fn the_signature_words_agree_with_their_known_vectors() {
         evaluate(Network::TESTNET, "(keccak256 0x)").expect("keccak256 evaluates"),
         Some(
             Value::buff_from(
-                hex::decode(
-                    "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-                )
-                .expect("a hash")
+                hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                    .expect("a hash")
             )
             .expect("a buffer")
         )
@@ -237,10 +247,8 @@ fn the_signature_words_agree_with_their_known_vectors() {
         evaluate(Network::TESTNET, "(sha256 0x)").expect("sha256 evaluates"),
         Some(
             Value::buff_from(
-                hex::decode(
-                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                )
-                .expect("a hash")
+                hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                    .expect("a hash")
             )
             .expect("a buffer")
         )
@@ -329,9 +337,8 @@ fn assert_wasm_failure_matches_interpreter(
 
 #[test]
 fn wasm_calls_match_the_clarity_six_interpreter() {
-    let contract =
-        QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.crosscheck")
-            .expect("valid contract identifier");
+    let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.crosscheck")
+        .expect("valid contract identifier");
     let source = "
         (define-public (describe (value (optional int)) (items (list 3 int)))
             (let ((count (len items)) (number (default-to 0 value)))

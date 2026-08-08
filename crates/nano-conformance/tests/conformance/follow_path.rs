@@ -297,7 +297,10 @@ impl Policy {
         let count = asked.len() + 1;
         // The tip moves off the node's own requests rather than off a clock, so a
         // round is interrupted at the same point on every run.
-        if self.reveal_every.is_some_and(|every| count.is_multiple_of(every)) {
+        if self
+            .reveal_every
+            .is_some_and(|every| count.is_multiple_of(every))
+        {
             self.visible.fetch_add(1, Ordering::SeqCst);
         }
         let refused = self.refusing.load(Ordering::SeqCst)
@@ -837,10 +840,8 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
         "the wrong chain is not longer, so nothing is being tested"
     );
 
-    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
-    .await;
-    let (lying_client, lying_task) = serve(Served::honest(liar, snapshots()))
-    .await;
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots())).await;
+    let (lying_client, lying_task) = serve(Served::honest(liar, snapshots())).await;
 
     let against_the_liar = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -994,8 +995,7 @@ fn parted_view(
 async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
     let chain = captured_chain();
     let honest: Vec<_> = chain[..12].to_vec();
-    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots()))
-    .await;
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots())).await;
 
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -1091,8 +1091,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
 #[tokio::test]
 async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     let chain = captured_chain();
-    let (client, task) = serve(Served::honest(chain[..12].to_vec(), snapshots()))
-    .await;
+    let (client, task) = serve(Served::honest(chain[..12].to_vec(), snapshots())).await;
 
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -1128,7 +1127,12 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
         "the executed chain spans one burn block above the seed, so nothing could \
          be derived or given back"
     );
-    let tracker = derived_chain(seed, retracted_at, &burnchain, &directory.path().join("capture"));
+    let tracker = derived_chain(
+        seed,
+        retracted_at,
+        &burnchain,
+        &directory.path().join("capture"),
+    );
     // The chain this node derived is the chain it executed: without this the
     // retraction below could discard nothing and the test would still pass, because
     // a wrong consensus hash matches no tenure.
@@ -1239,7 +1243,6 @@ pub fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBloc
     *views.get(1).expect("the capture holds two burn views")
 }
 
-
 /// was never asked for, which is the stronger half: a node that asked and quietly
 /// carried on when refused would pass the first claim while still letting a
 /// reachable peer choose its burn heights.
@@ -1259,14 +1262,26 @@ async fn reference_roots(
     served: &[NakamotoBlock],
     target: u64,
     budget: CatchUpBudget,
-) -> ([u8; 32], nano_primitives::TrieHash, Option<nano_primitives::TrieHash>) {
+) -> (
+    [u8; 32],
+    nano_primitives::TrieHash,
+    Option<nano_primitives::TrieHash>,
+) {
     let directory = tempfile::tempdir().expect("a directory");
     let (honest, task) = serve(Served::honest(served.to_vec(), snapshots())).await;
     let burnchain = MovableBurnchain::new(captured_burnchain());
     let (mut executor, _) = node(directory.path(), burnchain);
     let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
     let mut history = TenureSource::only(honest.clone());
-    close_the_gap(&mut executor, &honest, &mut history, &staging, budget, target).await;
+    close_the_gap(
+        &mut executor,
+        &honest,
+        &mut history,
+        &staging,
+        budget,
+        target,
+    )
+    .await;
     let tip = executor.tip().clone();
     assert_eq!(
         tip.header.chain_length, target,
@@ -1333,11 +1348,7 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
     let burnchain = MovableBurnchain::new(captured_burnchain());
     let (mut executor, _) = node(directory.path(), burnchain.clone());
     let staging = Staging::open(&staging_path).expect("staging opens");
-    let (client, task) = serve(Served::honest(
-        served[..upto_seed].to_vec(),
-        snapshots(),
-    ))
-    .await;
+    let (client, task) = serve(Served::honest(served[..upto_seed].to_vec(), snapshots())).await;
     let mut history = TenureSource::only(client.clone());
     close_the_gap(
         &mut executor,
@@ -1345,7 +1356,11 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
         &mut history,
         &staging,
         budget,
-        served[..upto_seed].last().expect("a prefix tip").header.chain_length,
+        served[..upto_seed]
+            .last()
+            .expect("a prefix tip")
+            .header
+            .chain_length,
     )
     .await;
     assert_eq!(
@@ -1368,8 +1383,15 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
     )
     .await;
     let mut history = TenureSource::only(blind.clone());
-    let executed =
-        close_the_gap(&mut executor, &blind, &mut history, &staging, budget, target).await;
+    let executed = close_the_gap(
+        &mut executor,
+        &blind,
+        &mut history,
+        &staging,
+        budget,
+        target,
+    )
+    .await;
     assert!(
         executed > 0,
         "nothing was executed with the peer's sortitions gone, so the claim is untested"
@@ -1449,7 +1471,10 @@ pub fn derived_chain(
     .expect("the snapshots parse");
     for row in &mut rows {
         if row["block_height"].as_u64() == Some(seed) {
-            let consensus = row["consensus_hash"].as_str().unwrap_or_default().to_owned();
+            let consensus = row["consensus_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             let vrf_seed = seeds
                 .get(&consensus)
                 .map(|context| context.vrf_seed)

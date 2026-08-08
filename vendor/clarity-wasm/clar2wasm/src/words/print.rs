@@ -81,9 +81,7 @@ impl ComplexWord for Print {
         // what the interpreter prints; only the value left on the stack converts.
         let expr_ty = generator
             .get_expr_type(expr)
-            .ok_or_else(|| {
-                GeneratorError::TypeError("print expression must be typed".to_owned())
-            })?
+            .ok_or_else(|| GeneratorError::TypeError("print expression must be typed".to_owned()))?
             .clone();
         if need_ducktyping(&ty, &expr_ty) {
             let workspace = match dt_needed_workspace(&expr_ty) {

@@ -45,7 +45,10 @@ const POX_5_NAME: &str = "pox-5";
 /// `pox-5` contract is supposed to have checked before it returned `ok`, so
 /// reaching one means the contract and this handler disagree.
 #[derive(Debug)]
-#[allow(dead_code, reason = "the description is read through Debug in the reported error")]
+#[allow(
+    dead_code,
+    reason = "the description is read through Debug in the reported error"
+)]
 enum LockingError {
     /// The account already holds a lock.
     AlreadyLocked,
@@ -348,11 +351,18 @@ fn handle_lockup(
     match applied {
         Ok(()) => {
             global.log_stacking(&staker, amount)?;
-            Ok(Some(lock_event(global.mainnet, staker, amount, unlock_height)))
+            Ok(Some(lock_event(
+                global.mainnet,
+                staker,
+                amount,
+                unlock_height,
+            )))
         }
         Err(error) => Err(locking_error(
             error,
-            &format!("pox-5 {function}: failed to lock {amount} from {staker} until {unlock_height}"),
+            &format!(
+                "pox-5 {function}: failed to lock {amount} from {staker} until {unlock_height}"
+            ),
         )),
     }
 }
@@ -377,7 +387,12 @@ fn handle_update(
     match extend(&mut global.database, &staker, unlock_height, amount) {
         Ok(_) => {
             global.log_stacking(&staker, amount)?;
-            Ok(Some(lock_event(global.mainnet, staker, amount, unlock_height)))
+            Ok(Some(lock_event(
+                global.mainnet,
+                staker,
+                amount,
+                unlock_height,
+            )))
         }
         Err(error) => Err(locking_error(
             error,

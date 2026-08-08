@@ -94,9 +94,7 @@ impl ServedTenures {
         // sortition invalidates every bit under the old name, because the tenures they
         // stood for are no longer on the chain nano follows.
         let merged = match self.recorded(cycle_height)? {
-            Some((known, tenures_known)) if known == cycle_start => {
-                union(&tenures_known, tenures)
-            }
+            Some((known, tenures_known)) if known == cycle_start => union(&tenures_known, tenures),
             _ => tenures.clone(),
         };
         self.connection.execute(
@@ -159,9 +157,9 @@ impl ServedTenures {
     /// How many cycles are recorded, for an operator who wants to know whether this
     /// node is useful to its peers yet.
     pub fn cycles(&self) -> Result<usize, PeerDbError> {
-        let count: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM served_tenures", [], |row| row.get(0))?;
+        let count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM served_tenures", [], |row| row.get(0))?;
         Ok(usize::try_from(count).unwrap_or(0))
     }
 }
@@ -222,11 +220,16 @@ mod tests {
     fn what_the_window_saw_is_not_forgotten_when_it_slides() {
         let served = ServedTenures::in_memory().expect("a store");
         assert_eq!(
-            served.record(AT, CYCLE, &tenures(&[0, 1, 2])).expect("record"),
+            served
+                .record(AT, CYCLE, &tenures(&[0, 1, 2]))
+                .expect("record"),
             3
         );
         // The next round's window has moved on and no longer mentions 0..=2.
-        assert_eq!(served.record(AT, CYCLE, &tenures(&[3, 4])).expect("record"), 5);
+        assert_eq!(
+            served.record(AT, CYCLE, &tenures(&[3, 4])).expect("record"),
+            5
+        );
         let answer = served.inventory(CYCLE).expect("a query").expect("recorded");
         for index in 0..5 {
             assert_eq!(answer.get(index), Some(true), "tenure {index} was run");
@@ -241,10 +244,15 @@ mod tests {
         let path = directory.path().join("served.sqlite");
         {
             let served = ServedTenures::open(&path).expect("a store");
-            served.record(AT, CYCLE, &tenures(&[7, 2099])).expect("record");
+            served
+                .record(AT, CYCLE, &tenures(&[7, 2099]))
+                .expect("record");
         }
         let reopened = ServedTenures::open(&path).expect("the same store");
-        let answer = reopened.inventory(CYCLE).expect("a query").expect("recorded");
+        let answer = reopened
+            .inventory(CYCLE)
+            .expect("a query")
+            .expect("recorded");
         assert_eq!(answer.get(7), Some(true));
         assert_eq!(answer.get(2099), Some(true));
         assert_eq!(answer.get(8), Some(false));
@@ -257,13 +265,23 @@ mod tests {
         let served = ServedTenures::in_memory().expect("a store");
         let other = ConsensusHash::from_bytes([0x77; 20]);
         served.record(AT, CYCLE, &tenures(&[1])).expect("record");
-        served.record(AT + 2100, other, &tenures(&[2])).expect("record");
+        served
+            .record(AT + 2100, other, &tenures(&[2]))
+            .expect("record");
         assert_eq!(
-            served.inventory(CYCLE).expect("a query").expect("recorded").get(2),
+            served
+                .inventory(CYCLE)
+                .expect("a query")
+                .expect("recorded")
+                .get(2),
             Some(false)
         );
         assert_eq!(
-            served.inventory(other).expect("a query").expect("recorded").get(1),
+            served
+                .inventory(other)
+                .expect("a query")
+                .expect("recorded")
+                .get(1),
             Some(false)
         );
         assert_eq!(served.cycles().expect("a count"), 2);
@@ -279,10 +297,14 @@ mod tests {
     #[test]
     fn a_renamed_cycle_forgets_what_the_old_fork_claimed() {
         let served = ServedTenures::in_memory().expect("a store");
-        served.record(AT, CYCLE, &tenures(&[3, 4, 5])).expect("record");
+        served
+            .record(AT, CYCLE, &tenures(&[3, 4, 5]))
+            .expect("record");
         let after_reorg = ConsensusHash::from_bytes([0xb1; 20]);
         assert_eq!(
-            served.record(AT, after_reorg, &tenures(&[9])).expect("record"),
+            served
+                .record(AT, after_reorg, &tenures(&[9]))
+                .expect("record"),
             1,
             "the new fork's claims start from what it has run"
         );

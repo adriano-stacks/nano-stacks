@@ -143,7 +143,9 @@ fn both(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
             nano_vm::ContractCallOutcome::Success(result)
             | nano_vm::ContractCallOutcome::AbortedByResponse(result),
         ) => format!("{:?}", result.value),
-        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => format!("failed: {error}"),
+        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+            format!("failed: {error}")
+        }
         Err(error) => format!("error: {error}"),
     };
 
@@ -225,8 +227,7 @@ fn an_allowance_over_another_contracts_nft_agrees() {
 #[test]
 fn an_allowance_naming_another_identifier_refuses_in_both() {
     let buyer = serialized(&Value::Principal(id("core").issuer.into()));
-    let (compiled, interpreted) =
-        both("release-unallowed", &[serialized(&Value::UInt(1)), buyer]);
+    let (compiled, interpreted) = both("release-unallowed", &[serialized(&Value::UInt(1)), buyer]);
     assert_eq!(compiled, interpreted);
     assert!(
         !compiled.contains("committed: true"),
@@ -248,8 +249,7 @@ fn the_allowance_shapes_no_definition_can_supply_a_type_for_agree() {
         "release-other-key",
         "release-unknown-asset",
     ] {
-        let (compiled, interpreted) =
-            both(function, &[serialized(&Value::UInt(1)), buyer.clone()]);
+        let (compiled, interpreted) = both(function, &[serialized(&Value::UInt(1)), buyer.clone()]);
         assert_eq!(compiled, interpreted, "`{function}` agrees");
     }
 }

@@ -83,7 +83,9 @@ fn checkpoint_and_pushable_block() -> Option<(ChainState, NakamotoBlock)> {
     if depth.completed == 0 {
         return None;
     }
-    let path = nano_conformance::captured_block_paths(&fixtures).into_iter().nth(1)?;
+    let path = nano_conformance::captured_block_paths(&fixtures)
+        .into_iter()
+        .nth(1)?;
     let block = NakamotoBlock::decode(&std::fs::read(&path).ok()?).ok()?;
     Some((chainstate, block))
 }

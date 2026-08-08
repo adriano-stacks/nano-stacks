@@ -61,8 +61,7 @@ fn open(directory: &Path) -> (ChainState, [u8; 32]) {
             .to_owned()
     };
     let decode = |value: &str| -> [u8; 32] {
-        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice())
-            .expect("32 bytes")
+        <[u8; 32]>::try_from(hex::decode(value).expect("hexadecimal").as_slice()).expect("32 bytes")
     };
     let source = decode(&field("source_state_id"));
     let root = nano_primitives::TrieHash::from_bytes(decode(&field("published_state_index_root")));

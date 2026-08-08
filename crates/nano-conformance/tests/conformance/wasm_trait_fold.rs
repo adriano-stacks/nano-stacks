@@ -131,7 +131,9 @@ fn both(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
             nano_vm::ContractCallOutcome::Success(result)
             | nano_vm::ContractCallOutcome::AbortedByResponse(result),
         ) => format!("{:?}", result.value),
-        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => format!("failed: {error}"),
+        Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
+            format!("failed: {error}")
+        }
         Err(error) => format!("error: {error}"),
     };
 

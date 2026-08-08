@@ -201,15 +201,13 @@ mod tests {
             format!("{wide:?}"),
             format!(
                 "{:?}",
-                Ok::<_, VmExecutionError>(Some(
-                    Value::Tuple(
-                        TupleData::from_data(vec![
-                            (ClarityName::from_literal("full"), Value::Bool(true)),
-                            (ClarityName::from_literal("soft"), Value::Bool(true)),
-                        ])
-                        .unwrap()
-                    )
-                ))
+                Ok::<_, VmExecutionError>(Some(Value::Tuple(
+                    TupleData::from_data(vec![
+                        (ClarityName::from_literal("full"), Value::Bool(true)),
+                        (ClarityName::from_literal("soft"), Value::Bool(true)),
+                    ])
+                    .unwrap()
+                )))
             ),
             "the reference hands back the payload's own tuple"
         );
@@ -217,15 +215,13 @@ mod tests {
             format!("{narrow:?}"),
             format!(
                 "{:?}",
-                Ok::<_, VmExecutionError>(Some(
-                    Value::Tuple(
-                        TupleData::from_data(vec![(
-                            ClarityName::from_literal("soft"),
-                            Value::Bool(true)
-                        )])
-                        .unwrap()
-                    )
-                ))
+                Ok::<_, VmExecutionError>(Some(Value::Tuple(
+                    TupleData::from_data(vec![(
+                        ClarityName::from_literal("soft"),
+                        Value::Bool(true)
+                    )])
+                    .unwrap()
+                )))
             ),
             "and this hands back the analysed one"
         );

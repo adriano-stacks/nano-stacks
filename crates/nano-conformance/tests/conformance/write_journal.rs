@@ -32,7 +32,10 @@
 //! opens the captured checkpoint's own MARF, is handed nano's journal, and is
 //! asked whether it seals the root the block header committed to.
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use nano_conformance::{FixtureManifest, FixtureMode};
 use nano_marf::{MarfValue, VersionedMarf};
@@ -175,7 +178,11 @@ fn core_seal(
     journal: &BlockJournal,
     sealed_as: [u8; 32],
 ) -> String {
-    let keys: Vec<String> = journal.writes.iter().map(|write| write.key.clone()).collect();
+    let keys: Vec<String> = journal
+        .writes
+        .iter()
+        .map(|write| write.key.clone())
+        .collect();
     let values: Vec<CoreMarfValue> = journal
         .writes
         .iter()
@@ -208,8 +215,11 @@ fn nano_seal(
     nano.begin(parent, journal.executed_as)
         .expect("nano begins the block");
     for write in &journal.writes {
-        nano.insert(write.key.as_bytes(), MarfValue::from_bytes(write.marf_value))
-            .expect("nano inserts");
+        nano.insert(
+            write.key.as_bytes(),
+            MarfValue::from_bytes(write.marf_value),
+        )
+        .expect("nano inserts");
     }
     hex::encode(nano.seal_to(sealed_as).expect("nano seals").as_bytes())
 }
@@ -241,8 +251,7 @@ fn fresh_pair() -> Pair {
     let nano_dir = tempfile::tempdir().expect("a directory");
     let core_dir = tempfile::tempdir().expect("a directory");
     Pair {
-        nano: VersionedMarf::open(nano_dir.path().join("marf.sqlite"))
-            .expect("open nano's MARF"),
+        nano: VersionedMarf::open(nano_dir.path().join("marf.sqlite")).expect("open nano's MARF"),
         core: core_marf(&core_dir.path().join("marf.sqlite")),
         source: None,
         _nano_dir: Some(nano_dir),
@@ -300,7 +309,8 @@ fn lockstep(pair: &mut Pair, journals: &[BlockJournal]) -> Vec<String> {
         let core_root = core_seal(&mut pair.core, parent, journal, sealed);
         let nano_root = nano_seal(&mut pair.nano, parent, journal, sealed);
         assert_eq!(
-            nano_root, core_root,
+            nano_root,
+            core_root,
             "journal block {index} ({} writes) seals the same root in both MARFs",
             journal.writes.len()
         );
@@ -331,7 +341,10 @@ fn journals_hold_every_kind_of_write() {
             "a block above height zero writes five height keys"
         );
         assert!(
-            journal.height_keys.iter().all(|write| write.value.is_none()),
+            journal
+                .height_keys
+                .iter()
+                .all(|write| write.value.is_none()),
             "a height key holds an encoded height or a block hash, not a hashed string"
         );
         assert_eq!(
@@ -412,7 +425,10 @@ fn journals_hold_every_kind_of_write() {
         "{} journals, {} writes, {rewritten_across_blocks} rewrites across blocks, \
          {rewritten_within_a_block} within one",
         journals.len(),
-        journals.iter().map(|journal| journal.writes.len()).sum::<usize>()
+        journals
+            .iter()
+            .map(|journal| journal.writes.len())
+            .sum::<usize>()
     );
 }
 
@@ -517,17 +533,13 @@ fn trim_to_source(checkpoint: &Path, destination: &Path, source: [u8; 32]) {
 /// leaves the same leaf as writing it once with the final value.
 fn deduplicated(writes: &[JournalWrite]) -> Vec<JournalWrite> {
     let mut order: Vec<&str> = Vec::new();
-    let mut last: std::collections::HashMap<&str, &JournalWrite> =
-        std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<&str, &JournalWrite> = std::collections::HashMap::new();
     for write in writes {
         if last.insert(write.key.as_str(), write).is_none() {
             order.push(write.key.as_str());
         }
     }
-    order
-        .into_iter()
-        .map(|key| last[key].clone())
-        .collect()
+    order.into_iter().map(|key| last[key].clone()).collect()
 }
 
 /// Replay `journals[..index]` over the imported checkpoint, then seal `index`
@@ -698,10 +710,8 @@ fn ordering_is_consensus_for_writes_that_share_a_path_prefix() {
                 .map(|(index, key)| JournalWrite {
                     key: (*key).to_owned(),
                     value: None,
-                    marf_value: *MarfValue::from_u32(
-                        u32::try_from(index).expect("a small index"),
-                    )
-                    .as_bytes(),
+                    marf_value: *MarfValue::from_u32(u32::try_from(index).expect("a small index"))
+                        .as_bytes(),
                 })
                 .collect(),
             sealed_as: Some([9; 32]),
@@ -798,10 +808,18 @@ fn read_journal(text: &str) -> Vec<BlockJournal> {
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         match fields.as_slice() {
-            ["block", sealed, "height", height, "parent", parent, "root", root] => {
-                let decode = |value: &str| {
-                    <[u8; 32]>::try_from(hex::decode(value).ok()?.as_slice()).ok()
-                };
+            [
+                "block",
+                sealed,
+                "height",
+                height,
+                "parent",
+                parent,
+                "root",
+                root,
+            ] => {
+                let decode =
+                    |value: &str| <[u8; 32]>::try_from(hex::decode(value).ok()?.as_slice()).ok();
                 blocks.push(BlockJournal {
                     executed_as: nano_chainstate::temporary_state_id(),
                     parent: decode(parent),
@@ -813,10 +831,9 @@ fn read_journal(text: &str) -> Vec<BlockJournal> {
                 });
             }
             ["write", key, "=", value, ..] => {
-                let marf_value = <[u8; 40]>::try_from(
-                    hex::decode(value).expect("hexadecimal").as_slice(),
-                )
-                .expect("40 bytes");
+                let marf_value =
+                    <[u8; 40]>::try_from(hex::decode(value).expect("hexadecimal").as_slice())
+                        .expect("40 bytes");
                 blocks
                     .last_mut()
                     .expect("a write belongs to a block")
@@ -872,7 +889,9 @@ fn a_recorded_mainnet_journal_seals_the_chains_root() {
     // Never the path handed in: this test *writes* the journal's blocks into the
     // MARF it is given. See `reflinked`.
     let (_copy, path) = reflinked(Path::new(&path));
-    let mut parent = journals[0].parent.expect("the journal names its own parent");
+    let mut parent = journals[0]
+        .parent
+        .expect("the journal names its own parent");
     // And the archive already holds the blocks about to be replayed, so inserting
     // them fails on `UNIQUE constraint failed: marf_data.block_hash`. This test
     // used to tell an operator to run the delete by hand against a copy they had
@@ -919,7 +938,11 @@ fn render(journal: &BlockJournal) -> String {
     use std::fmt::Write as _;
     let mut rendered = String::new();
     for write in journal.height_keys.iter().chain(&journal.writes) {
-        let JournalWrite { key, value, marf_value } = write;
+        let JournalWrite {
+            key,
+            value,
+            marf_value,
+        } = write;
         let _ = writeln!(
             rendered,
             "{key} = {} {}",

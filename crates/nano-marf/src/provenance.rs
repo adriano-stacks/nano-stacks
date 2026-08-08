@@ -181,7 +181,10 @@ impl UnfinishedImport {
         let state = fs::read_to_string(&marker)
             .ok()
             .and_then(|contents| toml::from_str::<UnfinishedWire>(&contents).ok())
-            .map_or_else(|| "an unnamed state".to_owned(), |wire| wire.source_state_id);
+            .map_or_else(
+                || "an unnamed state".to_owned(),
+                |wire| wire.source_state_id,
+            );
         Err(CheckpointError::UnfinishedImport {
             directory: directory.as_ref().to_path_buf(),
             marker,
@@ -309,13 +312,11 @@ impl ProvenanceWire {
     fn encode(provenance: &CheckpointProvenance) -> Self {
         Self {
             checkpoint: ManifestWire::encode(&provenance.checkpoint),
-            attestation: provenance
-                .attestation
-                .map(|attestation| AttestationWire {
-                    attesting_block_id: hex::encode(attestation.attesting_block_id),
-                    signer_weight: attestation.signer_weight,
-                    approval_threshold: attestation.approval_threshold,
-                }),
+            attestation: provenance.attestation.map(|attestation| AttestationWire {
+                attesting_block_id: hex::encode(attestation.attesting_block_id),
+                signer_weight: attestation.signer_weight,
+                approval_threshold: attestation.approval_threshold,
+            }),
         }
     }
 }

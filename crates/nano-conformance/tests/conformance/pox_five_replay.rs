@@ -124,7 +124,9 @@ fn the_captured_pox_five_window_locks_the_same_stx() {
         "the capture has no stx_lock_event, so it cannot check the PoX handler at all"
     );
     assert!(
-        expected.iter().all(|lock| lock.contract.ends_with(".pox-5")),
+        expected
+            .iter()
+            .all(|lock| lock.contract.ends_with(".pox-5")),
         "a lock came from a contract other than pox-5: {expected:?}"
     );
 

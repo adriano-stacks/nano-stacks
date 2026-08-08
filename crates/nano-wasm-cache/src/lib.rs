@@ -102,7 +102,8 @@ impl NativeModuleCache {
         let mut digest = Sha512_256::new();
         digest.update(hasher.finish().to_be_bytes());
         digest.update(wasm);
-        self.directory.join(format!("{:x}.cwasm", digest.finalize()))
+        self.directory
+            .join(format!("{:x}.cwasm", digest.finalize()))
     }
 }
 
