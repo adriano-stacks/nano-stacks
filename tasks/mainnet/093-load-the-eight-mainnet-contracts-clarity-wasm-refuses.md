@@ -61,11 +61,16 @@ cargo xtask check-module /home/aldur/mainnet-8716986/state \
       and not `Trait`, though a trait reference *is* a principal at run time
       ("a public function receives a trait argument as a bare principal",
       `wasm_generator.rs`). All three contracts compile and load.**
-- [ ] Reduce the duck-typing and tuple families the same way, from the real
-      contract rather than towards it — the lesson of task 086, where two invented
-      reductions passed while the real one differed.
-- [ ] Fix the duck-typing rule: `buff 1` against `string-ascii 256` is a
-      comparison four deployed contracts make and the network permits.
+- [x] Reduce the duck-typing family from the real contract. **Done:
+      `(map f a-string)`, from `gated-pages` line 390.**
+- [ ] Reduce the tuple family the same way, from the real contract rather than
+      towards it — the lesson of task 086, where two invented reductions passed
+      while the real one differed.
+- [x] Fix the duck-typing rule. **Done, and it was not a rule to relax: the
+      element type was wrong. `map` now takes it from clarity's own
+      `SequenceSubtype::unit_type` rather than from a read strategy that cannot
+      tell a buffer from an ASCII string. All four `gated-pages` compile and
+      load.**
 - [ ] Fix `Tuples fields should be typed` for whatever shape
       `trajan-endorsement-alpha` uses.
 - [ ] Crosscheck each minimized source against the reference interpreter for
@@ -189,3 +194,26 @@ the assertion is a crosscheck of `(map f a-string)` against the reference
 interpreter, not that the contract compiles: this is a *type* being wrong, and a
 wrong type that happens to lay out compatibly computes a wrong answer quietly —
 which is what task 086 was.
+
+## Seven of eight fixed, 2026-08-08
+
+The duck-typing family is closed, and not by adding a `buff → string` coercion —
+that would have papered over a wrong type with a wrong widening. `map` reads its
+element type from `SequenceElementType`, which is a *read strategy*: `Byte` means
+"a byte at a time" and is right for a buffer and an ASCII string alike, so its
+conversion to a `TypeSignature` has to pick one and picked `(buff 1)`. Fine for
+the load; wrong for the widening.
+
+`map` carries the element as a type as well as a strategy now, and that type
+comes from **clarity's own `SequenceSubtype::unit_type`** — the element type here
+is the reference implementation's rather than a second opinion about it. Two
+sites needed it: the workspace sizing and the `duck_type` call itself.
+
+All four `gated-pages` compile and load. `map_over_a_string` pins it against the
+reference interpreter for `string-ascii`, `buff`, `string-utf8`, a list, and the
+mainnet shape of a list beside a string — because the defect was a *type* being
+wrong, and a wrong type that lays out compatibly computes a wrong answer rather
+than refusing. It fails on the previous revision with the mainnet error verbatim.
+
+**One contract remains**: `trajan-endorsement-alpha`, on `Tuples fields should be
+typed`.

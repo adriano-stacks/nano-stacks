@@ -689,6 +689,33 @@ impl ComplexWord for Concat {
     }
 }
 
+/// The element type of a sequence, as a *type* rather than as a read strategy.
+///
+/// `SequenceElementType::Byte` means "read this a byte at a time", which is right
+/// for a buffer and for a `string-ascii` alike — and its conversion to a
+/// `TypeSignature` has to pick one, so it picks `(buff 1)`. That is fine wherever
+/// the answer drives a load and wrong wherever it drives *duck typing*: `map`
+/// over a `string-ascii` then asks to widen `(buff 1)` to the mapped function's
+/// `(string-ascii n)` parameter, which is refused as incompatible.
+///
+/// Four contracts mainnet deployed and accepted refuse to compile for exactly
+/// that — `SP2BRB6P0BK6T35DHTGXCV6MZ5TGRN5E0RKZ1T8B5.gated-pages` and its three
+/// siblings, each passing a bare `(string-ascii 256)` as one of `map`'s sequences
+/// so that `map` walks its characters. `fold` met the same ambiguity and worked
+/// around it by reading the folded function's declared parameter instead.
+///
+/// The answer is not clar2wasm's to invent: `SequenceSubtype::unit_type` is
+/// clarity's own, and using it means the element type here is the one the
+/// reference implementation uses rather than a second opinion about it.
+fn element_type_of(sequence: &TypeSignature) -> Result<TypeSignature, GeneratorError> {
+    match sequence {
+        TypeSignature::SequenceType(seq) => Ok(seq.unit_type()),
+        other => Err(GeneratorError::TypeError(format!(
+            "expected a sequence, got {other:?}"
+        ))),
+    }
+}
+
 #[derive(Debug)]
 pub struct Map;
 
@@ -716,6 +743,8 @@ impl ComplexWord for Map {
 
         struct MapArg {
             element_type: SequenceElementType,
+            /// The same element as a *type*, for duck typing. See `element_type_of`.
+            duck_ty: TypeSignature,
             element_size: i32,
             offset: BorrowedLocal,
             length: BorrowedLocal,
@@ -760,12 +789,14 @@ impl ComplexWord for Map {
             .iter()
             .skip(1)
             .map(|arg| {
-                let element_type: SequenceElementType = generator
+                let sequence_ty = generator
                     .get_expr_type(arg)
                     .ok_or_else(|| {
                         GeneratorError::TypeError("sequence expression must be typed".to_owned())
                     })?
-                    .try_into()?;
+                    .clone();
+                let duck_ty = element_type_of(&sequence_ty)?;
+                let element_type: SequenceElementType = (&sequence_ty).try_into()?;
                 let element_size = element_type.type_size();
 
                 let offset = generator.borrow_local(ValType::I32);
@@ -776,6 +807,7 @@ impl ComplexWord for Map {
 
                 Ok(MapArg {
                     element_type,
+                    duck_ty,
                     element_size,
                     offset,
                     length,
@@ -965,8 +997,8 @@ impl ComplexWord for Map {
                     let size = user_defined_args_types
                         .iter()
                         .zip(mapargs.iter())
-                        .map(|(fn_arg, MapArg { element_type, .. })| {
-                            if need_ducktyping(&element_type.into(), fn_arg) {
+                        .map(|(fn_arg, MapArg { duck_ty, .. })| {
+                            if need_ducktyping(duck_ty, fn_arg) {
                                 dt_needed_workspace(fn_arg)
                             } else {
                                 0
@@ -993,16 +1025,22 @@ impl ComplexWord for Map {
                 for (
                     MapArg {
                         element_type,
+                        duck_ty,
                         offset,
                         ..
                     },
                     expected_arg_ty,
                 ) in mapargs.iter().zip(user_defined_args_types)
                 {
+                    // `element_type` decides how the element is *read* -- a byte
+                    // at a time for a buffer and for a string alike -- and
+                    // `duck_ty` is what it *is*. The two differ for a string, and
+                    // this is the widening, so it is the second one. See
+                    // `element_type_of`.
                     element_type.load(generator, &mut loop_, **offset)?;
                     generator.duck_type(
                         &mut loop_,
-                        &element_type.into(),
+                        duck_ty,
                         &expected_arg_ty,
                         args_memory.as_ref().map(|(_, l)| **l),
                     )?;

@@ -52,6 +52,7 @@ mod mainnet_envelope;
 mod mainnet_receipts;
 mod mainnet_sortition;
 mod hosted_signer;
+mod map_over_a_string;
 mod marf_lockstep;
 mod mempool;
 mod one_engine_in_the_artifact;
