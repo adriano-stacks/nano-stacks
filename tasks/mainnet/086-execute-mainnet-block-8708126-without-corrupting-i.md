@@ -171,3 +171,33 @@ These need the live node stopped, and it is running:
 Until the receipt and root are compared with the network, this task stays open:
 the cause is pinned and the regression is in the gate, but "the block executes"
 and "the block executes to the chain's answer" are different claims.
+
+## Three more of this family are deployed on mainnet, 2026-08-08
+
+`be3ec64e` fixed one wasm-local use-count defect — `BindingUses` not descending
+into an allowance list — and this task proved it is what let `v0-5-market`
+execute. A sweep that compiles **and loads** every contract in the imported
+mainnet state (`cargo xtask sweep-contracts`, 146,273 of 146,280) finds three
+more contracts whose modules wasmtime refuses with the same symptom:
+
+| contract | refusal |
+|---|---|
+| `SP3XR2EN9C51B09MJE7EF73Q3GR4HXY1Z28KR4QY8.STX` | `type mismatch: expected i64 but nothing on stack (at offset 0x2550)` |
+| `SP673Z4BPB4R73359K9HE55F2X91V5BJTN5SXZ5T.xip130` | `type mismatch: expected i64, found i32 (at offset 0x4058)` |
+| `SP34FHX44NK9KZ8KJC08WR2NHP8NEGFTTT7MTH7XD.citycoins-vote-v1` | `type mismatch: expected i32, found i64 (at offset 0x9c4b)` |
+
+`be3ec64e`'s own message names `type mismatch: expected i64, found i32` as what
+wasmtime says when a mis-counted read leaves the wrong thing on the stack, and
+`expected i64 but nothing on stack` is that one step worse. So these are either
+further shapes `BindingUses` still does not walk, or a sibling defect in the same
+machinery.
+
+They matter here rather than in [[084]] — which is where the sweep found them —
+for the reason this task exists: **the refusal is the lucky half.** A mis-count
+whose slots happen to line up produces a module that loads and computes with a
+value nobody put there, and 8,708,126 is what that looks like. Three contracts
+refusing loudly implies an unknown number that do not.
+
+Sources can be dumped read-only with
+`NANO_DUMP_SOURCE=… cargo xtask check-module /home/aldur/mainnet-8716986/state <id>`,
+and `cargo xtask sweep-contracts` re-measures the whole state after any fix.
