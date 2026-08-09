@@ -66,6 +66,10 @@ steady-state operation may require a hosted Stacks API.
       `stacks-node`, including inventory and block exchange in both directions
       and transaction relay. Reference-codec socket tests remain necessary but
       are not this acceptance run.
+- [x] Send `/v3/tenures/fork_info` bounds in stacks-core's wire order: the older
+      `recurse_end` first and the newer `start_from` second. Keep the conformance
+      peer faithful enough to reject the reversed order, and prove a live node
+      crosses the fork check without an HTTP 400 or restart.
 - [x] Route signer-role StackerDB replication and proposal recovery through the
       discovered peer pool under
       [[071-fail-over-signer-role-replication-across-peers]]. A chain sync that
@@ -79,6 +83,30 @@ steady-state operation may require a hosted Stacks API.
       over p2p alone — and the active peer then removed mid-run: it never served a
       round again, the pool rotated, and discovered peers served instead while p2p
       grew the pool to eight underneath.
+
+## Fork-info path-order regression found 2026-08-09
+
+The long-running mainnet node reached 8,724,697 and then stopped executing while
+its selected peer advanced. Its retained log repeatedly names the same failure:
+
+```text
+HTTP 400 /v3/tenures/fork_info/<newer>/<older>
+```
+
+stacks-core parses the first path element as the older recursion bound and the
+second as the newer cursor. Nano sent them in result order, and its conformance
+peer implemented the same reversal, so the fork-switch test remained green while
+three stock peers refused canonical adjacent views. The client and mock are fixed.
+The rebuilt live follower crossed the same fork, gave back its orphan and executed
+through 8,724,864 without another reversed-path 400. Task 096 retains the stronger
+staging and restart hardening separately.
+
+The wire order was also queried directly against the selected stock peer at
+`172.96.141.17:20443`, without changing either node. For the exact pair retained
+in the node log, `<newer>/<older>` returned 400 with a 70-byte error, while
+`<older>/<newer>` returned 200 with a 4,907,021-byte canonical tenure-fork
+answer. This proves the fix against the production route rather than only the
+corrected mock.
 
 ## Acceptance Criteria
 

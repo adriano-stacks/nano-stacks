@@ -172,6 +172,13 @@ never from fetched, staged or peer-reported height.
       blocks are staged behind it, so the node has the material to continue the
       moment the block executes.
 
+      **The targeted frontier is now exact.** [[086]] bisected the original
+      stale-local read to `be3ec64e` and replayed the checked-in block twice in
+      each of two independent fresh reflink scratches. Result, all five costs,
+      all eight ordered events and the committed root match the network oracle.
+      This remains targeted diagnostic depth, not the pristine checkpoint replay
+      this task requires.
+
       No boundary is in the way of that catch-up: cycle 141 opens at burn 962,150
       and Bitcoin is at 961,466, so [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]]
       does not block this state until it nears the rollover.

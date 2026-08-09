@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079", "082", "083", "084", "085"]
+dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079", "082", "083", "084", "085", "086", "087", "088", "093", "096", "097", "098"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -95,6 +95,16 @@ and steady state, with evidence tied to the durable executed chain.
       [[084-eliminate-wasm-function-type-arity-refusals-for-ne]].
 - [ ] Account for and execute every required ignored or conditional gate under
       [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
+- [ ] Execute the captured mainnet block at 8,708,126 and close its corrupted
+      trait-principal ABI path under
+      [[086-execute-mainnet-block-8708126-without-corrupting-i]].
+- [ ] Make read-only diagnostic evidence non-mutating and fail closed on a wrong
+      state path under
+      [[087-make-read-only-state-diagnostics-refuse-absent-or]].
+- [ ] Cross a same-sortition Stacks fork without mixing staged siblings or
+      leaving restart state behind under [[096]].
+- [x] Mirror recursive trait argument casting and refusal costs under [[097]].
+- [ ] Execute the 8,724,865 nested trait-reference call under [[098]].
 
 ### Audit coverage map
 
@@ -112,6 +122,8 @@ Every gap from the repeated 2026-08-07 audit has an open release dependency:
 | scoreboard result does not fully control release status | [[075]], [[074]] |
 | stale artifact, misleading engine/differential report | [[074]], [[078]] |
 | ignored, skipped or missing-input tests | [[085]] |
+| mainnet block 8,708,126 failed principal reconstruction, then passed after rebuild without a causal proof | [[086]], [[060]] |
+| read-only xtask inspection creates an empty state on a wrong path | [[087]], [[074]] |
 | floating toolchain, formatting and Clippy warnings | [[078]] |
 | no-hosted catch-up, stock signer/client and 24-hour tip hold | this task, [[054]] |
 
