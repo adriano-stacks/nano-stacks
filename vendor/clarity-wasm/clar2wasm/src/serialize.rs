@@ -452,8 +452,7 @@ impl WasmGenerator {
             );
 
         // Save the length of the list to a local
-        builder.local_set(bytes_length);
-        builder.local_set(read_ptr);
+        builder.local_set(bytes_length).local_set(read_ptr).drop();
 
         // if bytes_length is zero, we can simply add 0_i32 to the serialized buffer,
         // otherwise, we'll loop through elements and serialize them one by one.
@@ -783,6 +782,10 @@ impl WasmGenerator {
         // First, save the values to locals, so that we can get them in
         // the correct order.
         let mut locals = self.save_to_locals(builder, ty, false);
+        let shape_handle = locals.pop().ok_or_else(|| {
+            GeneratorError::InternalError("tuple is missing its runtime-shape handle".into())
+        })?;
+        self.release_locals(vec![shape_handle]);
 
         // Now write the type prefix to memory
         builder
@@ -1027,7 +1030,7 @@ impl WasmGenerator {
                     .binop(BinaryOp::I32Add)
                     .local_set(*write_ptr);
 
-                let mut field_offset = input_offset;
+                let mut field_offset = input_offset + 4;
                 for (name, field_ty) in tuple_ty.get_type_map() {
                     builder
                         .local_get(*write_ptr)
@@ -1370,7 +1373,7 @@ impl WasmGenerator {
                 // since the actual size isn't known at compile time, and the actual size of the elements
                 // might also need to be computed at runtime, we will have to go element by element to find the
                 // result.
-                let &[offset, length] = value else {
+                let &[_shape_handle, offset, length] = value else {
                     return MISMATCHED_TYPE_VALUE(ty);
                 };
                 let current = self.borrow_local(ValType::I32);
@@ -1434,7 +1437,9 @@ impl WasmGenerator {
                 );
 
                 // we need to compute the serialization size of all elements in the tuple.
-                let mut remaining = value;
+                let Some((_shape_handle, mut remaining)) = value.split_first() else {
+                    return MISMATCHED_TYPE_VALUE(ty);
+                };
                 for elem_ty in tup.get_type_map().values() {
                     let Some((elem, rest)) =
                         remaining.split_at_checked(clar2wasm_ty(elem_ty).len())
@@ -1477,6 +1482,7 @@ mod tests {
         .into();
 
         gen.create_module(&return_ty, |gen, builder| {
+            builder.i32_const(0);
             gen.pass_value(builder, &value, &ty)
                 .expect("failed to write instructions for original value");
 

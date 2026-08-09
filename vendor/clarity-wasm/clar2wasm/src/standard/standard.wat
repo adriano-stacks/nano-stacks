@@ -71,6 +71,7 @@
                                                         (param $contract_id_length i32)
                                                         (param $token_name_offset i32)
                                                         (param $token_name_length i32)
+                                                        (param $identifiers_shape i32)
                                                         (param $identifiers_offset i32)
                                                         (param $identifiers_length i32)
                                                         (param $identifiers_ty_offset i32)
@@ -90,7 +91,7 @@
                                                                (result i64 i64)))
     (import "clarity" "stx_account" (func $stdlib.stx_account (param $principal_offset i32)
                                                        (param $principal_length i32)
-                                                       (result i64 i64 i64 i64 i64 i64)))
+                                                       (result i32 i64 i64 i64 i64 i64 i64)))
     (import "clarity" "stx_burn" (func $stdlib.stx_burn (param $amount_lo i64)
                                                  (param $amount_hi i64)
                                                  (param $principal_offset i32)
@@ -2241,7 +2242,7 @@
             (param $contract_offset i32)
             (param $contract_length i32)
             (param $res_principal_offset i32)
-            (result i32 i32 i32 i64 i64 i32 i32 i32)
+            (result i32 i32 i32 i32 i64 i64 i32 i32 i32)
         (local $version i32) (local $valid i32) (local $result_length i32)
         ;; Return `(err u1)` if `version` is empty. The type-checker and
         ;; compiler ensure it cannot be > 1 byte.
@@ -2251,6 +2252,7 @@
                 (i32.const 0) ;; err indicator
                 (i32.const 0) ;; ok value placeholder
                 (i32.const 0) ;; ok value placeholder
+                (i32.const 0) ;; error tuple runtime-shape handle
                 (i64.const 1) ;; error_code low
                 (i64.const 0) ;; error_code high
                 (i32.const 0) ;; principal none indicator
@@ -2270,6 +2272,7 @@
                 (i32.const 0) ;; err indicator
                 (i32.const 0) ;; ok value placeholder
                 (i32.const 0) ;; ok value placeholder
+                (i32.const 0) ;; error tuple runtime-shape handle
                 (i64.const 1) ;; error_code low
                 (i64.const 0) ;; error_code high
                 (i32.const 0) ;; principal none indicator
@@ -2290,6 +2293,7 @@
                 (i32.const 0) ;; err indicator
                 (i32.const 0) ;; ok value placeholder
                 (i32.const 0) ;; ok value placeholder
+                (i32.const 0) ;; error tuple runtime-shape handle
                 (i64.const 1) ;; error_code low
                 (i64.const 0) ;; error_code high
                 (i32.const 0) ;; principal none indicator
@@ -2322,6 +2326,7 @@
                         (i32.const 0) ;; err indicator
                         (i32.const 0) ;; ok value placeholder
                         (i32.const 0) ;; ok value placeholder
+                        (i32.const 0) ;; error tuple runtime-shape handle
                         (i64.const 2) ;; error_code low
                         (i64.const 0) ;; error_code high
                         (i32.const 0) ;; principal none indicator
@@ -2343,12 +2348,13 @@
         (local.set $result_length (i32.add (local.get $contract_length) (i32.const 22)))
 
         ;; If the version was valid, return an ok value
-        (if (result i32 i32 i32 i64 i64 i32 i32 i32) (local.get $valid)
+        (if (result i32 i32 i32 i32 i64 i64 i32 i32 i32) (local.get $valid)
             (then
                 ;; (ok the-principal)
                 (i32.const 1) ;; ok indicator
                 (local.get $res_principal_offset) ;; principal offset
                 (local.get $result_length) ;; principal length
+                (i32.const 0) ;; error tuple runtime-shape handle
                 (i64.const 0) ;; error_code placeholder
                 (i64.const 0) ;; error_code placeholder
                 (i32.const 0) ;; optional placeholder
@@ -2360,6 +2366,7 @@
                 (i32.const 0) ;; err indicator
                 (i32.const 0) ;; ok value placeholder
                 (i32.const 0) ;; ok value placeholder
+                (i32.const 0) ;; error tuple runtime-shape handle
                 (i64.const 0) ;; error_code low
                 (i64.const 0) ;; error_code high
                 (i32.const 1) ;; principal some indicator

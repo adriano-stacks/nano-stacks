@@ -173,7 +173,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0);
+                    then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
                     then.br(block_id);
                 },
                 |_| {},
@@ -822,7 +822,7 @@ impl WasmGenerator {
         // early exit as needed.
         // These I32s are the some indicator for the outer optional and
         // the offset and length of the list.
-        let wasm_val_ty = vec![ValType::I32, ValType::I32, ValType::I32];
+        let wasm_val_ty = vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32];
         let block_ty = self.bounded_control_type(&[], &wasm_val_ty)?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
@@ -839,7 +839,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0);
+                    then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
                     then.br(block_id);
                 },
                 |_| {},
@@ -865,7 +865,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0);
+                    then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
                     then.br(block_id);
                 },
                 |_| {},
@@ -934,7 +934,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Push the `some` indicator onto the stack
-                    then.i32_const(1);
+                    then.i32_const(1).i32_const(0);
 
                     // Push the offset and length onto the stack
                     then.local_get(result)
@@ -967,7 +967,7 @@ impl WasmGenerator {
             None,
             |then| {
                 // Return none
-                then.i32_const(0).i32_const(0).i32_const(0);
+                then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
                 then.br(block_id);
             },
             |_| {},
@@ -1104,7 +1104,7 @@ impl WasmGenerator {
 
         let field_offsets = tm
             .values()
-            .scan(0_u32, |offset, field_ty| {
+            .scan(4_u32, |offset, field_ty| {
                 let field_offset = *offset;
                 *offset += get_type_size(field_ty) as u32;
                 Some(field_offset)
@@ -1134,6 +1134,15 @@ impl WasmGenerator {
         // Main block creation
         let main_block_id = {
             let mut main_block = builder.dangling_instr_seq(return_ty);
+
+            main_block.local_get(tuple_output).i32_const(0).store(
+                memory,
+                StoreKind::I32 { atomic: false },
+                MemArg {
+                    align: 4,
+                    offset: tuple_output_offset,
+                },
+            );
 
             // we initialize the empty bitset
             for &b in bitset.iter() {

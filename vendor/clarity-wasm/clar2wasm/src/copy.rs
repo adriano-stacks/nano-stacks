@@ -20,9 +20,9 @@ impl WasmGenerator {
             | TypeSignature::UIntType
             | TypeSignature::BoolType => Ok(()),
             TypeSignature::SequenceType(SequenceSubtype::ListType(ltd)) => {
-                let [offset, len] = locals else {
+                let [_shape_handle, offset, len] = locals else {
                     return Err(GeneratorError::InternalError(
-                        "Copy: a list type should be (offset, length)".to_owned(),
+                        "Copy: a list type should be (shape, offset, length)".to_owned(),
                     ));
                 };
                 let memory = self.get_memory()?;
@@ -156,7 +156,7 @@ impl WasmGenerator {
             }
             TypeSignature::TupleType(tuple_type_signature) => {
                 let inner_ty_and_locals = tuple_type_signature.get_type_map().values().scan(
-                    locals,
+                    &locals[1..],
                     |remaining_locals, ty| {
                         let current_locals;
                         (current_locals, *remaining_locals) =

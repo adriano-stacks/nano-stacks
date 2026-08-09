@@ -39,6 +39,9 @@ pub struct WasmGenerator {
     /// The contract analysis, which contains the expressions and type
     /// information for the contract.
     pub(crate) contract_analysis: ContractAnalysis,
+    /// Code-generation-only type refinements. The stored analysis remains the
+    /// source of truth for consensus typing and arity reports.
+    lowered_type_overrides: HashMap<u64, TypeSignature>,
     /// original map_types, used for cost computation were we need a 1:1 mapping of the original complete types
     pub(crate) map_types_original: BTreeMap<ClarityName, (TypeSignature, TypeSignature)>,
     /// The WebAssembly module that is being generated.
@@ -512,6 +515,11 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
             types.extend(clar2wasm_ty(&inner_types.1));
             types
         }
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => vec![
+            ValType::I32, // runtime-shape handle
+            ValType::I32, // offset
+            ValType::I32, // length
+        ],
         TypeSignature::SequenceType(_) | TypeSignature::ListUnionType(_) => vec![
             ValType::I32, // offset
             ValType::I32, // length
@@ -529,12 +537,35 @@ pub(crate) fn clar2wasm_ty(ty: &TypeSignature) -> Vec<ValType> {
             types
         }
         TypeSignature::TupleType(inner_types) => {
-            let mut types = vec![];
+            let mut types = vec![ValType::I32]; // runtime-shape handle
             for inner_type in inner_types.get_type_map().values() {
                 types.extend(clar2wasm_ty(inner_type));
             }
             types
         }
+    }
+}
+
+/// Number of Wasm slots in the source-level flattened representation, before
+/// compiler-only hidden metadata and memory-backed lowering.
+pub(crate) fn source_wasm_arity(ty: &TypeSignature) -> usize {
+    match ty {
+        TypeSignature::NoType | TypeSignature::BoolType => 1,
+        TypeSignature::IntType | TypeSignature::UIntType => 2,
+        TypeSignature::ResponseType(inner_types) => {
+            1 + source_wasm_arity(&inner_types.0) + source_wasm_arity(&inner_types.1)
+        }
+        TypeSignature::SequenceType(_)
+        | TypeSignature::ListUnionType(_)
+        | TypeSignature::PrincipalType
+        | TypeSignature::CallableType(_)
+        | TypeSignature::TraitReferenceType(_) => 2,
+        TypeSignature::OptionalType(inner_ty) => 1 + source_wasm_arity(inner_ty),
+        TypeSignature::TupleType(inner_types) => inner_types
+            .get_type_map()
+            .values()
+            .map(source_wasm_arity)
+            .sum(),
     }
 }
 
@@ -611,7 +642,7 @@ pub(crate) fn widen_actions(
             if inside.len() != wanted.len() {
                 return None;
             }
-            let mut actions = Vec::new();
+            let mut actions = vec![Widen::Take];
             for ((left_name, left), (right_name, right)) in inside.iter().zip(wanted.iter()) {
                 if left_name != right_name {
                     return None;
@@ -845,9 +876,15 @@ impl WasmGenerator {
     pub fn new(contract_analysis: ContractAnalysis) -> Result<WasmGenerator, GeneratorError> {
         let standard_lib_wasm: &[u8] = include_bytes!("standard/standard.wasm");
 
-        let module = Module::from_buffer(standard_lib_wasm).map_err(|_err| {
+        let mut module = Module::from_buffer(standard_lib_wasm).map_err(|_err| {
             GeneratorError::InternalError("failed to load standard library".to_owned())
         })?;
+        let save_shape_ty = module
+            .types
+            .add(&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]);
+        let (save_shape, _) =
+            module.add_import_func("clarity", "save_runtime_shape", save_shape_ty);
+        module.funcs.get_mut(save_shape).name = Some("stdlib.save_runtime_shape".to_owned());
         // Get the stack-pointer global ID
         let global_id = get_global(&module, "stack-pointer")?;
 
@@ -856,6 +893,7 @@ impl WasmGenerator {
         Ok(WasmGenerator {
             map_types_original: contract_analysis.map_types.clone(),
             contract_analysis,
+            lowered_type_overrides: HashMap::new(),
             module,
             literal_memory_end: END_OF_STANDARD_DATA,
             stack_pointer: global_id,
@@ -969,7 +1007,7 @@ impl WasmGenerator {
             .rev()
             .find_map(|expr| self.get_expr_type(expr))
             .cloned();
-        let flattened_results = return_type.as_ref().map_or(0, |ty| clar2wasm_ty(ty).len());
+        let flattened_results = return_type.as_ref().map_or(0, source_wasm_arity);
         self.arity_report.borrow_mut().top_level_results = flattened_results;
         let packed_top_level = return_type.as_ref().is_some_and(uses_packed_value);
         let return_offset = packed_top_level.then(|| self.module.locals.add(ValType::I32));
@@ -1299,12 +1337,12 @@ impl WasmGenerator {
             let params = function_type
                 .args
                 .iter()
-                .map(|argument| clar2wasm_ty(&argument.signature).len())
+                .map(|argument| source_wasm_arity(&argument.signature))
                 .sum::<usize>();
             report.max_function_params = report.max_function_params.max(params);
             report.max_function_results = report
                 .max_function_results
-                .max(clar2wasm_ty(&function_type.returns).len());
+                .max(source_wasm_arity(&function_type.returns));
         }
         let packed_abi = uses_packed_abi(&function_type);
 
@@ -1503,7 +1541,8 @@ impl WasmGenerator {
             binding_locals + u32::from(packed_abi) * 2 + 1 + u32::from(switches_sender) * 2,
         );
 
-        let block_type = self.bounded_control_type(&[], results_types.as_slice())?;
+        self.note_control_arity(0, source_wasm_arity(&function_type.returns));
+        let block_type = self.checked_control_type(&[], results_types.as_slice())?;
         let mut block = func_body.dangling_instr_seq(block_type);
         let block_id = block.id();
 
@@ -1667,7 +1706,14 @@ impl WasmGenerator {
                 GeneratorError::TypeError("expression must be typed to be serialized".to_owned())
             })?
             .clone();
-        let serialized = self.type_for_serialization(&ty).to_string();
+        self.serialized_type(&ty)
+    }
+
+    pub(crate) fn serialized_type(
+        &mut self,
+        ty: &TypeSignature,
+    ) -> Result<(i32, i32), GeneratorError> {
+        let serialized = self.type_for_serialization(ty).to_string();
         signature_from_string(
             &serialized,
             self.contract_analysis.clarity_version,
@@ -1680,6 +1726,56 @@ impl WasmGenerator {
             data: serialized.into_bytes(),
         }))?;
         Ok((offset as i32, length as i32))
+    }
+
+    /// Materialize a composite stack value in the execution context's
+    /// runtime-shape arena, then put the same projected value back on stack
+    /// with its new handle.
+    pub(crate) fn capture_runtime_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        if !matches!(
+            ty,
+            TypeSignature::TupleType(_) | TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+        ) {
+            return Err(GeneratorError::InternalError(
+                "only tuples and lists carry runtime-shape handles".to_owned(),
+            ));
+        }
+
+        let locals = self.save_to_locals(builder, ty, true);
+        let handle = *locals.first().ok_or_else(|| {
+            GeneratorError::InternalError("composite value is missing its shape handle".to_owned())
+        })?;
+        let (type_offset, type_length) = self.serialized_type(ty)?;
+        let mut capture = builder.dangling_instr_seq(None);
+        for local in &locals {
+            capture.local_get(*local);
+        }
+        let (value_offset, _) = self.create_call_stack_local(&mut capture, ty, true, false);
+        self.write_to_memory(&mut capture, value_offset, 0, ty)?;
+        capture
+            .local_get(value_offset)
+            .i32_const(type_offset)
+            .i32_const(type_length)
+            .call(self.func_by_name("stdlib.save_runtime_shape"))
+            .local_set(handle);
+        let capture = capture.id();
+
+        builder.local_get(handle).unop(UnaryOp::I32Eqz).if_else(
+            None,
+            |then| {
+                then.instr(walrus::ir::Block { seq: capture });
+            },
+            |_| {},
+        );
+        for local in &locals {
+            builder.local_get(*local);
+        }
+        self.release_locals(locals);
+        Ok(())
     }
 
     /// Try to change `ty` for serialization/deserialization (as stringified signature)
@@ -1824,7 +1920,7 @@ impl WasmGenerator {
                 let declared = self.clarity_value_size(ty)?;
                 let type_size = declared.saturating_sub(entry.saturating_mul(list.get_max_len()));
                 builder
-                    .local_get(locals[1])
+                    .local_get(locals[2])
                     .i32_const(width)
                     .binop(BinaryOp::I32DivU)
                     .i32_const(entry as i32)
@@ -1864,6 +1960,15 @@ impl WasmGenerator {
 
     /// Gets the result type of the given `SymbolicExpression`.
     pub fn get_expr_type(&self, expr: &SymbolicExpression) -> Option<&TypeSignature> {
+        if let Some(ty) = self.lowered_type_overrides.get(&expr.id) {
+            return Some(ty);
+        }
+        self.get_source_expr_type(expr)
+    }
+
+    /// Gets the analyser's original result type without compiler-only layout
+    /// refinements.
+    pub(crate) fn get_source_expr_type(&self, expr: &SymbolicExpression) -> Option<&TypeSignature> {
         self.contract_analysis
             .type_map
             .as_ref()
@@ -1878,17 +1983,12 @@ impl WasmGenerator {
         expr: &SymbolicExpression,
         ty: TypeSignature,
     ) -> Result<(), GeneratorError> {
-        // Safely ignore the error because we know this type has already been set.
-        let _ = self
-            .contract_analysis
-            .type_map
-            .as_mut()
-            .ok_or_else(|| {
-                GeneratorError::InternalError(
-                    "type-checker must be called before Wasm generation".to_owned(),
-                )
-            })?
-            .set_type(expr, ty);
+        if self.contract_analysis.type_map.is_none() {
+            return Err(GeneratorError::InternalError(
+                "type-checker must be called before Wasm generation".to_owned(),
+            ));
+        }
+        self.lowered_type_overrides.insert(expr.id, ty);
         Ok(())
     }
 
@@ -2081,7 +2181,11 @@ impl WasmGenerator {
             GeneratorError::TypeError("Expression results must be typed".to_owned())
         })?);
 
-        let block_type = self.bounded_control_type(&[], &return_type)?;
+        let source_results = self
+            .get_source_expr_type(expr)
+            .map_or(return_type.len(), source_wasm_arity);
+        self.note_control_arity(0, source_results);
+        let block_type = self.checked_control_type(&[], &return_type)?;
         let mut block = builder.dangling_instr_seq(block_type);
         self.traverse_expr(&mut block, expr)?;
 
@@ -2096,6 +2200,14 @@ impl WasmGenerator {
         results: &[ValType],
     ) -> Result<InstrSeqType, GeneratorError> {
         self.note_control_arity(params.len(), results.len());
+        self.checked_control_type(params, results)
+    }
+
+    fn checked_control_type(
+        &mut self,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> Result<InstrSeqType, GeneratorError> {
         if uses_packed_slots(params.len(), results.len()) {
             return Err(GeneratorError::InternalError(format!(
                 "a {}/{}-slot control value was not lowered through memory",
@@ -2131,7 +2243,7 @@ impl WasmGenerator {
         result_offset: LocalId,
         result_type: &TypeSignature,
     ) -> Result<InstrSeqId, GeneratorError> {
-        self.note_control_arity(0, clar2wasm_ty(result_type).len());
+        self.note_control_arity(0, source_wasm_arity(result_type));
         let mut block = builder.dangling_instr_seq(None);
         self.traverse_expr(&mut block, expr)?;
         self.write_to_memory(&mut block, result_offset, 0, result_type)?;
@@ -2292,6 +2404,28 @@ impl WasmGenerator {
                 );
                 Ok(16)
             }
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
+                // Data stack: TOP | Length | Offset | ShapeHandle | ...
+                let seq_length = self.borrow_local(ValType::I32);
+                let seq_offset = self.borrow_local(ValType::I32);
+                let shape_handle = self.borrow_local(ValType::I32);
+                builder
+                    .local_set(*seq_length)
+                    .local_set(*seq_offset)
+                    .local_set(*shape_handle);
+
+                for (value, delta) in [(*shape_handle, 0), (*seq_offset, 4), (*seq_length, 8)] {
+                    builder.local_get(offset_local).local_get(value).store(
+                        memory,
+                        StoreKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: offset + delta,
+                        },
+                    );
+                }
+                Ok(12)
+            }
             TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
             | TypeSignature::ListUnionType(_)
@@ -2401,16 +2535,16 @@ impl WasmGenerator {
                 Ok(bytes_written + 4)
             }
             TypeSignature::TupleType(tuple_ty) => {
-                // Data stack: TOP | last_value | value_before_last | ... | first_value
+                // Data stack: TOP | last_value | ... | first_value | ShapeHandle
                 // we will write the values from last to first by setting the correct offset at which it's supposed to be written
-                let mut bytes_written = 0;
+                let mut bytes_written = 4;
                 let types: Vec<_> = tuple_ty.get_type_map().values().cloned().collect();
-                let offsets_delta: Vec<_> = std::iter::once(0u32)
+                let offsets_delta: Vec<_> = std::iter::once(4u32)
                     .chain(
                         types
                             .iter()
                             .map(|t| get_type_size(t) as u32)
-                            .scan(0, |acc, i| {
+                            .scan(4, |acc, i| {
                                 *acc += i;
                                 Some(*acc)
                             }),
@@ -2424,6 +2558,16 @@ impl WasmGenerator {
                         &elem_ty,
                     )?;
                 }
+                let shape_handle = self.borrow_local(ValType::I32);
+                builder
+                    .local_set(*shape_handle)
+                    .local_get(offset_local)
+                    .local_get(*shape_handle)
+                    .store(
+                        memory,
+                        StoreKind::I32 { atomic: false },
+                        MemArg { align: 4, offset },
+                    );
                 Ok(bytes_written)
             }
         }
@@ -2504,6 +2648,19 @@ impl WasmGenerator {
             }
             // Principals and sequence types are stored in-memory and
             // represented by an offset and length.
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
+                for delta in [0, 4, 8] {
+                    builder.local_get(offset).load(
+                        memory.id(),
+                        LoadKind::I32 { atomic: false },
+                        MemArg {
+                            align: 4,
+                            offset: literal_offset + delta,
+                        },
+                    );
+                }
+                Ok(12)
+            }
             TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
             | TypeSignature::ListUnionType(_)
@@ -2529,8 +2686,16 @@ impl WasmGenerator {
                 Ok(8)
             }
             TypeSignature::TupleType(tuple) => {
-                // Memory: Offset -> | Value1 | Value2 | ... |
-                let mut offset_adjust = 0;
+                // Memory: Offset -> | ShapeHandle | Value1 | Value2 | ... |
+                builder.local_get(offset).load(
+                    memory.id(),
+                    LoadKind::I32 { atomic: false },
+                    MemArg {
+                        align: 4,
+                        offset: literal_offset,
+                    },
+                );
+                let mut offset_adjust = 4;
                 for ty in tuple.get_type_map().values() {
                     offset_adjust +=
                         self.read_from_memory(builder, offset, literal_offset + offset_adjust, ty)?

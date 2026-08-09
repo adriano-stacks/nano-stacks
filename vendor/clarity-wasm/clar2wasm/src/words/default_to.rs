@@ -84,7 +84,7 @@ impl ComplexWord for DefaultTo {
                 0 => None,
                 size => Some(generator.create_call_stack_bytes(builder, size as i32).0),
             };
-            generator.duck_type(builder, &opt_val_ty, &expr_type, workspace)?;
+            generator.duck_type_preserve(builder, &opt_val_ty, &expr_type, workspace)?;
         }
         let opt_val_locals = generator.save_to_locals(builder, &expr_type, true);
 
@@ -142,11 +142,7 @@ impl ComplexWord for DefaultTo {
 
 #[cfg(test)]
 mod tests {
-    use clarity::vm::errors::VmExecutionError;
-    use clarity::vm::types::TupleData;
-    use clarity::vm::{ClarityName, Value};
-
-    use crate::tools::{crosscheck_compare_only, evaluate, interpret};
+    use crate::tools::{crosscheck_compare_only, evaluate};
 
     #[test]
     fn default_to_less_than_two_args() {
@@ -168,99 +164,53 @@ mod tests {
             .contains("expecting 2 arguments, got 3"));
     }
 
-    /// The tuple-supertype asymmetry, in the word that reaches it.
-    ///
-    /// `least_supertype` walks the *default's* fields and drops the payload's
-    /// extras, so `(default-to { soft: false } entry)` over an `(optional {
-    /// soft: bool, full: bool })` analyses as the one-field tuple.
-    /// `native_default_to` then hands back whichever value its branch produced,
-    /// unconverted — so on the `some` branch the answer's shape is the payload's
-    /// and not the expression's analysed type, and on the `none` branch it is the
-    /// default's. One expression, two runtime shapes.
-    ///
-    /// `traverse` above converts the payload to the analysed type instead,
-    /// because a wasm value's representation is fixed by one static type. There
-    /// is no third choice: narrowing reproduces the `none` branch and loses a
-    /// field on the `some` branch, and widening would reproduce the `some` branch
-    /// and have to invent a field for the other.
-    ///
-    /// Measured on `(some { soft: true, full: true })`, consensus serialization
-    /// included:
-    ///
-    /// ```text
-    /// returned  compiled    0c0000000104736f667403
-    ///           interpreted 0c000000020466756c6c0304736f667403
-    /// var-set   compiled    (ok { soft: true }), the var written
-    ///           interpreted RuntimeCheck(TypeValueError), nothing written
-    /// argument  compiled    { soft: true }
-    ///           interpreted RuntimeCheck(TypeValueError)
-    /// ```
-    ///
-    /// The last two are *state* divergences and not only receipt ones: both a
-    /// narrow `define-data-var` and a narrow function parameter type-check at run
-    /// time and refuse a differing field count, so the reference aborts the
-    /// transaction where this commits a write and carries on. The parameter check
-    /// is `clarity2_implicit_cast`, whose own comment calls the case "unreachable
-    /// if the type-checker has already run successfully" — which is as close as
-    /// the reference comes to saying that this type should not have been handed
-    /// out.
-    ///
-    /// Asserted rather than `#[ignore]`d, and asserted on *both* engines. An
-    /// ignored equality is a divergence nobody measures; the same divergence
-    /// pinned in both directions cannot move — in either engine — without turning
-    /// this red, and it is the reference's half that decides the chain. The `none`
-    /// branch must still agree, because there the value *is* its analysed type.
-    ///
-    /// Accounted for in nano-stacks task 068, which records why no choice inside
-    /// this word closes it: the conformant engine here is one whose values carry
-    /// their shape at run time.
     #[test]
     fn clar_default_to_narrowing_answers_with_the_branch_the_reference_took() {
         const NARROWING: &str =
             "(define-read-only (whole (entry (optional { soft: bool, full: bool })))
                (default-to { soft: false } entry))";
 
-        // The `some` branch: the payload's own two-field tuple in the reference,
-        // the analysed one-field tuple here.
         let entry = "(whole (some { soft: true, full: true }))";
-        let wide = interpret(&format!("{NARROWING} {entry}"));
-        let narrow = evaluate(&format!("{NARROWING} {entry}"));
-        assert_ne!(
-            format!("{wide:?}"),
-            format!("{narrow:?}"),
-            "if this has closed, close the accounting in nano-stacks task 068 with it"
-        );
-        assert_eq!(
-            format!("{wide:?}"),
-            format!(
-                "{:?}",
-                Ok::<_, VmExecutionError>(Some(Value::Tuple(
-                    TupleData::from_data(vec![
-                        (ClarityName::from_literal("full"), Value::Bool(true)),
-                        (ClarityName::from_literal("soft"), Value::Bool(true)),
-                    ])
-                    .unwrap()
-                )))
-            ),
-            "the reference hands back the payload's own tuple"
-        );
-        assert_eq!(
-            format!("{narrow:?}"),
-            format!(
-                "{:?}",
-                Ok::<_, VmExecutionError>(Some(Value::Tuple(
-                    TupleData::from_data(vec![(
-                        ClarityName::from_literal("soft"),
-                        Value::Bool(true)
-                    )])
-                    .unwrap()
-                )))
-            ),
-            "and this hands back the analysed one"
-        );
-
-        // The `none` branch: the default's own value, which is the analysed type in
-        // both, so it must agree.
+        crosscheck_compare_only(&format!("{NARROWING} {entry}"));
         crosscheck_compare_only(&format!("{NARROWING} (whole none)"));
+    }
+
+    #[test]
+    fn clar_default_to_preserves_a_list_payloads_runtime_shape() {
+        const NARROWING: &str = "(define-read-only (whole-list
+                (entry (optional (list 1 { soft: bool, full: bool }))))
+               (default-to (list { soft: false }) entry))";
+
+        crosscheck_compare_only(&format!(
+            "{NARROWING} (whole-list (some (list {{ soft: true, full: true }})))"
+        ));
+        crosscheck_compare_only(&format!("{NARROWING} (whole-list none)"));
+    }
+
+    #[test]
+    fn clar_default_to_preserves_shapes_repeatedly_in_map_and_fold() {
+        const SNIPPET: &str = r#"
+            (define-private (preserve-one (entry { soft: bool, full: bool }))
+                (default-to { soft: false } (some entry)))
+            (define-private (count-soft
+                    (entry { soft: bool, full: bool })
+                    (count uint))
+                (+ count
+                    (if (get soft (default-to { soft: false } (some entry)))
+                        u1
+                        u0)))
+            (define-constant entries
+                (list
+                    { soft: true, full: false }
+                    { soft: false, full: true }
+                    { soft: true, full: true }
+                    { soft: false, full: false }))
+            {
+                mapped: (map preserve-one entries),
+                folded: (fold count-soft entries u0)
+            }
+        "#;
+
+        crosscheck_compare_only(SNIPPET);
     }
 }

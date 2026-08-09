@@ -88,7 +88,7 @@ impl ComplexWord for Print {
                 0 => None,
                 size => Some(generator.create_call_stack_bytes(builder, size as i32).0),
             };
-            generator.duck_type(builder, &ty, &expr_ty, workspace)?;
+            generator.duck_type_preserve(builder, &ty, &expr_ty, workspace)?;
         }
 
         Ok(())

@@ -13,6 +13,7 @@ use walrus::InstrSeqBuilder;
 use wasmtime::{AsContextMut, Instance, Trap};
 
 use crate::error::WasmError;
+use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_generator::{clar2wasm_ty, GeneratorError, WasmGenerator};
 use crate::wasm_utils::{
     get_global, read_bytes_from_wasm, read_from_wasm_indirect, read_identifier_from_wasm,
@@ -151,13 +152,17 @@ impl From<i32> for ErrorMap {
     }
 }
 
-pub(crate) fn resolve_error(
+pub(crate) fn resolve_error<S>(
     e: wasmtime::Error,
     instance: Instance,
-    mut store: impl AsContextMut,
+    mut store: S,
     epoch_id: &StacksEpochId,
     clarity_version: &ClarityVersion,
-) -> VmExecutionError {
+) -> VmExecutionError
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     if let Some(vm_error) = e.root_cause().downcast_ref::<VmExecutionError>() {
         if let Some(vm_error) = clone_vm_execution_error(vm_error) {
             return vm_error;
@@ -242,13 +247,17 @@ fn clone_runtime_check_error(error: &RuntimeCheckErrorKind) -> Option<RuntimeChe
 /// Returns a Clarity `Error` that corresponds to the runtime error encountered during
 /// WebAssembly execution.
 ///
-fn from_runtime_error_code(
+fn from_runtime_error_code<S>(
     instance: Instance,
-    mut store: impl AsContextMut,
+    mut store: S,
     e: wasmtime::Error,
     epoch_id: &StacksEpochId,
     clarity_version: &ClarityVersion,
-) -> VmExecutionError {
+) -> VmExecutionError
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     let runtime_error_code = get_global_i32(&instance, &mut store, "runtime-error-code");
 
     match ErrorMap::from(runtime_error_code) {
@@ -434,12 +443,16 @@ fn extract_expected_and_got(bytes: &[u8]) -> (usize, usize) {
 ///
 /// Returns a deserialized Clarity `Value` representing the short return value.
 ///
-fn short_return_value(
+fn short_return_value<S>(
     instance: &Instance,
-    store: &mut impl AsContextMut,
+    store: &mut S,
     epoch_id: &StacksEpochId,
     clarity_version: &ClarityVersion,
-) -> Value {
+) -> Value
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     let val_offset = get_global_i32(instance, store, "runtime-error-value-offset");
     let type_ser_offset = get_global_i32(instance, store, "runtime-error-type-ser-offset");
     let type_ser_len = get_global_i32(instance, store, "runtime-error-type-ser-len");

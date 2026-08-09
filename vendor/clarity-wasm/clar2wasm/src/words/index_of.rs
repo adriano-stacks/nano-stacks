@@ -107,11 +107,17 @@ impl ComplexWord for IndexOf {
         let offset = generator.module.locals.add(ValType::I32);
         let end_offset = generator.module.locals.add(ValType::I32);
 
+        builder.local_set(seq_size).local_set(offset);
+        if matches!(
+            generator.get_expr_type(seq),
+            Some(TypeSignature::SequenceType(
+                clarity::vm::types::SequenceSubtype::ListType(_)
+            ))
+        ) {
+            builder.drop();
+        }
         builder
-            .local_set(seq_size)
-            // STACK: [offset]
-            .local_tee(offset)
-            // STACK: [offset]
+            .local_get(offset)
             .local_get(seq_size)
             // STACK: [offset, size]
             .binop(BinaryOp::I32Add)

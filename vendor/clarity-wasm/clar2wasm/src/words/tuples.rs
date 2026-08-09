@@ -103,6 +103,7 @@ impl ComplexWord for TupleCons {
 
         // Finally load the locals onto the stack
         let locals: Vec<_> = locals_map.into_values().flatten().collect();
+        builder.i32_const(0);
         for local in &locals {
             builder.local_get(*local);
         }
@@ -187,6 +188,9 @@ impl ComplexWord for TupleGet {
                 drop_value(builder, field_ty);
             }
         }
+        // Drop the tuple's root runtime-shape handle. The extracted field's
+        // own handle, if composite, remains part of that field's slots.
+        builder.drop();
 
         // Load the target field from the locals we created above.
         for local in val_locals.iter().rev() {
@@ -325,6 +329,7 @@ impl ComplexWord for TupleMerge {
                 drop_value(builder, ty_);
             }
         }
+        builder.drop();
 
         // Traverse the RHS tuple argument, leaving it on top of the stack.
         generator.traverse_expr(builder, &args[1])?;
@@ -358,8 +363,10 @@ impl ComplexWord for TupleMerge {
                     builder.local_set(*local);
                 });
         }
+        builder.drop();
 
         // Now we load the result locals onto the stack
+        builder.i32_const(0);
         result_locals.into_values().flatten().for_each(|local| {
             builder.local_get(local);
         });

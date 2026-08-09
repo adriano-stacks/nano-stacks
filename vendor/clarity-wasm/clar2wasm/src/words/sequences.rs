@@ -101,7 +101,10 @@ impl ComplexWord for ListCons {
         }
 
         // Push the offset and size to the data stack
-        builder.local_get(offset).i32_const(total_size as i32);
+        builder
+            .i32_const(0)
+            .local_get(offset)
+            .i32_const(total_size as i32);
 
         Ok(())
     }
@@ -220,18 +223,21 @@ impl ComplexWord for Fold {
         // Evaluate the sequence, which will load it into the call stack,
         // leaving the offset and size on the data stack.
         generator.traverse_expr(builder, sequence)?;
-        // STACK: [offset, length]
+        // STACK: [shape?, offset, length]
 
         let length = generator.borrow_local(ValType::I32);
         let offset = generator.borrow_local(ValType::I32);
         let end_offset = generator.borrow_local(ValType::I32);
 
         // Store the length and offset into locals.
-        builder.local_set(*length).local_tee(*offset);
-        // STACK: [offset]
+        builder.local_set(*length).local_set(*offset);
+        if matches!(elem_ty, SequenceElementType::Other(_)) {
+            builder.drop();
+        }
 
         // Compute the ending offset of the sequence.
         builder
+            .local_get(*offset)
             .local_get(*length)
             .binop(BinaryOp::I32Add)
             .local_set(*end_offset);
@@ -442,7 +448,7 @@ impl ComplexWord for Append {
         let (write_ptr, _) = generator.create_call_stack_local(builder, &ty, false, true);
 
         // Push the offset and length of this list to the stack to be returned.
-        builder.local_get(write_ptr);
+        builder.i32_const(0).local_get(write_ptr);
 
         // Push the write pointer onto the stack for `memory.copy`.
         builder.local_get(write_ptr);
@@ -451,11 +457,16 @@ impl ComplexWord for Append {
         // top of the stack.
         generator.traverse_expr(builder, list)?;
 
-        // The stack now has the destination, source and length arguments in
-        // right order for `memory.copy` to copy the source list into the new
-        // list. Save a copy of the length for later.
+        // Keep the runtime-shape handle out of memory.copy's arguments. Append
+        // derives a new list shape, so the result starts with handle zero.
         let src_length = generator.module.locals.add(ValType::I32);
-        builder.local_tee(src_length);
+        let src_offset = generator.module.locals.add(ValType::I32);
+        builder
+            .local_set(src_length)
+            .local_set(src_offset)
+            .drop()
+            .local_get(src_offset)
+            .local_get(src_length);
 
         // Increment the write pointer by the length of the source list.
         builder
@@ -546,6 +557,10 @@ impl ComplexWord for AsMaxLen {
         // Traverse the input list, leaving the offset and length on top of
         // the stack.
         let seq = args.get_expr(0)?;
+        let is_list = matches!(
+            generator.get_expr_type(seq),
+            Some(TypeSignature::SequenceType(SequenceSubtype::ListType(_)))
+        );
         generator.traverse_expr(builder, seq)?;
 
         // Save the offset and length to locals for later. Leave the length on
@@ -554,6 +569,9 @@ impl ComplexWord for AsMaxLen {
         builder.local_set(length_local);
         let offset_local = generator.module.locals.add(ValType::I32);
         builder.local_set(offset_local);
+        if is_list {
+            builder.drop();
+        }
         builder.local_get(length_local);
 
         self.charge(generator, builder, 0)?;
@@ -621,6 +639,9 @@ impl ComplexWord for AsMaxLen {
         // Now, put the original offset and length back on the stack. In the
         // case where the result is `none`, these will be ignored, but it
         // doesn't hurt to have them there.
+        if is_list {
+            builder.i32_const(0);
+        }
         builder.local_get(offset_local).local_get(length_local);
 
         Ok(())
@@ -660,6 +681,10 @@ impl ComplexWord for Concat {
             .ok_or_else(|| GeneratorError::TypeError("concat expression must be typed".to_owned()))?
             .clone();
         let (offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
+        let is_list = matches!(
+            &ty,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+        );
 
         let length = generator.module.locals.add(ValType::I32);
         builder.i32_const(0).local_set(length);
@@ -672,6 +697,9 @@ impl ComplexWord for Concat {
             let arg_length = generator.module.locals.add(ValType::I32);
             let arg_offset = generator.module.locals.add(ValType::I32);
             builder.local_set(arg_length).local_set(arg_offset);
+            if is_list {
+                builder.drop();
+            }
 
             builder
                 .local_get(offset)
@@ -688,6 +716,9 @@ impl ComplexWord for Concat {
                 .local_set(length);
         }
 
+        if is_list {
+            builder.i32_const(0);
+        }
         builder.local_get(offset).local_get(length);
 
         // we charge after the operation since that's the only time we have the
@@ -813,6 +844,9 @@ impl ComplexWord for Map {
 
                 generator.traverse_expr(builder, arg)?;
                 builder.local_set(*length).local_set(*offset);
+                if matches!(&element_type, SequenceElementType::Other(_)) {
+                    builder.drop();
+                }
 
                 Ok(MapArg {
                     element_type,
@@ -1120,7 +1154,10 @@ impl ComplexWord for Map {
         );
 
         // we finally return the (offset, length) of the result list
-        builder.local_get(result_offset).local_get(*result_length);
+        builder
+            .i32_const(0)
+            .local_get(result_offset)
+            .local_get(*result_length);
 
         Ok(())
     }
@@ -1149,14 +1186,19 @@ impl ComplexWord for Len {
 
         // Traverse the sequence, leaving the offset and length on the stack.
         let seq = args.get_expr(0)?;
+        let is_list = matches!(
+            generator.get_expr_type(seq),
+            Some(TypeSignature::SequenceType(SequenceSubtype::ListType(_)))
+        );
         generator.traverse_expr(builder, seq)?;
 
         // Save the length, then drop the offset and push the length back.
         let length_local = generator.module.locals.add(ValType::I32);
-        builder
-            .local_set(length_local)
-            .drop()
-            .local_get(length_local);
+        builder.local_set(length_local).drop();
+        if is_list {
+            builder.drop();
+        }
+        builder.local_get(length_local);
 
         // Get the length
         generator
@@ -1239,6 +1281,20 @@ impl ComplexWord for ElementAt {
         // Traverse the sequence, leaving the offset and length on the stack.
         let seq = args.get_expr(0)?;
         generator.traverse_expr(builder, seq)?;
+
+        if matches!(
+            generator.get_expr_type(seq),
+            Some(TypeSignature::SequenceType(SequenceSubtype::ListType(_)))
+        ) {
+            let length = generator.borrow_local(ValType::I32);
+            let offset = generator.borrow_local(ValType::I32);
+            builder
+                .local_set(*length)
+                .local_set(*offset)
+                .drop()
+                .local_get(*offset)
+                .local_get(*length);
+        }
 
         // Extend the length to 64-bits.
         builder.unop(UnaryOp::I64ExtendUI32);
@@ -1470,8 +1526,14 @@ impl ComplexWord for ReplaceAt {
         // Traverse the list, leaving the offset and length on top of the stack.
         generator.traverse_expr(builder, seq)?;
 
-        // Save actual list length to a local + keep it on the stack for the memcpy
-        builder.local_tee(length);
+        // Save actual list length and remove a list's runtime-shape handle from
+        // the memcpy arguments.
+        let source_offset = generator.module.locals.add(ValType::I32);
+        builder.local_set(length).local_set(source_offset);
+        if matches!(&element_ty, SequenceElementType::Other(_)) {
+            builder.drop();
+        }
+        builder.local_get(source_offset).local_get(length);
 
         // At this point, we can compute the cost of the function call using the number of elements in the list
         builder.local_get(length);
@@ -1653,7 +1715,11 @@ impl ComplexWord for ReplaceAt {
         }
 
         // Push the `none` indicator and placeholders for offset/length
-        then.i32_const(0).i32_const(0).i32_const(0);
+        then.i32_const(0);
+        if matches!(&element_ty, SequenceElementType::Other(_)) {
+            then.i32_const(0);
+        }
+        then.i32_const(0).i32_const(0);
 
         let mut else_ = builder.dangling_instr_seq(branch_ty);
         let else_id = else_.id();
@@ -1718,7 +1784,11 @@ impl ComplexWord for ReplaceAt {
         }
 
         // Push the `some` indicator with destination offset/length.
-        else_.i32_const(1).local_get(dest_offset).local_get(length);
+        else_.i32_const(1);
+        if matches!(&element_ty, SequenceElementType::Other(_)) {
+            else_.i32_const(0);
+        }
+        else_.local_get(dest_offset).local_get(length);
 
         builder.instr(IfElse {
             consequent: then_id,
@@ -1757,6 +1827,21 @@ impl ComplexWord for Slice {
 
         // Traverse the sequence, leaving the offset and length on the stack.
         generator.traverse_expr(builder, seq)?;
+
+        let is_list = matches!(
+            generator.get_expr_type(seq),
+            Some(TypeSignature::SequenceType(SequenceSubtype::ListType(_)))
+        );
+        if is_list {
+            let length = generator.borrow_local(ValType::I32);
+            let offset = generator.borrow_local(ValType::I32);
+            builder
+                .local_set(*length)
+                .local_set(*offset)
+                .drop()
+                .local_get(*offset)
+                .local_get(*length);
+        }
 
         // Extend the sequence length to 64-bits.
         builder.unop(UnaryOp::I64ExtendUI32);
@@ -1986,6 +2071,10 @@ impl ComplexWord for Slice {
         // `(some sequence)`, where `sequence` is the slice of the input
         // sequence with offset left and length right - left.
         builder.select(Some(ValType::I32));
+
+        if is_list {
+            builder.i32_const(0);
+        }
 
         // Now push the offset (`local_left`) and length
         // (`local_right - local_left`). If the result is `none`, then these

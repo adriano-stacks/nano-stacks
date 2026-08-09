@@ -1,4 +1,4 @@
-use clarity::vm::types::{FixedFunction, FunctionType, TypeSignature};
+use clarity::vm::types::{FixedFunction, FunctionType, SequenceSubtype, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::{self, Block, IfElse, Loop, UnaryOp};
 use walrus::{InstrSeqBuilder, LocalId, ValType};
@@ -623,6 +623,10 @@ impl ComplexWord for Filter {
             .clone();
 
         let elem_ty = generator.get_sequence_element_type(sequence)?;
+        let is_list = matches!(
+            &ty,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+        );
 
         // Setup neccesary locals for the operations.
         let input_len = generator.module.locals.add(ValType::I32);
@@ -631,6 +635,9 @@ impl ComplexWord for Filter {
 
         // save list (offset, length) to locals
         builder.local_set(input_len).local_set(input_offset);
+        if is_list {
+            builder.drop();
+        }
 
         // reserve space for the output list
         let (output_offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
@@ -729,6 +736,9 @@ impl ComplexWord for Filter {
 
         builder.instr(Loop { seq: loop_id });
 
+        if is_list {
+            builder.i32_const(0);
+        }
         builder.local_get(output_offset);
         builder.local_get(output_len);
 

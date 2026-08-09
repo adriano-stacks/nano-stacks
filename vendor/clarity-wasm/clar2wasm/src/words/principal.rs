@@ -169,6 +169,7 @@ fn generate_tuple(
     principal_offset: LocalId,
     length: LocalId,
 ) {
+    builder.i32_const(0);
     // Push the hash-bytes offset
     builder
         .local_get(principal_offset)

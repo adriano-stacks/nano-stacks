@@ -8,6 +8,12 @@ use crate::wasm_generator::{
 };
 use crate::wasm_utils::get_type_in_memory_size;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RuntimeShapeMode {
+    Sanitize,
+    Preserve,
+}
+
 impl WasmGenerator {
     /// Converts the representation of a Value on top of the stack from a type to another type. The Value keeps the
     /// same value in the end, only its representation in locals and memory differs.
@@ -27,6 +33,39 @@ impl WasmGenerator {
         target_ty: &TypeSignature,
         preallocated_memory: Option<LocalId>,
     ) -> Result<(), GeneratorError> {
+        self.duck_type_with_shape(
+            builder,
+            og_ty,
+            target_ty,
+            preallocated_memory,
+            RuntimeShapeMode::Sanitize,
+        )
+    }
+
+    pub(crate) fn duck_type_preserve(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        og_ty: &TypeSignature,
+        target_ty: &TypeSignature,
+        preallocated_memory: Option<LocalId>,
+    ) -> Result<(), GeneratorError> {
+        self.duck_type_with_shape(
+            builder,
+            og_ty,
+            target_ty,
+            preallocated_memory,
+            RuntimeShapeMode::Preserve,
+        )
+    }
+
+    fn duck_type_with_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        og_ty: &TypeSignature,
+        target_ty: &TypeSignature,
+        preallocated_memory: Option<LocalId>,
+        shape_mode: RuntimeShapeMode,
+    ) -> Result<(), GeneratorError> {
         // This is a no-op if both types are identical
         if !need_ducktyping(og_ty, target_ty) {
             return Ok(());
@@ -40,7 +79,14 @@ impl WasmGenerator {
         });
 
         let locals = self.create_locals_for_ty(target_ty);
-        self.duck_type_stack(builder, og_ty, target_ty, &locals, memory_pointer)?;
+        self.duck_type_stack(
+            builder,
+            og_ty,
+            target_ty,
+            &locals,
+            memory_pointer,
+            shape_mode,
+        )?;
         for l in locals {
             builder.local_get(l);
         }
@@ -55,6 +101,7 @@ impl WasmGenerator {
         target_ty: &TypeSignature,
         locals: &[LocalId],
         allocated_mem_offset: LocalId,
+        shape_mode: RuntimeShapeMode,
     ) -> Result<(), GeneratorError> {
         if is_principal_like(og_ty) && is_principal_like(target_ty) {
             for &local in locals.iter().rev() {
@@ -105,6 +152,7 @@ impl WasmGenerator {
                     target_subty,
                     sub_locals,
                     allocated_mem_offset,
+                    shape_mode,
                 )?;
                 builder.local_set(*variant_local);
             }
@@ -131,6 +179,7 @@ impl WasmGenerator {
                     target_err_ty,
                     err_locals,
                     allocated_mem_offset,
+                    shape_mode,
                 )?;
                 self.duck_type_stack(
                     builder,
@@ -138,10 +187,20 @@ impl WasmGenerator {
                     target_ok_ty,
                     ok_locals,
                     allocated_mem_offset,
+                    shape_mode,
                 )?;
                 builder.local_set(*variant_local);
             }
             (TypeSignature::TupleType(og_tup_ty), TypeSignature::TupleType(target_tup_ty)) => {
+                if shape_mode == RuntimeShapeMode::Preserve {
+                    self.capture_runtime_shape(builder, og_ty)?;
+                }
+                let (target_handle, target_field_locals) =
+                    locals.split_first().ok_or_else(|| {
+                        GeneratorError::InternalError(
+                            "Not enough locals for duck-typing a tuple".to_owned(),
+                        )
+                    })?;
                 // A tuple's slots are its fields' slots concatenated in ascending
                 // field-name order, so the last field is on top of the stack and owns
                 // the tail of `locals`: both are consumed from the end. Walking the
@@ -149,7 +208,7 @@ impl WasmGenerator {
                 // names in the same descending order the target locals come off in.
                 // A source field the target does not have is dropped, not converted.
                 let target_map = target_tup_ty.get_type_map();
-                let mut remaining_locals = locals;
+                let mut remaining_locals = target_field_locals;
                 for (name, og_subty) in og_tup_ty.get_type_map().iter().rev() {
                     let Some(target_subty) = target_map.get(name) else {
                         drop_value(builder, og_subty);
@@ -171,6 +230,7 @@ impl WasmGenerator {
                         target_subty,
                         current_locals,
                         allocated_mem_offset,
+                        shape_mode,
                     )?;
                 }
                 if !remaining_locals.is_empty() {
@@ -178,26 +238,37 @@ impl WasmGenerator {
                         "Duck typing cannot invent tuple fields:\n\t{og_ty:?}\n\t{target_ty:?}"
                     )));
                 }
+                if shape_mode == RuntimeShapeMode::Preserve {
+                    builder.local_set(*target_handle);
+                } else {
+                    builder.drop().i32_const(0).local_set(*target_handle);
+                }
             }
             (
                 TypeSignature::SequenceType(SequenceSubtype::ListType(og_ltd)),
                 TypeSignature::SequenceType(SequenceSubtype::ListType(target_ltd)),
             ) => {
+                if shape_mode == RuntimeShapeMode::Preserve {
+                    self.capture_runtime_shape(builder, og_ty)?;
+                }
                 let og_elem_ty = og_ltd.get_list_item_type();
                 let target_elem_ty = target_ltd.get_list_item_type();
 
                 // Set list length and offset to locals, and reserve some working space to store the target elements
-                let [offset, length] = locals else {
+                let [target_handle, offset, length] = locals else {
                     return Err(GeneratorError::InternalError(
-                        "List duck typing should use only two locals".to_owned(),
+                        "List duck typing should use three locals".to_owned(),
                     ));
                 };
+                let source_handle = self.borrow_local(ValType::I32);
 
                 let offset_target = self.module.locals.add(ValType::I32);
                 let length_target = self.module.locals.add(ValType::I32);
 
-                builder.local_set(*length);
-                builder.local_set(*offset);
+                builder
+                    .local_set(*length)
+                    .local_set(*offset)
+                    .local_set(*source_handle);
 
                 // Create locals for the element target repr.
                 let target_locs = self.create_locals_for_ty(target_elem_ty);
@@ -214,6 +285,7 @@ impl WasmGenerator {
                         target_elem_ty,
                         &target_locs,
                         allocated_mem_offset,
+                        shape_mode,
                     )?;
                     for l in target_locs.iter() {
                         loop_.local_get(*l);
@@ -270,6 +342,11 @@ impl WasmGenerator {
                     },
                     |_else| {},
                 );
+                if shape_mode == RuntimeShapeMode::Preserve {
+                    builder.local_get(*source_handle).local_set(*target_handle);
+                } else {
+                    builder.i32_const(0).local_set(*target_handle);
+                }
             }
             _ => {
                 return Err(GeneratorError::TypeError(format!(

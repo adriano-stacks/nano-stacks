@@ -18,6 +18,7 @@ use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
 use crate::error_mapping;
 use crate::linker::{link_cost_globals, link_host_functions};
+use crate::runtime_shape::{RuntimeShapeArena, RuntimeShapeStore};
 use crate::wasm_generator::{uses_packed_abi, uses_packed_value};
 use crate::wasm_utils::*;
 use crate::{CompiledContract, ModuleCache};
@@ -43,6 +44,7 @@ pub struct ClarityWasmContext<'a, 'b, 'hooks> {
     pub contract_analysis: Option<&'a ContractAnalysis>,
     pub cost_globals: Option<CostGlobals>,
     pub module_cache: &'a ModuleCache,
+    runtime_shapes: RuntimeShapeArena,
 }
 
 impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
@@ -72,6 +74,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             contract_analysis,
             cost_globals,
             module_cache,
+            runtime_shapes: RuntimeShapeArena::default(),
         }
     }
 
@@ -100,6 +103,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             contract_analysis,
             cost_globals: None,
             module_cache,
+            runtime_shapes: RuntimeShapeArena::default(),
         }
     }
 
@@ -355,6 +359,16 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
 
         self.push_to_event_batch(event);
         Ok(())
+    }
+}
+
+impl RuntimeShapeStore for ClarityWasmContext<'_, '_, '_> {
+    fn runtime_shapes(&self) -> Option<&RuntimeShapeArena> {
+        Some(&self.runtime_shapes)
+    }
+
+    fn runtime_shapes_mut(&mut self) -> Option<&mut RuntimeShapeArena> {
+        Some(&mut self.runtime_shapes)
     }
 }
 

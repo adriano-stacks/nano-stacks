@@ -110,6 +110,7 @@ impl WasmGenerator {
                         "Mismatched value/type".to_owned(),
                     ));
                 };
+                builder.i32_const(0);
                 for (elem, elem_ty) in tuple
                     .data_map
                     .values()
@@ -146,6 +147,7 @@ impl WasmGenerator {
 
                 // the offset is already on the stack
                 builder
+                    .i32_const(0)
                     .global_get(self.stack_pointer)
                     .i32_const(length as i32);
 

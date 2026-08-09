@@ -509,7 +509,7 @@ fn wasm_equal_tuple(
 
     // if this is a 1-tuple, we can just check for equality of element
     if let &[ty] = tuple_inner_ty.as_slice() {
-        return wasm_equal(ty, generator, builder, first_op, nth_op);
+        return wasm_equal(ty, generator, builder, &first_op[1..], &nth_op[1..]);
     }
 
     // we'll compare tuple lazily field by field, so that
@@ -529,8 +529,8 @@ fn wasm_equal_tuple(
         let block_id = block.id();
 
         // we will check for the equality of each element, and exit the block if one is unequal
-        let mut first_op_rest = first_op;
-        let mut nth_op_rest = nth_op;
+        let mut first_op_rest = &first_op[1..];
+        let mut nth_op_rest = &nth_op[1..];
         for ty in tuple_inner_ty {
             let size = clar2wasm_ty(ty).len();
 
@@ -574,14 +574,14 @@ fn wasm_equal_list(
     nth_op: &[LocalId],
     list_ty: &TypeSignature,
 ) -> Result<(), GeneratorError> {
-    let [offset_a, len_a] = first_op else {
+    let [_shape_a, offset_a, len_a] = first_op else {
         return Err(GeneratorError::InternalError(
-            "List type should have two i32 locals: offset and length".to_string(),
+            "List type should have shape, offset and length locals".to_string(),
         ));
     };
-    let [offset_b, len_b] = nth_op else {
+    let [_shape_b, offset_b, len_b] = nth_op else {
         return Err(GeneratorError::InternalError(
-            "List type should have two i32 locals: offset and length".to_string(),
+            "List type should have shape, offset and length locals".to_string(),
         ));
     };
 

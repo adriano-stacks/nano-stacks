@@ -16,7 +16,24 @@ use wasmtime::{AsContextMut, Memory, Val, ValType};
 
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
+use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
+
+fn load_runtime_shape<S>(store: &mut S, handle: i32) -> Result<Value, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
+    store.as_context_mut().data().load_runtime_shape(handle)
+}
+
+fn save_runtime_shape<S>(store: &mut S, value: Value) -> Result<i32, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
+    store.as_context_mut().data_mut().save_runtime_shape(value)
+}
 
 fn invalid_utf8_scalar_representation() -> VmExecutionError {
     crate::error::wasm_error(WasmError::WasmGeneratorError(
@@ -107,14 +124,18 @@ pub const PRINCIPAL_BYTES_MAX: usize = STANDARD_PRINCIPAL_BYTES + CONTRACT_NAME_
 /// - `store` is the Wasm store.
 ///
 /// Returns the Clarity `Value` and the number of Wasm `Val`s that were used.
-pub fn wasm_to_clarity_value(
+pub fn wasm_to_clarity_value<S>(
     type_sig: &TypeSignature,
     value_index: usize,
     buffer: &[Val],
     memory: Memory,
-    store: &mut impl AsContextMut,
+    store: &mut S,
     epoch: StacksEpochId,
-) -> Result<(Option<Value>, usize), VmExecutionError> {
+) -> Result<(Option<Value>, usize), VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     match type_sig {
         TypeSignature::IntType => {
             let lower = buffer[value_index]
@@ -259,15 +280,21 @@ pub fn wasm_to_clarity_value(
             Ok((Some(Value::buff_from(buff)?), 2))
         }
         TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
-            let offset = buffer[value_index]
+            let handle = buffer[value_index]
                 .i32()
                 .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-            let length = buffer[value_index + 1]
+            if handle != 0 {
+                return Ok((Some(load_runtime_shape(store, handle)?), 3));
+            }
+            let offset = buffer[value_index + 1]
+                .i32()
+                .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+            let length = buffer[value_index + 2]
                 .i32()
                 .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
 
             let value = read_from_wasm(memory, store, type_sig, offset, length, epoch)?;
-            Ok((Some(value), 2))
+            Ok((Some(value), 3))
         }
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
@@ -335,7 +362,16 @@ pub fn wasm_to_clarity_value(
             }
         }
         TypeSignature::TupleType(t) => {
-            let mut index = value_index;
+            let handle = buffer[value_index]
+                .i32()
+                .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+            if handle != 0 {
+                return Ok((
+                    Some(load_runtime_shape(store, handle)?),
+                    wasm_value_types(type_sig).len(),
+                ));
+            }
+            let mut index = value_index + 1;
             let mut data_map = Vec::new();
             for (name, ty) in t.get_type_map() {
                 let (value, increment) =
@@ -362,14 +398,30 @@ pub fn wasm_to_clarity_value(
 /// In-memory values require one extra level
 /// of indirection, so this function will read the offset and length from the
 /// memory, then read the actual value.
-pub fn read_from_wasm_indirect(
+pub fn read_from_wasm_indirect<S>(
     memory: Memory,
-    store: &mut impl AsContextMut,
+    store: &mut S,
     ty: &TypeSignature,
     mut offset: i32,
     epoch: StacksEpochId,
-) -> Result<Value, VmExecutionError> {
+) -> Result<Value, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     let mut length = get_type_size(ty);
+
+    if matches!(
+        ty,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+    ) {
+        let handle = read_i32(memory, store, offset)?;
+        if handle != 0 {
+            return load_runtime_shape(store, handle);
+        }
+        (offset, length) = read_indirect_offset_and_length(memory, store, offset + 4)?;
+        return read_from_wasm(memory, store, ty, offset, length, epoch);
+    }
 
     // For in-memory types, first read the offset and length from the memory,
     // then read the actual value.
@@ -382,14 +434,18 @@ pub fn read_from_wasm_indirect(
 
 /// Read a value from the Wasm memory at `offset` with `length`, given the
 /// provided Clarity `TypeSignature`.
-pub fn read_from_wasm(
+pub fn read_from_wasm<S>(
     memory: Memory,
-    store: &mut impl AsContextMut,
+    store: &mut S,
     ty: &TypeSignature,
     offset: i32,
     length: i32,
     epoch: StacksEpochId,
-) -> Result<Value, VmExecutionError> {
+) -> Result<Value, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     match ty {
         TypeSignature::UIntType => {
             debug_assert!(
@@ -533,8 +589,12 @@ pub fn read_from_wasm(
             Ok(Value::Bool(bool_val != 0))
         }
         TypeSignature::TupleType(type_sig) => {
+            let handle = read_i32(memory, store, offset)?;
+            if handle != 0 {
+                return load_runtime_shape(store, handle);
+            }
             let mut data = Vec::new();
-            let mut current_offset = offset;
+            let mut current_offset = offset + 4;
             for (field_key, field_ty) in type_sig.get_type_map() {
                 let field_length = get_type_size(field_ty);
                 let field_value =
@@ -621,21 +681,29 @@ pub fn read_from_wasm(
     }
 }
 
-pub fn read_indirect_offset_and_length(
+fn read_i32<S>(memory: Memory, store: &mut S, offset: i32) -> Result<i32, VmExecutionError>
+where
+    S: AsContextMut,
+{
+    let mut buffer = [0; 4];
+    memory
+        .read(store, offset as usize, &mut buffer)
+        .map_err(|e| crate::error::wasm_error(WasmError::Runtime(e.into())))?;
+    Ok(i32::from_le_bytes(buffer))
+}
+
+pub fn read_indirect_offset_and_length<S>(
     memory: Memory,
-    store: &mut impl AsContextMut,
+    store: &mut S,
     offset: i32,
-) -> Result<(i32, i32), VmExecutionError> {
-    let mut buffer: [u8; 4] = [0; 4];
-    memory
-        .read(store.as_context_mut(), offset as usize, &mut buffer)
-        .map_err(|e| crate::error::wasm_error(WasmError::Runtime(e.into())))?;
-    let indirect_offset = i32::from_le_bytes(buffer);
-    memory
-        .read(store.as_context_mut(), (offset + 4) as usize, &mut buffer)
-        .map_err(|e| crate::error::wasm_error(WasmError::Runtime(e.into())))?;
-    let length = i32::from_le_bytes(buffer);
-    Ok((indirect_offset, length))
+) -> Result<(i32, i32), VmExecutionError>
+where
+    S: AsContextMut,
+{
+    Ok((
+        read_i32(memory, store, offset)?,
+        read_i32(memory, store, offset + 4)?,
+    ))
 }
 
 /// Return the number of bytes required to representation of a value of the
@@ -647,6 +715,7 @@ pub fn get_type_size(ty: &TypeSignature) -> i32 {
     match ty {
         TypeSignature::IntType | TypeSignature::UIntType => 16, // low: i64, high: i64
         TypeSignature::BoolType => 4,                           // i32
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => 12,
         TypeSignature::PrincipalType
         | TypeSignature::SequenceType(_)
         | TypeSignature::CallableType(_)
@@ -654,7 +723,7 @@ pub fn get_type_size(ty: &TypeSignature) -> i32 {
         | TypeSignature::TraitReferenceType(_) => 8, // offset: i32, length: i32
         TypeSignature::OptionalType(inner) => 4 + get_type_size(inner), // indicator: i32, value: inner
         TypeSignature::TupleType(tuple_ty) => {
-            let mut size = 0;
+            let mut size = 4;
             for inner_type in tuple_ty.get_type_map().values() {
                 size += get_type_size(inner_type);
             }
@@ -695,7 +764,7 @@ pub fn get_type_in_memory_size(ty: &TypeSignature, include_repr: bool) -> i32 {
         TypeSignature::OptionalType(inner) => 4 + get_type_in_memory_size(inner, include_repr),
         TypeSignature::SequenceType(SequenceSubtype::ListType(list_data)) => {
             if include_repr {
-                8 // offset + length
+                12 // shape handle + offset + length
                  + list_data.get_max_len() as i32
                     * get_type_in_memory_size(list_data.get_list_item_type(), true)
             } else {
@@ -719,7 +788,7 @@ pub fn get_type_in_memory_size(ty: &TypeSignature, include_repr: bool) -> i32 {
         TypeSignature::NoType => 4,   // i32
         TypeSignature::BoolType => 4, // i32
         TypeSignature::TupleType(tuple_ty) => {
-            let mut size = 0;
+            let mut size = 4;
             for inner_type in tuple_ty.get_type_map().values() {
                 size += get_type_in_memory_size(inner_type, include_repr);
             }
@@ -753,15 +822,19 @@ pub fn placeholder_for_type(ty: ValType) -> Val {
 /// to the memory at `in_mem_offset`, and if `include_repr` is true, the offset
 /// and length of the value will be written to the memory at `offset`.
 /// Returns the number of bytes written at `offset` and at `in_mem_offset`.
-pub fn write_to_wasm(
-    mut store: impl AsContextMut,
+pub fn write_to_wasm<S>(
+    mut store: S,
     memory: Memory,
     ty: &TypeSignature,
     offset: i32,
     in_mem_offset: i32,
     value: &Value,
     include_repr: bool,
-) -> Result<(i32, i32), VmExecutionError> {
+) -> Result<(i32, i32), VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     match ty {
         TypeSignature::IntType => {
             let mut buffer: [u8; 8] = [0; 8];
@@ -883,6 +956,7 @@ pub fn write_to_wasm(
         TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
             let mut written = 0;
             let list_data = value_as_list(value)?;
+            let handle = save_runtime_shape(&mut store, value.clone())?;
             let elem_ty = list.get_list_item_type();
             // For a list, the values are written to the memory at
             // `in_mem_offset`, and the representation (offset and length) is
@@ -908,18 +982,22 @@ pub fn write_to_wasm(
             }
 
             if include_repr {
-                // Write the representation (offset and length) of the value to
-                // `offset`.
+                memory
+                    .write(&mut store, offset as usize, &handle.to_le_bytes())
+                    .map_err(|e| {
+                        crate::error::wasm_error(WasmError::UnableToWriteMemory(e.into()))
+                    })?;
+                written += 4;
                 let offset_buffer = in_mem_offset.to_le_bytes();
                 memory
-                    .write(&mut store, (offset) as usize, &offset_buffer)
+                    .write(&mut store, (offset + written) as usize, &offset_buffer)
                     .map_err(|e| {
                         crate::error::wasm_error(WasmError::UnableToWriteMemory(e.into()))
                     })?;
                 written += 4;
                 let len_buffer = val_written.to_le_bytes();
                 memory
-                    .write(&mut store, (offset + 4) as usize, &len_buffer)
+                    .write(&mut store, (offset + written) as usize, &len_buffer)
                     .map_err(|e| {
                         crate::error::wasm_error(WasmError::UnableToWriteMemory(e.into()))
                     })?;
@@ -1111,7 +1189,11 @@ pub fn write_to_wasm(
         }
         TypeSignature::TupleType(type_sig) => {
             let tuple_data = value_as_tuple(value)?;
-            let mut written = 0;
+            let handle = save_runtime_shape(&mut store, value.clone())?;
+            memory
+                .write(&mut store, offset as usize, &handle.to_le_bytes())
+                .map_err(|e| crate::error::wasm_error(WasmError::UnableToWriteMemory(e.into())))?;
+            let mut written = 4;
             let mut in_mem_written = 0;
 
             for (key, val_type) in type_sig.get_type_map() {
@@ -1137,13 +1219,17 @@ pub fn write_to_wasm(
     }
 }
 
-pub fn pass_argument_to_wasm(
+pub fn pass_argument_to_wasm<S>(
     memory: Memory,
-    mut store: impl AsContextMut,
+    mut store: S,
     ty: &TypeSignature,
     value: &Value,
     offset: i32,
-) -> Result<(Vec<Val>, i32), VmExecutionError> {
+) -> Result<(Vec<Val>, i32), VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
     match value {
         Value::UInt(value) => Ok((
             vec![
@@ -1255,8 +1341,9 @@ pub fn pass_argument_to_wasm(
                 written += length;
                 in_memory_written += in_memory_length;
             }
+            let handle = save_runtime_shape(&mut store, value.clone())?;
             Ok((
-                vec![Val::I32(offset), Val::I32(written)],
+                vec![Val::I32(handle), Val::I32(offset), Val::I32(written)],
                 in_memory + in_memory_written,
             ))
         }
@@ -1297,7 +1384,7 @@ pub fn pass_argument_to_wasm(
             let TypeSignature::TupleType(tuple) = ty else {
                 return Err(crate::error::wasm_error(WasmError::ValueTypeMismatch));
             };
-            let mut result = Vec::new();
+            let mut result = vec![Val::I32(save_runtime_shape(&mut store, value.clone())?)];
             let mut next = offset;
             for (name, ty) in tuple.get_type_map() {
                 let value = values
@@ -1452,6 +1539,11 @@ pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
             types.extend(wasm_value_types(&inner_types.1));
             types
         }
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => vec![
+            ValType::I32, // runtime-shape handle
+            ValType::I32, // offset
+            ValType::I32, // length
+        ],
         TypeSignature::SequenceType(_) => vec![
             ValType::I32, // offset
             ValType::I32, // length
@@ -1469,7 +1561,7 @@ pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
             types
         }
         TypeSignature::TupleType(inner_types) => {
-            let mut types = vec![];
+            let mut types = vec![ValType::I32];
             for inner_type in inner_types.get_type_map().values() {
                 types.extend(wasm_value_types(inner_type));
             }

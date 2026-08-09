@@ -42,6 +42,7 @@ use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
 use crate::initialize::{call_function, ClarityWasmContext};
+use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_utils::*;
 
 fn pubkey_to_address_v1(public_key: Secp256k1PublicKey) -> Result<StacksAddress, VmExecutionError> {
@@ -267,6 +268,7 @@ fn link_global<T>(
 pub fn link_host_functions(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
+    link_save_runtime_shape_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
     link_define_ft_fn(linker)?;
@@ -373,6 +375,45 @@ pub fn link_host_functions(
     link_debug_msg(linker)
 }
 
+fn link_save_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "save_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             value_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let serialized_ty = read_identifier_from_wasm(
+                    memory,
+                    &mut caller,
+                    serialized_ty_offset,
+                    serialized_ty_length,
+                )?;
+                let epoch = caller.data().global_context.epoch_id;
+                let version = caller.data().contract_context().get_clarity_version();
+                let value_ty = signature_from_string(&serialized_ty, *version, epoch)?;
+                let value =
+                    read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
+                let handle = caller.data_mut().save_runtime_shape(value)?;
+                Ok(handle)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "save_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
 /// Link host interface function, `define_variable`, into the Wasm module.
 /// This function is called for all variable definitions (`define-data-var`).
 fn link_define_variable_fn(
@@ -385,8 +426,8 @@ fn link_define_variable_fn(
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut value_offset: i32,
-             mut value_length: i32| {
+             value_offset: i32,
+             _value_length: i32| {
                 // Get the memory from the caller
                 let memory = caller
                     .get_export("memory")
@@ -415,18 +456,8 @@ fn link_define_variable_fn(
                 let contract = caller.data().contract_context().contract_identifier.clone();
 
                 // Read the initial value from the memory
-                if is_in_memory_type(&value_type) {
-                    (value_offset, value_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, value_offset)?;
-                }
-                let value = read_from_wasm(
-                    memory,
-                    &mut caller,
-                    &value_type,
-                    value_offset,
-                    value_length,
-                    epoch,
-                )?;
+                let value =
+                    read_from_wasm_indirect(memory, &mut caller, &value_type, value_offset, epoch)?;
 
                 caller
                     .data_mut()
@@ -984,8 +1015,8 @@ fn link_set_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut value_offset: i32,
-             mut value_length: i32| {
+             value_offset: i32,
+             _value_length: i32| {
                 // Get the memory from the caller
                 let memory = caller
                     .get_export("memory")
@@ -1012,16 +1043,11 @@ fn link_set_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     .clone();
 
                 // Read in the value from the Wasm memory
-                if is_in_memory_type(&data_types.value_type) {
-                    (value_offset, value_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, value_offset)?;
-                }
-                let value = read_from_wasm(
+                let value = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.value_type,
                     value_offset,
-                    value_length,
                     epoch,
                 )?;
 
@@ -1960,6 +1986,7 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              contract_id_length: i32,
              token_name_offset: i32,
              token_name_length: i32,
+             identifiers_shape: i32,
              identifiers_offset: i32,
              identifiers_length: i32,
              identifiers_ty_offset: i32,
@@ -2024,16 +2051,21 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                     epoch,
                 )?;
 
-                // `read_from_wasm` rather than `read_identifier_from_wasm`:
-                // this is a typed list of NFT key values, not a string.
-                let identifiers_value = read_from_wasm(
-                    memory,
-                    &mut caller,
-                    &identifiers_ty,
-                    identifiers_offset,
-                    identifiers_length,
-                    epoch,
-                )?;
+                // This is a typed list of NFT key values, not a string. A
+                // nonzero shape handle is authoritative when the list crossed
+                // a preserving run-time-shape boundary.
+                let identifiers_value = if identifiers_shape == 0 {
+                    read_from_wasm(
+                        memory,
+                        &mut caller,
+                        &identifiers_ty,
+                        identifiers_offset,
+                        identifiers_length,
+                        epoch,
+                    )?
+                } else {
+                    caller.data().load_runtime_shape(identifiers_shape)?
+                };
                 let allowed_identifiers = identifiers_value.expect_list()?;
 
                 let asset_identifier = AssetIdentifier {
@@ -2270,6 +2302,7 @@ fn link_stx_account_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
 
                 // Return value is a tuple: `{locked: uint, unlock-height: uint, unlocked: uint}`
                 Ok((
+                    0i32,
                     locked_low,
                     locked_high,
                     unlock_height as i64,
@@ -3066,8 +3099,8 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut asset_offset: i32,
-             mut asset_length: i32,
+             asset_offset: i32,
+             _asset_length: i32,
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
@@ -3099,16 +3132,11 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                 let expected_asset_type = &nft_metadata.key_type;
 
                 // Read in the NFT identifier from the Wasm memory
-                if is_in_memory_type(expected_asset_type) {
-                    (asset_offset, asset_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, asset_offset)?;
-                }
-                let asset = read_from_wasm(
+                let asset = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     expected_asset_type,
                     asset_offset,
-                    asset_length,
                     epoch,
                 )?;
 
@@ -3171,8 +3199,8 @@ fn link_nft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut asset_offset: i32,
-             mut asset_length: i32,
+             asset_offset: i32,
+             _asset_length: i32,
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
@@ -3205,16 +3233,11 @@ fn link_nft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 let expected_asset_type = &nft_metadata.key_type;
 
                 // Read in the NFT identifier from the Wasm memory
-                if is_in_memory_type(expected_asset_type) {
-                    (asset_offset, asset_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, asset_offset)?;
-                }
-                let asset = read_from_wasm(
+                let asset = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     expected_asset_type,
                     asset_offset,
-                    asset_length,
                     epoch,
                 )?;
 
@@ -3313,8 +3336,8 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut asset_offset: i32,
-             mut asset_length: i32,
+             asset_offset: i32,
+             _asset_length: i32,
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
@@ -3347,16 +3370,11 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 let expected_asset_type = &nft_metadata.key_type;
 
                 // Read in the NFT identifier from the Wasm memory
-                if is_in_memory_type(expected_asset_type) {
-                    (asset_offset, asset_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, asset_offset)?;
-                }
-                let asset = read_from_wasm(
+                let asset = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     expected_asset_type,
                     asset_offset,
-                    asset_length,
                     epoch,
                 )?;
 
@@ -3445,8 +3463,8 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut asset_offset: i32,
-             mut asset_length: i32,
+             asset_offset: i32,
+             _asset_length: i32,
              sender_offset: i32,
              sender_length: i32,
              recipient_offset: i32,
@@ -3481,16 +3499,11 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                 let expected_asset_type = &nft_metadata.key_type;
 
                 // Read in the NFT identifier from the Wasm memory
-                if is_in_memory_type(expected_asset_type) {
-                    (asset_offset, asset_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, asset_offset)?;
-                }
-                let asset = read_from_wasm(
+                let asset = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     expected_asset_type,
                     asset_offset,
-                    asset_length,
                     epoch,
                 )?;
 
@@ -3623,8 +3636,8 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut key_offset: i32,
-             mut key_length: i32,
+             key_offset: i32,
+             _key_length: i32,
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
@@ -3652,16 +3665,11 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     .clone();
 
                 // Read in the key from the Wasm memory
-                if is_in_memory_type(&data_types.key_type) {
-                    (key_offset, key_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, key_offset)?;
-                }
-                let key = read_from_wasm(
+                let key = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.key_type,
                     key_offset,
-                    key_length,
                     epoch,
                 )?;
 
@@ -3720,10 +3728,10 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut key_offset: i32,
-             mut key_length: i32,
-             mut value_offset: i32,
-             mut value_length: i32| {
+             key_offset: i32,
+             _key_length: i32,
+             value_offset: i32,
+             _value_length: i32| {
                 if caller.data().global_context.is_read_only() {
                     return Err(crate::error::wasm_error(WasmError::Expect(
                         "Tried to set in a read only context".into(),
@@ -3756,30 +3764,20 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     .clone();
 
                 // Read in the key from the Wasm memory
-                if is_in_memory_type(&data_types.key_type) {
-                    (key_offset, key_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, key_offset)?;
-                }
-                let key = read_from_wasm(
+                let key = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.key_type,
                     key_offset,
-                    key_length,
                     epoch,
                 )?;
 
                 // Read in the value from the Wasm memory
-                if is_in_memory_type(&data_types.value_type) {
-                    (value_offset, value_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, value_offset)?;
-                }
-                let value = read_from_wasm(
+                let value = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.value_type,
                     value_offset,
-                    value_length,
                     epoch,
                 )?;
 
@@ -3839,10 +3837,10 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut key_offset: i32,
-             mut key_length: i32,
-             mut value_offset: i32,
-             mut value_length: i32| {
+             key_offset: i32,
+             _key_length: i32,
+             value_offset: i32,
+             _value_length: i32| {
                 if caller.data().global_context.is_read_only() {
                     return Err(crate::error::wasm_error(WasmError::Expect(
                         "Tried to insert in read only cont".into(),
@@ -3875,30 +3873,20 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                     .clone();
 
                 // Read in the key from the Wasm memory
-                if is_in_memory_type(&data_types.key_type) {
-                    (key_offset, key_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, key_offset)?;
-                }
-                let key = read_from_wasm(
+                let key = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.key_type,
                     key_offset,
-                    key_length,
                     epoch,
                 )?;
 
                 // Read in the value from the Wasm memory
-                if is_in_memory_type(&data_types.value_type) {
-                    (value_offset, value_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, value_offset)?;
-                }
-                let value = read_from_wasm(
+                let value = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.value_type,
                     value_offset,
-                    value_length,
                     epoch,
                 )?;
 
@@ -3957,8 +3945,8 @@ fn link_map_delete_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             |mut caller: Caller<'_, ClarityWasmContext>,
              name_offset: i32,
              name_length: i32,
-             mut key_offset: i32,
-             mut key_length: i32| {
+             key_offset: i32,
+             _key_length: i32| {
                 if caller.data().global_context.is_read_only() {
                     return Err(crate::error::wasm_error(WasmError::Expect(
                         "Tried to delete in read only context".into(),
@@ -3990,16 +3978,11 @@ fn link_map_delete_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                     .clone();
 
                 // Read in the key from the Wasm memory
-                if is_in_memory_type(&data_types.key_type) {
-                    (key_offset, key_length) =
-                        read_indirect_offset_and_length(memory, &mut caller, key_offset)?;
-                }
-                let key = read_from_wasm(
+                let key = read_from_wasm_indirect(
                     memory,
                     &mut caller,
                     &data_types.key_type,
                     key_offset,
-                    key_length,
                     epoch,
                 )?;
 
@@ -7196,6 +7179,12 @@ fn link_debug_msg<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
 pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     let mut linker = Linker::new(engine);
 
+    linker.func_wrap(
+        "clarity",
+        "save_runtime_shape",
+        |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
     link_skip_list(&mut linker)?;
 
     // Link in the host interface functions.
@@ -7486,6 +7475,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
          _contract_id_length: i32,
          _token_name_offset: i32,
          _token_name_length: i32,
+         _identifiers_shape: i32,
          _identifiers_offset: i32,
          _identifiers_length: i32,
          _identifiers_ty_offset: i32,
@@ -7557,7 +7547,9 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "stx_account",
-        |_principal_offset: i32, _principal_length: i32| Ok((0i64, 0i64, 0i64, 0i64, 0i64, 0i64)),
+        |_principal_offset: i32, _principal_length: i32| {
+            Ok((0i32, 0i64, 0i64, 0i64, 0i64, 0i64, 0i64))
+        },
     )?;
 
     linker.func_wrap(
