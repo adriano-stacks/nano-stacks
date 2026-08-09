@@ -158,7 +158,9 @@ struct ContractRefusal {
 
 #[derive(Default)]
 struct ContractInventory {
+    metadata_rows: usize,
     named: usize,
+    current: usize,
     checked: usize,
     loaded: usize,
     maximum: nano_vm::ArityReport,
@@ -166,10 +168,15 @@ struct ContractInventory {
     maximum_live_locals: u32,
     maximum_live_local_sites: Vec<ContractLocalsPeak>,
     refused: BTreeMap<String, Vec<ContractRefusal>>,
+    stale_metadata: Vec<String>,
     unmeasured: BTreeMap<String, Vec<String>>,
 }
 
 impl ContractInventory {
+    fn note_unmeasured(&mut self, contract: String, reason: String) {
+        self.unmeasured.entry(reason).or_default().push(contract);
+    }
+
     fn note_arity(&mut self, contract: &str, report: nano_vm::ArityReport) {
         self.maximum.max_function_params = self
             .maximum
@@ -233,8 +240,9 @@ impl ContractInventory {
     }
 
     fn passes(&self) -> bool {
-        self.checked == self.named
-            && self.loaded == self.checked
+        self.current + self.stale_metadata.len() == self.named
+            && self.checked == self.current
+            && self.loaded == self.current
             && self.refused.is_empty()
             && self.unmeasured.is_empty()
     }
@@ -269,9 +277,7 @@ fn refusal_reason(error: &impl std::fmt::Debug) -> String {
         .split("contract analysis failed: ")
         .nth(1)
         .unwrap_or(&reason)
-        .chars()
-        .take(90)
-        .collect()
+        .to_owned()
 }
 
 fn chainstate_directory(state: &Path) -> PathBuf {
@@ -292,6 +298,116 @@ fn chainstate_directory(state: &Path) -> PathBuf {
     }
 }
 
+const CONTRACT_METADATA_QUERY: &str = "SELECT key, COUNT(*) FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis' \
+     GROUP BY key ORDER BY key";
+
+fn contract_metadata_candidates(database: &Path) -> Result<(usize, Vec<String>), String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        nano_marf::immutable_uri(database),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| format!("cannot open contract metadata: {error}"))?;
+    let mut statement = connection
+        .prepare(CONTRACT_METADATA_QUERY)
+        .map_err(|error| format!("cannot query contract metadata: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("cannot read contract metadata: {error}"))?;
+    let mut metadata_rows = 0_usize;
+    let mut contracts = Vec::new();
+    for row in rows {
+        let (key, occurrences) =
+            row.map_err(|error| format!("cannot read contract metadata: {error}"))?;
+        let occurrences = usize::try_from(occurrences)
+            .map_err(|_| format!("contract metadata count is invalid for {key}"))?;
+        metadata_rows = metadata_rows
+            .checked_add(occurrences)
+            .ok_or_else(|| "contract metadata row count overflowed".to_owned())?;
+        let contract = key
+            .strip_prefix("clr-meta::")
+            .and_then(|key| key.strip_suffix("::analysis"))
+            .ok_or_else(|| format!("contract metadata key has an unexpected shape: {key}"))?;
+        contracts.push(contract.to_owned());
+    }
+    Ok((metadata_rows, contracts))
+}
+
+fn inspect_contract_candidate(
+    vm: &mut nano_vm::Vm,
+    inventory: &mut ContractInventory,
+    contract: String,
+) {
+    let identifier = match clarity::vm::types::QualifiedContractIdentifier::parse(&contract) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            inventory.note_unmeasured(contract, format!("invalid contract identifier: {error}"));
+            return;
+        }
+    };
+    match vm.contract_presence(&identifier) {
+        Ok(nano_vm::ContractPresence::Present) => inventory.current += 1,
+        Ok(nano_vm::ContractPresence::Absent) => {
+            inventory.stale_metadata.push(contract);
+            return;
+        }
+        Err(error) => {
+            inventory.note_unmeasured(
+                contract,
+                format!("current-tip presence is unavailable: {error:?}"),
+            );
+            return;
+        }
+    }
+    let (source, version) = match vm.contract_source(&identifier) {
+        Ok(source) => source,
+        Err(error) => {
+            inventory.note_unmeasured(contract, format!("source is unavailable: {error:?}"));
+            return;
+        }
+    };
+    let epoch = match vm.recorded_deploy_epoch(&identifier) {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            inventory.note_unmeasured(contract, format!("deploy epoch is unavailable: {error:?}"));
+            return;
+        }
+    };
+    inventory.checked += 1;
+    match vm.inspect_module(&identifier, version, &source, epoch) {
+        Ok(inspected) => {
+            if !inventory.note_locals(&contract, &inspected.locals_report) {
+                inventory.note_unmeasured(
+                    contract.clone(),
+                    "compiler returned no live-locals measurement".to_owned(),
+                );
+            }
+            let report = inspected.arity_report;
+            inventory.note_arity(&contract, report.clone());
+            match inspected.refusal {
+                Some(error) => inventory
+                    .refused
+                    .entry(refusal_reason(&error))
+                    .or_default()
+                    .push(ContractRefusal {
+                        contract,
+                        arity: Some(report),
+                    }),
+                None => inventory.loaded += 1,
+            }
+        }
+        Err(error) => inventory
+            .refused
+            .entry(refusal_reason(&error))
+            .or_default()
+            .push(ContractRefusal {
+                contract,
+                arity: None,
+            }),
+    }
+}
+
 fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
     let chainstate = chainstate_directory(state);
     let mut vm =
@@ -303,95 +419,19 @@ fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
     vm.begin_block(Some(tip), [0xc5; 32])
         .map_err(|error| format!("cannot open a block on the tip: {error:?}"))?;
 
-    let contracts = sqlite(
-        &chainstate.join("clarity.sqlite"),
-        "SELECT key FROM metadata_table WHERE key LIKE 'clr-meta::%::analysis' ORDER BY key",
-    )?;
-    let contracts: Vec<String> = contracts
-        .lines()
-        .filter_map(|key| {
-            Some(
-                key.strip_prefix("clr-meta::")?
-                    .strip_suffix("::analysis")?
-                    .to_owned(),
-            )
-        })
-        .collect();
+    let (metadata_rows, contracts) =
+        contract_metadata_candidates(&chainstate.join("clarity.sqlite"))?;
     if contracts.is_empty() {
         return Err("the state names no contracts".to_owned());
     }
 
     let mut inventory = ContractInventory {
+        metadata_rows,
         named: contracts.len(),
         ..ContractInventory::default()
     };
     for contract in contracts {
-        let identifier = match clarity::vm::types::QualifiedContractIdentifier::parse(&contract) {
-            Ok(identifier) => identifier,
-            Err(error) => {
-                inventory
-                    .unmeasured
-                    .entry(format!("invalid contract identifier: {error}"))
-                    .or_default()
-                    .push(contract);
-                continue;
-            }
-        };
-        let (source, version) = match vm.contract_source(&identifier) {
-            Ok(source) => source,
-            Err(error) => {
-                inventory
-                    .unmeasured
-                    .entry(format!("source is unavailable: {error:?}"))
-                    .or_default()
-                    .push(contract);
-                continue;
-            }
-        };
-        let epoch = match vm.recorded_deploy_epoch(&identifier) {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                inventory
-                    .unmeasured
-                    .entry(format!("deploy epoch is unavailable: {error:?}"))
-                    .or_default()
-                    .push(contract);
-                continue;
-            }
-        };
-        inventory.checked += 1;
-        match vm.inspect_module(&identifier, version, &source, epoch) {
-            Ok(inspected) => {
-                if !inventory.note_locals(&contract, &inspected.locals_report) {
-                    inventory
-                        .unmeasured
-                        .entry("compiler returned no live-locals measurement".to_owned())
-                        .or_default()
-                        .push(contract.clone());
-                }
-                let report = inspected.arity_report;
-                inventory.note_arity(&contract, report.clone());
-                match inspected.refusal {
-                    Some(error) => inventory
-                        .refused
-                        .entry(refusal_reason(&error))
-                        .or_default()
-                        .push(ContractRefusal {
-                            contract,
-                            arity: Some(report),
-                        }),
-                    None => inventory.loaded += 1,
-                }
-            }
-            Err(error) => inventory
-                .refused
-                .entry(refusal_reason(&error))
-                .or_default()
-                .push(ContractRefusal {
-                    contract,
-                    arity: None,
-                }),
-        }
+        inspect_contract_candidate(&mut vm, &mut inventory, contract);
     }
     inventory.sort_measurements();
     Ok(inventory)
@@ -399,8 +439,13 @@ fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
 
 fn print_contract_inventory(inventory: &ContractInventory) {
     println!(
-        "{}/{} contracts compile and load ({} named by the state)",
-        inventory.loaded, inventory.checked, inventory.named
+        "{}/{} current-tip contracts compile and load ({} distinct candidates from {} metadata \
+         rows)",
+        inventory.loaded, inventory.current, inventory.named, inventory.metadata_rows
+    );
+    println!(
+        "  stale metadata       {} noncanonical candidate(s) absent from the current tip",
+        inventory.stale_metadata.len()
     );
     println!(
         "  Wasm type boundary   {} flattened parameters or results",
@@ -6278,7 +6323,13 @@ fn release_report(arguments: &[String]) -> ExitCode {
     println!("  reorganization, or a stock stacks-signer run against this binary.");
     println!("  Those require the named task-053 qualification runs.");
     report_revision();
-    let capture_valid = report_capture_validation(capture.as_deref());
+    if !report_capture_validation(capture.as_deref()) {
+        println!(
+            "\nrelease qualification stopped: an invalid capture cannot support replay or \
+             artifact evidence"
+        );
+        return ExitCode::FAILURE;
+    }
     report_engines();
     let receipt_binding = report_receipt_binding();
     let blocking = report_differentials() + report_declared_differentials();
@@ -6316,7 +6367,6 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && contract_arities
         && scoreboard
         && receipt_binding
-        && capture_valid
         && conditional_inventory
     {
         ExitCode::SUCCESS
@@ -6461,8 +6511,9 @@ mod tests {
     use super::{
         ARCHIVED_NAKAMOTO_BLOCK_QUERY, CheckpointHistoryExport, ContractArity, ContractInventory,
         ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
-        chainstate_directory, crosses_wasm_arity_boundary, encode_hex,
-        refuse_a_short_earnings_window, write_checkpoint_authentication_history,
+        chainstate_directory, contract_metadata_candidates, crosses_wasm_arity_boundary,
+        encode_hex, refusal_reason, refuse_a_short_earnings_window,
+        write_checkpoint_authentication_history,
     };
     use nano_chainstate::NakamotoBlock;
     use serde_json::json;
@@ -6490,6 +6541,51 @@ mod tests {
         fs::write(direct.join("marf.sqlite"), []).expect("direct MARF database marker");
         fs::write(direct.join("clarity.sqlite"), []).expect("direct Clarity database marker");
         assert_eq!(chainstate_directory(&direct), direct);
+    }
+
+    #[test]
+    fn contract_metadata_candidates_are_distinct_and_count_every_source_row() {
+        let root = tempfile::tempdir().expect("temporary state");
+        let database = root.path().join("clarity.sqlite");
+        let connection = rusqlite::Connection::open(&database).expect("create metadata store");
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata_table (
+                    key TEXT NOT NULL,
+                    blockhash TEXT,
+                    value TEXT NOT NULL,
+                    UNIQUE(key, blockhash)
+                );",
+            )
+            .expect("metadata schema");
+        let first = "clr-meta::SP000000000000000000002Q6VF78.first::analysis";
+        let second = "clr-meta::SP000000000000000000002Q6VF78.second::analysis";
+        for (key, block) in [(first, "01"), (first, "02"), (second, "03")] {
+            connection
+                .execute(
+                    "INSERT INTO metadata_table (key, blockhash, value) VALUES (?1, ?2, '{}')",
+                    rusqlite::params![key, block],
+                )
+                .expect("metadata row");
+        }
+        connection
+            .execute(
+                "INSERT INTO metadata_table (key, blockhash, value) VALUES (?1, '04', '{}')",
+                rusqlite::params!["clr-meta::SP000000000000000000002Q6VF78.first::contract-src"],
+            )
+            .expect("unrelated metadata row");
+        drop(connection);
+
+        let (rows, contracts) =
+            contract_metadata_candidates(&database).expect("read contract candidates");
+        assert_eq!(rows, 3);
+        assert_eq!(
+            contracts,
+            vec![
+                "SP000000000000000000002Q6VF78.first".to_owned(),
+                "SP000000000000000000002Q6VF78.second".to_owned(),
+            ]
+        );
     }
 
     fn fixture_blocks() -> Vec<FixtureBlock> {
@@ -6732,7 +6828,9 @@ mod tests {
         assert!(crosses_wasm_arity_boundary(&wide));
 
         let mut inventory = ContractInventory {
+            metadata_rows: 2,
             named: 2,
+            current: 2,
             checked: 2,
             loaded: 2,
             ..ContractInventory::default()
@@ -6752,28 +6850,50 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_or_unmeasured_contract_fails_the_arity_inventory() {
+    fn stale_metadata_is_excluded_but_a_real_refusal_still_fails_with_its_full_reason() {
+        struct RefusalMessage<'a>(&'a str);
+
+        impl std::fmt::Debug for RefusalMessage<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
         let report = arity([1_001, 2, 3, 4, 5]);
-        let mut refused = ContractInventory {
-            named: 1,
+        let mut inventory = ContractInventory {
+            metadata_rows: 3,
+            named: 2,
+            current: 1,
             checked: 1,
+            loaded: 1,
+            stale_metadata: vec!["SP000000000000000000002Q6VF78.stale".to_owned()],
             ..ContractInventory::default()
         };
-        refused.note_arity("SP000000000000000000002Q6VF78.refused", report.clone());
-        refused.refused.insert(
-            "function params size is out of bounds".to_owned(),
+        assert!(inventory.passes());
+
+        inventory.loaded = 0;
+        inventory.note_arity("SP000000000000000000002Q6VF78.refused", report.clone());
+        let full_detail = format!(
+            "contract analysis failed: validator refusal {} END",
+            "x".repeat(120)
+        );
+        let reason = refusal_reason(&RefusalMessage(&full_detail));
+        assert!(reason.ends_with(" END"), "refusal was truncated: {reason}");
+        inventory.refused.insert(
+            reason,
             vec![ContractRefusal {
                 contract: "SP000000000000000000002Q6VF78.refused".to_owned(),
                 arity: Some(report.clone()),
             }],
         );
-        assert!(!refused.passes());
+        assert!(!inventory.passes());
         assert_eq!(
             arity_dimensions(&report),
             "function params/results 1001/2, control params/results 3/4, top-level results 5"
         );
 
         let mut unmeasured = ContractInventory {
+            metadata_rows: 1,
             named: 1,
             ..ContractInventory::default()
         };

@@ -1,7 +1,7 @@
 ---
 title: "Refuse an unrecoverable checkpoint winner seed before sortition"
 id: "083"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["049", "051"]
 tags: ["mainnet", "sortition", "checkpoint", "consensus", "release"]
 created_at: "2026-08-07"
+completed_at: 2026-08-09
 ---
 
 # Refuse an unrecoverable checkpoint winner seed before sortition
@@ -29,14 +30,14 @@ chain instead of the typed startup refusal `plan.md` requires.
 - [x] Distinguish the valid cases explicitly: a saved chain carrying its effective
       winner seed, a captured block with one unanimous recoverable seed, and a burn
       block that elected nobody and therefore must carry the older effective seed.
-- [ ] Propagate the error through `resume_or_capture_below` and runtime startup;
+- [x] Propagate the error through `resume_or_capture_below` and runtime startup;
       do not persist a derived snapshot or execute a Stacks block after it.
-- [ ] Make `validate-fixtures` and `release-report` reject the same contradictory
+- [x] Make `validate-fixtures` and `release-report` reject the same contradictory
       seed before presenting any replay or artifact result as evidence.
-- [ ] Add adversarial fixtures for disagreeing commitments, no eligible
+- [x] Add adversarial fixtures for disagreeing commitments, no eligible
       commitment, a sortition-less seed missing its effective predecessor seed,
       and a valid unanimous recovery control.
-- [ ] Remove the "sample against zero" continuation and prove that no default seed
+- [x] Remove the "sample against zero" continuation and prove that no default seed
       remains reachable from checkpoint input.
 
 ## Acceptance Criteria
@@ -79,3 +80,27 @@ carry `winner_vrf_seed` for a seed row that elected somebody.
 Before this the capture's derived consensus hashes diverged from the chain's at
 burn 364; after it they match every block from 361 to 479. Pinned by
 `pox_boundary`, which cannot pass without it.
+
+## Closure evidence — 2026-08-09
+
+- `SortitionTracker::recover_seed` and `advance` return `TrackerError::Seed`
+  before advancement when no effective seed is recoverable. Runtime checkpoint
+  construction propagates `recover_seed(...)?` before returning a tracker to the
+  host, so the failing tracker cannot be saved or used for execution.
+- `cargo test -p nano-conformance --lib
+  a_capture_with_an_absent_winner_and_disagreeing_candidates_is_rejected`
+  passed with a decoded captured Bitcoin block whose eligible commitments
+  disagree and whose named winner is absent. Validation returned the typed
+  `InvalidSortitionSeed` refusal; the unmodified captured seed remained the valid
+  control.
+- `cargo test -p xtask --test release_report
+  an_invalid_checkpoint_seed_stops_before_replay_or_artifact_evidence` passed.
+  The CLI named the invalid seed and printed no artifact, scoreboard, or gate
+  evidence after fixture validation failed.
+- The focused sortition regressions cover a named eligible winner, unanimous
+  fallback, disagreeing candidates, no eligible commitment, a sortition-less
+  capture without its predecessor seed, and refusal to advance without an
+  effective seed. The bounded `pox_boundary` oracle remains green across burns
+  361 through 479.
+- `cargo clippy -p nano-conformance -p nano-vm -p xtask --all-targets -- -D
+  warnings` passed with the release validation path included.

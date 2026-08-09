@@ -1190,6 +1190,13 @@ enum Access {
 /// Maximum locals the pinned Wasmtime validator accepts in one function.
 pub const MAX_WASM_FUNCTION_LOCALS: u32 = 50_000;
 
+/// Whether the current state commits a deployed contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContractPresence {
+    Present,
+    Absent,
+}
+
 /// A compiled contract's raw source measurements and the runtime's load verdict.
 #[derive(Debug)]
 pub struct ModuleInspection {
@@ -1805,6 +1812,24 @@ impl Vm {
         contract: &QualifiedContractIdentifier,
     ) -> Result<(String, ClarityVersion), VmExecutionError> {
         contract_source(&mut self.store, &self.context, contract)
+    }
+
+    /// Whether the state currently being read commits this contract.
+    ///
+    /// This checks the MARF commitment rather than side-store metadata. An old
+    /// analysis row can outlive the fork that deployed it, while a present
+    /// commitment whose source cannot be read is a storage error, not absence.
+    pub fn contract_presence(
+        &self,
+        contract: &QualifiedContractIdentifier,
+    ) -> Result<ContractPresence, VmExecutionError> {
+        let key = make_contract_hash_key(contract);
+        let path = nano_marf::key_path(key.as_bytes());
+        Ok(if self.store.value_of(*path.as_bytes())?.is_some() {
+            ContractPresence::Present
+        } else {
+            ContractPresence::Absent
+        })
     }
 
     /// Record what a burn block's header hash is, for Clarity to read back.
@@ -5015,7 +5040,7 @@ mod tests {
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
-    use super::{ContractCallOutcome, MarfStore, Vm};
+    use super::{ContractCallOutcome, ContractPresence, MarfStore, Vm};
     use clarity::vm::costs::LimitedCostTracker;
 
     use clar2wasm::NativeModuleStore;
@@ -6332,6 +6357,42 @@ mod tests {
     /// A source every epoch accepts, so a deploy can establish real state for it.
     const PLAIN: &str = "(define-data-var total uint u7)
          (define-read-only (total-now) (ok (var-get total)))";
+
+    #[test]
+    fn contract_presence_ignores_stale_side_store_metadata() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let deployed = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.deployed")
+            .expect("a deployed contract identifier");
+        let stale = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.stale")
+            .expect("a stale contract identifier");
+        let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("open the state");
+        vm.begin_block(None, [1; 32]).expect("begin block");
+        vm.deploy_contract(
+            deployed.clone(),
+            ClarityVersion::Clarity2,
+            PLAIN,
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the current contract");
+        vm.store
+            .side_store
+            .execute(
+                "INSERT INTO metadata_table (key, blockhash, value) VALUES (?1, NULL, '{}')",
+                params![format!("clr-meta::{stale}::analysis")],
+            )
+            .expect("insert stale analysis metadata");
+
+        assert_eq!(
+            vm.contract_presence(&deployed)
+                .expect("read deployed contract presence"),
+            ContractPresence::Present
+        );
+        assert_eq!(
+            vm.contract_presence(&stale)
+                .expect("read stale contract presence"),
+            ContractPresence::Absent
+        );
+    }
 
     /// Publish a contract properly, then make the state say what an imported one
     /// would say: this source, analyzed in that epoch.

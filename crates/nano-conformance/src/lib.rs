@@ -8,7 +8,10 @@ use std::{
 use nano_bitcoin::{
     BitcoinOperation, BitcoinOperationKind, PreStxCache, decode_block, decode_block_with_pre_stx,
 };
-use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, TenureAccounting};
+use nano_chainstate::{
+    BitcoinBlockContext, CHECKPOINT_HISTORY_LIMIT, ChainState, NakamotoBlock, TenureAccounting,
+};
+use nano_codec::{TenureChangeCause, TransactionPayloadData};
 use nano_primitives::{Network, TrieHash};
 use serde::Deserialize;
 
@@ -104,6 +107,13 @@ struct CapturedExecutionCost {
     runtime: u64,
     write_count: u64,
     write_length: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBoundaryRecord {
+    parent_tenure_consensus_hash: String,
+    coinbase_vrf_proof: String,
 }
 
 impl FixtureManifest {
@@ -304,6 +314,14 @@ fn validate_checkpoint(root: &Path) -> Result<(), FixtureValidationError> {
             ));
         }
     }
+    let published = nano_marf::CheckpointManifest::load(&checkpoint).map_err(|_| {
+        FixtureValidationError::InvalidCheckpointManifest(checkpoint_manifest.clone())
+    })?;
+    validate_checkpoint_authentication_history(
+        &checkpoint.join("authentication-history"),
+        published.source_state_id,
+        published.state_index_root,
+    )?;
     let accounting_path = checkpoint.join("native-effects.json");
     TenureAccounting::from_json(
         &fs::read(&accounting_path)
@@ -311,6 +329,207 @@ fn validate_checkpoint(root: &Path) -> Result<(), FixtureValidationError> {
     )
     .map_err(|_| FixtureValidationError::InvalidNativeAccounting(accounting_path))?;
     Ok(())
+}
+
+fn invalid_checkpoint_history(path: &Path, reason: impl Into<String>) -> FixtureValidationError {
+    FixtureValidationError::InvalidCheckpointHistory {
+        path: path.to_owned(),
+        reason: reason.into(),
+    }
+}
+
+fn history_hex<const LENGTH: usize>(
+    root: &Path,
+    field: &str,
+    value: &str,
+) -> Result<[u8; LENGTH], FixtureValidationError> {
+    hex::decode(value)
+        .ok()
+        .and_then(|bytes| <[u8; LENGTH]>::try_from(bytes.as_slice()).ok())
+        .ok_or_else(|| {
+            invalid_checkpoint_history(
+                root,
+                format!("{field} is not exactly {LENGTH} hexadecimal bytes"),
+            )
+        })
+}
+
+fn checkpoint_history_boundary(root: &Path) -> Result<[u8; 20], FixtureValidationError> {
+    let boundary_path = root.join("boundary.json");
+    let boundary: CheckpointBoundaryRecord = fs::read(&boundary_path)
+        .map_err(|error| invalid_checkpoint_history(root, error.to_string()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| invalid_checkpoint_history(root, error.to_string()))
+        })?;
+    let consensus = history_hex::<20>(
+        root,
+        "parent_tenure_consensus_hash",
+        &boundary.parent_tenure_consensus_hash,
+    )?;
+    let proof = history_hex::<80>(root, "coinbase_vrf_proof", &boundary.coinbase_vrf_proof)?;
+    nano_crypto::VrfProof::from_bytes(&proof)
+        .map_err(|error| invalid_checkpoint_history(root, error.to_string()))?;
+    Ok(consensus)
+}
+
+fn checkpoint_history_paths(root: &Path) -> Result<Vec<PathBuf>, FixtureValidationError> {
+    let blocks_directory = root.join("blocks");
+    let entries = fs::read_dir(&blocks_directory)
+        .map_err(|error| invalid_checkpoint_history(root, error.to_string()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| invalid_checkpoint_history(root, error.to_string()))?
+            .path();
+        if path.extension().is_some_and(|extension| extension == "bin") {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Err(invalid_checkpoint_history(
+            root,
+            "blocks directory contains no Nakamoto block files",
+        ));
+    }
+    if paths.len() > CHECKPOINT_HISTORY_LIMIT {
+        return Err(invalid_checkpoint_history(
+            root,
+            format!(
+                "{} blocks exceed the bounded limit of {CHECKPOINT_HISTORY_LIMIT}",
+                paths.len()
+            ),
+        ));
+    }
+    Ok(paths)
+}
+
+fn decode_checkpoint_history_blocks(
+    root: &Path,
+    paths: Vec<PathBuf>,
+) -> Result<BTreeMap<[u8; 32], NakamotoBlock>, FixtureValidationError> {
+    let mut by_id = BTreeMap::new();
+    for path in paths {
+        let block = fs::read(&path)
+            .map_err(|error| invalid_checkpoint_history(root, error.to_string()))
+            .and_then(|bytes| {
+                NakamotoBlock::decode(&bytes)
+                    .map_err(|error| invalid_checkpoint_history(root, error.to_string()))
+            })?;
+        let id = *block.block_id().as_bytes();
+        if by_id.insert(id, block).is_some() {
+            return Err(invalid_checkpoint_history(
+                root,
+                format!("block {} occurs more than once", hex::encode(id)),
+            ));
+        }
+    }
+    Ok(by_id)
+}
+
+fn ordered_checkpoint_history(
+    root: &Path,
+    mut by_id: BTreeMap<[u8; 32], NakamotoBlock>,
+    source: [u8; 32],
+) -> Result<Vec<NakamotoBlock>, FixtureValidationError> {
+    let mut cursor = source;
+    let mut reversed = Vec::with_capacity(by_id.len());
+    while let Some(block) = by_id.remove(&cursor) {
+        cursor = *block.header.parent_block_id.as_bytes();
+        reversed.push(block);
+    }
+    if reversed.is_empty() {
+        return Err(invalid_checkpoint_history(
+            root,
+            format!(
+                "history contains no checkpoint source block {}",
+                hex::encode(source)
+            ),
+        ));
+    }
+    if !by_id.is_empty() {
+        return Err(invalid_checkpoint_history(
+            root,
+            format!(
+                "{} block(s) are disconnected from checkpoint source {}",
+                by_id.len(),
+                hex::encode(source)
+            ),
+        ));
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
+fn validate_checkpoint_history_blocks(
+    root: &Path,
+    history: &[NakamotoBlock],
+    state_root: TrieHash,
+    boundary_consensus: [u8; 20],
+) -> Result<(), FixtureValidationError> {
+    let first = &history[0];
+    let last = &history[history.len() - 1];
+    if !nano_chainstate::starts_new_tenure(first) {
+        return Err(invalid_checkpoint_history(
+            root,
+            "history does not begin at a tenure-start block",
+        ));
+    }
+    if last.header.state_index_root != state_root {
+        return Err(invalid_checkpoint_history(
+            root,
+            format!(
+                "source block publishes state root {}, not {}",
+                last.header.state_index_root, state_root
+            ),
+        ));
+    }
+    for pair in history.windows(2) {
+        let parent = &pair[0];
+        let child = &pair[1];
+        if child.header.parent_block_id != parent.block_id()
+            || child.header.chain_length != parent.header.chain_length.saturating_add(1)
+        {
+            return Err(invalid_checkpoint_history(
+                root,
+                format!(
+                    "history is not contiguous at Stacks height {}",
+                    child.header.chain_length
+                ),
+            ));
+        }
+    }
+    let previous_tenure =
+        first
+            .transactions
+            .iter()
+            .find_map(|transaction| match transaction.payload().data() {
+                TransactionPayloadData::TenureChange(payload)
+                    if payload.cause == TenureChangeCause::BlockFound =>
+                {
+                    Some(payload.previous_tenure_consensus_hash)
+                }
+                _ => None,
+            });
+    if previous_tenure.map(|hash| *hash.as_bytes()) != Some(boundary_consensus) {
+        return Err(invalid_checkpoint_history(
+            root,
+            "boundary proof names a different parent tenure than the first history block",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_authentication_history(
+    root: &Path,
+    source: [u8; 32],
+    state_root: TrieHash,
+) -> Result<(), FixtureValidationError> {
+    let boundary_consensus = checkpoint_history_boundary(root)?;
+    let paths = checkpoint_history_paths(root)?;
+    let by_id = decode_checkpoint_history_blocks(root, paths)?;
+    let history = ordered_checkpoint_history(root, by_id, source)?;
+    validate_checkpoint_history_blocks(root, &history, state_root, boundary_consensus)
 }
 
 fn is_nonempty_file(path: &Path) -> Result<bool, FixtureValidationError> {
@@ -375,6 +594,10 @@ pub enum FixtureValidationError {
         path: PathBuf,
         reason: String,
     },
+    InvalidCheckpointHistory {
+        path: PathBuf,
+        reason: String,
+    },
     EmptyCapture,
     Metadata {
         path: PathBuf,
@@ -428,6 +651,11 @@ impl std::fmt::Display for FixtureValidationError {
             Self::InvalidSortitionSeed { path, reason } => write!(
                 formatter,
                 "invalid checkpoint sortition seed under {}: {reason}",
+                path.display()
+            ),
+            Self::InvalidCheckpointHistory { path, reason } => write!(
+                formatter,
+                "invalid checkpoint authentication history under {}: {reason}",
                 path.display()
             ),
             Self::EmptyCapture => {
@@ -1873,11 +2101,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ChainState, FixtureManifest, FixtureMode, FixtureStatus, FixtureValidationError,
+        CHECKPOINT_HISTORY_LIMIT, ChainState, FixtureManifest, FixtureMode, FixtureValidationError,
         apply_captured_block, baseline_replay, captured_accounting, captured_bitcoin_operations,
-        captured_bitcoin_snapshots, captured_chainstate, captured_checkpoint_block,
+        captured_bitcoin_snapshots, captured_chainstate, captured_checkpoint_block, captured_magic,
         captured_network, captured_signer_set, captured_signer_sets, checkpoint_manifest,
-        checkpoint_state, decode_hash, scoreboard, validate_fixture_tree,
+        checkpoint_state, decode_hash, scoreboard, validate_checkpoint_authentication_history,
+        validate_fixture_tree, validate_sortition_seed,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -2316,15 +2545,170 @@ mod tests {
         );
     }
 
+    struct AuthenticationFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        source: [u8; 32],
+        state_root: TrieHash,
+        disconnected: Vec<u8>,
+    }
+
+    fn authentication_fixture() -> AuthenticationFixture {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let blocks = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                let raw = fs::read(path).expect("read captured block");
+                let block = NanoNakamotoBlock::decode(&raw).expect("decode captured block");
+                (raw, block)
+            })
+            .collect::<Vec<_>>();
+        let starts = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, block))| nano_chainstate::starts_new_tenure(block))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(starts.len() >= 2, "capture contains two tenure starts");
+        let boundary_index = starts[0];
+        let first_index = starts[1];
+        let source_index = starts.get(2).map_or(blocks.len() - 1, |index| *index - 1);
+        let directory = tempfile::tempdir().expect("temporary authentication history");
+        let root = directory.path().join("authentication-history");
+        fs::create_dir_all(root.join("blocks")).expect("history blocks directory");
+        let boundary = &blocks[boundary_index].1;
+        fs::write(
+            root.join("boundary.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "parent_tenure_consensus_hash": hex::encode(boundary.header.consensus_hash.as_bytes()),
+                "coinbase_vrf_proof": hex::encode(
+                    nano_chainstate::coinbase_vrf_proof(boundary).expect("boundary proof")
+                ),
+            }))
+            .expect("boundary JSON"),
+        )
+        .expect("write boundary");
+        for (raw, block) in &blocks[first_index..=source_index] {
+            fs::write(
+                root.join("blocks").join(format!(
+                    "{:08}-{}.bin",
+                    block.header.chain_length,
+                    hex::encode(block.block_id().as_bytes())
+                )),
+                raw,
+            )
+            .expect("write history block");
+        }
+        let source = &blocks[source_index].1;
+        AuthenticationFixture {
+            _directory: directory,
+            root,
+            source: *source.block_id().as_bytes(),
+            state_root: source.header.state_index_root,
+            disconnected: blocks[boundary_index].0.clone(),
+        }
+    }
+
     #[test]
-    fn checked_in_fixture_is_a_valid_capture() {
+    fn a_complete_checkpoint_authentication_history_is_valid() {
+        let fixture = authentication_fixture();
+        validate_checkpoint_authentication_history(
+            &fixture.root,
+            fixture.source,
+            fixture.state_root,
+        )
+        .expect("valid authentication history");
+    }
+
+    #[test]
+    fn a_missing_checkpoint_authentication_history_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary fixture");
+        let error = validate_checkpoint_authentication_history(
+            &directory.path().join("missing"),
+            [0; 32],
+            TrieHash::from_bytes([0; 32]),
+        )
+        .expect_err("missing authentication history");
+        assert!(
+            matches!(
+                error,
+                FixtureValidationError::InvalidCheckpointHistory { .. }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_checkpoint_authentication_block_is_rejected() {
+        let fixture = authentication_fixture();
+        fs::write(
+            fixture.root.join("blocks/disconnected.bin"),
+            fixture.disconnected,
+        )
+        .expect("write disconnected block");
+        let error = validate_checkpoint_authentication_history(
+            &fixture.root,
+            fixture.source,
+            fixture.state_root,
+        )
+        .expect_err("disconnected authentication block");
+        assert!(error.to_string().contains("disconnected"), "{error}");
+    }
+
+    #[test]
+    fn an_oversized_checkpoint_authentication_history_is_rejected() {
+        let fixture = authentication_fixture();
+        let blocks = fixture.root.join("blocks");
+        let present = fs::read_dir(&blocks).expect("history blocks").count();
+        for index in present..=CHECKPOINT_HISTORY_LIMIT {
+            fs::write(blocks.join(format!("padding-{index:04}.bin")), []).expect("write padding");
+        }
+        let error = validate_checkpoint_authentication_history(
+            &fixture.root,
+            fixture.source,
+            fixture.state_root,
+        )
+        .expect_err("oversized authentication history");
+        assert!(error.to_string().contains("bounded limit"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_authentication_history_must_end_at_the_published_source_and_root() {
+        let fixture = authentication_fixture();
+        let source_error = validate_checkpoint_authentication_history(
+            &fixture.root,
+            [0xff; 32],
+            fixture.state_root,
+        )
+        .expect_err("wrong source");
+        assert!(
+            source_error.to_string().contains("no checkpoint source"),
+            "{source_error}"
+        );
+        let root_error = validate_checkpoint_authentication_history(
+            &fixture.root,
+            fixture.source,
+            TrieHash::from_bytes([0xff; 32]),
+        )
+        .expect_err("wrong root");
+        assert!(
+            root_error.to_string().contains("publishes state root"),
+            "{root_error}"
+        );
+    }
+
+    #[test]
+    fn checked_in_capture_is_explicitly_execution_only_until_recaptured() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let manifest = FixtureManifest::load(&root.join("manifest.toml")).expect("manifest");
-        assert_eq!(
-            validate_fixture_tree(&root).expect("captured fixture directory is valid"),
-            FixtureStatus::Captured {
-                replay_blocks: manifest.replay_blocks
-            }
+        let error = validate_fixture_tree(&root).expect_err(
+            "a capture without the checkpoint authentication suffix cannot qualify a release",
+        );
+        assert!(
+            matches!(
+                error,
+                FixtureValidationError::InvalidCheckpointHistory { .. }
+            ),
+            "{error}"
         );
         assert!(fs::metadata(root.join("README.md")).is_ok());
     }
@@ -4533,33 +4917,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_capture_without_a_recoverable_sortition_seed_is_rejected()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root = temporary_fixture_root()?;
+    fn install_execution_only_capture(
+        root: &Path,
+        fixture: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         write_file(
             &root.join("manifest.toml"),
-            "mode = \"captured\"\nreplay_blocks = 1\n",
-        )?;
-        let bitcoin_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-        write_file(
-            &root
-                .join("bitcoin/blocks")
-                .join(format!("{bitcoin_hash}.hex")),
-            "00",
+            "mode = \"captured\"\nreplay_blocks = 1\nreceipts = false\n",
         )?;
         write_file(&root.join("nakamoto/blocks/00000001.bin"), "block")?;
-        write_file(&root.join("events/new_block/00000001.json"), "{}")?;
         write_file(&root.join("stacker_set/cycle-0.json"), "{}")?;
-        // `pox_payouts` is among the required inputs, and it is required rather than
-        // defaulted for the reason this test exists: a capture that does not state how
-        // many of a commitment's outputs are payouts cannot say what any commitment
-        // burned, and defaulting it would let such a capture read as a valid oracle
-        // and then answer with a miner's change.
-        let snapshot = format!(
-            "[{{\"block_height\":1,\"burn_header_hash\":\"{bitcoin_hash}\",\"burn_header_timestamp\":0,\"consensus_hash\":\"0000000000000000000000000000000000000000\",\"winning_block_txid\":\"{bitcoin_hash}\",\"pox_payouts\":\"[[\\\"burn\\\"],20000]\"}}]"
-        );
-        write_file(&root.join("sortition/snapshots.json"), &snapshot)?;
         write_file(
             &root.join("chainstate/checkpoint-H/checkpoint.toml"),
             "format = \"stacks-core-marf-sqlite-v2\"\nsource_state_id = \"id\"\npublished_state_index_root = \"root\"\n",
@@ -4568,15 +4935,126 @@ mod tests {
             &root.join("chainstate/checkpoint-H/native-effects.json"),
             "{\"matured_effects\":[]}",
         )?;
-        write_file(&root.join("provenance.toml"), "hacknet_commit = \"test\"\n")?;
+        fs::copy(
+            fixture.join("provenance.toml"),
+            root.join("provenance.toml"),
+        )?;
+        Ok(())
+    }
 
+    fn install_captured_seed(
+        root: &Path,
+        fixture: &Path,
+    ) -> Result<(serde_json::Value, BitcoinBlock), Box<dyn std::error::Error>> {
+        let history = fs::read(fixture.join("sortition/consensus-hashes.json"))?;
+        let history: serde_json::Value = serde_json::from_slice(&history)?;
+        let seed_consensus_hash = history["hashes"]
+            .as_array()
+            .and_then(|hashes| hashes.last())
+            .and_then(serde_json::Value::as_str)
+            .expect("the captured history ends at a consensus hash");
+        let snapshots: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(fixture.join("sortition/snapshots.json"))?)?;
+        let seed = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot["consensus_hash"] == seed_consensus_hash)
+            .expect("the capture carries its seed snapshot");
+        let bitcoin_hash = seed["burn_header_hash"]
+            .as_str()
+            .expect("the seed names its Bitcoin block");
+        let bitcoin_height = seed["block_height"]
+            .as_u64()
+            .expect("the seed names its Bitcoin height");
+        fs::create_dir_all(root.join("sortition"))?;
+        fs::copy(
+            fixture.join("sortition/consensus-hashes.json"),
+            root.join("sortition/consensus-hashes.json"),
+        )?;
+        fs::copy(
+            fixture.join("sortition/leader-keys.json"),
+            root.join("sortition/leader-keys.json"),
+        )?;
+        fs::create_dir_all(root.join("bitcoin/blocks"))?;
+        fs::copy(
+            fixture
+                .join("bitcoin/blocks")
+                .join(format!("{bitcoin_hash}.hex")),
+            root.join("bitcoin/blocks")
+                .join(format!("{bitcoin_hash}.hex")),
+        )?;
+
+        write_file(
+            &root.join("sortition/snapshots.json"),
+            &serde_json::to_string(&[&seed])?,
+        )?;
+        validate_sortition_seed(root).expect("the unmodified captured seed is recoverable");
+
+        let raw = hex::decode(
+            fs::read_to_string(
+                root.join("bitcoin/blocks")
+                    .join(format!("{bitcoin_hash}.hex")),
+            )?
+            .trim(),
+        )?;
+        let block = decode_bitcoin_block(bitcoin_height, &raw, captured_magic(root))?;
+        Ok((seed, block))
+    }
+
+    #[test]
+    fn a_capture_with_an_absent_winner_and_disagreeing_candidates_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temporary_fixture_root()?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        install_execution_only_capture(&root, &fixture)?;
+        let (mut seed, block) = install_captured_seed(&root, &fixture)?;
+        let bitcoin_height = seed["block_height"]
+            .as_u64()
+            .expect("the seed names its Bitcoin height");
+        let eligible_seeds = block
+            .operations
+            .iter()
+            .filter_map(|operation| match operation.kind {
+                nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                    new_seed,
+                    parent_modulus,
+                    ..
+                } if nano_sortition::commitment_is_on_time(parent_modulus, bitcoin_height) => {
+                    Some(new_seed)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert!(
-            matches!(
-                validate_fixture_tree(&root),
-                Err(FixtureValidationError::InvalidSortitionSeed { .. })
-            ),
-            "a structurally complete capture cannot be evidence without the history and seed \
-             that let the production tracker start"
+            eligible_seeds
+                .iter()
+                .skip(1)
+                .any(|candidate| candidate != &eligible_seeds[0]),
+            "the real seed block must carry disagreeing eligible commitments"
+        );
+
+        let absent_winner = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert!(
+            block
+                .operations
+                .iter()
+                .all(|operation| hex::encode(operation.txid) != absent_winner),
+            "the adversarial snapshot must name a commitment absent from the decoded block"
+        );
+        seed["winning_block_txid"] = serde_json::Value::String(absent_winner.to_owned());
+        write_file(
+            &root.join("sortition/snapshots.json"),
+            &serde_json::to_string(&[seed])?,
+        )?;
+
+        let error = validate_fixture_tree(&root)
+            .expect_err("release validation must reject an unrecoverable capture seed");
+        let FixtureValidationError::InvalidSortitionSeed { reason, .. } = error else {
+            panic!("the fixture must reach seed recovery, not fail earlier: {error}");
+        };
+        assert!(reason.contains(absent_winner), "{reason}");
+        assert!(
+            reason.contains("eligible commitment nor an agreement"),
+            "{reason}"
         );
         fs::remove_dir_all(root)?;
         Ok(())

@@ -1,7 +1,7 @@
 ---
 id: "074"
 title: "Make the release report readable and its fixtures self-describing"
-status: completed
+status: in-progress
 priority: critical
 effort: medium
 dependencies: []
@@ -9,7 +9,6 @@ tags: ["mainnet", "conformance", "release", "tooling"]
 created_at: 2026-08-07
 type: bug
 group: mainnet
-completed_at: 2026-08-08
 ---
 
 # Make the release report readable and its fixtures self-describing
@@ -73,6 +72,10 @@ who learns to skip them on the report learns to skip them everywhere.
 - [x] Describe the artifact accurately: the Clarity interpreter machinery is
       linked as unreachable frontend/ABI code, while no interpreter entry point
       or call edge is reachable from production.
+- [ ] Carry the checkpoint's authenticated block suffix and parent-tenure VRF
+      boundary in every captured release fixture. `validate-fixtures` and
+      `release-report` must refuse a captured fixture when that history is absent,
+      oversized, disconnected or inconsistent with the published source/root.
 
 ## Acceptance Criteria
 
@@ -90,6 +93,8 @@ who learns to skip them on the report learns to skip them everywhere.
 - The artifact digest, embedded compiler identity, source identity and revision
   describe one freshly built binary.
 - A red scoreboard or required gate makes `release-report` exit non-zero.
+- Every captured release fixture can authenticate the state it starts from; only
+  an explicit empty baseline is exempt from checkpoint-history validation.
 
 ## Evidence that opened this task
 
@@ -130,3 +135,30 @@ surface makes both commands exit non-zero. Missing required inputs still retain
 their individual test names through `classify_failures`; the two parameterized
 investigations are explicitly optional diagnostics instead of being counted as
 release gates.
+
+## Reopened for checkpoint authentication history, 2026-08-08
+
+Task 076 made the earlier validation claim incomplete. A fresh executing node
+cannot authenticate a MARF root from accounting data and post-checkpoint replay
+blocks: it needs the bounded canonical Nakamoto suffix ending at the checkpoint,
+plus the preceding tenure's coinbase VRF proof. Capture and validation now use the
+exact runtime artifact at
+`chainstate/checkpoint-H/authentication-history/{boundary.json,blocks/*.bin}` and
+fail closed on a missing, oversized, disconnected, source-mismatched or
+root-mismatched history. Baseline-only fixture trees remain exempt.
+
+The checked-in Hacknet capture predates that artifact. It publishes checkpoint
+source `7dbd545ff1817dc99decb60f5683290c402d7ef699402918fb17d292550e6777`
+and root `a366005633eecfb7f4bb3b710a5b7c939f28d4e0f8862dda6c7ccfa12c41fab3`,
+but contains only post-checkpoint blocks 461 through 800. It has neither the
+source block at height 460 nor the preceding tenure boundary, so it remains a
+useful execution oracle but cannot qualify a fresh checkpoint start.
+
+This is not locally recoverable from a similarly named chain. A read-only
+`mode=ro&immutable=1` query checked all 17 `nakamoto.sqlite` archives under
+`/home/aldur`; none contains that exact processed, non-orphaned source ID. The
+closest surviving short Hacknet archive reaches height 856 but names a different
+block at height 461 (`4b2211b2…` rather than the capture's `86f05aca…`). Inventing a
+boundary record or borrowing the same height from that chain would be a forged
+checkpoint witness. The task therefore remains open until the fixture is
+recaptured from a chainstate that still holds its exact checkpoint ancestry.
