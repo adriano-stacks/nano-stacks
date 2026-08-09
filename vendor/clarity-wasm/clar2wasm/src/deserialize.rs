@@ -820,9 +820,10 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Create a block for the body of this operation, so that we can
         // early exit as needed.
-        // These I32s are the some indicator for the outer optional and
-        // the offset and length of the list.
-        let wasm_val_ty = vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32];
+        let optional_list_ty = TypeSignature::OptionalType(Box::new(TypeSignature::SequenceType(
+            SequenceSubtype::ListType(list_ty.clone()),
+        )));
+        let wasm_val_ty = clar2wasm_ty(&optional_list_ty);
         let block_ty = self.bounded_control_type(&[], &wasm_val_ty)?;
         let mut block = builder.dangling_instr_seq(block_ty);
         let block_id = block.id();
@@ -839,7 +840,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
+                    add_placeholder_for_clarity_type(then, &optional_list_ty);
                     then.br(block_id);
                 },
                 |_| {},
@@ -865,7 +866,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
+                    add_placeholder_for_clarity_type(then, &optional_list_ty);
                     then.br(block_id);
                 },
                 |_| {},
@@ -888,7 +889,7 @@ impl WasmGenerator {
                 None,
                 |then| {
                     // Return none
-                    then.i32_const(0).i32_const(0).i32_const(0);
+                    add_placeholder_for_clarity_type(then, &optional_list_ty);
                     then.br(block_id);
                 },
                 |_| {},
@@ -967,7 +968,7 @@ impl WasmGenerator {
             None,
             |then| {
                 // Return none
-                then.i32_const(0).i32_const(0).i32_const(0).i32_const(0);
+                add_placeholder_for_clarity_type(then, &optional_list_ty);
                 then.br(block_id);
             },
             |_| {},

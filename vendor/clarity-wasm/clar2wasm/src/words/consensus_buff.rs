@@ -319,7 +319,17 @@ impl ComplexWord for FromConsensusBuff {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::crosscheck_compare_only;
+    use clarity::vm::Value;
+
+    use crate::tools::{crosscheck, crosscheck_compare_only};
+
+    #[test]
+    fn oversized_list_header_returns_none() {
+        crosscheck(
+            "(from-consensus-buff? (list 1 uint) 0x0b00000002)",
+            Ok(Some(Value::none())),
+        );
+    }
 
     #[test]
     fn exact_width_tuple_round_trips_through_consensus_bytes() {
