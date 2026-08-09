@@ -4,10 +4,8 @@
 //! time a reward cycle opens: whether the cycle selected an anchor block. Get the
 //! bit wrong and every hash from the boundary on is wrong, silently — so the
 //! tracker used to refuse to cross a boundary at all, and a follower stopped dead
-//! at the first one it met. That is [[082]], and it is what the twelve
-//! `follow_path`/`catch_up_rounds` rigs were failing on: they replay burns
-//! 360–479 with a twenty-block cycle, so the run crosses 380, 400, 420, 440 and
-//! 460, and the chain stopped at 379.
+//! at the first one it met. That is [[082]]. This focused gate derives burns
+//! 360–479 with a twenty-block cycle, so it crosses 380, 400, 420, 440 and 460.
 //!
 //! **In Nakamoto the bit is one, and that is a rule rather than an observation.**
 //! `load_nakamoto_reward_set` builds exactly one anchor status,
@@ -253,6 +251,13 @@ fn a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain() {
             derived.consensus_hash.to_string(),
             snapshot.consensus_hash.trim_start_matches("0x"),
             "burn {} derives the consensus hash the chain recorded",
+            snapshot.block_height
+        );
+        let expected_winner =
+            (snapshot.sortition != 0).then(|| decode32(&snapshot.winning_block_txid));
+        assert_eq!(
+            derived.winner_txid, expected_winner,
+            "burn {} derives the winner the chain recorded",
             snapshot.block_height
         );
         checked += 1;

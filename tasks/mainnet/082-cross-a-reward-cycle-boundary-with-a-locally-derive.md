@@ -54,8 +54,9 @@ gates both sit on the far side of this.
 - [x] Keep the refusal for the case that remains genuinely unanswerable, and say
       which of the two it is: a node that cannot yet decide, and a node whose state
       does not reach the prepare phase at all.
-- [x] Extend the captured-fixture gate across at least one boundary, so the rigs
-      that lost their peer fallback replay the whole capture locally again.
+- [~] Derive the captured Bitcoin snapshots across a boundary without a peer.
+      The focused derivation crosses all five boundaries; the execution rigs do
+      not yet replay the whole capture across one.
 - [ ] Cross a boundary on mainnet with the derived chain and compare the resulting
       consensus hashes against a stock node's for the whole cycle after it.
 
@@ -225,8 +226,21 @@ vector off every captured identifier independently and asserts one bit per
 boundary and no bit anywhere else — 20 bits at 379, 25 at 479. Neither is
 skip-gated.
 
-The conformance suite is **254 passed, 0 failed, 4 ignored**, from 238 passed and
-12 failed. The one acceptance criterion that stays open is the live crossing:
-a node holding mainnet tip across a cycle rollover, which is 053's soak and is
-blocked on the mainnet follower being restarted on a binary carrying this and
-[[088-name-a-burn-view-execution-still-has-to-reach]].
+The historical conformance count above predates later gates. Two acceptance
+criteria remain: a whole-capture execution run with zero peer sortition requests,
+and a live mainnet rollover/whole-following-cycle comparison.
+
+## Reconciliation, 2026-08-09
+
+The focused production-path differential now also compares `winner_txid` with the
+captured winner at every burn from 361 through 479, beside the existing sortition
+identifier and consensus-hash checks. The exact current-tree test passed from the
+freshly built conformance artifact:
+
+```text
+pox_boundary::a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain ... ok
+```
+
+This closes the missing winner half of the first acceptance criterion. It does not
+substitute for executing the captured Nakamoto blocks across the boundary, and it
+does not supply the live rollover evidence, so task 082 remains in progress.

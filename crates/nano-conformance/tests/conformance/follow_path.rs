@@ -1352,12 +1352,9 @@ pub fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBloc
 /// carried on when refused would pass the first claim while still letting a
 /// reachable peer choose its burn heights.
 ///
-/// The chain is derived rather than quoted, and the served prefix stays inside one
-/// reward cycle. Both are the same limit: a checkpoint-seeded chain cannot derive
-/// across a cycle boundary, because the consensus hash mixes one bit per cycle and
-/// whether a new cycle chose an anchor block is not knowable from the burnchain
-/// alone. That is a real property of such a chain, recorded in [[049]], and not
-/// something to work around here.
+/// The chain is derived rather than quoted. The served prefix stays inside one
+/// reward cycle so this test isolates peer-sortition refusal; `pox_boundary`
+/// independently derives the captured burnchain across all five cycle boundaries.
 /// Close the same gap against a peer that *does* serve sortitions.
 ///
 /// The control, and the whole test rests on it: without a run that reached the same
