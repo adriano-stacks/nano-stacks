@@ -3621,6 +3621,37 @@ impl WasmGenerator {
         Ok(())
     }
 
+    /// Whether a function of this contract is entered the way a transaction
+    /// enters it.
+    ///
+    /// A public or read-only function reads each argument's size out of the
+    /// `argument-sizes` region rather than measuring the value itself, so every
+    /// call to one has to put them there — including the calls that do not look
+    /// like calls. `fold` and `map` apply a *named* function, and when that name
+    /// is a public or read-only one they reach the same prologue by the same
+    /// path ([[099-measure-the-arguments-fold-and-map-hand-to-a-function]]).
+    pub(crate) fn is_external_entry(&self, name: &str) -> bool {
+        self.contract_analysis
+            .get_public_function_type(name)
+            .or_else(|| self.contract_analysis.get_read_only_function_type(name))
+            .is_some()
+    }
+
+    /// Measure the value on top of the stack and keep the size for the callee.
+    ///
+    /// The value is left where it was found: this is a measurement, not a
+    /// consumption.
+    pub(crate) fn take_argument_size(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+    ) -> Result<BorrowedLocal, GeneratorError> {
+        let size = self.borrow_local(ValType::I32);
+        self.clarity_value_size_on_stack(builder, ty)?;
+        builder.local_set(*size);
+        Ok(size)
+    }
+
     /// Call a read-only function defined in the current contract.
     fn local_call_read_only(
         &mut self,

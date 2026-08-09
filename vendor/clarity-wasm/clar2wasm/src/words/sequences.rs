@@ -279,6 +279,7 @@ impl ComplexWord for Fold {
 
         // Load the element from the sequence and duck-type it to the expected type
         elem_ty.load(generator, &mut loop_, *offset)?;
+        let mut element_clar_ty: TypeSignature = (&elem_ty).into();
         if let Some(FoldFuncTy {
             elem_ty: Some(expected_elem_ty),
             ..
@@ -287,7 +288,14 @@ impl ComplexWord for Fold {
             let (l, _) = generator
                 .create_call_stack_bytes(&mut loop_, dt_needed_workspace(expected_elem_ty) as _);
             generator.duck_type(&mut loop_, &(&elem_ty).into(), expected_elem_ty, Some(l))?;
+            element_clar_ty = expected_elem_ty.clone();
         }
+        // Measured here rather than at the call, because a size is read off the
+        // top of the stack and by then the accumulator is sitting on top of it.
+        let measure_arguments = generator.is_external_entry(func.as_str());
+        let element_size = measure_arguments
+            .then(|| generator.take_argument_size(&mut loop_, &element_clar_ty))
+            .transpose()?;
 
         // Copy the accumulator for the function call. We need a copy otherwise we would overwrite the value
         // after each function call.
@@ -323,6 +331,14 @@ impl ComplexWord for Fold {
             variadic.visit(generator, &mut loop_, arg_types, &result_clar_ty)?;
         } else {
             let preallocated = generator.borrow_local(ValType::I32);
+            let argument_sizes = match element_size {
+                Some(element_size) => {
+                    let accumulator_size =
+                        generator.take_argument_size(&mut loop_, &result_clar_ty)?;
+                    Some(vec![element_size, accumulator_size])
+                }
+                None => None,
+            };
             loop_.i32_const(accumulator_offset).local_set(*preallocated);
             // Call user defined function
             generator.visit_call_user_defined(
@@ -333,7 +349,7 @@ impl ComplexWord for Fold {
                     .map_or(&result_clar_ty, |fft| &fft.return_ty),
                 fold_func_ty.as_ref().map(|fft| &fft.acc_ty),
                 Some(*preallocated),
-                None,
+                argument_sizes.as_deref(),
             )?;
         }
         // Save the result into the locals (in reverse order as we pop)
@@ -1066,6 +1082,12 @@ impl ComplexWord for Map {
                         .local_set(**args_memory_local);
                 }
 
+                // A public or read-only function reads its argument sizes out of
+                // the `argument-sizes` region, so they are measured as each
+                // argument reaches the top of the stack
+                // ([[099-measure-the-arguments-fold-and-map-hand-to-a-function]]).
+                let measure_arguments = generator.is_external_entry(fname.as_str());
+                let mut argument_sizes = Vec::new();
                 for (
                     MapArg {
                         element_type,
@@ -1088,6 +1110,10 @@ impl ComplexWord for Map {
                         &expected_arg_ty,
                         args_memory.as_ref().map(|(_, l)| **l),
                     )?;
+                    if measure_arguments {
+                        argument_sizes
+                            .push(generator.take_argument_size(&mut loop_, &expected_arg_ty)?);
+                    }
                 }
                 generator.visit_call_user_defined(
                     &mut loop_,
@@ -1095,7 +1121,7 @@ impl ComplexWord for Map {
                     &user_defined_return_type,
                     Some(return_element_type),
                     in_memory_offset,
-                    None,
+                    measure_arguments.then_some(argument_sizes.as_slice()),
                 )?;
             }
 
@@ -2328,6 +2354,50 @@ mod tests {
                     { kept: u2, extra: u3 })
                 (append (list { kept: u1 }) (wide))
             ",
+        );
+    }
+
+    /// `fold` and `map` applying a function a *transaction* could also enter.
+    ///
+    /// A public or read-only function reads each argument's size out of the
+    /// `argument-sizes` region instead of measuring the value itself, so every
+    /// call has to put them there. `fold` and `map` did not, and the compiler
+    /// answered an internal error rather than a wrong answer — the contract
+    /// could not be loaded at all. That is mainnet's
+    /// `SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.pool-0-reserve-v2-0`, and with
+    /// it mainnet block 8724865
+    /// ([[099-measure-the-arguments-fold-and-map-hand-to-a-function]]).
+    #[test]
+    fn folding_a_read_only_function_measures_its_arguments() {
+        crosscheck(
+            "(define-read-only (add (x uint) (acc uint)) (+ x acc))
+             (fold add (list u1 u2 u3) u0)",
+            Ok(Some(Value::UInt(6))),
+        );
+    }
+
+    #[test]
+    fn mapping_a_read_only_function_measures_its_arguments() {
+        crosscheck(
+            "(define-read-only (double (x uint)) (* x u2))
+             (map double (list u1 u2 u3))",
+            Ok(Some(
+                Value::cons_list_unsanitized(vec![Value::UInt(2), Value::UInt(4), Value::UInt(6)])
+                    .unwrap(),
+            )),
+        );
+    }
+
+    /// The same, with an argument whose size is not a constant.
+    #[test]
+    fn mapping_a_read_only_function_measures_a_variable_sized_argument() {
+        crosscheck(
+            "(define-read-only (size (x (string-ascii 8))) (len x))
+             (map size (list \"a\" \"abc\" \"abcdefgh\"))",
+            Ok(Some(
+                Value::cons_list_unsanitized(vec![Value::UInt(1), Value::UInt(3), Value::UInt(8)])
+                    .unwrap(),
+            )),
         );
     }
 
