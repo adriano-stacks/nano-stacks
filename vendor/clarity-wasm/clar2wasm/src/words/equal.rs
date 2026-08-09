@@ -8,7 +8,10 @@ use walrus::{InstrSeqBuilder, LocalId, ValType};
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
-use crate::wasm_generator::{clar2wasm_ty, drop_value, GeneratorError, WasmGenerator};
+use crate::layout::get_type_size;
+use crate::wasm_generator::{
+    clar2wasm_ty, drop_value, has_runtime_shape, GeneratorError, WasmGenerator,
+};
 use crate::wasm_utils::ArgumentCountCheck;
 
 #[derive(Debug)]
@@ -168,6 +171,10 @@ pub(super) fn wasm_equal(
     first_op: &[LocalId],
     nth_op: &[LocalId],
 ) -> Result<(), GeneratorError> {
+    if has_runtime_shape(ty) {
+        return wasm_equal_runtime_shape(ty, generator, builder, first_op, nth_op);
+    }
+
     match ty {
         // we should never compare NoType
         TypeSignature::NoType => {
@@ -231,6 +238,47 @@ pub(super) fn wasm_equal(
             "equality over {ty:?}"
         ))),
     }
+}
+
+fn wasm_equal_runtime_shape(
+    ty: &TypeSignature,
+    generator: &mut WasmGenerator,
+    builder: &mut InstrSeqBuilder,
+    first_op: &[LocalId],
+    nth_op: &[LocalId],
+) -> Result<(), GeneratorError> {
+    let value_size = u32::try_from(get_type_size(ty)).map_err(|_| {
+        GeneratorError::InternalError("runtime-shaped value has a negative size".to_owned())
+    })?;
+    let first_offset_value = generator.reserve_static_memory(value_size);
+    let second_offset_value = generator.reserve_static_memory(value_size);
+    let first_offset = generator.module.locals.add(ValType::I32);
+    let second_offset = generator.module.locals.add(ValType::I32);
+
+    builder
+        .i32_const(first_offset_value as i32)
+        .local_set(first_offset);
+    for local in first_op {
+        builder.local_get(*local);
+    }
+    generator.write_to_memory(builder, first_offset, 0, ty)?;
+
+    builder
+        .i32_const(second_offset_value as i32)
+        .local_set(second_offset);
+    for local in nth_op {
+        builder.local_get(*local);
+    }
+    generator.write_to_memory(builder, second_offset, 0, ty)?;
+
+    let (type_offset, type_length) = generator.serialized_type(ty)?;
+    builder
+        .i32_const(first_offset_value as i32)
+        .i32_const(second_offset_value as i32)
+        .i32_const(type_offset)
+        .i32_const(type_length)
+        .call(generator.func_by_name("stdlib.runtime_shape_is_equal"));
+    Ok(())
 }
 
 fn wasm_equal_int128(
@@ -779,5 +827,30 @@ mod tests {
             .expect("the argument evaluates")
             .expect("the argument has a value");
         crosscheck_cost(SOURCE, "different-shape", &[wide]);
+    }
+
+    #[test]
+    fn is_eq_reads_nested_narrowed_runtime_shapes() {
+        const SOURCE: &str = "
+            (define-read-only (same-nested
+                    (entry (optional { soft: bool, full: bool })))
+                (is-eq
+                    (ok (some (default-to { soft: true } entry)))
+                    (ok (some { soft: true }))))
+        ";
+
+        crosscheck(
+            &format!("{SOURCE} (same-nested (some {{ soft: true, full: true }}))"),
+            Ok(Some(Value::Bool(false))),
+        );
+        crosscheck(
+            &format!("{SOURCE} (same-nested none)"),
+            Ok(Some(Value::Bool(true))),
+        );
+
+        let wide = evaluate("(some { soft: true, full: true })")
+            .expect("the argument evaluates")
+            .expect("the argument has a value");
+        crosscheck_cost(SOURCE, "same-nested", &[wide]);
     }
 }

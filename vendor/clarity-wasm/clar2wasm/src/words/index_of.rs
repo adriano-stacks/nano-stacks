@@ -280,7 +280,7 @@ mod tests {
     use clarity::vm::types::{ListData, ListTypeData, SequenceData};
     use clarity::vm::Value;
 
-    use crate::tools::{crosscheck, evaluate, TestEnvironment};
+    use crate::tools::{crosscheck, crosscheck_cost, evaluate, TestEnvironment};
 
     #[test]
     fn index_of_list_less_than_two_args() {
@@ -528,6 +528,31 @@ mod tests {
             "(index-of (list (list (ok 2) (err 5)) (list (ok 42)) (list (err 7))) (list (err 7)))",
             Ok(Some(Value::some(Value::UInt(2)).unwrap())),
         );
+    }
+
+    #[test]
+    fn index_of_reads_narrowed_runtime_shapes() {
+        const SOURCE: &str = "
+            (define-read-only (find
+                    (entries (optional (list 1 { soft: bool, full: bool }))))
+                (index-of?
+                    (default-to (list { soft: true }) entries)
+                    { soft: true }))
+        ";
+
+        crosscheck(
+            &format!("{SOURCE} (find (some (list {{ soft: true, full: true }})))"),
+            Ok(Some(Value::none())),
+        );
+        crosscheck(
+            &format!("{SOURCE} (find none)"),
+            Ok(Some(Value::some(Value::UInt(0)).unwrap())),
+        );
+
+        let wide = evaluate("(some (list { soft: true, full: true }))")
+            .expect("the argument evaluates")
+            .expect("the argument has a value");
+        crosscheck_cost(SOURCE, "find", &[wide]);
     }
 
     //

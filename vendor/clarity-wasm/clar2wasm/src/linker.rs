@@ -269,6 +269,8 @@ pub fn link_host_functions(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
     link_save_runtime_shape_fn(linker)?;
+    link_runtime_shape_serialization_size_fn(linker)?;
+    link_runtime_shape_is_equal_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
     link_define_ft_fn(linker)?;
@@ -409,6 +411,74 @@ fn link_save_runtime_shape_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "save_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn link_runtime_shape_serialization_size_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_shape_serialization_size",
+            |caller: Caller<'_, ClarityWasmContext>, handle: i32| {
+                let size = caller
+                    .data()
+                    .load_runtime_shape(handle)?
+                    .serialized_size()
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                let size = i32::try_from(size)
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                Ok(size)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_shape_serialization_size".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn link_runtime_shape_is_equal_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_shape_is_equal",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             first_offset: i32,
+             second_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let serialized_ty = read_identifier_from_wasm(
+                    memory,
+                    &mut caller,
+                    serialized_ty_offset,
+                    serialized_ty_length,
+                )?;
+                let epoch = caller.data().global_context.epoch_id;
+                let version = *caller.data().contract_context().get_clarity_version();
+                let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
+                let first =
+                    read_from_wasm_indirect(memory, &mut caller, &value_ty, first_offset, epoch)?;
+                let second =
+                    read_from_wasm_indirect(memory, &mut caller, &value_ty, second_offset, epoch)?;
+                Ok(i32::from(first == second))
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_shape_is_equal".to_owned(),
                 error,
             ))
         })
@@ -7188,6 +7258,18 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         "clarity",
         "save_runtime_shape",
         |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "runtime_shape_serialization_size",
+        |_handle: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "runtime_shape_is_equal",
+        |_first_offset: i32, _second_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
     )?;
 
     link_skip_list(&mut linker)?;

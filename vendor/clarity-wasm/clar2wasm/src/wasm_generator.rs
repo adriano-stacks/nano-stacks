@@ -581,6 +581,19 @@ pub(crate) fn uses_packed_value(ty: &TypeSignature) -> bool {
     uses_packed_slots(0, clar2wasm_ty(ty).len())
 }
 
+pub(crate) fn has_runtime_shape(ty: &TypeSignature) -> bool {
+    match ty {
+        TypeSignature::OptionalType(inner) => has_runtime_shape(inner),
+        TypeSignature::ResponseType(inner) => {
+            has_runtime_shape(&inner.0) || has_runtime_shape(&inner.1)
+        }
+        TypeSignature::TupleType(_) | TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Functions beyond either Wasm boundary pass their values through linear memory.
 pub(crate) fn uses_packed_abi(function: &FixedFunction) -> bool {
     let params = function
@@ -885,6 +898,18 @@ impl WasmGenerator {
         let (save_shape, _) =
             module.add_import_func("clarity", "save_runtime_shape", save_shape_ty);
         module.funcs.get_mut(save_shape).name = Some("stdlib.save_runtime_shape".to_owned());
+        let shape_size_ty = module.types.add(&[ValType::I32], &[ValType::I32]);
+        let (shape_size, _) =
+            module.add_import_func("clarity", "runtime_shape_serialization_size", shape_size_ty);
+        module.funcs.get_mut(shape_size).name =
+            Some("stdlib.runtime_shape_serialization_size".to_owned());
+        let shape_equal_ty = module.types.add(
+            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            &[ValType::I32],
+        );
+        let (shape_equal, _) =
+            module.add_import_func("clarity", "runtime_shape_is_equal", shape_equal_ty);
+        module.funcs.get_mut(shape_equal).name = Some("stdlib.runtime_shape_is_equal".to_owned());
         // Get the stack-pointer global ID
         let global_id = get_global(&module, "stack-pointer")?;
 

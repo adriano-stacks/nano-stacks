@@ -6,7 +6,9 @@ use clarity::vm::types::{
 use walrus::ir::{BinaryOp, IfElse, Loop, MemArg, StoreKind};
 use walrus::{InstrSeqBuilder, LocalId, MemoryId, ValType};
 
-use crate::wasm_generator::{clar2wasm_ty, GeneratorError, WasmGenerator, MAX_WASM_TYPE_ARITY};
+use crate::wasm_generator::{
+    clar2wasm_ty, has_runtime_shape, GeneratorError, WasmGenerator, MAX_WASM_TYPE_ARITY,
+};
 
 impl WasmGenerator {
     /// Serialize an integer (`int` or `uint`) to memory using consensus
@@ -1163,6 +1165,10 @@ impl WasmGenerator {
 
     /// Tries to compute the serialization size of a simple value at compile time.
     fn serialization_size_simple(ty: &TypeSignature) -> Option<i32> {
+        if has_runtime_shape(ty) {
+            return None;
+        }
+
         match ty {
             TypeSignature::BoolType => Some(1),
             TypeSignature::IntType | TypeSignature::UIntType => Some(17),
@@ -1369,19 +1375,27 @@ impl WasmGenerator {
                     .binop(BinaryOp::I32Add);
             }
             TypeSignature::SequenceType(SequenceSubtype::ListType(ltd)) => {
-                builder.i32_const(5);
+                let &[shape_handle, offset, length] = value else {
+                    return MISMATCHED_TYPE_VALUE(ty);
+                };
+
+                let actual = builder
+                    .dangling_instr_seq(ValType::I32)
+                    .local_get(shape_handle)
+                    .call(self.func_by_name("stdlib.runtime_shape_serialization_size"))
+                    .id();
+
                 // since the actual size isn't known at compile time, and the actual size of the elements
                 // might also need to be computed at runtime, we will have to go element by element to find the
                 // result.
-                let &[_shape_handle, offset, length] = value else {
-                    return MISMATCHED_TYPE_VALUE(ty);
-                };
                 let current = self.borrow_local(ValType::I32);
                 let remaining = self.borrow_local(ValType::I32);
                 let ser_size = self.borrow_local(ValType::I32);
+                let mut projected = builder.dangling_instr_seq(ValType::I32);
+                projected.i32_const(5);
 
                 let loop_id = {
-                    let mut loop_ = builder.dangling_instr_seq(None);
+                    let mut loop_ = projected.dangling_instr_seq(None);
                     let loop_id = loop_.id();
 
                     let elem_size =
@@ -1415,7 +1429,7 @@ impl WasmGenerator {
                     loop_id
                 };
 
-                builder.local_set(*ser_size).local_get(length).if_else(
+                projected.local_set(*ser_size).local_get(length).if_else(
                     None,
                     |then| {
                         then.local_get(offset).local_set(*current);
@@ -1425,10 +1439,27 @@ impl WasmGenerator {
                     |_else| {},
                 );
 
-                builder.local_get(*ser_size);
+                projected.local_get(*ser_size);
+                let projected = projected.id();
+
+                builder.local_get(shape_handle).instr(IfElse {
+                    consequent: actual,
+                    alternative: projected,
+                });
             }
             TypeSignature::TupleType(tup) => {
-                builder.i32_const(
+                let Some((shape_handle, mut remaining)) = value.split_first() else {
+                    return MISMATCHED_TYPE_VALUE(ty);
+                };
+
+                let actual = builder
+                    .dangling_instr_seq(ValType::I32)
+                    .local_get(*shape_handle)
+                    .call(self.func_by_name("stdlib.runtime_shape_serialization_size"))
+                    .id();
+
+                let mut projected = builder.dangling_instr_seq(ValType::I32);
+                projected.i32_const(
                     tup.get_type_map()
                         .keys()
                         .map(|name| 1 + name.len() as i32)
@@ -1437,9 +1468,6 @@ impl WasmGenerator {
                 );
 
                 // we need to compute the serialization size of all elements in the tuple.
-                let Some((_shape_handle, mut remaining)) = value.split_first() else {
-                    return MISMATCHED_TYPE_VALUE(ty);
-                };
                 for elem_ty in tup.get_type_map().values() {
                     let Some((elem, rest)) =
                         remaining.split_at_checked(clar2wasm_ty(elem_ty).len())
@@ -1449,9 +1477,15 @@ impl WasmGenerator {
                     remaining = rest;
 
                     // we don't need the constant size, it was computed before.
-                    self.serialization_size_runtime(builder, elem_ty, elem)?;
-                    builder.binop(BinaryOp::I32Add);
+                    self.serialization_size_runtime(&mut projected, elem_ty, elem)?;
+                    projected.binop(BinaryOp::I32Add);
                 }
+
+                let projected = projected.id();
+                builder.local_get(*shape_handle).instr(IfElse {
+                    consequent: actual,
+                    alternative: projected,
+                });
             }
         }
         Ok(())
