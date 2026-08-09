@@ -21,7 +21,10 @@ use axum::{
     },
     routing::{get, post},
 };
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::{
+    Value as ClarityValue,
+    types::{PrincipalData, QualifiedContractIdentifier, TupleData},
+};
 use nano_address::StacksAddress;
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
@@ -43,6 +46,63 @@ pub use events::{
     stackerdb_chunks_payload,
 };
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
+
+const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;
+const MAINNET_SBTC_CONTRACT: &str = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
+const MAINNET_SBTC_REGISTRY_CONTRACT: &str =
+    "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry";
+
+/// The chain constants `/v2/pox` cannot derive from Clarity state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoxRpcConfig {
+    participation_threshold_pct: u64,
+    sbtc_contract: String,
+    sbtc_registry_contract: String,
+}
+
+impl PoxRpcConfig {
+    /// Resolve the fixed mainnet values, or validate all operator-supplied values
+    /// for a non-mainnet chain.
+    pub fn for_network(
+        network: Network,
+        participation_threshold_pct: Option<u64>,
+        sbtc_contract: Option<&str>,
+        sbtc_registry_contract: Option<&str>,
+    ) -> Result<Self, String> {
+        if network.is_mainnet() {
+            return Ok(Self {
+                participation_threshold_pct: MAINNET_POX_PARTICIPATION_THRESHOLD_PCT,
+                sbtc_contract: MAINNET_SBTC_CONTRACT.to_owned(),
+                sbtc_registry_contract: MAINNET_SBTC_REGISTRY_CONTRACT.to_owned(),
+            });
+        }
+        let participation_threshold_pct = participation_threshold_pct.ok_or_else(|| {
+            "burnchain.pox_participation_threshold_pct is required when RPC is enabled on a non-mainnet chain"
+                .to_owned()
+        })?;
+        if participation_threshold_pct > 100 {
+            return Err(format!(
+                "burnchain.pox_participation_threshold_pct must be at most 100, found {participation_threshold_pct}"
+            ));
+        }
+        let contract = |field: &str, value: Option<&str>| {
+            let value = value.ok_or_else(|| {
+                format!("{field} is required when RPC is enabled on a non-mainnet chain")
+            })?;
+            QualifiedContractIdentifier::parse(value)
+                .map(|contract| contract.to_string())
+                .map_err(|error| format!("{field} is not a contract identifier: {error}"))
+        };
+        Ok(Self {
+            participation_threshold_pct,
+            sbtc_contract: contract("node.pox_5_sbtc_contract", sbtc_contract)?,
+            sbtc_registry_contract: contract(
+                "node.pox_5_sbtc_registry_contract",
+                sbtc_registry_contract,
+            )?,
+        })
+    }
+}
 
 /// The one boundary an unsolicited block passes before a node will hold it.
 ///
@@ -196,6 +256,8 @@ pub struct RpcState {
     mempool: Option<Arc<Mutex<Mempool>>>,
     /// The chain this node is on, which no peer needs to be asked about.
     network: Network,
+    /// The `PoX` constants fixed by this chain's configuration.
+    pox_rpc: Option<PoxRpcConfig>,
     /// The reward sets this node derived, keyed by cycle.
     stacker_sets: Arc<RwLock<BTreeMap<u64, Value>>>,
     /// The `StackerDB` contracts this node replicates.
@@ -251,6 +313,7 @@ impl RpcState {
             submitted: None,
             mempool: None,
             network,
+            pox_rpc: None,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
             stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
             blocks: None,
@@ -270,6 +333,13 @@ impl RpcState {
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<Mutex<dyn ChainAccess>>) -> Self {
         self.chain = Some(chain);
+        self
+    }
+
+    /// Serve PoX-5's configured chain constants.
+    #[must_use]
+    pub fn with_pox_config(mut self, config: PoxRpcConfig) -> Self {
+        self.pox_rpc = Some(config);
         self
     }
 
@@ -535,6 +605,7 @@ async fn trace(request: axum::extract::Request, next: axum::middleware::Next) ->
 #[derive(Debug)]
 enum RpcError {
     Unavailable,
+    UnavailableBecause(String),
     NotFound,
     BadRequest(String),
     /// A refusal that carries stacks-core's own JSON body.
@@ -546,6 +617,9 @@ impl IntoResponse for RpcError {
     fn into_response(self) -> Response {
         match self {
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Self::UnavailableBecause(message) => {
+                (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+            }
             Self::NotFound => StatusCode::NOT_FOUND.into_response(),
             Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
@@ -675,6 +749,7 @@ async fn sync_status(
         .await
         .as_ref()
         .map(|executed| executed.tip.clone());
+    let observed_height = followed.max(selected.as_ref().map(|selected| selected.stacks_height));
     Ok(axum::Json(SyncStatusWire {
         followed_stacks_height: followed,
         selected_stacks_height: selected.as_ref().map(|selected| selected.stacks_height),
@@ -685,89 +760,233 @@ async fn sync_status(
         executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
         executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
         executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
-        blocks_behind: followed
+        blocks_behind: observed_height
             .zip(tip.as_ref().map(|tip| tip.stacks_height))
-            .map(|(followed, executed)| followed.saturating_sub(executed)),
+            .map(|(observed, executed)| observed.saturating_sub(executed)),
     }))
 }
 
-/// The cycle constants are this node's own, and the height is the one it
-/// executed: a caller told a burn height it can then ask no account about is
-/// being told about the peer.
-///
-/// The shape is `RPCPoxInfoData`'s, in full, because a stock signer reads this
-/// route into that type and serde refuses a document missing a field — so
-/// answering with a useful subset is answering with nothing. Where nano has the
-/// value it gives it; where it does not it gives the type's zero and says so
-/// here, which is the same rule the `new_block` payload follows.
-///
-/// What nano genuinely does not know:
-///
-/// - `pox_activation_threshold_ustx`, `total_liquid_supply_ustx` and the cycles'
-///   `stacked_ustx`: read from `.pox-5`'s `get-pox-info`, which nothing in nano
-///   calls, and no consumer of this route needs.
-/// - the epochs before 4.0. nano is a 4.0-only node started from a checkpoint at
-///   or after the boundary, so the earlier epochs are not its history to report;
-///   `epochs` carries the one it executes under and `current_epoch` names it,
-///   which is the field a signer actually reads.
-/// - the sBTC contracts, unless the operator configured them.
-async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
-    let executed = executed(&state).await?;
-    let network = state.network;
-    let pox = executed.pox.ok_or(RpcError::Unavailable)?;
-    let height = executed.tip.bitcoin_height;
-    let cycle_length = u64::from(pox.reward_phase_length + pox.prepare_phase_length);
-    let cycle = height.saturating_sub(pox.first_bitcoin_height) / cycle_length.max(1);
-    let next_start = pox.first_bitcoin_height + (cycle + 1) * cycle_length;
-    let prepare_start = next_start.saturating_sub(u64::from(pox.prepare_phase_length));
-    // The reward-slot threshold nano derived for the cycle, from its own pox-5
-    // state. Absent means nano has not resolved that cycle, which is also the
-    // honest answer to whether PoX is active as far as this node is concerned.
-    let (this_threshold, next_threshold, resolved) = {
-        let sets = state.stacker_sets.read().await;
-        let threshold = |cycle: u64| -> u64 {
-            sets.get(&cycle)
-                .and_then(|set| set.get("pox_ustx_threshold"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-        };
-        (
-            threshold(cycle),
-            threshold(cycle + 1),
-            sets.contains_key(&cycle),
-        )
+struct PoxChainValues {
+    minimum_amount: u64,
+    liquid_supply: u64,
+    current_cycle_stacked: u64,
+    next_cycle_stacked: u64,
+}
+
+fn pox_unavailable(message: impl Into<String>) -> RpcError {
+    RpcError::UnavailableBecause(message.into())
+}
+
+fn pox_read(
+    chain: &mut dyn ChainAccess,
+    network: Network,
+    function: &str,
+    arguments: &[ClarityValue],
+) -> Result<ClarityValue, RpcError> {
+    let contract = clarity::boot_util::boot_code_id("pox-5", network.is_mainnet());
+    let sender = PrincipalData::Standard(contract.issuer.clone());
+    let arguments = arguments
+        .iter()
+        .map(ClarityValue::serialize_to_vec)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            pox_unavailable(format!("cannot encode pox-5.{function} arguments: {error}"))
+        })?;
+    chain
+        .call_read_only(&ReadOnlyCall {
+            sender,
+            sponsor: None,
+            contract,
+            function: function.to_owned(),
+            arguments,
+        })
+        .map_err(|error| {
+            let reason = match error {
+                ChainAccessError::Unavailable(reason) | ChainAccessError::Failed(reason) => reason,
+                ChainAccessError::NotReadOnly => "the call attempted to write state".to_owned(),
+            };
+            pox_unavailable(format!("cannot read pox-5.{function}: {reason}"))
+        })
+}
+
+fn pox_u64(value: &ClarityValue, context: &str) -> Result<u64, RpcError> {
+    let ClarityValue::UInt(value) = value else {
+        return Err(pox_unavailable(format!(
+            "pox-5.{context} did not return a uint"
+        )));
     };
-    let activation = u64::from(pox.pox_5_activation_height.unwrap_or_default());
-    Ok(axum::Json(json!({
+    (*value).try_into().map_err(|_| {
+        pox_unavailable(format!(
+            "pox-5.{context} returned a value larger than a u64"
+        ))
+    })
+}
+
+fn pox_tuple(value: ClarityValue) -> Result<TupleData, RpcError> {
+    let ClarityValue::Response(response) = value else {
+        return Err(pox_unavailable(
+            "pox-5.get-pox-info did not return a response",
+        ));
+    };
+    if !response.committed {
+        return Err(pox_unavailable("pox-5.get-pox-info returned an error"));
+    }
+    let ClarityValue::Tuple(tuple) = *response.data else {
+        return Err(pox_unavailable(
+            "pox-5.get-pox-info did not return an ok tuple",
+        ));
+    };
+    Ok(tuple)
+}
+
+fn pox_tuple_u64(tuple: &TupleData, field: &str) -> Result<u64, RpcError> {
+    let value = tuple
+        .get(field)
+        .map_err(|_| pox_unavailable(format!("pox-5.get-pox-info omitted {field}")))?;
+    pox_u64(value, &format!("get-pox-info.{field}"))
+}
+
+fn pox_chain_values(
+    chain: &mut dyn ChainAccess,
+    network: Network,
+    current_cycle: u64,
+    next_cycle: u64,
+) -> Result<PoxChainValues, RpcError> {
+    let info = pox_tuple(pox_read(chain, network, "get-pox-info", &[])?)?;
+    let stacked = |chain: &mut dyn ChainAccess, cycle: u64| {
+        pox_read(
+            chain,
+            network,
+            "get-total-ustx-stacked",
+            &[ClarityValue::UInt(u128::from(cycle))],
+        )
+        .and_then(|value| pox_u64(&value, "get-total-ustx-stacked"))
+    };
+    Ok(PoxChainValues {
+        minimum_amount: pox_tuple_u64(&info, "min-amount-ustx")?,
+        liquid_supply: pox_tuple_u64(&info, "total-liquid-supply-ustx")?,
+        current_cycle_stacked: stacked(chain, current_cycle)?,
+        next_cycle_stacked: stacked(chain, next_cycle)?,
+    })
+}
+
+struct PoxCyclePosition {
+    height: u64,
+    cycle_length: u64,
+    current_cycle: u64,
+    next_cycle: u64,
+    next_start: u64,
+    prepare_start: u64,
+    blocks_until_prepare: i64,
+    blocks_until_reward: u64,
+    activation: u64,
+    first_reward_cycle: u64,
+}
+
+fn pox_cycle_position(pox: &PoxInfo, height: u64) -> Result<PoxCyclePosition, RpcError> {
+    let cycle_length = u64::from(pox.reward_phase_length)
+        .checked_add(u64::from(pox.prepare_phase_length))
+        .filter(|length| *length != 0)
+        .ok_or_else(|| pox_unavailable("the PoX reward cycle length is invalid"))?;
+    let effective_height = height
+        .checked_sub(pox.first_bitcoin_height)
+        .ok_or_else(|| {
+            pox_unavailable("the executed burn height precedes the first PoX burn block")
+        })?;
+    let current_cycle = effective_height / cycle_length;
+    let next_cycle = current_cycle
+        .checked_add(1)
+        .ok_or_else(|| pox_unavailable("the PoX reward cycle overflowed"))?;
+    let next_start = next_cycle
+        .checked_mul(cycle_length)
+        .and_then(|offset| pox.first_bitcoin_height.checked_add(offset))
+        .ok_or_else(|| pox_unavailable("the next PoX reward-cycle height overflowed"))?;
+    let prepare_start = next_start
+        .checked_sub(u64::from(pox.prepare_phase_length))
+        .ok_or_else(|| pox_unavailable("the next PoX prepare height underflowed"))?;
+    let blocks_until_prepare = i64::try_from(prepare_start)
+        .and_then(|prepare| i64::try_from(height).map(|height| (prepare, height)))
+        .ok()
+        .and_then(|(prepare, height)| prepare.checked_sub(height))
+        .ok_or_else(|| pox_unavailable("the next PoX prepare distance overflowed"))?;
+    let blocks_until_reward = next_start
+        .checked_sub(height)
+        .ok_or_else(|| pox_unavailable("the next PoX reward distance underflowed"))?;
+    let activation = u64::from(
+        pox.pox_5_activation_height
+            .ok_or_else(|| pox_unavailable("the PoX-5 activation height is unavailable"))?,
+    );
+    let first_reward_cycle = activation
+        .checked_sub(pox.first_bitcoin_height)
+        .ok_or_else(|| pox_unavailable("the PoX-5 activation precedes PoX"))?
+        / cycle_length;
+    let first_reward_cycle = first_reward_cycle
+        .checked_add(1)
+        .ok_or_else(|| pox_unavailable("the first PoX-5 reward cycle overflowed"))?;
+
+    Ok(PoxCyclePosition {
+        height,
+        cycle_length,
+        current_cycle,
+        next_cycle,
+        next_start,
+        prepare_start,
+        blocks_until_prepare,
+        blocks_until_reward,
+        activation,
+        first_reward_cycle,
+    })
+}
+
+async fn read_pox_chain_values(
+    state: &RpcState,
+    network: Network,
+    cycle: &PoxCyclePosition,
+) -> Result<PoxChainValues, RpcError> {
+    let chain = state.chain()?;
+    let mut chain = chain.lock().await;
+    pox_chain_values(&mut *chain, network, cycle.current_cycle, cycle.next_cycle)
+}
+
+fn pox_info_json(
+    network: Network,
+    pox: &PoxInfo,
+    configured: &PoxRpcConfig,
+    cycle: &PoxCyclePosition,
+    values: &PoxChainValues,
+    activation_threshold: u64,
+    resolved: bool,
+) -> Value {
+    json!({
         "contract_id": network.boot_contract_id("pox-5"),
-        "pox_activation_threshold_ustx": 0,
+        "pox_activation_threshold_ustx": activation_threshold,
         "first_burnchain_block_height": pox.first_bitcoin_height,
-        "current_burnchain_block_height": height,
+        "current_burnchain_block_height": cycle.height,
         "prepare_phase_block_length": pox.prepare_phase_length,
         "reward_phase_block_length": pox.reward_phase_length,
         "reward_slots": pox.reward_slots,
         "rejection_fraction": pox.rejection_fraction,
-        "total_liquid_supply_ustx": 0,
+        "total_liquid_supply_ustx": values.liquid_supply,
         "current_cycle": {
-            "id": cycle,
-            "min_threshold_ustx": this_threshold,
-            "stacked_ustx": 0,
+            "id": cycle.current_cycle,
+            "min_threshold_ustx": values.minimum_amount,
+            "stacked_ustx": values.current_cycle_stacked,
             "is_pox_active": resolved,
         },
         "next_cycle": {
-            "id": cycle + 1,
-            "min_threshold_ustx": next_threshold,
-            "min_increment_ustx": 0,
-            "stacked_ustx": 0,
-            "prepare_phase_start_block_height": prepare_start,
-            "blocks_until_prepare_phase": prepare_start.cast_signed() - height.cast_signed(),
-            "reward_phase_start_block_height": next_start,
-            "blocks_until_reward_phase": next_start.saturating_sub(height),
+            "id": cycle.next_cycle,
+            "min_threshold_ustx": values.minimum_amount,
+            "min_increment_ustx": values.minimum_amount,
+            "stacked_ustx": values.next_cycle_stacked,
+            "prepare_phase_start_block_height": cycle.prepare_start,
+            "blocks_until_prepare_phase": cycle.blocks_until_prepare,
+            "reward_phase_start_block_height": cycle.next_start,
+            "blocks_until_reward_phase": cycle.blocks_until_reward,
             "ustx_until_pox_rejection": Value::Null,
         },
         "epochs": [{
             "epoch_id": "Epoch40",
-            "start_height": activation,
+            "start_height": cycle.activation,
             "end_height": i64::MAX,
             "block_limit": {
                 "write_length": 15_000_000,
@@ -779,21 +998,54 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, Rp
             "network_epoch": 16,
         }],
         "current_epoch": "Epoch40",
-        "min_amount_ustx": this_threshold,
+        "min_amount_ustx": values.minimum_amount,
         "prepare_cycle_length": pox.prepare_phase_length,
-        "reward_cycle_id": cycle,
-        "reward_cycle_length": cycle_length,
+        "reward_cycle_id": cycle.current_cycle,
+        "reward_cycle_length": cycle.cycle_length,
         "rejection_votes_left_required": Value::Null,
-        "next_reward_cycle_in": next_start.saturating_sub(height),
+        "next_reward_cycle_in": cycle.blocks_until_reward,
         "contract_versions": [{
             "contract_id": network.boot_contract_id("pox-5"),
-            "activation_burnchain_block_height": activation,
-            "first_reward_cycle_id": activation.saturating_sub(pox.first_bitcoin_height)
-                / cycle_length.max(1),
+            "activation_burnchain_block_height": cycle.activation,
+            "first_reward_cycle_id": cycle.first_reward_cycle,
         }],
-        "pox_5_sbtc_contract": "",
-        "pox_5_sbtc_registry_contract": "",
-    })))
+        "pox_5_sbtc_contract": configured.sbtc_contract.as_str(),
+        "pox_5_sbtc_registry_contract": configured.sbtc_registry_contract.as_str(),
+    })
+}
+
+/// The cycle constants are this node's own, and the height and token totals come
+/// from the Clarity state it executed. A missing or malformed local answer is an
+/// unavailable route, never a plausible zero.
+async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
+    let executed = executed(&state).await?;
+    let network = state.network;
+    let pox = executed.pox.ok_or(RpcError::Unavailable)?;
+    let configured = state
+        .pox_rpc
+        .as_ref()
+        .ok_or_else(|| pox_unavailable("PoX RPC constants were not installed at startup"))?;
+    let cycle = pox_cycle_position(&pox, executed.tip.bitcoin_height)?;
+    let values = read_pox_chain_values(&state, network, &cycle).await?;
+    let activation_threshold = u128::from(values.liquid_supply)
+        .checked_mul(u128::from(configured.participation_threshold_pct))
+        .map(|value| value / 100)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| pox_unavailable("the PoX participation threshold overflowed"))?;
+    let resolved = state
+        .stacker_sets
+        .read()
+        .await
+        .contains_key(&cycle.current_cycle);
+    Ok(axum::Json(pox_info_json(
+        network,
+        &pox,
+        configured,
+        &cycle,
+        &values,
+        activation_threshold,
+        resolved,
+    )))
 }
 
 async fn tenure_info(
@@ -1908,9 +2160,16 @@ mod tests {
     use reqwest::Url;
     use tower::ServiceExt;
 
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{Arc, Mutex as StdMutex},
+    };
 
-    use clarity::vm::{Value, types::PrincipalData};
+    use clarity::vm::{
+        Value,
+        representations::ClarityName,
+        types::{PrincipalData, TupleData},
+    };
     use nano_address::StacksAddress;
     use nano_codec::{
         AnchorMode, Principal, Transaction, TransactionPayloadData, TransactionVersion,
@@ -1922,8 +2181,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, ReadOnlyCall,
-        Router, RpcState, SealedTip, mpsc, router,
+        AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, PoxRpcConfig,
+        ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -1932,6 +2191,10 @@ mod tests {
 
     /// The events an observer has been sent, by path and payload.
     type Received = Arc<std::sync::Mutex<Vec<(String, Json)>>>;
+    type ScriptedChainFixture = (
+        Arc<Mutex<dyn ChainAccess>>,
+        Arc<StdMutex<Vec<ReadOnlyCall>>>,
+    );
 
     const NETWORK: Network = Network::TESTNET;
 
@@ -1955,6 +2218,30 @@ mod tests {
         fn call_read_only(&mut self, call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
             self.answer.clone().ok_or_else(|| {
                 ChainAccessError::Failed(format!("no such function {}", call.function))
+            })
+        }
+    }
+
+    struct ScriptedChain {
+        answers: VecDeque<Result<Value, ChainAccessError>>,
+        calls: Arc<StdMutex<Vec<ReadOnlyCall>>>,
+    }
+
+    impl ChainAccess for ScriptedChain {
+        fn account(
+            &mut self,
+            _principal: &PrincipalData,
+        ) -> Result<AccountEntry, ChainAccessError> {
+            Ok(AccountEntry::default())
+        }
+
+        fn call_read_only(&mut self, call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
+            self.calls.lock().expect("call log").push(call.clone());
+            self.answers.pop_front().unwrap_or_else(|| {
+                Err(ChainAccessError::Failed(format!(
+                    "no answer for {}",
+                    call.function
+                )))
             })
         }
     }
@@ -1994,6 +2281,13 @@ mod tests {
         serde_json::from_slice(&bytes).expect("decode body")
     }
 
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("UTF-8 body")
+    }
+
     fn chain(
         accounts: &[(StacksAddress, AccountEntry)],
         answer: Option<Value>,
@@ -2005,6 +2299,33 @@ mod tests {
                 .collect(),
             answer,
         }))
+    }
+
+    fn scripted_chain(
+        answers: impl IntoIterator<Item = Result<Value, ChainAccessError>>,
+    ) -> ScriptedChainFixture {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        (
+            Arc::new(Mutex::new(ScriptedChain {
+                answers: answers.into_iter().collect(),
+                calls: calls.clone(),
+            })),
+            calls,
+        )
+    }
+
+    fn pox_contract_info(min_amount: Value, total_liquid_supply: Value) -> Value {
+        Value::okay(Value::Tuple(
+            TupleData::from_data(vec![
+                (ClarityName::from_literal("min-amount-ustx"), min_amount),
+                (
+                    ClarityName::from_literal("total-liquid-supply-ustx"),
+                    total_liquid_supply,
+                ),
+            ])
+            .expect("a PoX info tuple"),
+        ))
+        .expect("an ok response")
     }
 
     #[tokio::test]
@@ -2277,6 +2598,253 @@ mod tests {
                 },
                 blocks: Vec::new(),
             }],
+        }
+    }
+
+    fn pox_config() -> PoxRpcConfig {
+        PoxRpcConfig::for_network(
+            NETWORK,
+            Some(5),
+            Some("ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token"),
+            Some("ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-registry"),
+        )
+        .expect("a non-mainnet PoX RPC configuration")
+    }
+
+    async fn pox_state(chain: Arc<Mutex<dyn ChainAccess>>) -> RpcState {
+        let state = RpcState::new(NETWORK)
+            .with_pox_config(pox_config())
+            .with_chain(chain);
+        state.publish(captured_view()).await;
+        state
+            .publish_executed(
+                SealedTip {
+                    stacks_height: 12,
+                    stacks_tip: StacksBlockId::from_bytes([6; 32]),
+                    stacks_block_hash: BlockHeaderHash::from_bytes([7; 32]),
+                    consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                    bitcoin_height: 11,
+                    state_index_root: TrieHash::from_bytes([8; 32]),
+                },
+                Vec::new(),
+            )
+            .await;
+        state
+    }
+
+    #[test]
+    fn pox_rpc_configuration_is_fixed_on_mainnet_and_complete_elsewhere() {
+        let mainnet =
+            PoxRpcConfig::for_network(Network::MAINNET, Some(100), Some("not a contract"), None)
+                .expect("mainnet ignores operator overrides");
+        assert_eq!(mainnet.participation_threshold_pct, 5);
+        assert_eq!(
+            mainnet.sbtc_contract,
+            "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token"
+        );
+        assert_eq!(
+            mainnet.sbtc_registry_contract,
+            "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry"
+        );
+
+        for (name, percent, token, registry, expected) in [
+            (
+                "missing percent",
+                None,
+                Some("ST000000000000000000002AMW42H.sbtc-token"),
+                Some("ST000000000000000000002AMW42H.sbtc-registry"),
+                "pox_participation_threshold_pct is required",
+            ),
+            (
+                "invalid percent",
+                Some(101),
+                Some("ST000000000000000000002AMW42H.sbtc-token"),
+                Some("ST000000000000000000002AMW42H.sbtc-registry"),
+                "at most 100",
+            ),
+            (
+                "missing token",
+                Some(5),
+                None,
+                Some("ST000000000000000000002AMW42H.sbtc-registry"),
+                "node.pox_5_sbtc_contract is required",
+            ),
+            (
+                "malformed registry",
+                Some(5),
+                Some("ST000000000000000000002AMW42H.sbtc-token"),
+                Some("not-a-contract"),
+                "node.pox_5_sbtc_registry_contract is not a contract identifier",
+            ),
+        ] {
+            let error = PoxRpcConfig::for_network(NETWORK, percent, token, registry)
+                .expect_err("an incomplete non-mainnet configuration is refused");
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pox_info_reads_the_exact_local_values_and_serves_the_stock_shape() {
+        let (chain, calls) = scripted_chain([
+            Ok(pox_contract_info(
+                Value::UInt(50_000),
+                Value::UInt(4_000_000),
+            )),
+            Ok(Value::UInt(1_250_000)),
+            Ok(Value::UInt(2_500_000)),
+        ]);
+        let response = router(pox_state(chain).await)
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/pox")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "contract_id": "ST000000000000000000002AMW42H.pox-5",
+                "pox_activation_threshold_ustx": 200_000,
+                "first_burnchain_block_height": 0,
+                "current_burnchain_block_height": 11,
+                "prepare_phase_block_length": 5,
+                "reward_phase_block_length": 15,
+                "reward_slots": 2,
+                "rejection_fraction": Json::Null,
+                "total_liquid_supply_ustx": 4_000_000,
+                "current_cycle": {
+                    "id": 0,
+                    "min_threshold_ustx": 50_000,
+                    "stacked_ustx": 1_250_000,
+                    "is_pox_active": false,
+                },
+                "next_cycle": {
+                    "id": 1,
+                    "min_threshold_ustx": 50_000,
+                    "min_increment_ustx": 50_000,
+                    "stacked_ustx": 2_500_000,
+                    "prepare_phase_start_block_height": 15,
+                    "blocks_until_prepare_phase": 4,
+                    "reward_phase_start_block_height": 20,
+                    "blocks_until_reward_phase": 9,
+                    "ustx_until_pox_rejection": Json::Null,
+                },
+                "epochs": [{
+                    "epoch_id": "Epoch40",
+                    "start_height": 262,
+                    "end_height": i64::MAX,
+                    "block_limit": {
+                        "write_length": 15_000_000,
+                        "write_count": 15_000,
+                        "read_length": 200_000_000,
+                        "read_count": 30_000,
+                        "runtime": 5_000_000_000u64,
+                    },
+                    "network_epoch": 16,
+                }],
+                "current_epoch": "Epoch40",
+                "min_amount_ustx": 50_000,
+                "prepare_cycle_length": 5,
+                "reward_cycle_id": 0,
+                "reward_cycle_length": 20,
+                "rejection_votes_left_required": Json::Null,
+                "next_reward_cycle_in": 9,
+                "contract_versions": [{
+                    "contract_id": "ST000000000000000000002AMW42H.pox-5",
+                    "activation_burnchain_block_height": 262,
+                    "first_reward_cycle_id": 14,
+                }],
+                "pox_5_sbtc_contract":
+                    "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token",
+                "pox_5_sbtc_registry_contract":
+                    "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-registry",
+            })
+        );
+
+        let calls = calls.lock().expect("call log");
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| {
+            call.sender.to_string() == "ST000000000000000000002AMW42H"
+                && call.contract.to_string() == "ST000000000000000000002AMW42H.pox-5"
+                && call.sponsor.is_none()
+        }));
+        assert_eq!(calls[0].function, "get-pox-info");
+        assert!(calls[0].arguments.is_empty());
+        for (call, cycle) in calls[1..].iter().zip([0, 1]) {
+            assert_eq!(call.function, "get-total-ustx-stacked");
+            assert_eq!(
+                call.arguments,
+                vec![Value::UInt(cycle).serialize_to_vec().expect("a uint")]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pox_info_never_turns_a_bad_local_read_into_zero() {
+        let missing = Value::okay(Value::Tuple(
+            TupleData::from_data(vec![(
+                ClarityName::from_literal("min-amount-ustx"),
+                Value::UInt(50_000),
+            )])
+            .expect("a tuple"),
+        ))
+        .expect("an ok response");
+        let cases = [
+            (
+                "missing",
+                vec![Ok(missing)],
+                "omitted total-liquid-supply-ustx",
+            ),
+            (
+                "malformed",
+                vec![Ok(pox_contract_info(
+                    Value::UInt(50_000),
+                    Value::Bool(false),
+                ))],
+                "did not return a uint",
+            ),
+            (
+                "overflow",
+                vec![Ok(pox_contract_info(
+                    Value::UInt(50_000),
+                    Value::UInt(u128::from(u64::MAX) + 1),
+                ))],
+                "larger than a u64",
+            ),
+            (
+                "execution error",
+                vec![Err(ChainAccessError::Failed("MARF read failed".to_owned()))],
+                "cannot read pox-5.get-pox-info: MARF read failed",
+            ),
+            (
+                "malformed stacked amount",
+                vec![
+                    Ok(pox_contract_info(
+                        Value::UInt(50_000),
+                        Value::UInt(4_000_000),
+                    )),
+                    Ok(Value::Bool(false)),
+                ],
+                "get-total-ustx-stacked did not return a uint",
+            ),
+        ];
+        for (name, answers, expected) in cases {
+            let (chain, _) = scripted_chain(answers);
+            let response = router(pox_state(chain).await)
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/pox")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            let body = body_text(response).await;
+            assert!(body.contains(expected), "{name}: {body}");
         }
     }
 
@@ -2558,6 +3126,50 @@ mod tests {
         // is measured against what the network has, and a fork choice that
         // refused the peer's tip does not shorten the journey.
         assert_eq!(status["blocks_behind"], json!(8));
+    }
+
+    /// A failed full poll must not hide the newer tip fork choice already found.
+    #[tokio::test]
+    async fn a_selected_tip_ahead_of_a_stale_followed_height_is_still_behind() {
+        let state = RpcState::new(NETWORK);
+        state.publish_followed_height(4).await;
+        state
+            .publish_selected(super::SelectedTip {
+                stacks_height: 9,
+                stacks_tip: StacksBlockId::from_bytes([9; 32]),
+                peer: "http://peer.example:20443/".to_owned(),
+            })
+            .await;
+        state
+            .publish_executed(
+                SealedTip {
+                    stacks_height: 4,
+                    stacks_tip: StacksBlockId::from_bytes([4; 32]),
+                    stacks_block_hash: BlockHeaderHash::from_bytes([5; 32]),
+                    consensus_hash: ConsensusHash::from_bytes([6; 20]),
+                    bitcoin_height: 3,
+                    state_index_root: TrieHash::from_bytes([7; 32]),
+                },
+                Vec::new(),
+            )
+            .await;
+
+        let status = body_json(
+            router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/nano/sync_status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(status["followed_stacks_height"], json!(4));
+        assert_eq!(status["selected_stacks_height"], json!(9));
+        assert_eq!(status["executed_stacks_height"], json!(4));
+        assert_eq!(status["blocks_behind"], json!(5));
     }
 
     /// A node that has followed a peer but executed nothing must not answer the

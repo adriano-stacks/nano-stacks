@@ -350,6 +350,8 @@ chain_id = $chain_id
 peers = ["$peer/"]
 ${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
 ${NANO_PROPOSAL_TOKEN:+block_proposal_token = \"$NANO_PROPOSAL_TOKEN\"}
+pox_5_sbtc_contract = "$(compose_value POX_5_SBTC_CONTRACT)"
+pox_5_sbtc_registry_contract = "$(compose_value POX_5_SBTC_REGISTRY_CONTRACT)"
 event_observers = [${NANO_EVENT_OBSERVERS:+\"${NANO_EVENT_OBSERVERS//,/\", \"}\"}]
 
 [burnchain]
@@ -357,6 +359,7 @@ rpc_url = "$BITCOIN_RPC"
 rpc_user = "$(compose_value BITCOIN_RPC_USER)"
 rpc_password = "$(compose_value BITCOIN_RPC_PASS)"
 magic = "${NANO_BITCOIN_MAGIC:-T3}"
+pox_participation_threshold_pct = 1
 
 [checkpoint]
 marf = "$RUN/checkpoint/marf.sqlite"

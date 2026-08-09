@@ -2204,7 +2204,9 @@ async fn start_rpc(
     let Some(address) = config.node.rpc_bind else {
         return Ok(None);
     };
+    let pox_rpc = config.pox_rpc_config(network)?;
     let mut state = RpcState::new(network)
+        .with_pox_config(pox_rpc)
         .with_mempool(mempool)
         .with_block_sink(blocks)
         .with_chunk_relay(chunks)
@@ -3624,8 +3626,6 @@ async fn terminated() {
 
 #[cfg(test)]
 mod tests {
-    /// Every execution batch says where it started, where it ended, how many
-    /// blocks that was and the root it sealed — and a batch that executed nothing
     use std::{collections::BTreeMap, fs, path::Path};
 
     use nano_bitcoin::{
@@ -3639,6 +3639,8 @@ mod tests {
     use nano_primitives::{ConsensusHash, Network, TrieHash};
     use nano_sync::PoxInfo;
 
+    /// Every execution batch says where it started, where it ended, how many
+    /// blocks that was and the root it sealed — and a batch that executed nothing
     /// says *that*, in a sentence nothing else produces.
     ///
     /// This is the line an operator reads to know whether a node is moving. It
@@ -3718,8 +3720,6 @@ mod tests {
         }
     }
 
-    /// The cycle a checkpointed node starts in has no pox-5 positions to walk,
-    /// and the checkpoint is the only thing that can answer for it.
     fn captured_fixtures() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures")
     }
@@ -4190,6 +4190,8 @@ authentication_history = "{}"
         }
     }
 
+    /// The cycle a checkpointed node starts in has no pox-5 positions to walk,
+    /// and the checkpoint is the only thing that can answer for it.
     ///
     /// Mainnet's cycle 140 was stacked in pox-4, before the boundary the export
     /// was taken at, so `active_signer_set` finds nothing and is right to. The

@@ -38,6 +38,23 @@ execution.
       production transitions.
 - [x] Serve every route from the coherent executed snapshot established by
       [[046-distinguish-followed-and-executed-chain-tips]].
+- [x] Make `blocks_behind` remain truthful when fork choice has selected a tip
+      above execution but the full followed view failed to publish. The live
+      node currently reports selected 8,724,890, followed/executed 8,724,697,
+      and zero behind; the selected and executed facts are present, so the
+      derived distance must not silently use the stale followed height.
+
+      **Verified 2026-08-09.** `/nano/sync_status` now measures
+      `max(followed, selected) - executed`. `cargo test -p nano-rpc
+      a_selected_tip_ahead_of_a_stale_followed_height_is_still_behind` preserves
+      the live failure shape (selected 9, followed/executed 4) and reports five
+      behind; `cargo test -p nano-rpc
+      the_followed_selected_and_executed_tips_are_three_separate_answers` keeps
+      the network-gap contract (followed 12, selected 9, executed 4) at eight.
+      `cargo check -p nano-rpc -p nano-node --all-targets` and `cargo clippy -p
+      nano-rpc -p nano-node --all-targets -- -D warnings` both passed. The same
+      serialized batch passed all three PoX RPC tests, the non-mainnet config
+      test, `bash -n hacknet/harness.sh`, and `git diff --check`.
 - [x] Exercise an event observer against the binary and retain delivered
       `new_block`, burn-block and proposal-response payloads.
 - [~] Run a stock `stacks-signer` against the binary without a compatibility

@@ -10,6 +10,7 @@ use std::{fmt, fs, io, net::SocketAddr, path::PathBuf};
 use nano_address::StacksAddress;
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use nano_primitives::{Network, TrieHash};
+use nano_rpc::PoxRpcConfig;
 use nano_stackerdb::StackerDbContract;
 use reqwest::Url;
 use serde::Deserialize;
@@ -78,6 +79,12 @@ pub struct NodeConfig {
     /// their choosing, so there is no default: a node that was not given a token
     /// answers `503` rather than inventing one.
     pub block_proposal_token: Option<String>,
+    /// Where this chain's sBTC token is deployed, as `<address>.<name>`.
+    ///
+    /// Mainnet's token is fixed and this is ignored there. A non-mainnet RPC
+    /// must name its deployment because the public `PoX` response is part of the
+    /// signer-facing wire contract.
+    pub pox_5_sbtc_contract: Option<String>,
     /// Where this chain's sBTC registry is deployed, as `<address>.<name>`.
     ///
     /// The single output a waterfall reward cycle pays is derived from that
@@ -133,6 +140,11 @@ pub struct BurnchainConfig {
     pub magic: String,
     /// Bitcoin height at which PoX-5 activates, when the peers cannot say.
     pub pox_5_activation_height: Option<u32>,
+    /// The liquid STX participation percentage which activates `PoX`.
+    ///
+    /// Mainnet's value is fixed. Other chains must state theirs when they serve
+    /// the `PoX` RPC because it cannot be recovered from the boot contract.
+    pub pox_participation_threshold_pct: Option<u64>,
 }
 
 /// The state this node starts executing from, the first time it starts.
@@ -294,6 +306,9 @@ impl Config {
         config.checkpoint.state_root()?;
         config.node.peers()?;
         config.node.event_observers()?;
+        if let (Some(network), Some(_)) = (config.network(), config.node.rpc_bind) {
+            config.pox_rpc_config(network)?;
+        }
         if let Some(signer) = &config.signer {
             signer.private_key()?;
         }
@@ -329,6 +344,17 @@ impl Config {
     #[must_use]
     pub fn chainstate_dir(&self, role: &str) -> PathBuf {
         self.node.working_dir.join(role)
+    }
+
+    /// The fixed and operator-supplied values the `PoX` RPC needs for this chain.
+    pub fn pox_rpc_config(&self, network: Network) -> Result<PoxRpcConfig, ConfigError> {
+        PoxRpcConfig::for_network(
+            network,
+            self.burnchain.pox_participation_threshold_pct,
+            self.node.pox_5_sbtc_contract.as_deref(),
+            self.node.pox_5_sbtc_registry_contract.as_deref(),
+        )
+        .map_err(ConfigError::Invalid)
     }
 }
 
@@ -584,6 +610,66 @@ mod tests {
         miner.block_signing_private_key().expect("miner key");
         miner.vrf_private_key().expect("VRF key");
         assert_eq!(miner.commitment_sats, 20_000);
+    }
+
+    #[test]
+    fn a_non_mainnet_rpc_requires_complete_pox_constants() {
+        let rpc = MINIMAL
+            .replace(
+                "peers = [\"http://127.0.0.1:20443/\"]",
+                r#"peers = ["http://127.0.0.1:20443/"]
+        rpc_bind = "127.0.0.1:20492"
+        pox_5_sbtc_contract = "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token"
+        pox_5_sbtc_registry_contract = "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-registry""#,
+            )
+            .replace(
+                "rpc_password = \"hacknet\"",
+                "rpc_password = \"hacknet\"\n        pox_participation_threshold_pct = 1",
+            );
+        Config::parse(&rpc).expect("complete non-mainnet PoX RPC constants");
+
+        for (name, text, expected) in [
+            (
+                "participation",
+                rpc.replace("        pox_participation_threshold_pct = 1\n", ""),
+                "pox_participation_threshold_pct is required",
+            ),
+            (
+                "token",
+                rpc.replace(
+                    "        pox_5_sbtc_contract = \"ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token\"\n",
+                    "",
+                ),
+                "pox_5_sbtc_contract is required",
+            ),
+            (
+                "registry",
+                rpc.replace(
+                    "        pox_5_sbtc_registry_contract = \"ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-registry\"\n",
+                    "",
+                ),
+                "pox_5_sbtc_registry_contract is required",
+            ),
+            (
+                "percentage range",
+                rpc.replace(
+                    "pox_participation_threshold_pct = 1",
+                    "pox_participation_threshold_pct = 101",
+                ),
+                "at most 100",
+            ),
+            (
+                "contract syntax",
+                rpc.replace(
+                    "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token",
+                    "not-a-contract",
+                ),
+                "not a contract identifier",
+            ),
+        ] {
+            let error = Config::parse(&text).expect_err("an invalid PoX RPC config is refused");
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
     }
 
     #[test]
