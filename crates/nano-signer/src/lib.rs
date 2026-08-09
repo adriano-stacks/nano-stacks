@@ -304,7 +304,7 @@ where
             .block_at(bitcoin_context.height)
             .map_err(|error| format!("could not load Bitcoin operations: {error}"))?;
         self.chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_nakamoto_proposal_with_bitcoin_operations(
                 bitcoin_context,
                 &operations.operations,
                 Some(*block.header.parent_block_id.as_bytes()),

@@ -66,6 +66,7 @@ mod pox_boundary;
 mod pox_five_replay;
 mod pox_locking;
 mod pre_checkpoint_headers;
+mod proposal_failover;
 mod rejected_blocks;
 mod release_dependencies;
 mod release_inventory;

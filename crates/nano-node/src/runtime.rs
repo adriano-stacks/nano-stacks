@@ -1819,6 +1819,36 @@ pub async fn open_executor(
     peers: &mut TenureSource,
     directory: &Path,
 ) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
+    open_executor_with_sortition_copy(config, network, pox, peers, directory, None).await
+}
+
+pub(crate) async fn open_validator_executor(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peers: &mut TenureSource,
+    directory: &Path,
+    sortition_state: &Path,
+) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
+    open_executor_with_sortition_copy(
+        config,
+        network,
+        pox,
+        peers,
+        directory,
+        Some(sortition_state),
+    )
+    .await
+}
+
+async fn open_executor_with_sortition_copy(
+    config: &Config,
+    network: Network,
+    pox: &PoxInfo,
+    peers: &mut TenureSource,
+    directory: &Path,
+    sortition_copy: Option<&Path>,
+) -> Result<CheckpointExecutor<BurnchainSource>, Box<dyn Error>> {
     let (mut chainstate, anchor, context) =
         open_chainstate(config, network, pox, peers, directory).await?;
     let checkpoint_history = context
@@ -1859,6 +1889,9 @@ pub async fn open_executor(
         }
         None => CheckpointExecutor::resume(chainstate, anchor, bitcoin),
     };
+    if let Some(state) = sortition_copy {
+        tracker.save_standing_on(state, executor.bitcoin_height())?;
+    }
     executor.track_sortitions(tracker, config.node.working_dir.clone());
     Ok(executor)
 }

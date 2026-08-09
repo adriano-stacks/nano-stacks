@@ -22,7 +22,9 @@
 
 use std::{fs, time::Instant};
 
-use crate::binary_restart::{PATIENCE, Running, free_port, serve_burnchain, write_config};
+use crate::binary_restart::{
+    PATIENCE, Running, authenticated_anchor_index, free_port, serve_burnchain, write_config,
+};
 use crate::follow_path::{Served, alternative_history, captured_chain, serve, snapshots};
 
 /// Blocks the peer serves above the anchor.
@@ -65,19 +67,20 @@ async fn followed_height(node: &Running, at_least: u64) -> u64 {
 #[tokio::test]
 async fn a_node_that_follows_to_the_tip_and_executes_nothing_says_both() {
     let chain = captured_chain();
-    let anchor = chain.first().expect("the capture has a block").clone();
+    let anchor_index = authenticated_anchor_index(&chain);
+    let anchor = chain[anchor_index].clone();
     // Forked at the anchor, so nothing the peer serves is executable: a branch
     // sharing a prefix would have the node execute that prefix — correctly, it
     // being the canonical chain — and "executed nothing" would then be a claim
     // about the fixture.
-    let served = alternative_history(&chain[..=SERVED_BLOCKS], 1);
+    let served = alternative_history(&chain[anchor_index..=anchor_index + SERVED_BLOCKS], 1);
     let peer_tip = served.last().expect("a tip").header.chain_length;
     assert!(
         peer_tip > anchor.header.chain_length,
         "the peer is not ahead of the anchor, so there is nothing to be behind"
     );
 
-    let (burnchain, burnchain_task) = serve_burnchain().await;
+    let (burnchain, burnchain_task) = serve_burnchain();
     let (peer, peer_task) = serve(Served::honest(served, snapshots())).await;
     let directory = tempfile::tempdir().expect("a directory");
     let rpc = free_port().await;
@@ -86,11 +89,7 @@ async fn a_node_that_follows_to_the_tip_and_executes_nothing_says_both() {
         &[peer.base_url().to_string()],
         &burnchain,
         rpc,
-        &anchor,
-        snapshots()
-            .iter()
-            .find(|row| row.consensus_hash == anchor.header.consensus_hash.to_string())
-            .map_or(0, |row| row.block_height),
+        &chain,
     );
     let node = Running::start(&config, rpc, directory.path().join("node.log"));
 
@@ -109,7 +108,7 @@ async fn a_node_that_follows_to_the_tip_and_executes_nothing_says_both() {
     let log = fs::read_to_string(&node.log).unwrap_or_default();
     node.kill();
     peer_task.abort();
-    burnchain_task.abort();
+    drop(burnchain_task);
 
     // The three claims, in the order they were confused in.
     assert_eq!(

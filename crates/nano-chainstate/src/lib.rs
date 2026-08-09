@@ -730,6 +730,7 @@ struct BlockExecution<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockAuthentication {
     Required,
+    Proposal,
     UnauthenticatedFixture,
 }
 
@@ -1662,6 +1663,34 @@ impl ChainState {
         )
     }
 
+    /// Execute a signer proposal with every consensus check except signer threshold.
+    ///
+    /// A proposal carries the miner's signature and complete transactions, but no
+    /// signer signatures: producing those is the decision this execution informs.
+    /// The state root, miner, sortition, tenure, VRF and transaction checks remain
+    /// identical to a followed block.
+    pub fn append_nakamoto_proposal_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            &mut block,
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Verify,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::Proposal,
+            },
+        )
+    }
+
     /// Execute a fixture block and verify its state root without authenticating consensus.
     ///
     /// This is only for execution-oracle fixtures whose checkpoint does not carry
@@ -2305,7 +2334,7 @@ impl ChainState {
         // asked of a followed block and not of a candidate. The miner's own
         // answer to each of them is the code that builds the block.
         let assembled = matches!(root, RootPolicy::Mine(_));
-        if authentication == BlockAuthentication::Required {
+        if authentication != BlockAuthentication::UnauthenticatedFixture {
             self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
         }
         self.vm

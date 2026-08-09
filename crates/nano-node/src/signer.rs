@@ -47,7 +47,10 @@ pub async fn open(
     peers: &mut nano_sync::TenureSource,
     directory: &Path,
 ) -> Result<Validator, Box<dyn Error>> {
-    let executor = runtime::open_executor(config, network, pox, peers, directory).await?;
+    let sortition_state = crate::hosting::validator_sortition_state(config);
+    let executor =
+        runtime::open_validator_executor(config, network, pox, peers, directory, &sortition_state)
+            .await?;
     let (chainstate, anchor, bitcoin_height, bitcoin) = executor.into_validator_parts();
     let mut context = pox.bitcoin_context();
     context.move_to_burn_block(bitcoin_height);

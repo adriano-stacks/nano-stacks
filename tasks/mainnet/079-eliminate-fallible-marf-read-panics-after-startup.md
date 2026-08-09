@@ -1,7 +1,7 @@
 ---
 id: "079"
 title: "Eliminate fallible MARF read panics after startup"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["057", "065"]
 tags: ["mainnet", "storage", "recovery", "reliability"]
 created_at: 2026-08-07
+completed_at: 2026-08-09
 ---
 
 # Eliminate fallible MARF read panics after startup
@@ -34,7 +35,7 @@ fail.
       without a panic.
 - [x] Cover storage I/O failure after a successful open and prove no partial
       block or repair write is committed.
-- [ ] Retain the clean restart, SIGKILL and commit-boundary recovery gates from
+- [x] Retain the clean restart, SIGKILL and commit-boundary recovery gates from
       tasks 057 and 065.
 
 ## Where this stands, 2026-08-07
