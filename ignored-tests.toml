@@ -213,6 +213,22 @@ requires = "NANO_086_SOURCE read-only mainnet chainstate through 8,708,126 and N
 note = "VM receipt and verified-root oracle only; the fixture seam deliberately does not authenticate consensus."
 
 [[ignored]]
+test = "the_mainnet_8686666_old_epoch_receipt_and_root_match_the_canonical_oracle"
+class = "infrastructure"
+owner = "064"
+job = "release-qualification"
+requires = "NANO_064_SOURCE immutable mainnet chainstate through 8,686,666 and NANO_064_SCRATCH fresh writable reflink clone"
+note = "Recorded deploy epoch, VM receipt and verified-root oracle; the fixture seam deliberately does not authenticate consensus."
+
+[[ignored]]
+test = "the_mainnet_8724865_nested_trait_receipt_and_root_match_the_canonical_oracle"
+class = "infrastructure"
+owner = "098"
+job = "release-qualification"
+requires = "NANO_098_SOURCE immutable mainnet chainstate through 8,724,865 and NANO_098_SCRATCH fresh writable reflink clone"
+note = "VM receipt and verified-root oracle only; the fixture seam deliberately does not authenticate consensus."
+
+[[ignored]]
 test = "a_stock_signer_answers_proposals_through_nano"
 class = "infrastructure"
 owner = "053"

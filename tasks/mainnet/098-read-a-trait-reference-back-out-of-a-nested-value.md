@@ -15,11 +15,12 @@ type: bug
 
 ## Objective
 
-A trait reference inside a composite is written into Wasm linear memory and read
-back as garbage, and the read is not a wrong answer but an `InvariantViolation` —
-so the block is refused outright rather than the transaction getting a receipt.
-`/home/aldur/mainnet-tip` cannot execute mainnet block 8724865 and holds at
-8724864.
+At the task's opening boundary, a trait reference inside a composite was written
+into Wasm linear memory and read back as garbage. The read was not a wrong answer
+but an `InvariantViolation`, so the block was refused outright rather than the
+transaction getting a receipt. The retained failure logs stop at mainnet block
+8724864; a later rebuilt process has now crossed the block, but the isolated
+receipt/root replay remains the completion gate.
 
 ## Evidence
 
@@ -56,11 +57,11 @@ by stride — or in the `in_mem_offset` a nested composite hands to its children
 
 ## Acceptance
 
-- Mainnet block 8724865 executes to the state root the network published,
+- [~] Mainnet block 8724865 executes to the state root the network published,
   and transaction `24d63204…c061558` gets the receipt the network recorded.
-- A crosscheck reads a trait reference back out of a tuple inside a list through
+- [x] A crosscheck reads a trait reference back out of a tuple inside a list through
   both engines and gets the same value and the same five cost dimensions.
-- Reproduced offline first, in `fixtures/mainnet/divergence/`, rather than
+- [~] Reproduced offline first, in `fixtures/mainnet/divergence/`, rather than
   diagnosed against the live node.
 
 ## Current boundary
@@ -90,7 +91,26 @@ cargo test -p clar2wasm --lib words::contract::tests \
 The faithful caller → oracle → governance reduction, including the bound
 2,007-byte buffer and `(some execution-plan)`, is also green. It therefore does
 not pin the historical invalid representation, and no layout change is justified
-from it. The current live binary still reproduces the exact offset at 8724865,
-but `/home/aldur/mainnet-tip` is active with positive Clarity/staging WALs; it is
-not opened or reflinked mid-write. The exact `call-both-tx` and full-block/root
-gates remain open until a clean stopped-state snapshot is available.
+from it.
+
+A rebuilt live binary resumed exactly at 8,724,864 and logged a successful
+8,724,864 → 8,725,364 `RootPolicy::Verify` batch. Its read-only `/v2/info` later
+reported 8,728,953. Hiro's canonical record says tx `24d63204…c061558` at index 2
+of block 8,724,865 succeeded with `(ok true)`, costs
+`(891, 4545157, 18263940, 24, 4909)`, and 21 ordered events. The node's own archive
+served the exact 6,316-byte block. Both are now checked in as
+`block-8724865.hex` and `tx-24d632-receipt.json`; the always-on fixture integrity
+test is green, as are the release-inventory policy gate and strict conformance
+Clippy.
+
+The ignored `the_mainnet_8724865_nested_trait_receipt_and_root_match_the_canonical_oracle`
+gate now runs against an immutable checkpointed copy and a separate writable
+reflink, never the live node. Its exact-prestate comparison executes block
+transactions 0 and 1 through the production path, then asks both engines about
+transaction 2 with the same cumulative tracker. The interpreter exactly matches
+Hiro's cost `(891, 4545157, 18263940, 24, 4909)`; the compiler returns the same
+value but charges `(891, 4545156, 18259366, 24, 4909)`. Recursive temporary
+repair of compiler-stubbed contract bodies is reverted after the diagnostic;
+all 342 original stub definitions compare byte-for-byte afterward. The task is
+therefore still open on a measured compiler undercharge of one read byte and
+4,574 runtime units, not on the historical trait-layout refusal.

@@ -15,7 +15,7 @@
 //! means to leave no trace has to bracket it — `MarfStore::begin` and
 //! `MarfStore::abort`, or a VM block that is aborted rather than sealed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use clarity::{
     types::StacksEpochId,
@@ -346,22 +346,87 @@ pub fn execute_contract_call_outcome(
     )
 }
 
-/// Heal a contract and the ones it names, so the interpreter can run the call.
-///
-/// A contract that cannot be healed is the call's problem to report, not a
-/// reason to refuse before running anything — the call may never reach it.
+#[derive(Debug)]
+struct HealedContract {
+    identifier: QualifiedContractIdentifier,
+    definition: String,
+}
+
+/// Heal every statically reachable contract, including concrete contract
+/// principals supplied as transaction arguments.
 fn heal_reachable_contracts(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
     contract: &QualifiedContractIdentifier,
-) {
-    let referenced = contract_source(store, bitcoin_context, contract)
-        .map(|(source, version)| referenced_contracts(contract, &source, version))
-        .unwrap_or_default();
-    for reachable in std::iter::once(contract.clone()).chain(referenced) {
-        if !store.contract_is_interpretable(&reachable) {
-            let _ = heal_contract_for_interpreter(store, bitcoin_context, &reachable);
+) -> Vec<HealedContract> {
+    let mut pending = vec![contract.clone()];
+    let mut visited = HashSet::new();
+    let mut healed = Vec::new();
+    while let Some(reachable) = pending.pop() {
+        if !visited.insert(reachable.clone()) {
+            continue;
         }
+        let Ok((source, version)) = contract_source(store, bitcoin_context, &reachable) else {
+            continue;
+        };
+        pending.extend(referenced_contracts(&reachable, &source, version));
+        if store.contract_is_interpretable(&reachable) {
+            continue;
+        }
+        let Some(definition) = store.stored_contract(&reachable) else {
+            continue;
+        };
+        if heal_contract_for_interpreter(store, bitcoin_context, &reachable).is_ok() {
+            healed.push(HealedContract {
+                identifier: reachable,
+                definition,
+            });
+        }
+    }
+    healed
+}
+
+fn restore_contracts(
+    store: &MarfStore,
+    healed: Vec<HealedContract>,
+) -> Result<(), VmExecutionError> {
+    for contract in healed.into_iter().rev() {
+        store
+            .replace_contract_definition(&contract.identifier, &contract.definition)
+            .map_err(|error| VmInternalError::Expect(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn collect_argument_contracts(value: &Value, contracts: &mut Vec<QualifiedContractIdentifier>) {
+    use clarity::vm::types::SequenceData;
+
+    match value {
+        Value::Principal(PrincipalData::Contract(contract)) => contracts.push(contract.clone()),
+        Value::CallableContract(callable) => {
+            contracts.push(callable.contract_identifier.clone());
+        }
+        Value::Tuple(tuple) => {
+            for value in tuple.data_map.values() {
+                collect_argument_contracts(value, contracts);
+            }
+        }
+        Value::Optional(optional) => {
+            if let Some(value) = optional.data.as_deref() {
+                collect_argument_contracts(value, contracts);
+            }
+        }
+        Value::Response(response) => collect_argument_contracts(&response.data, contracts),
+        Value::Sequence(SequenceData::List(list)) => {
+            for value in &list.data {
+                collect_argument_contracts(value, contracts);
+            }
+        }
+        Value::Int(_)
+        | Value::UInt(_)
+        | Value::Bool(_)
+        | Value::Principal(PrincipalData::Standard(_))
+        | Value::Sequence(SequenceData::Buffer(_) | SequenceData::String(_)) => {}
     }
 }
 
@@ -551,9 +616,23 @@ pub fn interpret_contract_call(
     // definition first: the call's own contract and everything it reaches, since
     // a nested `contract-call?` lands in a contract the compiler may also have
     // deployed and healing only the named one leaves the failure one level down.
-    heal_reachable_contracts(store, context, &call.contract);
+    let mut roots = vec![call.contract.clone()];
+    for argument in call.arguments {
+        let mut bytes = argument.as_slice();
+        if let Ok(value) = Value::deserialize_read(&mut bytes, None, false)
+            && bytes.is_empty()
+        {
+            collect_argument_contracts(&value, &mut roots);
+        }
+    }
+    let mut healed = Vec::new();
+    for root in roots {
+        healed.extend(heal_reachable_contracts(store, context, &root));
+    }
     let (store, context) = vm.state_and_context();
-    execute_contract_call_outcome_in_context(store, context, call, cost_tracker)
+    let result = execute_contract_call_outcome_in_context(store, context, call, cost_tracker);
+    restore_contracts(store, healed)?;
+    result
 }
 
 /// Contracts in a state the interpreter cannot run, because the compiler

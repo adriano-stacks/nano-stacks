@@ -1,0 +1,53 @@
+{
+  "source": "https://api.hiro.so/extended/v1/tx/0xf33840c54f18a314f00b1338bc3d43e3103cbe9ce424d0418e94bc463903fe62?event_limit=100",
+  "retrieved_at": "2026-08-09T17:31:31Z",
+  "txid": "f33840c54f18a314f00b1338bc3d43e3103cbe9ce424d0418e94bc463903fe62",
+  "block_height": 8686666,
+  "block_hash": "3def0cca097833897264ab6f2b8a8ae21a292fb3f98efe2a3f1418a38b0329f1",
+  "index_block_hash": "48d462aebf806f2c36d7fd413b13aaa539b65a2ffcb838f08ae3941b54d77097",
+  "parent_index_block_hash": "0fd5ca03ea4eefa17ab65c82e60d29b2ff1f3e174a5dcd83dad5bc8856d48e4c",
+  "burn_block_height": 960665,
+  "tx_index": 0,
+  "canonical": true,
+  "status": "success",
+  "result": {
+    "hex": "070100000000000000000000000000bd2585",
+    "repr": "(ok u12395909)"
+  },
+  "cost": {
+    "read_count": 53,
+    "read_length": 48263,
+    "runtime": 87814,
+    "write_count": 8,
+    "write_length": 83
+  },
+  "events": [
+    {
+      "kind": "stx",
+      "operation": "transfer",
+      "sender": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1",
+      "recipient": "SP1HCCEV162A4J65PAFW5RJYKADACCPSZF42PJCQZ",
+      "amount": "12395909"
+    },
+    {
+      "kind": "fungible_token",
+      "operation": "burn",
+      "asset": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-token::ststx",
+      "sender": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.stacking-dao-core-v1",
+      "amount": "11896677"
+    },
+    {
+      "kind": "non_fungible_token",
+      "operation": "burn",
+      "asset": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-withdraw-nft::ststx-withdraw",
+      "sender": "SP1HCCEV162A4J65PAFW5RJYKADACCPSZF42PJCQZ",
+      "value_hex": "0100000000000000000000000000002037"
+    },
+    {
+      "kind": "contract_log",
+      "contract": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-nft-helper-v1",
+      "topic": "print",
+      "value_hex": "0c0000000206616374696f6e0d00000008776974686472617704646174610c0000000306616d6f756e740100000000000000000000000000b587650c626c6f636b2d686569676874010000000000000000000000000003d6da07737461636b6572051662c63b6130944918b653f85c4bd35354c65b3f79"
+    }
+  ]
+}

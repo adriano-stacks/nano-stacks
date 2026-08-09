@@ -15,9 +15,9 @@ created_at: 2026-08-06
 
 ## Objective
 
-`ensure_wasm_module` compiles a contract under epoch 4.0 and, when clarity-wasm
-refuses it, retries under **the newest older epoch that happens to accept it**,
-then executes that build. A live mainnet catch-up prints it once a contract:
+Before this task, `ensure_wasm_module` compiled a contract under epoch 4.0 and,
+when clarity-wasm refused it, retried under **the newest older epoch that happened
+to accept it**, then executed that build. A live mainnet catch-up printed:
 
 ```
 SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1 does not compile under
@@ -43,8 +43,9 @@ old contract keeps working without any epoch being inferred at call time.
 
 ## Tasks
 
-- [x] Find what `reserve-v1` uses that epoch 4.0 rejects, and how many mainnet
-      contracts the replay hits it for. Report the count, not an example.
+- [x] Find what `reserve-v1` uses that epoch 4.0 rejects and measure the exact
+      current-tip population by compiling every contract under both its recorded
+      epoch and forced Epoch40. Report the count, not an example.
 - [x] Read the deploy epoch out of the stored contract analysis rather than
       searching for an epoch that compiles.
 - [x] Preserve and verify the existing separation between language semantics
@@ -61,9 +62,11 @@ old contract keeps working without any epoch being inferred at call time.
       stacks-core snapshot in
       [[066-refuse-at-block-at-run-time-as-epoch-4-0-does]] asserts the exact
       error and all five cost dimensions.
-- [ ] Confirm the same behavior with a real captured network receipt from an old
-      mainnet contract after the removal epoch. The population of 881 possible
-      contracts is not evidence that the replay window exercised one.
+- [x] Confirm the same behavior with a real captured network receipt from an old
+      mainnet contract after the removal epoch. Block 8,686,666 calls
+      `reserve-v1`; the isolated replay matches its result, all five costs, four
+      ordered events and committed root through two compiled runs and the
+      interpreter call comparison.
 
 ## Acceptance Criteria
 
@@ -102,14 +105,27 @@ in a way that shows up in receipts rather than in roots.
 source outright while the analysis stacks-core wrote at deploy time accepted it
 and still stands.
 
-Counted over the mainnet checkpoint's `metadata_table` at height 8,665,600, which
-holds it as stacks-core wrote it:
+The original metadata/source scan found 881 textual candidates, but that was not
+an exact compiler or canonical-current-state measurement. The corrected
+read-only sweep at state tip
+`63f2beda310a00e9c790f9f8e2e41f42f6f145f034e6cac040cd9bd46746c2b6` measured:
 
-- **146,141** contracts have a stored analysis.
-- **881** of them have an `(at-block` call site in their stored source. That is
-  the population epoch 4.0 rejects and the old code rebuilt under a guess.
-- **116** were analyzed in `Epoch40`. The other 146,025 were analyzed under an
-  older epoch, the largest group being 62,076 in `Epoch2_05`/Clarity1.
+- **146,346** raw analysis metadata rows, **137,342** distinct identifiers and
+  **58** noncanonical stale candidates, leaving **137,284** current contracts.
+- **137,284/137,284** compile and load under their chain-recorded semantic epoch.
+- Forced Epoch40 loads 136,413 and refuses **871**, with **zero unmeasured**:
+  866 on removed `at-block`, four on unresolved `loop_n4`, and one on unresolved
+  `mul-down`.
+- Recorded epochs account for every current contract: Epoch2_05 55,859; Epoch20
+  1,693; Epoch21 6,812; Epoch22 224; Epoch23 1,522; Epoch24 9,985; Epoch25 9,486;
+  Epoch30 3,144; Epoch31 16,681; Epoch32 3,985; Epoch33 23,378; Epoch34 4,194;
+  Epoch40 321.
+
+The sweep is typed and fail-closed: compiler refusal is separate from a state or
+inspection failure, and its denominator must account for every current contract.
+Its retained output is `/tmp/task064-epoch-inventory-7cbed784.txt`, SHA-256
+`2ecc19bc78feb3159900f10da9d27bc049fa5f26d424ef49c528b1dea56dfdcb`, bound to
+compiler `sha256:f493148d4790beaa10d3f06f5f23c4fd8299b4a732c7fbb1aae1b194922e095b`.
 
 And the guess was wrong on the case that produced the log line.
 `reserve-v1`'s stored analysis says **`Epoch24` / Clarity2**; the search picked
@@ -157,31 +173,36 @@ does; its comment now says which argument means what and why.
   its module built byte for byte. This one **does not** fail with the search
   restored, and that is a finding rather than a weak test: see below.
 
-### The removed-word pin, and what stands in for the network
+### The removed-word pin and the observed network receipt
 
-The last item is closed by `conformance/at_block_refusal.rs` and by [[066]], which
-is where it went: a contract whose stored analysis names **Epoch 3.3 / Clarity 2**
-and whose source uses `at-block`, called at 4.0 through both engines from planted
-state — because a contract *containing* the word cannot be deployed at 4.0 by
-either engine, which is the whole shape of the case.
-
-**"The network's" receipt is not obtainable, and what replaces it is stronger than
-a paraphrase would be.** The mainnet capture declares `receipts = false` and no
-public API serves a historical receipt, so the oracle is stacks-core's own
-consensus snapshot: `runtime_check_error_kind_at_block_unavailable_ccall`
-(`stackslib/src/chainstate/tests/runtime_analysis_tests.rs`) deploys a contract in
-3.3, calls it in 3.4, and records `vm_error: Some(AtBlockUnavailable)`, `(err
-none)`, the block accepted, and
+The reference pin remains `conformance/at_block_refusal.rs` and [[066]]: a
+contract whose stored analysis names **Epoch 3.3 / Clarity 2** and whose source
+uses `at-block`, called at 4.0 through both engines from planted state. The pinned
+stacks-core snapshot `runtime_check_error_kind_at_block_unavailable_ccall`
+records `vm_error: Some(AtBlockUnavailable)`, `(err none)`, an accepted block and
 
 ```
 ExecutionCost { write_length: 0, write_count: 0, read_length: 159, read_count: 3, runtime: 275 }
 ```
 
-nano charges that, in both engines, for that contract's source copied byte for byte
-— `read_length` is the contract's size, which is why it is copied rather than
-paraphrased. All five dimensions are asserted, and the write dimensions are the
-reason this was ever invisible: a refusal writes nothing, so the block it produces
-seals the root an untouched block seals.
+nano charges that in both engines for the source copied byte for byte. This is a
+reference snapshot, not the observed network receipt.
+
+The observed receipt is transaction
+`f33840c54f18a314f00b1338bc3d43e3103cbe9ce424d0418e94bc463903fe62`, transaction
+zero of mainnet block **8,686,666**. It calls the old Epoch24/Clarity2
+`SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1` after `at-block` was
+removed. Hiro records `(ok u12395909)`, costs
+`{read_count:53, read_length:48263, runtime:87814, write_count:8,
+write_length:83}` and four ordered events. The ignored conformance gate
+`the_mainnet_8686666_old_epoch_receipt_and_root_match_the_canonical_oracle`
+executes an isolated stopped-state copy twice with root verification, checks the
+receipt and events, and compares the compiler call with the interpreter call.
+
+The release report now names these separately as the reference snapshot and the
+observed mainnet receipt, and refuses qualification if either is missing or
+invalid. Its mandatory state inventory reports the exact 871-contract affected
+population while proving all 137,284 run under recorded epochs.
 
 Writing it falsified two of [[066]]'s own closed items — the `AtBlock` cost was
 being charged for a refusal that charges nothing, and the error was arriving as
@@ -209,11 +230,21 @@ different divergence.
   (`type_checker/v2_1/natives/mod.rs:138`) and again at *runtime* against the
   *current* epoch (`functions/database.rs:562`, `RuntimeCheckErrorKind::
   AtBlockUnavailable`). Only the first is an epoch-selection question and only the
-  first was this task's. The second was a clarity-wasm gap on the same 881
+  first was this task's. The second was a clarity-wasm gap on the same 866
   contracts, closed there, and the pin above is shared between the two because the
   fixture is the same one.
-- The count is of `(at-block` call sites in stored sources, not of contracts a
-  compilation refuses. Compiling all 146,141 to get the exact figure was not done.
-- No offline gate in the suite executes real mainnet contracts, so this change is
-  not checked against a mainnet replay here. `mainnet_receipts` would catch a
-  moved receipt but needs `NANO_MAINNET_RECEIPTS` pointing at an observer run.
+
+### Evidence, 2026-08-09
+
+- `cargo test -p nano-vm --lib`: 37 passed, one unrelated diagnostic ignored.
+- `cargo test -p xtask --bin xtask`: 19 passed.
+- strict all-target Clippy for `nano-vm` and `xtask`: green.
+- `cargo test -p clar2wasm --lib cost::crosscheck`: 30/30; STX/NFT word suites
+  16/16 and 27/27; strict clar2wasm Clippy green.
+- Two independent stopped-state block-8,686,666 replays matched the network
+  result, all five costs, all four ordered events and committed root.
+- The full typed sweep completed in about two hours, left both source database
+  stamps unchanged, and produced the exact counts above with no unmeasured row.
+
+All task-local implementation and evidence are complete. The task remains
+in-progress only because its declared dependency [[060]] is still in-progress.

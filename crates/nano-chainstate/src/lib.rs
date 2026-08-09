@@ -1805,6 +1805,80 @@ impl ChainState {
         )
     }
 
+    /// Open the exact prestate of one transaction in a captured fixture block.
+    ///
+    /// Prefix transactions use the production transaction path, including fees,
+    /// nonces, postconditions, commits and cumulative block cost. The target's
+    /// fee and nonce checks are applied in an open transaction, but its payload
+    /// is left to the conformance caller so that two engines can be compared at
+    /// the same point. The caller must roll back that transaction and abort the
+    /// block when it has made its observation.
+    pub fn begin_unauthenticated_fixture_transaction_prestate(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        transaction_index: usize,
+    ) -> Result<ExecutionCost, ChainStateError> {
+        if transaction_index >= block.transactions.len() {
+            return Err(ChainStateError::InvalidTransaction(format!(
+                "fixture transaction index {transaction_index} is outside a {}-transaction block",
+                block.transactions.len()
+            )));
+        }
+        self.vm
+            .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
+        let result = (|| {
+            self.vm.setup_block_metadata(block.header.timestamp)?;
+            let mut ledger = self.ledger.clone();
+            if block_starts_new_tenure(block) {
+                self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;
+            }
+            let coinbase_height = u64::from(self.vm.tenure_height()?);
+            signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
+
+            let mut execution_cost = ExecutionCost::ZERO;
+            for transaction in &block.transactions[..transaction_index] {
+                transaction.verify_authorization().map_err(|error| {
+                    ChainStateError::InvalidTransaction(format!(
+                        "transaction authorization failed: {error}"
+                    ))
+                })?;
+                let receipt = self.execute_transaction(transaction, &execution_cost)?;
+                execution_cost.add(&receipt.result.cost).map_err(|error| {
+                    ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))
+                })?;
+            }
+
+            let target = &block.transactions[transaction_index];
+            target.verify_authorization().map_err(|error| {
+                ChainStateError::InvalidTransaction(format!(
+                    "transaction authorization failed: {error}"
+                ))
+            })?;
+            if system_receipt(target).is_some() {
+                return Err(ChainStateError::InvalidTransaction(
+                    "a system transaction has no alternate execution engine".to_owned(),
+                ));
+            }
+            let origin = target.origin_address().ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "transaction has no recognized network".to_owned(),
+                )
+            })?;
+            let sender = principal_from_address(origin)?;
+            self.vm.begin_transaction()?;
+            self.prepare_user_transaction(target, &sender)?;
+            Ok(execution_cost)
+        })();
+        if result.is_err() {
+            let _ = self.vm.rollback_transaction();
+            let _ = self.vm.abort_block();
+        }
+        result
+    }
+
     #[cfg(test)]
     fn execute_unauthenticated_fixture_block_with_effects(
         &mut self,
@@ -3033,24 +3107,8 @@ impl ChainState {
         if let Some(receipt) = system_receipt(transaction) {
             return self.execute_system_transaction(transaction, &sender, receipt);
         }
-        let sponsor = transaction
-            .sponsor_address()
-            .map(principal_from_address)
-            .transpose()?;
-        let origin_condition = transaction.auth().origin();
-        let payer_condition = transaction.auth().payer();
-        if self.vm.account_nonce(&sender)? != origin_condition.nonce() {
-            return Err(ChainStateError::InvalidTransaction(
-                "origin nonce does not match account state".to_owned(),
-            ));
-        }
+        let sponsor = self.prepare_user_transaction(transaction, &sender)?;
         let payer = sponsor.as_ref().unwrap_or(&sender);
-        if self.vm.account_nonce(payer)? != payer_condition.nonce() {
-            return Err(ChainStateError::InvalidTransaction(
-                "payer nonce does not match account state".to_owned(),
-            ));
-        }
-        self.vm.debit_fee(payer, payer_condition.fee())?;
         let result = self.execute_payload(
             transaction,
             origin,
@@ -3099,6 +3157,32 @@ impl ChainState {
             committed: true,
             result,
         })
+    }
+
+    fn prepare_user_transaction(
+        &mut self,
+        transaction: &Transaction,
+        sender: &PrincipalData,
+    ) -> Result<Option<PrincipalData>, ChainStateError> {
+        let sponsor = transaction
+            .sponsor_address()
+            .map(principal_from_address)
+            .transpose()?;
+        let origin_condition = transaction.auth().origin();
+        let payer_condition = transaction.auth().payer();
+        if self.vm.account_nonce(sender)? != origin_condition.nonce() {
+            return Err(ChainStateError::InvalidTransaction(
+                "origin nonce does not match account state".to_owned(),
+            ));
+        }
+        let payer = sponsor.as_ref().unwrap_or(sender);
+        if self.vm.account_nonce(payer)? != payer_condition.nonce() {
+            return Err(ChainStateError::InvalidTransaction(
+                "payer nonce does not match account state".to_owned(),
+            ));
+        }
+        self.vm.debit_fee(payer, payer_condition.fee())?;
+        Ok(sponsor)
     }
 
     fn apply_transaction_failure(
