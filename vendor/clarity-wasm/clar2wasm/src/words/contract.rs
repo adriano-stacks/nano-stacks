@@ -4,15 +4,15 @@ use crate::layout::get_type_size;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{PrincipalData, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType, Value};
-use walrus::ir::{BinaryOp, Block, IfElse};
+use walrus::ir::{BinaryOp, Block, IfElse, MemArg, StoreKind};
 use walrus::{InstrSeqBuilder, LocalId, ValType};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
 use crate::wasm_generator::{
-    add_placeholder_for_clarity_type, clar2wasm_ty, uses_packed_value, ArgumentsExt,
-    GeneratorError, WasmGenerator,
+    ArgumentsExt, GeneratorError, WasmGenerator, add_placeholder_for_clarity_type, clar2wasm_ty,
+    uses_packed_value,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::SimpleWord;
@@ -892,20 +892,65 @@ impl ComplexWord for ContractCall {
 
         // Write the arguments to the call stack, to be read by the host
         let arg_offset = generator.module.locals.add(ValType::I32);
-        let total_args_size = args_ty.iter().map(get_type_size).sum();
+        let total_args_size: i32 = args_ty.iter().map(get_type_size).sum();
+        let argument_sizes_length = i32::try_from(args.len())
+            .ok()
+            .and_then(|length| length.checked_mul(4))
+            .ok_or_else(|| {
+                GeneratorError::InternalError("contract-call? argument sizes overflow".into())
+            })?;
+        let call_arguments_size = total_args_size
+            .checked_add(argument_sizes_length)
+            .ok_or_else(|| {
+                GeneratorError::InternalError("contract-call? argument memory overflow".into())
+            })?;
         builder
             .global_get(generator.stack_pointer)
             .local_tee(arg_offset)
-            .i32_const(total_args_size)
+            .i32_const(call_arguments_size)
             .binop(BinaryOp::I32Add)
             .global_set(generator.stack_pointer);
+        let argument_sizes_offset = generator.module.locals.add(ValType::I32);
+        builder
+            .local_get(arg_offset)
+            .i32_const(total_args_size)
+            .binop(BinaryOp::I32Add)
+            .local_set(argument_sizes_offset);
+        let memory = generator.get_memory()?;
 
         let mut arg_length = 0;
-        for (arg, arg_ty) in args.iter().zip(args_ty) {
+        for (index, (arg, arg_ty)) in args.iter().zip(args_ty).enumerate() {
             // Traverse the argument, pushing it onto the stack
             generator.traverse_expr(builder, arg)?;
 
+            // `DefinedFunction::execute_apply` charges the value as the caller
+            // evaluated it, before the callee re-tags principals as traits.
+            // Preserve that size beside the representations so the host does
+            // not have to infer it from the callee's declared types.
+            generator.clarity_value_size_on_stack(builder, &arg_ty)?;
+            let argument_size = generator.borrow_local(ValType::I32);
+            builder.local_set(*argument_size);
+
             arg_length += generator.write_to_memory(builder, arg_offset, arg_length, &arg_ty)?;
+            let size_offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .ok_or_else(|| {
+                    GeneratorError::InternalError(
+                        "contract-call? argument size offset overflow".into(),
+                    )
+                })?;
+            builder
+                .local_get(argument_sizes_offset)
+                .local_get(*argument_size)
+                .store(
+                    memory,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 4,
+                        offset: size_offset,
+                    },
+                );
         }
 
         // Push the arguments offset and length onto the data stack

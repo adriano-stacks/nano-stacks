@@ -1,7 +1,7 @@
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::contexts::GlobalContext;
 use clarity::vm::costs::cost_functions::ClarityCostFunction;
-use clarity::vm::costs::{runtime_cost, CostTracker};
+use clarity::vm::costs::{CostTracker, runtime_cost};
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
@@ -11,8 +11,8 @@ use clarity::vm::types::{
     TupleData, TypeSignature,
 };
 use clarity::vm::{CallStack, ContractContext, Value};
-use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
+use stacks_common::types::chainstate::StacksBlockId;
 use wasmtime::{AsContextMut, Linker, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
@@ -530,6 +530,7 @@ pub fn initialize_contract(
 fn charge_refused_application(
     tracker: &mut GlobalContext,
     arguments: &[Value],
+    argument_sizes: Option<&[u64]>,
     expected: &[TypeSignature],
     epoch: StacksEpochId,
 ) -> Result<(), VmExecutionError> {
@@ -543,12 +544,15 @@ fn charge_refused_application(
     // also why the two branches count different things when the call was
     // refused for having the wrong number of arguments in the first place.
     if epoch.uses_arg_size_for_cost() {
-        for argument in arguments {
-            runtime_cost(
-                ClarityCostFunction::InnerTypeCheckCost,
-                tracker,
-                argument.size()?,
-            )?;
+        if argument_sizes.is_some_and(|sizes| sizes.len() != arguments.len()) {
+            return Err(crate::error::wasm_error(WasmError::ValueTypeMismatch));
+        }
+        for (index, argument) in arguments.iter().enumerate() {
+            let size = match argument_sizes {
+                Some(sizes) => sizes[index],
+                None => u64::from(argument.size()?),
+            };
+            runtime_cost(ClarityCostFunction::InnerTypeCheckCost, tracker, size)?;
         }
     } else {
         for expected_type in expected {
@@ -566,6 +570,35 @@ fn charge_refused_application(
 pub fn call_function(
     function_name: &str,
     arguments: &[Value],
+    module: &CompiledContract,
+    global_context: &mut GlobalContext,
+    contract_context: &ContractContext,
+    call_stack: &mut CallStack,
+    sender: Option<PrincipalData>,
+    caller: Option<PrincipalData>,
+    sponsor: Option<PrincipalData>,
+    module_cache: &ModuleCache,
+) -> Result<Value, VmExecutionError> {
+    call_function_with_argument_sizes(
+        function_name,
+        arguments,
+        None,
+        module,
+        global_context,
+        contract_context,
+        call_stack,
+        sender,
+        caller,
+        sponsor,
+        module_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_function_with_argument_sizes(
+    function_name: &str,
+    arguments: &[Value],
+    argument_sizes: Option<&[u64]>,
     module: &CompiledContract,
     global_context: &mut GlobalContext,
     contract_context: &ContractContext,
@@ -613,7 +646,13 @@ pub fn call_function(
     // function's own prelude, which runs whoever calls it — except when the call
     // is refused here and never enters it.
     if arguments.len() != expected_arguments.len() {
-        charge_refused_application(global_context, arguments, expected_arguments, epoch)?;
+        charge_refused_application(
+            global_context,
+            arguments,
+            argument_sizes,
+            expected_arguments,
+            epoch,
+        )?;
         return Err(
             clarity::vm::errors::RuntimeCheckErrorKind::IncorrectArgumentCount(
                 expected_arguments.len(),
@@ -659,25 +698,32 @@ pub fn call_function(
         .get(&mut store)
         .i32()
         .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-    let argument_sizes =
+    let argument_sizes_global =
         instance
             .get_global(&mut store, "argument-sizes")
             .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
                 "argument-sizes".into(),
             )))?;
-    let argument_sizes_offset = argument_sizes
+    let argument_sizes_offset = argument_sizes_global
         .get(&mut store)
         .i32()
         .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    if argument_sizes.is_some_and(|sizes| sizes.len() != arguments.len()) {
+        return Err(crate::error::wasm_error(WasmError::ValueTypeMismatch));
+    }
     for (index, argument) in arguments.iter().enumerate() {
-        let index = i32::try_from(index)
+        let byte_index = i32::try_from(index)
             .ok()
             .and_then(|index| index.checked_mul(4))
             .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-        let size = i32::try_from(argument.size()?)
+        let size = match argument_sizes {
+            Some(sizes) => sizes[index],
+            None => u64::from(argument.size()?),
+        };
+        let size = i32::try_from(size)
             .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
         let size_offset = argument_sizes_offset
-            .checked_add(index)
+            .checked_add(byte_index)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
         memory
@@ -701,6 +747,7 @@ pub fn call_function(
                 charge_refused_application(
                     store.data_mut().global_context,
                     arguments,
+                    argument_sizes,
                     expected_arguments,
                     epoch,
                 )?;
@@ -713,6 +760,7 @@ pub fn call_function(
                 charge_refused_application(
                     store.data_mut().global_context,
                     arguments,
+                    argument_sizes,
                     expected_arguments,
                     epoch,
                 )?;
@@ -737,6 +785,7 @@ pub fn call_function(
             charge_refused_application(
                 store.data_mut().global_context,
                 arguments,
+                argument_sizes,
                 expected_arguments,
                 epoch,
             )?;

@@ -1927,7 +1927,8 @@ mod word {
 /// the interpreter rather than a hand-written expectation.
 #[cfg(test)]
 mod crosscheck {
-    use clarity::vm::Value;
+    use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TupleData};
+    use clarity::vm::{ClarityName, Value};
 
     use crate::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
 
@@ -2379,6 +2380,147 @@ mod crosscheck {
             ],
             "f",
             &[target],
+        );
+    }
+
+    /// A transaction argument reaches a public function as a serialized
+    /// principal, is cast to the trait in the declared list-entry type, and is
+    /// then read back out of the tuple by `element-at?` and `get`.
+    #[test]
+    fn reads_a_trait_from_a_tuple_inside_a_list() {
+        let trait_definition = "(define-trait decoder-trait ((decode () (response uint uint))))";
+        let decoder_contract = "(impl-trait .trait-definition.decoder-trait)
+                                (define-public (decode) (ok u42))";
+        let reader = "(use-trait decoder-trait .trait-definition.decoder-trait)
+                      (define-public (read
+                          (plans (list 4 { decoder: <decoder-trait>, version: uint })))
+                        (let ((plan (unwrap-panic (element-at? plans u0)))
+                              (decoder (get decoder plan)))
+                          (contract-call? decoder decode)))";
+        let decoder =
+            QualifiedContractIdentifier::parse("S1G2081040G2081040G2081040G208105NK8PE5.decoder")
+                .expect("contract identifier");
+        let plan = Value::Tuple(
+            TupleData::from_data(vec![
+                (
+                    ClarityName::from_literal("decoder"),
+                    Value::Principal(PrincipalData::Contract(decoder)),
+                ),
+                (ClarityName::from_literal("version"), Value::UInt(4)),
+            ])
+            .expect("execution-plan tuple"),
+        );
+        let plans = Value::cons_list_unsanitized(vec![plan]).expect("execution-plan list");
+
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("decoder", decoder_contract),
+                ("reader", reader),
+            ],
+            "read",
+            &[plans],
+        );
+    }
+
+    /// The failing mainnet path first passes a tuple of literal contract
+    /// principals across a contract boundary after a large bound buffer, then
+    /// reads one field as the trait the callee declared.
+    #[test]
+    fn reads_a_trait_from_a_cross_contract_tuple() {
+        let trait_definition = "(define-trait decoder-trait ((decode () (response uint uint))))
+             (define-trait storage-trait ((store () (response uint uint))))
+             (define-trait core-trait ((verify () (response uint uint))))";
+        let decoder = "(impl-trait .trait-definition.decoder-trait)
+                       (impl-trait .trait-definition.storage-trait)
+                       (impl-trait .trait-definition.core-trait)
+                       (define-public (decode) (ok u42))
+                       (define-public (store) (ok u42))
+                       (define-public (verify) (ok u42))";
+        let reader = "(use-trait decoder-trait .trait-definition.decoder-trait)
+                      (use-trait storage-trait .trait-definition.storage-trait)
+                      (use-trait core-trait .trait-definition.core-trait)
+                      (define-public (read (bytes (buff 8192))
+                          (plan { decoder: <decoder-trait>,
+                                  storage: <storage-trait>,
+                                  core: <core-trait> }))
+                        (let ((decoder (get decoder plan)))
+                          (contract-call? decoder decode)))";
+        let caller = "(define-public (f (bytes (buff 8192)))
+                        (contract-call? .reader read bytes
+                          { decoder: .decoder,
+                            storage: .decoder,
+                            core: .decoder }))";
+        let bytes = Value::buff_from(vec![0x5a; 2_007]).expect("price-feed bytes");
+
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("decoder", decoder),
+                ("reader", reader),
+                ("caller", caller),
+            ],
+            "f",
+            &[bytes],
+        );
+    }
+
+    /// The mainnet refusal forwards the bound execution plan through a second
+    /// contract call as an optional tuple before reading its trait fields.
+    #[test]
+    fn forwards_a_bound_trait_tuple_inside_an_optional() {
+        let trait_definition = "(define-trait decoder-trait ((decode () (response uint uint))))
+             (define-trait storage-trait ((store () (response uint uint))))
+             (define-trait core-trait ((verify () (response uint uint))))";
+        let decoder = "(impl-trait .trait-definition.decoder-trait)
+                       (impl-trait .trait-definition.storage-trait)
+                       (impl-trait .trait-definition.core-trait)
+                       (define-public (decode) (ok u42))
+                       (define-public (store) (ok u42))
+                       (define-public (verify) (ok u42))";
+        let governance = "(use-trait decoder-trait .trait-definition.decoder-trait)
+                          (use-trait storage-trait .trait-definition.storage-trait)
+                          (use-trait core-trait .trait-definition.core-trait)
+                          (define-read-only (check
+                              (former principal)
+                              (plan-opt (optional {
+                                  decoder: <decoder-trait>,
+                                  storage: <storage-trait>,
+                                  core: <core-trait> })))
+                            (let ((plan (unwrap! plan-opt (err u1)))
+                                  (decoder-contract (get decoder plan)))
+                              (if (is-eq former (contract-of decoder-contract))
+                                  (ok true)
+                                  (err u2))))";
+        let oracle = "(use-trait decoder-trait .trait-definition.decoder-trait)
+                      (use-trait storage-trait .trait-definition.storage-trait)
+                      (use-trait core-trait .trait-definition.core-trait)
+                      (define-public (read
+                          (bytes (buff 8192))
+                          (plan { decoder: <decoder-trait>,
+                                  storage: <storage-trait>,
+                                  core: <core-trait> }))
+                        (begin
+                          (try! (contract-call? .governance check
+                              contract-caller (some plan)))
+                          (ok (len bytes))))";
+        let caller = "(define-public (f (bytes (buff 8192)))
+                        (contract-call? .oracle read bytes
+                          { decoder: .decoder,
+                            storage: .decoder,
+                            core: .decoder }))";
+        let bytes = Value::buff_from(vec![0x5a; 2_007]).expect("price-feed bytes");
+
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("decoder", decoder),
+                ("governance", governance),
+                ("oracle", oracle),
+                ("caller", caller),
+            ],
+            "f",
+            &[bytes],
         );
     }
 

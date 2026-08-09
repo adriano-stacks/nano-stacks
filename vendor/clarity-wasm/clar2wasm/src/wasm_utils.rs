@@ -681,7 +681,11 @@ where
     }
 }
 
-fn read_i32<S>(memory: Memory, store: &mut S, offset: i32) -> Result<i32, VmExecutionError>
+pub(crate) fn read_i32<S>(
+    memory: Memory,
+    store: &mut S,
+    offset: i32,
+) -> Result<i32, VmExecutionError>
 where
     S: AsContextMut,
 {

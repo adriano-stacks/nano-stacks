@@ -41,7 +41,7 @@ use wasmtime::{
 use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
-use crate::initialize::{ClarityWasmContext, call_function};
+use crate::initialize::{ClarityWasmContext, call_function_with_argument_sizes};
 use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_utils::*;
 
@@ -5608,7 +5608,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              function_offset: i32,
              function_length: i32,
              args_offset: i32,
-             _args_length: i32,
+             args_length: i32,
              return_offset: i32,
              _return_length: i32| {
                 (|| -> Result<(), VmExecutionError> {
@@ -5822,7 +5822,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              function_offset: i32,
              function_length: i32,
              args_offset: i32,
-             _args_length: i32,
+             args_length: i32,
              return_offset: i32,
              _return_length: i32| {
                 let result = (|| -> Result<(), VmExecutionError> {
@@ -5861,8 +5861,12 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     )?;
                     let argument_types = function.get_arg_types().to_vec();
                     let mut arguments = Vec::with_capacity(argument_types.len());
+                    let mut argument_sizes = Vec::with_capacity(argument_types.len());
                     let mut argument_offset = args_offset;
-                    for argument_type in &argument_types {
+                    let argument_sizes_offset = args_offset
+                        .checked_add(args_length)
+                        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    for (index, argument_type) in argument_types.iter().enumerate() {
                         arguments.push(read_from_wasm_indirect(
                             memory,
                             &mut caller,
@@ -5871,6 +5875,17 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                             epoch,
                         )?);
                         argument_offset += get_type_size(argument_type);
+                        let size_offset = i32::try_from(index)
+                            .ok()
+                            .and_then(|index| index.checked_mul(4))
+                            .and_then(|index| argument_sizes_offset.checked_add(index))
+                            .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                        let size = read_i32(memory, &mut caller, size_offset)?;
+                        argument_sizes.push(
+                            u64::try_from(size).map_err(|_| {
+                                crate::error::wasm_error(WasmError::ValueTypeMismatch)
+                            })?,
+                        );
                     }
 
                     let module = caller
@@ -5936,9 +5951,10 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     let module_cache = caller.data().module_cache;
                     let result = {
                         let context = caller.data_mut();
-                        call_function(
+                        call_function_with_argument_sizes(
                             function_name.as_str(),
                             &arguments,
+                            Some(&argument_sizes),
                             &module,
                             context.global_context,
                             &contract,
