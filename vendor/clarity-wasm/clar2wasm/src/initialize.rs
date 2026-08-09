@@ -6,8 +6,9 @@ use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{
-    AssetIdentifier, BuffData, CallableData, FunctionType, PrincipalData,
-    QualifiedContractIdentifier, SequenceData, SequenceSubtype, TupleData, TypeSignature,
+    AssetIdentifier, BuffData, CallableData, FunctionType, ListData, ListTypeData, OptionalData,
+    PrincipalData, QualifiedContractIdentifier, ResponseData, SequenceData, SequenceSubtype,
+    TupleData, TypeSignature,
 };
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
@@ -667,7 +668,37 @@ pub fn call_function(
     };
     let mut wasm_arguments = Vec::new();
     for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
-        let argument = implicit_contract_cast(expected_type, argument);
+        let cast_argument = match implicit_contract_cast(expected_type, argument) {
+            Ok(argument) => argument,
+            Err(error) => {
+                charge_refused_application(
+                    store.data_mut().global_context,
+                    arguments,
+                    expected_arguments,
+                    epoch,
+                )?;
+                return Err(error);
+            }
+        };
+        let argument = if epoch.sanitize_in_function_invocation() {
+            let Some((sanitized, _)) = Value::sanitize_value(&epoch, expected_type, cast_argument)
+            else {
+                charge_refused_application(
+                    store.data_mut().global_context,
+                    arguments,
+                    expected_arguments,
+                    epoch,
+                )?;
+                return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
+                    Box::new(expected_type.clone()),
+                    argument.to_error_string(),
+                )
+                .into());
+            };
+            sanitized
+        } else {
+            cast_argument
+        };
         // `TypeValueError` and not `TypeError`: the interpreter refuses a
         // mistyped transaction argument by naming the *value*
         // (`DefinedFunction::execute_apply`, `clarity2_implicit_cast`), and the
@@ -794,8 +825,32 @@ pub fn call_function(
 /// value left every nested one — a trait inside a tuple inside a list, which is
 /// what a router's `(list 5 (tuple ... (pool-trait <trait>) ...))` argument is —
 /// failing `admits` and raising a type error on a call the network accepted.
-fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Value {
-    match (expected_type, argument) {
+/// A trait already carried by the value is re-tagged, not only a bare principal.
+/// `clarity2_implicit_cast` casts "principals to traits **and traits to other
+/// traits**", and nano implemented only the first half. A value that reached the
+/// callee already tagged as some other trait — an inner call's argument, or a
+/// field a caller had cast for its own signature — kept that tag, `admits` saw a
+/// trait the callee does not declare, and the call was refused. On mainnet that
+/// was a router taking `(list 100 {asset: <ft-trait>, lp-token: <ft-trait>, …})`
+/// a field of which arrived tagged `<ft-mint-trait>`: block 8724865 refused a
+/// transaction the network executed, and the state roots parted
+/// ([[097-cast-a-trait-argument-the-callee-declares-differently]]).
+///
+/// Each composite is first rebuilt carrying the type the callee declared, just
+/// like `clarity2_implicit_cast`. Epoch 4 then sanitizes that intermediate value
+/// against the declaration, deriving the runtime shape from what it contains.
+fn implicit_contract_cast(
+    expected_type: &TypeSignature,
+    argument: &Value,
+) -> Result<Value, VmExecutionError> {
+    Ok(match (expected_type, argument) {
+        (
+            TypeSignature::CallableType(CallableSubtype::Trait(trait_identifier)),
+            Value::CallableContract(callable),
+        ) => Value::CallableContract(CallableData {
+            contract_identifier: callable.contract_identifier.clone(),
+            trait_identifier: Some(Box::new(trait_identifier.clone())),
+        }),
         (
             TypeSignature::CallableType(CallableSubtype::Trait(trait_identifier)),
             Value::Principal(PrincipalData::Contract(contract_identifier)),
@@ -808,49 +863,60 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
             Value::Sequence(SequenceData::List(list)),
         ) => {
             let entry_type = list_type.get_list_item_type();
-            let cast = list
-                .data
-                .iter()
-                .map(|item| implicit_contract_cast(entry_type, item))
-                .collect();
-            // Rebuilt rather than re-tagged: a value carries its own type
-            // signature, and one that still says `principal` where the cast put
-            // a callable is what `admits` rejects.
-            Value::cons_list_unsanitized(cast).unwrap_or_else(|_| argument.clone())
+            let mut cast = Vec::with_capacity(list.data.len());
+            for item in &list.data {
+                cast.push(implicit_contract_cast(entry_type, item)?);
+            }
+            // The declared entry type over the *value's* length, which is what
+            // `clarity2_implicit_cast` builds. Deriving the type from the cast
+            // elements instead — `cons_list_unsanitized` — answers the least
+            // supertype of what happens to be in the list and its actual length,
+            // so a shorter list or a heterogeneous one came out carrying a
+            // signature the callee never declared.
+            Value::Sequence(SequenceData::List(ListData {
+                data: cast,
+                type_signature: ListTypeData::new_list(
+                    entry_type.clone(),
+                    list.type_signature.get_max_len(),
+                )?,
+            }))
         }
         (TypeSignature::TupleType(tuple_type), Value::Tuple(tuple)) => {
-            let cast = tuple
-                .data_map
-                .iter()
-                .map(|(name, value)| {
-                    let expected = tuple_type.field_type(name).map_or_else(
-                        || value.clone(),
-                        |field| implicit_contract_cast(field, value),
-                    );
-                    (name.clone(), expected)
-                })
-                .collect();
-            TupleData::from_data(cast).map_or_else(|_| argument.clone(), Value::Tuple)
+            let mut cast = std::collections::BTreeMap::new();
+            for (name, value) in &tuple.data_map {
+                let Some(field) = tuple_type.field_type(name) else {
+                    return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
+                        Box::new(expected_type.clone()),
+                        argument.to_error_string(),
+                    )
+                    .into());
+                };
+                cast.insert(name.clone(), implicit_contract_cast(field, value)?);
+            }
+            Value::Tuple(TupleData {
+                type_signature: tuple_type.clone(),
+                data_map: cast,
+            })
         }
-        (TypeSignature::OptionalType(inner), Value::Optional(optional)) => optional
-            .data
-            .as_ref()
-            .map_or_else(
-                || Ok(argument.clone()),
-                |value| Value::some(implicit_contract_cast(inner, value)),
-            )
-            .unwrap_or_else(|_| argument.clone()),
+        (
+            TypeSignature::OptionalType(inner),
+            Value::Optional(OptionalData { data: Some(value) }),
+        ) => Value::Optional(OptionalData {
+            data: Some(Box::new(implicit_contract_cast(inner, value)?)),
+        }),
         (TypeSignature::ResponseType(inner), Value::Response(response)) => {
-            let (expected, wrap): (_, fn(Value) -> _) = if response.committed {
-                (&inner.0, Value::okay)
+            let expected = if response.committed {
+                &inner.0
             } else {
-                (&inner.1, Value::error)
+                &inner.1
             };
-            wrap(implicit_contract_cast(expected, &response.data))
-                .unwrap_or_else(|_| argument.clone())
+            Value::Response(ResponseData {
+                committed: response.committed,
+                data: Box::new(implicit_contract_cast(expected, &response.data)?),
+            })
         }
         _ => argument.clone(),
-    }
+    })
 }
 
 /// A transaction argument the callee's type refuses.
@@ -867,7 +933,11 @@ fn implicit_contract_cast(expected_type: &TypeSignature, argument: &Value) -> Va
 /// cost dimensions, for the same call through both engines.
 #[cfg(test)]
 mod refused_arguments {
-    use clarity::vm::types::TupleData;
+    use clarity::vm::types::signatures::CallableSubtype;
+    use clarity::vm::types::{
+        CallableData, ListTypeData, QualifiedContractIdentifier, SequenceSubtype, TraitIdentifier,
+        TupleData, TypeSignature,
+    };
     use clarity::vm::{ClarityName, Value};
 
     use crate::tools::crosscheck_cost;
@@ -895,6 +965,85 @@ mod refused_arguments {
             "(define-public (f (a {x: uint})) (ok (get x a)))",
             "f",
             &[wide],
+        );
+    }
+
+    /// A trait argument already tagged as some *other* trait is re-tagged.
+    ///
+    /// `clarity2_implicit_cast` casts "principals to traits and **traits to
+    /// other traits**", and only the first half was implemented: a value that
+    /// arrived already tagged kept its tag, `admits` saw a trait the callee does
+    /// not declare, and the call was refused where the interpreter runs it.
+    /// Mainnet block 8724865 is this, nested exactly as here — the tag on a
+    /// trait field of a tuple inside a list
+    /// ([[097-cast-a-trait-argument-the-callee-declares-differently]]).
+    ///
+    /// Asserted on the cast itself, which is how the interpreter tests its own
+    /// (`clarity/src/vm/callables.rs::test_implicit_cast`): a snippet cannot
+    /// reach it, because `admits` is the only thing downstream that can tell the
+    /// two tags apart and both engines agree once the value is past it.
+    #[test]
+    fn a_trait_tagged_as_another_trait_is_re_tagged_as_the_callee_declares_it() {
+        #[allow(clippy::expect_used)]
+        let elsewhere = TraitIdentifier::parse_fully_qualified(
+            "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.traits.ft-mint-trait",
+        )
+        .expect("a trait identifier");
+        #[allow(clippy::expect_used)]
+        let declared = TraitIdentifier::parse_fully_qualified(
+            "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.traits.ft-trait",
+        )
+        .expect("a trait identifier");
+        #[allow(clippy::expect_used)]
+        let token =
+            QualifiedContractIdentifier::parse("SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.token")
+                .expect("a contract identifier");
+        let tagged = |trait_identifier: &TraitIdentifier| {
+            Value::CallableContract(CallableData {
+                contract_identifier: token.clone(),
+                trait_identifier: Some(Box::new(trait_identifier.clone())),
+            })
+        };
+        // A tuple in a list, which is the mainnet router's argument shape and
+        // the one a cast that recursed only into the outermost value missed.
+        let listed = |value: Value| {
+            #[allow(clippy::expect_used)]
+            Value::cons_list_unsanitized(vec![Value::Tuple(
+                TupleData::from_data(vec![(name("asset"), value)]).expect("a tuple"),
+            )])
+            .expect("a list")
+        };
+        let expected_type = TypeSignature::SequenceType(SequenceSubtype::ListType(
+            #[allow(clippy::expect_used)]
+            ListTypeData::new_list(
+                TypeSignature::TupleType(
+                    #[allow(clippy::expect_used)]
+                    vec![(
+                        name("asset"),
+                        TypeSignature::CallableType(CallableSubtype::Trait(declared.clone())),
+                    )]
+                    .try_into()
+                    .expect("a tuple type"),
+                ),
+                4,
+            )
+            .expect("a list type"),
+        ));
+
+        #[allow(clippy::expect_used)]
+        let cast = super::implicit_contract_cast(&expected_type, &listed(tagged(&elsewhere)))
+            .expect("the cast answers");
+
+        assert_eq!(
+            cast,
+            listed(tagged(&declared)),
+            "a trait tag the callee does not declare survived the cast"
+        );
+        assert!(
+            expected_type
+                .admits(&crate::tools::TestConfig::latest_epoch(), &cast)
+                .expect("admits answers"),
+            "the cast value is one the callee's own type refuses"
         );
     }
 
