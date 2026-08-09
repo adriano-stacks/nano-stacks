@@ -1,7 +1,7 @@
 ---
 id: "077"
 title: "Remove peer-derived consensus execution fallbacks"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["049", "051"]
 tags: ["mainnet", "consensus", "sortition", "checkpoint"]
 created_at: 2026-08-07
+completed_at: 2026-08-09
 ---
 
 # Remove peer-derived consensus execution fallbacks
@@ -22,7 +23,7 @@ local sortition chain may let a peer choose consensus-visible execution context.
 
 - [x] Remove the production `LocalView::NoChain` path that uses a peer
       `/v3/sortitions` response as execution context.
-- [~] Refuse startup when checkpoint sortition history, PoX history or payout
+- [x] Refuse startup when checkpoint sortition history, PoX history or payout
       calendar cannot seed the local Bitcoin-derived chain.
 - [x] Treat `SortitionTracker::resume_or_capture` failure as a runtime startup
       error instead of logging it and continuing.
@@ -30,7 +31,7 @@ local sortition chain may let a peer choose consensus-visible execution context.
       accounting must come from checkpointed and locally derived state.
 - [x] Keep peer sortition responses, if retained, diagnostic-only and prevent
       their fields from reaching Clarity headers, validation or fork choice.
-- [ ] Add adversarial tests in which peers lie about Bitcoin height, burn hash,
+- [x] Add adversarial tests in which peers lie about Bitcoin height, burn hash,
       timestamp, VRF seed and accumulated coinbase while local execution remains
       unchanged or refuses before execution.
 
@@ -64,3 +65,20 @@ regression exposed by removing the fallback; it is not a reason to restore one.
 and VRF seed from a peer. `tenure_coinbase` also asks the peer for accumulated
 coinbase outside `LocalView::At`, and failure to start local sortition derivation
 is only printed.
+
+## Closed, 2026-08-09
+
+Checkpoint startup now selects the authenticated boundary, truncates any later
+captured seed, derives locally through the checkpoint source and refuses missing
+or contradictory history, PoX inputs and payout schedules. Execution, proposal
+validation and mining read the local tracker and committed ledger; peer sortition
+and mining-competition fields remain diagnostic-only.
+
+`peer_sortition_lies_never_reach_execution` serves false Bitcoin height, burn hash,
+timestamp, VRF seed, sortition identifiers, winner state and accumulated coinbase.
+The node asks that peer for zero sortitions, reaches the same block ID, state root
+and content root as the honest control, and continues executing. Focused signer,
+miner and sync tests additionally reject peer signer context and prevent peer
+consensus routes or diagnostic participants from entering proposal inputs;
+`a_peer_serving_a_coherent_wrong_chain_moves_nothing` pins fork choice. The focused
+unit/conformance suites and strict Clippy gate passed at `a383ab59`.

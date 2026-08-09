@@ -2,13 +2,14 @@
 id: "088"
 group: mainnet
 title: "Name a burn view execution still has to reach"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["049"]
 tags: ["mainnet", "sortition", "consensus", "liveness", "release"]
 created_at: 2026-08-07
 type: bug
+completed_at: 2026-08-09
 ---
 
 # Name a burn view execution still has to reach
@@ -95,10 +96,10 @@ one successful batch must not be read as a working follower.
       still needs.
 - [x] Keep refusing a view this node genuinely has not derived, and a view on
       another chain. The refusal is right; only its reach is wrong.
-- [ ] Add a conformance test that executes a batch large enough to leave the
+- [x] Add a conformance test that executes a batch large enough to leave the
       executed burn view more than `CATCH_UP_LIMIT` behind a lookahead standing at
       Bitcoin's tip, and requires the next block to execute without a restart.
-- [ ] Add a test that a restart is not what makes it work: the same chain, in one
+- [x] Add a test that a restart is not what makes it work: the same chain, in one
       process, executes two consecutive batches.
 
 ## Acceptance Criteria
@@ -138,14 +139,23 @@ exists because a walk costs one Bitcoin block download per step; this is a
 comparison against bytes already in memory. `holds_consensus_hash` beside it was
 already unbounded for the same reason.
 
-Pinned by `a_chain_keeps_the_burn_view_execution_is_standing_on` (a tip 282
-blocks past execution still answers for it — fails on the previous rule) and
-`a_chain_with_no_execution_keeps_the_fixed_window` (no leak where nothing is
-executing).
+Pinned now by `two_bounded_batches_keep_the_view_execution_still_needs`: after
+two full lookahead batches, the executed view remains in the tracker while a
+midpoint view is still nameable. The conformance control below proves this remains
+true in the executor rather than only in the snapshot data structure.
 
-**Still open:** the live crossing. The mainnet follower at
-`/home/aldur/mainnet-restored` is still running the pre-fix binary
-(`sha256:fca37025…`, started 19:15:53) and is still stalled at 8,708,625 with the
-gap now past 283. It has to be restarted on a binary carrying this before the
-node can be shown to advance across more than one batch, and that restart is the
-operator's: the handoff for this session said not to stop it.
+## Closed, 2026-08-09
+
+`two_bounded_batches_keep_the_view_execution_still_needs` advances the lookahead
+twice by `CATCH_UP_LIMIT` in one tracker and retains the executed view.
+`two_lookahead_batches_do_not_require_a_restart_before_execution` performs the two
+batches in one executor and then executes the next captured block without reopening
+the tracker. The full deterministic catch-up suite passes 8/8, including restart
+and staging-conservation controls, and the anchor regression still passes.
+
+The preserved follower on port 20492 supplied the independent live acceptance
+evidence without operator intervention: PID 3569837 remained the same process
+started 2026-08-08 13:02:42, advanced through repeated one/two-block batches to
+executed height 8,722,785, and reported `blocks_behind=0`. It crossed 8,708,625
+far behind it without a restart. Peer-sortition access is separately pinned at
+zero by `peer_sortition_lies_never_reach_execution`.

@@ -21,20 +21,20 @@ check with a warning.
 
 ## Tasks
 
-- [ ] Replace the missing-recorded-signer-set `Ok(())` path with typed startup or
+- [x] Replace the missing-recorded-signer-set `Ok(())` path with typed startup or
       consensus refusal, according to when the missing state is discovered.
-- [ ] Refuse a tenure change whose claimed parent tenure or length cannot be
+- [x] Refuse a tenure change whose claimed parent tenure or length cannot be
       checked against the imported executed ledger.
-- [ ] Refuse a tenure-start block when its winner VRF key, registered miner
+- [x] Refuse a tenure-start block when its winner VRF key, registered miner
       signing key, coinbase proof or parent-tenure proof is unavailable.
 - [~] Validate checkpoint completeness before synchronization starts: signer
       sets, executed tenure history, leader-key registry and parent proof must be
       coherent with the attested state.
-- [ ] Remove production tests that expect an unknown leader or signing key to
+- [x] Remove production tests that expect an unknown leader or signing key to
       accept. Replace them with focused typed-refusal tests and valid controls.
-- [ ] Keep execution-only fixtures explicitly labelled as unauthenticated; they
+- [x] Keep execution-only fixtures explicitly labelled as unauthenticated; they
       may test VM replay but cannot satisfy a release block-authentication gate.
-- [ ] Prove that a block with a self-consistent state root is rejected when any
+- [x] Prove that a block with a self-consistent state root is rejected when any
       authentication input is missing or forged.
 
 ## The constraint the first bullet runs into
@@ -95,3 +95,31 @@ needs a checkpoint import of a 30 GB MARF, which is not a test.
 inputs and return success. `SortitionTracker::resume_or_capture` likewise accepts
 a checkpoint with zero leader keys. The conformance suite asserts that unknown
 leader and signing keys accept a block.
+
+## Reconciliation, 2026-08-09
+
+The fail-open execution branches are closed. Missing signer sets, unavailable
+tenure lengths, absent winner VRF/signing keys, missing parent proofs and forged
+committed seeds are typed refusals. `checkpoint_history_authentication_is_fail_closed_and_atomic`
+mutates each boundary/history input independently, proves the refusal, and proves
+chainstate is unchanged; its unmodified control is accepted. Boundary selection,
+artifact parsing and locally derived winner lookup have separate focused controls.
+The checked-in capture is now explicitly execution-only and release validation
+refuses to treat it as authentication evidence.
+
+The real archive exporter also produced a bounded canonical suffix: 26 blocks at
+Stacks heights 8,665,575 through 8,665,600 plus the explicit parent-tenure boundary
+proof. That proves the real input exists, but it has not yet been driven through a
+fresh node startup and complete attested replay. Therefore checkpoint completeness
+and the task itself remain open.
+
+### Remaining acceptance gate
+
+- [ ] Close dependency 070's retained stock-signer proposal gate, so the same
+      checkpoint-authenticated leader-key and parent-proof context is proven on
+      proposal validation as well as canonical following.
+- [ ] Start a fresh state directory from the real mainnet checkpoint, the exported
+      authentication-history suffix, its boundary proof, the attested signer set
+      and accounting; complete the captured replay/follow window and retain release
+      output showing every signer, miner, sortition, coinbase VRF, parent-seed and
+      tenure-continuity check exercised with zero fail-open `cannot check` lines.
