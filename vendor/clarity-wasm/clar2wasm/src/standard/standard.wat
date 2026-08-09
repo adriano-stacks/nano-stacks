@@ -349,6 +349,7 @@
                                                                          (param $index_hi i64)
                                                                          (param $count_lo i64)
                                                                          (param $count_hi i64)
+                                                                         (param $siblings_shape i32)
                                                                          (param $siblings_offset i32)
                                                                          (param $siblings_length i32)
                                                                          (result i32)))

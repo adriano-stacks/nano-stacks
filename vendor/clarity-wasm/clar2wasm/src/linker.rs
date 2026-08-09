@@ -6739,6 +6739,7 @@ fn link_verify_merkle_proof_fn(
              index_high: i64,
              count_low: i64,
              count_high: i64,
+             siblings_shape: i32,
              siblings_offset: i32,
              siblings_length: i32| {
                 let memory = caller
@@ -6763,14 +6764,18 @@ fn link_verify_merkle_proof_fn(
                     epoch,
                 )?;
                 let sibling_type = TypeSignature::list_of(TypeSignature::BUFFER_32, 24)?;
-                let siblings = read_from_wasm(
-                    memory,
-                    &mut caller,
-                    &sibling_type,
-                    siblings_offset,
-                    siblings_length,
-                    epoch,
-                )?;
+                let siblings = if siblings_shape == 0 {
+                    read_from_wasm(
+                        memory,
+                        &mut caller,
+                        &sibling_type,
+                        siblings_offset,
+                        siblings_length,
+                        epoch,
+                    )?
+                } else {
+                    caller.data().load_runtime_shape(siblings_shape)?
+                };
                 let index = ((index_high as u128) << 64) | index_low as u64 as u128;
                 let count = ((count_high as u128) << 64) | count_low as u64 as u128;
                 Ok(crate::bitcoin::verify_merkle_proof(leaf, root, index, count, siblings)? as i32)
@@ -8042,6 +8047,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
          _index_high: i64,
          _count_low: i64,
          _count_high: i64,
+         _siblings_shape: i32,
          _siblings_offset: i32,
          _siblings_length: i32| Ok(0i32),
     )?;
