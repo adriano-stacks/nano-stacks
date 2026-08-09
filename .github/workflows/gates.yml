@@ -64,7 +64,12 @@ jobs:
       # ignored/conditional inventory and consumes the scoreboard verdict. It does
       # not pretend that this offline runner has the mainnet and Hacknet inputs.
       - name: offline release evidence
-        run: nix develop --command cargo xtask release-report --no-gates
+        run: |
+          set +e
+          nix develop --command cargo xtask release-report --no-gates
+          status=$?
+          set -e
+          test "$status" -eq 2
 
   # Release qualification is deliberately not a push/PR job. It needs large
   # captured state, a live mainnet route and stock Hacknet services; pretending a

@@ -532,7 +532,7 @@ fn read_task_status(path: &Path, found: &mut BTreeMap<String, String>, errors: &
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tables, validate_unique_ignored_tests, IgnoredTest, ReleaseInventory};
+    use super::{IgnoredTest, ReleaseInventory, parse_tables, validate_unique_ignored_tests};
 
     #[test]
     fn table_parser_ignores_multiline_evidence() {

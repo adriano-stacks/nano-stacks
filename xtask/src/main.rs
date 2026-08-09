@@ -6046,6 +6046,7 @@ fn report_inputs() {
     }
     for (name, value) in names {
         let shown = if name == "NANO_FUNDED_KEY"
+            || name == "NANO_MAINNET_KEY"
             || name.contains("PRIVATE_KEY")
             || name.contains("PASSWORD")
             || name.contains("SECRET")
@@ -6245,6 +6246,19 @@ fn release_report(arguments: &[String]) -> ExitCode {
             "\n  {blocking} ignored or declared semantic differential(s) remain, so this \
              report fails whatever else passed. See the release inventories."
         );
+    }
+    if !run_gates {
+        return if built
+            && artifact
+            && contract_arities
+            && scoreboard
+            && receipt_binding
+            && release_inventory
+        {
+            ExitCode::from(2)
+        } else {
+            ExitCode::FAILURE
+        };
     }
     if passed
         && blocking == 0

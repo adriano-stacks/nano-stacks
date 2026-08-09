@@ -191,6 +191,7 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
             artifact.to_str().expect("UTF-8 temporary path"),
         ])
         .env("NANO_FIXTURES", &fixtures)
+        .env("NANO_MAINNET_KEY", "not-for-logs")
         .output()
         .expect("run non-qualifying release report");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -198,6 +199,11 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
     assert!(
         !output.status.success(),
         "--no-gates qualified a release:\n{stdout}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a complete offline audit did not use the non-qualifying exit code:\n{stdout}"
     );
     assert!(
         stdout.contains(
@@ -218,5 +224,9 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
     assert!(
         stdout.contains("NANO_REPLAY_BOTH_ENGINES=1"),
         "the report omitted its required semantic engine comparison:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("NANO_MAINNET_KEY         <redacted>") && !stdout.contains("not-for-logs"),
+        "the report exposed a private mainnet key:\n{stdout}"
     );
 }
