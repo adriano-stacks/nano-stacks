@@ -428,6 +428,14 @@ requires = "mainnet capture/state with blocks and published reward sets"
 policy = "required"
 
 [[conditional]]
+site = "signer_weight_enforcement::a_block_without_an_authenticated_signer_set_is_rejected#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "mainnet capture/state with blocks and published reward sets"
+policy = "required"
+
+[[conditional]]
 site = "signer_weight_enforcement::a_block_below_the_weight_threshold_is_rejected#1"
 class = "infrastructure"
 owner = "076"
@@ -580,7 +588,7 @@ requires = "capture with tenure start, leader-key registration and signing-key h
 policy = "required"
 
 [[conditional]]
-site = "tenure_vrf_enforcement::an_unknown_leader_key_accepts_the_block_and_says_so#1"
+site = "tenure_vrf_enforcement::an_unknown_leader_key_refuses_the_block#1"
 class = "infrastructure"
 owner = "076"
 job = "release-qualification"
@@ -644,7 +652,7 @@ requires = "capture with tenure start, leader-key registration and signing-key h
 policy = "required"
 
 [[conditional]]
-site = "tenure_vrf_enforcement::an_unregistered_signing_key_accepts_the_block_and_says_so#1"
+site = "tenure_vrf_enforcement::an_unregistered_signing_key_refuses_the_block#1"
 class = "infrastructure"
 owner = "076"
 job = "release-qualification"
@@ -652,7 +660,7 @@ requires = "capture with tenure start, leader-key registration and signing-key h
 policy = "required"
 
 [[conditional]]
-site = "tenure_vrf_enforcement::an_unregistered_signing_key_accepts_the_block_and_says_so#2"
+site = "tenure_vrf_enforcement::an_unregistered_signing_key_refuses_the_block#2"
 class = "infrastructure"
 owner = "076"
 job = "release-qualification"
@@ -683,4 +691,4 @@ job = "release-qualification"
 requires = "NANO_MAINNET_MARF, NANO_MAINNET_BLOCK, NANO_MAINNET_ROOT and NANO_MAINNET_JOURNAL as used by the test"
 policy = "required"
 
-# 85 call sites inventoried.
+# 86 call sites inventoried.

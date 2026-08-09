@@ -256,13 +256,6 @@ job = "release-qualification"
 requires = "running Hacknet node on localhost:20443 and NANO_SIGNER_PUBLIC_KEY"
 
 [[ignored]]
-test = "hacknet_commitment_matches_the_stock_miners"
-class = "infrastructure"
-owner = "053"
-job = "release-qualification"
-requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
-
-[[ignored]]
 test = "hacknet_follower_retains_an_authenticated_tenure"
 class = "infrastructure"
 owner = "053"

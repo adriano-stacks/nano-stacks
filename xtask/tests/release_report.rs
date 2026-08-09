@@ -62,6 +62,15 @@ fn make_checkpoint_winner_absent(fixtures: &Path) {
     .expect("write adversarial snapshots");
 }
 
+fn baseline_fixture(root: &Path) {
+    fs::create_dir_all(root).expect("create baseline fixture directory");
+    fs::write(
+        root.join("manifest.toml"),
+        "mode = \"baseline\"\nreplay_blocks = 0\n",
+    )
+    .expect("write baseline fixture manifest");
+}
+
 #[test]
 fn a_red_scoreboard_makes_both_commands_fail() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -163,4 +172,51 @@ fn an_invalid_checkpoint_seed_stops_before_replay_or_artifact_evidence() {
             "the report presented {forbidden:?} after invalid validation:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
+    let temporary = tempfile::tempdir().expect("temporary release inputs");
+    let fixtures = temporary.path().join("fixtures");
+    baseline_fixture(&fixtures);
+    let xtask = Path::new(env!("CARGO_BIN_EXE_xtask"));
+    let artifact = temporary.path().join("stacks-node");
+    fs::copy(xtask, &artifact).expect("copy an immutable test artifact");
+
+    let output = Command::new(xtask)
+        .args([
+            "release-report",
+            "--no-gates",
+            "--artifact",
+            artifact.to_str().expect("UTF-8 temporary path"),
+        ])
+        .env("NANO_FIXTURES", &fixtures)
+        .output()
+        .expect("run non-qualifying release report");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "--no-gates qualified a release:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "--no-gates: required test commands were not run; this report is explicitly non-qualifying"
+        ),
+        "the report did not name the bypass:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "conditional site signer_weight_enforcement::a_block_without_an_authenticated_signer_set_is_rejected#1 (owner task 076)"
+        ),
+        "the report omitted a required conditional site or its owner:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ignored test reads_a_mainnet_burn_block (owner task 053)"),
+        "the report omitted an ignored infrastructure test or its owner:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("NANO_REPLAY_BOTH_ENGINES=1"),
+        "the report omitted its required semantic engine comparison:\n{stdout}"
+    );
 }

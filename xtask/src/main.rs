@@ -19,6 +19,10 @@ use nano_chainstate::{
 use nano_primitives::Network;
 use serde_json::json;
 
+mod release_inventory;
+
+use release_inventory::ReleaseInventory;
+
 /// The chain a state directory on disk belongs to.
 ///
 /// Read from the state rather than named here. Every one of these subcommands
@@ -5304,6 +5308,7 @@ struct GateResult {
     command: String,
     passed: bool,
     detail: String,
+    unrunnable: Vec<String>,
 }
 
 /// Run one gate and summarize what it said.
@@ -5328,6 +5333,7 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
             command: printed,
             passed: false,
             detail: format!("{command} could not be started"),
+            unrunnable: Vec::new(),
         };
     };
     let combined = format!(
@@ -5352,8 +5358,12 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
     } else {
         results.join("; ")
     };
+    let (unrunnable, broken) = if output.status.success() {
+        (BTreeMap::new(), Vec::new())
+    } else {
+        classify_failures(&combined)
+    };
     if !output.status.success() {
-        let (unrunnable, broken) = classify_failures(&combined);
         if !unrunnable.is_empty() {
             let total: usize = unrunnable.values().map(Vec::len).sum();
             let _ = write!(
@@ -5381,6 +5391,7 @@ fn run_gate(command: &str, arguments: &[&str], environment: &[(&str, &str)]) -> 
         command: printed,
         passed: output.status.success(),
         detail,
+        unrunnable: unrunnable.into_values().flatten().collect(),
     }
 }
 
@@ -5423,73 +5434,6 @@ fn classify_failures(output: &str) -> (BTreeMap<String, Vec<String>>, Vec<String
         }
     }
     (unrunnable, broken)
-}
-
-struct ConditionalInventory {
-    modules: Vec<(String, usize)>,
-    required: usize,
-    diagnostics: usize,
-    errors: Vec<String>,
-}
-
-/// Summarize and validate the owned conditional policy entries.
-fn conditional_gates() -> ConditionalInventory {
-    let Ok(text) = fs::read_to_string(workspace_root().join("conditional-tests.toml")) else {
-        return ConditionalInventory {
-            modules: Vec::new(),
-            required: 0,
-            diagnostics: 0,
-            errors: vec!["conditional-tests.toml is absent or unreadable".to_owned()],
-        };
-    };
-    let mut modules = BTreeMap::new();
-    let mut sites = BTreeSet::new();
-    let mut required = 0;
-    let mut diagnostics = 0;
-    let mut errors = Vec::new();
-    for table in text.split("[[conditional]]").skip(1) {
-        let field = |name: &str| {
-            let prefix = format!("{name} = \"");
-            table
-                .lines()
-                .map(str::trim)
-                .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix('"'))
-                .map(str::to_owned)
-        };
-        let site = field("site").unwrap_or_else(|| "UNNAMED".to_owned());
-        let class = field("class").unwrap_or_default();
-        let policy = field("policy").unwrap_or_default();
-        let job = field("job").unwrap_or_default();
-        let owner = field("owner").unwrap_or_default();
-        let prerequisites = field("requires").unwrap_or_default();
-        let valid = match (class.as_str(), policy.as_str()) {
-            ("infrastructure", "required") => job == "release-qualification",
-            ("diagnostic", "optional") => job == "manual-diagnostics",
-            _ => false,
-        } && !owner.is_empty()
-            && !prerequisites.is_empty();
-        if !valid {
-            errors.push(format!("{site} has an invalid or incomplete policy"));
-        }
-        if !sites.insert(site.clone()) {
-            errors.push(format!("{site} is declared more than once"));
-        }
-        if class == "diagnostic" {
-            diagnostics += 1;
-        } else {
-            required += 1;
-        }
-        let module = site
-            .split_once("::")
-            .map_or(site.as_str(), |(module, _)| module);
-        *modules.entry(module.to_owned()).or_default() += 1;
-    }
-    ConditionalInventory {
-        modules: modules.into_iter().collect(),
-        required,
-        diagnostics,
-        errors,
-    }
 }
 
 /// The version the lock file pins for a crate, if it pins exactly one.
@@ -5658,27 +5602,28 @@ fn report_receipt_binding() -> bool {
 /// A reason the inventory does not list is `unclassified`, which counts against
 /// the release exactly as `semantic` does, so the undecided case cannot be the
 /// quiet one.
-fn report_differentials() -> usize {
+fn report_differentials(inventory: &ReleaseInventory) -> usize {
     println!("\nignored tests");
-    let roots = [
-        "vendor/clarity-wasm/clar2wasm/src",
-        "vendor/clarity-wasm/clar2wasm/tests",
-        "crates",
-    ];
-    let inventory = ignored_inventory();
     let mut blocking = Vec::new();
     let mut infrastructure = 0usize;
     let mut tools = 0usize;
-    for root in roots {
-        for (path, name, reason) in ignored_tests(&workspace_root().join(root)) {
-            match inventory.get(name.as_str()).map(String::as_str) {
-                Some("infrastructure") => infrastructure += 1,
-                Some("covered" | "tool" | "out-of-scope") => tools += 1,
-                Some(class) => blocking.push((path, format!("{name}: {reason}"), class.to_owned())),
-                None => {
-                    blocking.push((path, format!("{name}: {reason}"), "unclassified".to_owned()));
-                }
-            }
+    for test in &inventory.ignored_tests {
+        let policy = inventory.ignored_policy(&test.name);
+        match policy.map(|policy| policy.class.as_str()) {
+            Some("infrastructure") => infrastructure += 1,
+            Some("covered" | "tool" | "out-of-scope") => tools += 1,
+            Some(class) => blocking.push((
+                test.path.clone(),
+                format!("{}: {}", test.name, test.reason),
+                class.to_owned(),
+                policy.map_or("UNOWNED", |policy| policy.owner.as_str()),
+            )),
+            None => blocking.push((
+                test.path.clone(),
+                format!("{}: {}", test.name, test.reason),
+                "unclassified".to_owned(),
+                "UNOWNED",
+            )),
         }
     }
     blocking.sort();
@@ -5699,8 +5644,8 @@ fn report_differentials() -> usize {
         blocking.len()
     );
     let count = blocking.len();
-    for (path, reason, class) in blocking {
-        println!("    [{class}] {path}: {reason}");
+    for (path, reason, class, owner) in blocking {
+        println!("    [{class}] {path}: {reason} (owner task {owner})");
     }
     count
 }
@@ -5750,29 +5695,20 @@ fn report_declared_differentials() -> usize {
     entries.len()
 }
 
-/// Where every `#[ignore]` is accounted for, by the exact reason it gives.
-pub const IGNORED_INVENTORY: &str = "ignored-tests.toml";
-
-/// The inventory, as `reason -> class`.
-///
-/// An unreadable or unparsable inventory yields nothing, which classifies every
-/// ignored test as `unclassified` and fails the gate. That is the right direction
-/// to fail in: the file existing is part of what is being asserted.
-fn ignored_inventory() -> BTreeMap<String, String> {
-    let Ok(text) = fs::read_to_string(workspace_root().join(IGNORED_INVENTORY)) else {
-        eprintln!("{IGNORED_INVENTORY} cannot be read, so every ignored test is unclassified");
-        return BTreeMap::new();
-    };
-    parse_ignored_inventory(&text)
-}
-
 /// Run every ignored test classified as infrastructure, and no waived semantics.
 ///
 /// Cargo supplies one filter string but any number of `--skip` filters, so one
 /// workspace invocation can execute the complete infrastructure class without
 /// starting a Cargo process per test. The release runner supplies their services.
 fn infrastructure_tests() -> ExitCode {
-    let inventory = ignored_inventory();
+    let inventory = ReleaseInventory::load(&workspace_root());
+    if !inventory.errors.is_empty() {
+        eprintln!(
+            "the release inventory is invalid:\n  {}",
+            inventory.errors.join("\n  ")
+        );
+        return ExitCode::FAILURE;
+    }
     let mut arguments = vec![
         "test".to_owned(),
         "--release".to_owned(),
@@ -5782,8 +5718,10 @@ fn infrastructure_tests() -> ExitCode {
         "--test-threads=1".to_owned(),
     ];
     let mut skipped: Vec<String> = inventory
-        .into_iter()
-        .filter_map(|(test, class)| (class != "infrastructure").then_some(test))
+        .ignored
+        .iter()
+        .filter(|policy| policy.class != "infrastructure")
+        .map(|policy| policy.test.clone())
         .collect();
     skipped.sort();
     for test in skipped {
@@ -5816,6 +5754,7 @@ fn infrastructure_gate(environment: &[(&str, &str)]) -> GateResult {
             command: "cargo xtask infrastructure-tests".to_owned(),
             passed: false,
             detail: "the xtask binary cannot be found".to_owned(),
+            unrunnable: Vec::new(),
         },
         |binary| {
             run_gate(
@@ -5825,102 +5764,6 @@ fn infrastructure_gate(environment: &[(&str, &str)]) -> GateResult {
             )
         },
     )
-}
-
-/// Read `reason` and `class` out of the inventory's `[[ignored]]` tables.
-///
-/// Hand-parsed rather than pulling a TOML crate into `xtask` for eleven entries of
-/// two flat string fields each. It reads only what it needs and ignores the rest,
-/// which is why `note` may be a multi-line string without this caring.
-fn parse_ignored_inventory(text: &str) -> BTreeMap<String, String> {
-    let mut found = BTreeMap::new();
-    let mut reason: Option<String> = None;
-    let value = |line: &str| -> Option<String> {
-        let (_, rest) = line.split_once('=')?;
-        let rest = rest.trim();
-        // Only single-line quoted scalars: `note` is a `"""` block and is not read.
-        let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
-        (!inner.starts_with('"')).then(|| inner.to_owned())
-    };
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[[ignored]]" {
-            reason = None;
-        } else if trimmed.starts_with("test") {
-            reason = value(trimmed);
-        } else if trimmed.starts_with("class")
-            && let (Some(key), Some(class)) = (reason.take(), value(trimmed))
-        {
-            found.insert(key, class);
-        }
-    }
-    found
-}
-
-/// Every `#[ignore]` under `root`, as `(file:line, test name, reason)`.
-fn ignored_tests(root: &Path) -> Vec<(String, String, String)> {
-    let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir(root) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(ignored_tests(&path));
-            continue;
-        }
-        if path.extension().is_none_or(|extension| extension != "rs") {
-            continue;
-        }
-        let Ok(source) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let shown = path
-            .strip_prefix(workspace_root())
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        for (line, text) in source.lines().enumerate() {
-            let trimmed = text.trim_start();
-            // The attribute, not a mention of it in prose: a doc comment
-            // explaining why something is *not* ignored would otherwise be counted.
-            if !trimmed.starts_with("#[ignore") {
-                continue;
-            }
-            let reason = trimmed
-                .split_once('"')
-                .and_then(|(_, rest)| rest.rsplit_once('"').map(|(reason, _)| reason.to_owned()))
-                .unwrap_or_else(|| "no reason given".to_owned());
-            // Keyed by the test's own name, not by its reason. Twelve sites share
-            // the wording "test system needs to be improved relative to versioning
-            // and epochs", and they are not one thing: some are words epoch 4.0
-            // removed and some are `asserts!` and `as-contract`, which it very much
-            // has. One key for both would classify the second by the first.
-            // The first declaration below the attribute, whatever else sits
-            // between them: `#[ignore]` may come before `#[test]`, and the
-            // declaration may be `async fn`, `pub fn` or a `proptest!` body's
-            // plain `fn`. Anything else in between is another attribute.
-            let name = source
-                .lines()
-                .skip(line + 1)
-                .take(8)
-                .find_map(|next| {
-                    let next = next.trim_start();
-                    let rest = ["fn ", "async fn ", "pub fn ", "pub async fn "]
-                        .into_iter()
-                        .find_map(|prefix| next.strip_prefix(prefix))?;
-                    Some(
-                        rest.split(['(', '<', ' '])
-                            .next()
-                            .unwrap_or(rest)
-                            .to_owned(),
-                    )
-                })
-                .unwrap_or_else(|| format!("{shown}:{}", line + 1));
-            found.push((format!("{shown}:{}", line + 1), name, reason));
-        }
-    }
-    found
 }
 
 fn report_artifact(binary: &Path) -> bool {
@@ -6116,6 +5959,10 @@ fn report_state_engines(directory: &Path) {
 /// runs `cargo xtask scoreboard`.
 fn report_scoreboard() -> bool {
     println!("\nscoreboard");
+    println!(
+        "  NANO_REPLAY_BOTH_ENGINES=1: every captured contract call is compared with the \
+         interpreter before sealing (required semantic gate, owner task 060)"
+    );
     let manifest_path = fixture_root().join("manifest.toml");
     if let Err(error) = FixtureManifest::load(&manifest_path) {
         println!(
@@ -6128,7 +5975,11 @@ fn report_scoreboard() -> bool {
         println!("  cannot find this binary to run the scoreboard with");
         return false;
     };
-    let Ok(run) = Command::new(binary).arg("scoreboard").output() else {
+    let Ok(run) = Command::new(binary)
+        .arg("scoreboard")
+        .env("NANO_REPLAY_BOTH_ENGINES", "1")
+        .output()
+    else {
         println!("  the scoreboard could not be run");
         return false;
     };
@@ -6208,29 +6059,53 @@ fn report_inputs() {
     }
 }
 
-fn report_conditional_gates() -> bool {
-    println!("\nconditional gates");
-    let conditional = conditional_gates();
+fn report_release_inventory(inventory: &ReleaseInventory, run_gates: bool) -> bool {
+    println!("\nrelease test inventory");
+    let required = inventory.required_conditionals().count();
+    let diagnostics = inventory.conditionals.len().saturating_sub(required);
+    let mut modules = BTreeMap::new();
+    for policy in &inventory.conditionals {
+        let module = policy
+            .site
+            .split_once("::")
+            .map_or("UNNAMED", |(name, _)| name);
+        *modules.entry(module).or_insert(0usize) += 1;
+    }
     println!(
-        "  {} required gates and {} optional diagnostics across {} files are owned in \
+        "  {required} required gates and {diagnostics} optional diagnostics across {} files are owned in \
          conditional-tests.toml.",
-        conditional.required,
-        conditional.diagnostics,
-        conditional.modules.len()
+        modules.len()
     );
-    println!("  Required gates panic when NANO_REQUIRE_MAINNET is set; diagnostics only name");
-    println!("  the parameters an operator would need for a specific investigation.");
-    for (name, count) in &conditional.modules {
+    println!(
+        "  {} ignored infrastructure tests are owned in ignored-tests.toml.",
+        inventory.infrastructure_ignored().count()
+    );
+    for (name, count) in modules {
         println!("    {name:<34} {count}");
     }
-    for error in &conditional.errors {
+    for error in &inventory.errors {
         println!("  FAIL: {error}");
     }
-    conditional.required > 0 && conditional.errors.is_empty()
+    if !run_gates {
+        println!("\n  UNEXECUTED: --no-gates is not release qualification.");
+        for policy in inventory.infrastructure_ignored() {
+            println!(
+                "    ignored test {} (owner task {})",
+                policy.test, policy.owner
+            );
+        }
+        for policy in inventory.required_conditionals() {
+            println!(
+                "    conditional site {} (owner task {})",
+                policy.site, policy.owner
+            );
+        }
+    }
+    required > 0 && inventory.errors.is_empty()
 }
 
 /// Run the three gates tasks/053 names and report what each said.
-fn report_gates(capture: Option<&str>) -> bool {
+fn report_gates(capture: Option<&str>, inventory: &ReleaseInventory) -> bool {
     println!("\ngates");
     println!("  Each command below also inherits every variable under `inputs`.");
     let mut environment: Vec<(&str, &str)> = vec![("NANO_REQUIRE_MAINNET", "1")];
@@ -6284,6 +6159,13 @@ fn report_gates(capture: Option<&str>) -> bool {
             if gate.passed { "pass" } else { "FAIL" },
             gate.detail
         );
+        for test in &gate.unrunnable {
+            let owner = inventory
+                .conditional_owner(test)
+                .or_else(|| inventory.ignored_owner(test))
+                .unwrap_or("UNOWNED");
+            println!("      unexecuted {test} (owner task {owner})");
+        }
     }
     all_passed
 }
@@ -6330,9 +6212,10 @@ fn release_report(arguments: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    let inventory = ReleaseInventory::load(&workspace_root());
     report_engines();
     let receipt_binding = report_receipt_binding();
-    let blocking = report_differentials() + report_declared_differentials();
+    let blocking = report_differentials(&inventory) + report_declared_differentials();
     let built = artifact.is_some() || build_release_artifact();
     let artifact_path =
         artifact.unwrap_or_else(|| workspace_root().join("target/release/stacks-node"));
@@ -6341,14 +6224,17 @@ fn release_report(arguments: &[String]) -> ExitCode {
     report_checkpoint(state.as_deref());
     let scoreboard = report_scoreboard();
     report_inputs();
-    let conditional_inventory = report_conditional_gates();
+    let release_inventory = report_release_inventory(&inventory, run_gates);
 
     let passed = if run_gates {
-        report_gates(capture.as_deref())
+        report_gates(capture.as_deref(), &inventory)
     } else {
         println!("\ngates");
-        println!("  --no-gates: nothing was run, so nothing is claimed.");
-        true
+        println!(
+            "  --no-gates: required test commands were not run; this report is explicitly \
+             non-qualifying."
+        );
+        false
     };
 
     // A blocking ignore is a failed gate whether or not the gates that ran passed.
@@ -6367,7 +6253,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && contract_arities
         && scoreboard
         && receipt_binding
-        && conditional_inventory
+        && release_inventory
     {
         ExitCode::SUCCESS
     } else {
