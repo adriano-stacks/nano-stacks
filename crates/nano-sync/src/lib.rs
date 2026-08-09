@@ -897,41 +897,7 @@ impl SyncClient {
         if !sortitions.is_empty() {
             return Err(SyncError::InvalidSortition);
         }
-        Ok(SortitionInfo {
-            bitcoin_block_hash: parse_prefixed_bitcoin_block_hash(&sortition.burn_block_hash)?,
-            bitcoin_height: sortition.burn_block_height,
-            bitcoin_timestamp: sortition.burn_header_timestamp,
-            sortition_id: parse_prefixed_sortition_id(&sortition.sortition_id)?,
-            parent_sortition_id: parse_prefixed_sortition_id(&sortition.parent_sortition_id)?,
-            consensus_hash: parse_prefixed_consensus_hash(&sortition.consensus_hash)?,
-            was_sortition: sortition.was_sortition,
-            miner_public_key_hash: sortition
-                .miner_pk_hash160
-                .as_deref()
-                .map(parse_prefixed_hash160)
-                .transpose()?,
-            stacks_parent_consensus_hash: sortition
-                .stacks_parent_ch
-                .as_deref()
-                .map(parse_prefixed_consensus_hash)
-                .transpose()?,
-            last_sortition_consensus_hash: sortition
-                .last_sortition_ch
-                .as_deref()
-                .map(parse_prefixed_consensus_hash)
-                .transpose()?,
-            committed_block_hash: sortition
-                .committed_block_hash
-                .as_deref()
-                .map(parse_prefixed_block_hash)
-                .transpose()?,
-            vrf_seed: sortition
-                .vrf_seed
-                .as_deref()
-                .map(parse_prefixed_hex)
-                .transpose()?,
-            mining_competition: None,
-        })
+        parse_sortition_info(&sortition)
     }
 
     /// Download and validate one Nakamoto block by its block ID.
@@ -996,13 +962,15 @@ impl SyncClient {
     /// This is how a node finds where a candidate chain left the one it holds:
     /// the answer runs backwards from `start` to `stop`, one entry per burn
     /// block, and the first entry both chains agree on is the fork point.
+    /// stacks-core's route names the older bound first and the newer cursor
+    /// second, despite returning the entries in the opposite direction.
     pub async fn tenure_fork_info(
         &self,
         start: ConsensusHash,
         stop: ConsensusHash,
     ) -> Result<Vec<ForkInfo>, SyncError> {
         let wire: Vec<ForkInfoWire> = self
-            .get(&format!("v3/tenures/fork_info/{start}/{stop}"))
+            .get(&format!("v3/tenures/fork_info/{stop}/{start}"))
             .await?;
         wire.into_iter()
             .map(|entry| {
@@ -2291,6 +2259,47 @@ fn parse_prefixed_hash160(value: &str) -> Result<Hash160, SyncError> {
     parse_prefixed_hex(value).map(Hash160::from_bytes)
 }
 
+fn parse_sortition_info(sortition: &SortitionInfoWire) -> Result<SortitionInfo, SyncError> {
+    Ok(SortitionInfo {
+        bitcoin_block_hash: parse_prefixed_bitcoin_block_hash(&sortition.burn_block_hash)?,
+        bitcoin_height: sortition.burn_block_height,
+        bitcoin_timestamp: sortition.burn_header_timestamp,
+        sortition_id: parse_prefixed_sortition_id(&sortition.sortition_id)?,
+        parent_sortition_id: parse_prefixed_sortition_id(&sortition.parent_sortition_id)?,
+        consensus_hash: parse_prefixed_consensus_hash(&sortition.consensus_hash)?,
+        was_sortition: sortition.was_sortition,
+        miner_public_key_hash: sortition
+            .miner_pk_hash160
+            .as_deref()
+            .map(parse_prefixed_hash160)
+            .transpose()?,
+        stacks_parent_consensus_hash: sortition
+            .stacks_parent_ch
+            .as_deref()
+            .map(parse_prefixed_consensus_hash)
+            .transpose()?,
+        last_sortition_consensus_hash: sortition
+            .last_sortition_ch
+            .as_deref()
+            .map(parse_prefixed_consensus_hash)
+            .transpose()?,
+        committed_block_hash: sortition
+            .committed_block_hash
+            .as_deref()
+            .map(parse_prefixed_block_hash)
+            .transpose()?,
+        vrf_seed: sortition
+            .vrf_seed
+            .as_deref()
+            .map(parse_prefixed_hex)
+            .transpose()?,
+        // This type also carries diagnostics this node derives for its own RPC.
+        // A peer's copy is neither authentication evidence nor worth retaining in
+        // the 4,096-entry sortition cache, so unknown additive fields are discarded.
+        mining_competition: None,
+    })
+}
+
 fn parse_stacker_set(value: StackerSetWire) -> Result<StackerSet, SyncError> {
     let sbtc_address = value
         .sbtc_address
@@ -2377,10 +2386,10 @@ mod tests {
 
     use super::{
         BlockUploadWire, BurnView, CandidateTip, RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, Signer,
-        SignerSet, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError, TenureSource,
-        choose_canonical_tip, parse_block_hash, parse_block_id, parse_consensus_hash,
-        parse_prefixed_hash160, parse_stacker_set, retry_after, validate_tenure,
-        validate_tenure_transition,
+        SignerSet, SortitionInfoWire, StackerSetResponseWire, StackerSetWire, SyncClient,
+        SyncError, TenureSource, choose_canonical_tip, parse_block_hash, parse_block_id,
+        parse_consensus_hash, parse_prefixed_hash160, parse_sortition_info, parse_stacker_set,
+        retry_after, validate_tenure, validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -2427,6 +2436,32 @@ mod tests {
             &[0xaa; 20]
         );
         assert!(parse_prefixed_hash160("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+    }
+
+    #[test]
+    fn peer_mining_diagnostics_are_discarded_before_the_sortition_cache() {
+        let wire: SortitionInfoWire = serde_json::from_value(serde_json::json!({
+            "burn_block_hash": format!("0x{}", "11".repeat(32)),
+            "burn_block_height": 123,
+            "burn_header_timestamp": 456,
+            "sortition_id": format!("0x{}", "22".repeat(32)),
+            "parent_sortition_id": format!("0x{}", "33".repeat(32)),
+            "consensus_hash": format!("0x{}", "44".repeat(20)),
+            "was_sortition": true,
+            "mining_competition": {
+                "winner_txid": "not even hexadecimal",
+                "participants": vec![serde_json::json!({
+                    "txid": false,
+                    "arbitrary_peer_bytes": "ff".repeat(1_024),
+                }); 4_097],
+            },
+        }))
+        .expect("unknown peer diagnostics are skipped");
+        let sortition = parse_sortition_info(&wire).expect("stock sortition fields remain valid");
+
+        assert_eq!(sortition.bitcoin_height, 123);
+        assert_eq!(sortition.consensus_hash.as_bytes(), &[0x44; 20]);
+        assert_eq!(sortition.mining_competition, None);
     }
 
     /// A hash reads the same whether or not the peer prefixed it.

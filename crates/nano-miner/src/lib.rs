@@ -4,12 +4,14 @@ mod commitment;
 mod tenure;
 
 pub use commitment::{
-    CommitmentPlan, CommitmentPlanError, EPOCH_4_MARKER, RegisteredLeaderKey, plan_commitment,
+    CommitmentParent, CommitmentPlan, CommitmentPlanError, EPOCH_4_MARKER, RegisteredLeaderKey,
+    plan_local_commitment,
 };
 pub use tenure::{
-    BitcoinTenureView, NAKAMOTO_BLOCK_VERSION_EPOCH_4, SortitionHashPoint, TenureExtension,
-    TenureStartError, TenureTip, build_tenure_continuation_block, build_tenure_extend_block,
-    build_tenure_start_block, extend_sortition_hash, total_burn_after,
+    BitcoinTenureView, NAKAMOTO_BLOCK_VERSION_EPOCH_4, ParentTenure, SortitionHashBlock,
+    SortitionHashPoint, TenureExtension, TenureStartError, TenureTip,
+    build_tenure_continuation_block, build_tenure_extend_block, build_tenure_start_block,
+    extend_sortition_hash, total_burn_after,
 };
 
 use std::fmt;
@@ -24,7 +26,7 @@ use nano_bitcoin::{
     LeaderKeyRegistrationTransactionError, build_leader_commitment_transaction,
     build_leader_key_registration_transaction,
 };
-use nano_chainstate::{SignerSet, SignerSetError};
+use nano_chainstate::{SignerSetError, SignerWeights};
 use nano_crypto::{MessageSignature, StacksPrivateKey};
 use nano_stackerdb::{
     BlockProposal, BlockResponse, Chunk, ChunkAck, SignerMessage, SignerMessageError,
@@ -532,7 +534,7 @@ impl ProposalCoordinator {
     pub async fn collect_signatures(
         &self,
         proposal: &BlockProposal,
-        signer_set: &SignerSet,
+        signer_set: &SignerWeights,
     ) -> Result<Vec<MessageSignature>, ProposalError> {
         let slots = self.client.slot_versions(&self.signer_contract).await?;
         let mut messages = Vec::with_capacity(slots.len());
@@ -561,7 +563,7 @@ impl ProposalCoordinator {
     pub async fn finalize_and_submit(
         &self,
         proposal: &BlockProposal,
-        signer_set: &SignerSet,
+        signer_set: &SignerWeights,
         node: &SyncClient,
     ) -> Result<nano_chainstate::NakamotoBlock, ProposalError> {
         let signatures = self.collect_signatures(proposal, signer_set).await?;
@@ -617,7 +619,7 @@ impl ProposalCoordinator {
 
 fn response_signatures(
     proposal: &BlockProposal,
-    signer_set: &SignerSet,
+    signer_set: &SignerWeights,
     messages: impl IntoIterator<Item = Vec<u8>>,
 ) -> Result<Vec<MessageSignature>, ProposalError> {
     let expected_hash = proposal.block.header.signer_signature_hash();
@@ -758,7 +760,9 @@ mod tests {
                 weight: 7,
             },
         ])
-        .expect("valid signer set");
+        .expect("valid signer set")
+        .signing_weights()
+        .expect("recorded signer weights");
         let stale = SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAcceptance::new(
             Sha256Sum::from_bytes([9; 32]),
             first.sign(digest.as_bytes()),

@@ -59,7 +59,10 @@ pub async fn validate_proposals(
     mut requests: UnboundedReceiver<ProposalRequest>,
 ) -> Role {
     let interval = Duration::from_secs(config.node.poll_interval_secs);
-    let mut burn = LocalBurnView::open(&config);
+    let mut burn = match LocalBurnView::open(&config, validator.validator_mut().bitcoin_context()) {
+        Ok(burn) => burn,
+        Err(error) => return Err(error),
+    };
     let mut endpoints = peers.endpoints();
     println!(
         "validating block proposals for the signers this node hosts, over {} peers",
@@ -83,7 +86,13 @@ pub async fn validate_proposals(
             // canonical chain inside the first proposal it is given.
             () = sleep(interval) => {
                 if let Err(error) =
-                    signer::catch_up(&mut peers, &mut validator, config.node.max_sync_blocks).await
+                    signer::catch_up(
+                        &mut peers,
+                        &mut burn,
+                        &pox,
+                        &mut validator,
+                        config.node.max_sync_blocks,
+                    ).await
                 {
                     eprintln!("the proposal validator could not follow the chain: {error}");
                 }
@@ -97,7 +106,7 @@ pub async fn validate_proposals(
             &config,
             &pox,
             &mut peers,
-            burn.as_mut(),
+            &mut burn,
             &mut validator,
             &request,
         )
@@ -153,10 +162,11 @@ fn refresh_pool(
 ///
 /// So the same chain the canonical path derives is derived here, off the same
 /// Bitcoin blocks, and written down as it advances so a restart resumes it.
-struct LocalBurnView {
+pub(crate) struct LocalBurnView {
     tracker: crate::sortition::SortitionTracker,
     bitcoin: crate::runtime::BurnchainSource,
     state: std::path::PathBuf,
+    canonical_view: nano_primitives::ConsensusHash,
 }
 
 /// The capture a locally derived burn view is seeded from.
@@ -172,15 +182,24 @@ struct LocalBurnView {
 /// are not the same directory, which is every mainnet one. With it went the
 /// leader-key registry the same loader carries, so the validator could check no
 /// tenure's VRF proof and no miner's signature: the two things it exists to check.
-fn capture_directory(config: &Config) -> Option<&std::path::Path> {
-    let capture = config.checkpoint.sortition.as_deref();
-    if capture.is_none() {
-        eprintln!(
-            "no checkpoint sortition history is configured, so the proposal validator cannot \
-             derive burn views locally and can check no tenure's VRF"
-        );
-    }
-    capture
+fn capture_directory(config: &Config) -> Result<&std::path::Path, String> {
+    config.checkpoint.sortition.as_deref().ok_or_else(|| {
+        "no checkpoint sortition history is configured, so the proposal validator cannot derive \
+         burn views locally and can check no tenure's VRF"
+            .to_owned()
+    })
+}
+
+pub(crate) fn validator_sortition_state(config: &Config) -> std::path::PathBuf {
+    config
+        .chainstate_dir(crate::runtime::SIGNER_CHAINSTATE)
+        .join("sortitions")
+}
+
+struct LocalBlockContext {
+    bitcoin: nano_chainstate::BitcoinBlockContext,
+    sortition: nano_sync::SortitionInfo,
+    reward_cycle: u64,
 }
 
 impl LocalBurnView {
@@ -194,43 +213,125 @@ impl LocalBurnView {
     /// with it went the leader-key registry that the same loader carries: a
     /// validator that can derive no burn view can check no tenure's VRF and no
     /// miner's signature, which is the whole reason this exists.
-    fn open(config: &Config) -> Option<Self> {
+    pub(crate) fn open(
+        config: &Config,
+        standing: nano_chainstate::BitcoinBlockContext,
+    ) -> Result<Self, String> {
         let capture = capture_directory(config)?;
-        let state = config.node.working_dir.clone();
-        let tracker = crate::sortition::SortitionTracker::resume_or_capture(&state, capture)
-            .inspect_err(|error| {
-                eprintln!(
-                    "the proposal validator cannot derive burn views locally, so it can check \
-                     no tenure's VRF: {error}"
-                );
-            })
-            .ok()?;
+        let state = validator_sortition_state(config);
+        let tracker = crate::sortition::SortitionTracker::resume_or_capture_below(
+            &state,
+            capture,
+            standing.height,
+        )
+        .map_err(|error| {
+            format!(
+                "the proposal validator cannot derive burn views locally, so it can check no \
+                 tenure's VRF: {error}"
+            )
+        })?;
+        if tracker.leader_keys() == 0 {
+            return Err(format!(
+                "checkpoint sortition history {} carries no authenticated leader-key registry",
+                capture.display()
+            ));
+        }
+        let canonical_view = tracker.consensus_hash_at(standing.height).ok_or_else(|| {
+            format!(
+                "the proposal validator's standing burn {} is absent from the local sortition \
+                 history",
+                standing.height
+            )
+        })?;
         let bitcoin = crate::runtime::bitcoin_source(config)
-            .inspect_err(|error| {
-                eprintln!("the proposal validator has no burnchain to derive from: {error}");
-            })
-            .ok()?;
+            .map_err(|error| format!("the proposal validator has no burnchain: {error}"))?;
         println!(
             "the proposal validator derives burn views locally from burn {} on PoX history {}",
             tracker.tip().bitcoin_height,
             tracker.tip().pox_id
         );
-        Some(Self {
+        Ok(Self {
             tracker,
             bitcoin,
             state,
+            canonical_view,
         })
     }
 
-    /// Fill in the burn block `view` names, or say why this node cannot.
-    fn record(
+    /// Derive every proposal-validation input from this node's Bitcoin chain.
+    fn context_for(
+        &mut self,
+        block: &nano_chainstate::NakamotoBlock,
+        pox: &PoxInfo,
+        schedule: Option<nano_chainstate::CoinbaseSchedule>,
+    ) -> Result<LocalBlockContext, String> {
+        let view = block
+            .bitcoin_view_consensus_hash()
+            .unwrap_or(self.canonical_view);
+        let height = self.locate(view, pox)?;
+        let view_snapshot = self
+            .tracker
+            .snapshot_at(height)
+            .ok_or_else(|| format!("no derived snapshot for burn {height}"))?;
+        if view_snapshot.total_burn != block.header.bitcoin_spent {
+            return Err(format!(
+                "block {} says {} burn has been spent, while the local sortition at burn \
+                 {height} derives {}",
+                block.header.chain_length, block.header.bitcoin_spent, view_snapshot.total_burn
+            ));
+        }
+        let view_local = crate::LocalSortition::from_snapshot(view_snapshot);
+        let tenure_height = self
+            .tracker
+            .height_of_consensus_hash(block.header.consensus_hash)
+            .ok_or_else(|| {
+                format!(
+                    "tenure {} is absent from the local sortition history",
+                    block.header.consensus_hash
+                )
+            })?;
+        let tenure_snapshot = self
+            .tracker
+            .snapshot_at(tenure_height)
+            .ok_or_else(|| format!("no derived snapshot for tenure burn {tenure_height}"))?;
+        let tenure_local = crate::LocalSortition::from_snapshot(tenure_snapshot);
+        let sortition = self
+            .tracker
+            .sortition_info_at(tenure_height)
+            .ok_or_else(|| format!("no local sortition for tenure burn {tenure_height}"))?;
+
+        let mut bitcoin = pox.bitcoin_context();
+        view_local.record(&mut bitcoin);
+        tenure_local.record_authentication(&mut bitcoin);
+        if tenure_height != height {
+            bitcoin.move_to_burn_block(tenure_height);
+            bitcoin.extend_view_to(height);
+        }
+        self.record_coinbase(block, schedule, tenure_height, &mut bitcoin)?;
+        Ok(LocalBlockContext {
+            bitcoin,
+            sortition,
+            reward_cycle: pox.reward_cycle(tenure_height),
+        })
+    }
+
+    fn locate(
         &mut self,
         view: nano_primitives::ConsensusHash,
         pox: &PoxInfo,
-        context: &mut nano_chainstate::BitcoinBlockContext,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let payouts = crate::payout_schedule(pox)
             .ok_or_else(|| "no payout schedule, so no sortition can be derived".to_owned())?;
+        let standing_on = self
+            .tracker
+            .height_of_consensus_hash(self.canonical_view)
+            .ok_or_else(|| {
+                format!(
+                    "the canonical burn view {} is absent from the local sortition history",
+                    self.canonical_view
+                )
+            })?;
+        self.tracker.keep_from(standing_on);
         let burnchain_tip = self
             .bitcoin
             .tip_height()
@@ -259,11 +360,80 @@ impl LocalBurnView {
         }
         let height =
             found.ok_or_else(|| format!("burn view {view} is not on this node's burnchain yet"))?;
-        let snapshot = self
-            .tracker
-            .snapshot_at(height)
-            .ok_or_else(|| format!("no derived snapshot for burn {height}"))?;
-        crate::LocalSortition::from_snapshot(snapshot).record(context);
+        Ok(height)
+    }
+
+    fn record_coinbase(
+        &self,
+        block: &nano_chainstate::NakamotoBlock,
+        schedule: Option<nano_chainstate::CoinbaseSchedule>,
+        tenure_height: u64,
+        bitcoin: &mut nano_chainstate::BitcoinBlockContext,
+    ) -> Result<(), String> {
+        if nano_chainstate::starts_new_tenure(block) {
+            let schedule = schedule.ok_or_else(|| {
+                format!(
+                    "no authenticated coinbase schedule is available for tenure burn {tenure_height}"
+                )
+            })?;
+            let previous = self
+                .tracker
+                .previous_sortition_height(tenure_height)
+                .ok_or_else(|| {
+                    format!(
+                        "the local sortition history cannot derive accumulated coinbase for \
+                         tenure burn {tenure_height}"
+                    )
+                })?;
+            bitcoin.accumulated_coinbase = schedule.accumulated_at(tenure_height, Some(previous));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        block: &nano_chainstate::NakamotoBlock,
+        pox: &PoxInfo,
+        validator: &mut Validator,
+    ) -> Result<(u64, u64), String> {
+        validator.clear_context();
+        let schedule = validator.coinbase_schedule();
+        let context = self.context_for(block, pox, schedule)?;
+        if nano_chainstate::starts_new_tenure(block) {
+            validator.set_accumulated_coinbase(
+                context.sortition.bitcoin_height,
+                context.bitcoin.accumulated_coinbase,
+            );
+        }
+        validator
+            .validator_mut()
+            .set_bitcoin_context(context.bitcoin);
+        let bitcoin_height = context.sortition.bitcoin_height;
+        let reward_cycle = context.reward_cycle;
+        validator.set_context(context.sortition, reward_cycle);
+        Ok((bitcoin_height, reward_cycle))
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        block: &nano_chainstate::NakamotoBlock,
+        pox: &PoxInfo,
+        validator: &mut Validator,
+    ) -> Result<(), String> {
+        let (bitcoin_height, _) = self.prepare(block, pox, validator)?;
+        validator
+            .validator_mut()
+            .observe(block, bitcoin_height)
+            .map_err(|error| {
+                format!(
+                    "canonical block {} at height {} failed to validate: {error}",
+                    block.block_id(),
+                    block.header.chain_length
+                )
+            })?;
+        self.canonical_view = block
+            .bitcoin_view_consensus_hash()
+            .unwrap_or(self.canonical_view);
         Ok(())
     }
 }
@@ -273,12 +443,12 @@ async fn judge(
     config: &Config,
     pox: &PoxInfo,
     peers: &mut TenureSource,
-    burn: Option<&mut LocalBurnView>,
+    burn: &mut LocalBurnView,
     validator: &mut Validator,
     request: &ProposalRequest,
 ) -> Result<(), (String, ProposalRejectCode)> {
     let block = &request.block;
-    signer::catch_up(peers, validator, config.node.max_sync_blocks)
+    signer::catch_up(peers, burn, pox, validator, config.node.max_sync_blocks)
         .await
         .map_err(|error| {
             (
@@ -286,58 +456,15 @@ async fn judge(
                 ProposalRejectCode::ChainstateError,
             )
         })?;
-    let sortition = peers
-        .sortition(block.header.consensus_hash)
-        .await
-        .map_err(|error| {
-            (
-                format!(
-                    "this node has no sortition for the tenure {} the proposal names: {error}",
-                    block.header.consensus_hash
-                ),
-                ProposalRejectCode::NoSuchTenure,
-            )
-        })?;
-    let cycle = pox.reward_cycle(sortition.bitcoin_height);
-    // A tenure's coinbase depends on the burn blocks since the last sortition, so
-    // a proposal validated without it would seal a root that differs from the
-    // network's, and the validator refuses to guess.
-    let schedule = validator.coinbase_schedule();
-    match peers
-        .accumulated_coinbase(block, schedule, sortition.bitcoin_height)
-        .await
-    {
-        Ok(Some(accumulated)) => {
-            validator.set_accumulated_coinbase(sortition.bitcoin_height, accumulated);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return Err((
-                format!("this node could not read the tenure's accumulated coinbase: {error}"),
-                ProposalRejectCode::ChainstateError,
-            ));
-        }
-    }
-    let bitcoin_height = sortition.bitcoin_height;
-    // Derived, and refused rather than guessed at. Validating under the standing
-    // context would check this proposal against whatever burn block the last one
-    // stood on -- the anchor's, for the first -- which is how a valid tenure came
-    // to be reported as an invalid one.
-    if let Some(burn) = burn {
-        let mut context = validator.validator_mut().bitcoin_context();
-        burn.record(block.header.consensus_hash, pox, &mut context)
-            .map_err(|error| {
-                (
-                    format!(
-                        "this node cannot derive the burn view {} the proposal names: {error}",
-                        block.header.consensus_hash
-                    ),
-                    ProposalRejectCode::NoSuchTenure,
-                )
-            })?;
-        validator.validator_mut().set_bitcoin_context(context);
-    }
-    validator.set_context(sortition, cycle);
+    let (bitcoin_height, cycle) = burn.prepare(block, pox, validator).map_err(|error| {
+        (
+            format!(
+                "this node cannot derive the local validation context for proposal {}: {error}",
+                block.block_id()
+            ),
+            ProposalRejectCode::NoSuchTenure,
+        )
+    })?;
     validator
         .validate(&BlockProposal {
             block: block.clone(),
@@ -748,7 +875,7 @@ pub fn identifier(contract: &StackerDbContract) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::capture_directory;
+    use super::{capture_directory, validator_sortition_state};
     use crate::config::Config;
 
     /// A mainnet checkpoint whose sortition history is not beside its trie, which
@@ -785,10 +912,10 @@ mod tests {
         let config = Config::parse(MAINNET).expect("a valid mainnet configuration");
         assert_eq!(
             capture_directory(&config),
-            Some(std::path::Path::new("/capture/sortition"))
+            Ok(std::path::Path::new("/capture/sortition"))
         );
         assert_ne!(
-            capture_directory(&config),
+            capture_directory(&config).ok(),
             config.checkpoint.marf.parent(),
             "the trie's directory holds no sortition history, and this is the bug"
         );
@@ -799,6 +926,83 @@ mod tests {
     fn a_checkpoint_with_no_sortition_history_derives_no_burn_view() {
         let without = MAINNET.replace(r#"sortition = "/capture/sortition""#, "");
         let config = Config::parse(&without).expect("a valid mainnet configuration");
-        assert_eq!(capture_directory(&config), None);
+        assert!(capture_directory(&config).is_err());
+    }
+
+    fn tracker(height: u64, identity: u8) -> crate::sortition::SortitionTracker {
+        let mut snapshot = nano_sortition::SortitionSnapshot::genesis(
+            height,
+            nano_primitives::BitcoinHeaderHash::from_bytes([identity; 32]),
+        );
+        snapshot.consensus_hash = nano_primitives::ConsensusHash::from_bytes([identity; 20]);
+        crate::sortition::SortitionTracker::new(snapshot.clone(), vec![snapshot.consensus_hash])
+            .expect("the history ends at its snapshot")
+    }
+
+    fn saved_identity(directory: &std::path::Path) -> (u64, String) {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(directory.join("snapshots.json")).expect("read saved snapshots"),
+        )
+        .expect("saved snapshots decode");
+        let row = rows.first().expect("one saved snapshot");
+        (
+            row["block_height"].as_u64().expect("a burn height"),
+            row["consensus_hash"]
+                .as_str()
+                .expect("a consensus hash")
+                .to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_stale_validator_cannot_overwrite_the_followers_sortition_state() {
+        let directory = tempfile::tempdir().expect("a working directory");
+        let configured = MAINNET.replace("/tmp/nano", &directory.path().display().to_string());
+        let config = Config::parse(&configured).expect("a valid mainnet configuration");
+        let follower_state = config.node.working_dir.clone();
+        let validator_state = validator_sortition_state(&config);
+        assert_eq!(
+            validator_state,
+            follower_state
+                .join(crate::runtime::SIGNER_CHAINSTATE)
+                .join("sortitions")
+        );
+
+        let follower = tracker(400, 0xaa);
+        let stale_validator = tracker(300, 0xbb);
+        let (follower_saved, wait_for_follower) = std::sync::mpsc::sync_channel(0);
+        let follower_write = follower_state.clone();
+        let validator_write = validator_state.clone();
+        std::thread::scope(|scope| {
+            let follower_writer = scope.spawn(move || {
+                follower
+                    .save(&follower_write)
+                    .expect("the follower state saves");
+                follower_saved.send(()).expect("signal the follower save");
+            });
+            let validator_writer = scope.spawn(move || {
+                wait_for_follower.recv().expect("wait for the newer state");
+                stale_validator
+                    .save(&validator_write)
+                    .expect("the stale validator state saves afterwards");
+            });
+            follower_writer
+                .join()
+                .expect("the follower writer finishes");
+            validator_writer
+                .join()
+                .expect("the validator writer finishes");
+        });
+
+        assert_eq!(
+            saved_identity(&follower_state),
+            (400, "aa".repeat(20)),
+            "a validator that finished later replaced the follower's newer identity"
+        );
+        assert_eq!(
+            saved_identity(&validator_state),
+            (300, "bb".repeat(20)),
+            "the validator did not persist under its role-specific state"
+        );
     }
 }

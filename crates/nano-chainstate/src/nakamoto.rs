@@ -278,26 +278,7 @@ impl SignerSet {
         header: &NakamotoBlockHeader,
         responses: impl IntoIterator<Item = MessageSignature>,
     ) -> Result<Vec<MessageSignature>, SignerSetError> {
-        let digest = *header.signer_signature_hash().as_bytes();
-        let mut ordered = BTreeMap::new();
-        for signature in responses {
-            let public_key = signature
-                .recover(&digest)
-                .map_err(SignerSetError::Signature)?;
-            let index = self
-                .signers
-                .iter()
-                .position(|signer| signer.public_key == public_key)
-                .ok_or(SignerSetError::UnknownOrUnorderedSigner)?;
-            if ordered.insert(index, signature).is_some() {
-                return Err(SignerSetError::UnknownOrUnorderedSigner);
-            }
-        }
-        let signatures = ordered.into_values().collect::<Vec<_>>();
-        let mut candidate = header.clone();
-        candidate.signer_signatures.clone_from(&signatures);
-        self.verify(&candidate)?;
-        Ok(signatures)
+        self.signing_weights()?.order_responses(header, responses)
     }
 }
 
@@ -353,6 +334,35 @@ impl SignerWeights {
     pub fn approval_threshold(&self) -> Result<u32, SignerSetError> {
         u32::try_from((u64::from(self.total_weight()?) * 7).div_ceil(10))
             .map_err(|_| SignerSetError::WeightOverflow)
+    }
+
+    /// Order valid signer responses by recorded reward-set index and require threshold weight.
+    pub fn order_responses(
+        &self,
+        header: &NakamotoBlockHeader,
+        responses: impl IntoIterator<Item = MessageSignature>,
+    ) -> Result<Vec<MessageSignature>, SignerSetError> {
+        let digest = *header.signer_signature_hash().as_bytes();
+        let mut ordered = BTreeMap::new();
+        for signature in responses {
+            let public_key = signature
+                .recover(&digest)
+                .map_err(SignerSetError::Signature)?;
+            let signing_hash = hash160(&public_key.to_bytes_compressed());
+            let index = self
+                .entries
+                .iter()
+                .position(|(hash, _)| *hash == signing_hash)
+                .ok_or(SignerSetError::UnknownOrUnorderedSigner)?;
+            if ordered.insert(index, signature).is_some() {
+                return Err(SignerSetError::UnknownOrUnorderedSigner);
+            }
+        }
+        let signatures = ordered.into_values().collect::<Vec<_>>();
+        let mut candidate = header.clone();
+        candidate.signer_signatures.clone_from(&signatures);
+        self.verify(&candidate)?;
+        Ok(signatures)
     }
 
     /// Verify recovered signatures are unique, reward-set ordered, and sufficiently weighted.
@@ -573,10 +583,10 @@ impl std::error::Error for TenureError {}
 mod tests {
     use super::{
         NakamotoBlock, NakamotoBlockHeader, ProblematicTransaction, Signer, SignerSet,
-        SignerSetError,
+        SignerSetError, SignerWeights,
     };
     use nano_crypto::StacksPrivateKey;
-    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
+    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash, hash160};
 
     #[test]
     fn reward_set_rejects_zero_threshold() {
@@ -664,6 +674,44 @@ mod tests {
         assert_eq!(
             ordered,
             vec![first_response, second_response, third_response]
+        );
+    }
+
+    #[test]
+    fn recorded_weights_ignore_a_peer_s_substitute_reward_set() {
+        let local = StacksPrivateKey::from_seed(b"local signer");
+        let attacker = StacksPrivateKey::from_seed(b"peer substitute");
+        let header = NakamotoBlockHeader {
+            version: 1,
+            chain_length: 1,
+            bitcoin_spent: 0,
+            consensus_hash: ConsensusHash::from_bytes([1; 20]),
+            parent_block_id: StacksBlockId::from_bytes([2; 32]),
+            transaction_merkle_root: Sha256Sum::from_bytes([3; 32]),
+            state_index_root: TrieHash::from_bytes([4; 32]),
+            timestamp: 5,
+            miner_signature: local.sign(&[5; 32]),
+            signer_signatures: Vec::new(),
+            pox_treatment: BitVec::zeros(1).expect("valid bit vector"),
+            problematic_transactions: Vec::new(),
+        };
+        let digest = header.signer_signature_hash();
+        let local_weights = SignerWeights::new(vec![(
+            hash160(&local.public_key().to_bytes_compressed()),
+            10,
+        )])
+        .expect("local signer weights");
+        let peer_set = SignerSet::new(vec![Signer {
+            public_key: attacker.public_key(),
+            weight: 10,
+        }])
+        .expect("peer substitute set");
+        let response = attacker.sign(digest.as_bytes());
+
+        assert!(peer_set.order_responses(&header, [response]).is_ok());
+        assert_eq!(
+            local_weights.order_responses(&header, [response]),
+            Err(SignerSetError::UnknownOrUnorderedSigner)
         );
     }
 

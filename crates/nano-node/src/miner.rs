@@ -15,17 +15,17 @@ use std::{
 use crate::runtime::BurnchainSource;
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoincore_rpc::Auth;
+use clarity::vm::types::{PrincipalData, StandardPrincipalData};
 use nano_address::StacksAddress;
-use nano_chainstate::{NakamotoBlock, SignerSetError};
+use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, SignerSetError};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use std::sync::Arc;
 
 use nano_mempool::Mempool;
 use nano_miner::{
-    BitcoinTenureView, BitcoinWallet, ProposalCoordinator, ProposalError, RegisteredLeaderKey,
-    SortitionHashPoint, TenureExtension, TenureTip, build_tenure_continuation_block,
-    build_tenure_extend_block, build_tenure_start_block, extend_sortition_hash, plan_commitment,
-    total_burn_after,
+    BitcoinWallet, CommitmentParent, ParentTenure, ProposalCoordinator, ProposalError,
+    RegisteredLeaderKey, TenureExtension, TenureTip, build_tenure_continuation_block,
+    build_tenure_extend_block, build_tenure_start_block, plan_local_commitment,
 };
 use nano_primitives::{ConsensusHash, Hash160, Network, hash160};
 use nano_rpc::{EventDispatcher, EventKind, mined_nakamoto_block_payload};
@@ -45,8 +45,6 @@ use crate::{
 /// The previous commitment's change output, which the next commitment must
 /// spend so the sortition attributes them both to one miner.
 const COMMITMENT_CHAIN_FILE: &str = "commit-chain.txt";
-/// The sortition-hash chain point, extended and rewritten as it advances.
-const SORTITION_HASH_FILE: &str = "sortition-hash.json";
 /// Contract index carrying block responses.
 const RESPONSE_MESSAGE_ID: u32 = 1;
 
@@ -121,7 +119,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             transaction_index: 0,
         },
         committed_at: 0,
-        mined: Vec::new(),
+        mined: MinedTenures::default(),
         mempool,
         tenure: None,
     };
@@ -161,9 +159,10 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             sleep(interval).await;
             continue;
         }
+        executor.follow_burnchain(&state.pox);
         let bitcoin_height = wallet.block_count()?;
         if bitcoin_height > state.committed_at {
-            match state.commit(&wallet).await {
+            match state.commit(&wallet, &mut executor) {
                 Ok(()) => state.committed_at = bitcoin_height,
                 Err(error) => {
                     eprintln!("committing at Bitcoin height {bitcoin_height} failed: {error}");
@@ -182,6 +181,8 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
 /// A tenure this miner started and is still building on.
 struct TenureState {
     tip: TenureTip,
+    /// Burn view inherited by continuation blocks until an extension moves it.
+    burn_view: ConsensusHash,
     /// Blocks mined in this tenure, which its next tenure change reports.
     blocks: u32,
     /// Next nonce the miner key spends, for the transactions only it signs.
@@ -190,6 +191,23 @@ struct TenureState {
     since: Instant,
     /// Whether the tenure has already been extended at its current age.
     extended: bool,
+}
+
+#[derive(Default)]
+struct MinedTenures(Vec<ConsensusHash>);
+
+impl MinedTenures {
+    fn is_pending(&self, sortition: &SortitionInfo, miner: Hash160) -> bool {
+        sortition.was_sortition
+            && sortition.miner_public_key_hash == Some(miner)
+            && !self.0.contains(&sortition.consensus_hash)
+    }
+
+    fn accepted(&mut self, consensus_hash: ConsensusHash) {
+        if !self.0.contains(&consensus_hash) {
+            self.0.push(consensus_hash);
+        }
+    }
 }
 
 impl TenureState {
@@ -202,8 +220,10 @@ impl TenureState {
                 bitcoin_spent: block.header.bitcoin_spent,
                 timestamp: block.header.timestamp,
             },
+            burn_view: won.consensus_hash,
             blocks: 1,
-            nonce,
+            // The tenure change and coinbase spend consecutive miner nonces.
+            nonce: nonce.saturating_add(2),
             since: Instant::now(),
             extended: false,
         }
@@ -214,6 +234,9 @@ impl TenureState {
         self.tip.height = block.header.chain_length;
         self.tip.timestamp = block.header.timestamp;
         self.blocks = self.blocks.saturating_add(1);
+        if let Some(view) = block.bitcoin_view_consensus_hash() {
+            self.burn_view = view;
+        }
         if nano_chainstate::starts_or_extends_tenure(block) {
             self.nonce = self.nonce.saturating_add(1);
             self.since = Instant::now();
@@ -240,7 +263,7 @@ struct State {
     /// Bitcoin height this miner last committed at.
     committed_at: u64,
     /// Tenures already started, so a won sortition is not mined twice.
-    mined: Vec<ConsensusHash>,
+    mined: MinedTenures,
     /// The transactions this node holds for the blocks it still owes.
     ///
     /// Shared with the RPC: a node whose RPC admits transactions into a pool the
@@ -250,6 +273,16 @@ struct State {
 }
 
 impl State {
+    fn miner_principal(&self) -> PrincipalData {
+        PrincipalData::Standard(
+            StandardPrincipalData::new(
+                self.miner_address.version(),
+                *self.miner_address.hash160().as_bytes(),
+            )
+            .expect("a miner address has a valid standard-principal version"),
+        )
+    }
+
     /// Refuse a wallet that cannot pay for a commitment, before the loop.
     ///
     /// Both halves of a miner's Bitcoin identity are checked at start-up rather than
@@ -310,15 +343,54 @@ impl State {
     }
 
     /// Commit to the next tenure, chained to the previous commitment's change.
-    async fn commit(&self, wallet: &BitcoinWallet) -> Result<(), Box<dyn Error>> {
+    fn commit(
+        &self,
+        wallet: &BitcoinWallet,
+        executor: &mut CheckpointExecutor<BurnchainSource>,
+    ) -> Result<(), Box<dyn Error>> {
         let mut bitcoin = runtime::bitcoin_source(&self.config)?;
-        let plan = plan_commitment(
-            &self.peer,
+        let bitcoin_tip_height = wallet.block_count()?;
+        let local_tip = executor.local_burn_tip()?;
+        if local_tip.bitcoin_height != bitcoin_tip_height {
+            return Err(format!(
+                "the local sortition chain is at burn {} while Bitcoin is at {bitcoin_tip_height}",
+                local_tip.bitcoin_height
+            )
+            .into());
+        }
+        let parent_consensus_hash = executor.tip().header.consensus_hash;
+        let parent_sortition = executor.local_sortition_info(parent_consensus_hash)?;
+        let (tenure_start_block_id, _) = executor
+            .chainstate_mut()
+            .tenure_start(parent_consensus_hash)
+            .ok_or_else(|| {
+                format!(
+                    "the locally executed tenure {parent_consensus_hash} has no authenticated start block"
+                )
+            })?;
+        let tenure_vrf_proof = executor
+            .chainstate_mut()
+            .parent_tenure_proof()
+            .ok_or("the locally executed tenure has no authenticated coinbase VRF proof")?;
+        let target = bitcoin_tip_height
+            .checked_add(1)
+            .ok_or("Bitcoin height overflow")?;
+        let reward_cycle = self.pox.reward_cycle(target);
+        let sbtc_address = executor
+            .chainstate_mut()
+            .sbtc_payout_address(self.config.node.pox_5_sbtc_registry_contract.as_deref())?;
+        let plan = plan_local_commitment(
             &mut bitcoin,
             self.leader_key,
-            wallet.block_count()?,
-        )
-        .await?;
+            CommitmentParent {
+                bitcoin_tip_height,
+                tenure_start_block_id,
+                sortition: parent_sortition,
+                tenure_vrf_proof,
+                sbtc_address,
+                reward_cycle,
+            },
+        )?;
         let chain_file = self.config.node.working_dir.join(COMMITMENT_CHAIN_FILE);
         let previous_change = fs::read_to_string(&chain_file)
             .ok()
@@ -349,7 +421,7 @@ impl State {
         &mut self,
         executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<(), Box<dyn Error>> {
-        let Some(won) = self.won_tenure().await? else {
+        let Some(won) = self.won_tenure(executor)? else {
             // A tenure is not one block: while nano still owns the current one,
             // it keeps confirming what the mempool holds, and says on chain
             // when the tenure outlives the budget it started with.
@@ -369,51 +441,51 @@ impl State {
             return Ok(());
         };
 
-        self.mined.push(won.consensus_hash);
-        let nonce = self.peer.account_nonce(self.miner_address).await?;
+        let parent = executor.local_parent_tenure(&self.miner_principal())?;
         // A tenure already under way is one to carry on with, not to start
         // again: its first block is on the chain, and proposing another would
         // ask the signers to replace one they have signed.
-        if self.peer.tenure_info().await?.consensus_hash == won.consensus_hash {
-            let resumed = self.resume_tenure(&won, nonce).await?;
+        if executor.tip().header.consensus_hash == won.consensus_hash {
+            let burn_view = executor.local_executed_burn_view()?.consensus_hash;
+            let resumed = Self::resume_tenure(&won, parent, burn_view)?;
             println!(
                 "carrying on tenure {} from height {}",
                 resumed.tip.consensus_hash, resumed.tip.height
             );
             self.tenure = Some(resumed);
+            self.mined.accepted(won.consensus_hash);
             return Ok(());
         }
         let block = self.mine(executor, &won).await?;
         println!("the network accepted nano's block {}", block.block_id());
-        self.tenure = Some(TenureState::started(&won, &block, nonce));
+        self.tenure = Some(TenureState::started(&won, &block, parent.miner_nonce));
+        // Only a proposal the network accepted is remembered. A transport or
+        // signer timeout must be retried on the next round, not mistaken for a
+        // tenure this process already mined.
+        self.mined.accepted(won.consensus_hash);
         executor.accept_own_block(block);
         Ok(())
     }
 
     /// Adopt a tenure this miner started but is no longer tracking, which is
     /// what a restart in the middle of one leaves behind.
-    async fn resume_tenure(
-        &self,
+    fn resume_tenure(
         won: &SortitionInfo,
-        nonce: u64,
+        parent: ParentTenure,
+        burn_view: ConsensusHash,
     ) -> Result<TenureState, Box<dyn Error>> {
-        let info = self.peer.tenure_info().await?;
-        let tip = self.peer.block(info.tip_block_id).await?;
-        let start = self.peer.block(info.tenure_start_block_id).await?;
+        if parent.tip.consensus_hash != won.consensus_hash {
+            return Err(format!(
+                "local tip tenure {} does not match won tenure {}",
+                parent.tip.consensus_hash, won.consensus_hash
+            )
+            .into());
+        }
         Ok(TenureState {
-            tip: TenureTip {
-                consensus_hash: won.consensus_hash,
-                block_id: info.tip_block_id,
-                height: info.tip_height,
-                bitcoin_spent: tip.header.bitcoin_spent,
-                timestamp: tip.header.timestamp,
-            },
-            blocks: u32::try_from(
-                info.tip_height
-                    .saturating_sub(start.header.chain_length)
-                    .saturating_add(1),
-            )?,
-            nonce,
+            tip: parent.tip,
+            burn_view,
+            blocks: parent.blocks,
+            nonce: parent.miner_nonce,
             since: Instant::now(),
             extended: false,
         })
@@ -423,27 +495,19 @@ impl State {
     ///
     /// A Bitcoin block without a sortition does not end the previous tenure, so
     /// the tenure to mine is the last sortition that chose a miner.
-    async fn won_tenure(&self) -> Result<Option<SortitionInfo>, Box<dyn Error>> {
-        let tip = self.peer.sortition_tip().await?;
-        let current = if tip.was_sortition {
-            Some(tip)
-        } else {
-            match tip.last_sortition_consensus_hash {
-                Some(consensus_hash) => Some(self.peer.sortition(consensus_hash).await?),
-                None => None,
-            }
-        };
-        Ok(current.filter(|sortition| {
-            sortition.was_sortition
-                && sortition.miner_public_key_hash == Some(self.miner_hash)
-                && !self.mined.contains(&sortition.consensus_hash)
-        }))
+    fn won_tenure(
+        &self,
+        executor: &CheckpointExecutor<BurnchainSource>,
+    ) -> Result<Option<SortitionInfo>, Box<dyn Error>> {
+        Ok(executor
+            .latest_local_winner()?
+            .filter(|sortition| self.mined.is_pending(sortition, self.miner_hash)))
     }
 
     /// Mine the next block of a tenure nano still owns, if there is anything to
     /// say.
     ///
-    /// Nothing is proposed when the peer has moved past nano's tenure or its
+    /// Nothing is proposed when local execution has moved past nano's tenure or
     /// tip, when the mempool is empty, and when no extension is due: a block
     /// with no transactions and no tenure change would only ask the signers to
     /// sign the state they already agreed to.
@@ -452,9 +516,8 @@ impl State {
         executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<Option<NakamotoBlock>, Box<dyn Error>> {
         let state = self.tenure.as_ref().expect("a tenure to continue");
-        let tenure = self.peer.tenure_info().await?;
-        if tenure.consensus_hash != state.tip.consensus_hash
-            || tenure.tip_block_id != state.tip.block_id
+        if executor.tip().header.consensus_hash != state.tip.consensus_hash
+            || executor.tip().block_id() != state.tip.block_id
         {
             return Ok(None);
         }
@@ -463,11 +526,14 @@ impl State {
         // the RPC admits into the same pool meanwhile.
         {
             let mut mempool = self.mempool.lock().await;
+            // Candidate transport only. A peer may omit transactions (including
+            // through its admission view) just as it may serve an empty page;
+            // the local account map below decides what can enter this block.
             self.peer.fill_mempool(&mut mempool, now).await?;
         }
         let accounts = {
             let mempool = self.mempool.lock().await;
-            self.peer.accounts_for(&mempool).await?
+            executor.local_mempool_accounts(&mempool)?
         };
         let pending = {
             let mut mempool = self.mempool.lock().await;
@@ -480,21 +546,23 @@ impl State {
             return Ok(None);
         }
 
-        let sortition = self.peer.sortition(state.tip.consensus_hash).await?;
-        let mut context = runtime::bitcoin_context(&self.config, &self.pox);
-        context.move_to_burn_block(sortition.bitcoin_height);
-        let burn_view = self.peer.sortition_tip().await?;
+        let sortition = executor.local_sortition_info(state.tip.consensus_hash)?;
+        let burn_view = if extend_due {
+            executor.local_burn_tip()?.consensus_hash
+        } else {
+            state.burn_view
+        };
         let candidate = if extend_due {
             println!(
                 "extending tenure {} after {:?} into burn view {}",
                 state.tip.consensus_hash,
                 state.since.elapsed(),
-                burn_view.consensus_hash
+                burn_view
             );
             build_tenure_extend_block(
                 &state.tip,
                 TenureExtension {
-                    burn_view_consensus_hash: burn_view.consensus_hash,
+                    burn_view_consensus_hash: burn_view,
                     blocks_in_tenure: state.blocks,
                     nonce: state.nonce,
                     now,
@@ -507,6 +575,7 @@ impl State {
             build_tenure_continuation_block(&state.tip, Vec::new(), now)
         };
 
+        let context = executor.local_mining_context(&self.pox, &candidate, burn_view)?;
         let (block, applied) =
             executor.assemble_selecting(candidate, context, &pending, &self.miner_key)?;
         if block.transactions.is_empty() {
@@ -523,7 +592,9 @@ impl State {
             EventKind::MinedNakamotoBlock,
             &mined_nakamoto_block_payload(&block, &applied, sortition.bitcoin_height),
         );
-        let block = self.submit(block, sortition.bitcoin_height).await?;
+        let block = self
+            .submit(block, sortition.bitcoin_height, context, executor)
+            .await?;
         // A confirmed transaction leaves now rather than when the peer's
         // account nonces catch up, so the next block does not offer it again.
         for transaction in &block.transactions {
@@ -542,28 +613,19 @@ impl State {
             "won the sortition at Bitcoin height {} with consensus hash {}",
             won.bitcoin_height, won.consensus_hash
         );
-        let view = self.tenure_view(won).await?;
+        let view = executor.local_tenure_view(won.consensus_hash)?;
+        let parent = executor.local_parent_tenure(&self.miner_principal())?;
         let candidate = build_tenure_start_block(
-            &self.peer,
             won,
+            parent,
             view,
             self.network,
             &self.miner_key,
             &self.vrf_key,
             won.bitcoin_timestamp,
-        )
-        .await?;
+        )?;
 
-        let mut context = runtime::bitcoin_context(&self.config, &self.pox);
-        context.move_to_burn_block(won.bitcoin_height);
-        let context = self
-            .peer
-            .tenure_coinbase_context(
-                &candidate,
-                executor.chainstate_mut().accounting_mut().schedule(),
-                context,
-            )
-            .await?;
+        let context = executor.local_mining_context(&self.pox, &candidate, won.consensus_hash)?;
         let (block, applied) = executor.assemble(candidate, context, &self.miner_key)?;
         println!(
             "assembled block {} at height {} with state root {}",
@@ -575,7 +637,8 @@ impl State {
             EventKind::MinedNakamotoBlock,
             &mined_nakamoto_block_payload(&block, &applied, won.bitcoin_height),
         );
-        self.submit(block, won.bitcoin_height).await
+        self.submit(block, won.bitcoin_height, context, executor)
+            .await
     }
 
     /// Publish a block to the signers and submit it once they have signed it.
@@ -583,9 +646,11 @@ impl State {
         &self,
         block: NakamotoBlock,
         bitcoin_height: u64,
+        context: BitcoinBlockContext,
+        executor: &mut CheckpointExecutor<BurnchainSource>,
     ) -> Result<NakamotoBlock, Box<dyn Error>> {
         let reward_cycle = self.pox.reward_cycle(bitcoin_height);
-        let reward_set = self.peer.stacker_set(reward_cycle).await?;
+        let signer_weights = executor.local_proposal_signers(context)?;
         let proposal = BlockProposal {
             block,
             bitcoin_height,
@@ -604,7 +669,7 @@ impl State {
         let deadline = Instant::now() + Duration::from_secs(self.miner.signer_timeout_secs);
         loop {
             match coordinator
-                .finalize_and_submit(&proposal, &reward_set.signer_set, &self.peer)
+                .finalize_and_submit(&proposal, &signer_weights, &self.peer)
                 .await
             {
                 Ok(block) => {
@@ -625,38 +690,6 @@ impl State {
             }
         }
     }
-
-    /// The burn total and sortition hash the won tenure must commit to.
-    async fn tenure_view(&self, won: &SortitionInfo) -> Result<BitcoinTenureView, Box<dyn Error>> {
-        let mut bitcoin = runtime::bitcoin_source(&self.config)?;
-        let tenure = self.peer.tenure_info().await?;
-        let parent = self.peer.sortition(tenure.consensus_hash).await?;
-        let parent_start = self.peer.block(tenure.tenure_start_block_id).await?;
-        let mut sortition_heights = Vec::new();
-        for height in parent.bitcoin_height + 1..=won.bitcoin_height {
-            if self.peer.sortition_at_height(height).await?.was_sortition {
-                sortition_heights.push(height);
-            }
-        }
-        let total_burn = total_burn_after(
-            &mut bitcoin,
-            parent_start.header.bitcoin_spent,
-            &sortition_heights,
-        )?;
-
-        let cache = self.config.node.working_dir.join(SORTITION_HASH_FILE);
-        let cached = fs::read(&cache)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<SortitionHashPoint>(&bytes).ok())
-            .filter(|point| point.bitcoin_height <= won.bitcoin_height)
-            .unwrap_or_else(|| SortitionHashPoint::genesis(self.pox.first_bitcoin_height));
-        let point = extend_sortition_hash(&self.peer, &bitcoin, cached, won.bitcoin_height).await?;
-        fs::write(&cache, serde_json::to_vec(&point)?)?;
-        Ok(BitcoinTenureView {
-            total_burn,
-            sortition_hash: point.sortition_hash,
-        })
-    }
 }
 
 fn now_unix() -> u64 {
@@ -671,4 +704,97 @@ fn parse_outpoint(value: &str) -> Option<OutPoint> {
         txid: Txid::from_str(transaction_id).ok()?,
         vout: index.parse().ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use nano_miner::{ParentTenure, TenureTip};
+    use nano_primitives::{
+        BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
+    };
+    use nano_sync::SortitionInfo;
+
+    use super::{MinedTenures, State};
+
+    fn won(miner: Hash160) -> SortitionInfo {
+        SortitionInfo {
+            bitcoin_block_hash: BitcoinHeaderHash::from_bytes([1; 32]),
+            bitcoin_height: 10,
+            bitcoin_timestamp: 11,
+            sortition_id: SortitionId::from_bytes([2; 32]),
+            parent_sortition_id: SortitionId::from_bytes([3; 32]),
+            consensus_hash: ConsensusHash::from_bytes([4; 20]),
+            was_sortition: true,
+            miner_public_key_hash: Some(miner),
+            stacks_parent_consensus_hash: Some(ConsensusHash::from_bytes([5; 20])),
+            last_sortition_consensus_hash: Some(ConsensusHash::from_bytes([5; 20])),
+            committed_block_hash: Some(BlockHeaderHash::from_bytes([6; 32])),
+            vrf_seed: Some([7; 32]),
+            mining_competition: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_proposal_leaves_the_won_tenure_retryable() {
+        let miner_hash = Hash160::from_bytes([8; 20]);
+        let won = won(miner_hash);
+        let mut mined = MinedTenures::default();
+
+        assert!(mined.is_pending(&won, miner_hash));
+        // A transport/signing failure makes no state transition.
+        assert!(mined.is_pending(&won, miner_hash));
+        mined.accepted(won.consensus_hash);
+        assert!(!mined.is_pending(&won, miner_hash));
+    }
+
+    #[test]
+    fn a_restart_resumes_from_the_local_tenure_identity_and_count() {
+        let miner = Hash160::from_bytes([8; 20]);
+        let won = won(miner);
+        let parent = ParentTenure {
+            tip: TenureTip {
+                consensus_hash: won.consensus_hash,
+                block_id: StacksBlockId::from_bytes([9; 32]),
+                height: 120,
+                bitcoin_spent: 50,
+                timestamp: 60,
+            },
+            start_block_id: StacksBlockId::from_bytes([10; 32]),
+            blocks: 9,
+            miner_nonce: 22,
+        };
+
+        let burn_view = ConsensusHash::from_bytes([12; 20]);
+        let resumed = State::resume_tenure(&won, parent, burn_view).expect("resume local tenure");
+        assert_eq!(resumed.tip, parent.tip);
+        assert_eq!(resumed.burn_view, burn_view);
+        assert_eq!(resumed.blocks, 9);
+        assert_eq!(resumed.nonce, 22);
+
+        let mut foreign = won;
+        foreign.consensus_hash = ConsensusHash::from_bytes([11; 20]);
+        assert!(State::resume_tenure(&foreign, parent, burn_view).is_err());
+    }
+
+    #[test]
+    fn peer_consensus_routes_are_not_miner_proposal_inputs() {
+        let source = include_str!("miner.rs");
+        for (receiver, method) in [
+            (".peer.", "tenure_info("),
+            (".peer.", "sortition("),
+            (".peer.", "sortition_tip("),
+            (".peer.", "sortition_at_height("),
+            (".peer.", "tenure_coinbase_context("),
+            (".peer.", "stacker_set("),
+            (".peer.", "account_nonce("),
+            (".peer.", "accounts_for("),
+            ("plan_", "commitment("),
+        ] {
+            let forbidden = format!("{receiver}{method}");
+            assert!(
+                !source.contains(&forbidden),
+                "miner proposals must not read peer consensus input through {forbidden}"
+            );
+        }
+    }
 }

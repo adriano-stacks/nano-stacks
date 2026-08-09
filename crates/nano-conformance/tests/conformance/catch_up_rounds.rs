@@ -39,7 +39,7 @@ use std::{collections::BTreeMap, path::Path, sync::atomic::Ordering};
 
 use nano_chainstate::NakamotoBlock;
 use nano_node::{CatchUpBudget, CatchUpRound, CheckpointExecutor, staging::Staging};
-use nano_primitives::TrieHash;
+use nano_primitives::{StacksBlockId, TrieHash};
 use nano_sync::{SyncClient, TenureSource};
 
 use crate::follow_path::{
@@ -103,6 +103,21 @@ impl Progress {
         self.fetched += round.fetched;
         self.rate_limited += usize::from(round.rate_limited);
     }
+}
+
+/// The captured blocks currently held by staging, in chain order.
+fn staged_chain(staging: &Staging, chain: &[NakamotoBlock]) -> Vec<(u64, StacksBlockId)> {
+    let staged = chain
+        .iter()
+        .filter(|block| staging.holds(block.block_id()).expect("staging answers"))
+        .map(|block| (block.header.chain_length, block.block_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staging.len().expect("staging counts"),
+        u64::try_from(staged.len()).expect("the capture fits"),
+        "staging holds a block outside the captured chain"
+    );
+    staged
 }
 
 /// Everything a finished run can be compared by, on both sides of a restart.
@@ -382,6 +397,52 @@ async fn a_gap_inside_one_tenure_closes_across_rounds() {
     );
 }
 
+/// Two lookahead batches cannot drop the burn view the next execution batch needs.
+#[tokio::test]
+async fn two_lookahead_batches_do_not_require_a_restart_before_execution() {
+    let chain = captured_chain();
+    let blocks: Vec<NakamotoBlock> = chain[..ONE_TENURE].to_vec();
+    let (client, task) = serve(Served::honest(blocks, snapshots())).await;
+    let directory = tempfile::tempdir().expect("a directory");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    burnchain.extend_empty(nano_node::sortition::CATCH_UP_LIMIT * 3);
+    let (mut executor, _) = node(directory.path(), burnchain);
+
+    assert_eq!(
+        executor.follow_burnchain(&pox()),
+        nano_node::sortition::CATCH_UP_LIMIT,
+        "the first lookahead was not bounded by one batch"
+    );
+    assert_eq!(
+        executor.follow_burnchain(&pox()),
+        nano_node::sortition::CATCH_UP_LIMIT,
+        "the second lookahead did not continue in the same process"
+    );
+
+    let staging =
+        Staging::open(&directory.path().join("staging.sqlite")).expect("the staging store opens");
+    let mut history = TenureSource::only(client.clone());
+    let before = executor.tip().header.chain_length;
+    let round = executor
+        .catch_up(
+            &client,
+            &mut history,
+            &pox(),
+            &staging,
+            CatchUpBudget {
+                fetch: 8,
+                execute: 1,
+            },
+            &[],
+        )
+        .await
+        .expect("execution continues without reopening the tracker");
+    assert_eq!(round.executed, 1);
+    assert_eq!(executor.tip().header.chain_length, before + 1);
+
+    task.abort();
+}
+
 /// A gap across many tenures closes under deterministic 429s and short pages.
 ///
 /// Three of the item's conditions at once, on purpose: they interact. A short
@@ -407,6 +468,67 @@ async fn a_gap_across_many_tenures_closes_under_rate_limits_and_short_pages() {
     );
 }
 
+fn assert_refused_round_preserved_descent(
+    executor: &CheckpointExecutor<MovableBurnchain>,
+    refused_round: &CatchUpRound,
+    previous: (u64, StacksBlockId),
+    staging: &Staging,
+    chain: &[NakamotoBlock],
+    staged_before: &[(u64, StacksBlockId)],
+) {
+    let (height, committed) = previous;
+    assert!(
+        executor.tip().header.chain_length >= height,
+        "the refused round took the executed tip below the block the round before it committed"
+    );
+    assert_eq!(
+        u64::from(u32::try_from(refused_round.executed).expect("a chunk fits")),
+        executor.tip().header.chain_length - height,
+        "the refused round's own count does not match the heights it moved"
+    );
+    assert!(
+        executor.tip().header.chain_length > height || executor.tip().block_id() == committed,
+        "the tip changed without the round executing anything"
+    );
+    let after_height = executor.tip().header.chain_length;
+    let staged_after = staged_chain(staging, chain);
+    let expected_after = staged_before
+        .iter()
+        .filter(|(staged_height, _)| *staged_height > after_height)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staged_after, expected_after,
+        "the refused round removed an unexecuted block from the descent; only the duplicate \
+         fixture boundary and the exact block IDs sealed by this round may disappear"
+    );
+}
+
+fn assert_only_boundary_is_already_sealed(
+    staged: &[(u64, StacksBlockId)],
+    chain: &[NakamotoBlock],
+    anchor: u64,
+    executed_height: u64,
+) {
+    assert!(
+        !staged.is_empty(),
+        "nothing is staged for the next round to resume from"
+    );
+    let anchor_block = chain
+        .iter()
+        .find(|block| block.header.chain_length == anchor)
+        .expect("the capture contains the fixture boundary");
+    assert_eq!(
+        staged
+            .iter()
+            .filter(|(height, _)| *height <= executed_height)
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![(anchor, anchor_block.block_id())],
+        "the only already-sealed staged block must be the tenure endpoint duplicated by descent"
+    );
+}
+
 /// A whole round of 429s ends successfully, and the next round carries on.
 ///
 /// The mainnet failure, reduced: a peer that refuses everything for a round.
@@ -428,6 +550,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
     let (mut executor, _) = node(directory.path(), burnchain);
+    let anchor = executor.tip().header.chain_length;
     let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
     let mut history = TenureSource::only(client.clone());
     let budget = CatchUpBudget {
@@ -445,11 +568,8 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     );
     let committed = executor.tip().block_id();
     let height = executor.tip().header.chain_length;
-    let staged = staging.len().expect("the staging store answers");
-    assert!(
-        staged > 0,
-        "nothing is staged for the next round to resume from"
-    );
+    let staged_before = staged_chain(&staging, &chain);
+    assert_only_boundary_is_already_sealed(&staged_before, &chain, anchor, height);
 
     // Now the peer refuses everything, for one whole round.
     policy.refusing.store(true, Ordering::SeqCst);
@@ -474,30 +594,15 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
         refused_round.fetched, 0,
         "the refused round fetched blocks from a peer that was refusing everything"
     );
-    // It does execute, and that is the property rather than an accident: the
-    // blocks were already on disk and the context for the burn view they stand on
-    // was already in hand, so a peer that has stopped answering does not stop a
-    // node from sealing what it holds. What it must not do is go backwards or
-    // throw the descent away.
-    assert!(
-        executor.tip().header.chain_length >= height,
-        "the refused round took the executed tip below the block the round before it \
-         committed"
-    );
-    assert_eq!(
-        u64::from(u32::try_from(refused_round.executed).expect("a chunk fits")),
-        executor.tip().header.chain_length - height,
-        "the refused round's own count does not match the heights it moved"
-    );
-    assert!(
-        executor.tip().header.chain_length > height || executor.tip().block_id() == committed,
-        "the tip changed without the round executing anything"
-    );
-    assert_eq!(
-        staging.len().expect("the staging store answers")
-            + u64::try_from(refused_round.executed).expect("a chunk fits"),
-        staged,
-        "the refused round threw away the descent the round before it paid for"
+    // Blocks already on disk may still execute while the peer is refusing, but
+    // the round must not move backwards or throw away the unexecuted descent.
+    assert_refused_round_preserved_descent(
+        &executor,
+        &refused_round,
+        (height, committed),
+        &staging,
+        &chain,
+        &staged_before,
     );
 
     // And the peer relents. The next round resumes from the block above the one
@@ -525,7 +630,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     );
     assert_eq!(
         executed,
-        usize::try_from(target - chain[0].header.chain_length).expect("the gap fits"),
+        usize::try_from(target - anchor).expect("the gap fits"),
         "the rounds after the refusal executed blocks the refused round had already sealed"
     );
 
@@ -556,6 +661,7 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
     let (mut executor, _) = node(directory.path(), burnchain);
+    let anchor = executor.tip().header.chain_length;
     let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
     let mut history = TenureSource::only(client.clone());
     let budget = CatchUpBudget {
@@ -580,7 +686,7 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
     );
     assert_eq!(
         executor.tip().header.chain_length,
-        chain[0].header.chain_length,
+        anchor,
         "the round executed a block it could not have fetched"
     );
 
@@ -610,7 +716,7 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
     );
     assert_eq!(
         executed,
-        usize::try_from(target - chain[0].header.chain_length).expect("the gap fits"),
+        usize::try_from(target - anchor).expect("the gap fits"),
         "the rounds after the throttle executed a block twice"
     );
 
@@ -625,9 +731,9 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
 /// own request count that moves the peer.
 #[tokio::test]
 async fn a_tip_that_moves_mid_round_is_followed() {
-    // Two blocks visible to begin with: the anchor, and one above it for the
+    // Three blocks visible to begin with: the fixture boundary, and one above it for the
     // first round to have something to do.
-    let policy = Policy::default().revealing(2, 3);
+    let policy = Policy::default().revealing(3, 3);
     let budget = CatchUpBudget {
         fetch: 8,
         execute: 4,

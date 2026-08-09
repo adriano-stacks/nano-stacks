@@ -9,7 +9,7 @@ use std::{
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use fs2::FileExt;
 use nano_bitcoin::BitcoinSource;
-use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, SignerSet};
+use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, SignerSet, SignerWeights};
 use nano_crypto::StacksPrivateKey;
 use nano_primitives::{ConsensusHash, Sha256Sum, hash160};
 use nano_stackerdb::{
@@ -132,6 +132,11 @@ impl<V> ActiveSortitionValidator<V> {
         self.context = Some(SortitionProposalValidator::new(sortition, reward_cycle));
     }
 
+    /// Refuse validation until a complete context for the next proposal is installed.
+    pub fn clear_context(&mut self) {
+        self.context = None;
+    }
+
     /// Return the wrapped validator.
     #[must_use]
     pub fn into_inner(self) -> V {
@@ -237,13 +242,22 @@ where
         self.bitcoin_context
     }
 
+    /// Read the active signer weights from the state this validator executed.
+    pub fn recorded_signer_weights(&mut self) -> Result<SignerWeights, String> {
+        self.chainstate
+            .recorded_signer_set(self.bitcoin_context)
+            .map_err(|error| error.to_string())
+    }
+
     fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
         let mut context = self.bitcoin_context;
         // Both, not the view alone: a proposal's tenure and its view are the same
         // burn block unless the caller has said the tenure was extended, and moving
         // the view while leaving the tenure at whatever the standing context held
         // would have the prepare-phase rule read another block's height.
-        context.move_to_burn_block(bitcoin_height);
+        if context.tenure_burn_height() != bitcoin_height {
+            context.move_to_burn_block(bitcoin_height);
+        }
         context.accumulated_coinbase = self
             .accumulated
             .get(&bitcoin_height)
@@ -1466,7 +1480,7 @@ impl StateAnnouncer {
     }
 }
 
-impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
+impl<V: ProposalValidator + Send> LiveSigner<V> {
     /// Construct a live signer from an HTTP peer and its `StackerDB` service.
     #[must_use]
     pub const fn new(
@@ -1505,44 +1519,23 @@ impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
         self.service.signer_mut().validator_mut()
     }
 
-    /// Fetch, authenticate, validate, and answer the latest miner proposal once.
-    pub async fn poll(&mut self) -> Result<Option<ChunkAck>, LiveSignerError> {
-        let tenure = self.client.tenure_info().await?;
-        let Some(pending) = self
-            .service
-            .next_proposal_for_cycle(tenure.reward_cycle)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let sortition = self
-            .client
-            .sortition(pending.proposal.block.header.consensus_hash)
-            .await?;
-        let schedule = self
-            .service
-            .signer_mut()
-            .validator_mut()
-            .coinbase_schedule();
-        if let Some(accumulated) = self
-            .client
-            .accumulated_coinbase(
-                &pending.proposal.block,
-                schedule,
-                pending.proposal.bitcoin_height,
-            )
-            .await?
-        {
-            self.service
-                .signer_mut()
-                .validator_mut()
-                .set_accumulated_coinbase(pending.proposal.bitcoin_height, accumulated);
-        }
+    /// Fetch the latest unanswered miner proposal for a locally selected cycle.
+    pub async fn next_proposal(
+        &mut self,
+        reward_cycle: u64,
+    ) -> Result<Option<PendingProposal>, LiveSignerError> {
         self.service
-            .signer_mut()
-            .validator_mut()
-            .set_context(sortition, tenure.reward_cycle);
+            .next_proposal_for_cycle(reward_cycle)
+            .await
+            .map_err(Into::into)
+    }
 
+    /// Validate and answer a proposal after the node installed local consensus context.
+    pub async fn answer(
+        &mut self,
+        pending: PendingProposal,
+        signers: &SignerSet,
+    ) -> Result<Option<ChunkAck>, LiveSignerError> {
         // The protocol is two phased: promise to sign a block that validates,
         // and sign only once the promises carry threshold weight. A stock signer
         // waits for the same weight before signing, so promising is what lets
@@ -1552,13 +1545,8 @@ impl<V: ProposalValidator + AccumulatedCoinbase + Send> LiveSigner<V> {
             .validate(&pending.proposal)
             .map_err(SignerServiceError::Signer)?;
         let signature_hash = self.service.pre_commit(&pending.proposal).await?;
-        let signers = self
-            .client
-            .stacker_set(tenure.reward_cycle)
-            .await?
-            .signer_set;
         let (client, contract) = self.service.pre_commit_channel();
-        let promised = pre_commit_weight(client, contract, signature_hash, &signers).await?;
+        let promised = pre_commit_weight(client, contract, signature_hash, signers).await?;
         let threshold = signers.approval_threshold().map_err(|error| {
             SignerServiceError::Signer(SignerError::Validation(error.to_string()))
         })?;
@@ -1713,6 +1701,27 @@ mod tests {
 
         validator.set_context(sortition, proposal.reward_cycle);
         validator.validate(&proposal).expect("refreshed context");
+    }
+
+    #[test]
+    fn locally_refreshed_context_rejects_proposal_height_and_cycle_lies() {
+        let (proposal, sortition) = valid_sortition_proposal();
+        let mut validator = ActiveSortitionValidator::new(Accept);
+        validator.set_context(sortition, proposal.reward_cycle);
+
+        let mut wrong_height = proposal.clone();
+        wrong_height.bitcoin_height += 1;
+        assert!(validator.validate(&wrong_height).is_err());
+
+        let mut wrong_cycle = proposal.clone();
+        wrong_cycle.reward_cycle += 1;
+        assert!(validator.validate(&wrong_cycle).is_err());
+
+        validator.clear_context();
+        assert!(
+            validator.validate(&proposal).is_err(),
+            "a failed local refresh cannot reuse the preceding proposal's context"
+        );
     }
 
     /// A slot keeps its last chunk, so a proposal from a cycle that has rolled

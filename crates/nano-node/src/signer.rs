@@ -7,14 +7,13 @@
 use std::{error::Error, path::Path, time::Duration};
 
 use crate::runtime::BurnchainSource;
-use nano_bitcoin::BitcoinSource as _;
-use nano_chainstate::SignerSet;
+use nano_chainstate::{SignerSet, SignerWeights};
 use nano_crypto::StacksPrivateKey;
 use nano_p2p::Discovered;
 use nano_primitives::Network;
 use nano_signer::{
-    AccumulatedCoinbase, ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner,
-    LiveSigner, SignerConfig as EmbeddedSignerConfig, SignerService, StateAnnouncer,
+    ActiveSortitionValidator, ChainstateProposalValidator, EmbeddedSigner, LiveSigner,
+    SignerConfig as EmbeddedSignerConfig, SignerService, StateAnnouncer,
 };
 use nano_stackerdb::StackerDbContract;
 use nano_sync::{PoxInfo, TenureSource};
@@ -22,7 +21,7 @@ use tokio::time::sleep;
 
 use crate::{
     config::{Config, SignerConfig, cycle_contract, miner_contract},
-    hosting::Replicas,
+    hosting::{LocalBurnView, Replicas},
     runtime,
 };
 
@@ -35,6 +34,7 @@ const PRE_COMMIT_MESSAGE_ID: u32 = 3;
 
 /// The state a signer validates proposals against.
 pub type Validator = ActiveSortitionValidator<ChainstateProposalValidator<BurnchainSource>>;
+type Live = LiveSigner<ChainstateProposalValidator<BurnchainSource>>;
 
 /// Where the signer records what it has already signed.
 const STATE_FILE: &str = "signer.json";
@@ -47,22 +47,10 @@ pub async fn open(
     peers: &mut nano_sync::TenureSource,
     directory: &Path,
 ) -> Result<Validator, Box<dyn Error>> {
-    let (mut chainstate, anchor, pending) =
-        runtime::open_chainstate(config, network, pox, peers, directory).await?;
-    let mut bitcoin = runtime::bitcoin_source(config)?;
-    let mut context = runtime::bitcoin_context(config, pox);
-    context.move_to_burn_block(config.checkpoint.anchor_bitcoin_height);
-    if let Some(pending) = pending {
-        let operations = bitcoin.block_at(pending.height)?;
-        let parent = chainstate.tip()?;
-        chainstate.append_nakamoto_block_with_bitcoin_operations(
-            pending,
-            &operations.operations,
-            parent,
-            &anchor,
-        )?;
-        context = pending;
-    }
+    let executor = runtime::open_executor(config, network, pox, peers, directory).await?;
+    let (chainstate, anchor, bitcoin_height, bitcoin) = executor.into_validator_parts();
+    let mut context = pox.bitcoin_context();
+    context.move_to_burn_block(bitcoin_height);
     Ok(ActiveSortitionValidator::new(
         ChainstateProposalValidator::new(chainstate, &anchor, context, bitcoin),
     ))
@@ -73,11 +61,12 @@ pub async fn run(
     config: Config,
     signer: SignerConfig,
     network: Network,
+    pox: PoxInfo,
     discovered: Option<Discovered>,
     peers: TenureSource,
     validator: Validator,
 ) -> runtime::Role {
-    start(config, signer, network, discovered, peers, validator)
+    start(config, signer, network, pox, discovered, peers, validator)
         .await
         .map_err(|error| format!("the signer stopped: {error}"))
 }
@@ -86,10 +75,12 @@ async fn start(
     config: Config,
     signer: SignerConfig,
     network: Network,
+    pox: PoxInfo,
     discovered: Option<Discovered>,
     mut peers: TenureSource,
-    validator: Validator,
+    mut validator: Validator,
 ) -> Result<(), Box<dyn Error>> {
+    let mut burn = LocalBurnView::open(&config, validator.validator_mut().bitcoin_context())?;
     // The pool the chain is followed over, not one client picked out of it: a
     // signer bound to the peer it started with makes that peer's availability its
     // own, and on mainnet that peer was the hosted API this node is meant not to
@@ -144,47 +135,44 @@ async fn start(
             live.service_mut().use_client(replica.clone());
             announcer.use_client(replica);
         }
-        let signers = match binding(&mut peers, network, &key).await {
-            Ok(binding) => {
-                if bound_cycle != Some(binding.cycle) {
-                    println!(
-                        "signing reward cycle {} from slot {}",
-                        binding.cycle, binding.slot
-                    );
-                    live.service_mut()
-                        .rebind(binding.responses, binding.pre_commits, binding.slot);
-                    announcer.rebind(binding.states, binding.slot);
-                    bound_cycle = Some(binding.cycle);
-                }
-                binding.signers
-            }
+        let binding = match local_binding(
+            &mut peers,
+            &mut burn,
+            &pox,
+            live.validator_mut(),
+            config.node.max_sync_blocks,
+            network,
+            &key,
+        )
+        .await
+        {
+            Ok(binding) => binding,
             Err(error) => {
-                eprintln!("signer is not in the active reward set: {error}");
+                eprintln!("signer has no authenticated reward-cycle binding: {error}");
                 sleep(interval).await;
                 continue;
             }
         };
-        if let Err(error) = announcer.announce(live.peer(), &signers).await {
+        if bound_cycle != Some(binding.cycle) {
+            println!(
+                "signing reward cycle {} from slot {}",
+                binding.cycle, binding.slot
+            );
+            live.service_mut()
+                .rebind(binding.responses, binding.pre_commits, binding.slot);
+            announcer.rebind(binding.states, binding.slot);
+            bound_cycle = Some(binding.cycle);
+        }
+        if let Err(error) = announcer.announce(live.peer(), &binding.signers).await {
             eprintln!("signer state announcement failed: {error}");
             replicas.rotate();
         }
-        if let Err(error) = catch_up(
-            &mut peers,
-            live.validator_mut(),
-            config.node.max_sync_blocks,
-        )
-        .await
+        if let Err(error) = poll(&mut live, &mut burn, &pox, binding.cycle, &binding.signers).await
         {
-            eprintln!("signer chainstate sync failed: {error}");
-            sleep(interval).await;
-            continue;
-        }
-        match live.poll().await {
-            Ok(_) => replicas.credit(),
-            Err(error) => {
-                eprintln!("signer poll failed: {error}");
-                replicas.rotate();
-            }
+            eprintln!("signer poll failed: {error}");
+            replicas.rotate();
+        } else {
+            replicas.credit();
         }
         sleep(interval).await;
     }
@@ -200,22 +188,64 @@ struct Binding {
     signers: SignerSet,
 }
 
-async fn binding(
+async fn local_binding(
     peers: &mut TenureSource,
+    burn: &mut LocalBurnView,
+    pox: &PoxInfo,
+    validator: &mut Validator,
+    max_blocks: usize,
     network: Network,
     key: &StacksPrivateKey,
 ) -> Result<Binding, String> {
-    let cycle = peers
-        .tenure_info()
+    catch_up(peers, burn, pox, validator, max_blocks).await?;
+    let context = validator.validator_mut().bitcoin_context();
+    let cycle = pox.reward_cycle(context.height);
+    let expected = validator.validator_mut().recorded_signer_weights()?;
+    binding(peers, network, cycle, &expected, key).await
+}
+
+async fn poll(
+    live: &mut Live,
+    burn: &mut LocalBurnView,
+    pox: &PoxInfo,
+    cycle: u64,
+    signers: &SignerSet,
+) -> Result<(), String> {
+    let Some(pending) = live
+        .next_proposal(cycle)
         .await
         .map_err(|error| error.to_string())?
-        .reward_cycle;
+    else {
+        return Ok(());
+    };
+    burn.prepare(&pending.proposal.block, pox, live.validator_mut())?;
+    live.answer(pending, signers)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn binding(
+    peers: &mut TenureSource,
+    network: Network,
+    cycle: u64,
+    expected: &SignerWeights,
+    key: &StacksPrivateKey,
+) -> Result<Binding, String> {
     let public_key = key.public_key().to_bytes_compressed();
     let signers = peers
         .stacker_set(cycle)
         .await
         .map_err(|error| error.to_string())?
         .signer_set;
+    let supplied = signers
+        .signing_weights()
+        .map_err(|error| error.to_string())?;
+    if supplied != *expected {
+        return Err(format!(
+            "a peer supplied signer weights for cycle {cycle} that differ from local chainstate"
+        ));
+    }
     let slot = signers
         .signers()
         .iter()
@@ -237,6 +267,8 @@ async fn binding(
 /// verify its state root, so this runs before every round of signing.
 pub(crate) async fn catch_up(
     peers: &mut nano_sync::TenureSource,
+    burn: &mut LocalBurnView,
+    pox: &PoxInfo,
     validator: &mut Validator,
     max_blocks: usize,
 ) -> Result<(), String> {
@@ -273,28 +305,7 @@ pub(crate) async fn catch_up(
     }
 
     for block in blocks.iter().rev() {
-        let sortition = peers
-            .sortition(block.header.consensus_hash)
-            .await
-            .map_err(|error| error.to_string())?;
-        let schedule = validator.coinbase_schedule();
-        if let Some(accumulated) = peers
-            .accumulated_coinbase(block, schedule, sortition.bitcoin_height)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            validator.set_accumulated_coinbase(sortition.bitcoin_height, accumulated);
-        }
-        validator
-            .validator_mut()
-            .observe(block, sortition.bitcoin_height)
-            .map_err(|error| {
-                format!(
-                    "canonical block {} at height {} failed to validate: {error}",
-                    block.block_id(),
-                    block.header.chain_length
-                )
-            })?;
+        burn.observe(block, pox, validator)?;
     }
     Ok(())
 }

@@ -31,7 +31,7 @@ use nano_codec::{
 };
 use nano_crypto::{StacksPrivateKey, Vrf, VrfProof, VrfPublicKey};
 use nano_marf::{MarfValue, TriePointer};
-use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, sha512_256};
+use nano_primitives::{ConsensusHash, Network, Sha256Sum, StacksBlockId, TrieHash, sha512_256};
 use nano_sortition::{SortitionReorg, SortitionSnapshot};
 pub use nano_vm::BitcoinBlockContext;
 use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
@@ -757,6 +757,8 @@ struct ChainLedger {
     accounting: TenureAccounting,
     /// Stacks height each tenure started at, which `get-tenure-info?` maps back.
     tenure_start_heights: BTreeMap<u32, u32>,
+    /// Block identifier of each tenure start this node authenticated or executed.
+    tenure_start_blocks: BTreeMap<u32, [u8; 32]>,
     /// The blocks executed since the checkpoint, oldest first, bounded at
     /// `REORG_REACH`.
     executed: Vec<ExecutedBlock>,
@@ -787,6 +789,11 @@ impl ChainLedger {
                 .tenure_start_heights
                 .iter()
                 .map(|(tenure, height)| (*tenure, *height))
+                .collect(),
+            tenure_start_blocks: self
+                .tenure_start_blocks
+                .iter()
+                .map(|(tenure, block)| (*tenure, hex::encode(block)))
                 .collect(),
             executed: self
                 .executed
@@ -826,10 +833,20 @@ impl ChainLedger {
             .parent_tenure_proof
             .map(|proof| decode_hex(&proof).ok_or_else(|| bad("the parent tenure's VRF proof")))
             .transpose()?;
+        let tenure_start_blocks = record
+            .tenure_start_blocks
+            .into_iter()
+            .map(|(tenure, block)| {
+                decode_hex(&block)
+                    .map(|block| (tenure, block))
+                    .ok_or_else(|| bad("a tenure-start block"))
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             accounting: TenureAccounting::from_checkpoint(record.accounting)
                 .map_err(|error| ChainStateError::Ledger(error.to_string()))?,
             tenure_start_heights: record.tenure_start_heights.into_iter().collect(),
+            tenure_start_blocks,
             executed,
             parent_tenure_proof,
         })
@@ -848,6 +865,9 @@ struct ChainLedgerRecord {
     accounting: TenureAccountingCheckpoint,
     /// Tenure height paired with the Stacks height its start block sits at.
     tenure_start_heights: Vec<(u32, u32)>,
+    /// Tenure height paired with its authenticated start block identifier.
+    #[serde(default)]
+    tenure_start_blocks: Vec<(u32, String)>,
     executed: Vec<ExecutedBlockRecord>,
     parent_tenure_proof: Option<String>,
 }
@@ -1316,6 +1336,9 @@ impl ChainState {
             ledger
                 .tenure_start_heights
                 .insert(tenure_height, stacks_height);
+            ledger
+                .tenure_start_blocks
+                .insert(tenure_height, *block.block_id().as_bytes());
         }
         self.check_signer_signatures(block, entry.bitcoin_context)
             .map_err(history_block(height))?;
@@ -1444,6 +1467,31 @@ impl ChainState {
             .tenure_start_heights
             .get(&tenure_height)
             .copied()
+    }
+
+    /// The authenticated start block and Stacks height of an executed tenure.
+    ///
+    /// A legacy ledger may know only the height. That is not enough for a miner
+    /// to name the parent tenure in a commitment, so it answers `None` rather
+    /// than treating the first block seen after restart as the tenure start.
+    #[must_use]
+    pub fn tenure_start(&self, consensus_hash: ConsensusHash) -> Option<(StacksBlockId, u32)> {
+        let tenure_height = self
+            .ledger
+            .executed
+            .iter()
+            .rev()
+            .find(|block| block.consensus_hash == consensus_hash)?
+            .tenure_height;
+        Some((
+            StacksBlockId::from_bytes(*self.ledger.tenure_start_blocks.get(&tenure_height)?),
+            *self.ledger.tenure_start_heights.get(&tenure_height)?,
+        ))
+    }
+
+    /// Read an account nonce from this chain's sealed state.
+    pub fn account_nonce(&mut self, principal: &PrincipalData) -> Result<u64, ChainStateError> {
+        Ok(self.vm.account_nonce(principal)?)
     }
 
     /// The same height as Clarity answers it, from the VM's own map.
@@ -2381,6 +2429,9 @@ impl ChainState {
         ledger
             .tenure_start_heights
             .retain(|tenure, _| *tenure < discarded_from_tenure);
+        ledger
+            .tenure_start_blocks
+            .retain(|tenure, _| *tenure < discarded_from_tenure);
         vm.stand_on_tenure_starts(
             ledger
                 .tenure_start_heights
@@ -3196,10 +3247,22 @@ fn note_executed_block(
     // the same here is what makes the ledger the single thing to write down:
     // otherwise the map recovered on restart is missing exactly the tenure in
     // flight, which is the one being asked about.
+    let first_seen = !ledger.tenure_start_heights.contains_key(&tenure_height);
     let tenure_start_height = *ledger
         .tenure_start_heights
         .entry(tenure_height)
         .or_insert(stacks_height);
+    if block_starts_new_tenure(block) {
+        ledger
+            .tenure_start_blocks
+            .entry(tenure_height)
+            .or_insert_with(|| *block.block_id().as_bytes());
+    } else if first_seen {
+        // A checkpoint or legacy state may begin in the middle of a tenure. Its
+        // first observed height is enough for Clarity's historical convention,
+        // but it is not the tenure-start identifier a miner must commit to.
+        ledger.tenure_start_blocks.remove(&tenure_height);
+    }
     ledger.executed.push(ExecutedBlock {
         block_id: *block.block_id().as_bytes(),
         consensus_hash: block.header.consensus_hash,
@@ -4470,12 +4533,14 @@ mod tests {
         let ChainLedger {
             accounting,
             tenure_start_heights,
+            tenure_start_blocks,
             executed,
             parent_tenure_proof,
         } = ChainLedger::default();
 
         assert_eq!(accounting, TenureAccounting::default());
         assert!(tenure_start_heights.is_empty());
+        assert!(tenure_start_blocks.is_empty());
         assert!(executed.is_empty());
         assert!(parent_tenure_proof.is_none());
     }
@@ -4489,6 +4554,7 @@ mod tests {
         let mut ledger = ChainLedger {
             accounting: accounting_counting_fees(),
             tenure_start_heights: [(251_321, 8_665_600), (251_322, 8_665_612)].into(),
+            tenure_start_blocks: [(251_321, [0x2a; 32]), (251_322, [0x3a; 32])].into(),
             executed: vec![ExecutedBlock {
                 block_id: [0x3a; 32],
                 consensus_hash: nano_primitives::ConsensusHash::from_bytes([0x7c; 20]),
@@ -4500,6 +4566,19 @@ mod tests {
         assert_eq!(
             ChainLedger::decode(&encoded).expect("the ledger decodes"),
             ledger
+        );
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).expect("ledger JSON");
+        legacy
+            .as_object_mut()
+            .expect("ledger object")
+            .remove("tenure_start_blocks");
+        let legacy =
+            ChainLedger::decode(&serde_json::to_vec(&legacy).expect("encode legacy-shaped ledger"))
+                .expect("a pre-start-id ledger remains readable");
+        assert!(
+            legacy.tenure_start_blocks.is_empty(),
+            "a restart must not fabricate tenure-start identities absent from its ledger"
         );
 
         // An empty one too: the first block after a checkpoint has no parent

@@ -127,6 +127,27 @@ impl MovableBurnchain {
         }
     }
 
+    /// Extend this burnchain with deterministic empty blocks.
+    pub fn extend_empty(&self, count: u64) -> u64 {
+        let mut blocks = self.blocks.lock().expect("the burnchain is not poisoned");
+        let start = blocks.keys().next_back().copied().unwrap_or_default();
+        for height in (start + 1)..=(start + count) {
+            let mut hash = [0_u8; 32];
+            hash[..8].copy_from_slice(&height.to_be_bytes());
+            blocks.insert(
+                height,
+                BitcoinBlock {
+                    height,
+                    hash,
+                    timestamp: height,
+                    operations: Vec::new(),
+                },
+            );
+        }
+        drop(blocks);
+        start + count
+    }
+
     /// Replace the block at a height with one carrying a different hash.
     ///
     /// The operations are kept: a reorganization that also emptied the block
@@ -291,6 +312,16 @@ impl Policy {
             .collect()
     }
 
+    /// How many content-addressed block requests reached this peer.
+    pub fn blocks_asked(&self) -> usize {
+        self.asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with("/v3/blocks/"))
+            .count()
+    }
+
     /// Record a request and say whether this one is refused.
     fn admits(&self, path: &str) -> bool {
         let mut asked = self.asked.lock().expect("the log is not poisoned");
@@ -331,15 +362,13 @@ pub struct Served {
     pub snapshots: Vec<Snapshot>,
     /// How it misbehaves while serving them.
     pub policy: Policy,
-    /// Whether `/v3/sortitions/...` exists on this peer at all.
-    ///
-    /// Not a rate limit and not a lie: the route answers 404, which is what a peer
-    /// that does not serve it looks like. [[049]]'s first acceptance criterion is that
-    /// taking it away does not stop a node with a Bitcoin source of its own.
-    sortitions: bool,
+    /// Whether every consensus field in a served sortition is adversarial.
+    lying_sortitions: bool,
     /// Whether a tenure asked for by burn view is answered with another tenure's
     /// blocks.
     lying_tenures: bool,
+    /// Whether a content-addressed block request returns another held block.
+    lying_blocks: bool,
 }
 
 impl Served {
@@ -349,8 +378,9 @@ impl Served {
             blocks,
             snapshots,
             policy: Policy::default(),
-            sortitions: true,
+            lying_sortitions: false,
             lying_tenures: false,
+            lying_blocks: false,
         }
     }
 
@@ -361,6 +391,13 @@ impl Served {
         self
     }
 
+    /// The same peer, answering each block request with a different held block.
+    #[must_use]
+    pub const fn answering_the_wrong_block(mut self) -> Self {
+        self.lying_blocks = true;
+        self
+    }
+
     /// The same peer, misbehaving.
     #[must_use]
     pub fn under(mut self, policy: Policy) -> Self {
@@ -368,10 +405,10 @@ impl Served {
         self
     }
 
-    /// The same peer, with no sortition routes.
+    /// The same peer, lying about every execution-visible sortition field.
     #[must_use]
-    pub const fn without_sortitions(mut self) -> Self {
-        self.sortitions = false;
+    pub const fn lying_about_sortitions(mut self) -> Self {
+        self.lying_sortitions = true;
         self
     }
 
@@ -391,10 +428,16 @@ impl Served {
     }
 
     fn block(&self, id: &str) -> Option<Vec<u8>> {
-        self.visible()
-            .iter()
-            .find(|block| hex::encode(block.block_id()) == id)
-            .map(NakamotoBlock::encode)
+        let blocks = self.visible();
+        let wanted = |block: &&NakamotoBlock| hex::encode(block.block_id()) == id;
+        if self.lying_blocks {
+            blocks.iter().find(wanted)?;
+            return blocks
+                .iter()
+                .find(|block| !wanted(block))
+                .map(NakamotoBlock::encode);
+        }
+        blocks.iter().find(wanted).map(NakamotoBlock::encode)
     }
 
     /// Every block of the tenure the named block belongs to, back to back.
@@ -509,7 +552,7 @@ impl Served {
             .iter()
             .filter(|other| other.block_height < snapshot.block_height && other.sortition == 1)
             .max_by_key(|other| other.block_height);
-        serde_json::json!({
+        let mut answer = serde_json::json!({
             "burn_block_hash": format!("0x{}", snapshot.burn_header_hash),
             "burn_block_height": snapshot.block_height,
             "burn_header_timestamp": snapshot.burn_header_timestamp,
@@ -524,7 +567,18 @@ impl Served {
             }),
             "committed_block_hash": serde_json::Value::Null,
             "vrf_seed": format!("0x{}", hex::encode(vrf_seed)),
-        })
+        });
+        if self.lying_sortitions {
+            answer["burn_block_hash"] = serde_json::json!(format!("0x{}", "11".repeat(32)));
+            answer["burn_block_height"] = serde_json::json!(snapshot.block_height + 1_000_000);
+            answer["burn_header_timestamp"] = serde_json::json!(u64::MAX);
+            answer["sortition_id"] = serde_json::json!(format!("0x{}", "22".repeat(32)));
+            answer["parent_sortition_id"] = serde_json::json!(format!("0x{}", "33".repeat(32)));
+            answer["was_sortition"] = serde_json::json!(snapshot.sortition != 1);
+            answer["last_sortition_ch"] = serde_json::json!(format!("0x{}", "44".repeat(20)));
+            answer["vrf_seed"] = serde_json::json!(format!("0x{}", "55".repeat(32)));
+        }
+        answer
     }
 
     /// The burn view between two consensus hashes, newest first.
@@ -537,16 +591,21 @@ impl Served {
     ///
     /// The consensus hash is stated `0x`-prefixed here, because that is what both real
     /// implementations state and a client that could not read it could not read either.
-    fn fork_info(&self, start: &str, stop: &str) -> serde_json::Value {
+    fn fork_info(&self, recurse_end: &str, start_from: &str) -> Option<serde_json::Value> {
         let height = |hash: &str| {
             self.snapshots
                 .iter()
                 .find(|snapshot| snapshot.consensus_hash == hash)
                 .map(|snapshot| snapshot.block_height)
         };
-        let (Some(start), Some(stop)) = (height(start), height(stop)) else {
-            return serde_json::Value::Array(Vec::new());
+        let (Some(stop), Some(start)) = (height(recurse_end), height(start_from)) else {
+            return Some(serde_json::Value::Array(Vec::new()));
         };
+        // stacks-core refuses a walk whose first path element does not bound the
+        // second from below. Equal elements are the valid single-tenure case.
+        if recurse_end != start_from && stop >= start {
+            return None;
+        }
         let mut entries: Vec<serde_json::Value> = self
             .snapshots
             .iter()
@@ -565,7 +624,7 @@ impl Served {
             })
             .collect();
         entries.reverse();
-        serde_json::Value::Array(entries)
+        Some(serde_json::Value::Array(entries))
     }
 
     /// Every block this peer holds of the tenure a burn view elected.
@@ -673,7 +732,6 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 let found = state
                     .snapshots
                     .iter()
-                    .filter(|_| state.sortitions)
                     .find(|snapshot| snapshot.consensus_hash == hash)
                     .map(|snapshot| state.sortition(snapshot));
                 found.map_or_else(
@@ -688,7 +746,6 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
                 let found = state
                     .snapshots
                     .iter()
-                    .filter(|_| state.sortitions)
                     .find(|snapshot| snapshot.block_height == height)
                     .map(|snapshot| state.sortition(snapshot));
                 found.map_or_else(
@@ -700,10 +757,22 @@ pub async fn serve(served: Served) -> (SyncClient, tokio::task::JoinHandle<()>) 
         .route(
             "/v3/tenures/fork_info/{start}/{stop}",
             get(|State(state): State<Arc<Served>>, axum::extract::Path((start, stop)): axum::extract::Path<(String, String)>| async move {
-                axum::Json(state.fork_info(
-                    &start.trim_start_matches("0x").to_lowercase(),
-                    &stop.trim_start_matches("0x").to_lowercase(),
-                ))
+                state
+                    .fork_info(
+                        &start.trim_start_matches("0x").to_lowercase(),
+                        &stop.trim_start_matches("0x").to_lowercase(),
+                    )
+                    .map_or_else(
+                        || {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!(
+                                    "Supplied start and end sortitions are not in the same fork"
+                                )),
+                            )
+                        },
+                        |body| (StatusCode::OK, axum::Json(body)),
+                    )
             }),
         )
         .layer(axum::middleware::from_fn_with_state(
@@ -763,7 +832,14 @@ pub const fn pox() -> PoxInfo {
 /// sBTC taproot output — at exactly 280.
 pub const POX_5_ACTIVATION_HEIGHT: u32 = 262;
 
-/// A node standing on the captured checkpoint, with the anchor block applied.
+/// The capture starts on the last block of an already-running tenure. Its first
+/// tenure change therefore commits a nine-block parent tenure while only one of
+/// those blocks is present. Replay that incomplete boundary explicitly through
+/// the fixture-only API; every block followed after it has a complete local
+/// tenure ledger and goes through production authentication.
+const FIXTURE_BOUNDARY_BLOCKS: usize = 2;
+
+/// A node standing on the first complete tenure boundary in the capture.
 ///
 /// Durable, in a directory of its own, because a retraction stands on the ledger
 /// the surviving block committed and an in-memory state has none to read back.
@@ -776,18 +852,35 @@ pub fn node(
     burnchain: MovableBurnchain,
 ) -> (CheckpointExecutor<MovableBurnchain>, Vec<NakamotoBlock>) {
     let fixtures = fixtures();
-    let (chainstate, _) = crate::restart::open(directory);
+    let (mut chainstate, source) = crate::restart::open(directory);
     let chain = captured_chain();
-    let anchor = chain.first().expect("the capture has blocks").clone();
-    // The anchor's own context comes from the capture, as a configured node's
-    // does from its checkpoint: nothing has been executed yet, so there is
-    // nowhere else for it to come from.
-    let context = *nano_conformance::captured_bitcoin_snapshots(&fixtures)
-        .expect("the captured snapshots read")
-        .get(&anchor.header.consensus_hash.to_string())
-        .expect("the anchor's own burn block");
-    let mut executor = CheckpointExecutor::from_chainstate(chainstate, anchor, context, burnchain)
-        .expect("the anchor block applies");
+    let replay = nano_conformance::replay_into(
+        &mut chainstate,
+        source,
+        &fixtures,
+        nano_conformance::FixtureManifest {
+            mode: nano_conformance::FixtureMode::Captured,
+            replay_blocks: u64::try_from(FIXTURE_BOUNDARY_BLOCKS).expect("the prefix fits"),
+            receipts: true,
+        },
+        0,
+        &mut |_, _| {},
+    );
+    assert_eq!(
+        replay.completed,
+        u64::try_from(FIXTURE_BOUNDARY_BLOCKS).expect("the prefix fits"),
+        "the explicit fixture boundary did not replay: {replay:?}"
+    );
+    let anchor = chain
+        .get(FIXTURE_BOUNDARY_BLOCKS - 1)
+        .expect("the capture has its boundary blocks")
+        .clone();
+    assert_eq!(
+        chainstate.tip().expect("the fixture tip reads"),
+        Some(*anchor.block_id().as_bytes()),
+        "the fixture prefix did not seal its boundary"
+    );
+    let mut executor = CheckpointExecutor::resume(chainstate, anchor, burnchain);
     nano_conformance::derive_sortitions(&mut executor, &fixtures, directory);
     (executor, chain)
 }
@@ -833,7 +926,7 @@ pub fn alternative_history(chain: &[NakamotoBlock], from: usize) -> Vec<Nakamoto
 async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
     let chain = captured_chain();
     let honest: Vec<_> = chain[..8].to_vec();
-    let liar = alternative_history(&chain[..16], 1);
+    let liar = alternative_history(&chain[..16], FIXTURE_BOUNDARY_BLOCKS);
     assert!(
         liar.last().expect("a tip").header.chain_length
             > honest.last().expect("a tip").header.chain_length,
@@ -1017,6 +1110,7 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
     );
     let disputed = *tenures.first().expect("a newest tenure");
     let agreed = *tenures.get(1).expect("a tenure below it");
+    let oldest = *tenures.last().expect("an oldest tenure");
     let executed_before = executor.chainstate_mut().executed_blocks();
     let stands_on = executor
         .chainstate_mut()
@@ -1032,10 +1126,11 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
             row.consensus_hash = replacement.to_string();
         }
     }
-    let (parted_client, parted_task) = serve(Served::honest(
-        parted_view(&honest, disputed, replacement),
-        parted,
-    ))
+    let parted_policy = Policy::default();
+    let (parted_client, parted_task) = serve(
+        Served::honest(parted_view(&honest, disputed, replacement), parted)
+            .under(parted_policy.clone()),
+    )
     .await;
 
     let mut history = TenureSource::only(parted_client.clone());
@@ -1070,6 +1165,16 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
         executed_after.last().copied(),
         Some(stands_on),
         "the chain does not end at the block the switch named"
+    );
+    let expected_path = format!("/v3/tenures/fork_info/{oldest}/{replacement}");
+    assert!(
+        parted_policy
+            .asked
+            .lock()
+            .expect("the log is not poisoned")
+            .iter()
+            .any(|(path, admitted)| path == &expected_path && *admitted),
+        "the client did not put stacks-core's older bound before its newer cursor"
     );
 
     honest_task.abort();
@@ -1299,7 +1404,7 @@ async fn reference_roots(
     roots
 }
 
-/// A gap closes with the peer's `/v3/sortitions` routes gone entirely.
+/// Peer sortition lies cannot change any locally derived execution input.
 ///
 /// [[049]]'s first acceptance criterion, and the one thing the rest of this file
 /// could not show: every burn view a block executes under is named by this node's own
@@ -1310,7 +1415,7 @@ async fn reference_roots(
 /// peer's tip and seals the same roots as one that had the route — **and** the route
 
 #[tokio::test]
-async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
+async fn peer_sortition_lies_never_reach_execution() {
     let chain = captured_chain();
     let rows = snapshots();
     let burn_of = |block: &NakamotoBlock| burn_height_of(&rows, block);
@@ -1342,8 +1447,10 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
 
     // The node under test. It executes up to the seed's burn view against a peer that
     // does serve sortitions — a node has to reach the burn block its chain is seeded
-    // at before it can be seeded there — and everything above that against one that
-    // does not.
+    // at before it can be seeded there — and everything above that against one whose
+    // height, burn hash, timestamp, sortition identifiers, winner flag, VRF seed and
+    // previous-sortition pointer are all lies. The last two would also change the
+    // peer-derived accumulated coinbase.
     let directory = tempfile::tempdir().expect("a directory");
     let staging_path = directory.path().join("staging.sqlite");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -1380,7 +1487,7 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
     let (blind, blind_task) = serve(
         Served::honest(served.clone(), snapshots())
             .under(asked.clone())
-            .without_sortitions(),
+            .lying_about_sortitions(),
     )
     .await;
     let mut history = TenureSource::only(blind.clone());
@@ -1395,12 +1502,12 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
     .await;
     assert!(
         executed > 0,
-        "nothing was executed with the peer's sortitions gone, so the claim is untested"
+        "nothing was executed against the lying peer, so the claim is untested"
     );
     let tip = executor.tip().clone();
     assert_eq!(
         tip.header.chain_length, target,
-        "the node stopped at height {} of the peer's {target} with the sortition route gone",
+        "the node stopped at height {} of the lying peer's {target}",
         tip.header.chain_length
     );
     assert_eq!(
@@ -1413,8 +1520,8 @@ async fn a_gap_closes_with_the_peers_sortitions_unavailable() {
                 .expect("read the derived content root"),
         ),
         reference_closed,
-        "the node that derived its own burn views sealed a different chain from the one \
-         that was told them"
+        "the peer's false burn height, hash, timestamp, VRF seed or accumulated coinbase \
+         changed locally derived execution"
     );
     // The stronger half. A node that asked and carried on when refused would have
     // reached the tip too, and would still be one reachable peer away from having its
@@ -1506,6 +1613,13 @@ pub fn derived_chain(
         serde_json::to_vec(&serde_json::json!({ "hashes": hashes })).expect("the history encodes"),
     )
     .expect("the history is written");
+    fs::copy(
+        fixtures()
+            .join("sortition")
+            .join(nano_node::sortition::LEADER_KEY_FILE),
+        capture.join(nano_node::sortition::LEADER_KEY_FILE),
+    )
+    .expect("the checkpoint leader-key registry is copied");
 
     let mut tracker = nano_node::sortition::SortitionTracker::from_capture(capture)
         .expect("the synthesized capture seeds a chain");

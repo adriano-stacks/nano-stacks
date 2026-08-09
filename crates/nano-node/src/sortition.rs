@@ -76,6 +76,30 @@ pub enum TrackerError {
     Seed(String),
     Bitcoin(String),
     Sortition(SortitionError),
+    BoundarySnapshotMissing(ConsensusHash),
+    BoundarySnapshotDuplicate(ConsensusHash),
+    BoundaryHistoryMissing(ConsensusHash),
+    BoundaryHistoryDuplicate(ConsensusHash),
+    BoundaryNotWinner {
+        consensus_hash: ConsensusHash,
+        bitcoin_height: u64,
+    },
+    BoundaryBlockMismatch {
+        bitcoin_height: u64,
+    },
+    BoundaryWinnerCommitmentMissing {
+        bitcoin_height: u64,
+        winner_txid: [u8; 32],
+    },
+    BoundaryWinnerKeyUnavailable {
+        bitcoin_height: u64,
+        key_block_height: u64,
+        key_transaction_index: u32,
+    },
+    BoundaryWinnerMismatch {
+        bitcoin_height: u64,
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for TrackerError {
@@ -84,6 +108,58 @@ impl std::fmt::Display for TrackerError {
             Self::Seed(reason) => write!(formatter, "sortition seed: {reason}"),
             Self::Bitcoin(reason) => write!(formatter, "burnchain: {reason}"),
             Self::Sortition(error) => write!(formatter, "sortition: {error:?}"),
+            Self::BoundarySnapshotMissing(hash) => {
+                write!(
+                    formatter,
+                    "no captured snapshot names checkpoint boundary {hash}"
+                )
+            }
+            Self::BoundarySnapshotDuplicate(hash) => write!(
+                formatter,
+                "more than one captured snapshot names checkpoint boundary {hash}"
+            ),
+            Self::BoundaryHistoryMissing(hash) => write!(
+                formatter,
+                "checkpoint boundary {hash} is absent from the consensus-hash history"
+            ),
+            Self::BoundaryHistoryDuplicate(hash) => write!(
+                formatter,
+                "checkpoint boundary {hash} occurs more than once in the consensus-hash history"
+            ),
+            Self::BoundaryNotWinner {
+                consensus_hash,
+                bitcoin_height,
+            } => write!(
+                formatter,
+                "checkpoint boundary {consensus_hash} at burn {bitcoin_height} did not elect a winner"
+            ),
+            Self::BoundaryBlockMismatch { bitcoin_height } => write!(
+                formatter,
+                "checkpoint boundary snapshot and Bitcoin block disagree at burn {bitcoin_height}"
+            ),
+            Self::BoundaryWinnerCommitmentMissing {
+                bitcoin_height,
+                winner_txid,
+            } => write!(
+                formatter,
+                "checkpoint boundary at burn {bitcoin_height} names winning commitment {}, but that eligible commitment is absent",
+                hex::encode(winner_txid)
+            ),
+            Self::BoundaryWinnerKeyUnavailable {
+                bitcoin_height,
+                key_block_height,
+                key_transaction_index,
+            } => write!(
+                formatter,
+                "checkpoint boundary winner at burn {bitcoin_height} names absent leader key {key_block_height}:{key_transaction_index}"
+            ),
+            Self::BoundaryWinnerMismatch {
+                bitcoin_height,
+                field,
+            } => write!(
+                formatter,
+                "checkpoint boundary snapshot and winning commitment disagree on {field} at burn {bitcoin_height}"
+            ),
         }
     }
 }
@@ -257,6 +333,35 @@ impl SortitionTracker {
     #[must_use]
     pub fn snapshot_at(&self, bitcoin_height: u64) -> Option<&SortitionSnapshot> {
         self.engine.snapshots().snapshot_at(bitcoin_height)
+    }
+
+    /// Return one locally derived snapshot in the shape proposal authentication uses.
+    #[must_use]
+    pub fn sortition_info_at(&self, bitcoin_height: u64) -> Option<nano_sync::SortitionInfo> {
+        let snapshot = self.snapshot_at(bitcoin_height)?;
+        let hash_at =
+            |height: Option<u64>| height.and_then(|height| self.consensus_hash_at(height));
+        Some(nano_sync::SortitionInfo {
+            bitcoin_block_hash: snapshot.bitcoin_header_hash,
+            bitcoin_height: snapshot.bitcoin_height,
+            bitcoin_timestamp: snapshot.bitcoin_timestamp,
+            sortition_id: snapshot.sortition_id,
+            parent_sortition_id: snapshot.parent_sortition_id,
+            consensus_hash: snapshot.consensus_hash,
+            was_sortition: snapshot.winner_txid.is_some(),
+            miner_public_key_hash: snapshot
+                .winner_signing_key_hash
+                .map(nano_primitives::Hash160::from_bytes),
+            stacks_parent_consensus_hash: hash_at(snapshot.parent_bitcoin_height),
+            last_sortition_consensus_hash: hash_at(
+                self.previous_sortition_height(snapshot.bitcoin_height),
+            ),
+            committed_block_hash: snapshot
+                .committed_block_hash
+                .map(nano_primitives::BlockHeaderHash::from_bytes),
+            vrf_seed: snapshot.winner_vrf_seed,
+            mining_competition: snapshot.mining_competition.clone(),
+        })
     }
 
     /// The last burn height below this one that elected somebody.
@@ -561,6 +666,90 @@ impl SortitionTracker {
         self.recover_seed_from(&block)
     }
 
+    /// Resolve the captured boundary winner through its Bitcoin commitment and
+    /// the checkpoint's leader-key registry.
+    ///
+    /// A boundary is the root of this tracker, so its winner was stated by the
+    /// capture rather than derived by the engine. Reading the named commitment
+    /// again is what keeps the VRF key used for the boundary proof local.
+    pub fn authenticate_boundary_winner(
+        &self,
+        block: &BitcoinBlock,
+    ) -> Result<[u8; 32], TrackerError> {
+        let boundary = self.tip();
+        if block.height != boundary.bitcoin_height
+            || block.hash != *boundary.bitcoin_header_hash.as_bytes()
+        {
+            return Err(TrackerError::BoundaryBlockMismatch {
+                bitcoin_height: boundary.bitcoin_height,
+            });
+        }
+        let winner_txid = boundary
+            .winner_txid
+            .ok_or(TrackerError::BoundaryNotWinner {
+                consensus_hash: boundary.consensus_hash,
+                bitcoin_height: boundary.bitcoin_height,
+            })?;
+        let operation = block.operations.iter().find(|operation| {
+            operation.txid == winner_txid
+                && matches!(
+                    &operation.kind,
+                    BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. }
+                        if commitment_is_on_time(*parent_modulus, block.height)
+                )
+        });
+        let Some(operation) = operation else {
+            return Err(TrackerError::BoundaryWinnerCommitmentMissing {
+                bitcoin_height: boundary.bitcoin_height,
+                winner_txid,
+            });
+        };
+        let BitcoinOperationKind::LeaderBlockCommit {
+            block_header_hash,
+            new_seed,
+            key_block_height,
+            key_transaction_index,
+            ..
+        } = &operation.kind
+        else {
+            unreachable!("the winner search selected a leader commitment");
+        };
+        if boundary.winner_vrf_seed != Some(*new_seed) {
+            return Err(TrackerError::BoundaryWinnerMismatch {
+                bitcoin_height: boundary.bitcoin_height,
+                field: "the effective VRF seed",
+            });
+        }
+        if boundary
+            .committed_block_hash
+            .is_some_and(|hash| hash != *block_header_hash)
+        {
+            return Err(TrackerError::BoundaryWinnerMismatch {
+                bitcoin_height: boundary.bitcoin_height,
+                field: "the committed Stacks block",
+            });
+        }
+        let key_height = u64::from(*key_block_height);
+        let key_index = u32::from(*key_transaction_index);
+        let registration = self.keys.registration(key_height, key_index).ok_or(
+            TrackerError::BoundaryWinnerKeyUnavailable {
+                bitcoin_height: boundary.bitcoin_height,
+                key_block_height: key_height,
+                key_transaction_index: key_index,
+            },
+        )?;
+        if boundary
+            .winner_signing_key_hash
+            .is_some_and(|hash| registration.signing_key_hash != Some(hash))
+        {
+            return Err(TrackerError::BoundaryWinnerMismatch {
+                bitcoin_height: boundary.bitcoin_height,
+                field: "the registered block-signing key",
+            });
+        }
+        Ok(registration.vrf_public_key)
+    }
+
     fn recover_seed_from(&mut self, block: &BitcoinBlock) -> Result<(), TrackerError> {
         if self.engine.snapshots().effective_winner_seed().is_some() {
             return Ok(());
@@ -803,7 +992,7 @@ impl CapturedLeaderKey {
 }
 
 /// A snapshot a capture holds, in the fields a seed needs.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CapturedSnapshot {
     block_height: u64,
     burn_header_hash: String,
@@ -1142,10 +1331,7 @@ impl SortitionTracker {
     }
 
     pub fn from_capture(directory: &Path) -> Result<Self, TrackerError> {
-        let bytes = fs::read(directory.join("snapshots.json"))
-            .map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let snapshots: Vec<CapturedSnapshot> = serde_json::from_slice(&bytes)
-            .map_err(|error| TrackerError::Seed(error.to_string()))?;
+        let snapshots = captured_snapshots(directory)?;
         // The one snapshot a history can seed is the one it ends at: the
         // consensus hash of every block after it has to be derived, not stated,
         // or the chain would be quoting the capture rather than checking it.
@@ -1162,25 +1348,106 @@ impl SortitionTracker {
                     "no snapshot for the hash the history ends at: {anchor}"
                 ))
             })?;
-        let mut tracker = Self::new(seed_snapshot(seed)?, history)?;
-        // Where the last sortition at or below the seed was, for a seed that did not
-        // itself elect anybody. A capture's rows do not carry it and do not need to:
-        // a captured seed is refused above unless its own block had a sortition.
+        tracker_from_capture_seed(directory, seed, history)
+    }
+
+    /// Start a fresh checkpoint no later than its attested parent-tenure boundary.
+    ///
+    /// A general capture is normally seeded at its latest winner. Authentication
+    /// starts earlier: it must verify the first included tenure against the
+    /// preceding tenure's proof, so seeding above that boundary makes the proof
+    /// uncheckable. This selector takes the boundary from the artifact and
+    /// truncates a carried history that reaches past it. When the capture's seed
+    /// is below the boundary, it keeps that seed so the caller can derive the
+    /// boundary from Bitcoin instead of trusting a captured snapshot above it.
+    pub fn from_capture_at_consensus(
+        directory: &Path,
+        boundary: ConsensusHash,
+    ) -> Result<Self, TrackerError> {
+        let snapshots = captured_snapshots(directory)?;
+        let boundary_text = boundary.to_string();
+        let mut matching = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.consensus_hash == boundary_text);
+        let seed = matching
+            .next()
+            .ok_or(TrackerError::BoundarySnapshotMissing(boundary))?;
+        if matching.next().is_some() {
+            return Err(TrackerError::BoundarySnapshotDuplicate(boundary));
+        }
+        if !matches!(seed.sortition, Some(sortition) if sortition != 0) {
+            return Err(TrackerError::BoundaryNotWinner {
+                consensus_hash: boundary,
+                bitcoin_height: seed.block_height,
+            });
+        }
+        let mut history = Self::history_from(directory)?;
+        let mut positions = history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| (*hash == boundary).then_some(index));
+        let boundary_index = positions.next();
+        if positions.next().is_some() {
+            return Err(TrackerError::BoundaryHistoryDuplicate(boundary));
+        }
+        if let Some(boundary_index) = boundary_index {
+            history.truncate(boundary_index + 1);
+            return tracker_from_capture_seed(directory, seed, history);
+        }
+
+        let anchor = history
+            .last()
+            .ok_or_else(|| TrackerError::Seed("the history is empty".to_owned()))?
+            .to_string();
+        let mut anchors = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.consensus_hash == anchor);
+        let captured_seed = anchors.next().ok_or_else(|| {
+            TrackerError::Seed(format!(
+                "no snapshot for the hash the history ends at: {anchor}"
+            ))
+        })?;
+        if anchors.next().is_some() {
+            return Err(TrackerError::Seed(format!(
+                "more than one snapshot names the hash the history ends at: {anchor}"
+            )));
+        }
+        if captured_seed.block_height >= seed.block_height {
+            return Err(TrackerError::BoundaryHistoryMissing(boundary));
+        }
+        tracker_from_capture_seed(directory, captured_seed, history)
+    }
+}
+
+fn captured_snapshots(directory: &Path) -> Result<Vec<CapturedSnapshot>, TrackerError> {
+    let bytes = fs::read(directory.join("snapshots.json"))
+        .map_err(|error| TrackerError::Seed(error.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|error| TrackerError::Seed(error.to_string()))
+}
+
+fn tracker_from_capture_seed(
+    directory: &Path,
+    seed: &CapturedSnapshot,
+    history: Vec<ConsensusHash>,
+) -> Result<SortitionTracker, TrackerError> {
+    let mut tracker = SortitionTracker::new(seed_snapshot(seed)?, history)?;
+    // Where the last sortition at or below the seed was, for a seed that did not
+    // itself elect anybody. A capture's rows do not carry it and do not need to:
+    // a captured seed is refused above unless its own block had a sortition.
+    tracker
+        .engine
+        .snapshots_mut()
+        .seed_sortition_below_window(seed.last_sortition_height);
+    // And the run behind it, where a saved chain carries one. Older states have
+    // none and fall back to the single height above, which is what they had.
+    if !seed.sortitions_below_window.is_empty() {
         tracker
             .engine
             .snapshots_mut()
-            .seed_sortition_below_window(seed.last_sortition_height);
-        // And the run behind it, where a saved chain carries one. Older states have
-        // none and fall back to the single height above, which is what they had.
-        if !seed.sortitions_below_window.is_empty() {
-            tracker
-                .engine
-                .snapshots_mut()
-                .seed_sortitions_below_window(seed.sortitions_below_window.clone());
-        }
-        tracker.load_leader_keys(directory)?;
-        Ok(tracker)
+            .seed_sortitions_below_window(seed.sortitions_below_window.clone());
     }
+    tracker.load_leader_keys(directory)?;
+    Ok(tracker)
 }
 
 /// The block-signing hash the seed's winning key was registered with.
@@ -1353,6 +1620,8 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind};
     use nano_primitives::ConsensusHash;
     use nano_sortition::{
@@ -1360,7 +1629,21 @@ mod tests {
     };
     use nano_sync::BurnView as _;
 
-    use super::{CapturedSnapshot, SortitionTracker, TrackerError, seed_snapshot};
+    use super::{
+        CapturedSnapshot, History, SortitionTracker, TrackerError, captured_snapshots,
+        seed_snapshot,
+    };
+
+    fn captured_sortitions() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures/sortition")
+    }
+
+    fn captured_consensus_hash(snapshot: &CapturedSnapshot) -> ConsensusHash {
+        let bytes = hex::decode(&snapshot.consensus_hash).expect("decode captured consensus hash");
+        ConsensusHash::from_bytes(
+            <[u8; 20]>::try_from(bytes).expect("a captured consensus hash is 20 bytes"),
+        )
+    }
 
     /// A chain standing on one snapshot, with one hash behind it.
     pub(super) fn a_chain() -> SortitionTracker {
@@ -1457,6 +1740,145 @@ mod tests {
             "a candidate at this chain's own total may be a sortition-less block ahead of it"
         );
         assert_eq!(tracker.derived(foreign, 8_000_000), None);
+    }
+
+    #[test]
+    fn a_checkpoint_boundary_selects_and_truncates_the_capture() {
+        let directory = captured_sortitions();
+        let snapshots = captured_snapshots(&directory).expect("read captured snapshots");
+        let ordinary = SortitionTracker::from_capture(&directory).expect("load ordinary seed");
+        let boundary = snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| {
+                snapshot.block_height < ordinary.tip().bitcoin_height
+                    && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
+            })
+            .expect("the capture has an earlier winning boundary");
+        let boundary_hash = captured_consensus_hash(boundary);
+
+        let selected = SortitionTracker::from_capture_at_consensus(&directory, boundary_hash)
+            .expect("select the attested boundary");
+
+        assert_eq!(selected.tip().bitcoin_height, boundary.block_height);
+        assert_eq!(selected.tip().consensus_hash, boundary_hash);
+        assert_eq!(
+            selected.engine.snapshots().history().last(),
+            Some(&boundary_hash)
+        );
+        assert!(
+            selected.engine.snapshots().history().len()
+                < ordinary.engine.snapshots().history().len()
+        );
+        assert_eq!(selected.leader_keys(), ordinary.leader_keys());
+    }
+
+    #[test]
+    fn a_checkpoint_boundary_above_the_capture_seed_is_left_to_local_derivation() {
+        let directory = captured_sortitions();
+        let snapshots = captured_snapshots(&directory).expect("read captured snapshots");
+        let ordinary = SortitionTracker::from_capture(&directory).expect("load ordinary seed");
+        let boundary = snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.block_height > ordinary.tip().bitcoin_height
+                    && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
+            })
+            .expect("the capture has a winning boundary above its seed");
+
+        let selected = SortitionTracker::from_capture_at_consensus(
+            &directory,
+            captured_consensus_hash(boundary),
+        )
+        .expect("retain the authenticated seed below the boundary");
+
+        assert_eq!(selected.tip(), ordinary.tip());
+        assert_eq!(
+            selected.engine.snapshots().history(),
+            ordinary.engine.snapshots().history()
+        );
+        assert_eq!(selected.leader_keys(), ordinary.leader_keys());
+    }
+
+    #[test]
+    fn an_absent_duplicate_or_nonwinning_boundary_is_typed() {
+        let source = captured_sortitions();
+        let snapshots = captured_snapshots(&source).expect("read captured snapshots");
+        let winner = snapshots
+            .iter()
+            .find(|snapshot| matches!(snapshot.sortition, Some(sortition) if sortition != 0))
+            .expect("the capture has a winner");
+        let nonwinner = snapshots
+            .iter()
+            .find(|snapshot| snapshot.sortition == Some(0))
+            .expect("the capture has a nonwinner");
+        let winner_hash = captured_consensus_hash(winner);
+        let nonwinner_hash = captured_consensus_hash(nonwinner);
+
+        assert!(matches!(
+            SortitionTracker::from_capture_at_consensus(
+                &source,
+                ConsensusHash::from_bytes([0xff; 20])
+            ),
+            Err(TrackerError::BoundarySnapshotMissing(_))
+        ));
+        assert!(matches!(
+            SortitionTracker::from_capture_at_consensus(&source, nonwinner_hash),
+            Err(TrackerError::BoundaryNotWinner { .. })
+        ));
+
+        let duplicate = tempfile::tempdir().expect("a duplicate capture directory");
+        let mut duplicated = snapshots.clone();
+        duplicated.push(winner.clone());
+        fs::write(
+            duplicate.path().join("snapshots.json"),
+            serde_json::to_vec(&duplicated).expect("encode duplicate snapshots"),
+        )
+        .expect("write duplicate snapshots");
+        assert!(matches!(
+            SortitionTracker::from_capture_at_consensus(duplicate.path(), winner_hash),
+            Err(TrackerError::BoundarySnapshotDuplicate(_))
+        ));
+
+        let missing_history = tempfile::tempdir().expect("a missing history directory");
+        fs::write(
+            missing_history.path().join("snapshots.json"),
+            serde_json::to_vec(&snapshots).expect("encode snapshots"),
+        )
+        .expect("write snapshots");
+        let mut history = SortitionTracker::history_from(&source).expect("read captured history");
+        history.retain(|hash| *hash != winner_hash);
+        fs::write(
+            missing_history.path().join("consensus-hashes.json"),
+            serde_json::to_vec(&History {
+                hashes: history.iter().map(ToString::to_string).collect(),
+            })
+            .expect("encode missing history"),
+        )
+        .expect("write missing history");
+        assert!(matches!(
+            SortitionTracker::from_capture_at_consensus(missing_history.path(), winner_hash),
+            Err(TrackerError::BoundaryHistoryMissing(_))
+        ));
+
+        let mut history = SortitionTracker::history_from(&source).expect("read captured history");
+        let boundary_index = history
+            .iter()
+            .position(|hash| *hash == winner_hash)
+            .expect("the history carries the winning snapshot");
+        history.insert(boundary_index, winner_hash);
+        fs::write(
+            missing_history.path().join("consensus-hashes.json"),
+            serde_json::to_vec(&History {
+                hashes: history.iter().map(ToString::to_string).collect(),
+            })
+            .expect("encode duplicate history"),
+        )
+        .expect("write duplicate history");
+        assert!(matches!(
+            SortitionTracker::from_capture_at_consensus(missing_history.path(), winner_hash),
+            Err(TrackerError::BoundaryHistoryDuplicate(_))
+        ));
     }
 
     #[test]
@@ -1576,7 +1998,7 @@ mod anchor_tests {
     use nano_bitcoin::BitcoinBlock;
     use nano_sortition::{PayoutSchedule, PoxId, RewardCycleSchedule};
 
-    use super::tests::a_chain;
+    use super::{CATCH_UP_LIMIT, tests::a_chain};
 
     /// A cycle length of ten from burn zero, so 111 and 121 both open one.
     fn payouts() -> PayoutSchedule {
@@ -1630,6 +2052,45 @@ mod anchor_tests {
             chain.tip().pox_id,
             PoxId::from_bits(vec![true; before + opened]),
             "one bit per boundary crossed, no bit anywhere else, and every one of them set"
+        );
+    }
+
+    #[test]
+    fn two_bounded_batches_keep_the_view_execution_still_needs() {
+        let mut chain = a_chain();
+        let executed = chain.tip().bitcoin_height;
+        chain.keep_from(executed);
+        let target = executed + CATCH_UP_LIMIT * 2;
+
+        let first = chain
+            .catch_up(
+                |height| Ok::<_, String>(empty_block(height)),
+                target,
+                payouts(),
+                CATCH_UP_LIMIT,
+            )
+            .expect("the first bounded batch advances");
+        let first_tip = chain.tip().consensus_hash;
+        assert_eq!(first.advanced, CATCH_UP_LIMIT);
+        assert_eq!(chain.tip().bitcoin_height, executed + CATCH_UP_LIMIT);
+
+        let second = chain
+            .catch_up(
+                |height| Ok::<_, String>(empty_block(height)),
+                target,
+                payouts(),
+                CATCH_UP_LIMIT,
+            )
+            .expect("the second bounded batch advances without a restart");
+        assert_eq!(second.advanced, CATCH_UP_LIMIT);
+        assert_eq!(chain.tip().bitcoin_height, target);
+        assert_eq!(
+            chain.height_of_consensus_hash(first_tip),
+            Some(target - CATCH_UP_LIMIT)
+        );
+        assert!(
+            chain.snapshot_at(executed).is_some(),
+            "lookahead dropped the burn view execution still stands on"
         );
     }
 }

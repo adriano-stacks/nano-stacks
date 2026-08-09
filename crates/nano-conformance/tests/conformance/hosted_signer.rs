@@ -23,7 +23,7 @@ use nano_address::StacksAddress;
 use nano_codec::{AnchorMode, Principal, Transaction, TransactionPayloadData, TransactionVersion};
 use nano_crypto::{StacksPrivateKey, StacksPublicKey};
 use nano_primitives::{Network, Sha256Sum, hash160};
-use nano_stackerdb::{BlockResponse, SignerMessage};
+use nano_stackerdb::{BlockAcceptance, BlockResponse, SignerMessage};
 use nano_sync::SyncClient;
 use reqwest::Url;
 use serde_json::Value;
@@ -92,6 +92,19 @@ fn hosted() -> Option<Hosted> {
         );
     }
     run
+}
+
+const fn require_accepted_response(accepted: Option<BlockAcceptance>) -> BlockAcceptance {
+    accepted.expect(
+        "the hosted signer accepted no block through nano after the live gate ran: rejected \
+         responses are evidence of refusal, not acceptance",
+    )
+}
+
+#[test]
+#[should_panic(expected = "the hosted signer accepted no block through nano")]
+fn a_live_hosted_signer_run_without_an_acceptance_is_not_success() {
+    let _ = require_accepted_response(None);
 }
 
 /// The reward cycle nano says it is in, read from nano rather than from a peer.
@@ -195,14 +208,7 @@ async fn a_stock_signer_answers_proposals_through_nano() {
         posted.len()
     );
 
-    let Some(acceptance) = accepted else {
-        println!(
-            "the hosted signer has not accepted a block through nano: nano answers a proposal \
-             it has not executed with a refusal, and it cannot execute one without the \
-             leader-key registry its checkpoint does not carry"
-        );
-        return;
-    };
+    let acceptance = require_accepted_response(accepted);
     let recovered = acceptance
         .signature
         .recover(acceptance.signer_signature_hash.as_bytes())

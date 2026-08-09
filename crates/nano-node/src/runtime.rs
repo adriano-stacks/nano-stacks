@@ -50,7 +50,7 @@ const STARTUP_PATIENCE: Duration = Duration::from_secs(64);
 /// The state directory the node executes the canonical chain in.
 pub(crate) const NODE_CHAINSTATE: &str = "chainstate";
 /// The state directory the signer validates proposals in.
-const SIGNER_CHAINSTATE: &str = "signer-chainstate";
+pub(crate) const SIGNER_CHAINSTATE: &str = "signer-chainstate";
 /// The accounting a role used to rewrite as it executed.
 ///
 /// Read only, now: the ledger is committed with the seal, which is what makes it
@@ -1533,38 +1533,12 @@ fn contextualize_checkpoint_history<S: nano_bitcoin::BitcoinSource>(
     pox: &PoxInfo,
     tracker: &SortitionTracker,
     bitcoin: &mut S,
-    boundary: LoadedBoundaryProof,
+    boundary: CheckpointBoundaryProof,
     blocks: &[NakamotoBlock],
 ) -> Result<(CheckpointBoundaryProof, Vec<CheckpointHistoryBlock>), Box<dyn Error>>
 where
     S::Error: std::fmt::Display,
 {
-    let boundary_height = tracker
-        .height_of_consensus_hash(boundary.parent_tenure_consensus_hash)
-        .ok_or_else(|| {
-            format!(
-                "checkpoint boundary parent tenure {} is absent from local sortition history",
-                boundary.parent_tenure_consensus_hash
-            )
-        })?;
-    let boundary_snapshot = tracker.snapshot_at(boundary_height).ok_or_else(|| {
-        format!(
-            "local sortition chain retained no snapshot for checkpoint boundary parent tenure {} at burn {boundary_height}",
-            boundary.parent_tenure_consensus_hash
-        )
-    })?;
-    let boundary_key = boundary_snapshot.winner_vrf_public_key.ok_or_else(|| {
-        format!(
-            "local sortition at burn {boundary_height} has no winning VRF key for the checkpoint boundary parent-tenure proof"
-        )
-    })?;
-    let boundary = CheckpointBoundaryProof {
-        parent_tenure_consensus_hash: boundary.parent_tenure_consensus_hash,
-        coinbase_vrf_proof: boundary.coinbase_vrf_proof,
-        sortition_hash: *boundary_snapshot.sortition_hash.as_bytes(),
-        winner_vrf_public_key: boundary_key,
-    };
-
     let mut current_view = None;
     let mut history = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -1670,6 +1644,7 @@ fn checkpoint_sortition_tracker(
     chainstate: &ChainState,
     anchor: &NakamotoBlock,
     context: Option<BitcoinBlockContext>,
+    fresh_boundary: Option<nano_primitives::ConsensusHash>,
 ) -> Result<(SortitionTracker, BurnchainSource), Box<dyn Error>> {
     let capture = config.checkpoint.sortition.as_ref().ok_or(
         "this node executes blocks and has no checkpoint sortition history to derive burn \
@@ -1684,17 +1659,21 @@ fn checkpoint_sortition_tracker(
         },
         |context| context.height,
     );
-    let mut tracker = SortitionTracker::resume_or_capture_below(
-        &config.node.working_dir,
-        capture,
-        executed_burn_view,
-    )
-    .map_err(|error| {
-        format!(
-            "this node cannot derive sortitions of its own, and will not execute blocks under \
-             a burn view a peer chose: {error}"
+    let mut tracker = if let Some(boundary) = fresh_boundary {
+        SortitionTracker::from_capture_at_consensus(capture, boundary)?
+    } else {
+        SortitionTracker::resume_or_capture_below(
+            &config.node.working_dir,
+            capture,
+            executed_burn_view,
         )
-    })?;
+        .map_err(|error| {
+            format!(
+                "this node cannot derive sortitions of its own, and will not execute blocks under \
+                 a burn view a peer chose: {error}"
+            )
+        })?
+    };
     if tracker.leader_keys() == 0 {
         return Err(format!(
             "this checkpoint carries no leader-key registry, so this node could check no \
@@ -1706,15 +1685,105 @@ fn checkpoint_sortition_tracker(
         .into());
     }
     let mut bitcoin = bitcoin_source(config)?;
-    tracker
-        .recover_seed(|height| bitcoin.block_at(height))
-        .map_err(|error| {
-            format!(
-                "this node cannot recover the checkpoint's effective winner seed before \
-                 execution: {error}"
-            )
-        })?;
+    tracker.recover_seed(|height| bitcoin.block_at(height))?;
     Ok((tracker, bitcoin))
+}
+
+fn derive_checkpoint_authentication<S: nano_bitcoin::BitcoinSource>(
+    pox: &PoxInfo,
+    tracker: &mut SortitionTracker,
+    bitcoin: &mut S,
+    boundary: LoadedBoundaryProof,
+    history: &[NakamotoBlock],
+    target: u64,
+) -> Result<(CheckpointBoundaryProof, Vec<CheckpointHistoryBlock>), Box<dyn Error>>
+where
+    S::Error: std::fmt::Display,
+{
+    advance_to_checkpoint_boundary(
+        pox,
+        tracker,
+        bitcoin,
+        boundary.parent_tenure_consensus_hash,
+        target,
+    )?;
+    let boundary_snapshot = tracker.tip();
+    let boundary_consensus_hash = boundary_snapshot.consensus_hash;
+    let boundary_sortition_hash = *boundary_snapshot.sortition_hash.as_bytes();
+    if boundary_consensus_hash != boundary.parent_tenure_consensus_hash {
+        return Err(format!(
+            "fresh checkpoint sortition seed {} does not equal authentication boundary {}",
+            boundary_consensus_hash, boundary.parent_tenure_consensus_hash
+        )
+        .into());
+    }
+    let boundary_height = boundary_snapshot.bitcoin_height;
+    if target < boundary_height {
+        return Err(format!(
+            "checkpoint anchor burn {target} is below authentication boundary burn {boundary_height}"
+        )
+        .into());
+    }
+    let boundary_block = bitcoin
+        .block_at(boundary_height)
+        .map_err(|error| format!("Bitcoin block {boundary_height}: {error}"))?;
+    let winner_vrf_public_key = tracker.authenticate_boundary_winner(&boundary_block)?;
+    let boundary = CheckpointBoundaryProof {
+        parent_tenure_consensus_hash: boundary.parent_tenure_consensus_hash,
+        coinbase_vrf_proof: boundary.coinbase_vrf_proof,
+        sortition_hash: boundary_sortition_hash,
+        winner_vrf_public_key,
+    };
+    let payouts = crate::payout_schedule(pox).ok_or(
+        "the checkpoint authentication history cannot be checked without a PoX payout calendar",
+    )?;
+    tracker.keep_from(boundary_height);
+    let limit = target - boundary_height;
+    tracker.catch_up(|height| bitcoin.block_at(height), target, payouts, limit)?;
+    if tracker.tip().bitcoin_height != target {
+        return Err(format!(
+            "local sortition derivation stopped at burn {}, before checkpoint anchor burn {target}",
+            tracker.tip().bitcoin_height
+        )
+        .into());
+    }
+    contextualize_checkpoint_history(pox, tracker, bitcoin, boundary, history)
+}
+
+fn advance_to_checkpoint_boundary<S: nano_bitcoin::BitcoinSource>(
+    pox: &PoxInfo,
+    tracker: &mut SortitionTracker,
+    bitcoin: &mut S,
+    boundary: nano_primitives::ConsensusHash,
+    target: u64,
+) -> Result<(), Box<dyn Error>>
+where
+    S::Error: std::fmt::Display,
+{
+    let payouts = crate::payout_schedule(pox).ok_or(
+        "the checkpoint authentication history cannot be checked without a PoX payout calendar",
+    )?;
+    while tracker.tip().consensus_hash != boundary {
+        let height = tracker.tip().bitcoin_height;
+        if height >= target {
+            return Err(format!(
+                "local sortition derivation reached checkpoint anchor burn {target} without authentication boundary {boundary}"
+            )
+            .into());
+        }
+        let next = height
+            .checked_add(1)
+            .ok_or("checkpoint authentication boundary burn height overflow")?;
+        tracker.catch_up(|height| bitcoin.block_at(height), next, payouts, 1)?;
+        if tracker.tip().bitcoin_height != next {
+            return Err(format!(
+                "local sortition derivation stopped at burn {}, before authentication boundary {boundary}",
+                tracker.tip().bitcoin_height
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn authenticate_fresh_checkpoint(
@@ -1726,43 +1795,14 @@ fn authenticate_fresh_checkpoint(
     boundary: LoadedBoundaryProof,
     history: &[NakamotoBlock],
 ) -> Result<(), Box<dyn Error>> {
-    let capture = config
-        .checkpoint
-        .sortition
-        .as_ref()
-        .ok_or("checkpoint sortition history disappeared during startup")?;
-    let earliest = tracker
-        .height_of_consensus_hash(boundary.parent_tenure_consensus_hash)
-        .ok_or_else(|| {
-            format!(
-                "checkpoint authentication boundary tenure {} is absent from the local sortition history",
-                boundary.parent_tenure_consensus_hash
-            )
-        })?;
-    if tracker.tip().bitcoin_height > earliest {
-        *tracker = SortitionTracker::from_capture(capture).map_err(|error| {
-            format!(
-                "the saved sortition chain starts above checkpoint authentication history at burn {earliest}, and the checkpoint chain cannot replace it: {error}"
-            )
-        })?;
-        tracker.recover_seed(|height| bitcoin.block_at(height))?;
-        if tracker.tip().bitcoin_height > earliest {
-            return Err(format!(
-                "checkpoint sortition seed at burn {} is above boundary parent tenure at burn {earliest}; recapture the sortition artifact from at or below the authentication boundary",
-                tracker.tip().bitcoin_height
-            )
-            .into());
-        }
-    }
-    tracker.keep_from(earliest);
-    let target = config.checkpoint.anchor_bitcoin_height;
-    let payouts = crate::payout_schedule(pox).ok_or(
-        "the checkpoint authentication history cannot be checked without a PoX payout calendar",
+    let (boundary, history) = derive_checkpoint_authentication(
+        pox,
+        tracker,
+        bitcoin,
+        boundary,
+        history,
+        config.checkpoint.anchor_bitcoin_height,
     )?;
-    let limit = target.saturating_sub(tracker.tip().bitcoin_height);
-    tracker.catch_up(|height| bitcoin.block_at(height), target, payouts, limit)?;
-    let (boundary, history) =
-        contextualize_checkpoint_history(pox, tracker, bitcoin, boundary, history)?;
     chainstate.authenticate_checkpoint_history(
         config.checkpoint.source_state_id()?,
         config.checkpoint.state_root()?,
@@ -1785,8 +1825,11 @@ pub async fn open_executor(
         .as_ref()
         .map(|_| load_checkpoint_authentication_history(config))
         .transpose()?;
+    let fresh_boundary = checkpoint_history
+        .as_ref()
+        .map(|(boundary, _)| boundary.parent_tenure_consensus_hash);
     let (mut tracker, mut bitcoin) =
-        checkpoint_sortition_tracker(config, &chainstate, &anchor, context)?;
+        checkpoint_sortition_tracker(config, &chainstate, &anchor, context, fresh_boundary)?;
     if let Some((boundary, history)) = checkpoint_history {
         authenticate_fresh_checkpoint(
             config,
@@ -2259,11 +2302,14 @@ async fn start_signer(
     .await?;
     // The same pool the resume walked, kept rather than dropped: a signer handed one
     // client out of it depends on that client for the life of the node.
-    let (running, found) = (config.clone(), discovered.cloned());
+    let (running, found, cycles) = (config.clone(), discovered.cloned(), pox.clone());
     roles.spawn(async move {
         (
             Job::Signer,
-            signer::run(running, signer, network, found, pool, validator).await,
+            Box::pin(signer::run(
+                running, signer, network, cycles, found, pool, validator,
+            ))
+            .await,
         )
     });
     Ok(())
@@ -3580,6 +3626,19 @@ async fn terminated() {
 mod tests {
     /// Every execution batch says where it started, where it ended, how many
     /// blocks that was and the root it sealed — and a batch that executed nothing
+    use std::{collections::BTreeMap, fs, path::Path};
+
+    use nano_bitcoin::{
+        BitcoinBlock, BitcoinOperationKind, BitcoinSource, PreStxCache, decode_block_with_pre_stx,
+    };
+    use nano_chainstate::{
+        ChainState, ChainStateError, CheckpointBoundaryProof, CheckpointHistoryBlock,
+        CheckpointHistoryError, ConsensusError, NakamotoBlock, TenureVrfError, coinbase_vrf_proof,
+        starts_new_tenure,
+    };
+    use nano_primitives::{ConsensusHash, Network, TrieHash};
+    use nano_sync::PoxInfo;
+
     /// says *that*, in a sentence nothing else produces.
     ///
     /// This is the line an operator reads to know whether a node is moving. It
@@ -3661,6 +3720,476 @@ mod tests {
 
     /// The cycle a checkpointed node starts in has no pox-5 positions to walk,
     /// and the checkpoint is the only thing that can answer for it.
+    fn captured_fixtures() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../nano-conformance/fixtures")
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CapturedBurnBlock {
+        block_height: u64,
+        burn_header_hash: String,
+        consensus_hash: String,
+    }
+
+    #[derive(Clone)]
+    struct CapturedBurnchain {
+        blocks: BTreeMap<u64, BitcoinBlock>,
+    }
+
+    impl BitcoinSource for CapturedBurnchain {
+        type Error = String;
+
+        fn block_at(&mut self, height: u64) -> Result<BitcoinBlock, Self::Error> {
+            self.blocks
+                .get(&height)
+                .cloned()
+                .ok_or_else(|| format!("no captured Bitcoin block at {height}"))
+        }
+
+        fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+            self.blocks
+                .get(&height)
+                .map(|block| block.hash)
+                .ok_or_else(|| format!("no captured Bitcoin block at {height}"))
+        }
+
+        fn tip_height(&self) -> Result<u64, Self::Error> {
+            self.blocks
+                .last_key_value()
+                .map(|(height, _)| *height)
+                .ok_or_else(|| "the captured burnchain is empty".to_owned())
+        }
+    }
+
+    fn captured_burnchain(root: &Path) -> (CapturedBurnchain, BTreeMap<String, u64>) {
+        let mut rows: Vec<CapturedBurnBlock> = serde_json::from_slice(
+            &fs::read(root.join("sortition/snapshots.json")).expect("read snapshots"),
+        )
+        .expect("decode snapshots");
+        rows.sort_by_key(|row| row.block_height);
+        let mut cache = PreStxCache::new();
+        let mut blocks = BTreeMap::new();
+        let mut heights = BTreeMap::new();
+        for row in rows {
+            let encoded = fs::read_to_string(
+                root.join("bitcoin/blocks")
+                    .join(format!("{}.hex", row.burn_header_hash)),
+            )
+            .expect("read captured Bitcoin block");
+            let raw = hex::decode(encoded.trim()).expect("decode captured Bitcoin block hex");
+            let block = decode_block_with_pre_stx(row.block_height, &raw, *b"T3", &mut cache)
+                .expect("decode captured Bitcoin block");
+            heights.insert(row.consensus_hash, row.block_height);
+            blocks.insert(row.block_height, block);
+        }
+        (CapturedBurnchain { blocks }, heights)
+    }
+
+    fn captured_blocks(root: &Path) -> Vec<NakamotoBlock> {
+        let mut paths = fs::read_dir(root.join("nakamoto/blocks"))
+            .expect("read captured block directory")
+            .map(|entry| entry.expect("read captured block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                NakamotoBlock::decode(&fs::read(path).expect("read captured block"))
+                    .expect("decode captured block")
+            })
+            .collect()
+    }
+
+    fn captured_pox() -> PoxInfo {
+        PoxInfo {
+            first_bitcoin_height: 0,
+            bitcoin_height: 0,
+            prepare_phase_length: 5,
+            reward_phase_length: 15,
+            reward_slots: 30,
+            rejection_fraction: None,
+            pox_5_activation_height: Some(262),
+            v1_unlock_height: None,
+            v2_unlock_height: None,
+            v3_unlock_height: None,
+        }
+    }
+
+    struct AuthenticatedHistoryFixture {
+        checkpoint: std::path::PathBuf,
+        source: [u8; 32],
+        root: TrieHash,
+        boundary: CheckpointBoundaryProof,
+        history: Vec<CheckpointHistoryBlock>,
+        other_vrf_key: [u8; 32],
+    }
+
+    fn authentication_window(chain: &[NakamotoBlock]) -> (usize, usize, usize) {
+        let starts = chain
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| starts_new_tenure(block).then_some(index))
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 3, "the capture crosses three tenures");
+        (starts[0], starts[1], starts[2] - 1)
+    }
+
+    fn alternate_vrf_key(root: &Path, boundary: [u8; 32]) -> [u8; 32] {
+        #[derive(serde::Deserialize)]
+        struct LeaderKey {
+            public_key: String,
+        }
+        let keys: Vec<LeaderKey> = serde_json::from_slice(
+            &fs::read(root.join("sortition/leader-keys.json")).expect("read leader keys"),
+        )
+        .expect("decode leader keys");
+        keys.into_iter()
+            .filter_map(|key| hex::decode(key.public_key).ok())
+            .filter_map(|key| <[u8; 32]>::try_from(key).ok())
+            .find(|key| *key != boundary)
+            .expect("the capture carries another valid VRF key")
+    }
+
+    fn authenticated_history_fixture() -> AuthenticatedHistoryFixture {
+        let root = captured_fixtures();
+        let chain = captured_blocks(&root);
+        let (boundary_index, first, source_index) = authentication_window(&chain);
+        let source_block = &chain[source_index];
+        let boundary_block = &chain[boundary_index];
+        let (mut burnchain, heights) = captured_burnchain(&root);
+        let loaded_boundary = super::LoadedBoundaryProof {
+            parent_tenure_consensus_hash: boundary_block.header.consensus_hash,
+            coinbase_vrf_proof: coinbase_vrf_proof(boundary_block)
+                .expect("boundary tenure carries a coinbase proof"),
+        };
+        let mut tracker = crate::sortition::SortitionTracker::from_capture_at_consensus(
+            &root.join("sortition"),
+            loaded_boundary.parent_tenure_consensus_hash,
+        )
+        .expect("seed exactly at the captured authentication boundary");
+        let boundary_height = tracker.tip().bitcoin_height;
+        tracker
+            .recover_seed(|height| burnchain.block_at(height))
+            .expect("recover the boundary winner seed");
+        let source_view = source_block
+            .bitcoin_view_consensus_hash()
+            .unwrap_or(source_block.header.consensus_hash)
+            .to_string();
+        let target = heights[&source_view];
+        assert!(target > boundary_height, "the source is above its boundary");
+        let (boundary, history) = super::derive_checkpoint_authentication(
+            &captured_pox(),
+            &mut tracker,
+            &mut burnchain,
+            loaded_boundary,
+            &chain[first..=source_index],
+            target,
+        )
+        .expect("derive locally from the boundary before authenticating the history");
+        assert_eq!(tracker.tip().bitcoin_height, target);
+        AuthenticatedHistoryFixture {
+            checkpoint: root.join("chainstate/checkpoint-H/marf.sqlite"),
+            source: *source_block.block_id().as_bytes(),
+            root: source_block.header.state_index_root,
+            other_vrf_key: alternate_vrf_key(&root, boundary.winner_vrf_public_key),
+            boundary,
+            history,
+        }
+    }
+
+    #[test]
+    fn checkpoint_boundary_winner_comes_from_bitcoin_and_the_local_registry() {
+        let root = captured_fixtures();
+        let chain = captured_blocks(&root);
+        let (boundary_index, _, _) = authentication_window(&chain);
+        let boundary_hash = chain[boundary_index].header.consensus_hash;
+        let (mut burnchain, heights) = captured_burnchain(&root);
+        let mut tracker = crate::sortition::SortitionTracker::from_capture_at_consensus(
+            &root.join("sortition"),
+            boundary_hash,
+        )
+        .expect("select the captured boundary");
+        tracker
+            .recover_seed(|height| burnchain.block_at(height))
+            .expect("recover the boundary seed from Bitcoin");
+        super::advance_to_checkpoint_boundary(
+            &captured_pox(),
+            &mut tracker,
+            &mut burnchain,
+            boundary_hash,
+            heights[&boundary_hash.to_string()],
+        )
+        .expect("derive the boundary locally from the captured seed");
+        let boundary_height = tracker.tip().bitcoin_height;
+        let block = burnchain
+            .block_at(boundary_height)
+            .expect("read boundary Bitcoin block");
+        tracker
+            .authenticate_boundary_winner(&block)
+            .expect("the named commitment resolves through the local registry");
+
+        let mut missing = block.clone();
+        missing.operations.clear();
+        assert!(matches!(
+            tracker.authenticate_boundary_winner(&missing),
+            Err(crate::sortition::TrackerError::BoundaryWinnerCommitmentMissing { .. })
+        ));
+
+        let winner_txid = tracker
+            .tip()
+            .winner_txid
+            .expect("the boundary has a winner");
+        let mut absent_key = block;
+        let winner = absent_key
+            .operations
+            .iter_mut()
+            .find(|operation| operation.txid == winner_txid)
+            .expect("the Bitcoin block carries its winner");
+        let BitcoinOperationKind::LeaderBlockCommit {
+            key_block_height,
+            key_transaction_index,
+            ..
+        } = &mut winner.kind
+        else {
+            panic!("the winner is a leader commitment");
+        };
+        *key_block_height = u32::MAX;
+        *key_transaction_index = u16::MAX;
+        assert!(matches!(
+            tracker.authenticate_boundary_winner(&absent_key),
+            Err(crate::sortition::TrackerError::BoundaryWinnerKeyUnavailable { .. })
+        ));
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct AuthenticationState {
+        tip: Option<[u8; 32]>,
+        executed: Vec<[u8; 32]>,
+        tenures: Vec<ConsensusHash>,
+        parent_proof: Option<[u8; 80]>,
+        tenure_height: u32,
+        tenure_start: Option<u32>,
+        clarity_tenure_start: Option<u32>,
+    }
+
+    fn authentication_state(chainstate: &mut ChainState) -> AuthenticationState {
+        let tenure_height = chainstate
+            .vm_mut()
+            .tenure_height()
+            .expect("read checkpoint tenure height");
+        AuthenticationState {
+            tip: chainstate.tip().expect("read checkpoint tip"),
+            executed: chainstate.executed_blocks(),
+            tenures: chainstate.executed_tenures(),
+            parent_proof: chainstate.parent_tenure_proof(),
+            tenure_height,
+            tenure_start: chainstate.tenure_start_height(tenure_height),
+            clarity_tenure_start: chainstate.clarity_tenure_start_height(tenure_height),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AuthenticationRefusal {
+        MalformedBoundaryProof,
+        WrongBoundaryKey,
+        WrongBoundaryTenure,
+        MissingWinnerKey,
+        MissingSigningKey,
+        WrongCommittedParentSeed,
+    }
+
+    fn corrupt_authentication_history(
+        refusal: AuthenticationRefusal,
+        boundary: &mut CheckpointBoundaryProof,
+        history: &mut [CheckpointHistoryBlock],
+        other_vrf_key: [u8; 32],
+    ) {
+        match refusal {
+            AuthenticationRefusal::MalformedBoundaryProof => {
+                boundary.coinbase_vrf_proof = [0; 80];
+            }
+            AuthenticationRefusal::WrongBoundaryKey => {
+                boundary.winner_vrf_public_key = other_vrf_key;
+            }
+            AuthenticationRefusal::WrongBoundaryTenure => {
+                boundary.parent_tenure_consensus_hash = ConsensusHash::from_bytes([0xff; 20]);
+            }
+            AuthenticationRefusal::MissingWinnerKey => {
+                history[0].bitcoin_context.winner_vrf_public_key = None;
+            }
+            AuthenticationRefusal::MissingSigningKey => {
+                history[0].bitcoin_context.winner_signing_key_hash = None;
+                history[0].operations.clear();
+            }
+            AuthenticationRefusal::WrongCommittedParentSeed => {
+                history[0].bitcoin_context.vrf_seed[0] ^= 0xff;
+            }
+        }
+    }
+
+    fn expected_authentication_refusal(
+        refusal: AuthenticationRefusal,
+        error: &CheckpointHistoryError,
+    ) -> bool {
+        match refusal {
+            AuthenticationRefusal::MalformedBoundaryProof => matches!(
+                error,
+                CheckpointHistoryError::BoundaryProof(TenureVrfError::MalformedProof)
+            ),
+            AuthenticationRefusal::WrongBoundaryKey => matches!(
+                error,
+                CheckpointHistoryError::BoundaryProof(TenureVrfError::ProofNotFromLeaderKey)
+            ),
+            AuthenticationRefusal::WrongBoundaryTenure => {
+                matches!(error, CheckpointHistoryError::BoundaryTenure)
+            }
+            AuthenticationRefusal::MissingWinnerKey => matches!(
+                error,
+                CheckpointHistoryError::Block {
+                    error: ChainStateError::InvalidTransaction(reason),
+                    ..
+                } if reason == &ConsensusError::WinnerVrfKeyUnavailable.to_string()
+            ),
+            AuthenticationRefusal::MissingSigningKey => matches!(
+                error,
+                CheckpointHistoryError::Block {
+                    error: ChainStateError::InvalidTransaction(reason),
+                    ..
+                } if reason == &ConsensusError::WinnerSigningKeyUnavailable.to_string()
+            ),
+            AuthenticationRefusal::WrongCommittedParentSeed => matches!(
+                error,
+                CheckpointHistoryError::Vrf {
+                    error: TenureVrfError::SeedNotFromParentProof,
+                    ..
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn checkpoint_history_authentication_is_fail_closed_and_atomic() {
+        let fixture = authenticated_history_fixture();
+        let directory = tempfile::tempdir().expect("a chainstate directory");
+        let mut chainstate = ChainState::open_from_checkpoint(
+            Network::TESTNET,
+            directory.path(),
+            &fixture.checkpoint,
+            fixture.source,
+            fixture.root,
+        )
+        .expect("open the captured checkpoint at the authenticated source");
+        let unchanged = authentication_state(&mut chainstate);
+        let refusals = [
+            AuthenticationRefusal::MalformedBoundaryProof,
+            AuthenticationRefusal::WrongBoundaryKey,
+            AuthenticationRefusal::WrongBoundaryTenure,
+            AuthenticationRefusal::MissingWinnerKey,
+            AuthenticationRefusal::MissingSigningKey,
+            AuthenticationRefusal::WrongCommittedParentSeed,
+        ];
+        for refusal in refusals {
+            let mut boundary = fixture.boundary;
+            let mut history = fixture.history.clone();
+            corrupt_authentication_history(
+                refusal,
+                &mut boundary,
+                &mut history,
+                fixture.other_vrf_key,
+            );
+            let error = chainstate
+                .authenticate_checkpoint_history(fixture.source, fixture.root, boundary, &history)
+                .expect_err("a corrupted authentication history must be refused");
+            assert!(
+                expected_authentication_refusal(refusal, &error),
+                "{refusal:?} reached the wrong refusal: {error}"
+            );
+            assert_eq!(
+                authentication_state(&mut chainstate),
+                unchanged,
+                "{refusal:?} changed chainstate before refusing"
+            );
+        }
+
+        chainstate
+            .authenticate_checkpoint_history(
+                fixture.source,
+                fixture.root,
+                fixture.boundary,
+                &fixture.history,
+            )
+            .expect("the unmodified locally authenticated history is accepted");
+        assert_eq!(
+            chainstate.executed_blocks(),
+            fixture
+                .history
+                .iter()
+                .map(|entry| *entry.block.block_id().as_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn checkpoint_boundary_file_requires_a_complete_well_formed_proof() {
+        let directory = tempfile::tempdir().expect("an authentication history directory");
+        let history = directory.path().join("authentication-history");
+        fs::create_dir_all(&history).expect("create authentication history");
+        let config_text = format!(
+            r#"
+[node]
+working_dir = "{}"
+peers = []
+p2p_seeds = []
+
+[burnchain]
+
+[checkpoint]
+marf = "{}"
+source_state_id = "{}"
+state_root = "{}"
+anchor_block = "{}"
+anchor_bitcoin_height = 0
+authentication_history = "{}"
+"#,
+            directory.path().display(),
+            directory.path().join("marf.sqlite").display(),
+            "00".repeat(32),
+            "00".repeat(32),
+            directory.path().join("anchor.bin").display(),
+            history.display(),
+        );
+        let config: crate::config::Config = toml::from_str(&config_text).expect("parse config");
+        let cases = [
+            (
+                "missing",
+                serde_json::json!({
+                    "parent_tenure_consensus_hash": "00".repeat(20),
+                }),
+                "missing field `coinbase_vrf_proof`",
+            ),
+            (
+                "malformed",
+                serde_json::json!({
+                    "parent_tenure_consensus_hash": "00".repeat(20),
+                    "coinbase_vrf_proof": "00",
+                }),
+                "coinbase_vrf_proof is not 80 bytes",
+            ),
+        ];
+        for (name, boundary, expected) in cases {
+            fs::write(
+                history.join("boundary.json"),
+                serde_json::to_vec(&boundary).expect("encode boundary"),
+            )
+            .expect("write boundary");
+            let error = super::load_checkpoint_authentication_history(&config)
+                .expect_err("an absent or malformed boundary proof must be refused")
+                .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
     ///
     /// Mainnet's cycle 140 was stacked in pox-4, before the boundary the export
     /// was taken at, so `active_signer_set` finds nothing and is right to. The

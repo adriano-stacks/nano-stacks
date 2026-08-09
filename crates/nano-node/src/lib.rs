@@ -7,14 +7,15 @@ pub mod signer;
 pub mod sortition;
 pub mod staging;
 
-use std::{fmt, path::Path, time::Duration};
+use std::{collections::HashMap, fmt, path::Path, time::Duration};
 
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
     AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
-    NakamotoBlockHeader, SignerSet, SignerSetError, TenureAccounting,
+    NakamotoBlockHeader, SignerSet, SignerSetError, SignerWeights, TenureAccounting,
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
+use nano_miner::{BitcoinTenureView, ParentTenure, TenureTip};
 use nano_primitives::{Network, StacksBlockId, TrieHash};
 use nano_sync::{PoxInfo, SyncClient, SyncError, TenureSource};
 
@@ -142,9 +143,7 @@ impl LocalSortition {
     }
 
     pub(crate) fn record(self, bitcoin_context: &mut BitcoinBlockContext) {
-        bitcoin_context.sortition_hash = self.sortition_hash;
-        bitcoin_context.winner_vrf_public_key = self.winner_vrf_public_key;
-        bitcoin_context.winner_signing_key_hash = self.winner_signing_key_hash;
+        self.record_authentication(bitcoin_context);
         bitcoin_context.move_to_burn_block(self.bitcoin_height);
         bitcoin_context.burn_header_hash = self.burn_header_hash;
         if self.burn_block_time > 0 {
@@ -157,6 +156,13 @@ impl LocalSortition {
             bitcoin_context.burn_spend_total = u128::from(spends.total);
             bitcoin_context.burn_spend_winner = u128::from(spends.winner);
         }
+    }
+
+    /// Fill in the tenure authentication inputs without changing its execution view.
+    pub(crate) const fn record_authentication(self, context: &mut BitcoinBlockContext) {
+        context.sortition_hash = self.sortition_hash;
+        context.winner_vrf_public_key = self.winner_vrf_public_key;
+        context.winner_signing_key_hash = self.winner_signing_key_hash;
     }
 }
 
@@ -767,6 +773,12 @@ where
             archive: None,
             bitcoin,
         }
+    }
+
+    /// Consume an authenticated executor so a proposal validator can use its state.
+    pub(crate) fn into_validator_parts(self) -> (ChainState, NakamotoBlock, u64, S) {
+        let bitcoin_height = self.bitcoin_height();
+        (self.chainstate, self.tip, bitcoin_height, self.bitcoin)
     }
 
     /// Validate and execute one direct descendant of the current execution tip.
@@ -1978,22 +1990,9 @@ where
 
     /// The burn height of the sortition that elected this block's tenure.
     ///
-    /// This node's own chain first. Where it has none -- a checkpoint that carries no
-    /// sortition history seeds no chain, which is the case the hacknet rig runs in --
-    /// the tenure is still named by the block, so its burn block is one lookup away.
-    ///
-    /// Asking a peer for it is safe for the same reason asking for the view's is: the
-    /// prepare-phase rule this feeds decides whether a cycle's signer set is written,
-    /// which lands in the state root the block's own header commits to under
-    /// threshold signer weight. A peer that lies makes the block fail to seal; it
-    /// cannot make this node execute a different chain.
     /// Put the tenure's own burn height into the context, leaving the view where it
-    /// is. They are the same block until an extend moves them apart.
-    ///
-    /// `&mut self` and not `&self`: this future is spawned onto the runtime, and the
-    /// executor holds `RefCell`s and a sqlite connection, so a shared borrow of it
-    /// crossing the await inside would make the whole follower future non-`Send`. A
-    /// unique borrow is what keeps it spawnable.
+    /// is. They are the same block until an extend moves them apart. The local
+    /// sortition history must place the tenure; there is no peer fallback.
     fn record_tenure_burn_height(
         &self,
         block: &NakamotoBlock,
@@ -2055,13 +2054,12 @@ where
     /// node's own sortition chain cannot name yet, and a tenure whose accumulated
     /// coinbase that chain cannot measure.
     ///
-    /// The order is what matters here. **Local first, and a peer only where there is
-    /// no local chain to ask.** Every field below — the burn height itself, the burn
-    /// header hash and time, the VRF seed, the two miner spends, the sortition hash,
-    /// the winning leader key, and the coinbase a tenure accumulated — comes from
-    /// this node's own burnchain when it has one, and none of it is compared against
-    /// a peer's answer first, because there is no longer a request to compare
-    /// against: on the local path no peer is asked at all.
+    /// Every consensus field below — the burn height itself, the burn header hash
+    /// and time, the VRF seed, the two miner spends, the sortition hash, the winning
+    /// leader key, and the coinbase a tenure accumulated — comes from this node's
+    /// own burnchain. A peer may supply an ancestor block that states a view, but
+    /// that view is only an identifier until the local sortition chain places and
+    /// derives it.
     async fn context_for(
         &mut self,
         peers: &mut TenureSource,
@@ -2405,6 +2403,222 @@ where
         &self.tip
     }
 
+    /// The latest burn block this node derived, including a no-winner block.
+    pub(crate) fn local_burn_tip(
+        &self,
+    ) -> Result<nano_sync::SortitionInfo, CheckpointExecutionError> {
+        let tracker = self.sortition.as_ref().ok_or_else(|| {
+            CheckpointExecutionError::Link(
+                "the miner has no locally derived sortition chain".to_owned(),
+            )
+        })?;
+        tracker
+            .sortition_info_at(tracker.tip().bitcoin_height)
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(
+                    "the local sortition tip has no retained snapshot".to_owned(),
+                )
+            })
+    }
+
+    /// The burn view the locally executed tip stands on.
+    pub(crate) fn local_executed_burn_view(
+        &self,
+    ) -> Result<nano_sync::SortitionInfo, CheckpointExecutionError> {
+        self.sortition
+            .as_ref()
+            .and_then(|tracker| tracker.sortition_info_at(self.bitcoin_height))
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain has no snapshot for executed burn {}",
+                    self.bitcoin_height
+                ))
+            })
+    }
+
+    /// The latest locally elected tenure, which can precede a no-winner tip.
+    pub(crate) fn latest_local_winner(
+        &self,
+    ) -> Result<Option<nano_sync::SortitionInfo>, CheckpointExecutionError> {
+        let tip = self.local_burn_tip()?;
+        if tip.was_sortition {
+            return Ok(Some(tip));
+        }
+        let Some(height) = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.previous_sortition_height(tip.bitcoin_height))
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.sortition_info_at(height)))
+    }
+
+    /// One locally derived sortition, selected by its consensus hash.
+    pub(crate) fn local_sortition_info(
+        &self,
+        consensus_hash: nano_primitives::ConsensusHash,
+    ) -> Result<nano_sync::SortitionInfo, CheckpointExecutionError> {
+        let tracker = self.sortition.as_ref().ok_or_else(|| {
+            CheckpointExecutionError::Link(
+                "the miner has no locally derived sortition chain".to_owned(),
+            )
+        })?;
+        let height = tracker
+            .height_of_consensus_hash(consensus_hash)
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain does not contain tenure {consensus_hash}"
+                ))
+            })?;
+        tracker.sortition_info_at(height).ok_or_else(|| {
+            CheckpointExecutionError::Link(format!(
+                "the local sortition snapshot for tenure {consensus_hash} was not retained"
+            ))
+        })
+    }
+
+    /// Consensus fields a tenure-start proposal takes from local sortition state.
+    pub(crate) fn local_tenure_view(
+        &self,
+        consensus_hash: nano_primitives::ConsensusHash,
+    ) -> Result<BitcoinTenureView, CheckpointExecutionError> {
+        let tracker = self.sortition.as_ref().ok_or_else(|| {
+            CheckpointExecutionError::Link(
+                "the miner has no locally derived sortition chain".to_owned(),
+            )
+        })?;
+        let height = tracker
+            .height_of_consensus_hash(consensus_hash)
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain does not contain tenure {consensus_hash}"
+                ))
+            })?;
+        let snapshot = tracker.snapshot_at(height).ok_or_else(|| {
+            CheckpointExecutionError::Link(format!(
+                "the local sortition snapshot for tenure {consensus_hash} was not retained"
+            ))
+        })?;
+        Ok(BitcoinTenureView {
+            total_burn: snapshot.total_burn,
+            sortition_hash: *snapshot.sortition_hash.as_bytes(),
+        })
+    }
+
+    /// The parent tenure and miner nonce from this node's sealed chain.
+    pub(crate) fn local_parent_tenure(
+        &mut self,
+        principal: &clarity::vm::types::PrincipalData,
+    ) -> Result<ParentTenure, CheckpointExecutionError> {
+        let consensus_hash = self.tip.header.consensus_hash;
+        let (start_block_id, start_height) = self
+            .chainstate
+            .tenure_start(consensus_hash)
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the locally executed tenure {consensus_hash} has no authenticated start block"
+                ))
+            })?;
+        let blocks = self
+            .tip
+            .header
+            .chain_length
+            .checked_sub(u64::from(start_height))
+            .and_then(|blocks| blocks.checked_add(1))
+            .and_then(|blocks| u32::try_from(blocks).ok())
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the locally executed tenure {consensus_hash} has an invalid start height"
+                ))
+            })?;
+        let miner_nonce = self.chainstate.account_nonce(principal)?;
+        Ok(ParentTenure {
+            tip: TenureTip {
+                consensus_hash,
+                block_id: self.tip.block_id(),
+                height: self.tip.header.chain_length,
+                bitcoin_spent: self.tip.header.bitcoin_spent,
+                timestamp: self.tip.header.timestamp,
+            },
+            start_block_id,
+            blocks,
+            miner_nonce,
+        })
+    }
+
+    /// Build the execution context for a locally assembled proposal.
+    pub(crate) fn local_mining_context(
+        &mut self,
+        pox: &PoxInfo,
+        block: &NakamotoBlock,
+        burn_view: nano_primitives::ConsensusHash,
+    ) -> Result<BitcoinBlockContext, CheckpointExecutionError> {
+        let bitcoin_height = self
+            .sortition
+            .as_ref()
+            .and_then(|tracker| tracker.height_of_consensus_hash(burn_view))
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain cannot place proposal burn view {burn_view}"
+                ))
+            })?;
+        let mut context = pox.bitcoin_context();
+        context.move_to_burn_block(bitcoin_height);
+        self.local_sortition(pox, bitcoin_height, block.header.bitcoin_spent)?
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain cannot authenticate proposal burn {bitcoin_height}"
+                ))
+            })?
+            .record(&mut context);
+        self.record_tenure_burn_height(block, &mut context)?;
+        self.seed_burn_headers(bitcoin_height);
+        self.tenure_coinbase(block, context, bitcoin_height)
+            .ok_or_else(|| {
+                CheckpointExecutionError::Link(format!(
+                    "the local sortition chain cannot derive proposal coinbase at burn {bitcoin_height}"
+                ))
+            })
+    }
+
+    /// Signer weights the locally executed `.signers` contract records.
+    pub(crate) fn local_proposal_signers(
+        &mut self,
+        context: BitcoinBlockContext,
+    ) -> Result<SignerWeights, CheckpointExecutionError> {
+        Ok(self.chainstate.recorded_signer_set(context)?)
+    }
+
+    /// Account state used to order peer-supplied mempool candidates.
+    pub(crate) fn local_mempool_accounts(
+        &mut self,
+        mempool: &nano_mempool::Mempool,
+    ) -> Result<HashMap<nano_address::StacksAddress, nano_mempool::Account>, CheckpointExecutionError>
+    {
+        let mut accounts = HashMap::new();
+        for address in mempool.addresses() {
+            let principal = clarity::vm::types::PrincipalData::Standard(
+                clarity::vm::types::StandardPrincipalData::new(
+                    address.version(),
+                    *address.hash160().as_bytes(),
+                )
+                .map_err(|error| CheckpointExecutionError::Link(error.to_string()))?,
+            );
+            accounts.insert(
+                address,
+                nano_mempool::Account {
+                    nonce: self.chainstate.account_nonce(&principal)?,
+                    balance: Some(self.chainstate.account_balance(&principal)?),
+                },
+            );
+        }
+        Ok(accounts)
+    }
+
     /// Walk the derived sortition chain toward Bitcoin's tip, on Bitcoin's clock.
     ///
     /// Every other walk is driven by execution — the chain is advanced to name the
@@ -2415,25 +2629,29 @@ where
     ///
     /// Bounded and quiet: a walk that finds nothing new costs one `tip_height` call,
     /// and only a walk that actually moved is written down or reported.
-    pub fn follow_burnchain(&mut self, pox: &PoxInfo) {
+    pub fn follow_burnchain(&mut self, pox: &PoxInfo) -> u64 {
         let Some(payouts) = payout_schedule(pox) else {
-            return;
+            return 0;
         };
+        let executed = self.bitcoin_height();
         let Self {
             sortition: Some(tracker),
             bitcoin,
             ..
         } = self
         else {
-            return;
+            return 0;
         };
+        if executed > 0 {
+            tracker.keep_from(executed);
+        }
         let Ok(burnchain_tip) = bitcoin.tip_height() else {
             // Reported by the execution path already, and every round would repeat
             // it: a burnchain that cannot be read is not news twice a minute.
-            return;
+            return 0;
         };
         if burnchain_tip <= tracker.tip().bitcoin_height {
-            return;
+            return 0;
         }
         let standing_on = tracker.tip().bitcoin_height;
         match tracker.follow_burnchain(
@@ -2452,9 +2670,13 @@ where
                         .map_or(standing_on, |tracker| tracker.tip().bitcoin_height)
                 );
                 self.save_sortitions();
+                walk.advanced
             }
-            Ok(_) => {}
-            Err(error) => eprintln!("following the burnchain locally failed: {error}"),
+            Ok(_) => 0,
+            Err(error) => {
+                eprintln!("following the burnchain locally failed: {error}");
+                0
+            }
         }
     }
 
@@ -2490,10 +2712,10 @@ where
         // history, which `/v3/sortitions/consensus` answers by walking this same
         // chain rather than by keeping a window here.
         while let Some(at) = walk.take() {
-            let Some(snapshot) = tracker.snapshot_at(at) else {
+            let Some(sortition) = tracker.sortition_info_at(at) else {
                 break;
             };
-            sortitions.push(self.sortition_info(snapshot));
+            sortitions.push(sortition);
             if sortitions.len() == 2 {
                 break;
             }
@@ -2521,43 +2743,6 @@ where
             .block_hash_at(height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
         Ok((height, hash))
-    }
-
-    /// One derived snapshot, in the shape stacks-core's own readers expect.
-    ///
-    /// The two consensus hashes are resolved through this node's *own* history:
-    /// a snapshot names the burn height its commitment built on, and the history
-    /// says what that height was called.
-    fn sortition_info(
-        &self,
-        snapshot: &nano_sortition::SortitionSnapshot,
-    ) -> nano_sync::SortitionInfo {
-        let tracker = self.sortition.as_ref();
-        let hash_at =
-            |height: Option<u64>| height.and_then(|height| tracker?.consensus_hash_at(height));
-        let stacks_parent = hash_at(snapshot.parent_bitcoin_height);
-        nano_sync::SortitionInfo {
-            bitcoin_block_hash: snapshot.bitcoin_header_hash,
-            bitcoin_height: snapshot.bitcoin_height,
-            bitcoin_timestamp: snapshot.bitcoin_timestamp,
-            sortition_id: snapshot.sortition_id,
-            parent_sortition_id: snapshot.parent_sortition_id,
-            consensus_hash: snapshot.consensus_hash,
-            was_sortition: snapshot.winner_txid.is_some(),
-            miner_public_key_hash: snapshot
-                .winner_signing_key_hash
-                .map(nano_primitives::Hash160::from_bytes),
-            stacks_parent_consensus_hash: stacks_parent,
-            last_sortition_consensus_hash: hash_at(
-                tracker
-                    .and_then(|tracker| tracker.previous_sortition_height(snapshot.bitcoin_height)),
-            ),
-            committed_block_hash: snapshot
-                .committed_block_hash
-                .map(nano_primitives::BlockHeaderHash::from_bytes),
-            vrf_seed: snapshot.winner_vrf_seed,
-            mining_competition: snapshot.mining_competition.clone(),
-        }
     }
 }
 

@@ -7,10 +7,8 @@ use nano_bitcoin::{
     BitcoinOperation, BitcoinOperationKind, BitcoinRpcSourceError, BitcoinSource,
     LeaderBlockCommitment,
 };
-use nano_chainstate::NakamotoBlock;
-use nano_codec::TransactionPayloadData;
-use nano_primitives::{Hash160, sha512_256};
-use nano_sync::{SortitionInfo, SyncClient, SyncError};
+use nano_primitives::{Hash160, StacksBlockId, sha512_256};
+use nano_sync::SortitionInfo;
 
 /// The epoch marker every epoch-4 commitment must carry.
 pub const EPOCH_4_MARKER: u8 = 0x11;
@@ -34,28 +32,32 @@ pub struct CommitmentPlan {
     pub reward_cycle: u64,
 }
 
+/// Locally authenticated inputs for a commitment to the next Bitcoin block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentParent {
+    pub bitcoin_tip_height: u64,
+    pub tenure_start_block_id: StacksBlockId,
+    pub sortition: SortitionInfo,
+    pub tenure_vrf_proof: [u8; 80],
+    pub sbtc_address: PoxAddress,
+    pub reward_cycle: u64,
+}
+
 #[derive(Debug)]
 pub enum CommitmentPlanError {
-    Sync(SyncError),
     Bitcoin(BitcoinRpcSourceError),
     NoParentSortition,
-    MissingVrfProof,
     ParentCommitmentNotFound,
     AmbiguousParentCommitment,
     HeightOverflow,
-    StaleNodeView { node: u64, bitcoin: u64 },
 }
 
 impl fmt::Display for CommitmentPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sync(error) => write!(formatter, "node query failed: {error}"),
             Self::Bitcoin(error) => write!(formatter, "Bitcoin query failed: {error}"),
             Self::NoParentSortition => {
                 formatter.write_str("the tip tenure has no winning Bitcoin sortition")
-            }
-            Self::MissingVrfProof => {
-                formatter.write_str("the tip tenure's start block carries no VRF proof")
             }
             Self::ParentCommitmentNotFound => {
                 formatter.write_str("the parent tenure's winning commitment is not on Bitcoin")
@@ -64,10 +66,6 @@ impl fmt::Display for CommitmentPlanError {
                 formatter.write_str("the parent tenure's winning commitment is ambiguous")
             }
             Self::HeightOverflow => formatter.write_str("Bitcoin height overflow"),
-            Self::StaleNodeView { node, bitcoin } => write!(
-                formatter,
-                "peer has processed Bitcoin height {node} but Bitcoin is at {bitcoin}"
-            ),
         }
     }
 }
@@ -75,21 +73,12 @@ impl fmt::Display for CommitmentPlanError {
 impl std::error::Error for CommitmentPlanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sync(error) => Some(error),
             Self::Bitcoin(error) => Some(error),
             Self::NoParentSortition
-            | Self::MissingVrfProof
             | Self::ParentCommitmentNotFound
             | Self::AmbiguousParentCommitment
-            | Self::HeightOverflow
-            | Self::StaleNodeView { .. } => None,
+            | Self::HeightOverflow => None,
         }
-    }
-}
-
-impl From<SyncError> for CommitmentPlanError {
-    fn from(error: SyncError) -> Self {
-        Self::Sync(error)
     }
 }
 
@@ -99,70 +88,39 @@ impl From<BitcoinRpcSourceError> for CommitmentPlanError {
     }
 }
 
-/// Derive the commitment that extends the peer's canonical tenure at the next Bitcoin block.
-///
-/// A commitment only counts in the Bitcoin block that follows the one it was
-/// derived from, so the peer's view must already match the Bitcoin tip.
-pub async fn plan_commitment<S>(
-    node: &SyncClient,
+/// Derive a commitment entirely from locally authenticated parent state.
+pub fn plan_local_commitment<S>(
     bitcoin: &mut S,
     key: RegisteredLeaderKey,
-    bitcoin_tip_height: u64,
+    parent: CommitmentParent,
 ) -> Result<CommitmentPlan, CommitmentPlanError>
 where
     S: BitcoinSource,
     CommitmentPlanError: From<S::Error>,
 {
-    let bitcoin_tip = node.sortition_tip().await?;
-    if bitcoin_tip.bitcoin_height != bitcoin_tip_height {
-        return Err(CommitmentPlanError::StaleNodeView {
-            node: bitcoin_tip.bitcoin_height,
-            bitcoin: bitcoin_tip_height,
-        });
-    }
-    let tenure = node.tenure_info().await?;
-    let tenure_start = node.block(tenure.tenure_start_block_id).await?;
-    let parent = node.sortition(tenure.consensus_hash).await?;
-    let target_bitcoin_height = bitcoin_tip
-        .bitcoin_height
+    let target_bitcoin_height = parent
+        .bitcoin_tip_height
         .checked_add(1)
         .ok_or(CommitmentPlanError::HeightOverflow)?;
-    let reward_cycle = node.pox_info().await?.reward_cycle(target_bitcoin_height);
-
-    let reward_set = node.stacker_set(reward_cycle).await?;
-
     Ok(CommitmentPlan {
         commitment: LeaderBlockCommitment {
-            block_header_hash: *tenure.tenure_start_block_id.as_bytes(),
-            new_seed: tenure_seed(&tenure_start)?,
-            parent_block_height: u32::try_from(parent.bitcoin_height)
+            block_header_hash: *parent.tenure_start_block_id.as_bytes(),
+            new_seed: *sha512_256(&parent.tenure_vrf_proof).as_bytes(),
+            parent_block_height: u32::try_from(parent.sortition.bitcoin_height)
                 .map_err(|_| CommitmentPlanError::HeightOverflow)?,
-            parent_transaction_index: parent_transaction_index(bitcoin, &parent)?,
+            parent_transaction_index: parent_transaction_index(bitcoin, &parent.sortition)?,
             key_block_height: key.bitcoin_height,
             key_transaction_index: key.transaction_index,
             memo: EPOCH_4_MARKER,
             parent_modulus: u8::try_from(
-                bitcoin_tip.bitcoin_height % BITCOIN_BLOCK_MINED_AT_MODULUS,
+                parent.bitcoin_tip_height % BITCOIN_BLOCK_MINED_AT_MODULUS,
             )
             .expect("a Bitcoin modulus below five fits in a byte"),
         },
-        sbtc_address: reward_set.sbtc_address.ok_or(SyncError::InvalidRewardSet)?,
+        sbtc_address: parent.sbtc_address,
         target_bitcoin_height,
-        reward_cycle,
+        reward_cycle: parent.reward_cycle,
     })
-}
-
-/// The seed a commitment must carry is the hash of the tenure it builds upon.
-fn tenure_seed(tenure_start: &NakamotoBlock) -> Result<[u8; 32], CommitmentPlanError> {
-    tenure_start
-        .transactions
-        .iter()
-        .find_map(|transaction| match transaction.payload().data() {
-            TransactionPayloadData::NakamotoCoinbase { vrf_proof, .. } => Some(*vrf_proof),
-            _ => None,
-        })
-        .map(|proof| *sha512_256(&proof).as_bytes())
-        .ok_or(CommitmentPlanError::MissingVrfProof)
 }
 
 /// Locate the winning commitment of a sortition among the Bitcoin operations that produced it.
@@ -247,11 +205,17 @@ fn transaction_index(operation: &BitcoinOperation) -> Result<u16, CommitmentPlan
 
 #[cfg(test)]
 mod tests {
+    use nano_address::{PoxAddress, PoxAddressType32};
     use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind, BitcoinSource};
-    use nano_primitives::{BlockHeaderHash, ConsensusHash, Hash160, SortitionId};
+    use nano_primitives::{
+        BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId, sha512_256,
+    };
     use nano_sync::SortitionInfo;
 
-    use super::{CommitmentPlanError, parent_transaction_index};
+    use super::{
+        CommitmentParent, CommitmentPlanError, RegisteredLeaderKey, parent_transaction_index,
+        plan_local_commitment,
+    };
 
     struct FixedBitcoin(Vec<BitcoinBlock>);
 
@@ -347,82 +311,52 @@ mod tests {
         );
     }
 
-    /// Stock miners racing for the same sortition agree on every consensus field
-    /// but their own leader key, so their commitments are a live oracle for ours.
-    #[tokio::test]
-    #[ignore = "requires a running Hacknet node and Bitcoin Core on localhost"]
-    async fn hacknet_commitment_matches_the_stock_miners() {
-        let mut bitcoin = nano_bitcoin::BitcoinRpcSource::new(
-            "http://127.0.0.1:18443",
-            "hacknet",
-            "hacknet",
-            *b"T3",
-        )
-        .expect("connect to Hacknet Bitcoin Core");
-        let node = nano_sync::SyncClient::new(
-            reqwest::Url::parse("http://127.0.0.1:20443/").expect("valid Hacknet URL"),
-        )
-        .expect("create sync client");
-        let key = super::RegisteredLeaderKey {
-            bitcoin_height: 0,
-            transaction_index: 0,
+    #[test]
+    fn a_local_commitment_uses_the_authenticated_tenure_identity_and_proof() {
+        let mut bitcoin = FixedBitcoin(vec![
+            BitcoinBlock {
+                height: 1,
+                hash: [0; 32],
+                timestamp: 0,
+                operations: vec![registration(1, [9; 20])],
+            },
+            BitcoinBlock {
+                height: 2,
+                hash: [0; 32],
+                timestamp: 0,
+                operations: vec![commitment(5, 1)],
+            },
+        ]);
+        let proof = [6; 80];
+        let start = StacksBlockId::from_bytes([4; 32]);
+        let payout = PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [3; 32],
         };
+        let plan = plan_local_commitment(
+            &mut bitcoin,
+            RegisteredLeaderKey {
+                bitcoin_height: 7,
+                transaction_index: 8,
+            },
+            CommitmentParent {
+                bitcoin_tip_height: 2,
+                tenure_start_block_id: start,
+                sortition: sortition(2),
+                tenure_vrf_proof: proof,
+                sbtc_address: payout.clone(),
+                reward_cycle: 9,
+            },
+        )
+        .expect("derive from local parent");
 
-        // Hacknet also produces Bitcoin blocks on a timer, so keep planning until
-        // one of them actually carries competing commitments.
-        for _ in 0..5 {
-            let tip = node
-                .sortition_tip()
-                .await
-                .expect("fetch the peer's Bitcoin tip");
-            let plan = super::plan_commitment(&node, &mut bitcoin, key, tip.bitcoin_height)
-                .await
-                .expect("derive a commitment for the current tip");
-            let target = loop {
-                if let Ok(block) = bitcoin.block_at(plan.target_bitcoin_height) {
-                    break block;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            };
-            let stock = target
-                .operations
-                .into_iter()
-                .filter_map(|operation| match operation.kind {
-                    BitcoinOperationKind::LeaderBlockCommit {
-                        block_header_hash,
-                        new_seed,
-                        parent_block_height,
-                        parent_transaction_index,
-                        memo,
-                        ..
-                    } => Some((
-                        block_header_hash,
-                        new_seed,
-                        parent_block_height,
-                        parent_transaction_index,
-                        memo,
-                    )),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if stock.is_empty() {
-                continue;
-            }
-            for commitment in stock {
-                assert_eq!(
-                    commitment,
-                    (
-                        plan.commitment.block_header_hash,
-                        plan.commitment.new_seed,
-                        plan.commitment.parent_block_height,
-                        plan.commitment.parent_transaction_index,
-                        plan.commitment.memo,
-                    )
-                );
-            }
-            return;
-        }
-        panic!("Hacknet produced no competing commitments");
+        assert_eq!(plan.commitment.block_header_hash, *start.as_bytes());
+        assert_eq!(plan.commitment.new_seed, *sha512_256(&proof).as_bytes());
+        assert_eq!(plan.commitment.parent_transaction_index, 5);
+        assert_eq!(plan.sbtc_address, payout);
+        assert_eq!(plan.reward_cycle, 9);
+        assert_eq!(plan.target_bitcoin_height, 3);
     }
 
     #[test]
