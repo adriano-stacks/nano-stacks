@@ -59,6 +59,14 @@ node may invoke.
       reference interpreter; use direct state access or clarity-wasm.
 - [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
       compiler-hostile deployments and calls, with no healing or engine switch.
+      The 8,708,126 frontier is owned by
+      [[086-execute-mainnet-block-8708126-without-corrupting-i]] and its cause is
+      now pinned: not the trait argument, but a `let`-bound principal whose use
+      count the wasm-local pre-pass did not see inside an allowance list, so the
+      allowance read it out of a slot that had already been handed back to the
+      pool. `be3ec64e` fixes it, bisected pre-/post-fix, and the block seals the
+      root the network signed. The later replay crossed task 088's sortition
+      frontier and reached 8,724,865; task 098 owns the next VM boundary.
 - [x] Compare clarity-wasm with the interpreter before sealing in the
       conformance harness and retain minimized regression fixtures for every
       disagreement found.
@@ -153,6 +161,15 @@ failed — the network executed this block.
 
 Next: identify the transaction at 8,708,126 and the value it was reading. 7,639
 blocks are staged behind it, so the state continues the moment it executes.
+
+**Exact 8,708,126 evidence:** [[086]] bisected the stale-local read to
+`be3ec64e`, then replayed the checked-in block twice in each of two independent
+fresh reflink scratches. Result, all five costs, all eight ordered events and the
+committed root match the network oracle. Focused interpreter differentials pin
+each causal value/cost boundary. Exact-prestate full interpreter event/asset
+parity for transaction index four remains open because no production API can
+execute a partial same-block prefix under an alternate engine without duplicating
+private fee, nonce, postcondition and rollback semantics.
 
 ## Acceptance Criteria
 

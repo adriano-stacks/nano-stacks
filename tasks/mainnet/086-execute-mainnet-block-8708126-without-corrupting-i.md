@@ -64,16 +64,19 @@ or exclude a restart/cache/state-lifecycle effect.
       adaptation, nested call return handling, optional/response layout or another
       ABI boundary, and pin the smallest faithful reproducer against the reference
       interpreter.
-- [ ] Fix the shared clarity-wasm layout/offset logic without a contract exception,
+- [x] Fix the shared clarity-wasm layout/offset logic without a contract exception,
       block exception, interpreter fallback or healing path, if the bisect shows
-      that the existing `BindingUses` fix is not the cause.
-- [ ] Assert the captured transaction's result, costs, events and writes and the
+      that the existing `BindingUses` fix is not the cause. The bisect confirmed
+      `BindingUses` caused the original principal failure; the replay then exposed
+      and pinned general runtime-shape, cost and cross-contract sanitization gaps.
+- [x] Assert the captured transaction's result, costs, events and writes and the
       block's final state root against mainnet evidence.
-- [ ] Resume the restored replay through the remaining staged blocks and record the
+- [x] Resume the restored replay through the remaining staged blocks and record the
       next first divergence. The first post-restart batch reached 8,708,625; do not
       call that one batch a release run or silently fold a subsequent sortition
-      stall into this VM task.
-- [ ] Add the reproducer to the mandatory conformance suite and name this task in
+      stall into this VM task. The later follower reached 8,724,865; task 098 owns
+      the next VM boundary found by the continued replay.
+- [x] Add the reproducer to the mandatory conformance suite and name this task in
       task 060's unchecked pristine-WASM replay item.
 
 ## Acceptance Criteria
@@ -134,9 +137,10 @@ root 44d76d9ab3592521cc412973677bf380d2c25011f6c772f45f80a6c296088e11`. The
 failing run in `named.log` resumed the same parent and the same seal, and failed
 `823f248a…` of 8,708,126.
 
-## What is not proved, and why
+## Historical gaps before the offline replay
 
-These need the live node stopped, and it is running:
+The following was the evidence boundary before the stopped-state fixture existed;
+the exact replay below supersedes the receipt/root and live-node limitations.
 
 - [ ] Replay the exact block from an isolated copy of the 8,708,125 parent with
       each binary. The parent is still a sealed version inside the MARF, and
@@ -171,6 +175,51 @@ These need the live node stopped, and it is running:
 Until the receipt and root are compared with the network, this task stays open:
 the cause is pinned and the regression is in the gate, but "the block executes"
 and "the block executes to the chain's answer" are different claims.
+
+## Exact offline replay, 2026-08-09
+
+The stopped restored state retains complete parent and child headers and roots.
+The checked-in block bytes are identical to both the retained archive and a fresh
+Hiro response. `tx-823f-receipt.json` freezes Hiro's canonical result, all five
+cost dimensions and eight ordered events.
+
+Two independent fresh reflink scratches, in separate test processes, discarded
+only the scratch to 8,708,125 and executed the checked-in block twice per process
+under `RootPolicy::Verify`. All four executions produced result
+`(ok u118277070)`, cost `(170, 232559, 893312, 17, 345)`, the eight oracle events
+and the committed child root; the source database inode, length and modification
+stamps were unchanged. The fixture seam seeds only extension continuity from the
+complete parent header and deliberately claims no consensus authentication.
+
+The final 24-runtime-unit mismatch was causal, not tuned away. The pinned
+interpreter sanitizes a cross-contract result before returning it. The active
+linker did not, so the first asset tuple retained declared nested
+`(optional (buff 1))` metadata for a `none` value: size 490 instead of 478.
+`LookupVariableSize` charged twice that 12-byte difference. The general linker
+fix sanitizes every returned value, then applies dynamic trait admission, before
+writing it to Wasm. The map-backed None/Some regression
+`charges_copying_a_sanitized_cross_contract_result` fails without that change;
+the full 23-test cost crosscheck and 1,441-test clar2wasm library suite pass with
+it, as does strict all-target Clippy.
+
+## What is still not proved
+
+- [ ] Run the whole captured block with the historical pre-`be3ec64e` compiler.
+      The focused pre-pass and conformance reductions prove the causal stale-local
+      read, but the exact old binary has not executed this preserved scratch.
+- [ ] Compare the captured transaction's full interpreter event and `AssetMap`
+      effects at its exact same-block prestate. It is transaction index four;
+      running it directly on the parent omits the first four transactions and
+      changes one treasury mint from 516 to 514. The production prefix executor
+      is private and also owns cumulative cost, nonce, fee, postcondition and
+      commit/rollback semantics. There is no honest public partial-block engine
+      injection seam, and this task does not add a duplicate one. Focused
+      interpreter crosschecks cover every causal value/cost change; the captured
+      block's compiled receipt and root are independently bound to the network.
+
+The task remains open only for those two literal historical/interpreter evidence
+items. The production failure, receipt, costs, events, writes and next replay
+frontier are pinned.
 
 ## Three more of this family are deployed on mainnet, 2026-08-08
 

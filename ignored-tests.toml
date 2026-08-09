@@ -205,6 +205,14 @@ job = "release-qualification"
 requires = "network access to https://mempool.space/api"
 
 [[ignored]]
+test = "the_mainnet_8708126_receipt_and_root_match_the_canonical_oracle"
+class = "infrastructure"
+owner = "086"
+job = "release-qualification"
+requires = "NANO_086_SOURCE read-only mainnet chainstate through 8,708,126 and NANO_086_SCRATCH fresh writable reflink clone"
+note = "VM receipt and verified-root oracle only; the fixture seam deliberately does not authenticate consensus."
+
+[[ignored]]
 test = "a_stock_signer_answers_proposals_through_nano"
 class = "infrastructure"
 owner = "053"

@@ -1063,6 +1063,11 @@ pub enum ChainStateError {
         expected: TrieHash,
         actual: TrieHash,
     },
+    FixtureExtensionParentTip {
+        expected: [u8; 32],
+        actual: Option<[u8; 32]>,
+    },
+    FixtureExtensionParentHeader([u8; 32]),
     /// The state kept beside the MARF could not be written or read back.
     Ledger(String),
 }
@@ -1086,6 +1091,17 @@ impl std::fmt::Display for ChainStateError {
                 formatter,
                 "state root mismatch: expected {expected}, got {actual}"
             ),
+            Self::FixtureExtensionParentTip { expected, actual } => write!(
+                formatter,
+                "unauthenticated fixture extension parent {} is not the sealed tip {}",
+                hex::encode(expected),
+                actual.map_or_else(|| "<none>".to_owned(), hex::encode)
+            ),
+            Self::FixtureExtensionParentHeader(parent) => write!(
+                formatter,
+                "unauthenticated fixture extension parent {} has no complete recorded header",
+                hex::encode(parent)
+            ),
             Self::Ledger(error) => {
                 write!(formatter, "the ledger kept beside the MARF: {error}")
             }
@@ -1103,6 +1119,8 @@ impl std::error::Error for ChainStateError {
             | Self::TransactionFailure { .. }
             | Self::UnsupportedPayload
             | Self::NoSignerSet(_)
+            | Self::FixtureExtensionParentTip { .. }
+            | Self::FixtureExtensionParentHeader(_)
             | Self::Ledger(_)
             | Self::StateRootMismatch { .. } => None,
         }
@@ -1455,6 +1473,47 @@ impl ChainState {
         );
         self.adopt(ledger);
         Ok(true)
+    }
+
+    /// Seed the minimum ledger needed to extend an unauthenticated fixture.
+    ///
+    /// The parent header is the oracle for this fixture-only path. It must be the
+    /// sealed tip and complete: a partial peer backfill cannot establish tenure
+    /// continuity. This records no tenure-start identity, proof or accounting.
+    pub fn seed_unauthenticated_fixture_extension_from_parent_header(
+        &mut self,
+        parent: StacksBlockId,
+    ) -> Result<(), ChainStateError> {
+        let parent = *parent.as_bytes();
+        let actual = self.tip()?;
+        if actual != Some(parent) {
+            return Err(ChainStateError::FixtureExtensionParentTip {
+                expected: parent,
+                actual,
+            });
+        }
+        let header = self
+            .vm
+            .recorded_header(parent)
+            .ok_or(ChainStateError::FixtureExtensionParentHeader(parent))?;
+
+        let mut ledger = self.ledger.clone();
+        ledger
+            .tenure_start_heights
+            .insert(header.tenure_height, header.tenure_start_height);
+        ledger.executed.push(ExecutedBlock {
+            block_id: parent,
+            consensus_hash: ConsensusHash::from_bytes(header.consensus_hash),
+            tenure_height: header.tenure_height,
+        });
+        self.vm.stand_on_tenure_starts(
+            ledger
+                .tenure_start_heights
+                .iter()
+                .map(|(tenure, height)| (*tenure, *height)),
+        );
+        self.adopt(ledger);
+        Ok(())
     }
 
     /// The Stacks height a tenure's first block sits at, as this chain has it.
@@ -4049,7 +4108,8 @@ mod tests {
 
     use nano_address::StacksAddress;
     use nano_codec::Transaction;
-    use nano_primitives::{Hash160, Network, TrieHash};
+    use nano_primitives::{ConsensusHash, Hash160, Network, StacksBlockId, TrieHash};
+    use nano_vm::{BlockHeader, HeaderFields};
 
     use super::{
         AppliedBlock, BitcoinBlockContext, ChainLedger, ChainState, ChainStateError, NakamotoBlock,
@@ -4278,6 +4338,39 @@ mod tests {
             source,
             BitcoinBlockContext::at_height(bitcoin_height),
         )
+    }
+
+    fn sealed_fixture_parent(
+        known: Option<HeaderFields>,
+    ) -> (ChainState, StacksBlockId, BlockHeader) {
+        let parent = StacksBlockId::from_bytes([0x42; 32]);
+        let header = BlockHeader {
+            consensus_hash: [0x31; 20],
+            tenure_height: 251_321,
+            tenure_start_height: 8_665_575,
+            ..BlockHeader::default()
+        };
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
+        chainstate
+            .vm
+            .begin_block(None, *parent.as_bytes())
+            .expect("begin parent");
+        chainstate.vm.seal_block().expect("seal parent");
+        if let Some(fields) = known {
+            if fields.is_complete() {
+                chainstate
+                    .vm
+                    .record_block_header(*parent.as_bytes(), header)
+                    .expect("record complete parent header");
+            } else {
+                chainstate
+                    .vm
+                    .record_partial_header(*parent.as_bytes(), header, fields)
+                    .expect("record partial parent header");
+            }
+        }
+        chainstate.vm.stand_on_tenure_starts(std::iter::empty());
+        (chainstate, parent, header)
     }
 
     fn execute_unauthenticated_fixture(
@@ -4543,6 +4636,107 @@ mod tests {
         assert!(tenure_start_blocks.is_empty());
         assert!(executed.is_empty());
         assert!(parent_tenure_proof.is_none());
+    }
+
+    #[test]
+    fn an_unauthenticated_fixture_extension_seeds_only_parent_continuity() {
+        let (mut chainstate, parent, header) = sealed_fixture_parent(Some(HeaderFields::ALL));
+        assert_eq!(
+            chainstate.clarity_tenure_start_height(header.tenure_height),
+            None
+        );
+
+        chainstate
+            .seed_unauthenticated_fixture_extension_from_parent_header(parent)
+            .expect("seed extension from the complete sealed parent");
+
+        assert_eq!(
+            chainstate.tenure_start_height(header.tenure_height),
+            Some(header.tenure_start_height)
+        );
+        assert_eq!(
+            chainstate.clarity_tenure_start_height(header.tenure_height),
+            Some(header.tenure_start_height)
+        );
+        assert_eq!(chainstate.executed_blocks(), vec![*parent.as_bytes()]);
+        assert_eq!(
+            chainstate.executed_tenures(),
+            vec![ConsensusHash::from_bytes(header.consensus_hash)]
+        );
+        assert_eq!(
+            chainstate.ledger.executed,
+            vec![ExecutedBlock {
+                block_id: *parent.as_bytes(),
+                consensus_hash: ConsensusHash::from_bytes(header.consensus_hash),
+                tenure_height: header.tenure_height,
+            }]
+        );
+        assert_eq!(chainstate.ledger.accounting, TenureAccounting::default());
+        assert!(
+            chainstate.ledger.tenure_start_blocks.is_empty(),
+            "an observed parent is not an authenticated tenure-start identity"
+        );
+        assert!(
+            chainstate.ledger.parent_tenure_proof.is_none(),
+            "a recorded header is not a VRF proof"
+        );
+        assert!(
+            chainstate
+                .tenure_start(ConsensusHash::from_bytes(header.consensus_hash))
+                .is_none(),
+            "the seam fabricated a tenure-start block"
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_fixture_extension_refuses_another_tip_without_changes() {
+        let (mut chainstate, parent, header) = sealed_fixture_parent(Some(HeaderFields::ALL));
+        let requested = StacksBlockId::from_bytes([0x43; 32]);
+        let before = chainstate.ledger.clone();
+        let tip = chainstate.tip().expect("read tip");
+        let tenure_start = chainstate.clarity_tenure_start_height(header.tenure_height);
+
+        let error = chainstate
+            .seed_unauthenticated_fixture_extension_from_parent_header(requested)
+            .expect_err("a parent other than the sealed tip must be refused");
+        assert!(matches!(
+            error,
+            ChainStateError::FixtureExtensionParentTip {
+                expected,
+                actual: Some(actual),
+            } if expected == *requested.as_bytes() && actual == *parent.as_bytes()
+        ));
+        assert_eq!(chainstate.ledger, before);
+        assert_eq!(chainstate.tip().expect("read tip"), tip);
+        assert_eq!(
+            chainstate.clarity_tenure_start_height(header.tenure_height),
+            tenure_start
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_fixture_extension_requires_a_complete_parent_header() {
+        for known in [None, Some(HeaderFields::PEER_BURN_CONTEXT)] {
+            let (mut chainstate, parent, header) = sealed_fixture_parent(known);
+            let before = chainstate.ledger.clone();
+            let tip = chainstate.tip().expect("read tip");
+            let tenure_start = chainstate.clarity_tenure_start_height(header.tenure_height);
+
+            let error = chainstate
+                .seed_unauthenticated_fixture_extension_from_parent_header(parent)
+                .expect_err("a missing or partial parent header must be refused");
+            assert!(matches!(
+                error,
+                ChainStateError::FixtureExtensionParentHeader(missing)
+                    if missing == *parent.as_bytes()
+            ));
+            assert_eq!(chainstate.ledger, before);
+            assert_eq!(chainstate.tip().expect("read tip"), tip);
+            assert_eq!(
+                chainstate.clarity_tenure_start_height(header.tenure_height),
+                tenure_start
+            );
+        }
     }
 
     /// Every field of the ledger survives the row it is committed in.
