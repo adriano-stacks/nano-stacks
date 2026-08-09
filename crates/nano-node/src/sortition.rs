@@ -1991,6 +1991,37 @@ mod tests {
         ));
         assert_eq!(tracker.tip().bitcoin_height, 100);
     }
+
+    #[test]
+    fn a_saved_tracker_can_restart_one_burn_view_before_execution() {
+        let mut tracker = a_chain();
+        let payouts = PayoutSchedule::new(
+            RewardCycleSchedule::new(0, 10, None).expect("a schedule"),
+            2,
+        )
+        .expect("payouts");
+        tracker
+            .advance(&block_with(101, Vec::new()), payouts)
+            .expect("derive the previous view");
+        tracker
+            .advance(&block_with(102, Vec::new()), payouts)
+            .expect("derive the executed view");
+
+        let directory = tempfile::tempdir().expect("saved tracker directory");
+        tracker
+            .save_standing_on(directory.path(), 101)
+            .expect("save one view behind execution");
+        let resumed = SortitionTracker::from_capture(directory.path()).expect("resume saved view");
+
+        assert_eq!(resumed.tip().bitcoin_height, 101);
+        assert_eq!(
+            resumed.tip().consensus_hash,
+            tracker
+                .snapshot_at(101)
+                .expect("the previous view is retained")
+                .consensus_hash
+        );
+    }
 }
 
 #[cfg(test)]

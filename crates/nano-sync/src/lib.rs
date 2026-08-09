@@ -57,6 +57,15 @@ const TENURE_WALK: usize = 32;
 /// beyond it means this node fell too far behind to follow.
 const BRIDGE_WALK: usize = 1024;
 
+/// How many `fork_info` pages one walk will ask a peer for.
+///
+/// stacks-core answers ten sortitions at a time, so this reaches three hundred
+/// burn blocks back — days of burnchain, and far deeper than any fork a signer
+/// set would let stand. A backstop, not a target: the walk ends as soon as it
+/// reaches the bound it was given, and a peer whose chain never met this one
+/// runs out of answers well before it.
+const FORK_INFO_PAGES: usize = 32;
+
 /// How long to wait out a peer's first rate limit, and how often to try again.
 /// How a rate-limited peer is waited out.
 ///
@@ -962,9 +971,46 @@ impl SyncClient {
     /// This is how a node finds where a candidate chain left the one it holds:
     /// the answer runs backwards from `start` to `stop`, one entry per burn
     /// block, and the first entry both chains agree on is the fork point.
+    ///
+    /// A page at a time, because one request does not reach. stacks-core walks
+    /// back at most `DEPTH_LIMIT = 10` sortitions and then answers 200 with a
+    /// **truncated** body, saying nothing about having stopped early
+    /// (`stackslib/src/net/api/get_tenures_fork_info.rs:38`). A caller that asked
+    /// once saw ten burn blocks and read everything below them as "these chains
+    /// never met": on mainnet the walk reached burn 961671 while the two chains
+    /// had parted at 961648, so a real fork was indistinguishable from no fork at
+    /// all ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]). Each page
+    /// resumes from the oldest entry the last one carried, and the walk ends when
+    /// it reaches `stop`, stops making progress, or runs out of pages.
+    ///
+    /// Pages overlap by their boundary entry, which no caller has to care about:
+    /// the answer is read as a set of consensus hashes.
+    pub async fn tenure_fork_info(
+        &self,
+        start: ConsensusHash,
+        stop: ConsensusHash,
+    ) -> Result<Vec<ForkInfo>, SyncError> {
+        let mut walked: Vec<ForkInfo> = Vec::new();
+        let mut cursor = start;
+        for _ in 0..FORK_INFO_PAGES {
+            let page = self.fork_info_page(cursor, stop).await?;
+            let Some(oldest) = page.last().map(|entry| entry.consensus_hash) else {
+                break;
+            };
+            walked.extend(page);
+            if oldest == stop || oldest == cursor {
+                break;
+            }
+            cursor = oldest;
+        }
+        Ok(walked)
+    }
+
+    /// One `fork_info` answer, however far back the peer chose to walk.
+    ///
     /// stacks-core's route names the older bound first and the newer cursor
     /// second, despite returning the entries in the opposite direction.
-    pub async fn tenure_fork_info(
+    async fn fork_info_page(
         &self,
         start: ConsensusHash,
         stop: ConsensusHash,

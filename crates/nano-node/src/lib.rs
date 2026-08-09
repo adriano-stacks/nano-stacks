@@ -1079,7 +1079,17 @@ where
         // A descent that overshot leaves blocks below the executed tip, which
         // no round will ever execute and every round would otherwise resume
         // from.
-        staging.remove_to(executed_height)?;
+        //
+        // Below it, and not up to it. A block staged at the executed tip's own
+        // height is either that block — dropped by name just below, having been
+        // executed — or its **sibling**, which is the root of a branch that
+        // parted from this one and the only thing linking what sits above it to
+        // the block both branches descend from. Clearing the whole height threw
+        // that root away on every round, so the branch above it could never be
+        // reached: the mainnet stall at 8724697
+        // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+        staging.remove_to(executed_height.saturating_sub(1))?;
+        staging.remove(executed_tip)?;
         // A peer that will not even say where its tip is does not end the round:
         // everything already staged can still be executed and sealed, and the
         // descent picks up at the next poll. This was the first `?` of the round,
@@ -1132,10 +1142,22 @@ where
             // node has already sealed — which was then asked for again on every
             // round for as long as the peer's tip stayed inside one tenure, seven
             // times over one tenure in the harness that found it.
+            //
+            // The gap is a question about a *block*, not about a height. Asking
+            // whether the lowest staged block sits above the executed tip reads
+            // as the same question and is not: a branch that parted from this one
+            // has a block at every height this node has already sealed, so its
+            // lowest block was `executed_height + 1` — no gap by that measure —
+            // while its parent was this node's tip's sibling and nothing above it
+            // could ever execute. Naming the parent answers both: a tenure that
+            // straddles the tip points at a block this node executed and is left
+            // alone, and a branch that parted points at one it did not and is
+            // followed down to where the two agree
+            // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
             if let Some(resume) = staging
                 .descent_resumes_at()?
                 .filter(|_| !round.rate_limited)
-                .filter(|(_, lowest)| *lowest > executed_height.saturating_add(1))
+                .filter(|(resume, _)| !self.chainstate.has_executed(*resume.as_bytes()))
                 .map(|(resume, _)| resume)
             {
                 fetched += Self::descend(
@@ -1150,6 +1172,14 @@ where
             }
             round.fetched = fetched;
         }
+        // A tenure response may include blocks below the requested stop. The
+        // start-of-round trim cannot remove those because they were fetched
+        // afterwards; leaving them here makes branch selection mistake an
+        // already-executed ancestor for the sibling branch's root and retract one
+        // block too far. Keep the sibling at `executed_height`, but not anything
+        // below it or the exact executed tip.
+        staging.remove_to(executed_height.saturating_sub(1))?;
+        staging.remove(executed_tip)?;
         // Before executing anything, ask Bitcoin whether the burn blocks this
         // node's sortitions were derived from still hold. A round is the right
         // place: a sortition is a fact about a Bitcoin block and many Stacks
@@ -1174,14 +1204,21 @@ where
         // peer stopped answering, which says nothing about which chain it is on,
         // and the two requests this asks would be the round's error instead of
         // its progress.
-        if !round.rate_limited
-            && round.executed == 0
-            && round.fetched > 0
-            && let Ok(peer) = node.tenure_info().await
-            && let Some(resume) = self.switch_to_fork(node, peer.consensus_hash).await?
-        {
-            round.reorganized = Some(resume);
-            staging.clear()?;
+        //
+        // The branch this node already holds is asked first, and it is asked of
+        // nobody: a fork whose two sides share a sortition chain has no burn view
+        // to name and no peer to ask about it, and the evidence is sitting in
+        // staging. Only when that answers nothing is the burn view a peer holds
+        // worth a request.
+        if !round.rate_limited && round.executed == 0 && round.fetched > 0 {
+            if let Some(resume) = self.switch_to_staged_branch(node, staging).await? {
+                round.reorganized = Some(resume);
+            } else if let Ok(peer) = node.tenure_info().await
+                && let Some(resume) = self.switch_to_fork(node, peer.consensus_hash).await?
+            {
+                round.reorganized = Some(resume);
+                staging.clear()?;
+            }
         }
         round.staged = staging.len()?;
         Ok(round)
@@ -1684,22 +1721,33 @@ where
     /// Write the derived chain down, so the next start resumes instead of
     /// re-deriving.
     fn save_sortitions(&self) {
-        let (Some(tracker), Some(state)) = (self.sortition.as_ref(), self.sortition_state.as_ref())
-        else {
-            return;
-        };
         let written = std::time::Instant::now();
-        // Standing on the burn view this node has executed to, not on the tip the
-        // view-locating walk reached: a chain saved above what execution needs is
-        // one a restart cannot use, because it only walks forward.
-        if let Err(error) = tracker.save_standing_on(state, self.bitcoin_height()) {
-            eprintln!("the derived sortition chain could not be written down: {error}");
-        } else {
-            println!(
+        match self.persist_sortitions_for_restart() {
+            Ok(Some(_)) => println!(
                 "the derived sortition chain is written down ({:.2}s)",
                 written.elapsed().as_secs_f64()
-            );
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("the derived sortition chain could not be written down: {error}");
+            }
         }
+    }
+
+    /// Persist the burn view a Stacks fork can need immediately after retraction.
+    fn persist_sortitions_for_restart(
+        &self,
+    ) -> Result<Option<u64>, crate::sortition::TrackerError> {
+        let (Some(tracker), Some(state)) = (self.sortition.as_ref(), self.sortition_state.as_ref())
+        else {
+            return Ok(None);
+        };
+        // A branch can replace the first block of the current sortition without a
+        // Bitcoin reorganization; its common parent then stands one burn block
+        // lower. Saving exactly at execution made a restart unable to reach that
+        // parent because a sortition chain only walks forward.
+        tracker.save_standing_on(state, self.bitcoin_height().saturating_sub(1))?;
+        Ok(Some(tracker.tip().bitcoin_height))
     }
 
     fn local_sortition(
@@ -1801,6 +1849,12 @@ where
                 )),
             ));
         }
+        self.stand_on_known_block(block);
+        Ok(())
+    }
+
+    /// Update the in-memory and served tip after the durable chain was retracted.
+    fn stand_on_known_block(&mut self, block: NakamotoBlock) {
         self.tip = block;
         self.bitcoin_view = None;
         self.bitcoin_height = 0;
@@ -1811,7 +1865,6 @@ where
         {
             eprintln!("cannot give back the blocks this node retracted: {error}");
         }
-        Ok(())
     }
 
     /// Ask Bitcoin whether the burn blocks behind this node's sortitions still hold.
@@ -1917,6 +1970,97 @@ where
         Ok(Some(resume))
     }
 
+    /// Stand on the block a branch this node already holds descends from.
+    ///
+    /// The fork a burn view cannot describe. A tenure can win a sortition, put a
+    /// block out, and still be built around: the next sortition's miner commits
+    /// to the tenure *before* it, and the chain carries on one block to the side
+    /// of the one this node executed. Both branches then stand on the same
+    /// unreorganized sortition chain, both tenures are canonical burn views, and
+    /// there is no consensus hash whose presence on one side and absence on the
+    /// other names where they parted — [`Self::switch_to_fork`] matches this
+    /// node's own tip tenure, retracts nothing, and answers `None` forever. That
+    /// is the mainnet stall at 8724697: 1509 blocks staged, none executable, for
+    /// as long as the node ran
+    /// ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+    ///
+    /// So the fork point is named as a block, and it is read off this node's own
+    /// two records rather than asked for: the lowest block staging holds, and
+    /// whether this node executed its parent. A peer supplies neither answer. It
+    /// cannot name a block this node did not compute, cannot move the tip to a
+    /// branch no higher than the one already executed, and cannot reach anything
+    /// below the branch's own root — every block on it arrived carrying threshold
+    /// signer weight and a burn view this node derived from Bitcoin itself.
+    ///
+    /// Staging is *kept*, unlike every other retraction here: the branch about to
+    /// be executed is what it holds.
+    ///
+    /// Returns the block to resume from when a switch happened.
+    async fn switch_to_staged_branch(
+        &mut self,
+        node: &SyncClient,
+        staging: &Staging,
+    ) -> Result<Option<[u8; 32]>, NodeExecutionError> {
+        // Nothing to gain from a branch that reaches no further than the chain
+        // already executed, which is what keeps a peer serving an old sibling
+        // from rewinding this node round after round.
+        let Some(highest) = staging.highest()? else {
+            return Ok(None);
+        };
+        if highest.header.chain_length <= self.tip.header.chain_length {
+            return Ok(None);
+        }
+        let Some((parent, _)) = staging.descent_resumes_at()? else {
+            return Ok(None);
+        };
+        let parent = *parent.as_bytes();
+        // The ordinary case, and the reason this is cheap: the branch descends
+        // from the tip, so there is no fork and the executor was simply waiting
+        // on a gap the descent above has now closed.
+        if parent == *self.tip.block_id().as_bytes() || !self.chainstate.has_executed(parent) {
+            return Ok(None);
+        }
+        // Fetch and validate the local ancestor before retracting durable state.
+        // A peer or network failure must leave the persisted and in-memory tips
+        // naming the same chain.
+        let resume_block = node.block(StacksBlockId::from_bytes(parent)).await?;
+        if *resume_block.block_id().as_bytes() != parent {
+            return Err(NodeExecutionError::Execution(
+                CheckpointExecutionError::Link(format!(
+                    "the peer answered for block {} with block {}, so this node cannot stand on \
+                     the ancestor its staged branch names",
+                    hex::encode(parent),
+                    resume_block.block_id()
+                )),
+            ));
+        }
+        // This belongs before the chainstate write, not merely to the periodic
+        // burnchain walk. If the tracker was already current, that walk had
+        // nothing to save; a kill after retraction would otherwise leave a sealed
+        // parent below a sortition seed that can only walk forward.
+        self.persist_sortitions_for_restart().map_err(|error| {
+            NodeExecutionError::Execution(CheckpointExecutionError::Bitcoin(format!(
+                "the sortition chain could not retain the burn view needed to restart this Stacks fork: {error}"
+            )))
+        })?;
+        let retraction = self.chainstate.retract_to(parent);
+        if retraction.discarded.is_empty() {
+            return Ok(None);
+        }
+        println!(
+            "a branch {} blocks longer parted at {}: giving back {} blocks this node executed \
+             and standing on it again",
+            highest
+                .header
+                .chain_length
+                .saturating_sub(self.tip.header.chain_length),
+            hex::encode(parent),
+            retraction.discarded.len()
+        );
+        self.stand_on_known_block(resume_block);
+        Ok(retraction.resume_from)
+    }
+
     /// Stand on the last block a peer's chain and this one agree about.
     ///
     /// A peer that reorganises past this node used to strand it: the follower
@@ -1940,7 +2084,20 @@ where
         let Some(oldest) = ours.last().copied() else {
             return Ok(None);
         };
-        let theirs = node.tenure_fork_info(theirs, oldest).await?;
+        // Nothing a peer answers here can fail the round. Its view of where two
+        // chains parted is a hint that saves this node a search, never a
+        // consensus input — a 400, a closed socket or a chain it does not
+        // recognise all mean the same thing, which is that this peer cannot help.
+        // Returning the error instead ended the round before execution: a peer
+        // answering `NotInSameFork` stalled a mainnet follower for 728 rounds
+        // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+        let theirs = match node.tenure_fork_info(theirs, oldest).await {
+            Ok(view) => view,
+            Err(error) => {
+                eprintln!("a peer could not say where its burn view parted from this one: {error}");
+                return Ok(None);
+            }
+        };
         let Some(point) = nano_sync::fork_point_of(&ours, &theirs) else {
             return Ok(None);
         };

@@ -2635,6 +2635,21 @@ impl ChainState {
         }
     }
 
+    /// Whether this node executed this block on the chain it is standing on.
+    ///
+    /// The question a fork asks that a height cannot answer. Two branches can
+    /// carry a block at the same height under the same tenure, so "is there a
+    /// gap below what I hold" and "did the branch I hold part from mine" are
+    /// both settled by naming a block and asking whether this node computed it —
+    /// never by comparing chain lengths, and never on a peer's word.
+    #[must_use]
+    pub fn has_executed(&self, block_id: [u8; 32]) -> bool {
+        self.ledger
+            .executed
+            .iter()
+            .any(|block| block.block_id == block_id)
+    }
+
     /// The blocks executed since the checkpoint, oldest first.
     #[must_use]
     pub fn executed_blocks(&self) -> Vec<[u8; 32]> {

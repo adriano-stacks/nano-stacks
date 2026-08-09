@@ -37,11 +37,15 @@ use std::{
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use nano_bitcoin::{BitcoinBlock, BitcoinSource};
-use nano_chainstate::NakamotoBlock;
+use nano_chainstate::{BitcoinBlockContext, NakamotoBlock};
 use nano_node::{CatchUpBudget, CheckpointExecutor, staging::Staging};
 use nano_primitives::ConsensusHash;
 use nano_sync::{PeerPool, PoxInfo, SyncClient, TenureSource};
 use serde::Deserialize;
+
+/// How many sortitions stacks-core will walk back in one `fork_info` answer,
+/// from `stackslib/src/net/api/get_tenures_fork_info.rs:38`.
+const DEPTH_LIMIT: usize = 10;
 
 pub fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
@@ -606,10 +610,29 @@ impl Served {
         if recurse_end != start_from && stop >= start {
             return None;
         }
-        let mut entries: Vec<serde_json::Value> = self
+        let mut rows: Vec<_> = self
             .snapshots
             .iter()
             .filter(|snapshot| snapshot.block_height >= stop && snapshot.block_height <= start)
+            .collect();
+        rows.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.block_height));
+        // stacks-core walks back from the cursor and gives up after `DEPTH_LIMIT`
+        // sortitions, answering 200 with a *truncated* body and saying nothing
+        // about it (`get_tenures_fork_info.rs:38`). A harness that answered the
+        // whole range let a client that asked once look correct, which is how a
+        // fork point thirty-eight burn blocks down came to read as no fork at all
+        // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]). The cursor
+        // itself is pushed before the walk starts, so it is never counted.
+        let mut depth = 0;
+        let entries: Vec<serde_json::Value> = rows
+            .into_iter()
+            .take_while(|snapshot| {
+                let room = depth <= DEPTH_LIMIT;
+                if snapshot.sortition == 1 {
+                    depth += 1;
+                }
+                room
+            })
             .map(|snapshot| {
                 let tenure = self.tenure_of(&snapshot.consensus_hash);
                 serde_json::json!({
@@ -623,7 +646,6 @@ impl Served {
                 })
             })
             .collect();
-        entries.reverse();
         Some(serde_json::Value::Array(entries))
     }
 
@@ -1069,6 +1091,227 @@ fn parted_view(
         branch.push(moved);
     }
     branch
+}
+
+/// A burn view walk reaches past what one `fork_info` answer carries.
+///
+/// stacks-core stops after ten sortitions and answers 200 with a truncated body,
+/// stating nothing about having stopped. So the bound a caller asks for and the
+/// bound it gets back are different bounds, and the difference is silent: every
+/// fork deeper than ten burn blocks read as no fork at all, which on mainnet was
+/// a fork thirty-eight deep ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+///
+/// Asked of the client rather than through the node, because this is a claim
+/// about one request being made into as many as the answer needs.
+#[tokio::test]
+async fn a_burn_view_walk_reaches_past_one_answer() {
+    let (client, task) = serve(Served::honest(captured_chain(), snapshots())).await;
+    let hash = |snapshot: &Snapshot| {
+        ConsensusHash::from_bytes(
+            hex::decode(&snapshot.consensus_hash)
+                .expect("a captured consensus hash is hexadecimal")
+                .try_into()
+                .expect("a consensus hash is twenty bytes"),
+        )
+    };
+    let mut elected: Vec<_> = snapshots()
+        .into_iter()
+        .filter(|snapshot| snapshot.sortition == 1)
+        .collect();
+    elected.sort_by_key(|snapshot| snapshot.block_height);
+    assert!(
+        elected.len() > DEPTH_LIMIT * 3,
+        "the captured burnchain is too short to walk past one answer"
+    );
+    let newest = hash(elected.last().expect("a newest sortition"));
+    let bound = &elected[elected.len() - 1 - DEPTH_LIMIT * 3];
+
+    let walked = client
+        .tenure_fork_info(newest, hash(bound))
+        .await
+        .expect("the peer answers");
+
+    assert!(
+        walked
+            .iter()
+            .any(|entry| entry.consensus_hash == hash(bound)),
+        "the walk stopped short of the bound it was given: {} sortitions, down to burn {:?}",
+        walked.len(),
+        walked.last().map(|entry| entry.bitcoin_height)
+    );
+    assert!(
+        walked.iter().filter(|entry| entry.was_sortition).count() > DEPTH_LIMIT,
+        "the walk carried no more than a single answer's worth of sortitions"
+    );
+
+    task.abort();
+}
+
+/// A tenure that won its sortition and was built around is given back.
+///
+/// The mainnet stall of 2026-08-08, reduced: this node executes the block its
+/// tenure produced, the next sortition's miner commits to the tenure *before* it,
+/// and the chain carries on one block to the side. Both branches stand on the same
+/// unreorganized sortition chain and both tenures are canonical burn views, so
+/// there is no consensus hash present on one side and absent on the other —
+/// `switch_to_fork` matches this node's own tip tenure, retracts nothing, and the
+/// node holds fifteen hundred unexecutable blocks for as long as it runs
+/// ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+///
+/// What the round does instead is read the answer off its own two records: the
+/// lowest block staging holds, and whether this node executed that block's parent.
+/// The last assertion is the point — no peer was asked where the chains parted,
+/// because no peer could have been believed about it.
+fn execute_fixture_orphan(
+    directory: &Path,
+    burnchain: MovableBurnchain,
+    chain: &[NakamotoBlock],
+    agreed: [u8; 32],
+) -> (CheckpointExecutor<MovableBurnchain>, Vec<[u8; 32]>) {
+    let mut orphan = chain[11].clone();
+    orphan.header.timestamp = orphan.header.timestamp.saturating_add(1);
+    let orphan_id = orphan.block_id();
+    assert_ne!(
+        orphan_id,
+        chain[11].block_id(),
+        "the orphan is not a sibling"
+    );
+    let orphan_bitcoin_height = snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.consensus_hash == orphan.header.consensus_hash.to_string())
+        .map(|snapshot| snapshot.block_height)
+        .expect("the captured burnchain names the orphan's canonical view");
+    let (mut chainstate, _) = crate::restart::open(directory);
+    chainstate
+        .execute_unauthenticated_fixture_block_with_bitcoin_operations(
+            BitcoinBlockContext::at_height(orphan_bitcoin_height),
+            &[],
+            Some(agreed),
+            &orphan,
+        )
+        .expect("the fixture orphan executes");
+    let mut executor = CheckpointExecutor::resume(chainstate, orphan, burnchain);
+    nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory);
+    let executed = executor.chainstate_mut().executed_blocks();
+    assert_eq!(
+        executed.last().copied(),
+        Some(*orphan_id.as_bytes()),
+        "the executed chain does not end at the tip"
+    );
+    (executor, executed)
+}
+
+#[tokio::test]
+async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
+    let chain = captured_chain();
+    let honest: Vec<_> = chain[..11].to_vec();
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots())).await;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain.clone());
+    let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 64,
+    };
+    let mut history = TenureSource::only(honest_client.clone());
+    executor
+        .catch_up(&honest_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("the captured chain executes");
+    let agreed = *executor.tip().block_id().as_bytes();
+    drop(executor);
+
+    // Put one locally executed orphan above the common block. Only this setup
+    // block uses the explicit fixture seam: changing its timestamp changes its
+    // identity and invalidates its captured signature. The replacement branch
+    // below is the byte-exact captured chain and goes through production signer,
+    // tenure, VRF and state-root checks.
+    let (mut executor, executed_before) =
+        execute_fixture_orphan(directory.path(), burnchain.clone(), &chain, agreed);
+
+    // The branch: the same height as this node's orphan, a different block on it,
+    // and four blocks above — all byte-exact captured blocks under burn views this
+    // node's own sortition chain holds.
+    let branch = chain[..16].to_vec();
+    let branch_tip = branch.last().expect("replacement tip").block_id();
+    let branch_policy = Policy::default();
+    let (branch_client, branch_task) =
+        serve(Served::honest(branch, snapshots()).under(branch_policy.clone())).await;
+
+    let mut history = TenureSource::only(branch_client.clone());
+    let round = executor
+        .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("a branch parting at a block is not an error");
+    assert_eq!(
+        round.executed, 0,
+        "a block whose parent this node did not execute was executed"
+    );
+    assert_eq!(
+        round.reorganized,
+        Some(agreed),
+        "the round did not stand on the last block both branches descend from"
+    );
+    assert_eq!(
+        *executor.tip().block_id().as_bytes(),
+        agreed,
+        "the executor kept standing on the block it had given back"
+    );
+    let executed_after = executor.chainstate_mut().executed_blocks();
+    assert_eq!(
+        executed_after.last().copied(),
+        Some(agreed),
+        "the chain does not end at the block the switch named"
+    );
+    assert!(
+        executed_before.starts_with(&executed_after),
+        "the surviving chain is not a prefix of the one that was executed"
+    );
+    assert!(
+        !staging.is_empty().expect("staging answers"),
+        "the switch threw away the branch it had just decided to execute"
+    );
+
+    drop(executor);
+    let (chainstate, _) = crate::restart::open(directory.path());
+    let agreed_block = honest
+        .iter()
+        .find(|block| *block.block_id().as_bytes() == agreed)
+        .expect("the common block is in the served chain")
+        .clone();
+    let mut executor = CheckpointExecutor::resume(chainstate, agreed_block, burnchain);
+    nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory.path());
+
+    let next = executor
+        .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("the retained replacement branch executes");
+    assert!(next.executed > 0, "the replacement branch made no progress");
+    assert_eq!(
+        executor.tip().block_id(),
+        branch_tip,
+        "the executor did not reach the replacement branch's tip"
+    );
+    assert!(
+        staging.is_empty().expect("staging answers"),
+        "executed replacement blocks remain staged"
+    );
+    let asked = branch_policy.asked.lock().expect("the log is not poisoned");
+    assert!(
+        !asked.iter().any(|(path, _)| {
+            path.strip_prefix("/v3/tenures/fork_info/")
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(start, stop)| start != stop)
+        }),
+        "this node asked a peer where two chains parted instead of reading it off \
+         the blocks it already held"
+    );
+    drop(asked);
+
+    honest_task.abort();
+    branch_task.abort();
 }
 
 /// A peer whose burn view parted from this node's is followed onto the fork.
