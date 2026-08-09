@@ -659,6 +659,33 @@ pub fn call_function(
         .get(&mut store)
         .i32()
         .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    let argument_sizes =
+        instance
+            .get_global(&mut store, "argument-sizes")
+            .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
+                "argument-sizes".into(),
+            )))?;
+    let argument_sizes_offset = argument_sizes
+        .get(&mut store)
+        .i32()
+        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    for (index, argument) in arguments.iter().enumerate() {
+        let index = i32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(4))
+            .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+        let size = i32::try_from(argument.size()?)
+            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+        let size_offset = argument_sizes_offset
+            .checked_add(index)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+        memory
+            .write(&mut store, size_offset, &size.to_le_bytes())
+            .map_err(|error| {
+                crate::error::wasm_error(WasmError::UnableToWriteMemory(error.into()))
+            })?;
+    }
     let arguments_offset = offset;
     let mut representation_offset = offset;
     let mut in_memory_offset = if packed_abi {

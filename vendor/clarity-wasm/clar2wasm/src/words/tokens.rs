@@ -103,8 +103,8 @@ impl ComplexWord for BurnFungibleToken {
             .i32_const(id_length as i32);
 
         // Push the amount and sender onto the stack
-        generator.traverse_expr(builder, amount)?;
-        generator.traverse_expr(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, amount)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
 
         // Call the host interface function `ft_burn`
         builder.call(generator.func_by_name("stdlib.ft_burn"));
@@ -146,9 +146,9 @@ impl ComplexWord for TransferFungibleToken {
             .i32_const(id_length as i32);
 
         // Push the amount, sender, and recipient onto the stack
-        generator.traverse_expr(builder, amount)?;
-        generator.traverse_expr(builder, sender)?;
-        generator.traverse_expr(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, amount)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
 
         // Call the host interface function `ft_transfer`
         builder.call(generator.func_by_name("stdlib.ft_transfer"));
@@ -188,8 +188,8 @@ impl ComplexWord for MintFungibleToken {
             .i32_const(id_length as i32);
 
         // Push the amount and recipient onto the stack
-        generator.traverse_expr(builder, amount)?;
-        generator.traverse_expr(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, amount)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
 
         // Call the host interface function `ft_mint`
         builder.call(generator.func_by_name("stdlib.ft_mint"));
@@ -263,7 +263,7 @@ impl ComplexWord for GetBalanceOfFungibleToken {
             .i32_const(id_length as i32);
 
         // Push the owner onto the stack
-        generator.traverse_expr(builder, owner)?;
+        generator.traverse_expr_as_borrowed_value(builder, owner)?;
 
         // Call the host interface function `ft_get_balance`
         builder.call(generator.func_by_name("stdlib.ft_get_balance"));

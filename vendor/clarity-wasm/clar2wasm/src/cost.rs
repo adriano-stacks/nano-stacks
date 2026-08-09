@@ -231,7 +231,7 @@ pub trait ChargeGenerator {
                     return Err(GeneratorError::InternalError(format!(
                         "'{word_name}' does not exist in costs table for epoch '{}'",
                         ctx.epoch
-                    )))
+                    )));
                 }
             }
         }
@@ -372,7 +372,7 @@ impl ScalarGet for InstrSeqBuilder<'_> {
                     ty => {
                         return Err(GeneratorError::InternalError(format!(
                             "cost local should be of type i32 but is of type {ty}"
-                        )))
+                        )));
                     }
                 }
 
@@ -2095,6 +2095,48 @@ mod crosscheck {
         }
     }
 
+    #[test]
+    fn charges_fungible_token_operands_in_place() {
+        let principal = || {
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse("S1G2081040G2081040G2081040G208105NK8PE5")
+                    .expect("principal"),
+            )
+        };
+        for (snippet, arguments) in [
+            (
+                "(define-fungible-token token)
+                 (define-public (f (owner principal))
+                   (ok (ft-get-balance token owner)))",
+                vec![principal()],
+            ),
+            (
+                "(define-fungible-token token)
+                 (define-public (f (amount uint) (recipient principal))
+                   (ft-mint? token amount recipient))",
+                vec![Value::UInt(1), principal()],
+            ),
+            (
+                "(define-fungible-token token)
+                 (define-public (f (amount uint) (sender principal) (recipient principal))
+                   (begin
+                     (try! (ft-mint? token amount sender))
+                     (ft-transfer? token amount sender recipient)))",
+                vec![Value::UInt(1), principal(), principal()],
+            ),
+            (
+                "(define-fungible-token token)
+                 (define-public (f (amount uint) (owner principal))
+                   (begin
+                     (try! (ft-mint? token amount owner))
+                     (ft-burn? token amount owner)))",
+                vec![Value::UInt(1), principal()],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &arguments);
+        }
+    }
+
     /// A comparison or a branch over a bound name costs what the interpreter
     /// charges.
     ///
@@ -2280,6 +2322,117 @@ mod crosscheck {
         }
     }
 
+    /// A binding with a placeholder list keeps its actual, empty-list size
+    /// when `fold` widens the occurrence to the callback's accumulator type.
+    #[test]
+    fn charges_copying_a_widened_fold_accumulator() {
+        crosscheck_cost(
+            "(define-private (step (value uint) (acc {word: uint, fields: (list 8 uint)}))
+                 {word: (get word acc),
+                  fields: (unwrap-panic (as-max-len? (append (get fields acc) value) u8))})
+             (define-public (f)
+                 (let ((init {word: u0, fields: (list)}))
+                     (ok (fold step (list u1) init))))",
+            "f",
+            &[],
+        );
+    }
+
+    /// `let` is scaled by its number of bindings.
+    #[test]
+    fn charges_let_by_binding_count() {
+        for snippet in [
+            "(define-public (f) (let ((a u1)) (ok u0)))",
+            "(define-public (f)
+                 (let ((a u1) (b u2) (c u3) (d u4) (e u5) (g u6) (h u7) (i u8))
+                     (ok u0)))",
+            "(define-public (f)
+                 (let ((a u1) (b u2) (c u3) (d u4) (e u5) (g u6) (h u7) (i u8)
+                       (j u9) (k u10) (l u11) (m u12) (n u13) (o u14) (p u15) (q u16))
+                     (ok u0)))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    /// A trait value forwarded through `contract-call?` is charged at the size
+    /// of the callable value that the receiving public function sees.
+    #[test]
+    fn charges_a_forwarded_trait_argument_for_what_the_callee_receives() {
+        let trait_definition = "(define-trait route-trait ((route () (response bool uint))))";
+        let callee = "(use-trait route-trait .trait-definition.route-trait)
+                      (define-public (route (target <route-trait>)) (ok true))";
+        let caller = "(use-trait route-trait .trait-definition.route-trait)
+                      (define-public (f (target <route-trait>))
+                        (contract-call? .callee route target))";
+        let target = Value::Principal(
+            clarity::vm::types::PrincipalData::parse_qualified_contract_principal(
+                "S1G2081040G2081040G2081040G208105NK8PE5.trait-definition",
+            )
+            .expect("contract principal"),
+        );
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("callee", callee),
+                ("caller", caller),
+            ],
+            "f",
+            &[target],
+        );
+    }
+
+    /// Cross-contract results are sanitized before the caller copies them.
+    /// In particular, `none` narrows the nested optional metadata while a
+    /// present buffer keeps it.
+    #[test]
+    fn charges_copying_a_sanitized_cross_contract_result() {
+        let callee = r#"
+            (define-map registry uint
+                { id: uint, oracle: { callcode: (optional (buff 1)) } })
+            (map-set registry u0 { id: u0, oracle: { callcode: none } })
+            (map-set registry u1 { id: u1, oracle: { callcode: (some 0x02) } })
+            (define-read-only (get-asset (which uint))
+                (match (map-get? registry which)
+                    asset (ok asset)
+                    (err u1)))
+        "#;
+        let caller = r#"
+            (define-public (f (which uint))
+                (let ((asset (try! (contract-call? .callee get-asset which))))
+                    (ok (get id asset))))
+        "#;
+
+        for which in [0, 1] {
+            crosscheck_cost_multi_contract(
+                &[("callee", callee), ("caller", caller)],
+                "f",
+                &[Value::UInt(which)],
+            );
+        }
+    }
+
+    /// A contract principal literal is charged before the public callee casts
+    /// it to the trait the parameter declares.
+    #[test]
+    fn charges_a_local_public_trait_literal_as_a_principal() {
+        let trait_definition = "(define-trait route-trait ((route () (response bool uint))))";
+        let target = "(impl-trait .trait-definition.route-trait)
+                      (define-public (route) (if true (ok true) (err u1)))";
+        let caller = "(use-trait route-trait .trait-definition.route-trait)
+                      (define-public (route-local (target <route-trait>)) (ok true))
+                      (define-public (f) (route-local .target))";
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("target", target),
+                ("caller", caller),
+            ],
+            "f",
+            &[],
+        );
+    }
+
     #[test]
     fn charges_entering_a_function_once() {
         for (snippet, arguments) in [
@@ -2327,6 +2480,44 @@ mod crosscheck {
                 (
                     "caller",
                     "(define-public (f) (contract-call? .callee h u1))",
+                ),
+            ],
+            "f",
+            &[],
+        );
+    }
+
+    #[test]
+    fn charges_as_contract_safe_by_allowance_count() {
+        let snippet = r#"
+            (define-fungible-token token)
+            (define-public (one)
+                (as-contract? ((with-ft current-contract "token" u0)) u1))
+            (define-public (two)
+                (as-contract? ((with-stx u0)
+                               (with-ft current-contract "token" u0)) u1))
+        "#;
+
+        crosscheck_cost(snippet, "one", &[]);
+        crosscheck_cost(snippet, "two", &[]);
+    }
+
+    #[test]
+    fn charges_as_contract_safe_when_an_allowance_is_violated() {
+        crosscheck_cost_multi_contract(
+            &[
+                (
+                    "callee",
+                    "(define-public (send)
+                        (as-contract? ((with-stx u0))
+                            (try! (stx-transfer? u1 current-contract tx-sender))))",
+                ),
+                (
+                    "caller",
+                    "(define-public (f)
+                        (begin
+                            (try! (stx-transfer? u1 tx-sender .callee))
+                            (contract-call? .callee send)))",
                 ),
             ],
             "f",

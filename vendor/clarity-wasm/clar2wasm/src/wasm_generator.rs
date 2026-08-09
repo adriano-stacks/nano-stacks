@@ -12,7 +12,7 @@ use clarity::vm::types::{
     SequenceSubtype, StringSubtype, TraitIdentifier, TupleTypeSignature, TypeSignature,
 };
 use clarity::vm::variables::NativeVariables;
-use clarity::vm::{functions, variables, ClarityName, SymbolicExpression, SymbolicExpressionType};
+use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType, functions, variables};
 use walrus::ir::{
     BinaryOp, IfElse, InstrSeqId, InstrSeqType, LoadKind, MemArg, StoreKind, UnaryOp,
 };
@@ -25,8 +25,8 @@ use crate::cost::{ChargeContext, ChargeGenerator, WordCharge};
 use crate::duck_type::need_ducktyping;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_utils::{
-    get_type_in_memory_size, get_type_size, signature_from_string, trait_identifier_as_bytes,
-    ArgumentCountCheck, PRINCIPAL_BYTES_MAX,
+    ArgumentCountCheck, PRINCIPAL_BYTES_MAX, get_type_in_memory_size, get_type_size,
+    signature_from_string, trait_identifier_as_bytes,
 };
 use crate::{check_args, debug_msg, words};
 
@@ -50,6 +50,11 @@ pub struct WasmGenerator {
     pub(crate) literal_memory_end: u32,
     /// Global ID of the stack pointer.
     pub(crate) stack_pointer: GlobalId,
+    /// Start of the fixed scratch area carrying actual argument sizes into a
+    /// public or read-only function.
+    argument_sizes: GlobalId,
+    /// Number of entries reserved in `argument_sizes`.
+    max_argument_sizes: usize,
     /// Map strings saved in the literal memory to their offset.
     pub(crate) literal_memory_offset: HashMap<LiteralMemoryEntry, u32>,
     /// Map constants to an offset in the literal memory.
@@ -903,6 +908,9 @@ impl WasmGenerator {
             module.add_import_func("clarity", "runtime_shape_serialization_size", shape_size_ty);
         module.funcs.get_mut(shape_size).name =
             Some("stdlib.runtime_shape_serialization_size".to_owned());
+        let (value_size, _) =
+            module.add_import_func("clarity", "runtime_value_size", save_shape_ty);
+        module.funcs.get_mut(value_size).name = Some("stdlib.runtime_value_size".to_owned());
         let shape_equal_ty = module.types.add(
             &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             &[ValType::I32],
@@ -912,6 +920,12 @@ impl WasmGenerator {
         module.funcs.get_mut(shape_equal).name = Some("stdlib.runtime_shape_is_equal".to_owned());
         // Get the stack-pointer global ID
         let global_id = get_global(&module, "stack-pointer")?;
+        let argument_sizes = module.globals.add_local(
+            ValType::I32,
+            false,
+            walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
+        );
+        module.exports.add("argument-sizes", argument_sizes);
 
         let linked_error_id = get_global(&module, "runtime-error-linked")?;
 
@@ -922,6 +936,8 @@ impl WasmGenerator {
             module,
             literal_memory_end: END_OF_STANDARD_DATA,
             stack_pointer: global_id,
+            argument_sizes,
+            max_argument_sizes: 0,
             linked_error: linked_error_id,
             literal_memory_offset: HashMap::new(),
             constants: HashMap::new(),
@@ -1086,6 +1102,23 @@ impl WasmGenerator {
             current_function.finish(return_offset.into_iter().collect(), &mut self.module.funcs);
         self.module.exports.add(".top-level", top_level);
 
+        let argument_sizes_offset = self.literal_memory_end;
+        let argument_sizes_length = u32::try_from(self.max_argument_sizes)
+            .ok()
+            .and_then(|length| length.checked_mul(4))
+            .ok_or_else(|| {
+                GeneratorError::InternalError("function argument-size area is too large".into())
+            })?;
+        self.literal_memory_end = self
+            .literal_memory_end
+            .checked_add(argument_sizes_length)
+            .ok_or_else(|| {
+                GeneratorError::InternalError("literal memory offset overflow".into())
+            })?;
+        self.module.globals.get_mut(self.argument_sizes).kind = walrus::GlobalKind::Local(
+            walrus::InitExpr::Value(walrus::ir::Value::I32(argument_sizes_offset as i32)),
+        );
+
         self.set_memory_pages()?;
 
         // Update the initial value of the stack-pointer to point beyond the
@@ -1220,6 +1253,29 @@ impl WasmGenerator {
         expr: &SymbolicExpression,
         list: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
+        self.traverse_list_with_function_lookup(builder, expr, list, true)
+    }
+
+    pub(crate) fn traverse_allowance_expr(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+    ) -> Result<(), GeneratorError> {
+        match &expr.expr {
+            SymbolicExpressionType::List(list) => {
+                self.traverse_list_with_function_lookup(builder, expr, list, false)
+            }
+            _ => self.traverse_expr(builder, expr),
+        }
+    }
+
+    fn traverse_list_with_function_lookup(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        expr: &SymbolicExpression,
+        list: &[SymbolicExpression],
+        charge_function_lookup: bool,
+    ) -> Result<(), GeneratorError> {
         match list.split_first() {
             Some((
                 SymbolicExpression {
@@ -1249,7 +1305,9 @@ impl WasmGenerator {
 
                 // A definition is not evaluated, so only an application resolves
                 // a name to a function and pays for doing so.
-                if DefineFunctions::lookup_by_name(function_name).is_none() {
+                if charge_function_lookup
+                    && DefineFunctions::lookup_by_name(function_name).is_none()
+                {
                     self.charge_function_lookup(builder)?;
                 }
 
@@ -1355,6 +1413,10 @@ impl WasmGenerator {
                 None => format!("unable to find function type for {}", name.as_str()),
             }));
         };
+        let external_entry = matches!(kind, FunctionKind::Public | FunctionKind::ReadOnly);
+        if external_entry {
+            self.max_argument_sizes = self.max_argument_sizes.max(function_type.args.len());
+        }
 
         self.current_function_type = Some(function_type.clone());
         {
@@ -1509,15 +1571,35 @@ impl WasmGenerator {
 
         // Entering the function type-checks every argument it was given.
         self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
-        for (parameter_type, value_type, locals) in &parameters {
-            for local in locals {
-                func_body.local_get(*local);
-            }
-            self.clarity_value_size_on_stack(&mut func_body, value_type)?;
+        let memory = self.get_memory()?;
+        for (index, (parameter_type, value_type, locals)) in parameters.iter().enumerate() {
             let size = self.borrow_local(ValType::I32);
-            func_body.local_set(*size);
-            for _ in clar2wasm_ty(parameter_type) {
-                func_body.drop();
+            if external_entry {
+                let offset = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(4))
+                    .ok_or_else(|| {
+                        GeneratorError::InternalError(
+                            "function argument-size offset overflow".into(),
+                        )
+                    })?;
+                func_body
+                    .global_get(self.argument_sizes)
+                    .load(
+                        memory,
+                        LoadKind::I32 { atomic: false },
+                        MemArg { align: 4, offset },
+                    )
+                    .local_set(*size);
+            } else {
+                for local in locals {
+                    func_body.local_get(*local);
+                }
+                self.clarity_value_size_on_stack(&mut func_body, value_type)?;
+                func_body.local_set(*size);
+                for _ in clar2wasm_ty(parameter_type) {
+                    func_body.drop();
+                }
             }
             self.charge_inner_type_check(&mut func_body, *size)?;
         }
@@ -1702,7 +1784,7 @@ impl WasmGenerator {
             _ => {
                 return Err(GeneratorError::InternalError(
                     "Unhandled runtime error for try! function".to_owned(),
-                ))
+                ));
             }
         }
 
@@ -1880,48 +1962,69 @@ impl WasmGenerator {
         locals: &[LocalId],
         size: LocalId,
     ) -> Result<(), GeneratorError> {
+        let expected_locals = clar2wasm_ty(ty).len();
+        if locals.len() != expected_locals {
+            return Err(GeneratorError::InternalError(format!(
+                "runtime size for {ty} needs {expected_locals} locals, got {}",
+                locals.len()
+            )));
+        }
         match ty {
             TypeSignature::OptionalType(inner) => {
-                let inner_size = self.borrow_local(ValType::I32);
-                self.runtime_size(builder, inner, &locals[1..], *inner_size)?;
-                builder
-                    .local_get(locals[0])
-                    .if_else(
-                        ValType::I32,
-                        |then| {
-                            then.local_get(*inner_size)
-                                .i32_const(1)
-                                .binop(BinaryOp::I32Add);
-                        },
-                        |else_| {
-                            else_.i32_const(2);
-                        },
-                    )
-                    .local_set(size);
+                let some = {
+                    let mut some = builder.dangling_instr_seq(None);
+                    self.runtime_size(&mut some, inner, &locals[1..], size)?;
+                    some.local_get(size)
+                        .i32_const(1)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(size);
+                    some.id()
+                };
+
+                let none = {
+                    let mut none = builder.dangling_instr_seq(None);
+                    none.i32_const(2).local_set(size);
+                    none.id()
+                };
+
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: some,
+                    alternative: none,
+                });
             }
             TypeSignature::ResponseType(response) => {
                 let ok_locals = clar2wasm_ty(&response.0).len();
-                let ok_size = self.borrow_local(ValType::I32);
-                let err_size = self.borrow_local(ValType::I32);
-                self.runtime_size(builder, &response.0, &locals[1..], *ok_size)?;
-                self.runtime_size(builder, &response.1, &locals[1 + ok_locals..], *err_size)?;
-                builder
-                    .local_get(locals[0])
-                    .if_else(
-                        ValType::I32,
-                        |then| {
-                            then.local_get(*ok_size)
-                                .i32_const(1)
-                                .binop(BinaryOp::I32Add);
-                        },
-                        |else_| {
-                            else_
-                                .local_get(*err_size)
-                                .i32_const(1)
-                                .binop(BinaryOp::I32Add);
-                        },
-                    )
-                    .local_set(size);
+                let err_locals = clar2wasm_ty(&response.1).len();
+
+                let ok = {
+                    let mut ok = builder.dangling_instr_seq(None);
+                    self.runtime_size(&mut ok, &response.0, &locals[1..1 + ok_locals], size)?;
+                    ok.local_get(size)
+                        .i32_const(1)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(size);
+                    ok.id()
+                };
+
+                let err = {
+                    let mut err = builder.dangling_instr_seq(None);
+                    self.runtime_size(
+                        &mut err,
+                        &response.1,
+                        &locals[1 + ok_locals..1 + ok_locals + err_locals],
+                        size,
+                    )?;
+                    err.local_get(size)
+                        .i32_const(1)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(size);
+                    err.id()
+                };
+
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: ok,
+                    alternative: err,
+                });
             }
             // A byte sequence is `4 + len`, and a UTF-8 string is
             // `4 + 4 * characters` over four-byte scalars, so both are four
@@ -1936,22 +2039,19 @@ impl WasmGenerator {
                     .binop(BinaryOp::I32Add)
                     .local_set(size);
             }
-            // A list is `entry * count + type_size`, and its stack length is
-            // bytes, so the count is that over the entry's in-memory width
-            // (`words/sequences.rs`, `Len`).
-            TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
-                let entry = self.clarity_value_size(list.get_list_item_type())?;
-                let width = get_type_size(list.get_list_item_type());
-                let declared = self.clarity_value_size(ty)?;
-                let type_size = declared.saturating_sub(entry.saturating_mul(list.get_max_len()));
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+            | TypeSignature::TupleType(_) => {
+                for local in locals {
+                    builder.local_get(*local);
+                }
+                let (value_offset, _) = self.create_call_stack_local(builder, ty, true, false);
+                self.write_to_memory(builder, value_offset, 0, ty)?;
+                let (type_offset, type_length) = self.serialized_type(ty)?;
                 builder
-                    .local_get(locals[2])
-                    .i32_const(width)
-                    .binop(BinaryOp::I32DivU)
-                    .i32_const(entry as i32)
-                    .binop(BinaryOp::I32Mul)
-                    .i32_const(type_size as i32)
-                    .binop(BinaryOp::I32Add)
+                    .local_get(value_offset)
+                    .i32_const(type_offset)
+                    .i32_const(type_length)
+                    .call(self.func_by_name("stdlib.runtime_value_size"))
                     .local_set(size);
             }
             _ => {
@@ -2179,7 +2279,7 @@ impl WasmGenerator {
             | clarity::vm::Value::Sequence(_) => {
                 return Err(GeneratorError::TypeError(format!(
                     "Not a valid literal type: {value:?}"
-                )))
+                )));
             }
         };
         let memory = self.get_memory()?;
@@ -3157,6 +3257,17 @@ impl WasmGenerator {
         let expected = self.get_expr_type(expr).cloned();
         if let Some(expected) = expected.filter(|expected| *expected != ty) {
             if let Some(actions) = widen_actions(&ty, &expected) {
+                self.charge_variable_lookup(builder, self.bindings.depth())?;
+                if self.charge_local_value_copy {
+                    for value in &values {
+                        builder.local_get(*value);
+                    }
+                    self.clarity_value_size_on_stack(builder, &ty)?;
+                    let size = self.borrow_local(ValType::I32);
+                    builder.local_set(*size);
+                    drop_value(builder, &ty);
+                    self.charge_variable_copy(builder, *size)?;
+                }
                 let mut stored = values.iter();
                 for action in actions {
                     match action {
@@ -3176,7 +3287,6 @@ impl WasmGenerator {
                         }
                     }
                 }
-                self.charge_variable_lookup(builder, self.bindings.depth())?;
                 if spill_temps {
                     self.release_locals(values);
                 } else {
@@ -3251,7 +3361,41 @@ impl WasmGenerator {
                 )));
             }
         };
-        self.traverse_args(builder, args)?;
+        let external_entry = self
+            .contract_analysis
+            .get_public_function_type(name.as_str())
+            .or_else(|| {
+                self.contract_analysis
+                    .get_read_only_function_type(name.as_str())
+            })
+            .is_some();
+        let mut argument_sizes = Vec::new();
+        for arg in args {
+            self.traverse_expr(builder, arg)?;
+            if external_entry {
+                let size = self.borrow_local(ValType::I32);
+                if let SymbolicExpressionType::LiteralValue(value) = &arg.expr {
+                    let value_size = i32::try_from(
+                        value
+                            .size()
+                            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        GeneratorError::InternalError(
+                            "literal argument size exceeds i32".to_owned(),
+                        )
+                    })?;
+                    builder.i32_const(value_size).local_set(*size);
+                } else {
+                    let ty = self.get_expr_type(arg).cloned().ok_or_else(|| {
+                        GeneratorError::TypeError("function argument must be typed".into())
+                    })?;
+                    self.clarity_value_size_on_stack(builder, &ty)?;
+                    builder.local_set(*size);
+                }
+                argument_sizes.push(size);
+            }
+        }
 
         let expected_ty = self
             .get_expr_type(expr)
@@ -3259,7 +3403,15 @@ impl WasmGenerator {
                 GeneratorError::TypeError("function call expression must be typed".to_owned())
             })?
             .clone();
-        self.visit_call_user_defined(builder, name, &return_ty, Some(&expected_ty), None)
+        self.visit_call_user_defined(
+            builder,
+            name,
+            &return_ty,
+            Some(&expected_ty),
+            None,
+            external_entry.then_some(argument_sizes.as_slice()),
+        )?;
+        Ok(())
     }
 
     /// Visit a function call to a user-defined function. Arguments must have
@@ -3276,6 +3428,7 @@ impl WasmGenerator {
         return_ty: &TypeSignature,
         duck_ty: Option<&TypeSignature>,
         preallocated_memory: Option<LocalId>,
+        argument_sizes: Option<&[BorrowedLocal]>,
     ) -> Result<(), GeneratorError> {
         // this local contains the offset at which we will copy the each new element of the result
         // if there is an in-memory type
@@ -3303,13 +3456,13 @@ impl WasmGenerator {
             .get_public_function_type(name.as_str())
             .is_some()
         {
-            self.local_call_public(builder, return_ty, name)?;
+            self.local_call_public(builder, return_ty, name, argument_sizes)?;
         } else if self
             .contract_analysis
             .get_read_only_function_type(name.as_str())
             .is_some()
         {
-            self.local_call_read_only(builder, name)?;
+            self.local_call_read_only(builder, name, argument_sizes)?;
         } else if self
             .contract_analysis
             .get_private_function(name.as_str())
@@ -3360,7 +3513,7 @@ impl WasmGenerator {
             _ => {
                 return Err(GeneratorError::TypeError(format!(
                     "function {name} must have a fixed type"
-                )))
+                )));
             }
         };
         if !uses_packed_abi(&function_type) {
@@ -3423,7 +3576,15 @@ impl WasmGenerator {
         builder: &mut InstrSeqBuilder,
         return_ty: &TypeSignature,
         name: &ClarityName,
+        argument_sizes: Option<&[BorrowedLocal]>,
     ) -> Result<(), GeneratorError> {
+        self.write_argument_sizes(
+            builder,
+            argument_sizes.ok_or_else(|| {
+                GeneratorError::InternalError("public call is missing argument sizes".into())
+            })?,
+        )?;
+
         // Call the host interface function, `begin_public_call`
         builder.call(self.func_by_name("stdlib.begin_public_call"));
 
@@ -3465,7 +3626,15 @@ impl WasmGenerator {
         &mut self,
         builder: &mut InstrSeqBuilder,
         name: &ClarityName,
+        argument_sizes: Option<&[BorrowedLocal]>,
     ) -> Result<(), GeneratorError> {
+        self.write_argument_sizes(
+            builder,
+            argument_sizes.ok_or_else(|| {
+                GeneratorError::InternalError("read-only call is missing argument sizes".into())
+            })?,
+        )?;
+
         // Call the host interface function, `begin_readonly_call`
         builder.call(self.func_by_name("stdlib.begin_read_only_call"));
 
@@ -3474,6 +3643,31 @@ impl WasmGenerator {
         // Call the host interface function, `roll_back_call`
         builder.call(self.func_by_name("stdlib.roll_back_call"));
 
+        Ok(())
+    }
+
+    fn write_argument_sizes(
+        &self,
+        builder: &mut InstrSeqBuilder,
+        argument_sizes: &[BorrowedLocal],
+    ) -> Result<(), GeneratorError> {
+        let memory = self.get_memory()?;
+        for (index, size) in argument_sizes.iter().enumerate() {
+            let offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .ok_or_else(|| {
+                    GeneratorError::InternalError("function argument-size offset overflow".into())
+                })?;
+            builder
+                .global_get(self.argument_sizes)
+                .local_get(**size)
+                .store(
+                    memory,
+                    StoreKind::I32 { atomic: false },
+                    MemArg { align: 4, offset },
+                );
+        }
         Ok(())
     }
 
@@ -3724,9 +3918,93 @@ mod tests {
     // Tests that don't relate to specific words
     use crate::{
         compile,
-        tools::{crosscheck, crosscheck_compare_only, evaluate},
+        tools::{crosscheck, crosscheck_compare_only, crosscheck_cost, evaluate},
         wasm_generator::END_OF_STANDARD_DATA,
     };
+
+    fn one_exact_price_feed() -> Value {
+        Value::some(
+            Value::cons_list_unsanitized(vec![
+                Value::buff_from(vec![0x5a; 2_007]).expect("a valid price feed"),
+            ])
+            .expect("a valid price-feed list"),
+        )
+        .expect("a valid optional price-feed list")
+    }
+
+    #[test]
+    fn runtime_shape_cost_uses_actual_list_entry_size() {
+        crosscheck_cost(
+            "(define-public (consume (feeds (optional (list 3 (buff 8192)))))
+               (ok feeds))",
+            "consume",
+            &[one_exact_price_feed()],
+        );
+    }
+
+    #[test]
+    fn runtime_value_cost_survives_a_binding_and_local_call() {
+        crosscheck_cost(
+            "(define-public (collateral-add (feeds (optional (list 3 (buff 8192)))))
+               (ok feeds))
+             (define-public (supply-collateral-add
+                 (price-feed (buff 8192)))
+               (let ((payload { feeds: (some (list price-feed)) }))
+                 (collateral-add (get feeds payload))))",
+            "supply-collateral-add",
+            &[Value::buff_from(vec![0x5a; 2_007]).expect("a valid price feed")],
+        );
+    }
+
+    #[test]
+    fn runtime_value_cost_slices_response_arms() {
+        let entry = Value::Tuple(
+            TupleData::from_data(vec![
+                (ClarityName::from_literal("gas-price"), Value::UInt(12)),
+                (ClarityName::from_literal("price"), Value::UInt(34)),
+            ])
+            .expect("valid chain data"),
+        );
+        crosscheck_cost(
+            "(define-public (consume
+                 (entry (response { gas-price: uint, price: uint } uint)))
+               (ok true))",
+            "consume",
+            &[Value::okay(entry).expect("a valid response")],
+        );
+    }
+
+    #[test]
+    fn runtime_value_cost_skips_inactive_composite_arms() {
+        crosscheck_cost(
+            "(define-public (consume
+                 (entry (response { addr: principal } uint)))
+               (ok true))",
+            "consume",
+            &[Value::error(Value::UInt(7)).expect("a valid response")],
+        );
+        crosscheck_cost(
+            "(define-public (consume
+                 (entry (optional { addr: principal })))
+               (ok true))",
+            "consume",
+            &[Value::none()],
+        );
+    }
+
+    #[test]
+    fn runtime_value_cost_loads_the_gas_oracle_shape() {
+        crosscheck_cost(
+            "(define-constant err-not-found (err u4001))
+             (define-map chain-data uint { price: uint, gas-price: uint })
+             (define-read-only (get-chain-data (id uint))
+               (match (map-get? chain-data id)
+                 entry (ok entry)
+                 err-not-found))",
+            "get-chain-data",
+            &[Value::UInt(0)],
+        );
+    }
 
     #[test]
     fn is_in_regtest() {
@@ -4193,12 +4471,14 @@ mod tests {
         crosscheck(snippet, Ok(Some(clarity::vm::Value::Bool(true))));
 
         // issue 340 showed a bug for epoch < 2.1
-        assert!(crate::tools::evaluate_at(
-            snippet,
-            clarity::types::StacksEpochId::Epoch20,
-            clarity::vm::version::ClarityVersion::Clarity1,
-        )
-        .is_ok());
+        assert!(
+            crate::tools::evaluate_at(
+                snippet,
+                clarity::types::StacksEpochId::Epoch20,
+                clarity::vm::version::ClarityVersion::Clarity1,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4284,10 +4564,9 @@ mod tests {
                 (
                     ClarityName::from_literal("fn"),
                     Value::error(
-                        Value::cons_list_unsanitized(vec![Value::string_utf8_from_bytes(
-                            b"foo".to_vec(),
-                        )
-                        .unwrap()])
+                        Value::cons_list_unsanitized(vec![
+                            Value::string_utf8_from_bytes(b"foo".to_vec()).unwrap(),
+                        ])
                         .unwrap(),
                     )
                     .unwrap(),

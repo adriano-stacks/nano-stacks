@@ -186,10 +186,14 @@ impl ComplexWord for AsContractSafe {
             ArgumentCountCheck::AtLeast
         );
 
-        // TODO: add cost tracking #783
         let [allowances, inners @ ..] = args else {
             unreachable!()
         };
+
+        let allowance_list = allowances.match_list().ok_or_else(|| {
+            GeneratorError::TypeError("as-contract?'s allowances should be a list".to_owned())
+        })?;
+        self.charge(generator, builder, allowance_list.len() as u32)?;
 
         let return_ty = generator
             .get_expr_type(expr)
@@ -223,10 +227,8 @@ impl ComplexWord for AsContractSafe {
         let former_allowance_ctx = ALLOWANCE_CONTEXT.replace(Some(*allowance_ref_local));
 
         // Register each allowance (e.g. with-stx, with-stacking).
-        for allowance in allowances.match_list().ok_or_else(|| {
-            GeneratorError::TypeError("as-contract?'s allowances should be a list".to_owned())
-        })? {
-            generator.traverse_expr(builder, allowance)?;
+        for allowance in allowance_list {
+            generator.traverse_allowance_expr(builder, allowance)?;
         }
 
         let result_offset = uses_packed_value(&return_ty).then(|| {

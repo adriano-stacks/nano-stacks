@@ -136,3 +136,20 @@ That is this task's *refusal* direction rather than its silent-divergence one, s
 it is the safe half — but it means the outstanding architecture change now has a
 deployed contract behind it and not only a reduction. The network accepted this
 contract; nano cannot load it.
+
+## Runtime-shape boundary implemented, 2026-08-09
+
+The first general representation boundary now carries hidden tuple/list shape
+handles through stack, memory, local/public/cross-contract ABIs and a fresh
+per-Store canonical `Value` arena. Compiler-only type overrides preserve the
+network analysis rather than rewriting it. `default-to`, asymmetric equality,
+`index-of?`, canonical runtime size/cost and cross-contract result sanitization
+have focused interpreter differentials. The deployed Trajan append and equality
+refusals are fixed by shared sanitization/equality lowering, not contract cases.
+The full clar2wasm library gate passes 1,441 tests and strict all-target Clippy is
+green at this checkpoint.
+
+This task remains open: tuple merge, every list-metadata-preserving mutation,
+constants and the complete function/state admission matrix still need the same
+actual-shape semantics. The implemented boundary is architectural progress, not
+a claim that all asymmetric escapes are closed.

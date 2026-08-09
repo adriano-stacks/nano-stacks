@@ -4,14 +4,14 @@ use std::sync::Mutex;
 
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
-use clarity::vm::costs::{constants as cost_constants, CostTracker};
+use clarity::vm::costs::{CostTracker, constants as cost_constants};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 #[cfg(any())]
 use clarity::vm::functions::crypto::{pubkey_to_address_v1, pubkey_to_address_v2};
 #[cfg(any())]
 use clarity::vm::functions::post_conditions::{
-    check_allowances, Allowance, FtAllowance, NftAllowance, StackingAllowance, StxAllowance,
+    Allowance, FtAllowance, NftAllowance, StackingAllowance, StxAllowance, check_allowances,
 };
 use clarity::vm::types::{
     AssetIdentifier, BuffData, BufferLength, FunctionType, ListTypeData, PrincipalData,
@@ -24,13 +24,13 @@ use stacks_common::address::{
     AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
 use stacks_common::consts::CHAIN_ID_TESTNET;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::chainstate::StacksBlockId;
-use stacks_common::types::StacksEpochId;
 use stacks_common::util::ed25519::ed25519_verify;
 use stacks_common::util::hash::{Keccak256Hash, Sha512Sum, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{
-    secp256k1_decompress, secp256k1_recover, secp256k1_verify, Secp256k1PublicKey,
+    Secp256k1PublicKey, secp256k1_decompress, secp256k1_recover, secp256k1_verify,
 };
 use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
@@ -41,7 +41,7 @@ use wasmtime::{
 use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
-use crate::initialize::{call_function, ClarityWasmContext};
+use crate::initialize::{ClarityWasmContext, call_function};
 use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_utils::*;
 
@@ -270,6 +270,7 @@ pub fn link_host_functions(
 ) -> Result<(), VmExecutionError> {
     link_save_runtime_shape_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
+    link_runtime_value_size_fn(linker)?;
     link_runtime_shape_is_equal_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
@@ -388,21 +389,12 @@ fn link_save_runtime_shape_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-                let serialized_ty = read_identifier_from_wasm(
-                    memory,
+                let value = read_runtime_value(
                     &mut caller,
+                    value_offset,
                     serialized_ty_offset,
                     serialized_ty_length,
                 )?;
-                let epoch = caller.data().global_context.epoch_id;
-                let version = caller.data().contract_context().get_clarity_version();
-                let value_ty = signature_from_string(&serialized_ty, *version, epoch)?;
-                let value =
-                    read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
                 let handle = caller.data_mut().save_runtime_shape(value)?;
                 Ok(handle)
             },
@@ -441,6 +433,72 @@ fn link_runtime_shape_serialization_size_fn(
                 error,
             ))
         })
+}
+
+fn link_runtime_value_size_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_value_size",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             value_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                let size = read_runtime_value(
+                    &mut caller,
+                    value_offset,
+                    serialized_ty_offset,
+                    serialized_ty_length,
+                )?
+                .size()
+                .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                let size = i32::try_from(size)
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                Ok(size)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_value_size".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn read_runtime_value(
+    caller: &mut Caller<'_, ClarityWasmContext>,
+    value_offset: i32,
+    serialized_ty_offset: i32,
+    serialized_ty_length: i32,
+) -> Result<Value, VmExecutionError> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    let serialized_ty = read_identifier_from_wasm(
+        memory,
+        &mut *caller,
+        serialized_ty_offset,
+        serialized_ty_length,
+    )?;
+    let epoch = caller.data().global_context.epoch_id;
+    let (version, contract_identifier) = {
+        let contract = caller.data().contract_context();
+        (
+            *contract.get_clarity_version(),
+            contract.contract_identifier.clone(),
+        )
+    };
+    let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
+    read_from_wasm_indirect(memory, caller, &value_ty, value_offset, epoch).map_err(|error| {
+        crate::error::wasm_error(WasmError::Expect(format!(
+            "runtime value in {contract_identifier} at offset {value_offset} with outer type \
+             {serialized_ty} could not be read: {error}"
+        )))
+    })
 }
 
 fn link_runtime_shape_is_equal_fn(
@@ -3477,7 +3535,7 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 ) {
                     Err(VmExecutionError::Runtime(RuntimeError::NoSuchToken, _)) => Ok(()),
                     Ok(_owner) => {
-                        return Ok((0i32, 0i32, MintAssetErrorCodes::ALREADY_EXIST as i64, 0i64))
+                        return Ok((0i32, 0i32, MintAssetErrorCodes::ALREADY_EXIST as i64, 0i64));
                     }
                     Err(e) => Err(e),
                 }?;
@@ -3631,7 +3689,7 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                             0i32,
                             TransferAssetErrorCodes::DOES_NOT_EXIST as i64,
                             0i64,
-                        ))
+                        ));
                     }
                     Err(e) => Err(e),
                 }?;
@@ -5513,6 +5571,27 @@ fn link_get_tenure_info_miner_spend_winner_property_fn(
         })
 }
 
+fn sanitize_contract_call_result(
+    epoch: &StacksEpochId,
+    returns_constraint: Option<&TypeSignature>,
+    result: Value,
+) -> Result<Value, VmExecutionError> {
+    let result_type = TypeSignature::type_of(&result)?;
+    let (result, _) = Value::sanitize_value(epoch, &result_type, result)
+        .ok_or(RuntimeCheckErrorKind::CouldNotDetermineType)?;
+    if let Some(expected) = returns_constraint {
+        let actual = TypeSignature::type_of(&result)?;
+        if !expected.admits_type(epoch, &actual)? {
+            return Err(RuntimeCheckErrorKind::ReturnTypesMustMatch(
+                Box::new(expected.clone()),
+                Box::new(actual),
+            )
+            .into());
+        }
+    }
+    Ok(result)
+}
+
 /// Link host interface function, `contract_call`, into the Wasm module.
 /// This function is called for `contract-call?`s.
 #[cfg(any())]
@@ -5870,22 +5949,11 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                             module_cache,
                         )?
                     };
-
-                    // Every cross-contract call and what it answered. Two
-                    // engines can return the same value from a transaction by
-                    // different routes, and the first call they answer
-                    // differently is the only thing that names where they part.
-                    if std::env::var_os("NANO_TRACE_CALLS").is_some() {
-                        println!(
-                            "call {contract_id}::{function_name}({}) -> {result}",
-                            arguments
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-
+                    let result = sanitize_contract_call_result(
+                        &epoch,
+                        (trait_id_length != 0).then_some(&return_type),
+                        result,
+                    )?;
                     write_to_wasm(
                         &mut caller,
                         memory,
@@ -6269,7 +6337,7 @@ fn link_enter_at_block_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
                             Box::new(TypeSignature::BUFFER_32.clone()),
                             x.to_error_string(),
                         )
-                        .into())
+                        .into());
                     }
                 };
 
@@ -6969,7 +7037,7 @@ fn link_principal_of_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                             Box::new(TypeSignature::BUFFER_33.clone()),
                             key_val.to_error_string(),
                         )
-                        .into())
+                        .into());
                     }
                 };
 
@@ -7264,6 +7332,12 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         "clarity",
         "runtime_shape_serialization_size",
         |_handle: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "runtime_value_size",
+        |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
     )?;
 
     linker.func_wrap(

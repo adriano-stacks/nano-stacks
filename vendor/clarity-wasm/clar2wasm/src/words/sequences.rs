@@ -333,6 +333,7 @@ impl ComplexWord for Fold {
                     .map_or(&result_clar_ty, |fft| &fft.return_ty),
                 fold_func_ty.as_ref().map(|fft| &fft.acc_ty),
                 Some(*preallocated),
+                None,
             )?;
         }
         // Save the result into the locals (in reverse order as we pop)
@@ -1094,6 +1095,7 @@ impl ComplexWord for Map {
                     &user_defined_return_type,
                     Some(return_element_type),
                     in_memory_offset,
+                    None,
                 )?;
             }
 
