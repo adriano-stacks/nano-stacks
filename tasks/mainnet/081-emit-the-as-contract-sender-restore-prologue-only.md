@@ -25,7 +25,7 @@ switch the sender, instead of for every generated function.
 - [x] Keep every sender-leak regression green, including the mainnet
       8,668,161 shape — a function that `asserts!` its way out of `as-contract`,
       called twice by `map`.
-- [ ] Re-measure the prologue locals across the mainnet contract sweep recorded in
+- [x] Re-measure the prologue locals across the mainnet contract sweep recorded in
       [[073-decide-whether-a-contract-clarity-wasm-cannot-load]] ("Mainnet-state
       margin") and state the headroom this returns.
 
@@ -70,3 +70,22 @@ Note the interaction with [[073]]'s B2: the two prologue locals also count
 toward a function's local total, so removing them where unneeded slightly
 raises headroom under wasmparser's 50,000-locals limit — though after A+B1+B2
 no source-level shape reaches that limit anyway.
+
+## Mainnet-state measurement — 2026-08-09
+
+`cargo xtask sweep-contracts /home/aldur/mainnet-8716986/state` measured a
+maximum of **17,055 live locals out of 50,000**, leaving **32,945 locals of
+headroom**, at
+`SP3EGAD1CG4KTM1Z3B2D85WQMC1FQG0FVM3TPAE8D.t-a-1::.top-level`.
+
+The maximum is a top-level expression, so it has no function sender-restore
+prologue: this optimization returns **zero additional locals at the measured
+worst site**. It still removes exactly two locals from each generated function
+that does not contain `as-contract`. The earlier 16,505 maximum is not a valid
+before/after delta because other compiler changes landed between the two full
+sweeps.
+
+The inventory verdict was red for an orthogonal reason: 64 current contracts
+compiled but did not load. That does not hide a locals measurement — their
+compile reports were included — and it is recorded under [[084]] and [[093]],
+not claimed as success here.

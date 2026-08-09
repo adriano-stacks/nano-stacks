@@ -71,12 +71,14 @@ cargo xtask check-module /home/aldur/mainnet-8716986/state \
       `SequenceSubtype::unit_type` rather than from a read strategy that cannot
       tell a buffer from an ASCII string. All four `gated-pages` compile and
       load.**
-- [ ] `trajan-endorsement-alpha` is blocked on [[068]] rather than on a fix here.
-      Moved there.
+- [x] `trajan-endorsement-alpha` loads after [[068]]'s literal-append narrowing
+      fix. Task 068 remains open for its broader dynamic-shape requirements.
 - [ ] Crosscheck each minimized source against the reference interpreter for
       result, receipt, cost, events and writes — not merely that it compiles.
 - [ ] Add every reduction to the mandatory conformance suite, and re-run the
-      full mainnet sweep to confirm 137,340/137,340.
+      full mainnet sweep to confirm every current-tip contract loads. The honest
+      current denominator is 137,284; 58 of 137,342 distinct metadata candidates
+      are proven stale and must remain separately reported.
 
 ## Acceptance Criteria
 
@@ -255,3 +257,27 @@ had only minimized cases, and that is worth knowing: 068 is no longer only a
 differential nobody has met.
 
 **Seven of eight load. The eighth is 068's.**
+
+## Corrected full-state result — 2026-08-09 (still red)
+
+The original eight no longer appear among the refusals, including
+`trajan-endorsement-alpha`, but that does **not** close the full-inventory
+acceptance criterion. The corrected production-path sweep reported:
+
+```text
+137220/137284 current-tip contracts compile and load
+58 stale candidates excluded from 137342 distinct / 146346 raw metadata rows
+64 current-tip contracts refused
+```
+
+All 64 new refusals are the same Wasm validation family:
+`type mismatch: expected i32 but nothing on stack`. They are current, sourced,
+and below the measured arity boundary, so they are neither stale metadata nor an
+arity-lowering failure. The command exited 1 and its output is
+`/tmp/task081-084-inventory-current.txt`.
+
+Accordingly, the original reductions are evidenced as loading, but the mandatory
+full-sweep bullet and this task remain open. The next implementation work is to
+reduce and fix the shared `expected i32`/empty-stack code-generation path, then
+repeat the same current-tip inventory to 137,284/137,284 rather than restoring
+the obsolete raw-row denominator.

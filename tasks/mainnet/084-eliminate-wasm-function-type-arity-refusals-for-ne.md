@@ -179,3 +179,25 @@ that were never under it: `ensure_wasm_module` compiles under the epoch the chai
 *records*, because it decides which words exist. `sweep-contracts` reads the
 recorded epoch now (`Vm::recorded_deploy_epoch`). A sweep that assumes an epoch
 measures its own assumption.
+
+## Corrected current-tip inventory — 2026-08-09 (red)
+
+`cargo xtask sweep-contracts /home/aldur/mainnet-8716986/state` completed with
+status 1; its output is `/tmp/task081-084-inventory-current.txt`. The corrected
+accounting is **146,346 metadata rows → 137,342 distinct candidates → 58 proven
+stale/noncanonical rows excluded → 137,284 current contracts**. Of those,
+**137,220 compile and load and 64 refuse to load**. No load or inventory
+checklist item is closed by this run.
+
+The accepted numeric arity measurements are:
+
+- maximum function parameters/results: **1,003 / 1,128**;
+- maximum control parameters/results: **71 / 1,128**;
+- maximum top-level results: **65**.
+
+Both current contracts above Wasmtime's 1,000-slot boundary were lowered and
+loaded: `mix-sender-dope` at 1,003 function parameters and `pox-4` at 1,128
+function/control results. None of the 64 refusals is an arity refusal; all say
+`type mismatch: expected i32 but nothing on stack`. The lowering is therefore
+measured, but the release verdict correctly remains red until those current-tip
+refusals are eliminated and the stock-node deployment evidence is complete.
