@@ -125,3 +125,28 @@ build is the tool):
 2. **Read wait, ~6×**: nano reads ~7 MB per block for the ancestry walk;
    stacks-core's flat blob layout reads a fraction of that from a file 30×
    larger. Read amplification, not disk speed, is the gap.
+
+## Second round, 2026-08-10 evening: the arena (commit 35487894)
+
+An instrumented build split the user CPU: 221 of 389 seconds of a
+1,500-block replay were spent inside node *decode* — which blocks on
+resolving back-pointer children to ancestor block hashes through an 8 MB
+id→hash cache standing against 8.7 million blocks. Replaced with a flat
+append-only arena (one sequential scan at open, ~280 MB for the whole
+graph, retraction-safe because deleted ids are unreachable and `forget`
+rebuilds it).
+
+| same 4,149 blocks | wall | user | sys | CPU |
+|---|---|---|---|---|
+| nano, 16 KiB + pread | 23:36 | 501 s | 183 s | 48% |
+| nano + arena | **7:46** | 409 s | 60 s | 100% |
+| stacks-core validate-only | 5:54 | 158 s | 72 s | 65% |
+
+Gap now 1.32×, and nano is compute-bound: with the arena, MARF fetch and
+decode are 5.7 s of 159 s user CPU on the instrumented 1,500-block run.
+The remainder lives in the VM/host path. Next candidates, in likely order
+of size: the per-call wasmtime linker rebuild (223 host functions per
+call; caching blocked on `ClarityWasmContext` lifetimes), boundary value
+copies, `compile_under` running full codegen to find a native-cache key,
+and per-seal hashing. Lockstep, checkpoint and kill-during suites green
+after the change.
