@@ -123,3 +123,8 @@ and the task itself remain open.
       and accounting; complete the captured replay/follow window and retain release
       output showing every signer, miner, sortition, coinbase VRF, parent-seed and
       tenure-continuity check exercised with zero fail-open `cannot check` lines.
+- [x] Make `tenure_continuity` pass inside the complete release suite. With the
+      mainnet capture supplied, all four tests pass: the captured control is
+      accepted, wrong tenure identity and length are refused, and the mainnet
+      sample agrees on the tenure identity it can measure. No authentication
+      check was weakened or bypassed.

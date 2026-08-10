@@ -1885,3 +1885,40 @@ pub fn derived_chain(
     );
     tracker
 }
+
+/// Add the winning keys this node derives from the captured Bitcoin chain.
+pub fn authenticated_context(
+    mut context: BitcoinBlockContext,
+    tenure: ConsensusHash,
+) -> BitcoinBlockContext {
+    let seed = nano_node::CheckpointManifest::load(fixtures().join("chainstate/checkpoint-H"))
+        .expect("read the checkpoint manifest")
+        .first_bitcoin_height;
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let directory = tempfile::tempdir().expect("a local sortition capture");
+    let tracker = derived_chain(
+        seed,
+        context.height,
+        &burnchain,
+        &directory.path().join("sortition"),
+    );
+    let snapshot = tracker
+        .snapshot_at(context.height)
+        .expect("the local sortition chain reaches the tenure");
+    assert_eq!(
+        snapshot.consensus_hash, tenure,
+        "the locally derived burn view is the captured tenure's"
+    );
+    context.sortition_hash = *snapshot.sortition_hash.as_bytes();
+    context.winner_vrf_public_key = Some(
+        snapshot
+            .winner_vrf_public_key
+            .expect("the local sortition resolves the winning VRF key"),
+    );
+    context.winner_signing_key_hash = Some(
+        snapshot
+            .winner_signing_key_hash
+            .expect("the local sortition resolves the winning signing key"),
+    );
+    context
+}

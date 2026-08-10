@@ -29,6 +29,8 @@ use nano_codec::{
 use nano_conformance::{FixtureManifest, FixtureMode, replay_into};
 use nano_crypto::StacksPrivateKey;
 
+use crate::follow_path::authenticated_context;
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
@@ -63,7 +65,10 @@ fn standing_on_a_whole_tenure() -> Option<Standing> {
         .map(|(index, _)| index)?;
     let block = blocks.get(target)?.clone();
     let view = block.header.consensus_hash.to_string();
-    let context = *nano_conformance::captured_bitcoin_snapshots(&fixtures)?.get(&view)?;
+    let context = authenticated_context(
+        *nano_conformance::captured_bitcoin_snapshots(&fixtures)?.get(&view)?,
+        block.header.consensus_hash,
+    );
     let operations = nano_conformance::captured_bitcoin_operations(&fixtures)?
         .get(&view)
         .cloned()
