@@ -77,3 +77,10 @@ opt-level = 3
 [profile.loop]
 inherits = "release"
 incremental = true
+
+# Thin LTO and one codegen unit: measured on the 4,149-block mainnet replay
+# together with the allocator, and kept because the node is the same hot code.
+# `--profile loop` stays the fast-iteration escape hatch.
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -24,6 +24,7 @@ nano-oracle = { path = "../nano-oracle" }
 # either way, and this crate is never in the node's graph.
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
+mimalloc = "0.1"
 # The scoreboard reads a node's side store to tell a sealed state from a committed
 # block, and does it *read-only*: the state it is pointed at is usually a running
 # node's. Opening a `Vm` would be the DRY route and is the wrong one for that.

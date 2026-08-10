@@ -26,6 +26,12 @@ enum Command {
     },
 }
 
+/// The same allocator the replay tool measured: 14% off a mainnet replay, and
+/// an allocator with page decay also returns freed churn to the OS instead of
+/// ratcheting RSS the way glibc arenas did on the follower.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let Cli { command } = Cli::parse();

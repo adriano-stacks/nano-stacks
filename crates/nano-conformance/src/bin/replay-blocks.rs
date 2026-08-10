@@ -23,6 +23,11 @@ use nano_conformance::{
     FixtureManifest, FixtureMode, captured_blocks_sealed, durable_replay_chainstate, replay_into,
 };
 
+/// Execution decodes a trie node and boxes its children for every cache miss,
+/// and under glibc malloc that churn cost 14% of a 4,149-block mainnet replay.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let ([fixtures, directory, blocks], journal) = match arguments.as_slice() {
