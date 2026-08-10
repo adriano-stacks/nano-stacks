@@ -1,7 +1,7 @@
 ---
 title: "Eliminate WASM function type arity refusals for network valid contracts"
 id: "084"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["067"]
 tags: ["mainnet", "vm", "clarity", "wasm", "conformance", "release"]
 created_at: "2026-08-07"
+completed_at: 2026-08-09
 ---
 
 # Eliminate WASM function type arity refusals for network valid contracts
@@ -28,10 +29,10 @@ bug.
 - [x] Measure the smallest source that exceeds WebAssembly parameter and result
       arity separately, including nested tuples, optionals, responses, public
       functions, read-only functions and cross-contract calls.
-- [ ] Establish network validity with the pinned stacks-core analyzer, source and
+- [x] Establish network validity with the pinned stacks-core analyzer, source and
       transaction size limits, deploy costs and an actual stock-node deployment;
       interpreter acceptance alone is not sufficient release evidence.
-- [ ] Measure the maximum flattened parameter/result arity across every contract in
+- [x] Measure the maximum flattened parameter/result arity across every contract in
       the imported mainnet state and account for every contract the sweep cannot
       compile under task 073. **The second half is done — [[093]] classified all
       eight, and seven now load. The first half had a hole: 073's sweep called
@@ -51,7 +52,7 @@ bug.
 - [x] Preserve compile, module-load, host and runtime failure-path coverage with
       faults that are not valid Clarity programs the production node is required
       to execute.
-- [ ] Add the measured boundary and verdict to the release report, and make any
+- [x] Add the measured boundary and verdict to the release report, and make any
       unresolved network-valid refusal fail it.
 
 ## Acceptance Criteria
@@ -201,3 +202,46 @@ function/control results. None of the 64 refusals is an arity refusal; all say
 `type mismatch: expected i32 but nothing on stack`. The lowering is therefore
 measured, but the release verdict correctly remains red until those current-tip
 refusals are eliminated and the stock-node deployment evidence is complete.
+
+## Authoritative current-tip inventory — 2026-08-09 (green)
+
+After the runtime-shape validation family was fixed, the same production-path
+sweep reports **137,284/137,284** current-tip contracts compiling and loading,
+with 58 stale metadata candidates separately excluded. There are zero refused or
+unmeasured contracts.
+
+The measured maxima are **1,003 function parameters, 1,128 function results, 71
+control parameters, 1,128 control results and 65 top-level results**. Both real
+contracts beyond the 1,000-slot engine boundary are lowered and load:
+`mix-sender-dope` at 1,003 parameters and user `pox-4` at 1,128 function/control
+results. `release-report --state` consumes these maxima and fails qualification
+for an absent, unmeasured or refusing inventory. Retained output:
+`/tmp/task073-inventory-task099.txt`, SHA-256
+`2e96c3c9e5778c38662b067277f8b6aa3c7018afd2d0232208a7de1fd4ee470f`.
+
+The deliberately independent stock stacks-core analyzer/deployment evidence is
+recorded below. Interpreter acceptance and the green mainnet inventory are not
+being relabelled as that network-validity proof.
+
+## Pinned stock deployment — 2026-08-09
+
+`stock_arity_deployment::the_pinned_stock_node_deploys_a_function_beyond_wasmtime_arity`
+constructs a read-only function whose 501-field tuple parameter and result each
+flatten to 1,002 Wasm slots. The signed deployment's source and consensus-encoded
+transaction are both below `MAX_TRANSACTION_LEN`. It is processed at Epoch 4 by
+the pinned stacks-core `StacksChainState::process_transaction` path, rather than
+by nano's interpreter oracle.
+
+The stock analyzer records the contract analysis, the receipt is `(ok true)`
+with no VM or post-condition error, every deploy-cost dimension is below
+`BLOCK_LIMIT_MAINNET_40`, the source and analysis are present in the deployment
+state, and the production commit API accepts the block. The exact focused test
+and strict all-target conformance Clippy are green. Retained test output is
+`/tmp/task084-stock-deployment.txt`, SHA-256
+`b68f02fd7a4cc0b17db67bd3edc67e5dbc109a811ef43f422959004d88b22363`.
+
+The current-tree production inventory independently reports 137,284/137,284
+current-tip modules loading, including both real contracts beyond the engine's
+raw 1,000-slot boundary. Its retained output is
+`/tmp/task068-inventory-final.txt`, SHA-256
+`677c2e834e2a7209beabbf1af9c0531fbad570bd217c04135928f18fabdf77d6`.
