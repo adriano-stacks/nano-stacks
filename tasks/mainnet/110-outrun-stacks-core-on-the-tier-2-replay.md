@@ -243,3 +243,20 @@ Closing it is engine work inside clarity-wasm (W6 territory): batching or
 flattening host calls, cheaper value marshalling, possibly caching
 instances per (contract, block). That is the continuation, with this
 harness as its regression gate.
+
+## Seventh round: the last hypothesis tested tonight
+
+Sequential native-module reads in place of `deserialize_file`'s lazy mmap
+faults: no change (6:42 vs the 6:33–6:48 band), reverted. The unattributed
+~60 s of wall is therefore the durable-write path on a copy-on-write
+filesystem plus scheduler noise — the committing/validating asymmetry once
+more — and the user-CPU gap is the wasm host path, as round six measured.
+
+Ten hypotheses tested this session: seven shipped with measured wins,
+three measured null and reverted. The two moves that close the remaining
+53 s are known and sized: a validate-only replay mode (the seam is
+`replay_into`'s executor parameter; needs an equivalence argument and the
+full suite battery) for a symmetric benchmark, and host-call machinery
+work inside clarity-wasm for a real win that also speeds every node at
+tip. Neither is an evening's verified change; both inherit this harness
+as their gate.
