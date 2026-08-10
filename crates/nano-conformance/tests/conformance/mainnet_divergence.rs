@@ -41,6 +41,10 @@ const TASK_098_PARENT_HEIGHT: u32 = 8_724_864;
 const TASK_098_CHILD_HEIGHT: u32 = TASK_098_PARENT_HEIGHT + 1;
 const TASK_098_BLOCK_FILE: &str = "block-8724865.hex";
 const TASK_098_ORACLE_FILE: &str = "tx-24d632-receipt.json";
+const TASK_111_PARENT_HEIGHT: u32 = 8_733_928;
+const TASK_111_CHILD_HEIGHT: u32 = TASK_111_PARENT_HEIGHT + 1;
+const TASK_111_BLOCK_FILE: &str = "block-8733929.hex";
+const TASK_111_ORACLE_FILE: &str = "tx-6f8b-receipt.json";
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -344,6 +348,16 @@ fn normalized_event(event: &JsonValue) -> JsonValue {
                 "sender": body["sender"],
                 "recipient": body["recipient"],
                 "amount": body["amount"],
+            })
+        }
+        "stx_lock_event" => {
+            let body = &event["stx_lock_event"];
+            json!({
+                "kind": "stx",
+                "operation": "lock",
+                "locked_address": body["locked_address"],
+                "locked_amount": body["locked_amount"],
+                "unlock_height": body["unlock_height"],
             })
         }
         "contract_event" => {
@@ -934,5 +948,77 @@ fn the_mainnet_8724865_nested_trait_receipt_and_root_match_the_canonical_oracle(
     );
     assert_eq!(first.cost, oracle.cost);
     assert_eq!(first.events.len(), 21, "oracle event count changed");
+    source_is_unchanged(&inputs);
+}
+
+fn task_111_fixture() -> (NakamotoBlock, Oracle) {
+    hex_fixture(TASK_111_BLOCK_FILE, TASK_111_ORACLE_FILE)
+}
+
+#[test]
+fn the_mainnet_8733929_fastpool_fixture_is_self_consistent() {
+    let (block, oracle) = task_111_fixture();
+    assert_eq!(block.header.chain_length, u64::from(TASK_111_CHILD_HEIGHT));
+    assert_eq!(block.transactions.len(), 2);
+    assert_eq!(oracle.tx_index, 1);
+    assert_eq!(
+        block.transactions[oracle.tx_index].txid().to_string(),
+        oracle.txid
+    );
+    assert_eq!(oracle.events.len(), 2);
+    assert_eq!(
+        oracle.result.hex,
+        "070c000000070b616d6f756e742d7573747801000000000000000000000836928d74001266697273742d7265776172642d6379636c65010000000000000000000000000000008d0a6e756d2d6379636c65730100000000000000000000000000000060067369676e65720616296a283b358830510c486f90c13d924b92a6590e1e66617374706f6f6c2d6d61783530302d7369676e65722d6d616e61676572067374616b6572051685dc5a6a081acba8e773d6549953f6a2020ac17f12756e6c6f636b2d6275726e2d686569676874010000000000000000000000000011c1e60c756e6c6f636b2d6379636c6501000000000000000000000000000000ed"
+    );
+    assert_eq!(
+        oracle.result.repr,
+        "(ok (tuple (amount-ustx u9030480000000) (first-reward-cycle u141) (num-cycles u96) (signer 'SPMPMA1V6P430M8C91QS1G9XJ95S59JS1TZFZ4Q4.fastpool-max500-signer-manager) (staker 'SP22XRPKA10DCQA77EFB596AKYTH042P1FZH0BMQZ) (unlock-burn-height u1163750) (unlock-cycle u237)))"
+    );
+}
+
+#[test]
+#[ignore = "requires immutable mainnet source state and a fresh writable reflink scratch"]
+fn the_mainnet_8733929_fastpool_receipt_and_root_match_the_canonical_oracle() {
+    let inputs = inputs("NANO_111_SOURCE", "NANO_111_SCRATCH");
+    let (block, oracle) = task_111_fixture();
+    let mut source = ChainState::open_existing(&inputs.source).expect("open source read-only");
+    let mut scratch = ChainState::open(source.network(), &inputs.scratch).expect("open scratch");
+    let (parent, child) = validate_fixture(
+        &mut source,
+        &mut scratch,
+        &block,
+        &oracle,
+        TASK_111_PARENT_HEIGHT,
+        TASK_111_CHILD_HEIGHT,
+    );
+    let context = context(parent, child);
+    let first = replay_once(
+        &mut scratch,
+        &block,
+        context,
+        &oracle,
+        TASK_111_PARENT_HEIGHT,
+    );
+    let second = replay_once(
+        &mut scratch,
+        &block,
+        context,
+        &oracle,
+        TASK_111_PARENT_HEIGHT,
+    );
+
+    assert_eq!(first, second, "two scratch replays must be deterministic");
+    assert_eq!(first.state_root, *block.header.state_index_root.as_bytes());
+    assert_eq!(first.result_hex, oracle.result.hex);
+    assert_eq!(first.result_repr, oracle.result.repr);
+    assert_eq!(first.events, oracle.events);
+    compare_engines_at_exact_fixture_prestate(
+        &mut scratch,
+        &block,
+        context,
+        &oracle,
+        TASK_111_PARENT_HEIGHT,
+    );
+    assert_eq!(first.cost, oracle.cost);
     source_is_unchanged(&inputs);
 }

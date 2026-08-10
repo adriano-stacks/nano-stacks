@@ -263,6 +263,22 @@ the explicitly unauthenticated fixture seam. The fixture append still uses
 `RootPolicy::Verify`, so a different VM result cannot seal, but signer weights,
 tenure linkage and the parent-tenure VRF proof are outside this gate.
 
+## Fastpool signer-manager replay at 8,733,929
+
+`block-8733929.hex` and `tx-6f8b-receipt.json` freeze the block and canonical
+receipt that exposed task 111. The same scratch harness executes the block twice,
+checks its committed root, and compares the compiler and interpreter at the
+transaction's exact prestate, including result, all five cost dimensions, events
+and asset writes:
+
+```text
+NANO_111_SOURCE=/path/to/immutable/chainstate \
+NANO_111_SCRATCH=/path/to/fresh/reflink/chainstate \
+cargo test -p nano-conformance --test conformance \
+  mainnet_divergence::the_mainnet_8733929_fastpool_receipt_and_root_match_the_canonical_oracle \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
 ### Exact result and the last 24 runtime units
 
 Two independent fresh reflink scratches, run in separate test processes, now
