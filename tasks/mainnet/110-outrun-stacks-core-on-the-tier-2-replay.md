@@ -275,3 +275,19 @@ the block deterministically seals a different root (reproduced at
 8,665,602). A correct validate mode needs canonical-at-height metadata
 resolution first. The experiment is reverted whole; this note is what it
 bought.
+
+## Ninth round: the gap is quantified at the boundary
+
+A `Store::call_hook` probe (one hook, no closure touched) over 1,500 blocks:
+**4,896,022 host calls, 59.1 s of 105.8 s user CPU** — 3,264 boundary
+crossings per block at ~12 µs each, 56% of all execution. The generated
+wasm code itself costs ~47 s, already competitive with the interpreter's
+whole budget. The engine work is therefore not codegen quality but call
+*volume*: per-access data hops and type bookkeeping cross the boundary one
+value at a time where the interpreter pays a nanosecond Rust call.
+
+Concrete continuation, now with a target: count host calls per name (the
+same hook, keyed), then cut the top of the distribution — emit type/size
+bookkeeping as wasm-side code, batch data reads, widen the hot intrinsics.
+Every 800 calls removed per block is roughly ten seconds off this
+benchmark; parity needs about half of them gone.
