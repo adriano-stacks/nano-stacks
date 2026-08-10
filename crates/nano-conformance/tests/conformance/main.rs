@@ -49,6 +49,7 @@ mod mainnet_accounting;
 mod mainnet_checkpoint;
 mod mainnet_codec;
 mod mainnet_codegen;
+mod mainnet_codegen_effects;
 mod mainnet_divergence;
 mod mainnet_envelope;
 mod mainnet_receipts;

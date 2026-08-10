@@ -2,13 +2,14 @@
 id: "093"
 group: mainnet
 title: "Load the eight mainnet contracts clarity-wasm refuses"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["073"]
 tags: ["mainnet", "vm", "clarity", "wasm", "conformance", "release"]
 created_at: 2026-08-08
 type: bug
+completed_at: 2026-08-09
 ---
 
 # Load the eight mainnet contracts clarity-wasm refuses
@@ -73,9 +74,9 @@ cargo xtask check-module /home/aldur/mainnet-8716986/state \
       load.**
 - [x] `trajan-endorsement-alpha` loads after [[068]]'s literal-append narrowing
       fix. Task 068 remains open for its broader dynamic-shape requirements.
-- [ ] Crosscheck each minimized source against the reference interpreter for
+- [x] Crosscheck each minimized source against the reference interpreter for
       result, receipt, cost, events and writes — not merely that it compiles.
-- [ ] Add every reduction to the mandatory conformance suite, and re-run the
+- [x] Add every reduction to the mandatory conformance suite, and re-run the
       full mainnet sweep to confirm every current-tip contract loads. The honest
       current denominator is 137,284; 58 of 137,342 distinct metadata candidates
       are proven stale and must remain separately reported.
@@ -258,7 +259,7 @@ differential nobody has met.
 
 **Seven of eight load. The eighth is 068's.**
 
-## Corrected full-state result — 2026-08-09 (still red)
+## Corrected full-state result — 2026-08-09
 
 The original eight no longer appear among the refusals, including
 `trajan-endorsement-alpha`, but that does **not** close the full-inventory
@@ -281,3 +282,28 @@ full-sweep bullet and this task remain open. The next implementation work is to
 reduce and fix the shared `expected i32`/empty-stack code-generation path, then
 repeat the same current-tip inventory to 137,284/137,284 rather than restoring
 the obsolete raw-row denominator.
+
+That implementation work is now complete. The authoritative production-path
+sweep reports:
+
+```text
+137284/137284 current-tip contracts compile and load
+58 stale metadata candidates excluded from 137342 distinct / 146346 raw rows
+```
+
+No contract is refused or unmeasured. The retained output is
+`/tmp/task073-inventory-task099.txt` (SHA-256
+`2e96c3c9e5778c38662b067277f8b6aa3c7018afd2d0232208a7de1fd4ee470f`).
+
+The mandatory `mainnet_codegen_effects` module exercises one reduction for each
+defect family as a complete transaction. Trait equality, mapping over an ASCII
+string and appending a wider user-function result each compare compiler and
+interpreter result, all five cost dimensions, ordered print event, `AssetMap`,
+committed data-var value and sealed root. All three passed in both the development
+and release-profile full conformance suites; the latter finished at **277 passed,
+0 failed, 5 inventoried infrastructure ignores**. The focused trait, sequence and
+runtime-shape suites remain in place as lower-level pins.
+
+The broader asymmetric-shape admission work remains honestly open under [[068]],
+but it no longer prevents any of these eight deployed contracts from compiling or
+loading and is not an exception in the sweep.
