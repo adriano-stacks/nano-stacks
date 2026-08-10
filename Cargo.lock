@@ -2883,6 +2883,7 @@ dependencies = [
  "nano-primitives",
  "rusqlite",
  "serde",
+ "tempfile",
  "toml 1.1.4+spec-1.1.0",
 ]
 

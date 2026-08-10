@@ -245,8 +245,8 @@ impl TrieStorage {
         // Only a database created by this open takes the page size; an existing
         // file keeps its own. Nodes of one block sit adjacent under the
         // `(block, idx)` key, so a 16 KiB page turns four scattered reads into
-        // one — measured on a mainnet ancestry walk, and it also rewrote a
-        // 23 GB store into 14 GB.
+        // one — measured on a mainnet ancestry walk. At equal compaction it
+        // also reduced the mainnet store from 15.6 GB to 14.2 GB.
         connection.pragma_update(None, "page_size", SQLITE_PAGE_BYTES)?;
         let mode = if journal { "WAL" } else { "OFF" };
         connection.query_row(&format!("PRAGMA journal_mode = {mode}"), [], |_| Ok(()))?;
