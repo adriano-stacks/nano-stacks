@@ -1531,7 +1531,6 @@ pub fn is_in_memory_type(ty: &TypeSignature) -> bool {
     }
 }
 
-#[allow(clippy::unimplemented)]
 pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
     match ty {
         TypeSignature::NoType => vec![ValType::I32], // TODO: issue #445. Can this just be empty?
@@ -1555,7 +1554,8 @@ pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
         TypeSignature::BoolType => vec![ValType::I32],
         TypeSignature::PrincipalType
         | TypeSignature::CallableType(_)
-        | TypeSignature::ListUnionType(_) => vec![
+        | TypeSignature::ListUnionType(_)
+        | TypeSignature::TraitReferenceType(_) => vec![
             ValType::I32, // offset
             ValType::I32, // length
         ],
@@ -1571,7 +1571,6 @@ pub fn wasm_value_types(ty: &TypeSignature) -> Vec<ValType> {
             }
             types
         }
-        _ => unimplemented!("{:?}", ty),
     }
 }
 
