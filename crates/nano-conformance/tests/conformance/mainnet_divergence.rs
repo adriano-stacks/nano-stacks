@@ -280,7 +280,12 @@ fn validate_fixture(
             &block.header.parent_block_id.to_string()
         );
     }
-    assert_eq!(oracle.burn_block_height, source_child.burn_block_height);
+    // Hiro reports the tenure's sortition height. A Nakamoto extension may stand
+    // on a later burn view, which is the Clarity-visible height recorded here.
+    assert!(
+        oracle.burn_block_height <= source_child.burn_block_height,
+        "the block cannot execute before its tenure's sortition"
+    );
     assert!(oracle.canonical, "oracle transaction must be canonical");
     assert_eq!(oracle.status, "success");
     assert!(oracle.source.starts_with("https://api.hiro.so/"));

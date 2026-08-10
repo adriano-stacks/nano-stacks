@@ -4,6 +4,8 @@
   "txid": "6f8bf2076f0c563921be39631a4bd7643ccb093ea9935324502e3f7b59329e93",
   "block_height": 8733929,
   "block_hash": "d2d5ff5ada1589c07d4d1f040ae28ca4f29d63212726398f2e2d36de81bd3aa0",
+  "index_block_hash": "654333859d57f8eeb62c4744fc6fffe2410f495505f7d3e5f3cbb8750575c933",
+  "parent_index_block_hash": "2dba2de4f1a11bc61e91c99586cc7345d61f68297c985ac6bcf07a45f3c93cfd",
   "burn_block_height": 961889,
   "tx_index": 1,
   "canonical": true,
