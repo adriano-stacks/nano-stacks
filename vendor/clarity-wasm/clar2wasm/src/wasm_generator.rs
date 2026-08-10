@@ -5155,6 +5155,48 @@ mod tests {
     }
 
     #[test]
+    fn local_call_widens_a_constant_nested_none_argument() {
+        crosscheck(
+            r#"
+            (define-constant stored-key {
+                bond-index: none,
+                reward-cycle: u7,
+            })
+            (define-private (reward-cycle (entry {
+                bond-index: (optional uint),
+                reward-cycle: uint,
+            }))
+                (get reward-cycle entry)
+            )
+            (reward-cycle stored-key)
+            "#,
+            Ok(Some(clarity::vm::Value::UInt(7))),
+        );
+    }
+
+    #[test]
+    fn local_call_widens_a_function_result_nested_none_argument() {
+        crosscheck(
+            r#"
+            (define-private (stored-key)
+                {
+                    bond-index: none,
+                    reward-cycle: u7,
+                }
+            )
+            (define-private (reward-cycle (entry {
+                bond-index: (optional uint),
+                reward-cycle: uint,
+            }))
+                (get reward-cycle entry)
+            )
+            (reward-cycle (stored-key))
+            "#,
+            Ok(Some(clarity::vm::Value::UInt(7))),
+        );
+    }
+
+    #[test]
     fn top_level_result_none() {
         crosscheck(
             "
