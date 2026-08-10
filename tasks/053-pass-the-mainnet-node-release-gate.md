@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: improvement
 group: mainnet
-dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079", "082", "083", "084", "085", "086", "087", "088", "093", "096", "097", "098"]
+dependencies: ["011", "027", "037", "049", "050", "051", "052", "054", "056", "057", "058", "060", "061", "062", "064", "067", "068", "069", "070", "071", "073", "074", "075", "076", "077", "078", "079", "082", "083", "084", "085", "086", "087", "088", "093", "096", "097", "098", "106"]
 tags: ["mainnet", "conformance", "release"]
 created_at: 2026-08-02
 ---
@@ -72,7 +72,7 @@ and steady state, with evidence tied to the durable executed chain.
       signer run as interoperability evidence.
 - [ ] Run the signer-set and signer-weight mainnet gates in reward cycle 141 or
       later; `NANO_REQUIRE_MAINNET` must report that they ran rather than skipped.
-- [ ] Hold mainnet tip for at least 24 hours across tenure and Bitcoin boundaries.
+- [ ] Complete the dedicated mainnet tip hold under [[106]].
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
       conformance report.
 

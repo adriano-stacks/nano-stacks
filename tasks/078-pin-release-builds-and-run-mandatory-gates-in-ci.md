@@ -41,6 +41,9 @@ which compiler produced release evidence.
       than making the default workflow permanently red.
 - [ ] Make CI reject every unowned ignored or conditionally skipped required test
       through [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
+- [ ] Make `kill_during_import` deterministic in the complete release suite. It
+      failed in the 2026-08-09 combined run and passed in isolation. Find the
+      shared-state or timing cause, then retain a repeated-run regression.
 - [x] Prove `nix develop` changes no tracked or ignored repository file in a clean
       checkout.
 
