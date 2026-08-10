@@ -1,12 +1,13 @@
 ---
 id: "081"
 title: "Emit the as-contract sender-restore prologue only for functions that use as-contract"
-status: in-progress
+status: completed
 priority: medium
 effort: small
 dependencies: []
 tags: ["mainnet", "vm", "clarity"]
 created_at: 2026-08-07
+completed_at: 2026-08-09
 ---
 
 # Emit the as-contract sender-restore prologue only for functions that use as-contract
@@ -74,18 +75,22 @@ no source-level shape reaches that limit anyway.
 ## Mainnet-state measurement — 2026-08-09
 
 `cargo xtask sweep-contracts /home/aldur/mainnet-8716986/state` measured a
-maximum of **17,055 live locals out of 50,000**, leaving **32,945 locals of
-headroom**, at
-`SP3EGAD1CG4KTM1Z3B2D85WQMC1FQG0FVM3TPAE8D.t-a-1::.top-level`.
+maximum of **1,164 exact emitted locals out of 50,000**, leaving **48,836 locals
+of headroom**, at
+`SPXGT7ADNZNARR4SVSJN56QGSZFHGATJEQMFPMJW.pox-4::get-alex`. This is parsed from
+the emitted Wasm module, not inferred from the compiler's live-local pool. The
+same run reports a live-pool peak of 1,164 only as an optimizer diagnostic.
 
-The maximum is a top-level expression, so it has no function sender-restore
-prologue: this optimization returns **zero additional locals at the measured
-worst site**. It still removes exactly two locals from each generated function
-that does not contain `as-contract`. The earlier 16,505 maximum is not a valid
-before/after delta because other compiler changes landed between the two full
-sweeps.
+`get-alex` contains no `as-contract`, so the conditional prologue removes exactly
+two locals at the measured worst function: the counterfactual unconditional
+prologue would be 1,166 locals and 48,834 headroom. Every other function without
+`as-contract` receives the same two-local reduction; functions that can switch
+the sender retain the paired prologue/postlude.
 
-The inventory verdict was red for an orthogonal reason: 64 current contracts
-compiled but did not load. That does not hide a locals measurement — their
-compile reports were included — and it is recorded under [[084]] and [[093]],
-not claimed as success here.
+The authoritative sweep compiled and loaded **137,284/137,284** current-tip
+contracts, separately excluding 58 stale metadata candidates. The retained
+output is `/tmp/task073-inventory-task099.txt` (SHA-256
+`2e96c3c9e5778c38662b067277f8b6aa3c7018afd2d0232208a7de1fd4ee470f`).
+The current clar2wasm library gate passed 1,456 tests, the release conformance
+suite passed 277/277 runnable tests including the sender-leak regressions, and
+the scoreboard remains 340/340.

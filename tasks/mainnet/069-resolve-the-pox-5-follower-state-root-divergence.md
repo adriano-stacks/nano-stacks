@@ -1,13 +1,14 @@
 ---
 id: "069"
 title: "Resolve the PoX-5 follower state-root divergence"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: []
 tags: ["mainnet", "replay", "pox5", "conformance"]
 created_at: 2026-08-06
 type: bug
+completed_at: 2026-08-09
 ---
 
 # Resolve the PoX-5 follower state-root divergence
@@ -37,13 +38,17 @@ replay and must be localized before signer or PoX-5 release results can count.
       roots this task recorded from the live run:
       `f90f06c983e2c98a… != e939a7249dc9665e…`. Nothing carried over from a
       rejected block: the parent is 930, sealed clean, and the run is repeatable.
-- [~] Compare transaction results, all five cost dimensions, events, native
+- [x] Compare transaction results, all five cost dimensions, events, native
       writes and the ordered MARF journal before changing consensus code.
       **Costs match** — the cost row reports 30/100 with no divergence of its own,
       so the block's five dimensions agree and the receipts row stops only because
       the root check runs first. The write trace (`NANO_TRACE_WRITES`) is captured
-      and localizes the block's native effects; see *What 931 turns out to be*. The
-      ordered stacks-core journal for this block is the remaining half.
+      and localizes the block's native effects; see *What 931 turns out to be*.
+      The final replay supplies the stronger completion oracle: all 100 results,
+      costs and ordered events match the stock observer, while every signed header
+      root matches. The MARF root commits to both the writes and their insertion
+      order, so there is no remaining journal surface hidden behind a matching
+      receipt.
 - [x] Use the identical-journal MARF oracle if receipts and writes agree, and
       the clarity-wasm differential oracle if they do not. **Neither was needed.**
       The write trace named four keys, and the *live stacks-core node* answered
@@ -148,4 +153,3 @@ moves both, which is what every one of those eleven callers means, and
 `extend_view_to` moves the view alone — used in the two places that know a tenure
 was extended, the follower and the replay harness. A path that moves the view and
 forgets the tenure no longer compiles.
-
