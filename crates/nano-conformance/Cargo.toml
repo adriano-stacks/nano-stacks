@@ -33,6 +33,7 @@ serde_json = "1.0.151"
 
 [dev-dependencies]
 axum = "0.8.9"
+criterion = "0.7"
 nano-codec = { path = "../nano-codec" }
 nano-mempool = { path = "../nano-mempool" }
 nano-p2p = { path = "../nano-p2p" }
@@ -47,6 +48,10 @@ tempfile = "3.27.0"
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 pox-locking = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", features = ["testing"] }
+
+[[bench]]
+name = "differential"
+harness = false
 
 [lints]
 workspace = true
