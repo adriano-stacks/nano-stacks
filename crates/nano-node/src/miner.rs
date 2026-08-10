@@ -66,6 +66,7 @@ pub struct Runtime {
     pub relay: nano_p2p::Relay,
     /// The pool the RPC admits transactions into, so they are the same ones.
     pub mempool: Arc<Mutex<Mempool>>,
+    pub metrics: nano_rpc::NodeMetrics,
 }
 
 /// Commit on every Bitcoin block and mine every tenure this miner wins.
@@ -86,6 +87,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         executor,
         dispatcher,
         relay,
+        metrics,
     } = runtime;
     let miner_key = miner.block_signing_private_key()?;
     let vrf_key = miner.vrf_private_key()?;
@@ -121,6 +123,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         committed_at: 0,
         mined: MinedTenures::default(),
         mempool,
+        metrics,
         tenure: None,
     };
     let funded = state.funded_wallet(&wallet)?;
@@ -269,6 +272,7 @@ struct State {
     /// Shared with the RPC: a node whose RPC admits transactions into a pool the
     /// miner cannot see accepts them and never mines them.
     mempool: Arc<Mutex<Mempool>>,
+    metrics: nano_rpc::NodeMetrics,
     tenure: Option<TenureState>,
 }
 
@@ -524,22 +528,25 @@ impl State {
         let now = now_unix();
         // Held only while the pool is touched: the peer calls below await, and
         // the RPC admits into the same pool meanwhile.
-        {
+        let mempool_size = {
             let mut mempool = self.mempool.lock().await;
             // Candidate transport only. A peer may omit transactions (including
             // through its admission view) just as it may serve an empty page;
             // the local account map below decides what can enter this block.
             self.peer.fill_mempool(&mut mempool, now).await?;
-        }
+            mempool.len()
+        };
+        self.metrics.publish_mempool_size(mempool_size);
         let accounts = {
             let mempool = self.mempool.lock().await;
             executor.local_mempool_accounts(&mempool)?
         };
-        let pending = {
+        let (pending, mempool_size) = {
             let mut mempool = self.mempool.lock().await;
             mempool.advance(&accounts, now);
-            mempool.candidates(&accounts)
+            (mempool.candidates(&accounts), mempool.len())
         };
+        self.metrics.publish_mempool_size(mempool_size);
         let extend_due = !state.extended
             && state.since.elapsed() >= Duration::from_secs(self.miner.tenure_extend_after_secs);
         if pending.is_empty() && !extend_due {
@@ -597,9 +604,12 @@ impl State {
             .await?;
         // A confirmed transaction leaves now rather than when the peer's
         // account nonces catch up, so the next block does not offer it again.
+        let mut mempool = self.mempool.lock().await;
         for transaction in &block.transactions {
-            self.mempool.lock().await.remove(transaction.txid());
+            mempool.remove(transaction.txid());
         }
+        self.metrics.publish_mempool_size(mempool.len());
+        drop(mempool);
         Ok(Some(block))
     }
 

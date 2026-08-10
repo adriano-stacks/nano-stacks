@@ -131,6 +131,68 @@ struct SyncCounters {
     pushed_blocks_refused: Counter,
 }
 
+struct ResourceGauges {
+    tenure_history_window: IntGauge,
+    mempool_transactions: IntGauge,
+}
+
+struct ProgressGauges {
+    executed_stacks_height: IntGauge,
+    followed_stacks_height: IntGauge,
+    selected_stacks_height: IntGauge,
+    burn_height: IntGauge,
+    last_sealed_timestamp_seconds: IntGauge,
+}
+
+impl ProgressGauges {
+    fn register(registry: &mut Registry) -> Self {
+        Self {
+            executed_stacks_height: gauge(
+                registry,
+                "executed_stacks_height",
+                "Latest Stacks height this node executed and sealed.",
+            ),
+            followed_stacks_height: gauge(
+                registry,
+                "followed_stacks_height",
+                "Latest Stacks height advertised by the followed peers.",
+            ),
+            selected_stacks_height: gauge(
+                registry,
+                "selected_stacks_height",
+                "Latest Stacks height selected by local fork choice.",
+            ),
+            burn_height: gauge(
+                registry,
+                "burn_height",
+                "Bitcoin height of the latest locally executed Stacks block.",
+            ),
+            last_sealed_timestamp_seconds: gauge(
+                registry,
+                "last_sealed_timestamp_seconds",
+                "Unix timestamp when the latest Stacks block was sealed.",
+            ),
+        }
+    }
+}
+
+impl ResourceGauges {
+    fn register(registry: &mut Registry) -> Self {
+        Self {
+            tenure_history_window: gauge(
+                registry,
+                "tenure_history_window",
+                "Executed tenures retained in the served history window.",
+            ),
+            mempool_transactions: gauge(
+                registry,
+                "mempool_transactions",
+                "Transactions currently retained in the local mempool.",
+            ),
+        }
+    }
+}
+
 impl SyncCounters {
     fn register(registry: &mut Registry) -> Self {
         Self {
@@ -162,11 +224,7 @@ struct Inner {
     registry: Registry,
     block_refusals: RefusalCounters,
     sync: SyncCounters,
-    executed_stacks_height: IntGauge,
-    followed_stacks_height: IntGauge,
-    selected_stacks_height: IntGauge,
-    burn_height: IntGauge,
-    last_sealed_timestamp_seconds: IntGauge,
+    progress: ProgressGauges,
     serving_peers: IntGauge,
     p2p_connected: IntGauge,
     p2p_known: IntGauge,
@@ -178,6 +236,7 @@ struct Inner {
     queued_proposals: IntGauge,
     queued_stackerdb_chunks: IntGauge,
     queued_transactions: IntGauge,
+    resources: ResourceGauges,
 }
 
 /// Metrics updated at the node's existing publication boundaries.
@@ -197,31 +256,8 @@ impl Default for NodeMetrics {
         let mut registry = Registry::with_prefix("nano");
         let block_refusals = RefusalCounters::register(&mut registry);
         let sync = SyncCounters::register(&mut registry);
-        let executed_stacks_height = gauge(
-            &mut registry,
-            "executed_stacks_height",
-            "Latest Stacks height this node executed and sealed.",
-        );
-        let followed_stacks_height = gauge(
-            &mut registry,
-            "followed_stacks_height",
-            "Latest Stacks height advertised by the followed peers.",
-        );
-        let selected_stacks_height = gauge(
-            &mut registry,
-            "selected_stacks_height",
-            "Latest Stacks height selected by local fork choice.",
-        );
-        let burn_height = gauge(
-            &mut registry,
-            "burn_height",
-            "Bitcoin height of the latest locally executed Stacks block.",
-        );
-        let last_sealed_timestamp_seconds = gauge(
-            &mut registry,
-            "last_sealed_timestamp_seconds",
-            "Unix timestamp when the latest Stacks block was sealed.",
-        );
+        let resources = ResourceGauges::register(&mut registry);
+        let progress = ProgressGauges::register(&mut registry);
         let serving_peers = gauge(
             &mut registry,
             "serving_peers",
@@ -277,11 +313,7 @@ impl Default for NodeMetrics {
             registry,
             block_refusals,
             sync,
-            executed_stacks_height,
-            followed_stacks_height,
-            selected_stacks_height,
-            burn_height,
-            last_sealed_timestamp_seconds,
+            progress,
             serving_peers,
             p2p_connected,
             p2p_known,
@@ -293,6 +325,7 @@ impl Default for NodeMetrics {
             queued_proposals,
             queued_stackerdb_chunks,
             queued_transactions,
+            resources,
         }))
     }
 }
@@ -328,18 +361,36 @@ impl NodeMetrics {
         self.0.sync.pushed_blocks_refused.inc_by(as_u64(refused));
     }
 
+    /// Publish the current local mempool size after a mutation.
+    pub fn publish_mempool_size(&self, transactions: usize) {
+        self.0
+            .resources
+            .mempool_transactions
+            .set(as_i64(transactions));
+    }
+
+    pub(crate) fn publish_tenure_history(&self, tenures: usize) {
+        self.0.resources.tenure_history_window.set(as_i64(tenures));
+    }
+
     pub(crate) fn publish_executed(&self, stacks_height: u64, burn_height: u64, now: u64) {
-        self.0.executed_stacks_height.set(as_i64(stacks_height));
-        self.0.burn_height.set(as_i64(burn_height));
-        self.0.last_sealed_timestamp_seconds.set(as_i64(now));
+        self.0
+            .progress
+            .executed_stacks_height
+            .set(as_i64(stacks_height));
+        self.0.progress.burn_height.set(as_i64(burn_height));
+        self.0
+            .progress
+            .last_sealed_timestamp_seconds
+            .set(as_i64(now));
     }
 
     pub(crate) fn publish_followed(&self, height: u64) {
-        self.0.followed_stacks_height.set(as_i64(height));
+        self.0.progress.followed_stacks_height.set(as_i64(height));
     }
 
     pub(crate) fn publish_selected(&self, height: u64) {
-        self.0.selected_stacks_height.set(as_i64(height));
+        self.0.progress.selected_stacks_height.set(as_i64(height));
     }
 
     pub(crate) fn publish_peers(&self, serving: usize, connected: usize, known: usize) {
@@ -455,6 +506,7 @@ mod tests {
         metrics.record_peer_failover();
         metrics.record_sync_round_unanswered();
         metrics.record_pushed_blocks(3, 2);
+        metrics.publish_mempool_size(11);
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -520,6 +572,8 @@ mod tests {
             "nano_sync_rounds_unanswered_total 1",
             "nano_pushed_blocks_accepted_total 3",
             "nano_pushed_blocks_refused_total 2",
+            "nano_mempool_transactions 11",
+            "nano_tenure_history_window 0",
             "# EOF",
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");

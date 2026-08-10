@@ -267,7 +267,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         &pox,
         &peer,
         (executor.clone(), mempool.clone()),
-        (dispatcher, relay.clone()),
+        (dispatcher, relay.clone(), state.metrics()),
         &mut roles,
     );
     start_signer(&config, network, &pox, discovered.as_ref(), &mut roles).await?;
@@ -1045,7 +1045,7 @@ async fn check_relayed(
     if let Some(metrics) = metrics {
         metrics.record_pushed_blocks(accepted, rejected);
     }
-    let admitted = admit_relayed(executor, mempool, relay, transactions).await;
+    let admitted = admit_relayed(executor, mempool, relay, transactions, metrics).await;
     if accepted > 0 || rejected > 0 || admitted > 0 {
         println!(
             "peers pushed {accepted} blocks this node accepted and {rejected} it refused, \
@@ -1068,6 +1068,7 @@ async fn admit_relayed(
         Option<nano_primitives::Hash160>,
         Box<nano_codec::Transaction>,
     )>,
+    metrics: Option<&nano_rpc::NodeMetrics>,
 ) -> usize {
     if transactions.is_empty() {
         return 0;
@@ -1093,9 +1094,13 @@ async fn admit_relayed(
             kept.push((from, transaction));
         }
     }
+    let mempool_size = mempool.len();
     drop(accounts);
     drop(executor);
     drop(mempool);
+    if let Some(metrics) = metrics {
+        metrics.publish_mempool_size(mempool_size);
+    }
     for (from, transaction) in &kept {
         relay.announce(nano_p2p::Offer::transaction(*from, transaction.clone()));
     }
@@ -2384,11 +2389,11 @@ fn start_miner(
     pox: &PoxInfo,
     peer: &SyncClient,
     chain: (Option<SharedExecutor>, Arc<Mutex<nano_mempool::Mempool>>),
-    announce: (EventDispatcher, nano_p2p::Relay),
+    announce: (EventDispatcher, nano_p2p::Relay, nano_rpc::NodeMetrics),
     roles: &mut JoinSet<(Job, Role)>,
 ) {
     let (executor, mempool) = chain;
-    let (dispatcher, relay) = announce;
+    let (dispatcher, relay, metrics) = announce;
     let (Some(miner), Some(executor)) = (config.miner.clone(), executor) else {
         return;
     };
@@ -2402,6 +2407,7 @@ fn start_miner(
         dispatcher,
         mempool,
         relay,
+        metrics,
     };
     roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
 }

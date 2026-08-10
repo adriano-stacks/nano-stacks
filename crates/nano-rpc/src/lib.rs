@@ -451,6 +451,7 @@ impl RpcState {
         let followed = self.followed.read().await.clone();
         let pox = followed.as_ref().map(|view| view.pox_info.clone());
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
+        self.metrics.publish_tenure_history(chain.len());
         *self.executed.write().await = Some(Executed {
             tip,
             chain,
@@ -1435,8 +1436,10 @@ async fn submit_transaction(
         &ExecutedTip::new(&mut *chain),
         now_seconds(),
     );
+    let mempool_size = mempool.len();
     drop(chain);
     drop(mempool);
+    state.metrics.publish_mempool_size(mempool_size);
     admission.map_err(|rejection| RpcError::Rejected(rejection.into_json(txid)))?;
     // Admitted here is admitted for the whole network: the pool this node keeps
     // is only read by its own miner, and a transaction nobody else hears about
