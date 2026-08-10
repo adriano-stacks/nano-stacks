@@ -475,14 +475,23 @@ fn link_runtime_value_size_fn(
                     serialized_ty_offset,
                     serialized_ty_length,
                 )?;
+                // No `principal` arm, deliberately: a trait reference erases
+                // to `principal` in the runtime type string, and `type_of` on
+                // a callable value answers with the callee's own type, whose
+                // size is the contract name's, not the principal maximum.
                 let size = match serialized_ty.as_str() {
                     "int" | "uint" => 16,
                     "bool" => 1,
-                    "principal" => 148,
                     _ => {
                         let epoch = caller.data().global_context.epoch_id;
                         let version = *caller.data().contract_context().get_clarity_version();
                         let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
+                        // Sizing from the declared type alone is unsound for
+                        // anything wider than a monomorphic primitive: at a
+                        // function entry the runtime shape may be *wider*
+                        // than the declaration — duck typing hands `echo` a
+                        // `{soft, full}` where `{soft}` is declared — and the
+                        // reference charges the value it was actually given.
                         let size = read_from_wasm_indirect(
                             memory,
                             &mut caller,
