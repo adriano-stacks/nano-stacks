@@ -48,6 +48,13 @@ pub struct ClarityWasmContext<'a, 'b, 'hooks> {
     /// function resolving it through `get_export("memory")` walked the export
     /// map by name on every one of millions of calls per replay.
     pub memory: Option<Memory>,
+    /// Type signatures already parsed from this instance's memory, by the
+    /// (offset, length) of their serialized text. The texts are constants the
+    /// compiler placed in the data segment, so within one call the same
+    /// coordinates always hold the same string — and parsing it fresh was
+    /// twelve microseconds on each of millions of size measurements a mainnet
+    /// replay makes.
+    pub parsed_types: std::collections::HashMap<(i32, i32), TypeSignature>,
     pub module_cache: &'a ModuleCache,
     runtime_shapes: RuntimeShapeArena,
 }
@@ -79,6 +86,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             contract_analysis,
             cost_globals,
             memory: None,
+            parsed_types: std::collections::HashMap::new(),
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
         }
@@ -109,6 +117,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             contract_analysis,
             cost_globals: None,
             memory: None,
+            parsed_types: std::collections::HashMap::new(),
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
         }

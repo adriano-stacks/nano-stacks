@@ -647,6 +647,16 @@ fn runtime_value_type(
     serialized_ty_length: i32,
 ) -> Result<(Memory, TypeSignature), VmExecutionError> {
     let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    // The serialized text is a data-segment constant, so within this call the
+    // same coordinates always hold the same string; parsing it fresh was the
+    // bulk of every size measurement.
+    if let Some(known) = caller
+        .data()
+        .parsed_types
+        .get(&(serialized_ty_offset, serialized_ty_length))
+    {
+        return Ok((memory, known.clone()));
+    }
     let serialized_ty = read_identifier_from_wasm(
         memory,
         &mut *caller,
@@ -655,10 +665,12 @@ fn runtime_value_type(
     )?;
     let epoch = caller.data().global_context.epoch_id;
     let version = *caller.data().contract_context().get_clarity_version();
-    Ok((
-        memory,
-        signature_from_string(&serialized_ty, version, epoch)?,
-    ))
+    let parsed = signature_from_string(&serialized_ty, version, epoch)?;
+    caller.data_mut().parsed_types.insert(
+        (serialized_ty_offset, serialized_ty_length),
+        parsed.clone(),
+    );
+    Ok((memory, parsed))
 }
 
 fn read_runtime_value(
