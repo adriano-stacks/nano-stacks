@@ -1810,9 +1810,9 @@ mod word {
     });
     decl_tests!("nft_burn", "(define-non-fungible-token st int) \
                              (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 4000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 829, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 609, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 18000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 964, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 744, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_get_balance", "(define-fungible-token st) \
                                    (ft-get-balance st 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR)", {
@@ -1823,9 +1823,9 @@ mod word {
     decl_tests!("nft_get_owner", "(define-non-fungible-token st int) \
                                   (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF) \
                                   (nft-get-owner? st 1)", {
-        1 => CostMeter { runtime: 8000, read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 1658,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 1438,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 36000, read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 1928,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 1708,  read_count: 2, read_length: 2, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_get_supply", "(define-fungible-token st) \
                                   (ft-get-supply st)", {
@@ -1841,9 +1841,9 @@ mod word {
     });
     decl_tests!("nft_mint", "(define-non-fungible-token st int) \
                              (nft-mint? st 1 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 4000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        2 => CostMeter { runtime: 829, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
-        3 => CostMeter { runtime: 609, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        1 => CostMeter { runtime: 18000, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        2 => CostMeter { runtime: 964, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
+        3 => CostMeter { runtime: 744, read_count: 1, read_length: 1, write_count: 1, write_length: 1 },
     });
     decl_tests!("ft_transfer", "(define-fungible-token st) \
                                 (ft-mint? st u100 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR) \
@@ -1856,10 +1856,59 @@ mod word {
     decl_tests!("nft_transfer", "(define-non-fungible-token st int) \
                                  (nft-mint? st 1 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR) \
                                  (nft-transfer? st 1 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF)", {
-        1 => CostMeter { runtime: 8000, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
-        2 => CostMeter { runtime: 1658, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
-        3 => CostMeter { runtime: 1215, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        1 => CostMeter { runtime: 36000, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        2 => CostMeter { runtime: 1928, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
+        3 => CostMeter { runtime: 1485, read_count: 2, read_length: 2, write_count: 2, write_length: 2 },
     });
+
+    #[test]
+    fn nft_operation_costs_match_the_interpreter_at_every_cost_version() {
+        let snippets = [
+            "(define-non-fungible-token st int)
+             (define-public (f) (nft-mint? st 1 tx-sender))",
+            "(define-non-fungible-token st int)
+             (nft-mint? st 1 tx-sender)
+             (define-public (f) (ok (nft-get-owner? st 1)))",
+            "(define-non-fungible-token st int)
+             (nft-mint? st 1 tx-sender)
+             (define-public (f)
+               (nft-transfer? st 1 tx-sender
+                 'SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF))",
+            "(define-non-fungible-token st int)
+             (nft-mint? st 1 tx-sender)
+             (define-public (f) (nft-burn? st 1 tx-sender))",
+        ];
+        for epoch in [
+            StacksEpochId::Epoch20,
+            StacksEpochId::Epoch2_05,
+            StacksEpochId::Epoch31,
+        ] {
+            let version = ClarityVersion::default_for_epoch(epoch);
+            for snippet in snippets {
+                let mut compiled = TestEnvironment::new_with_cost(epoch, version);
+                let mut interpreted = compiled.clone();
+                assert_eq!(
+                    compiled.init_contract_with_snippet("nft", snippet),
+                    interpreted.interpret_contract_with_snippet("nft", snippet),
+                    "deployment result diverged at {epoch:?} for {snippet}"
+                );
+                let compiled_before = CostMeter::from(compiled.cost_tracker.get_total());
+                let interpreted_before = CostMeter::from(interpreted.cost_tracker.get_total());
+                assert_eq!(
+                    compiled.call_contract("nft", "f", &[]),
+                    interpreted.interpret_call_contract("nft", "f", &[]),
+                    "operation result diverged at {epoch:?} for {snippet}"
+                );
+                assert_eq!(
+                    CostMeter::from(compiled.cost_tracker.get_total())
+                        .saturating_sub(compiled_before),
+                    CostMeter::from(interpreted.cost_tracker.get_total())
+                        .saturating_sub(interpreted_before),
+                    "operation cost diverged at {epoch:?} for {snippet}"
+                );
+            }
+        }
+    }
     decl_tests!("tuple_cons", "(tuple (b 0x0102) (id 1337))", {
         1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         2 => CostMeter { runtime: 1139,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },

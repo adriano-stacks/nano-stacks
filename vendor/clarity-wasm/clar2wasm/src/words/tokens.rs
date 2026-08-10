@@ -1,5 +1,6 @@
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
+use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
@@ -362,7 +363,7 @@ impl ComplexWord for BurnNonFungibleToken {
             .i32_const(id_offset as i32)
             .i32_const(id_length as i32);
 
-        self.charge(generator, builder, id_length)?;
+        self.charge(generator, builder, 0_u32)?;
 
         // Push the identifier onto the stack
         let identifier_ty = generator.nft_types.get(token).cloned().ok_or_else(|| {
@@ -370,6 +371,18 @@ impl ComplexWord for BurnNonFungibleToken {
         })?;
         generator.set_expr_type(identifier, identifier_ty.clone())?;
         generator.traverse_expr(builder, identifier)?;
+
+        let serialized = if generator
+            .executing_epoch()
+            .is_some_and(|epoch| epoch >= clarity::types::StacksEpochId::Epoch2_05)
+        {
+            generator.serialization_size(builder, &identifier_ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            Some(serialized)
+        } else {
+            None
+        };
 
         // Allocate space on the stack for the identifier
         let (id_offset, id_size) =
@@ -382,7 +395,18 @@ impl ComplexWord for BurnNonFungibleToken {
         builder.local_get(id_offset).i32_const(id_size);
 
         // Push the sender onto the stack
-        generator.traverse_expr(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
+
+        match &serialized {
+            Some(serialized) => self.charge(generator, builder, **serialized)?,
+            None => self.charge(
+                generator,
+                builder,
+                identifier_ty
+                    .size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?,
+        }
 
         // Call the host interface function `nft_burn`
         builder.call(generator.func_by_name("stdlib.nft_burn"));
@@ -421,14 +445,24 @@ impl ComplexWord for TransferNonFungibleToken {
             .i32_const(id_offset as i32)
             .i32_const(id_length as i32);
 
-        self.charge(generator, builder, id_length)?;
-
         // Push the identifier onto the stack
         let identifier_ty = generator.nft_types.get(token).cloned().ok_or_else(|| {
             GeneratorError::TypeError("Usage of nft-transfer? on an unknown nft token".to_owned())
         })?;
         generator.set_expr_type(identifier, identifier_ty.clone())?;
         generator.traverse_expr(builder, identifier)?;
+
+        let serialized = if generator
+            .executing_epoch()
+            .is_some_and(|epoch| epoch >= clarity::types::StacksEpochId::Epoch2_05)
+        {
+            generator.serialization_size(builder, &identifier_ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            Some(serialized)
+        } else {
+            None
+        };
 
         // Allocate space on the stack for the identifier
         let (id_offset, id_size) =
@@ -441,10 +475,21 @@ impl ComplexWord for TransferNonFungibleToken {
         builder.local_get(id_offset).i32_const(id_size);
 
         // Push the sender onto the stack
-        generator.traverse_expr(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
 
         // Push the recipient onto the stack
-        generator.traverse_expr(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
+
+        match &serialized {
+            Some(serialized) => self.charge(generator, builder, **serialized)?,
+            None => self.charge(
+                generator,
+                builder,
+                identifier_ty
+                    .size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?,
+        }
 
         // Call the host interface function `nft_transfer`
         builder.call(generator.func_by_name("stdlib.nft_transfer"));
@@ -482,14 +527,24 @@ impl ComplexWord for MintNonFungibleToken {
             .i32_const(id_offset as i32)
             .i32_const(id_length as i32);
 
-        self.charge(generator, builder, id_length)?;
-
         // Push the identifier onto the stack
         let identifier_ty = generator.nft_types.get(token).cloned().ok_or_else(|| {
             GeneratorError::TypeError("Usage of nft-mint? on an unknown nft token".to_owned())
         })?;
         generator.set_expr_type(identifier, identifier_ty.clone())?;
         generator.traverse_expr(builder, identifier)?;
+
+        let serialized = if generator
+            .executing_epoch()
+            .is_some_and(|epoch| epoch >= clarity::types::StacksEpochId::Epoch2_05)
+        {
+            generator.serialization_size(builder, &identifier_ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            Some(serialized)
+        } else {
+            None
+        };
 
         // Allocate space on the stack for the identifier
         let (id_offset, id_size) =
@@ -502,7 +557,18 @@ impl ComplexWord for MintNonFungibleToken {
         builder.local_get(id_offset).i32_const(id_size);
 
         // Push the recipient onto the stack
-        generator.traverse_expr(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
+
+        match &serialized {
+            Some(serialized) => self.charge(generator, builder, **serialized)?,
+            None => self.charge(
+                generator,
+                builder,
+                identifier_ty
+                    .size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?,
+        }
 
         // Call the host interface function `nft_mint`
         builder.call(generator.func_by_name("stdlib.nft_mint"));
@@ -539,14 +605,30 @@ impl ComplexWord for GetOwnerOfNonFungibleToken {
             .i32_const(id_offset as i32)
             .i32_const(id_length as i32);
 
-        self.charge(generator, builder, id_length)?;
-
         // Push the identifier onto the stack
         let identifier_ty = generator.nft_types.get(token).cloned().ok_or_else(|| {
             GeneratorError::TypeError("Usage of nft-get-owner? on an unknown nft token".to_owned())
         })?;
         generator.set_expr_type(identifier, identifier_ty.clone())?;
-        generator.traverse_expr(builder, identifier)?;
+        generator.traverse_expr_as_borrowed_value(builder, identifier)?;
+
+        if generator
+            .executing_epoch()
+            .is_some_and(|epoch| epoch >= clarity::types::StacksEpochId::Epoch2_05)
+        {
+            generator.serialization_size(builder, &identifier_ty)?;
+            let serialized = generator.borrow_local(ValType::I32);
+            builder.local_set(*serialized);
+            self.charge(generator, builder, *serialized)?;
+        } else {
+            self.charge(
+                generator,
+                builder,
+                identifier_ty
+                    .size()
+                    .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+            )?;
+        }
 
         // Allocate space on the stack for the identifier
         let (id_offset, id_size) =
