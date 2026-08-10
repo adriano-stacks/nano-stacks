@@ -43,13 +43,16 @@ fetching history from 8 peers: http://172.96.141.17:20443/, …,
 
 ## Tasks
 
-- [ ] De-duplicate the pool on the parsed URL, where every consumer already
+- [x] De-duplicate the pool on the parsed URL, where every consumer already
       goes through (`PeerPool::from_endpoints`), so history fetching and
-      StackerDB replication both get it.
-- [ ] Publish the pool to `/nano/sync_status`: the endpoints being fetched
+      StackerDB replication both get it. Regression test pins the two
+      spellings of one peer to one pool entry.
+- [x] Publish the pool to `/nano/sync_status`: the endpoints being fetched
       from, and the p2p session/known counts discovery reports.
-- [ ] Show it in the TUI: the sync source is one peer *of* a pool, with the
-      pool's size and the p2p session count visible.
+- [x] Show it in the TUI: a `peer pool` line under the sync source with the
+      pool's size, live p2p sessions and known peers.
+- [ ] Deploy: binary staged as `stacks-node.new` (`9a055ab8`); swap after the
+      107 memory measurement window closes so it is not cut short.
 
 ## Acceptance Criteria
 
