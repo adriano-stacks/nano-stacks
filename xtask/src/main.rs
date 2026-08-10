@@ -162,13 +162,21 @@ struct ContractRefusal {
 
 #[derive(Default)]
 struct ContractInventory {
+    state_tip: [u8; 32],
     metadata_rows: usize,
     named: usize,
     current: usize,
     checked: usize,
     loaded: usize,
+    deploy_epochs: BTreeMap<String, usize>,
+    counterfactual_epoch40_checked: usize,
+    counterfactual_epoch40_loaded: usize,
+    counterfactual_epoch40_refused: BTreeMap<String, Vec<String>>,
+    counterfactual_epoch40_unmeasured: BTreeMap<String, Vec<String>>,
     maximum: nano_vm::ArityReport,
     over_boundary: Vec<ContractArity>,
+    maximum_emitted_locals: u32,
+    maximum_emitted_local_sites: Vec<ContractLocalsPeak>,
     maximum_live_locals: u32,
     maximum_live_local_sites: Vec<ContractLocalsPeak>,
     refused: BTreeMap<String, Vec<ContractRefusal>>,
@@ -209,28 +217,25 @@ impl ContractInventory {
     }
 
     fn note_locals(&mut self, contract: &str, report: &nano_vm::LocalsReport) -> bool {
-        for (function, locals) in &report.max_live_locals {
-            match locals.cmp(&self.maximum_live_locals) {
-                std::cmp::Ordering::Greater => {
-                    self.maximum_live_locals = *locals;
-                    self.maximum_live_local_sites.clear();
-                    self.maximum_live_local_sites.push(ContractLocalsPeak {
-                        contract: contract.to_owned(),
-                        function: function.clone(),
-                        locals: *locals,
-                    });
-                }
-                std::cmp::Ordering::Equal => {
-                    self.maximum_live_local_sites.push(ContractLocalsPeak {
-                        contract: contract.to_owned(),
-                        function: function.clone(),
-                        locals: *locals,
-                    });
-                }
-                std::cmp::Ordering::Less => {}
-            }
+        for (function, measurement) in &report.emitted {
+            note_locals_peak(
+                &mut self.maximum_emitted_locals,
+                &mut self.maximum_emitted_local_sites,
+                contract,
+                function,
+                measurement.total,
+            );
         }
-        !report.max_live_locals.is_empty()
+        for (function, locals) in &report.max_live_locals {
+            note_locals_peak(
+                &mut self.maximum_live_locals,
+                &mut self.maximum_live_local_sites,
+                contract,
+                function,
+                *locals,
+            );
+        }
+        !report.max_live_locals.is_empty() && !report.emitted.is_empty()
     }
 
     fn sort_measurements(&mut self) {
@@ -241,14 +246,63 @@ impl ContractInventory {
                 .cmp(&right.contract)
                 .then_with(|| left.function.cmp(&right.function))
         });
+        self.maximum_emitted_local_sites.sort_by(|left, right| {
+            left.contract
+                .cmp(&right.contract)
+                .then_with(|| left.function.cmp(&right.function))
+        });
+        for contracts in self.counterfactual_epoch40_refused.values_mut() {
+            contracts.sort();
+        }
+        for contracts in self.counterfactual_epoch40_unmeasured.values_mut() {
+            contracts.sort();
+        }
+    }
+
+    fn counterfactual_epoch40_refusals(&self) -> usize {
+        self.counterfactual_epoch40_refused
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 
     fn passes(&self) -> bool {
         self.current + self.stale_metadata.len() == self.named
             && self.checked == self.current
             && self.loaded == self.current
+            && self.counterfactual_epoch40_checked == self.current
+            && self.counterfactual_epoch40_loaded + self.counterfactual_epoch40_refusals()
+                == self.current
             && self.refused.is_empty()
             && self.unmeasured.is_empty()
+            && self.counterfactual_epoch40_unmeasured.is_empty()
+            && self.maximum_emitted_locals <= nano_vm::MAX_WASM_FUNCTION_LOCALS
+    }
+}
+
+fn note_locals_peak(
+    maximum: &mut u32,
+    sites: &mut Vec<ContractLocalsPeak>,
+    contract: &str,
+    function: &str,
+    locals: u32,
+) {
+    match locals.cmp(maximum) {
+        std::cmp::Ordering::Greater => {
+            *maximum = locals;
+            sites.clear();
+            sites.push(ContractLocalsPeak {
+                contract: contract.to_owned(),
+                function: function.to_owned(),
+                locals,
+            });
+        }
+        std::cmp::Ordering::Equal => sites.push(ContractLocalsPeak {
+            contract: contract.to_owned(),
+            function: function.to_owned(),
+            locals,
+        }),
+        std::cmp::Ordering::Less => {}
     }
 }
 
@@ -282,6 +336,49 @@ fn refusal_reason(error: &impl std::fmt::Debug) -> String {
         .nth(1)
         .unwrap_or(&reason)
         .to_owned()
+}
+
+fn inspect_counterfactual_epoch40(
+    vm: &mut nano_vm::Vm,
+    inventory: &mut ContractInventory,
+    identifier: &clarity::vm::types::QualifiedContractIdentifier,
+    contract: &str,
+    version: clarity::vm::ClarityVersion,
+    source: &str,
+) {
+    let inspected = vm.inspect_module_semantic_epoch(
+        identifier,
+        version,
+        source,
+        clarity::types::StacksEpochId::Epoch40,
+    );
+    match inspected {
+        Ok(nano_vm::SemanticEpochInspection::Inspected(inspected)) => {
+            let inspected = *inspected;
+            inventory.counterfactual_epoch40_checked += 1;
+            match inspected.refusal {
+                Some(error) => inventory
+                    .counterfactual_epoch40_refused
+                    .entry(refusal_reason(&error))
+                    .or_default()
+                    .push(contract.to_owned()),
+                None => inventory.counterfactual_epoch40_loaded += 1,
+            }
+        }
+        Ok(nano_vm::SemanticEpochInspection::CompilationRefused(reason)) => {
+            inventory.counterfactual_epoch40_checked += 1;
+            inventory
+                .counterfactual_epoch40_refused
+                .entry(reason)
+                .or_default()
+                .push(contract.to_owned());
+        }
+        Err(error) => inventory
+            .counterfactual_epoch40_unmeasured
+            .entry(format!("counterfactual inspection failed: {error:?}"))
+            .or_default()
+            .push(contract.to_owned()),
+    }
 }
 
 fn chainstate_directory(state: &Path) -> PathBuf {
@@ -378,13 +475,18 @@ fn inspect_contract_candidate(
             return;
         }
     };
+    *inventory
+        .deploy_epochs
+        .entry(format!("{epoch:?}"))
+        .or_default() += 1;
     inventory.checked += 1;
-    match vm.inspect_module(&identifier, version, &source, epoch) {
-        Ok(inspected) => {
+    match vm.inspect_module_semantic_epoch(&identifier, version, &source, epoch) {
+        Ok(nano_vm::SemanticEpochInspection::Inspected(inspected)) => {
+            let inspected = *inspected;
             if !inventory.note_locals(&contract, &inspected.locals_report) {
                 inventory.note_unmeasured(
                     contract.clone(),
-                    "compiler returned no live-locals measurement".to_owned(),
+                    "compiler returned incomplete emitted/live locals measurements".to_owned(),
                 );
             }
             let report = inspected.arity_report;
@@ -395,21 +497,28 @@ fn inspect_contract_candidate(
                     .entry(refusal_reason(&error))
                     .or_default()
                     .push(ContractRefusal {
-                        contract,
+                        contract: contract.clone(),
                         arity: Some(report),
                     }),
                 None => inventory.loaded += 1,
             }
         }
-        Err(error) => inventory
+        Ok(nano_vm::SemanticEpochInspection::CompilationRefused(reason)) => inventory
             .refused
-            .entry(refusal_reason(&error))
+            .entry(reason)
             .or_default()
             .push(ContractRefusal {
-                contract,
+                contract: contract.clone(),
                 arity: None,
             }),
+        Err(error) => {
+            inventory.note_unmeasured(
+                contract.clone(),
+                format!("recorded-epoch module inspection failed: {error:?}"),
+            );
+        }
     }
+    inspect_counterfactual_epoch40(vm, inventory, &identifier, &contract, version, &source);
 }
 
 fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
@@ -430,15 +539,68 @@ fn contract_inventory(state: &Path) -> Result<ContractInventory, String> {
     }
 
     let mut inventory = ContractInventory {
+        state_tip: tip,
         metadata_rows,
         named: contracts.len(),
         ..ContractInventory::default()
     };
-    for contract in contracts {
+    for (index, contract) in contracts.into_iter().enumerate() {
         inspect_contract_candidate(&mut vm, &mut inventory, contract);
+        let inspected = index + 1;
+        if inspected % 10_000 == 0 {
+            eprintln!(
+                "inspected {inspected}/{} metadata candidates ({} current-tip)",
+                inventory.named, inventory.current
+            );
+        }
     }
     inventory.sort_measurements();
     Ok(inventory)
+}
+
+fn print_epoch_inventory(inventory: &ContractInventory) {
+    println!(
+        "  state tip            {}",
+        hex::encode(inventory.state_tip)
+    );
+    println!("  compiler             {}", nano_vm::COMPILER_IDENTITY);
+    println!(
+        "  stale metadata       {} noncanonical candidate(s) absent from the current tip",
+        inventory.stale_metadata.len()
+    );
+    println!("  recorded deploy epochs");
+    for (epoch, contracts) in &inventory.deploy_epochs {
+        println!("    {epoch:<16} {contracts}");
+    }
+    println!(
+        "  forced Epoch40       {}/{} load; {} semantic refusal(s); {} unmeasured",
+        inventory.counterfactual_epoch40_loaded,
+        inventory.current,
+        inventory.counterfactual_epoch40_refusals(),
+        inventory
+            .counterfactual_epoch40_unmeasured
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+}
+
+fn print_counterfactual_epoch40(inventory: &ContractInventory) {
+    for (reason, contracts) in &inventory.counterfactual_epoch40_refused {
+        println!(
+            "\n  AFFECTED {} x forcing Epoch40 refuses: {reason}",
+            contracts.len()
+        );
+        for contract in contracts {
+            println!("      {contract}");
+        }
+    }
+    for (reason, contracts) in &inventory.counterfactual_epoch40_unmeasured {
+        println!("\n  EPOCH40 UNMEASURED {} x {reason}", contracts.len());
+        for contract in contracts {
+            println!("      {contract}");
+        }
+    }
 }
 
 fn print_contract_inventory(inventory: &ContractInventory) {
@@ -447,10 +609,7 @@ fn print_contract_inventory(inventory: &ContractInventory) {
          rows)",
         inventory.loaded, inventory.current, inventory.named, inventory.metadata_rows
     );
-    println!(
-        "  stale metadata       {} noncanonical candidate(s) absent from the current tip",
-        inventory.stale_metadata.len()
-    );
+    print_epoch_inventory(inventory);
     println!(
         "  Wasm type boundary   {} flattened parameters or results",
         nano_vm::MAX_WASM_TYPE_ARITY
@@ -468,23 +627,30 @@ fn print_contract_inventory(inventory: &ContractInventory) {
         inventory.maximum.top_level_results
     );
     let locals_limit = nano_vm::MAX_WASM_FUNCTION_LOCALS;
-    if inventory.maximum_live_local_sites.is_empty() {
-        println!("  maximum live locals unavailable (no function was measured)");
-    } else if inventory.maximum_live_locals <= locals_limit {
+    if inventory.maximum_emitted_local_sites.is_empty() {
+        println!("  exact emitted locals unavailable (no function was measured)");
+    } else if inventory.maximum_emitted_locals <= locals_limit {
         println!(
-            "  maximum live locals {}/{} ({} headroom)",
-            inventory.maximum_live_locals,
+            "  exact emitted locals {}/{} ({} headroom)",
+            inventory.maximum_emitted_locals,
             locals_limit,
-            locals_limit - inventory.maximum_live_locals
+            locals_limit - inventory.maximum_emitted_locals
         );
     } else {
         println!(
-            "  maximum live locals {}/{} ({} OVER LIMIT)",
-            inventory.maximum_live_locals,
+            "  exact emitted locals {}/{} ({} OVER LIMIT)",
+            inventory.maximum_emitted_locals,
             locals_limit,
-            inventory.maximum_live_locals - locals_limit
+            inventory.maximum_emitted_locals - locals_limit
         );
     }
+    for peak in &inventory.maximum_emitted_local_sites {
+        println!("    {} :: {}", peak.contract, peak.function);
+    }
+    println!(
+        "  compiler live-pool peak {} (optimizer diagnostic)",
+        inventory.maximum_live_locals
+    );
     for peak in &inventory.maximum_live_local_sites {
         println!("    {} :: {}", peak.contract, peak.function);
     }
@@ -526,6 +692,7 @@ fn print_contract_inventory(inventory: &ContractInventory) {
             }
         }
     }
+    print_counterfactual_epoch40(inventory);
     for (reason, contracts) in &inventory.unmeasured {
         println!("\n  UNMEASURED {} x {reason}", contracts.len());
         for contract in contracts {
@@ -5583,6 +5750,112 @@ fn report_receipt_binding() -> bool {
     fixture != "UNNAMED"
 }
 
+struct ObservedEpochReceipt {
+    height: u64,
+    txid: String,
+    runtime: u64,
+    events: usize,
+}
+
+fn reference_epoch_snapshot(root: &Path) -> Result<(), String> {
+    let path = root.join("crates/nano-conformance/tests/conformance/at_block_refusal.rs");
+    let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    for required in [
+        "runtime_check_error_kind_at_block_unavailable_ccall",
+        "STACKS_CORE_REFUSAL_COST",
+        "runtime: 275",
+    ] {
+        if !source.contains(required) {
+            return Err(format!("reference snapshot is missing {required}"));
+        }
+    }
+    Ok(())
+}
+
+fn observed_epoch_receipt(root: &Path) -> Result<ObservedEpochReceipt, String> {
+    let directory = root.join("crates/nano-conformance/fixtures/mainnet/divergence");
+    let receipt_path = directory.join("tx-f338-receipt.json");
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(&receipt_path).map_err(|error| format!("{}: {error}", receipt_path.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", receipt_path.display()))?;
+    let expected_txid = "f33840c54f18a314f00b1338bc3d43e3103cbe9ce424d0418e94bc463903fe62";
+    if receipt["source"]
+        .as_str()
+        .is_none_or(|source| !source.starts_with("https://api.hiro.so/"))
+        || receipt["txid"].as_str() != Some(expected_txid)
+        || receipt["block_height"].as_u64() != Some(8_686_666)
+        || receipt["canonical"].as_bool() != Some(true)
+        || receipt["status"].as_str() != Some("success")
+        || receipt["result"]["repr"].as_str() != Some("(ok u12395909)")
+    {
+        return Err("observed receipt identity or result is not canonical".to_owned());
+    }
+    for (dimension, expected) in [
+        ("read_count", 53),
+        ("read_length", 48_263),
+        ("runtime", 87_814),
+        ("write_count", 8),
+        ("write_length", 83),
+    ] {
+        if receipt["cost"][dimension].as_u64() != Some(expected) {
+            return Err(format!("observed receipt has the wrong {dimension}"));
+        }
+    }
+    let events = receipt["events"]
+        .as_array()
+        .ok_or_else(|| "observed receipt has no ordered event list".to_owned())?
+        .len();
+    if events != 4 {
+        return Err(format!("observed receipt has {events} events instead of 4"));
+    }
+    let block_path = directory.join("block-8686666.hex");
+    let block = fs::read_to_string(&block_path)
+        .map_err(|error| format!("{}: {error}", block_path.display()))?;
+    if hex::decode(block.trim()).is_err() {
+        return Err(format!(
+            "{} is not a hexadecimal block",
+            block_path.display()
+        ));
+    }
+    Ok(ObservedEpochReceipt {
+        height: 8_686_666,
+        txid: expected_txid.to_owned(),
+        runtime: 87_814,
+        events,
+    })
+}
+
+fn report_historical_epoch_evidence() -> bool {
+    println!("\nhistorical epoch evidence");
+    let root = workspace_root();
+    let reference = reference_epoch_snapshot(&root);
+    match &reference {
+        Ok(()) => {
+            println!("  reference snapshot   PASS stacks-core at-block refusal (runtime 275)");
+        }
+        Err(error) => {
+            println!("  reference snapshot   FAIL {error}");
+        }
+    }
+    let observed = observed_epoch_receipt(&root);
+    match &observed {
+        Ok(receipt) => {
+            println!(
+                "  observed mainnet     PASS block {} tx {} (runtime {}, {} events)",
+                receipt.height, receipt.txid, receipt.runtime, receipt.events
+            );
+        }
+        Err(error) => {
+            println!("  observed mainnet     MISSING/INVALID {error}");
+        }
+    }
+    println!(
+        "  replay gate          mainnet_divergence::the_mainnet_8686666_old_epoch_receipt_and_root_match_the_canonical_oracle"
+    );
+    reference.is_ok() && observed.is_ok()
+}
+
 /// Every `#[ignore]` in the execution engine's own suite and in the conformance
 /// suite, with the reason it gives.
 ///
@@ -5813,11 +6086,11 @@ fn build_release_artifact() -> bool {
     gate.passed
 }
 
-fn report_contract_arities(state: Option<&Path>) -> bool {
+fn report_contract_arities(state: Option<&Path>, qualifying: bool) -> bool {
     println!("\ncontract arity inventory");
     let Some(state) = state else {
-        println!("  no --state directory given, so no full-state arity claim is made");
-        return true;
+        println!("  UNEXECUTED: no --state directory, so no full-state locals/arity claim");
+        return !qualifying;
     };
     match contract_inventory(state) {
         Ok(inventory) => {
@@ -6121,7 +6394,16 @@ fn report_gates(capture: Option<&str>, inventory: &ReleaseInventory) -> bool {
     let gates = [
         run_gate(
             "cargo",
-            &["test", "--release", "-p", "nano-rpc", "-p", "nano-node"],
+            &[
+                "test",
+                "--release",
+                "-p",
+                "nano-vm",
+                "-p",
+                "nano-rpc",
+                "-p",
+                "nano-node",
+            ],
             &[],
         ),
         run_gate(
@@ -6216,12 +6498,13 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let inventory = ReleaseInventory::load(&workspace_root());
     report_engines();
     let receipt_binding = report_receipt_binding();
+    let historical_epoch_evidence = report_historical_epoch_evidence();
     let blocking = report_differentials(&inventory) + report_declared_differentials();
     let built = artifact.is_some() || build_release_artifact();
     let artifact_path =
         artifact.unwrap_or_else(|| workspace_root().join("target/release/stacks-node"));
     let artifact = report_artifact(&artifact_path);
-    let contract_arities = report_contract_arities(state.as_deref());
+    let contract_arities = report_contract_arities(state.as_deref(), run_gates);
     report_checkpoint(state.as_deref());
     let scoreboard = report_scoreboard();
     report_inputs();
@@ -6253,6 +6536,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
             && contract_arities
             && scoreboard
             && receipt_binding
+            && historical_epoch_evidence
             && release_inventory
         {
             ExitCode::from(2)
@@ -6262,11 +6546,11 @@ fn release_report(arguments: &[String]) -> ExitCode {
     }
     if passed
         && blocking == 0
-        && built
         && artifact
         && contract_arities
         && scoreboard
         && receipt_binding
+        && historical_epoch_evidence
         && release_inventory
     {
         ExitCode::SUCCESS
@@ -6412,7 +6696,7 @@ mod tests {
         ARCHIVED_NAKAMOTO_BLOCK_QUERY, CheckpointHistoryExport, ContractArity, ContractInventory,
         ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
         chainstate_directory, contract_metadata_candidates, crosses_wasm_arity_boundary,
-        encode_hex, refusal_reason, refuse_a_short_earnings_window,
+        encode_hex, refusal_reason, refuse_a_short_earnings_window, report_contract_arities,
         write_checkpoint_authentication_history,
     };
     use nano_chainstate::NakamotoBlock;
@@ -6733,6 +7017,8 @@ mod tests {
             current: 2,
             checked: 2,
             loaded: 2,
+            counterfactual_epoch40_checked: 2,
+            counterfactual_epoch40_loaded: 2,
             ..ContractInventory::default()
         };
         inventory.note_arity("SP000000000000000000002Q6VF78.exact", exact);
@@ -6766,10 +7052,28 @@ mod tests {
             current: 1,
             checked: 1,
             loaded: 1,
+            counterfactual_epoch40_checked: 1,
+            counterfactual_epoch40_loaded: 1,
             stale_metadata: vec!["SP000000000000000000002Q6VF78.stale".to_owned()],
             ..ContractInventory::default()
         };
         assert!(inventory.passes());
+
+        inventory.counterfactual_epoch40_loaded = 0;
+        inventory.counterfactual_epoch40_refused.insert(
+            "at-block is unavailable in Epoch40".to_owned(),
+            vec!["SP000000000000000000002Q6VF78.current".to_owned()],
+        );
+        assert!(
+            inventory.passes(),
+            "a fully measured counterfactual refusal is evidence, not a current-state failure"
+        );
+        inventory.counterfactual_epoch40_refused.clear();
+        assert!(
+            !inventory.passes(),
+            "missing counterfactual accounting fails"
+        );
+        inventory.counterfactual_epoch40_loaded = 1;
 
         inventory.loaded = 0;
         inventory.note_arity("SP000000000000000000002Q6VF78.refused", report.clone());
@@ -6805,7 +7109,7 @@ mod tests {
     }
 
     #[test]
-    fn locals_inventory_records_the_exact_peak_and_sorts_every_tied_site() {
+    fn locals_inventory_records_exact_and_live_peaks_and_sorts_tied_sites() {
         assert_eq!(nano_vm::MAX_WASM_FUNCTION_LOCALS, 50_000);
         let mut inventory = ContractInventory::default();
         assert!(inventory.note_locals(
@@ -6816,18 +7120,60 @@ mod tests {
                     ("alpha".to_owned(), 15),
                     ("gamma".to_owned(), 15),
                 ]),
+                emitted: HashMap::from([
+                    (
+                        "omega".to_owned(),
+                        nano_vm::EmittedLocals {
+                            parameters: 2,
+                            declared: 16,
+                            total: 18,
+                        },
+                    ),
+                    (
+                        "alpha".to_owned(),
+                        nano_vm::EmittedLocals {
+                            parameters: 1,
+                            declared: 19,
+                            total: 20,
+                        },
+                    ),
+                ]),
             },
         ));
         assert!(inventory.note_locals(
             "SP000000000000000000002Q6VF78.a-contract",
             &nano_vm::LocalsReport {
                 max_live_locals: HashMap::from([("beta".to_owned(), 15)]),
+                emitted: HashMap::from([(
+                    "beta".to_owned(),
+                    nano_vm::EmittedLocals {
+                        parameters: 4,
+                        declared: 16,
+                        total: 20,
+                    },
+                )]),
             },
         ));
         assert!(!inventory.note_locals("SP.empty", &nano_vm::LocalsReport::default()));
         inventory.sort_measurements();
 
         assert_eq!(inventory.maximum_live_locals, 15);
+        assert_eq!(inventory.maximum_emitted_locals, 20);
+        assert_eq!(
+            inventory.maximum_emitted_local_sites,
+            vec![
+                ContractLocalsPeak {
+                    contract: "SP000000000000000000002Q6VF78.a-contract".to_owned(),
+                    function: "beta".to_owned(),
+                    locals: 20,
+                },
+                ContractLocalsPeak {
+                    contract: "SP000000000000000000002Q6VF78.z-contract".to_owned(),
+                    function: "alpha".to_owned(),
+                    locals: 20,
+                },
+            ]
+        );
         assert_eq!(
             inventory.maximum_live_local_sites,
             vec![
@@ -6848,6 +7194,21 @@ mod tests {
                 },
             ]
         );
+
+        inventory.current = 1;
+        inventory.named = 1;
+        inventory.checked = 1;
+        inventory.loaded = 1;
+        inventory.counterfactual_epoch40_checked = 1;
+        inventory.counterfactual_epoch40_loaded = 1;
+        inventory.maximum_emitted_locals = nano_vm::MAX_WASM_FUNCTION_LOCALS + 1;
+        assert!(!inventory.passes());
+    }
+
+    #[test]
+    fn qualifying_release_requires_a_full_state_inventory() {
+        assert!(!report_contract_arities(None, true));
+        assert!(report_contract_arities(None, false));
     }
 
     /// The shape `write_native_effects` builds: one entry per tenure it could

@@ -56,10 +56,11 @@ Two independent pressures push the local count up, and both are nano's:
       wasmtime refuses. Report the count per shape, not one number. **Measured
       per shape 2026-08-07: composite-copy flood (poc2) ~51,800 → 998;
       60,000-binding let, one read → 8; 26,000 all-read bindings 52,006 → 8;
-      mainnet sweep max 16,505 (see "Mainnet-state margin"). `match` binds ≤2
-      names and cannot reach the wall; prologue locals are 3/function. No
-      source-level shape reaches the locals limit anymore — the wall moved to
-      function-type arity (see "B2 shipped").**
+      cumulative/nested flattened bindings, wide optional/response `match`,
+      sequential wide `try!`, packed parameters and packed public responses are
+      now separately load-tested. Exact emitted locals are parsed from final Wasm
+      rather than inferred from live pooled locals; see the current measurement
+      below.**
 - [x] Establish whether stacks-core accepts those same sources — analyzer limits,
       read-length and the deploy cost budget — so the answer distinguishes "the
       network would reject this too" from "the network accepts what nano cannot
@@ -68,9 +69,9 @@ Two independent pressures push the local count up, and both are nano's:
 - [x] Search the imported mainnet state for contracts near the boundary. The
       checkpoint carries every deployed contract, so this is a measurement over
       real state, not a guess: report the highest local count any mainnet contract
-      reaches and its margin. **Done 2026-08-07: 137,332/137,340 compile; highest
-      peak 16,505 of 50,000 (3.0× margin; ~7× organic; 99.6% under 1k) — see
-      "Mainnet-state margin".**
+      reaches and its margin. **Done 2026-08-09: all 137,284 current-tip contracts
+      compile and load; the exact emitted maximum is 1,164 of 50,000, leaving
+      48,836, at `pox-4::get-alex` — see the current measurement below.**
 - [x] Run the eight contracts that failed the margin sweep through nano-vm's exact
       production `compile_under` path. Classify every one as a sweep-harness fault,
       network-invalid source or a distinct clarity-wasm conformance bug, and open a
@@ -102,18 +103,36 @@ Two independent pressures push the local count up, and both are nano's:
       migration's clar2wasm-side test pins the shape still compiles and the
       runtime still refuses; the positive control pins the interpreter accepts
       the same source.**
-- [ ] Close the function-type arity wall under
+- [x] Close the function-type arity wall under
       [[084-eliminate-wasm-function-type-arity-refusals-for-ne]] before treating
       the moved refusal as harmless. The 600-field tuple still demonstrates an
       interpreter-accepted source that clarity-wasm cannot load; its network
       validity and ABI fix are release questions, not failure-test details.
-- [ ] Record the outcome in the release report either way: a measured margin is
-      evidence, "no mainnet block has hit it" is not. **Recorded here:
-      "Mainnet-state margin" (max peak 16,505/50,000 over all 137,332
-      compilable mainnet contracts, 3.0× worst-case, ~7× organic, 99.6% under
-      1k) plus per-shape before/after numbers in "A+G shipped", "B1 shipped",
-      "B2 shipped". This remains open until the gate-time report consumes the
-      measurement and the unresolved eight-contract and arity results.**
+- [x] Record the outcome in the release report either way: a measured margin is
+      evidence, "no mainnet block has hit it" is not. `release-report --state`
+      consumes the exact emitted-locals and arity inventory; absent, unmeasured,
+      over-limit or refusing inventory makes qualification fail.
+
+## Authoritative current measurement — 2026-08-09
+
+`cargo xtask sweep-contracts /home/aldur/mainnet-8716986/state` compiled and
+loaded **137,284/137,284** current-tip contracts, separately reporting 58 stale
+metadata candidates out of 137,342 distinct / 146,346 raw rows. It measured the
+exact final modules at **1,164/50,000 emitted parameters plus locals**, leaving
+**48,836** at `SPXGT…pox-4::get-alex`. The compiler live-pool peak is printed
+separately and is not used as validator headroom.
+
+The spill planner budgets individual bindings by flattened slots across lexical
+ancestors. Focused gates cover cumulative nested lets, wide optional and both
+response match arms, packed parameters, sequential wide `try!`, and packed public
+responses. The full clar2wasm library suite passed 1,457 tests; Wasmtime loaded
+every module in the current-tip inventory. Retained current-tree sweep output:
+`/tmp/task068-inventory-final.txt`, SHA-256
+`677c2e834e2a7209beabbf1af9c0531fbad570bd217c04135928f18fabdf77d6`.
+
+The locals requirement, release-report bridge and independent pinned stock-node
+deployment proof are complete. Every task-local checkbox is now satisfied; the
+task remains in progress only while its formal task-060 dependency is open.
 
 ## Findings
 

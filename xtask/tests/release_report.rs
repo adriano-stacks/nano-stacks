@@ -72,6 +72,92 @@ fn baseline_fixture(root: &Path) {
 }
 
 #[test]
+fn the_embedded_compiler_identity_matches_the_current_vendor_tree() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask is under the workspace");
+    let xtask = Path::new(env!("CARGO_BIN_EXE_xtask"));
+    let embedded = Command::new(xtask)
+        .arg("compiler-identity")
+        .output()
+        .expect("read the embedded compiler identity");
+    let current = Command::new(xtask)
+        .args([
+            "compiler-identity",
+            workspace
+                .join("vendor/clarity-wasm")
+                .to_str()
+                .expect("UTF-8 workspace path"),
+        ])
+        .output()
+        .expect("hash the current compiler tree");
+
+    assert!(
+        embedded.status.success(),
+        "the artifact has no compiler identity: {}",
+        String::from_utf8_lossy(&embedded.stderr)
+    );
+    assert!(
+        current.status.success(),
+        "the current compiler tree has no identity: {}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let embedded = String::from_utf8(embedded.stdout).expect("UTF-8 identity");
+    let embedded = embedded.trim();
+    let digest = embedded
+        .strip_prefix("sha256:")
+        .expect("the embedded identity names its hash algorithm");
+    assert_eq!(
+        digest.len(),
+        64,
+        "the embedded identity is a SHA-256 digest"
+    );
+    assert!(
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the embedded identity is hexadecimal: {embedded}"
+    );
+    assert_eq!(
+        embedded,
+        String::from_utf8(current.stdout)
+            .expect("UTF-8 identity")
+            .trim(),
+        "the artifact names a compiler other than the current vendor tree"
+    );
+}
+
+#[test]
+fn a_missing_embedded_compiler_identity_fails_the_report() {
+    let temporary = tempfile::tempdir().expect("temporary release inputs");
+    let fixtures = temporary.path().join("fixtures");
+    baseline_fixture(&fixtures);
+    let artifact = temporary.path().join("stacks-node");
+    fs::write(&artifact, b"an artifact with no compiler identity")
+        .expect("write an identity-free artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "release-report",
+            "--no-gates",
+            "--artifact",
+            artifact.to_str().expect("UTF-8 temporary path"),
+        ])
+        .env("NANO_FIXTURES", &fixtures)
+        .output()
+        .expect("run release report command");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the report did not treat a missing identity as an audit failure:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("embedded compiler    MISSING"),
+        "the report did not name the missing identity:\n{stdout}"
+    );
+}
+
+#[test]
 fn a_red_scoreboard_makes_both_commands_fail() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -224,6 +310,11 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
     assert!(
         stdout.contains("NANO_REPLAY_BOTH_ENGINES=1"),
         "the report omitted its required semantic engine comparison:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("reference snapshot   PASS stacks-core at-block refusal")
+            && stdout.contains("observed mainnet     PASS block 8686666 tx f33840c5"),
+        "the report did not distinguish reference and observed epoch evidence:\n{stdout}"
     );
     assert!(
         stdout.contains("NANO_MAINNET_KEY         <redacted>") && !stdout.contains("not-for-logs"),
