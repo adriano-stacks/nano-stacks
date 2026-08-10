@@ -29,9 +29,11 @@ tests may not be waived.
 - [x] Give every entry an explicit class, owner task, required environment and
       release policy. Do not infer semantic versus infrastructure from substrings
       such as `needs to be implemented`.
-- [~] Remove every ignored semantic, cost, receipt, state, consensus and
+- [x] Remove every ignored semantic, cost, receipt, state, consensus and
       interoperability differential; a known unequal answer must remain a failing
-      test until fixed, not two accepted expectations.
+      test until fixed, not two accepted expectations. The current inventories
+      contain no semantic or unclassified ignore and no declared known
+      differential.
 - [ ] Run infrastructure-only tests in named CI/release jobs with their fixtures or
       services. A missing input must produce `could not run` and a failed release,
       never a green test count.
@@ -106,15 +108,11 @@ later test inherit a waiver silently.
 
 ## What is still open
 
-- `skip_gate` is not inventoried yet. It already has the right *mechanism*:
-  `NANO_REQUIRE_MAINNET` turns every skip into a failure, so a release run cannot
-  report green on gates that did not run. What it lacks is the same per-site
-  ownership the `#[ignore]` sites now have.
-- The fifteen blocking entries have to reach zero, which is 023's and 060's work
-  and not this task's.
-- The release report exits non-zero on a blocking count now: it prints the
-  fifteen and then fails whatever else passed, which is how a waived cost
-  differential rode along in a green report for as long as it did.
+The source and policy inventories now agree on every ignore and conditional
+site, and the blocking semantic count is zero. What remains is operational: run
+all required infrastructure entries in the named release jobs with their real
+captures, services and clients, and retain the report that proves none was
+unexecuted.
 
 ## Classified by running them, not by reading them, 2026-08-07
 

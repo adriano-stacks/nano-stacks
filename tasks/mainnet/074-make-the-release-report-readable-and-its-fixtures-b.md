@@ -69,6 +69,9 @@ who learns to skip them on the report learns to skip them everywhere.
 - [x] Build the release binary before reporting it, or require an explicit
       immutable artifact path. Verify the binary's embedded compiler identity
       before pairing it with revision and source identity.
+- [x] Close the 2026-08-09 regression where `release-report` printed
+      `artifact compiler MISSING`. A release report must fail when the pinned
+      compiler identity is absent from the inspected binary.
 - [x] Describe the artifact accurately: the Clarity interpreter machinery is
       linked as unreachable frontend/ABI code, while no interpreter entry point
       or call edge is reachable from production.
@@ -162,3 +165,17 @@ block at height 461 (`4b2211b2…` rather than the capture's `86f05aca…`). Inv
 boundary record or borrowing the same height from that chain would be a forged
 checkpoint witness. The task therefore remains open until the fixture is
 recaptured from a chainstate that still holds its exact checkpoint ancestry.
+
+## Compiler identity regression closed — 2026-08-09
+
+`nano-vm` now obtains its compiler identity from the pinned vendored compiler at
+build time and refuses to build when that identity is unavailable; there is no
+fallback placeholder. `release-report` validates the inspected artifact and exits
+1 when the embedded identity is missing. The command-level
+`an_artifact_without_a_compiler_identity_is_an_audit_failure` regression supplies
+an identity-free artifact, requires the `embedded compiler MISSING` diagnostic
+and the failing exit status. The current artifact identity is
+`sha256:86e25…`; focused build, report and strict Clippy gates are green.
+
+The authenticated-history fixture requirement remains independently open and is
+not weakened by this closure.

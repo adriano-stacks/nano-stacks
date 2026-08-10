@@ -96,36 +96,23 @@ node may invoke.
 - [x] Tell a compile refusal at a *call* apart from one at a deploy. The first
       can only ever be a compiler gap; the second is a transaction the network
       also failed. Conflating them makes a gap invisible in the state root.
-- [~] Resolve the asymmetric `least_supertype` tuple case where the interpreter
-      returns a taken branch's wider tuple but wasm exposes the narrowed layout.
-      **Amended:** the ignored test is gone, replaced by a two-sided pin on what
-      *each* engine answers, in both branch directions, across every boundary the
-      value can cross — an ignored equality is a divergence nobody measures. What
-      remains open is the fix, and
-      [[068-resolve-asymmetric-tuple-least-supertype-semantics]] records why no
-      choice inside clar2wasm closes it: the reference's answer follows the branch
-      taken, so the conformant engine is one whose values carry their shape at run
-      time.
+- [x] Resolve the asymmetric `least_supertype` tuple case where the interpreter
+      returns a taken branch's wider tuple but wasm once exposed the narrowed
+      layout. [[068-resolve-asymmetric-tuple-least-supertype-semantics]] now
+      carries runtime value shape through every compiler, memory, host and state
+      boundary; the differential declarations are removed, its focused suites
+      pass, the full compiler suite passes 1,457/1,457, and the current-tip
+      contract inventory loads 137,284/137,284.
 - [x] Resolve `match` branch bindings that shadow an enclosing local: wasm
       currently accepts a shape the reference interpreter rejects with
       `NameAlreadyUsed`. Pin both the taken and untaken branch behavior.
-- [~] Account for every ignored Clarity semantic differential in the release
-      report. A known engine disagreement may not be waived merely because it
-      has not appeared in the replayed mainnet window.
-      An `ignored tests` section, scanned rather than written down: it reads every
-      `#[ignore]` in the engine's own suite and the conformance suite out of the
-      sources and splits infrastructure reasons from semantic ones. A bare
-      `#[ignore]` with no reason counts as semantic, because an unexplained skip is
-      what the section exists to make impossible. **Audit correction
-      2026-08-07:** this is not complete. `needs to be implemented` is classified
-      as infrastructure, which hides the ignored Clarity-4 contract-call cost
-      test, and the scan cannot see [[068]] because its replacement tests pin two
-      unequal engine answers without an ignore. The report must account for both
-      forms under [[074]]. It currently reports **0 semantic** —
-      `#[ignore = "see issue #316"]` turned out to hide a wrong *expectation* and
-      not a disagreement: both engines answer `(+ 3 4)` for a deploy whose last
-      top-level form is a definition, which is what `initialize_contract` and
-      `eval_all` both do.
+- [x] Account for every ignored Clarity semantic differential in the release
+      report. The source-to-inventory gate covers every ignore and conditional
+      site, `known-differentials.toml` is empty, and `ignored-tests.toml` has no
+      semantic or unclassified entry: its remaining entries are measured
+      infrastructure, out-of-scope, covered or tool cases with named owners and
+      release policy. A new or stale site fails the mandatory inventory test and
+      release report instead of inheriting a prose waiver.
 - [x] Reject a contract call through a constant during top-level deployment with
       the reference `ContractCallExpectName` result under
       [[067-reject-contract-call-through-a-constant-while-depl]], and remove its
