@@ -101,11 +101,7 @@ fn context(
     }
 }
 
-/// Whether a payload still reports what a block and its transactions cost.
-///
-/// The dimensions themselves are the scoreboard's `replay: costs` row, which
-/// is a known-open divergence in the VM; this only holds the payload to
-/// carrying them.
+/// Whether a payload reports every block and transaction cost dimension.
 fn costs_are_reported(payload: &Value) -> bool {
     let dimensions = |cost: &Value| {
         [
@@ -146,21 +142,12 @@ const UNKNOWN_PROVENANCE: [&str; 3] = [
 ///
 /// stacks-core builds its event list out of a `HashSet` of event indices, so
 /// the order it publishes them in is not the order it numbered them; the
-/// index is the meaning. The cost dimensions come out because they are the
-/// scoreboard's own row.
+/// index is the meaning. Costs stay in: they are consensus-visible admission
+/// inputs, and the VM differential that once required removing them is closed.
 fn normalize(payload: &mut Value) {
     let object = payload.as_object_mut().expect("payload object");
-    object.remove("anchored_cost");
     if let Some(events) = object.get_mut("events").and_then(Value::as_array_mut) {
         events.sort_by_key(|event| event["event_index"].as_u64());
-    }
-    if let Some(transactions) = object.get_mut("transactions").and_then(Value::as_array_mut) {
-        for transaction in transactions {
-            transaction
-                .as_object_mut()
-                .expect("transaction object")
-                .remove("execution_cost");
-        }
     }
     if let Some(rewards) = object
         .get_mut("matured_miner_rewards")
