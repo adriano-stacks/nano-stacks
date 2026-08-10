@@ -1099,36 +1099,63 @@ where
             block_id: executed_tip,
             height: executed_height,
         };
-        // Forward first, and the order is the whole gain. The descent below has to
-        // reach this node's tip before a single staged block can execute, so from a
-        // checkpoint far behind the network it spends round after round downloading
-        // history nothing can yet run. The schedule starts at the tip and works up, so
-        // the first tenure it stages is the next one the executor wants.
+        // A staged branch with an unexecuted parent already says exactly what is
+        // missing, and nothing above that gap can run. Close it before asking for
+        // newer inventory: on the pristine mainnet replay the forward schedule spent
+        // every peer each round while 66,000 linked blocks waited above a 753-block
+        // hole, so the descent was skipped forever.
+        let mut fetched = 0;
+        if let Some(resume) = staging
+            .descent_resumes_at()?
+            .filter(|(resume, _)| !self.chainstate.has_executed(*resume.as_bytes()))
+            .map(|(resume, _)| resume)
+        {
+            fetched +=
+                Self::descend(history, staging, resume, stop, budget.fetch, &mut round).await?;
+        }
+
+        // With no known staged gap, forward first. A backward descent has to reach
+        // this node's tip before a single staged block can execute, while the schedule
+        // starts at the tip and asks directly for the next tenure.
         let acquired = staging.highest()?.map(|block| block.header.consensus_hash);
         let schedule = self.schedule_tenures(pox, claims, acquired);
-        let scheduled =
-            Self::fetch_scheduled(history, staging, &schedule, stop, budget.fetch, &mut round)
-                .await?;
-        let peer_tip = match node.tenure_info().await {
-            Ok(info) => Some(info.tip_block_id),
-            Err(error) if error.is_rate_limited() => {
-                round.rate_limited = true;
-                None
-            }
-            Err(error) => return Err(error.into()),
+        let scheduled = if round.rate_limited {
+            0
+        } else {
+            Self::fetch_scheduled(
+                history,
+                staging,
+                &schedule,
+                stop,
+                budget.fetch.saturating_sub(fetched),
+                &mut round,
+            )
+            .await?
         };
-        round.fetched = scheduled;
+        fetched += scheduled;
+        let peer_tip = if round.rate_limited {
+            None
+        } else {
+            match node.tenure_info().await {
+                Ok(info) => Some(info.tip_block_id),
+                Err(error) if error.is_rate_limited() => {
+                    round.rate_limited = true;
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        round.fetched = fetched;
         if let Some(peer_tip) = peer_tip {
-            let mut fetched = scheduled
-                + Self::descend(
-                    history,
-                    staging,
-                    peer_tip,
-                    stop,
-                    budget.fetch.saturating_sub(scheduled),
-                    &mut round,
-                )
-                .await?;
+            fetched += Self::descend(
+                history,
+                staging,
+                peer_tip,
+                stop,
+                budget.fetch.saturating_sub(fetched),
+                &mut round,
+            )
+            .await?;
             // The descent itself continues from the furthest it has reached,
             // which is what makes a rate-limited round cost nothing but time.
             //

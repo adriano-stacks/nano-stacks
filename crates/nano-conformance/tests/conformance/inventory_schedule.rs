@@ -290,6 +290,62 @@ async fn an_inventory_drives_a_forward_download_the_first_round_executes() {
     task.abort();
 }
 
+/// A forward schedule cannot spend the peer pool while a staged branch still has a gap.
+///
+/// This is the shape the pristine mainnet replay reached: tens of thousands of linked
+/// blocks sat above a small missing suffix, but each round asked for newer inventory
+/// first. Those requests exhausted every peer, so the descent toward the executed tip
+/// was skipped forever. The staged count grew while the executed height did not move.
+#[tokio::test]
+async fn an_existing_staged_gap_is_closed_before_forward_scheduling_exhausts_the_peer() {
+    let served = served_chain();
+    let directory = tempfile::tempdir().expect("a directory");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, staging, _) = ready_node(directory.path(), &burnchain, &served).await;
+    let anchor = executor.tip().header.chain_length;
+
+    let upper: Vec<_> = served
+        .iter()
+        .filter(|block| (anchor + 3..=anchor + 10).contains(&block.header.chain_length))
+        .cloned()
+        .collect();
+    assert_eq!(
+        upper.len(),
+        8,
+        "the fixture does not contain the staged suffix"
+    );
+    for block in &upper {
+        staging.put(block).expect("stage the suffix above the gap");
+    }
+
+    // One block per descent answer makes closing the two-block gap consume exactly
+    // two requests. The next request is the forward schedule and is refused, proving
+    // both order and progress without a clock or a flaky rate-limit window.
+    let policy = Policy::default().paged(1).refusing_after(2);
+    let (peer, task) = serve(Served::honest(served, snapshots()).under(policy.clone())).await;
+    let mut history = TenureSource::only(peer.clone());
+    let claims = vec![claims_everything(1, peer.base_url().as_str())];
+    let round = executor
+        .catch_up(&peer, &mut history, &pox(), &staging, BUDGET, &claims)
+        .await
+        .expect("rate limiting the forward schedule is not a failed round");
+
+    assert!(
+        policy.refusals() > 0,
+        "the peer never rate limited the round"
+    );
+    assert!(round.rate_limited, "the rate limit was not reported");
+    assert!(
+        round.executed > 0,
+        "the forward schedule starved the staged gap: {round:?}"
+    );
+    assert!(
+        executor.tip().header.chain_length > anchor,
+        "the executor remained at the anchor despite holding its next blocks"
+    );
+    task.abort();
+}
+
 /// A peer that claimed nothing is asked only for tenures that do not exist.
 ///
 /// Two peers holding the same chain, one of them claiming it, and the exact shape of

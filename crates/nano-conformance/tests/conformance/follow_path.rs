@@ -213,6 +213,8 @@ impl BitcoinSource for MovableBurnchain {
 pub struct Policy {
     /// Answer 429 to every *n*th request. `Some(1)` refuses everything.
     refuse_every: Option<usize>,
+    /// Answer at most this many requests, then rate-limit the rest.
+    refuse_after: Option<usize>,
     /// Answer 429 to everything while this is set.
     pub refusing: Arc<AtomicBool>,
     /// Answer 429 to tenure requests only, while this is set.
@@ -238,6 +240,13 @@ impl Policy {
     #[must_use]
     pub const fn refusing_every(mut self, requests: usize) -> Self {
         self.refuse_every = Some(requests);
+        self
+    }
+
+    /// Answer `requests` times, then refuse every later request.
+    #[must_use]
+    pub const fn refusing_after(mut self, requests: usize) -> Self {
+        self.refuse_after = Some(requests);
         self
     }
 
@@ -340,6 +349,7 @@ impl Policy {
         }
         let refused = self.refusing.load(Ordering::SeqCst)
             || (self.refusing_tenures.load(Ordering::SeqCst) && tenure_asked_for(path).is_some())
+            || self.refuse_after.is_some_and(|after| count > after)
             || self
                 .refuse_every
                 .is_some_and(|every| count.is_multiple_of(every));
