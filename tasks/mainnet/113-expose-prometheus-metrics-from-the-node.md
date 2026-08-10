@@ -1,7 +1,7 @@
 ---
 title: "Expose Prometheus metrics from the node"
 id: "113"
-status: pending
+status: in-progress
 priority: medium
 type: feature
 tags: ["mainnet", "node", "observability", "rpc"]
@@ -29,23 +29,23 @@ public RPC so exposure is an operator decision.
 
 ## Tasks
 
-- [ ] Serve `/metrics` in Prometheus text format on a separately configurable
+- [x] Serve `/metrics` in Prometheus text format on a separately configurable
       bind address (default loopback), wired through `nano-rpc`/`nano-node`
       alongside the existing axum surface.
-- [ ] Chain progress: executed tip height, followed tip height (kept distinct,
+- [x] Chain progress: executed tip height, followed tip height (kept distinct,
       per task 046), burn/sortition height, and the timestamp of the last
       sealed block — the stall signature is "followed advances, executed does
       not".
-- [ ] Fail-closed visibility: counters for refused blocks by typed reason
+- [x] Fail-closed visibility: counters for refused blocks by typed reason
       (compiler gap, root mismatch, signature, missing context), so a
       consensus refusal alerts instead of idling in a log.
-- [ ] Sync and peer health: per-role serving-peer pool size, failovers, rounds
+- [x] Sync and peer health: per-role serving-peer pool size, failovers, rounds
       unanswered, download queue depth, and pushed-block accept/refuse counts
       (per-tenure attribution stays in the log; the gauge is for alerting).
-- [ ] Resource internals for task 107's follow-up: MARF node cache entries and
+- [x] Resource internals for task 107's follow-up: MARF node cache entries and
       bytes, wasm module cache entries, tenure-history window length, mempool
       size — the gauges the memory audit had to reconstruct from heap dumps.
-- [ ] Document the scrape target in the hacknet overlay and add it to the
+- [x] Document the scrape target in the hacknet overlay and add it to the
       monitoring compose (or note where the operator points their own
       Prometheus), without registering the node with any service that would
       make monitoring load-bearing.
