@@ -54,6 +54,33 @@ comparison meaningless; checkpoint-to-tip time is the honest aggregate.
 - [x] Tier 2 and 3 are follow-ups; this task records their design so the
       numbers land somewhere agreed.
 
+## Tier 2 result, 2026-08-10
+
+The same 99 mainnet blocks (heights 8,665,602–8,665,700, the first tenures
+after the attested checkpoint), replayed on the same machine from reflink
+copies. nano: `replay-blocks` over `mainnet-capture` against a copy of
+`mainnet-pristine` (33 GB state at the anchor). stacks-core `6d58b498d3`:
+`stacks-inspect validate-block <db> range 8665602 8665701` against a copy of
+the 722 GB archive chainstate — verified to run the full `append_block`
+(execution, cost check, root check) and then roll the trie back.
+
+| run | nano | stacks-core |
+|---|---|---|
+| wall, cold | 25.9 s (0.262 s/block) | 22.8 s (0.230 s/block) |
+| wall, warm | 24.1 s (0.244 s/block) | 20.8 s (0.210 s/block) |
+| user CPU | 6.2–7.0 s | 2.1–2.3 s |
+| peak RSS | 819 MB | 50 MB |
+
+Reading: a wall-clock tie within ~15%, both runs I/O-dominated (23–43 %
+CPU). Two structural asymmetries, one each way: nano *commits* every block
+durably (~65 MB written, WAL fsyncs) while stacks-core validates and
+discards (~0.5 MB written); stacks-core walks a 722 GB chainstate while
+nano walks 33 GB. nano burns ~3× the CPU per block despite the wasm
+engine — trie-node decoding is the known cost, and these blocks are small
+(2–3 transactions), so per-block fixed costs dominate engine differences.
+A longer range with fatter blocks is the follow-up that would separate
+engine speed from storage-walk speed.
+
 ## Acceptance Criteria
 
 - `cargo bench -p nano-conformance` runs both sides of each surface and
