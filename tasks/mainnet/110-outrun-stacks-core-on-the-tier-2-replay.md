@@ -379,3 +379,18 @@ dominates the 3.2 M tuple measurements. Reverted as unmeasurable; the next
 session's first datum is a handle census, and the real fix remains
 compiler-side: emit the size where codegen knows the shape, or carry the
 size in the arena entry.
+
+## Fifteenth round: the host-side sizing avenue is closed, conclusively
+
+Three sound variants — declared-size for monomorphic tuples behind the
+shape-handle guard, arena-by-reference sizing for nonzero handles, and
+both combined — all pass the full 1,472-test suite including the
+wide-shape crosscheck, and none moves user CPU. The inference is forced:
+the 3.2 M tuple measurements are dynamic *by content* — the pool tuples
+carry string fields — so every sizing must construct the value, whatever
+the handle or declaration says. No host-side change can skip that read.
+
+The gap therefore closes only in codegen: emit size accounting where the
+compiler knows the shape statically, or store the size beside the arena
+entry when a shape is preserved. Both are specified; both inherit the
+wide-shape and trait-erasure rules and this harness.
