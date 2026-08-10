@@ -459,16 +459,43 @@ fn link_runtime_value_size_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let size = read_runtime_value(
+                // `Value::size` is `type_of(value).size()`, and for a
+                // monomorphic primitive the dynamic type is the static type:
+                // materializing the value cannot change the answer. Two
+                // thirds of every host call a mainnet replay makes is this
+                // measurement, almost all of it over these primitives, and
+                // each one deserialized the whole value to reach a constant.
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let serialized_ty = read_identifier_from_wasm(
+                    memory,
                     &mut caller,
-                    value_offset,
                     serialized_ty_offset,
                     serialized_ty_length,
-                )?
-                .size()
-                .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                let size = i32::try_from(size)
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                )?;
+                let size = match serialized_ty.as_str() {
+                    "int" | "uint" => 16,
+                    "bool" => 1,
+                    "principal" => 148,
+                    _ => {
+                        let epoch = caller.data().global_context.epoch_id;
+                        let version = *caller.data().contract_context().get_clarity_version();
+                        let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
+                        let size = read_from_wasm_indirect(
+                            memory,
+                            &mut caller,
+                            &value_ty,
+                            value_offset,
+                            epoch,
+                        )?
+                        .size()
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                        i32::try_from(size)
+                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?
+                    }
+                };
                 Ok(size)
             },
         )
