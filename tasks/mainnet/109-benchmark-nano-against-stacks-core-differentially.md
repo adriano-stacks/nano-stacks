@@ -2,13 +2,14 @@
 id: "109"
 group: mainnet
 title: "Benchmark nano against stacks-core differentially"
-status: in-progress
+status: completed
 priority: medium
 effort: medium
 dependencies: []
 tags: ["mainnet", "performance", "conformance", "tooling"]
 created_at: 2026-08-10
 type: chore
+completed_at: 2026-08-10
 ---
 
 # Benchmark nano against stacks-core differentially
@@ -50,7 +51,7 @@ comparison meaningless; checkpoint-to-tip time is the honest aggregate.
 - [x] MARF: seal the lockstep workload (batch insert + seal + commit), nano vs
       stacks-core, same keys and block chain. First quick-mode reading:
       6.90 ms vs 10.76 ms for the ten-block chain, fresh stores per sample.
-- [ ] Tier 2 and 3 are follow-ups; this task records their design so the
+- [x] Tier 2 and 3 are follow-ups; this task records their design so the
       numbers land somewhere agreed.
 
 ## Acceptance Criteria
