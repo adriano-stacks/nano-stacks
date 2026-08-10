@@ -1,7 +1,7 @@
 ---
 id: "078"
 title: "Pin release builds and run mandatory gates in CI"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: chore
@@ -9,6 +9,7 @@ group: build
 dependencies: ["032", "033"]
 tags: ["build", "ci", "release", "reproducibility"]
 created_at: 2026-08-07
+completed_at: 2026-08-10
 ---
 
 # Pin release builds and run mandatory gates in CI
@@ -22,32 +23,53 @@ which compiler produced release evidence.
 ## Tasks
 
 - [x] Track `flake.lock` and pin `nixpkgs` to an immutable revision.
-- [ ] Pin an exact Rust toolchain and make the Nix shell and non-Nix setup select
+- [x] Pin an exact Rust toolchain and make the Nix shell and non-Nix setup select
       the same compiler, Cargo, Clippy and rustfmt versions.
-- [~] Add repository-root CI for formatting, release workspace Clippy, the full
+- [x] Add repository-root CI for formatting, release workspace Clippy, the full
       conformance suite, the scoreboard and the release report's offline gates.
-- [~] Require the scoreboard and release report commands to propagate failures;
+- [x] Require the scoreboard and release report commands to propagate failures;
       CI must not infer success by parsing a table.
-- [ ] Build the release artifact from the checked-out revision before hashing or
+- [x] Build the release artifact from the checked-out revision before hashing or
       inspecting it, then verify its embedded compiler identity.
-- [ ] Make `cargo fmt --all -- --check` clean for the workspace, including the
+- [x] Make `cargo fmt --all -- --check` clean for the workspace, including the
       vendored compiler sources the workspace owns.
-- [ ] Make release workspace Clippy warning-free and enforce warnings as errors.
+- [x] Make release workspace Clippy warning-free and enforce warnings as errors.
       An exit status of zero with `items_after_test_module` or an unused import is
       not a passing lint gate under this repository's rules.
-- [ ] Separate ordinary offline CI from capture-backed release qualification.
+- [x] Separate ordinary offline CI from capture-backed release qualification.
       Every committed workflow job must have the inputs needed to become green;
       the release job must fail closed when its required capture is absent rather
       than making the default workflow permanently red.
-- [ ] Make CI reject every unowned ignored or conditionally skipped required test
+- [x] Make CI reject every unowned ignored or conditionally skipped required test
       through [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
-- [ ] Make `kill_during_import` deterministic in the complete release suite. It
+- [x] Make `kill_during_import` deterministic in the complete release suite. It
       failed in the 2026-08-09 combined run and passed in isolation. Find the
       shared-state or timing cause, then retain a repeated-run regression.
 - [x] Prove `nix develop` changes no tracked or ignored repository file in a clean
       checkout.
 
-## Where this stands, 2026-08-07
+## Closed, 2026-08-10
+
+The tracked Nix and Rust pins select rustc 1.97.1, Cargo 1.97.0, Clippy 0.1.97
+and rustfmt 1.9.0. Root and vendored formatting checks pass. Release-profile
+Clippy passes with `-D warnings` across every workspace target, including
+benchmarks, and across every clar2wasm target. `actionlint` passes.
+
+The offline workflow runs the bounded replay, fixture validation, full
+conformance and unit suites, then requires the release report's explicit
+non-qualifying exit status. Capture-backed qualification is a separate manual
+self-hosted job with declared inputs. Release-report regressions prove that a
+stale/missing compiler identity and a red scoreboard fail closed, while its
+artifact is rebuilt before inspection. The ignored/conditional source inventory
+is independently validated and names every owner.
+
+`kill_during_import` now synchronizes on each persisted phase rather than racing
+wall-clock sleeps; three consecutive exact runs each refused all 24 interrupted
+imports. CI checks that `flake.lock`, the root `Cargo.lock`, and the vendored
+`Cargo.lock` are byte-identical after all gates. Their hashes were unchanged by
+the final local gate run.
+
+## Historical audit, 2026-08-07
 
 **Done.**
 
@@ -165,9 +187,9 @@ silently adopted as mainnet.
 
 ## Tasks
 
-- [ ] Wire these variables into the release job so the mainnet gates run there,
+- [x] Wire these variables into the release job so the mainnet gates run there,
       and fail the job when any required one is absent rather than skipping.
-- [ ] Decide which of the seven are gates and which are diagnostics, and stop
+- [x] Decide which of the seven are gates and which are diagnostics, and stop
       counting the diagnostics as gates.
 
 ## Two gates were writing to the artifacts they were given
