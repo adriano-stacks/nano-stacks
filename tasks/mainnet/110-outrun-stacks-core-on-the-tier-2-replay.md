@@ -365,3 +365,17 @@ size tracking in generated code where the compiler knows the shape
 statically), `load_constant` (670 k deep clones), and admission. All three
 are compiler-side work with the wide-shape rule as their constraint and
 this harness as their gate.
+
+## Fourteenth round: the shape mechanism, mapped exactly
+
+The divergence probe settled how sizing really works: a tuple repr's first
+slot is a runtime-shape *handle*; nonzero means the whole value lives in
+the per-call arena and `read_from_wasm_indirect` answers by deep-cloning
+that arena entry (`load_runtime_shape` = `get(handle).cloned()`). Sizing
+it by reference instead — same expression minus the clone, provably
+equivalent, suite green — did not move user CPU under tonight's ±40 s box
+noise, which says the handle==0 path (a full field-by-field read)
+dominates the 3.2 M tuple measurements. Reverted as unmeasurable; the next
+session's first datum is a handle census, and the real fix remains
+compiler-side: emit the size where codegen knows the shape, or carry the
+size in the arena entry.
