@@ -9,6 +9,9 @@ include!("src/compiler_identity.rs");
 
 fn main() {
     let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/clarity-wasm");
+    // Watching the directory itself matters when it was absent during an earlier
+    // build: Cargo then has no covered files whose later appearance can rerun us.
+    println!("cargo:rerun-if-changed={}", vendor.display());
     // Every file the hash covers, so a compiler change re-stamps the constant.
     // Without this the identity is whatever the tree looked like the first time
     // this crate was built, which is worse than having none.
@@ -18,10 +21,11 @@ fn main() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
-    let identity = compiler_identity_of(&vendor).unwrap_or_else(|| {
-        // A build with no vendored compiler beside it: the constant says so
-        // rather than naming a tree nobody can produce.
-        "unknown: no vendor/clarity-wasm beside this crate".to_owned()
-    });
+    let Some(identity) = compiler_identity_of(&vendor) else {
+        panic!(
+            "the vendored compiler at {} is absent or unreadable; refusing to build an artifact without its identity",
+            vendor.display()
+        );
+    };
     println!("cargo:rustc-env=NANO_COMPILER_IDENTITY={identity}");
 }

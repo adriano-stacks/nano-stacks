@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use clar2wasm::wasm_generator::LocalsReport;
+pub use clar2wasm::wasm_generator::{EmittedLocals, LocalsReport};
 pub use clar2wasm::{ArityReport, MAX_WASM_TYPE_ARITY};
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
@@ -1205,6 +1205,17 @@ pub struct ModuleInspection {
     pub refusal: Option<VmExecutionError>,
 }
 
+/// The result of compiling a stored source under one explicit semantic epoch.
+///
+/// Compiler rejection is a property of the source/epoch pair. Errors outside
+/// the compiler remain the outer `Result`, so an inventory cannot mistake an
+/// unavailable state read for a semantic refusal.
+#[derive(Debug)]
+pub enum SemanticEpochInspection {
+    Inspected(Box<ModuleInspection>),
+    CompilationRefused(String),
+}
+
 /// Epoch 4 Clarity execution over a versioned MARF-backed store.
 #[derive(Debug)]
 pub struct Vm {
@@ -1786,20 +1797,55 @@ impl Vm {
         source: &str,
         epoch: StacksEpochId,
     ) -> Result<ModuleInspection, VmExecutionError> {
-        let compiled = compile_under_report(&mut self.store, contract, source, version, epoch)?;
+        match self.inspect_module_semantic_epoch(contract, version, source, epoch)? {
+            SemanticEpochInspection::Inspected(inspected) => Ok(*inspected),
+            SemanticEpochInspection::CompilationRefused(reason) => {
+                Err(compile_refusal(contract, &reason))
+            }
+        }
+    }
+
+    /// Compile and load under exactly `epoch`, retaining a typed compile refusal.
+    pub fn inspect_module_semantic_epoch(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        version: ClarityVersion,
+        source: &str,
+        epoch: StacksEpochId,
+    ) -> Result<SemanticEpochInspection, VmExecutionError> {
+        let mut compiled = match compile_under_report_outcome(
+            &mut self.store,
+            contract,
+            source,
+            version,
+            epoch,
+        )? {
+            CompileUnderOutcome::Compiled(compiled) => *compiled,
+            CompileUnderOutcome::Refused(reason) => {
+                return Ok(SemanticEpochInspection::CompilationRefused(reason));
+            }
+        };
         let arity_report = compiled.arity_report.clone();
-        let locals_report = compiled.locals_report.clone();
+        let mut locals_report = compiled.locals_report.clone();
+        let wasm = compiled.module.emit_wasm();
+        locals_report.measure_emitted(&wasm).map_err(|error| {
+            VmInternalError::Expect(format!(
+                "measuring emitted Wasm locals for {contract} failed: {error}"
+            ))
+        })?;
         let refusal = loadable(
             contract,
-            compiled.into_compiled_contract(),
+            CompiledContract::new(wasm, compiled.contract_analysis),
             self.modules.engine(),
         )
         .err();
-        Ok(ModuleInspection {
-            arity_report,
-            locals_report,
-            refusal,
-        })
+        Ok(SemanticEpochInspection::Inspected(Box::new(
+            ModuleInspection {
+                arity_report,
+                locals_report,
+                refusal,
+            },
+        )))
     }
 
     /// The source and Clarity version this state holds for a contract.
@@ -3888,6 +3934,22 @@ fn compile_under(
         .map(clar2wasm::CompileResult::into_compiled_contract)
 }
 
+enum CompileUnderOutcome {
+    Compiled(Box<clar2wasm::CompileResult>),
+    Refused(String),
+}
+
+enum CompileUnderError {
+    Refused(String),
+    State(StaticCheckError),
+}
+
+impl From<StaticCheckErrorKind> for CompileUnderError {
+    fn from(error: StaticCheckErrorKind) -> Self {
+        Self::State(error.into())
+    }
+}
+
 fn compile_under_report(
     store: &mut MarfStore,
     contract: &QualifiedContractIdentifier,
@@ -3895,32 +3957,49 @@ fn compile_under_report(
     version: ClarityVersion,
     epoch: StacksEpochId,
 ) -> Result<clar2wasm::CompileResult, VmExecutionError> {
+    match compile_under_report_outcome(store, contract, source, version, epoch)? {
+        CompileUnderOutcome::Compiled(compiled) => Ok(*compiled),
+        CompileUnderOutcome::Refused(reason) => Err(compile_refusal(contract, &reason)),
+    }
+}
+
+fn compile_under_report_outcome(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+    source: &str,
+    version: ClarityVersion,
+    epoch: StacksEpochId,
+) -> Result<CompileUnderOutcome, VmExecutionError> {
     let mut analysis = AnalysisDatabase::new(store);
-    analysis
-        .execute::<_, _, StaticCheckError>(|analysis_db| {
-            Ok(clar2wasm::compile_for_cost_epoch(
-                source,
-                contract,
-                LimitedCostTracker::new_free(),
-                version,
-                epoch,
-                // Whatever epoch accepts the contract, the chain charges it at
-                // the rate it is running at.
-                StacksEpochId::Epoch40,
-                analysis_db,
-                true,
-            )
-            .map_err(|error: clar2wasm::CompileError| {
-                // Name the contract: a compile failure surfaces at whatever
-                // call needed the module, which is routinely a different
-                // contract, and chasing that down took a day once already.
-                StaticCheckErrorKind::Unreachable(format!(
-                    "{contract}: {}",
-                    wasm_compile_error(error)
-                ))
-            })?)
-        })
-        .map_err(|error: StaticCheckError| VmInternalError::Expect(error.to_string()).into())
+    match analysis.execute::<_, _, CompileUnderError>(|analysis_db| {
+        clar2wasm::compile_for_cost_epoch(
+            source,
+            contract,
+            LimitedCostTracker::new_free(),
+            version,
+            epoch,
+            // Whatever epoch accepts the contract, the chain charges it at
+            // the rate it is running at.
+            StacksEpochId::Epoch40,
+            analysis_db,
+            true,
+        )
+        .map_err(|error| CompileUnderError::Refused(wasm_compile_error(error)))
+    }) {
+        Ok(compiled) => Ok(CompileUnderOutcome::Compiled(Box::new(compiled))),
+        Err(CompileUnderError::Refused(reason)) => Ok(CompileUnderOutcome::Refused(reason)),
+        Err(CompileUnderError::State(error)) => {
+            Err(VmInternalError::Expect(error.to_string()).into())
+        }
+    }
+}
+
+fn compile_refusal(contract: &QualifiedContractIdentifier, reason: &str) -> VmExecutionError {
+    // Name the contract: a compile failure surfaces at whatever call needed
+    // the module, which is routinely a different contract.
+    let error: StaticCheckError =
+        StaticCheckErrorKind::Unreachable(format!("{contract}: {reason}")).into();
+    VmInternalError::Expect(error.to_string()).into()
 }
 
 /// The epoch a contract of this Clarity version was first deployable in.
@@ -4550,6 +4629,11 @@ fn loadable(
     compiled: CompiledContract,
     engine: &wasmtime::Engine,
 ) -> Result<CompiledContract, VmExecutionError> {
+    if std::env::var("NANO_DUMP_WASM_CONTRACT").as_deref() == Ok(contract.to_string().as_str())
+        && let Some(path) = std::env::var_os("NANO_DUMP_WASM")
+    {
+        let _ = std::fs::write(path, &compiled.wasm);
+    }
     if let Err(error) = wasmtime::Module::validate(engine, &compiled.wasm) {
         // A module the runtime refuses can only be read as bytes, so leave them
         // somewhere a disassembler can reach when asked.
@@ -5047,8 +5131,8 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalysisDatabase, CLARITY_FILE, MarfStoreError, StaticCheckError, compile_under,
-        ensure_wasm_module, loadable, recorded_network, reports_analysis_failure,
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SemanticEpochInspection, StaticCheckError,
+        compile_under, ensure_wasm_module, loadable, recorded_network, reports_analysis_failure,
     };
 
     #[test]
@@ -5077,6 +5161,32 @@ mod tests {
         assert!(
             refused.contains(&contract.to_string()),
             "the production load refusal did not name its contract: {refused}"
+        );
+    }
+
+    #[test]
+    fn module_inspection_measures_the_exact_module_it_loads() {
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.locals")
+            .expect("a contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [9; 32]).expect("begin block");
+        let inspected = vm
+            .inspect_module(
+                &contract,
+                ClarityVersion::Clarity3,
+                "(define-read-only (add (left uint) (right uint)) (+ left right))",
+                StacksEpochId::Epoch31,
+            )
+            .expect("compile and inspect a module");
+
+        assert!(inspected.refusal.is_none());
+        assert!(!inspected.locals_report.emitted.is_empty());
+        assert!(
+            inspected
+                .locals_report
+                .emitted
+                .values()
+                .all(|measurement| measurement.total <= super::MAX_WASM_FUNCTION_LOCALS)
         );
     }
 
@@ -6522,6 +6632,22 @@ mod tests {
             )
             .is_err(),
             "epoch 4.0 has to refuse this source, or the rest of this proves nothing"
+        );
+        let forced = vm
+            .inspect_module_semantic_epoch(
+                &contract,
+                ClarityVersion::Clarity2,
+                USES_AT_BLOCK,
+                StacksEpochId::Epoch40,
+            )
+            .expect("the state is available even though Epoch40 refuses the source");
+        assert!(
+            matches!(
+                &forced,
+                SemanticEpochInspection::CompilationRefused(reason)
+                    if reason.contains("at-block")
+            ),
+            "compiler refusal must not be reported as an unavailable state: {forced:?}"
         );
         // The module is the one 2.4 builds, byte for byte.
         let recorded = compile_under(
