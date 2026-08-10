@@ -52,10 +52,15 @@ jobs:
         run: nix develop --command actionlint
 
       - name: formatting
-        run: nix develop --command cargo fmt --all -- --check
+        run: |
+          nix develop --command cargo fmt --all -- --check
+          nix develop --command cargo fmt --manifest-path vendor/clarity-wasm/Cargo.toml --all -- --check
 
       - name: clippy, release profile, every target
-        run: nix develop --command cargo clippy --release --workspace --all-targets -- -D warnings
+        run: |
+          nix develop --command cargo clippy --release --workspace --all-targets -- -D warnings
+          nix develop --command cargo clippy --manifest-path vendor/clarity-wasm/Cargo.toml \
+            --release -p clar2wasm --all-targets -- -D warnings
 
       - name: the bounded fixture replay, as a gate
         run: nix develop --command cargo xtask scoreboard
