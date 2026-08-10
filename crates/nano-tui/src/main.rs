@@ -472,7 +472,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Min(6),
                 Constraint::Length(1),
             ])
@@ -490,7 +490,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(11),
             Constraint::Length(6),
             Constraint::Min(6),
@@ -566,6 +566,20 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
                     Color::DarkGray
                 }),
             ),
+        ]),
+        Line::from(vec![
+            label("peer pool         "),
+            number(
+                sync.fetching_from_peers
+                    .as_ref()
+                    .map(|peers| peers.len() as u64),
+                Color::Green,
+            ),
+            label(" peers serving history  ·  "),
+            number(sync.p2p_sessions, Color::White),
+            label(" p2p sessions of "),
+            number(sync.p2p_known_peers, Color::DarkGray),
+            label(" known"),
         ]),
         Line::from(vec![
             label("sync lag          "),

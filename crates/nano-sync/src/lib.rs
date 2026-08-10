@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
     sync::{
@@ -1808,12 +1808,20 @@ impl PeerPool {
     /// becomes a client here. A URL that does not parse is dropped rather than
     /// raised — it came from a peer's handshake, so a bad one is that peer's
     /// problem and not a reason to have no pool.
+    ///
+    /// De-duplicated on the *parsed* URL: the same peer arrives both configured
+    /// (`http://host:20443/`) and from its own handshake (`http://host:20443`),
+    /// spellings a raw-string comparison keeps apart, and a pool holding one
+    /// peer twice doubles requests to it and counts it as two in per-peer
+    /// serving attribution.
     #[must_use]
     pub fn from_endpoints(endpoints: &[String]) -> Self {
+        let mut seen = HashSet::new();
         Self::new(
             endpoints
                 .iter()
                 .filter_map(|endpoint| Url::parse(endpoint).ok())
+                .filter(|url| seen.insert(url.clone()))
                 .filter_map(|url| SyncClient::new(url).ok())
                 .collect(),
         )
@@ -2468,6 +2476,20 @@ mod tests {
             .expect("create sync client");
 
         assert!(Node::new(client).latest_tenure().is_none());
+    }
+
+    /// The same peer arrives configured with a trailing slash and discovered
+    /// without one; a pool holding it twice doubles requests to it and counts
+    /// it as two in serving attribution.
+    #[test]
+    fn a_peer_configured_and_discovered_is_pooled_once() {
+        let pool = super::PeerPool::from_endpoints(&[
+            "http://172.96.141.17:20443/".to_owned(),
+            "http://172.96.141.17:20443".to_owned(),
+            "http://108.130.44.244:20443/".to_owned(),
+        ]);
+
+        assert_eq!(pool.len(), 2);
     }
 
     #[test]

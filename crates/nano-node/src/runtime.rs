@@ -732,7 +732,7 @@ async fn follow(follower: Follower) -> Role {
         advertised,
         relay,
         mempool,
-        pox,
+        mut pox,
         source,
         state,
         executor,
@@ -751,11 +751,11 @@ async fn follow(follower: Follower) -> Role {
         fetch: ROUND_FETCH,
         execute: config.node.max_sync_blocks,
     };
-    let mut pox = pox;
     prepare_to_follow(executor.as_ref(), &peer, &pox, source).await?;
     let mut rounds = Rounds::new(peer);
     loop {
         rounds.history.refresh(&config, discovered.as_ref());
+        publish_peer_report(state.as_ref(), &rounds.history, discovered.as_ref()).await;
         rounds
             .choose_peer(
                 &config,
@@ -2892,6 +2892,23 @@ async fn awaited_peer(
     }
 }
 
+/// Say which peers this round stands on, so `/nano/sync_status` can name the
+/// pool instead of only the one peer fork choice picked from it.
+async fn publish_peer_report(
+    state: Option<&RpcState>,
+    history: &BulkHistory,
+    discovered: Option<&Discovered>,
+) {
+    let Some(state) = state else { return };
+    state
+        .publish_peers(nano_rpc::PeerReport {
+            fetching: history.named.clone(),
+            p2p_connected: discovered.map_or(0, Discovered::connected),
+            p2p_known: discovered.map_or(0, Discovered::known),
+        })
+        .await;
+}
+
 /// Every peer this node could follow: the ones configured, and the ones p2p found.
 ///
 /// Configured first, so an operator naming a peer still gets it weighed; discovered
@@ -2925,6 +2942,10 @@ pub(crate) fn follow_endpoints(config: &Config, discovered: Option<&Discovered>)
 struct BulkHistory {
     source: TenureSource,
     endpoints: Vec<String>,
+    /// The pool as it was actually built — parsed, de-duplicated — which is
+    /// what `/nano/sync_status` names. `endpoints` keeps the raw strings so the
+    /// rebuild guard still compares what discovery handed over.
+    named: Vec<String>,
     claiming: Vec<String>,
 }
 
@@ -2933,6 +2954,7 @@ impl BulkHistory {
         Self {
             source: TenureSource::only(peer),
             endpoints: Vec::new(),
+            named: Vec::new(),
             claiming: Vec::new(),
         }
     }
@@ -2952,6 +2974,7 @@ impl BulkHistory {
                 rebuilt.len(),
                 rebuilt.endpoints().join(", ")
             );
+            self.named = rebuilt.endpoints();
             self.source = TenureSource::new(rebuilt.into_clients());
             self.endpoints = endpoints;
             // A fresh source has no order to preserve, so the shortlist applies again.

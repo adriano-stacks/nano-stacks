@@ -21,6 +21,10 @@ pub struct SyncStatus {
     /// The tip this node's own fork choice picked out of what peers offered.
     pub selected_stacks_height: Option<u64>,
     pub selected_from_peer: Option<String>,
+    /// The pool the sync source was picked from.
+    pub fetching_from_peers: Option<Vec<String>>,
+    pub p2p_sessions: Option<u64>,
+    pub p2p_known_peers: Option<u64>,
     /// The only one that means this node computed anything.
     pub executed_stacks_height: Option<u64>,
     pub executed_stacks_tip: Option<String>,

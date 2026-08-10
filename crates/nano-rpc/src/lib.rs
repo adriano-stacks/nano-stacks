@@ -231,6 +231,10 @@ pub struct RpcState {
     /// is not the highest thing advertised is a tip this node refused, and
     /// reporting only the ends makes that invisible.
     selected: Arc<RwLock<Option<SelectedTip>>>,
+    /// The pool the node stands on: the sync source is one peer *of* these, and
+    /// reporting only it made a node fetching from seven peers look
+    /// single-homed.
+    peers: Arc<RwLock<Option<PeerReport>>>,
     /// What this node executed and sealed, which every Stacks-compatible route
     /// answers from.
     executed: Arc<RwLock<Option<Executed>>>,
@@ -303,6 +307,7 @@ impl RpcState {
             followed: Arc::new(RwLock::new(None)),
             followed_height: Arc::new(RwLock::new(None)),
             selected: Arc::new(RwLock::new(None)),
+            peers: Arc::new(RwLock::new(None)),
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
@@ -457,6 +462,11 @@ impl RpcState {
     /// exactly when it settled.
     pub async fn publish_selected(&self, selected: SelectedTip) {
         *self.selected.write().await = Some(selected);
+    }
+
+    /// Say which peers this node is standing on.
+    pub async fn publish_peers(&self, peers: PeerReport) {
+        *self.peers.write().await = Some(peers);
     }
 
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
@@ -743,6 +753,7 @@ async fn sync_status(
 ) -> Result<axum::Json<SyncStatusWire>, RpcError> {
     let followed = *state.followed_height.read().await;
     let selected = state.selected.read().await.clone();
+    let peers = state.peers.read().await.clone();
     let tip = state
         .executed
         .read()
@@ -757,6 +768,9 @@ async fn sync_status(
             .as_ref()
             .map(|selected| selected.stacks_tip.to_string()),
         selected_from_peer: selected.map(|selected| selected.peer),
+        fetching_from_peers: peers.as_ref().map(|peers| peers.fetching.clone()),
+        p2p_sessions: peers.as_ref().map(|peers| peers.p2p_connected),
+        p2p_known_peers: peers.map(|peers| peers.p2p_known),
         executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
         executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
         executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
@@ -1948,12 +1962,26 @@ pub struct SelectedTip {
     pub peer: String,
 }
 
+/// The peer pool a follow round stands on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerReport {
+    /// The endpoints history is fetched from, de-duplicated and normalised.
+    pub fetching: Vec<String>,
+    /// Live binary p2p sessions.
+    pub p2p_connected: usize,
+    /// Peers the p2p table knows of, connected or not.
+    pub p2p_known: usize,
+}
+
 #[derive(Serialize)]
 struct SyncStatusWire {
     followed_stacks_height: Option<u64>,
     selected_stacks_height: Option<u64>,
     selected_stacks_tip: Option<String>,
     selected_from_peer: Option<String>,
+    fetching_from_peers: Option<Vec<String>>,
+    p2p_sessions: Option<usize>,
+    p2p_known_peers: Option<usize>,
     executed_stacks_height: Option<u64>,
     executed_stacks_tip: Option<String>,
     executed_state_index_root: Option<String>,
