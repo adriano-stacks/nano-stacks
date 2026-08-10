@@ -2172,6 +2172,16 @@ mod crosscheck {
                 vec![Value::UInt(3)],
             ),
             (
+                "(define-map m principal bool) \
+                 (define-public (f (a principal)) (ok (map-delete m a)))",
+                vec![Value::Principal(
+                    clarity::vm::types::PrincipalData::parse(
+                        "S1G2081040G2081040G2081040G208105NK8PE5",
+                    )
+                    .expect("principal"),
+                )],
+            ),
+            (
                 "(define-public (f (a bool)) (begin (asserts! a (err u1)) (ok u2)))",
                 vec![Value::Bool(true)],
             ),
