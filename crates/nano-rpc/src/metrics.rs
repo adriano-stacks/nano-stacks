@@ -600,7 +600,7 @@ mod tests {
     };
     use tower::ServiceExt as _;
 
-    use super::{ExecutionCacheReport, RefusalReason, router};
+    use super::{ExecutionCacheReport, NodeMetrics, RefusalReason, router, serve};
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 
@@ -705,6 +705,43 @@ mod tests {
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_tcp_scrape_exposes_a_refused_followed_tip() {
+        let metrics = NodeMetrics::default();
+        metrics.publish_executed(4, 3, 1_786_310_400);
+        metrics.publish_followed(4);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("metrics listener");
+        let address = listener.local_addr().expect("metrics address");
+        let server = tokio::spawn(serve(listener, metrics.clone()));
+        let url = format!("http://{address}/metrics");
+
+        let at_tip = reqwest::get(&url)
+            .await
+            .expect("metrics response")
+            .text()
+            .await
+            .expect("metrics body");
+        assert!(at_tip.contains("nano_executed_stacks_height 4"));
+        assert!(at_tip.contains("nano_followed_stacks_height 4"));
+
+        metrics.publish_followed(5);
+        metrics.record_block_refusal("Wasm module will not load");
+        let refused = reqwest::get(&url)
+            .await
+            .expect("metrics response")
+            .text()
+            .await
+            .expect("metrics body");
+        assert!(refused.contains("nano_executed_stacks_height 4"));
+        assert!(refused.contains("nano_followed_stacks_height 5"));
+        assert!(refused.contains("nano_block_refusals_total{reason=\"compiler_gap\"} 1"));
+
+        server.abort();
+        assert!(server.await.expect_err("server stopped").is_cancelled());
     }
 
     #[test]
