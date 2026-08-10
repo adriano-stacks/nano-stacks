@@ -1,7 +1,7 @@
 ---
 id: "075"
 title: "Make the consensus scoreboard an authoritative gate"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["060"]
 tags: ["consensus", "replay", "conformance", "release"]
 created_at: 2026-08-07
+completed_at: 2026-08-09
 ---
 
 # Make the consensus scoreboard an authoritative gate
@@ -21,18 +22,18 @@ gate.
 
 ## Tasks
 
-- [~] Minimize and fix the block-76 transaction-status divergence that currently
+- [x] Minimize and fix the block-76 transaction-status divergence that currently
       stops state-root, receipt and cost replay at 75/340.
 - [x] Restore 340/340 equality for state roots, receipt status, costs, events and
       writes without weakening the oracle or editing expected output to match
       nano.
 - [x] Return a non-zero exit status when any required scoreboard surface fails.
       Loading the manifest successfully is not a passing replay.
-- [ ] Make `release-report` consume the scoreboard result rather than treating
+- [x] Make `release-report` consume the scoreboard result rather than treating
       its printed table as evidence independent of success or failure.
-- [~] Add a command-level regression that corrupts one expected receipt or root
+- [x] Add a command-level regression that corrupts one expected receipt or root
       and asserts that both `scoreboard` and the release gate fail.
-- [ ] Run the complete release conformance suite and close the event-observer,
+- [x] Run the complete release conformance suite and close the event-observer,
       PoX-5 replay, kill-during-replay and write-journal failures exposed by the
       same regression.
 
@@ -94,6 +95,30 @@ So these rigs cannot replay locally end to end until a derived chain can cross o
 which is [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]] -- and that is a
 release blocker in its own right, because the live follower meets the same refusal at
 cycle 141.
+
+## Current closure evidence — 2026-08-09
+
+The intervening reward-cycle, authentication and fixture repairs closed the stale
+red-suite account above without weakening the captured oracle:
+
+- `cargo xtask scoreboard` exits zero at **340/340** roots, receipts and costs,
+  with the frozen mainnet slice at **500/500**. The retained output is
+  `/tmp/scoreboard-current-20260809.log` (SHA-256
+  `04018a86e7f657631cf68d666768a5f420e4b4d66bca0c5ecc820ee4fe9eb3d5`).
+- `a_red_scoreboard_makes_both_commands_fail` invokes the real `scoreboard` and
+  `release-report` commands against one tampered captured receipt and requires
+  both exit statuses to be non-zero.
+- `report_scoreboard` returns the subprocess verdict and that boolean is part of
+  the final release decision; a printed red table cannot be accepted.
+- The complete release-profile conformance command passed **277 tests, 0
+  failed**, with five explicitly inventoried infrastructure tests ignored, in
+  174.78 seconds. Its retained log is
+  `/tmp/conformance-release-current-20260809.log` (SHA-256
+  `247abc6893f102a3bfb35ed19ba11b92f6c6a5d9d3012e2b205d09fcfd4ec4b4`).
+
+The original block-76 observation was caused by compiling during a concurrent
+vendored-compiler edit. It is retained as the motivating failure, while both the
+real command gate and the tampered-oracle regression now pin the durable rule.
 
 ## Acceptance Criteria
 
