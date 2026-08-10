@@ -68,6 +68,19 @@ every block durably, which stacks-core's validate mode does not.
   checkpoint suite, `kill_during_replay`, `kill_during_import`, `restart`,
   `write_journal`, nano-marf and nano-vm unit suites, workspace clippy.
 
+## Why mmap is safe here, and its one trade-off
+
+`mmap_size` maps address space, not RAM: pages materialize on first touch,
+live in the same kernel page cache `pread` filled, and evict cleanly under
+pressure — SQLite never writes through the map (writes stay on the
+`write()` + WAL path, which is what the kill suites verify). A database
+larger than memory therefore degrades to exactly the old `pread` behavior on
+misses while keeping cheaper hits; a file larger than the 64 GiB pragma falls
+back to `pread` past that offset. The trade-off: a disk-level I/O error under
+mmap is a SIGBUS crash rather than a typed storage error. That converts rare
+hardware failure into crash-and-restart, which this node's recovery is tested
+for and the container restart policy absorbs.
+
 ## Follow-ups
 
 - Migrate `/home/aldur/mainnet-tip` to 16 KiB stores (`VACUUM INTO`, ~2 min
