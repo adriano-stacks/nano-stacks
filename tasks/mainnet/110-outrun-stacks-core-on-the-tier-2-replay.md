@@ -291,3 +291,15 @@ same hook, keyed), then cut the top of the distribution — emit type/size
 bookkeeping as wasm-side code, batch data reads, widen the hot intrinsics.
 Every 800 calls removed per block is roughly ten seconds off this
 benchmark; parity needs about half of them gone.
+
+## Tenth round: the first host-call win (commit b86f9bca)
+
+Every data-carrying host body opened with `get_export("memory")` — a
+by-name export-map walk, once per each of the 4.9 M host calls. Cached on
+the context at instantiation: **6:36.8 → 6:11.5**, every root verified,
+all suites green. Gap to stacks-core: 28 s.
+
+The same family holds the rest: per-name call distribution is the next
+measurement (the hook cannot name functions; counting needs one inserted
+statement per wrap site), and the shape/size bookkeeping calls the compiler
+could prove statically are the likely bulk of the 3,264 calls per block.
