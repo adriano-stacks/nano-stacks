@@ -235,6 +235,8 @@ pub struct RpcState {
     /// reporting only it made a node fetching from seven peers look
     /// single-homed.
     peers: Arc<RwLock<Option<PeerReport>>>,
+    /// Durable staging and the two bounded p2p relay queues.
+    queues: Arc<RwLock<QueueReport>>,
     /// What this node executed and sealed, which every Stacks-compatible route
     /// answers from.
     executed: Arc<RwLock<Option<Executed>>>,
@@ -308,6 +310,7 @@ impl RpcState {
             followed_height: Arc::new(RwLock::new(None)),
             selected: Arc::new(RwLock::new(None)),
             peers: Arc::new(RwLock::new(None)),
+            queues: Arc::new(RwLock::new(QueueReport::default())),
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
@@ -469,6 +472,21 @@ impl RpcState {
         *self.peers.write().await = Some(peers);
     }
 
+    /// Publish queue depths measured by the follow loop.
+    pub async fn publish_queues(&self, queues: QueueReport) {
+        let mut current = self.queues.write().await;
+        current.staged_blocks = queues.staged_blocks.or(current.staged_blocks);
+        current.relay_offered = queues.relay_offered.or(current.relay_offered);
+        current.relay_announcing = queues.relay_announcing.or(current.relay_announcing);
+        current.relay_dropped = queues.relay_dropped.or(current.relay_dropped);
+        current.queued_blocks = queues.queued_blocks.or(current.queued_blocks);
+        current.queued_proposals = queues.queued_proposals.or(current.queued_proposals);
+        current.queued_stackerdb_chunks = queues
+            .queued_stackerdb_chunks
+            .or(current.queued_stackerdb_chunks);
+        current.queued_transactions = queues.queued_transactions.or(current.queued_transactions);
+    }
+
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
     pub async fn publish(&self, view: NodeView) {
         *self.followed_height.write().await = Some(view.node_info.stacks_height);
@@ -498,7 +516,7 @@ impl RpcState {
 fn executed_chain(tenures: Vec<FollowedTenure>, tip: &SealedTip) -> Vec<FollowedTenure> {
     let parents: HashMap<StacksBlockId, StacksBlockId> = tenures
         .iter()
-        .flat_map(|tenure| &tenure.blocks)
+        .flat_map(|tenure| tenure.blocks.iter())
         .map(|block| (block.block_id(), block.header.parent_block_id))
         .collect();
     let mut executed = HashSet::new();
@@ -510,9 +528,20 @@ fn executed_chain(tenures: Vec<FollowedTenure>, tip: &SealedTip) -> Vec<Followed
     tenures
         .into_iter()
         .filter_map(|mut tenure| {
-            tenure
+            if !tenure
                 .blocks
-                .retain(|block| executed.contains(&block.block_id()));
+                .iter()
+                .all(|block| executed.contains(&block.block_id()))
+            {
+                tenure.blocks = Arc::new(
+                    tenure
+                        .blocks
+                        .iter()
+                        .filter(|block| executed.contains(&block.block_id()))
+                        .cloned()
+                        .collect(),
+                );
+            }
             let last = tenure.blocks.last()?;
             // The tenure's own tip moves down with it: a tenure whose newest
             // blocks were dropped must not keep advertising them.
@@ -660,7 +689,7 @@ impl RpcState {
             executed
                 .chain
                 .iter()
-                .flat_map(|tenure| &tenure.blocks)
+                .flat_map(|tenure| tenure.blocks.iter())
                 .any(|known| known.block_id() == block.block_id())
         })
     }
@@ -676,7 +705,7 @@ impl RpcState {
                 || executed
                     .chain
                     .iter()
-                    .flat_map(|tenure| &tenure.blocks)
+                    .flat_map(|tenure| tenure.blocks.iter())
                     .any(|known| known.block_id() == parent)
         })
     }
@@ -754,6 +783,7 @@ async fn sync_status(
     let followed = *state.followed_height.read().await;
     let selected = state.selected.read().await.clone();
     let peers = state.peers.read().await.clone();
+    let queues = *state.queues.read().await;
     let tip = state
         .executed
         .read()
@@ -771,6 +801,27 @@ async fn sync_status(
         fetching_from_peers: peers.as_ref().map(|peers| peers.fetching.clone()),
         p2p_sessions: peers.as_ref().map(|peers| peers.p2p_connected),
         p2p_known_peers: peers.map(|peers| peers.p2p_known),
+        staged_blocks: queues.staged_blocks,
+        relay_offered: queues.relay_offered,
+        relay_announcing: queues.relay_announcing,
+        relay_dropped: queues.relay_dropped,
+        queued_blocks: queues.queued_blocks,
+        queued_proposals: queues.queued_proposals,
+        queued_stackerdb_chunks: queues.queued_stackerdb_chunks,
+        queued_transactions: queues.queued_transactions,
+        event_observers: state.observers.as_ref().map(|observers| {
+            observers
+                .status()
+                .into_iter()
+                .map(|observer| ObserverStatusWire {
+                    url: observer.url.to_string(),
+                    delivered: observer.delivered,
+                    dropped: observer.dropped,
+                    undelivered: observer.undelivered,
+                    reachable: observer.reachable,
+                })
+                .collect()
+        }),
         executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
         executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
         executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
@@ -1816,7 +1867,7 @@ async fn tenure(
         .find(|tenure| tenure.info.tenure_start_block_id.to_string() == start_block_id)
         .ok_or(RpcError::NotFound)?;
     let mut bytes = Vec::new();
-    for block in tenure.blocks {
+    for block in tenure.blocks.iter() {
         if query
             .stop
             .as_ref()
@@ -1838,14 +1889,15 @@ async fn block(
     {
         return Ok(RawBlockStream(kept));
     }
-    let block = executed(&state)
-        .await?
+    let executed = executed(&state).await?;
+    let bytes = executed
         .chain
-        .into_iter()
-        .flat_map(|tenure| tenure.blocks)
+        .iter()
+        .flat_map(|tenure| tenure.blocks.iter())
         .find(|block| block.block_id().to_string() == block_id_path)
+        .map(NakamotoBlock::encode)
         .ok_or(RpcError::NotFound)?;
-    Ok(RawBlockStream(block.encode()))
+    Ok(RawBlockStream(bytes))
 }
 
 async fn events(
@@ -1973,6 +2025,27 @@ pub struct PeerReport {
     pub p2p_known: usize,
 }
 
+/// Queue depths the follow and relay loops own rather than the RPC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueueReport {
+    /// Blocks acquired but not yet executed.
+    pub staged_blocks: Option<u64>,
+    /// Peer pushes waiting for local validation.
+    pub relay_offered: Option<usize>,
+    /// Accepted items waiting to be sent to peers.
+    pub relay_announcing: Option<usize>,
+    /// Relay items shed because a bounded queue was full.
+    pub relay_dropped: Option<u64>,
+    /// RPC blocks waiting for the follow loop.
+    pub queued_blocks: Option<usize>,
+    /// Proposals waiting for the hosted validator.
+    pub queued_proposals: Option<usize>,
+    /// `StackerDB` chunks waiting for the replication loop.
+    pub queued_stackerdb_chunks: Option<usize>,
+    /// Transactions waiting for the follow loop.
+    pub queued_transactions: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct SyncStatusWire {
     followed_stacks_height: Option<u64>,
@@ -1982,10 +2055,28 @@ struct SyncStatusWire {
     fetching_from_peers: Option<Vec<String>>,
     p2p_sessions: Option<usize>,
     p2p_known_peers: Option<usize>,
+    staged_blocks: Option<u64>,
+    relay_offered: Option<usize>,
+    relay_announcing: Option<usize>,
+    relay_dropped: Option<u64>,
+    queued_blocks: Option<usize>,
+    queued_proposals: Option<usize>,
+    queued_stackerdb_chunks: Option<usize>,
+    queued_transactions: Option<usize>,
+    event_observers: Option<Vec<ObserverStatusWire>>,
     executed_stacks_height: Option<u64>,
     executed_stacks_tip: Option<String>,
     executed_state_index_root: Option<String>,
     blocks_behind: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ObserverStatusWire {
+    url: String,
+    delivered: u64,
+    dropped: u64,
+    undelivered: usize,
+    reachable: bool,
 }
 
 #[derive(Serialize)]
@@ -2159,7 +2250,10 @@ impl From<&FollowedTenure> for TenureForkInfoWire {
                 .blocks
                 .first()
                 .map(|block| format!("0x{}", block.block_id())),
-            nakamoto_blocks: Some(format!("0x{}", hex::encode(encode_blocks(&tenure.blocks)))),
+            nakamoto_blocks: Some(format!(
+                "0x{}",
+                hex::encode(encode_blocks(tenure.blocks.as_ref()))
+            )),
         }
     }
 }
@@ -2210,7 +2304,7 @@ mod tests {
 
     use super::{
         AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, PoxRpcConfig,
-        ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
+        QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -2624,7 +2718,7 @@ mod tests {
                     vrf_seed: None,
                     mining_competition: None,
                 },
-                blocks: Vec::new(),
+                blocks: Arc::new(Vec::new()),
             }],
         }
     }
@@ -3156,6 +3250,57 @@ mod tests {
         assert_eq!(status["blocks_behind"], json!(8));
     }
 
+    /// The long-running release gate reads queues rather than inferring them
+    /// from whether the tip happened to move between two samples.
+    #[tokio::test]
+    async fn sync_status_reports_every_queue_the_node_can_hold() {
+        let (blocks, _offered) = mpsc::unbounded_channel();
+        let (proposals, _proposed) = mpsc::unbounded_channel();
+        let (chunks, _written) = mpsc::unbounded_channel();
+        let (transactions, _submitted) = mpsc::unbounded_channel();
+        let state = RpcState::new(NETWORK)
+            .with_block_sink(blocks)
+            .with_proposal_validator(proposals)
+            .with_chunk_relay(chunks)
+            .with_transaction_relay(transactions)
+            .with_observers(EventDispatcher::new(Vec::new()));
+        state
+            .publish_queues(QueueReport {
+                staged_blocks: Some(13),
+                relay_offered: Some(2),
+                relay_announcing: Some(3),
+                relay_dropped: Some(5),
+                queued_blocks: Some(7),
+                queued_proposals: Some(11),
+                queued_stackerdb_chunks: Some(17),
+                queued_transactions: Some(19),
+            })
+            .await;
+
+        let status = body_json(
+            router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/nano/sync_status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+
+        assert_eq!(status["staged_blocks"], json!(13));
+        assert_eq!(status["relay_offered"], json!(2));
+        assert_eq!(status["relay_announcing"], json!(3));
+        assert_eq!(status["relay_dropped"], json!(5));
+        assert_eq!(status["queued_blocks"], json!(7));
+        assert_eq!(status["queued_proposals"], json!(11));
+        assert_eq!(status["queued_stackerdb_chunks"], json!(17));
+        assert_eq!(status["queued_transactions"], json!(19));
+        assert_eq!(status["event_observers"], json!([]));
+    }
+
     /// A failed full poll must not hide the newer tip fork choice already found.
     #[tokio::test]
     async fn a_selected_tip_ahead_of_a_stale_followed_height_is_still_behind() {
@@ -3274,7 +3419,7 @@ mod tests {
         }
         let mut view = captured_view();
         view.tenures[0].info.tenure_start_block_id = blocks[0].block_id();
-        view.tenures[0].blocks = blocks.clone();
+        view.tenures[0].blocks = Arc::new(blocks.clone());
         (view, blocks)
     }
 
@@ -3287,6 +3432,18 @@ mod tests {
             bitcoin_height: 11,
             state_index_root: block.header.state_index_root,
         }
+    }
+
+    #[test]
+    fn publishing_an_untrimmed_tenure_shares_its_blocks() {
+        let (view, blocks) = view_with_blocks(3);
+        let held = Arc::clone(&view.tenures[0].blocks);
+        let cloned = view.clone();
+        assert!(Arc::ptr_eq(&held, &cloned.tenures[0].blocks));
+
+        let chain = super::executed_chain(cloned.tenures, &sealed_at(&blocks[2]));
+        assert!(Arc::ptr_eq(&held, &view.tenures[0].blocks));
+        assert!(Arc::ptr_eq(&held, &chain[0].blocks));
     }
 
     /// Every route answers from what this node executed, so a block the peer has

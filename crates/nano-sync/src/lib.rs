@@ -159,7 +159,8 @@ pub struct SortitionInfo {
 pub struct FollowedTenure {
     pub info: TenureInfo,
     pub sortition: SortitionInfo,
-    pub blocks: Vec<NakamotoBlock>,
+    /// Immutable once validated, and shared by the follower and every published view.
+    pub blocks: Arc<Vec<NakamotoBlock>>,
 }
 
 /// How many followed tenures stay in memory.
@@ -1957,7 +1958,7 @@ impl TenureFollower {
     ) -> Result<Option<FollowedTenure>, SyncError> {
         let previous = self.history.last().ok_or(SyncError::Fork)?;
         let held = previous.blocks.len();
-        let mut blocks = previous.blocks.clone();
+        let mut blocks = previous.blocks.as_ref().clone();
         if self
             .client
             .extend_to_tenure_tip(&mut blocks, info.tip_block_id)
@@ -1982,7 +1983,7 @@ impl TenureFollower {
         let followed = FollowedTenure {
             info: info.clone(),
             sortition,
-            blocks,
+            blocks: Arc::new(blocks),
         };
         self.record(followed.clone());
         Ok(Some(followed))
@@ -2038,13 +2039,13 @@ impl TenureFollower {
                     // A round may answer with fewer blocks of the same tenure
                     // than the one before it did — a peer that rate limits cuts
                     // the walk short — and that is the same chain, not a fork.
-                    if !blocks.starts_with(&previous.blocks)
+                    if !blocks.starts_with(previous.blocks.as_ref())
                         && !previous.blocks.starts_with(&blocks)
                     {
                         return Err(SyncError::Fork);
                     }
                     if blocks.len() < previous.blocks.len() {
-                        blocks.clone_from(&previous.blocks);
+                        blocks.clone_from(previous.blocks.as_ref());
                     }
                 } else {
                     let held = self.held_tip(latest);
@@ -2068,7 +2069,7 @@ impl TenureFollower {
             let followed = FollowedTenure {
                 info: info.clone(),
                 sortition,
-                blocks,
+                blocks: Arc::new(blocks),
             };
             self.record(followed.clone());
             return Ok(Some(followed));

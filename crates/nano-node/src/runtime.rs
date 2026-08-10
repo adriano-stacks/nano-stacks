@@ -674,6 +674,55 @@ struct Rounds {
     history: BulkHistory,
 }
 
+struct ExecutedPublication<'a> {
+    state: Option<&'a RpcState>,
+    executor: &'a SharedExecutor,
+    sealed: SealedTip,
+    pox: &'a PoxInfo,
+    config: &'a Config,
+    network: Network,
+    node: &'a Node,
+    published: &'a mut RewardCyclePublication,
+    peer: &'a SyncClient,
+}
+
+async fn publish_executed_round(publication: ExecutedPublication<'_>) {
+    let ExecutedPublication {
+        state: Some(state),
+        executor,
+        sealed,
+        pox,
+        config,
+        network,
+        node,
+        published,
+        peer,
+    } = publication
+    else {
+        return;
+    };
+    let sortitions = {
+        let mut executor = executor.lock().await;
+        // On Bitcoin's clock: a node at the chain tip with nothing staged still
+        // has to derive and report the burn view its own tip stands on.
+        executor.follow_burnchain(pox);
+        executor.derived_sortitions()
+    };
+    state.publish_executed(sealed, sortitions).await;
+    publish_reward_cycle(RewardCycleInputs {
+        state,
+        executor,
+        network,
+        context: bitcoin_context(config, pox),
+        winners: &last_sortition_winners(node.tenures()),
+        published,
+        peer,
+        registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
+        checkpoint: &config.checkpoint,
+    })
+    .await;
+}
+
 impl Rounds {
     fn new(peer: SyncClient) -> Self {
         Self {
@@ -745,9 +794,8 @@ async fn follow(follower: Follower) -> Role {
         Err(role) => return role,
     };
     let budget = CatchUpBudget {
-        // Bounded so that a round ends and execution gets its turn: an
-        // unbounded descent over a gap of tens of thousands of blocks spends
-        // every round fetching and never executes what it already holds.
+        // Bounded so a round ends and execution gets its turn: an unbounded descent
+        // would spend every round fetching and never execute what it already holds.
         fetch: ROUND_FETCH,
         execute: config.node.max_sync_blocks,
     };
@@ -805,32 +853,28 @@ async fn follow(follower: Follower) -> Role {
             let round = execute_round(executor, inputs).await;
             rounds.executed_height = round.executed_height;
             rounds.failed |= round.peer_failed;
-            let sealed = round.sealed;
-            if let Some(state) = state.as_ref() {
-                let sortitions = {
-                    let mut executor = executor.lock().await;
-                    // On Bitcoin's clock rather than execution's: a node at the chain
-                    // tip with nothing staged derives no burn view otherwise, and
-                    // cannot then describe the one its own tip stands on.
-                    executor.follow_burnchain(&pox);
-                    executor.derived_sortitions()
-                };
-                state.publish_executed(sealed, sortitions).await;
-                publish_reward_cycle(RewardCycleInputs {
-                    state,
-                    executor,
-                    network,
-                    context: bitcoin_context(&config, &pox),
-                    winners: &last_sortition_winners(rounds.node.tenures()),
-                    published: &mut rounds.published,
-                    peer: &rounds.peer,
-                    registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
-                    checkpoint: &config.checkpoint,
-                })
-                .await;
-            }
+            publish_executed_round(ExecutedPublication {
+                state: state.as_ref(),
+                executor,
+                sealed: round.sealed,
+                pox: &pox,
+                config: &config,
+                network,
+                node: &rounds.node,
+                published: &mut rounds.published,
+                peer: &rounds.peer,
+            })
+            .await;
         }
-        sleep(interval).await;
+        finish_round(
+            state.as_ref(),
+            &staging,
+            &relay,
+            &offered,
+            &submitted,
+            interval,
+        )
+        .await;
     }
 }
 
@@ -2372,6 +2416,7 @@ async fn start_hosting(
         return Ok(());
     };
     let (running, replicating) = (config.clone(), config.clone());
+    let replicating_state = state.clone();
     let endpoints = follow_endpoints(config, discovered);
     let replicas = crate::hosting::Replicas::from_endpoints(&endpoints);
     let (validating_found, replicating_found) = (discovered.cloned(), discovered.cloned());
@@ -2383,7 +2428,7 @@ async fn start_hosting(
                 network,
                 replicating_found,
                 replicas,
-                state,
+                replicating_state,
                 written,
             )
             .await,
@@ -2419,6 +2464,7 @@ async fn start_hosting(
                 validating_found,
                 pool,
                 validator,
+                state,
                 proposed,
             )
             .await,
@@ -2907,6 +2953,34 @@ async fn publish_peer_report(
             p2p_known: discovered.map_or(0, Discovered::known),
         })
         .await;
+}
+
+/// Publish the queues the follow loop and p2p relay own, then wait for the next round.
+async fn finish_round(
+    state: Option<&RpcState>,
+    staging: &Staging,
+    relay: &nano_p2p::Relay,
+    offered: &tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    submitted: &tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    interval: Duration,
+) {
+    if let Some(state) = state {
+        let staged_blocks = staging.len().ok();
+        let relay = relay.status();
+        state
+            .publish_queues(nano_rpc::QueueReport {
+                staged_blocks,
+                relay_offered: relay.map(|status| status.offered),
+                relay_announcing: relay.map(|status| status.announcing),
+                relay_dropped: relay.map(|status| status.dropped),
+                queued_blocks: Some(offered.len()),
+                queued_proposals: None,
+                queued_stackerdb_chunks: None,
+                queued_transactions: Some(submitted.len()),
+            })
+            .await;
+    }
+    sleep(interval).await;
 }
 
 /// Every peer this node could follow: the ones configured, and the ones p2p found.

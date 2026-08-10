@@ -129,6 +129,17 @@ pub struct Relay {
     inner: Arc<Mutex<Queues>>,
 }
 
+/// The bounded relay queues at one instant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RelayStatus {
+    /// Peer pushes waiting for local validation.
+    pub offered: usize,
+    /// Accepted items waiting to be sent to peers.
+    pub announcing: usize,
+    /// Offers shed because either bounded queue was full.
+    pub dropped: u64,
+}
+
 #[derive(Debug, Default)]
 struct Queues {
     /// What peers pushed, waiting to be checked.
@@ -205,6 +216,18 @@ impl Relay {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.with(|queues| queues.dropped).unwrap_or(0)
+    }
+
+    /// Report both queue depths without draining either one.
+    ///
+    /// A poisoned lock is no measurement, rather than a plausible row of zeroes.
+    #[must_use]
+    pub fn status(&self) -> Option<RelayStatus> {
+        self.with(|queues| RelayStatus {
+            offered: queues.offered.len(),
+            announcing: queues.announcing.len(),
+            dropped: queues.dropped,
+        })
     }
 
     /// A poisoned lock means a panic while queueing a block, which is not a reason
@@ -308,6 +331,14 @@ mod tests {
         for nonce in 0..u64::try_from(MAX_QUEUED_OFFERS + 8).expect("small") {
             relay.offer(Offer::transaction(None, transaction(nonce)));
         }
+        assert_eq!(
+            relay.status(),
+            Some(RelayStatus {
+                offered: MAX_QUEUED_OFFERS,
+                announcing: 0,
+                dropped: 8,
+            })
+        );
         assert_eq!(relay.take_offered().len(), MAX_QUEUED_OFFERS);
         assert_eq!(relay.dropped(), 8);
     }

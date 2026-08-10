@@ -64,12 +64,14 @@ async fn verdict(
     // byte-for-byte canonical, including the state root the role must reproduce.
     candidate.header.signer_signatures.clear();
     let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let state = nano_rpc::RpcState::new(network);
     let role = tokio::spawn(hosting::validate_proposals(
         config,
         calendar,
         None,
         TenureSource::new(peers),
         validator,
+        state,
         receive,
     ));
     let (answer, answered) = tokio::sync::oneshot::channel();

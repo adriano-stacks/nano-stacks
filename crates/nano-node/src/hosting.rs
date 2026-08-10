@@ -56,6 +56,7 @@ pub async fn validate_proposals(
     discovered: Option<Discovered>,
     mut peers: TenureSource,
     mut validator: Validator,
+    state: RpcState,
     mut requests: UnboundedReceiver<ProposalRequest>,
 ) -> Role {
     let interval = Duration::from_secs(config.node.poll_interval_secs);
@@ -69,6 +70,12 @@ pub async fn validate_proposals(
         endpoints.len().max(1)
     );
     loop {
+        state
+            .publish_queues(nano_rpc::QueueReport {
+                queued_proposals: Some(requests.len()),
+                ..nano_rpc::QueueReport::default()
+            })
+            .await;
         // A throttle and a failure are set aside for a round, and a validator's
         // round is one proposal: forgiving them here is what stops a peer that was
         // unreachable once from being written off for the life of the node.
@@ -692,6 +699,12 @@ pub async fn replicate(
     let mut outbound = Vec::new();
     let mut reported = (0, 0);
     loop {
+        state
+            .publish_queues(nano_rpc::QueueReport {
+                queued_stackerdb_chunks: Some(written.len() + outbound.len()),
+                ..nano_rpc::QueueReport::default()
+            })
+            .await;
         replicas.refresh(&crate::runtime::follow_endpoints(
             &config,
             discovered.as_ref(),
