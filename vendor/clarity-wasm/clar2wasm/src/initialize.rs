@@ -13,7 +13,7 @@ use clarity::vm::types::{
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
-use wasmtime::{AsContextMut, Linker, Store, Val};
+use wasmtime::{AsContextMut, Linker, Memory, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
@@ -44,6 +44,10 @@ pub struct ClarityWasmContext<'a, 'b, 'hooks> {
     /// a contract, and `None` otherwise.
     pub contract_analysis: Option<&'a ContractAnalysis>,
     pub cost_globals: Option<CostGlobals>,
+    /// The instance's exported linear memory, cached at instantiation: a host
+    /// function resolving it through `get_export("memory")` walked the export
+    /// map by name on every one of millions of calls per replay.
+    pub memory: Option<Memory>,
     pub module_cache: &'a ModuleCache,
     runtime_shapes: RuntimeShapeArena,
 }
@@ -74,6 +78,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             bhh_stack: vec![],
             contract_analysis,
             cost_globals,
+            memory: None,
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
         }
@@ -103,6 +108,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             bhh_stack: vec![],
             contract_analysis,
             cost_globals: None,
+            memory: None,
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
         }
@@ -451,6 +457,7 @@ pub fn initialize_contract(
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    store.data_mut().memory = Some(memory);
     let packed_return_offset =
         if let Some(return_type) = return_type.filter(|_| packed_top_level) {
             let stack_pointer = instance.get_global(&mut store, "stack-pointer").ok_or(
@@ -722,6 +729,7 @@ pub(crate) fn call_function_with_argument_sizes(
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    store.data_mut().memory = Some(memory);
     let stack_pointer =
         instance
             .get_global(&mut store, "stack-pointer")

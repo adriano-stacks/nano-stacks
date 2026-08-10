@@ -393,10 +393,7 @@ fn link_save_runtime_shape_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let serialized_ty = read_identifier_from_wasm(
                     memory,
                     &mut caller,
@@ -613,10 +610,7 @@ fn runtime_value_type(
     serialized_ty_offset: i32,
     serialized_ty_length: i32,
 ) -> Result<(Memory, TypeSignature), VmExecutionError> {
-    let memory = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
-        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
     let serialized_ty = read_identifier_from_wasm(
         memory,
         &mut *caller,
@@ -664,10 +658,7 @@ fn link_runtime_shape_is_equal_fn(
              second_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let serialized_ty = read_identifier_from_wasm(
                     memory,
                     &mut caller,
@@ -708,10 +699,7 @@ fn link_define_variable_fn(
              value_offset: i32,
              _value_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -803,10 +791,7 @@ fn link_define_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
              supply_lo: i64,
              supply_hi: i64| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -866,10 +851,7 @@ fn link_define_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "define_nft",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -936,10 +918,7 @@ fn link_define_map_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "define_map",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -1018,10 +997,7 @@ fn link_define_function_fn(
              name_offset: i32,
              name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the variable name string from the memory
                 let function_name =
@@ -1127,10 +1103,7 @@ fn link_define_trait_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
             "define_trait",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let name =
                     read_identifier_from_wasm(memory, &mut caller, name_offset, name_length)?;
@@ -1172,10 +1145,7 @@ fn link_impl_trait_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "impl_trait",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let trait_id_string =
                     read_identifier_from_wasm(memory, &mut caller, name_offset, name_length)?;
@@ -1212,10 +1182,7 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the variable name for this identifier
                 let var_name =
@@ -1257,10 +1224,7 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                         "Value {var_name}"
                     ))))?;
 
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 write_to_wasm(
                     &mut caller,
@@ -1297,10 +1261,7 @@ fn link_set_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              value_offset: i32,
              _value_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -1373,10 +1334,7 @@ fn link_tx_sender_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
                         None,
                     ))?;
 
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1422,10 +1380,7 @@ fn link_contract_caller_fn(
                             None,
                         ))?;
 
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1463,10 +1418,7 @@ fn link_current_contract_fn(
              _return_length: i32| {
                 let contract = caller.data().contract_context().contract_identifier.clone();
 
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1502,10 +1454,7 @@ fn link_tx_sponsor_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
              _return_length: i32| {
                 let opt_sponsor = caller.data().sponsor.clone();
                 if let Some(sponsor) = opt_sponsor {
-                    let memory = caller
-                        .get_export("memory")
-                        .and_then(|export| export.into_memory())
-                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                     let (_, bytes_written) = write_to_wasm(
                         &mut caller,
@@ -2035,10 +1984,7 @@ fn link_exit_restrict_assets_fn(
              asset_owner_offset: i32,
              asset_owner_length: i32,
              allowance_ref: Option<ExternRef>| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(WasmError::MemoryNotFound)?;
+                let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
                 let epoch = caller.data().global_context.epoch_id;
                 let owner = read_from_wasm(
                     memory,
@@ -2184,10 +2130,7 @@ fn link_with_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              token_name_length: i32,
              amount_lo: i64,
              amount_hi: i64| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(WasmError::MemoryNotFound)?;
+                let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
 
                 let epoch = caller.data().global_context.epoch_id;
 
@@ -2270,10 +2213,7 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              identifiers_length: i32,
              identifiers_ty_offset: i32,
              identifiers_ty_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(WasmError::MemoryNotFound)?;
+                let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
 
                 let epoch = caller.data().global_context.epoch_id;
 
@@ -2468,10 +2408,7 @@ fn link_stx_get_balance_fn(
              principal_offset: i32,
              principal_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2519,10 +2456,7 @@ fn link_stx_account_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
              principal_offset: i32,
              principal_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2613,10 +2547,7 @@ fn link_stx_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2711,10 +2642,7 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2844,10 +2772,7 @@ fn link_ft_get_supply_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     caller.data().contract_context().contract_identifier.clone();
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the token name
                 let token_name =
@@ -2884,10 +2809,7 @@ fn link_ft_get_balance_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
              owner_offset: i32,
              owner_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the token name
                 let name =
@@ -2954,10 +2876,7 @@ fn link_ft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3080,10 +2999,7 @@ fn link_ft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3207,10 +3123,7 @@ fn link_ft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3383,10 +3296,7 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3437,10 +3347,7 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                 ) {
                     Ok(owner) => {
                         // Write the principal to the return buffer
-                        let memory = caller
-                            .get_export("memory")
-                            .and_then(|export| export.into_memory())
-                            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                        let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                         let (_, bytes_written) = write_to_wasm(
                             caller,
@@ -3483,10 +3390,7 @@ fn link_nft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3620,10 +3524,7 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3749,10 +3650,7 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3920,10 +3818,7 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the map name
                 let map_name =
@@ -3967,10 +3862,7 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     Ok(data) => {
                         let serialized_byte_len = i32::try_from(data.serialized_byte_len)
                             .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                        let memory = caller
-                            .get_export("memory")
-                            .and_then(|export| export.into_memory())
-                            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                        let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                         let ty = TypeSignature::OptionalType(Box::new(data_types.value_type));
                         write_to_wasm(
@@ -4019,10 +3911,7 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 }
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -4128,10 +4017,7 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 }
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -4234,10 +4120,7 @@ fn link_map_delete_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 }
 
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the map name
                 let map_name =
@@ -4439,10 +4322,7 @@ fn link_get_block_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4500,10 +4380,7 @@ fn link_get_block_info_vrf_seed_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4563,10 +4440,7 @@ fn link_get_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4626,10 +4500,7 @@ fn link_get_block_info_burnchain_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4689,10 +4560,7 @@ fn link_get_block_info_identity_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4752,10 +4620,7 @@ fn link_get_block_info_miner_address_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4809,10 +4674,7 @@ fn link_get_block_info_miner_spend_winner_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4865,10 +4727,7 @@ fn link_get_block_info_miner_spend_total_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4921,10 +4780,7 @@ fn link_get_block_info_block_reward_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4995,10 +4851,7 @@ fn link_get_burn_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let height = ((height_hi as u128) << 64) | ((height_lo as u64) as u128);
 
                 // Note: we assume that we will not have a height bigger than u32::MAX.
@@ -5070,10 +4923,7 @@ fn link_get_burn_block_info_pox_addrs_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let height = ((height_hi as u128) << 64) | ((height_lo as u64) as u128);
 
@@ -5169,10 +5019,7 @@ fn link_get_stacks_block_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 // Get the memory from the caller
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5221,10 +5068,7 @@ fn link_get_stacks_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Get the memory from the caller
                 if let Some(height_value) =
@@ -5280,10 +5124,7 @@ fn link_get_stacks_block_info_identity_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5339,10 +5180,7 @@ fn link_get_tenure_info_burnchain_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5398,10 +5236,7 @@ fn link_get_tenure_info_miner_address_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5451,10 +5286,7 @@ fn link_get_tenure_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5503,10 +5335,7 @@ fn link_get_tenure_info_vrf_seed_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5562,10 +5391,7 @@ fn link_get_tenure_info_block_reward_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5632,10 +5458,7 @@ fn link_get_tenure_info_miner_spend_total_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5684,10 +5507,7 @@ fn link_get_tenure_info_miner_spend_winner_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5768,10 +5588,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     //   is checked in callables::DefinedFunction::execute_apply.
 
                     // Get the memory from the caller
-                    let memory = caller
-                        .get_export("memory")
-                        .and_then(|export| export.into_memory())
-                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                     let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -5977,10 +5794,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              return_offset: i32,
              _return_length: i32| {
                 let result = (|| -> Result<(), VmExecutionError> {
-                    let memory = caller
-                        .get_export("memory")
-                        .and_then(|export| export.into_memory())
-                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                     let epoch = caller.data().global_context.epoch_id;
                     let contract_value = read_from_wasm(
                         memory,
@@ -6222,10 +6036,7 @@ fn link_contract_hash_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              contract_length: i32,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -6420,10 +6231,7 @@ fn link_print_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecut
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let serialized_ty = read_identifier_from_wasm(
                     memory,
@@ -6461,10 +6269,7 @@ fn link_enter_at_block_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
             |mut caller: Caller<'_, ClarityWasmContext>,
              block_hash_offset: i32,
              block_hash_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data_mut().global_context.epoch_id;
                 // The *executing* epoch, not the one the module was built under,
                 // and this is why the check cannot be a compile-time one: a
@@ -6591,10 +6396,7 @@ fn link_keccak256_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6630,10 +6432,7 @@ fn link_sha512_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecu
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6666,10 +6465,7 @@ fn link_sha512_256_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6709,10 +6505,7 @@ fn link_secp256k1_recover_fn(
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let ret_ty = TypeSignature::new_response(
                     TypeSignature::BUFFER_33.clone(),
@@ -6795,10 +6588,7 @@ fn link_secp256k1_verify_fn(
              pk_offset: i32,
              pk_length: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the message bytes from the memory
                 let msg_bytes = read_bytes_from_wasm(memory, &mut caller, msg_offset, msg_length)?;
@@ -6861,10 +6651,7 @@ fn link_secp256r1_verify_fn(
              signature_length: i32,
              public_key_offset: i32,
              public_key_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let message =
                     read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
                 let signature =
@@ -6922,10 +6709,7 @@ fn link_ed25519_verify_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
              signature_length: i32,
              public_key_offset: i32,
              public_key_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let message =
                     read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
                 let signature =
@@ -6980,10 +6764,7 @@ fn link_secp256k1_decompress_fn(
              public_key_length: i32,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let public_key = read_bytes_from_wasm(
                     memory,
                     &mut caller,
@@ -7047,10 +6828,7 @@ fn link_verify_merkle_proof_fn(
              siblings_shape: i32,
              siblings_offset: i32,
              siblings_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data().global_context.epoch_id;
                 let leaf = read_from_wasm(
                     memory,
@@ -7109,10 +6887,7 @@ fn link_get_bitcoin_tx_output_fn(
              vout_high: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data().global_context.epoch_id;
                 let tx = read_from_wasm(
                     memory,
@@ -7171,10 +6946,7 @@ fn link_principal_of_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              key_length: i32,
              principal_offset: i32| {
                 // Get the memory from the caller
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -7264,10 +7036,7 @@ fn link_save_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              name_length: i32,
              value_offset: i32,
              _value_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -7317,10 +7086,7 @@ fn link_load_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              name_length: i32,
              value_offset: i32,
              _value_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read constant name from the memory.
                 let const_name =
@@ -7374,10 +7140,7 @@ fn link_principal_to_string_ascii(
              principal_length: i32,
              result_offset: i32,
              result_length: i32| {
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|export| export.into_memory())
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data().global_context.epoch_id;
 
@@ -7423,6 +7186,8 @@ fn link_skip_list<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
             "clarity",
             "skip_list",
             |mut caller: Caller<'_, T>, offset_beg: i32, offset_end: i32| {
+                // Generic over `T`, so the cached handle on the Clarity context
+                // is out of reach; this test-only word keeps the name lookup.
                 let memory = caller
                     .get_export("memory")
                     .and_then(|export| export.into_memory())
