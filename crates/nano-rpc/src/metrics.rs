@@ -1,0 +1,309 @@
+use std::sync::{Arc, atomic::AtomicI64};
+
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use prometheus_client::{encoding::text::encode, metrics::gauge::Gauge, registry::Registry};
+
+use crate::QueueReport;
+
+type IntGauge = Gauge<i64, AtomicI64>;
+
+struct Inner {
+    registry: Registry,
+    executed_stacks_height: IntGauge,
+    followed_stacks_height: IntGauge,
+    selected_stacks_height: IntGauge,
+    burn_height: IntGauge,
+    last_sealed_timestamp_seconds: IntGauge,
+    serving_peers: IntGauge,
+    p2p_connected: IntGauge,
+    p2p_known: IntGauge,
+    staged_blocks: IntGauge,
+    relay_offered: IntGauge,
+    relay_announcing: IntGauge,
+    relay_dropped: IntGauge,
+    queued_blocks: IntGauge,
+    queued_proposals: IntGauge,
+    queued_stackerdb_chunks: IntGauge,
+    queued_transactions: IntGauge,
+}
+
+/// Metrics updated at the node's existing publication boundaries.
+#[derive(Clone)]
+pub struct NodeMetrics(Arc<Inner>);
+
+impl std::fmt::Debug for NodeMetrics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NodeMetrics")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for NodeMetrics {
+    fn default() -> Self {
+        let mut registry = Registry::with_prefix("nano");
+        let executed_stacks_height = gauge(
+            &mut registry,
+            "executed_stacks_height",
+            "Latest Stacks height this node executed and sealed.",
+        );
+        let followed_stacks_height = gauge(
+            &mut registry,
+            "followed_stacks_height",
+            "Latest Stacks height advertised by the followed peers.",
+        );
+        let selected_stacks_height = gauge(
+            &mut registry,
+            "selected_stacks_height",
+            "Latest Stacks height selected by local fork choice.",
+        );
+        let burn_height = gauge(
+            &mut registry,
+            "burn_height",
+            "Bitcoin height of the latest locally executed Stacks block.",
+        );
+        let last_sealed_timestamp_seconds = gauge(
+            &mut registry,
+            "last_sealed_timestamp_seconds",
+            "Unix timestamp when the latest Stacks block was sealed.",
+        );
+        let serving_peers = gauge(
+            &mut registry,
+            "serving_peers",
+            "Peers currently serving the follower.",
+        );
+        let p2p_connected = gauge(&mut registry, "p2p_connected", "Live binary P2P sessions.");
+        let p2p_known = gauge(
+            &mut registry,
+            "p2p_known",
+            "Peers known to the binary P2P table.",
+        );
+        let staged_blocks = gauge(
+            &mut registry,
+            "staged_blocks",
+            "Blocks acquired but not yet executed.",
+        );
+        let relay_offered = gauge(
+            &mut registry,
+            "relay_offered",
+            "Peer pushes waiting for local validation.",
+        );
+        let relay_announcing = gauge(
+            &mut registry,
+            "relay_announcing",
+            "Accepted relay items waiting to be announced.",
+        );
+        let relay_dropped = gauge(
+            &mut registry,
+            "relay_dropped",
+            "Relay items dropped because a bounded queue was full.",
+        );
+        let queued_blocks = gauge(
+            &mut registry,
+            "queued_blocks",
+            "RPC blocks waiting for the follow loop.",
+        );
+        let queued_proposals = gauge(
+            &mut registry,
+            "queued_proposals",
+            "Proposals waiting for the hosted validator.",
+        );
+        let queued_stackerdb_chunks = gauge(
+            &mut registry,
+            "queued_stackerdb_chunks",
+            "StackerDB chunks waiting for the replication loop.",
+        );
+        let queued_transactions = gauge(
+            &mut registry,
+            "queued_transactions",
+            "Transactions waiting for the follow loop.",
+        );
+        Self(Arc::new(Inner {
+            registry,
+            executed_stacks_height,
+            followed_stacks_height,
+            selected_stacks_height,
+            burn_height,
+            last_sealed_timestamp_seconds,
+            serving_peers,
+            p2p_connected,
+            p2p_known,
+            staged_blocks,
+            relay_offered,
+            relay_announcing,
+            relay_dropped,
+            queued_blocks,
+            queued_proposals,
+            queued_stackerdb_chunks,
+            queued_transactions,
+        }))
+    }
+}
+
+impl NodeMetrics {
+    pub(crate) fn publish_executed(&self, stacks_height: u64, burn_height: u64, now: u64) {
+        self.0.executed_stacks_height.set(as_i64(stacks_height));
+        self.0.burn_height.set(as_i64(burn_height));
+        self.0.last_sealed_timestamp_seconds.set(as_i64(now));
+    }
+
+    pub(crate) fn publish_followed(&self, height: u64) {
+        self.0.followed_stacks_height.set(as_i64(height));
+    }
+
+    pub(crate) fn publish_selected(&self, height: u64) {
+        self.0.selected_stacks_height.set(as_i64(height));
+    }
+
+    pub(crate) fn publish_peers(&self, serving: usize, connected: usize, known: usize) {
+        self.0.serving_peers.set(as_i64(serving));
+        self.0.p2p_connected.set(as_i64(connected));
+        self.0.p2p_known.set(as_i64(known));
+    }
+
+    pub(crate) fn publish_queues(&self, queues: &QueueReport) {
+        set_option(&self.0.staged_blocks, queues.staged_blocks);
+        set_option(&self.0.relay_offered, queues.relay_offered);
+        set_option(&self.0.relay_announcing, queues.relay_announcing);
+        set_option(&self.0.relay_dropped, queues.relay_dropped);
+        set_option(&self.0.queued_blocks, queues.queued_blocks);
+        set_option(&self.0.queued_proposals, queues.queued_proposals);
+        set_option(
+            &self.0.queued_stackerdb_chunks,
+            queues.queued_stackerdb_chunks,
+        );
+        set_option(&self.0.queued_transactions, queues.queued_transactions);
+    }
+
+    fn encode(&self) -> Result<String, std::fmt::Error> {
+        let mut body = String::new();
+        encode(&mut body, &self.0.registry)?;
+        Ok(body)
+    }
+}
+
+fn gauge(registry: &mut Registry, name: &'static str, help: &'static str) -> IntGauge {
+    let gauge = IntGauge::default();
+    registry.register(name, help, gauge.clone());
+    gauge
+}
+
+fn set_option<T>(gauge: &IntGauge, value: Option<T>)
+where
+    T: TryInto<i64>,
+{
+    if let Some(value) = value.and_then(|value| value.try_into().ok()) {
+        gauge.set(value);
+    }
+}
+
+fn as_i64<T>(value: T) -> i64
+where
+    T: TryInto<i64>,
+{
+    value.try_into().unwrap_or(i64::MAX)
+}
+
+/// Build the separately bound observability surface.
+pub fn router(metrics: NodeMetrics) -> Router {
+    Router::new()
+        .route("/metrics", get(scrape))
+        .with_state(metrics)
+}
+
+/// Serve metrics until the listener is stopped.
+pub async fn serve(listener: tokio::net::TcpListener, metrics: NodeMetrics) -> std::io::Result<()> {
+    axum::serve(listener, router(metrics)).await
+}
+
+async fn scrape(State(metrics): State<NodeMetrics>) -> impl IntoResponse {
+    match metrics.encode() {
+        Ok(body) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt as _;
+
+    use super::router;
+    use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
+    use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
+
+    #[tokio::test]
+    async fn metrics_are_well_formed_and_name_the_three_chain_heights() {
+        let state = RpcState::new(Network::MAINNET);
+        state.publish_followed_height(12).await;
+        state
+            .publish_selected(SelectedTip {
+                stacks_height: 9,
+                stacks_tip: StacksBlockId::from_bytes([9; 32]),
+                peer: "http://peer.example:20443/".to_owned(),
+            })
+            .await;
+        state
+            .publish_executed(
+                SealedTip {
+                    stacks_height: 4,
+                    stacks_tip: StacksBlockId::from_bytes([4; 32]),
+                    stacks_block_hash: BlockHeaderHash::from_bytes([5; 32]),
+                    consensus_hash: ConsensusHash::from_bytes([6; 20]),
+                    bitcoin_height: 3,
+                    state_index_root: TrieHash::from_bytes([7; 32]),
+                },
+                Vec::new(),
+            )
+            .await;
+        state
+            .publish_peers(PeerReport {
+                fetching: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                p2p_connected: 5,
+                p2p_known: 8,
+            })
+            .await;
+        state
+            .publish_queues(QueueReport {
+                staged_blocks: Some(7),
+                ..QueueReport::default()
+            })
+            .await;
+
+        let response = router(state.metrics())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = std::str::from_utf8(&body).expect("UTF-8 metrics");
+        for sample in [
+            "nano_followed_stacks_height 12",
+            "nano_selected_stacks_height 9",
+            "nano_executed_stacks_height 4",
+            "nano_burn_height 3",
+            "nano_serving_peers 3",
+            "nano_staged_blocks 7",
+            "# EOF",
+        ] {
+            assert!(body.contains(sample), "missing {sample:?} in {body}");
+        }
+    }
+}

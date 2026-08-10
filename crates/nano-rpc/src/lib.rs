@@ -1,5 +1,6 @@
 mod chain;
 mod events;
+mod metrics;
 mod stackerdb;
 
 use std::{
@@ -45,6 +46,7 @@ pub use events::{
     new_burn_block_payload, proposal_response_payload, stacker_set_payload,
     stackerdb_chunks_payload,
 };
+pub use metrics::{NodeMetrics, serve as serve_metrics};
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
 const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;
@@ -211,6 +213,7 @@ struct Executed {
 /// The validated node state exposed by the public HTTP API.
 #[derive(Clone)]
 pub struct RpcState {
+    metrics: NodeMetrics,
     /// What the peer said, kept so that catching up is measurable and read by
     /// nothing else. Serving the peer's height as this node's own is how a node
     /// that had executed nothing at all reported itself within three blocks of
@@ -306,6 +309,7 @@ impl RpcState {
     pub fn new(network: Network) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
+            metrics: NodeMetrics::default(),
             followed: Arc::new(RwLock::new(None)),
             followed_height: Arc::new(RwLock::new(None)),
             selected: Arc::new(RwLock::new(None)),
@@ -328,6 +332,12 @@ impl RpcState {
             proposal_token: None,
             observers: None,
         }
+    }
+
+    /// The lock-free observations served on the separate metrics listener.
+    #[must_use]
+    pub fn metrics(&self) -> NodeMetrics {
+        self.metrics.clone()
     }
 
     /// The `StackerDB` replicas this node serves, so the node can configure
@@ -436,6 +446,8 @@ impl RpcState {
         tip: SealedTip,
         sortitions: Vec<nano_sync::SortitionInfo>,
     ) {
+        self.metrics
+            .publish_executed(tip.stacks_height, tip.bitcoin_height, now_seconds());
         let followed = self.followed.read().await.clone();
         let pox = followed.as_ref().map(|view| view.pox_info.clone());
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
@@ -454,6 +466,7 @@ impl RpcState {
     /// Without this, `/nano/sync_status` answered `blocks_behind: null` for
     /// exactly the node the number exists for.
     pub async fn publish_followed_height(&self, height: u64) {
+        self.metrics.publish_followed(height);
         *self.followed_height.write().await = Some(height);
     }
 
@@ -464,16 +477,20 @@ impl RpcState {
     /// node that reported it only when it changed peers would stop reporting it
     /// exactly when it settled.
     pub async fn publish_selected(&self, selected: SelectedTip) {
+        self.metrics.publish_selected(selected.stacks_height);
         *self.selected.write().await = Some(selected);
     }
 
     /// Say which peers this node is standing on.
     pub async fn publish_peers(&self, peers: PeerReport) {
+        self.metrics
+            .publish_peers(peers.fetching.len(), peers.p2p_connected, peers.p2p_known);
         *self.peers.write().await = Some(peers);
     }
 
     /// Publish queue depths measured by the follow loop.
     pub async fn publish_queues(&self, queues: QueueReport) {
+        self.metrics.publish_queues(&queues);
         let mut current = self.queues.write().await;
         current.staged_blocks = queues.staged_blocks.or(current.staged_blocks);
         current.relay_offered = queues.relay_offered.or(current.relay_offered);
@@ -489,6 +506,7 @@ impl RpcState {
 
     /// Publish a fully validated snapshot and notify subscribers about a new tip.
     pub async fn publish(&self, view: NodeView) {
+        self.metrics.publish_followed(view.node_info.stacks_height);
         *self.followed_height.write().await = Some(view.node_info.stacks_height);
         let event = NodeEvent::from_view(&view);
         let changed = self

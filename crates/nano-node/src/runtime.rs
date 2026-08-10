@@ -77,6 +77,7 @@ pub(crate) const SIGNER_MESSAGE_IDS: [u32; 3] = [1, 2, 3];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Job {
     Rpc,
+    Metrics,
     Follower,
     Signer,
     Miner,
@@ -106,7 +107,12 @@ impl Job {
             // A node hosting a signer stops being useful to it when either of
             // these stops, but the chain it follows is unaffected, and the signer
             // says so far louder than this node could.
-            Self::Rpc | Self::Miner | Self::Peers | Self::Proposals | Self::Replication => false,
+            Self::Rpc
+            | Self::Metrics
+            | Self::Miner
+            | Self::Peers
+            | Self::Proposals
+            | Self::Replication => false,
         }
     }
 }
@@ -115,6 +121,7 @@ impl std::fmt::Display for Job {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Rpc => "RPC server",
+            Self::Metrics => "metrics server",
             Self::Follower => "follower",
             Self::Signer => "signer",
             Self::Miner => "miner",
@@ -247,8 +254,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // is only using disk.
     let archive = keep_executed_blocks(&config, executor.as_ref()).await;
     let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone(), archive);
+    let rpc_enabled = config.node.rpc_bind.is_some();
     let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
-    publish_sealed_tip(state.as_ref(), executor.as_ref()).await;
+    publish_sealed_tip(Some(&state), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
     // view fresh.
@@ -268,7 +276,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         network,
         &pox,
         discovered.as_ref(),
-        state.as_ref(),
+        rpc_enabled.then_some(&state),
         hosted,
         &mut roles,
     )
@@ -276,7 +284,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
-    if state.is_some() || executor.is_some() {
+    if rpc_enabled || executor.is_some() {
         let follower = Follower {
             config,
             network,
@@ -287,7 +295,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             mempool,
             pox,
             source,
-            state,
+            state: Some(state),
             executor,
             offered: api_to_loop.offered,
             submitted: api_to_loop.submitted,
@@ -2269,7 +2277,7 @@ async fn start_rpc(
     wiring: ApiWiring,
     dispatcher: &EventDispatcher,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
-) -> Result<Option<RpcState>, Box<dyn Error>> {
+) -> Result<RpcState, Box<dyn Error>> {
     let ApiWiring {
         executor,
         mempool,
@@ -2279,12 +2287,7 @@ async fn start_rpc(
         chunks,
         submitted,
     } = wiring;
-    let Some(address) = config.node.rpc_bind else {
-        return Ok(None);
-    };
-    let pox_rpc = config.pox_rpc_config(network)?;
     let mut state = RpcState::new(network)
-        .with_pox_config(pox_rpc)
         .with_mempool(mempool)
         .with_block_sink(blocks)
         .with_chunk_relay(chunks)
@@ -2314,18 +2317,41 @@ async fn start_rpc(
     if let Some(token) = config.node.block_proposal_token.clone() {
         state = state.with_proposal_token(token);
     }
-    let listener = TcpListener::bind(address).await?;
-    println!("serving the public RPC on {address}");
-    let served = state.clone();
-    roles.spawn(async move {
-        (
-            Job::Rpc,
-            serve(listener, served)
-                .await
-                .map_err(|error| error.to_string()),
-        )
-    });
-    Ok(Some(state))
+    if let Some(address) = config.node.rpc_bind {
+        state = state.with_pox_config(config.pox_rpc_config(network)?);
+        let listener = TcpListener::bind(address).await?;
+        println!("serving the public RPC on {address}");
+        let served = state.clone();
+        roles.spawn(async move {
+            (
+                Job::Rpc,
+                serve(listener, served)
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        });
+    }
+    let metrics_address = config.node.metrics_bind();
+    match TcpListener::bind(metrics_address).await {
+        Ok(listener) => {
+            println!("serving Prometheus metrics on {metrics_address}");
+            let metrics = state.metrics();
+            roles.spawn(async move {
+                (
+                    Job::Metrics,
+                    nano_rpc::serve_metrics(listener, metrics)
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            });
+        }
+        Err(error) => {
+            eprintln!(
+                "cannot bind Prometheus metrics on {metrics_address}: {error}; continuing without the metrics port"
+            );
+        }
+    }
+    Ok(state)
 }
 
 /// Mine the tenures this node wins, if it is configured to mine at all.
@@ -4452,6 +4478,7 @@ authentication_history = "{}"
         assert!(Job::Follower.is_fatal());
         assert!(!Job::Miner.is_fatal());
         assert!(!Job::Rpc.is_fatal());
+        assert!(!Job::Metrics.is_fatal());
     }
 }
 

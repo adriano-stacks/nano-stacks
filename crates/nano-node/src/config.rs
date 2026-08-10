@@ -5,7 +5,11 @@
 //! so a follower, a signer and a miner are the same binary reading different
 //! files.
 
-use std::{fmt, fs, io, net::SocketAddr, path::PathBuf};
+use std::{
+    fmt, fs, io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use nano_address::StacksAddress;
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
@@ -69,6 +73,8 @@ pub struct NodeConfig {
     pub p2p_address: Option<SocketAddr>,
     /// Where to serve the public RPC, or nothing to serve none of it.
     pub rpc_bind: Option<SocketAddr>,
+    /// Where to serve Prometheus metrics. Omitted, metrics stay on loopback.
+    pub metrics_bind: Option<SocketAddr>,
     /// Where to POST the events an observer subscribes to.
     #[serde(default)]
     pub event_observers: Vec<String>,
@@ -386,6 +392,18 @@ impl NodeConfig {
     pub fn event_observers(&self) -> Result<Vec<Url>, ConfigError> {
         urls("node.event_observers", &self.event_observers)
     }
+
+    /// Keep observations off the public RPC address unless an operator says otherwise.
+    #[must_use]
+    pub fn metrics_bind(&self) -> SocketAddr {
+        self.metrics_bind.unwrap_or_else(|| {
+            let port = self
+                .rpc_bind
+                .and_then(|address| address.port().checked_add(1))
+                .unwrap_or(9153);
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        })
+    }
 }
 
 impl BurnchainConfig {
@@ -579,11 +597,32 @@ mod tests {
         );
         assert_eq!(config.burnchain.magic().expect("magic"), *b"T3");
         assert_eq!(config.node.poll_interval_secs, 1);
+        assert_eq!(config.node.metrics_bind().to_string(), "127.0.0.1:9153");
         assert!(config.signer.is_none() && config.miner.is_none());
         assert_eq!(
             config.chainstate_dir("chainstate"),
             std::path::Path::new("/tmp/nano/chainstate")
         );
+    }
+
+    #[test]
+    fn metrics_default_to_a_separate_loopback_port() {
+        let beside_rpc = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("        chain_id = 2147483648\n", "")
+            .replace(
+                "peers = [\"http://127.0.0.1:20443/\"]",
+                "peers = [\"http://127.0.0.1:20443/\"]\n        rpc_bind = \"0.0.0.0:20492\"",
+            );
+        let config = Config::parse(&beside_rpc).expect("valid configuration");
+        assert_eq!(config.node.metrics_bind().to_string(), "127.0.0.1:20493");
+
+        let explicit = beside_rpc.replace(
+            "rpc_bind = \"0.0.0.0:20492\"",
+            "rpc_bind = \"0.0.0.0:20492\"\n        metrics_bind = \"127.0.0.1:19153\"",
+        );
+        let config = Config::parse(&explicit).expect("valid configuration");
+        assert_eq!(config.node.metrics_bind().to_string(), "127.0.0.1:19153");
     }
 
     /// A role is on because its table is there, and a key quoted the way
