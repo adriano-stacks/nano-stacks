@@ -1,7 +1,7 @@
 ---
 title: "Prove and pin why mainnet block 8708126 now executes"
 id: "086"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: []
 tags: ["mainnet", "vm", "clarity", "wasm", "conformance", "replay", "release"]
 created_at: "2026-08-07"
+completed_at: 2026-08-10
 ---
 
 # Prove and pin why mainnet block 8708126 now executes
@@ -46,7 +47,7 @@ or exclude a restart/cache/state-lifecycle effect.
       through 8,708,625 with root
       `44d76d9ab3592521cc412973677bf380d2c25011f6c772f45f80a6c296088e11`.
       Record binary/compiler identity, parent state and exact commands for each.
-- [ ] Replay the exact block from an isolated copy of the 8,708,125 parent with a
+- [x] Replay the exact block from an isolated copy of the 8,708,125 parent with a
       pre-failure binary and the passing binary, then bisect the intervening
       changes. In particular, test whether `be3ec64e`'s `BindingUses` walk under
       allowance lists fixed this call or merely happened to precede the restart.
@@ -54,7 +55,7 @@ or exclude a restart/cache/state-lifecycle effect.
       path nano-vm uses. Do not infer absence from `state-value` reading only trie
       data; use `check-module`/`Vm::contract_source` against the correct `state/`
       path after its node has stopped, and keep the wrong-path failure recorded.
-- [ ] Add a focused harness that runs the captured transaction or its exact called
+- [x] Add a focused harness that runs the captured transaction or its exact called
       function against the restored parent state and reports the malformed version,
       source value, expected type, linear-memory offset and producer expression.
 - [x] Reduce from the real function body. The existing large-buffer argument and
@@ -142,7 +143,7 @@ failing run in `named.log` resumed the same parent and the same seal, and failed
 The following was the evidence boundary before the stopped-state fixture existed;
 the exact replay below supersedes the receipt/root and live-node limitations.
 
-- [ ] Replay the exact block from an isolated copy of the 8,708,125 parent with
+- [x] Replay the exact block from an isolated copy of the 8,708,125 parent with
       each binary. The parent is still a sealed version inside the MARF, and
       `Vm::open_existing` (task 087) now makes reading it non-mutating, but
       `refuse_uncommitted` correctly refuses while the node holds a 13 MB
@@ -160,21 +161,20 @@ the exact replay below supersedes the receipt/root and live-node limitations.
       `f2b9a8b62b38eaa82a1e570493484690cd09d1e5`) carries `state_index_root`
       `44d76d9ab3592521cc412973677bf380d2c25011f6c772f45f80a6c296088e11` at
       header offset 101 — byte for byte the root nano sealed.
-- [ ] Assert the captured transaction's *receipt*: status, cost and events. The
+- [x] Assert the captured transaction's *receipt*: status, cost and events. The
       root match covers every write, because a write that differed would move it,
       but a cost is not in the root and decides block admission, and an event is
       not in the root at all. This needs an event-observer capture for the block
       or a stopped node to re-execute it under one.
-- [ ] Resume the restored replay and record the next first divergence. The node
+- [x] Resume the restored replay and record the next first divergence. The node
       reached 8,708,625 and then stalled on a local sortition that cannot name the
       peers' burn view; that is task 088, not this one.
 - [x] Add the reproducer to the mandatory conformance suite
       (`allowance_principal`, and `clar2wasm`'s pre-pass test).
-- [ ] Name this task in task 060's unchecked pristine-WASM replay item.
+- [x] Name this task in task 060's pristine-WASM replay item.
 
-Until the receipt and root are compared with the network, this task stays open:
-the cause is pinned and the regression is in the gate, but "the block executes"
-and "the block executes to the chain's answer" are different claims.
+The receipt and root are now compared with the network by the exact offline gate
+below; the task no longer relies on the historical live-node observation.
 
 ## Exact offline replay, 2026-08-09
 
@@ -202,24 +202,25 @@ writing it to Wasm. The map-backed None/Some regression
 the full 23-test cost crosscheck and 1,441-test clar2wasm library suite pass with
 it, as does strict all-target Clippy.
 
-## What is still not proved
+## Final causal pair
 
-- [ ] Run the whole captured block with the historical pre-`be3ec64e` compiler.
-      The focused pre-pass and conformance reductions prove the causal stale-local
-      read, but the exact old binary has not executed this preserved scratch.
-- [ ] Compare the captured transaction's full interpreter event and `AssetMap`
-      effects at its exact same-block prestate. It is transaction index four;
-      running it directly on the parent omits the first four transactions and
-      changes one treasury mint from 516 to 514. The production prefix executor
-      is private and also owns cumulative cost, nonce, fee, postcondition and
-      commit/rollback semantics. There is no honest public partial-block engine
-      injection seam, and this task does not add a duplicate one. Focused
-      interpreter crosschecks cover every causal value/cost change; the captured
-      block's compiled receipt and root are independently bound to the network.
+- [x] Run the whole captured block with the pre-`be3ec64e` compiler behavior. A
+      clean detached worktree at `197da529` restored the old `BindingUses` walk;
+      its fresh reflink replay failed transaction `823f248a…` with the expected
+      invalid principal at linear-memory offset 53,835. The current tree at
+      `605022a6`, rebuilt into a new empty Cargo target directory, passed the same
+      gate against a separate fresh reflink.
+- [x] Compare the captured transaction's full interpreter event and `AssetMap`
+      effects at its exact same-block prestate. The fixture helper executes
+      transactions zero through three with the production prefix executor, then
+      runs transaction four through clarity-wasm and the pinned interpreter in
+      isolated transactions. Value, all five cost dimensions, ordered events and
+      `AssetMap` agree; the compiled full-block replay also seals the canonical
+      root. The stopped source MARF and Clarity database inode, size and mtime
+      stamps remained unchanged.
 
-The task remains open only for those two literal historical/interpreter evidence
-items. The production failure, receipt, costs, events, writes and next replay
-frontier are pinned.
+The production failure, causal change, receipt, costs, events, writes, root and
+next replay frontier are all pinned.
 
 ## Three more of this family are deployed on mainnet, 2026-08-08
 
