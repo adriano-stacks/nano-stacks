@@ -64,6 +64,8 @@ const NODE_HASH_CACHE_BYTES: usize = 100_000_000;
 /// 65,536 entries.
 const BLOCK_CACHE_BYTES: usize = 12_000_000;
 const HASH_CACHE_BYTES: usize = 8_000_000;
+const SQLITE_MMAP_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
 
 const LEAF_RECORD: u8 = 0;
 const INTERNAL_RECORD: u8 = 1;
@@ -211,6 +213,7 @@ impl TrieStorage {
             crate::immutable_uri(path),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
+        connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
         connection.execute_batch(
             "PRAGMA cache_size = -2000000;
              PRAGMA temp_store = MEMORY;",
@@ -239,6 +242,12 @@ impl TrieStorage {
 
     fn open_with_journal(path: &Path, journal: bool) -> Result<Self, MarfError> {
         let connection = Connection::open(path)?;
+        // Only a database created by this open takes the page size; an existing
+        // file keeps its own. Nodes of one block sit adjacent under the
+        // `(block, idx)` key, so a 16 KiB page turns four scattered reads into
+        // one — measured on a mainnet ancestry walk, and it also rewrote a
+        // 23 GB store into 14 GB.
+        connection.pragma_update(None, "page_size", SQLITE_PAGE_BYTES)?;
         let mode = if journal { "WAL" } else { "OFF" };
         connection.query_row(&format!("PRAGMA journal_mode = {mode}"), [], |_| Ok(()))?;
         if !journal {
@@ -250,6 +259,14 @@ impl TrieStorage {
         // somewhere else in the tree. Against SQLite's default two megabytes
         // of page cache that is one random read per node, which is where a
         // mainnet import spent its time — 159 MB/s of reads to write 29.
+        //
+        // `mmap_size`: an ancestry walk is serial pointer-chasing over a
+        // multi-gigabyte file, ~80 µs a miss, and through `pread` every hit in
+        // the OS page cache still costs a syscall. Mapping the file makes a
+        // cached hit a memory access. Needs the raised `SQLITE_MAX_MMAP_SIZE`
+        // in `.cargo/config.toml` — under the stock 2 GB ceiling only the
+        // file's first two gigabytes would map.
+        connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
         connection.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -2000000;
@@ -683,5 +700,28 @@ impl<'a> Reader<'a> {
             return Err(MarfError::InvalidPath);
         }
         Ok(self.take(length)?.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SQLITE_MMAP_BYTES, SQLITE_PAGE_BYTES, TrieStorage};
+
+    #[test]
+    fn a_durable_store_uses_wide_pages_and_maps_large_databases() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store =
+            TrieStorage::open(&directory.path().join("marf.sqlite")).expect("open a durable store");
+        let page_bytes: i64 = store
+            .connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read the page size");
+        let mmap_bytes: i64 = store
+            .connection
+            .pragma_query_value(None, "mmap_size", |row| row.get(0))
+            .expect("read the mmap size");
+
+        assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
+        assert_eq!(mmap_bytes, SQLITE_MMAP_BYTES);
     }
 }

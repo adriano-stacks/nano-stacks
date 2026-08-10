@@ -3500,6 +3500,9 @@ fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
     })
 }
 
+const SQLITE_MMAP_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
+
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
     open_side_store_with_journal(path, true)
 }
@@ -3513,6 +3516,7 @@ fn open_side_store_existing(path: &Path) -> Result<rusqlite::Connection, rusqlit
         nano_marf::immutable_uri(path),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
     connection.execute_batch(
         "PRAGMA cache_size = -1000000;
          PRAGMA temp_store = MEMORY;",
@@ -3535,6 +3539,10 @@ fn open_side_store_with_journal(
     journal: bool,
 ) -> Result<rusqlite::Connection, rusqlite::Error> {
     let connection = rusqlite::Connection::open(path)?;
+    // Takes effect only when this open creates the database; an existing file
+    // keeps its page size. Same reasoning as the MARF store's: values are read
+    // by hash from anywhere in the file, and larger pages cost fewer reads.
+    connection.pragma_update(None, "page_size", SQLITE_PAGE_BYTES)?;
     let mode = if journal { "WAL" } else { "OFF" };
     connection.query_row(&format!("PRAGMA journal_mode = {mode}"), [], |_| Ok(()))?;
     if !journal {
@@ -3544,6 +3552,11 @@ fn open_side_store_with_journal(
     // string, in the source's row order rather than key order, so every insert
     // lands somewhere else in the destination's B-tree. The same two megabytes
     // of default page cache that slowed the MARF slows this more.
+    //
+    // `mmap_size` for the same reason the MARF sets it: a value read is keyed
+    // by hash, so it lands anywhere in an eleven-gigabyte file, and through
+    // `pread` even a page-cache hit costs a syscall.
+    connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
     connection.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -1000000;
@@ -5131,9 +5144,26 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SemanticEpochInspection, StaticCheckError,
-        compile_under, ensure_wasm_module, loadable, recorded_network, reports_analysis_failure,
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_MMAP_BYTES, SQLITE_PAGE_BYTES,
+        SemanticEpochInspection, StaticCheckError, compile_under, ensure_wasm_module, loadable,
+        open_side_store_with_journal, recorded_network, reports_analysis_failure,
     };
+
+    #[test]
+    fn a_durable_side_store_uses_wide_pages_and_maps_large_databases() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let connection = open_side_store_with_journal(&directory.path().join(CLARITY_FILE), true)
+            .expect("open a durable side store");
+        let page_bytes: i64 = connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read the page size");
+        let mmap_bytes: i64 = connection
+            .pragma_query_value(None, "mmap_size", |row| row.get(0))
+            .expect("read the mmap size");
+
+        assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
+        assert_eq!(mmap_bytes, SQLITE_MMAP_BYTES);
+    }
 
     #[test]
     fn malformed_wasm_fixture_exercises_the_production_module_load_refusal() {
