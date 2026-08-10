@@ -1,13 +1,14 @@
 ---
 title: "Pin the untested arms of the stack-layout measurement rule"
 id: "112"
-status: pending
+status: completed
 priority: high
 type: improvement
 tags: ["mainnet", "wasm", "conformance", "costs"]
 created_at: "2026-08-10"
 parent: 111
 effort: small
+completed_at: 2026-08-10
 ---
 
 # Pin the untested arms of the stack-layout measurement rule
@@ -32,18 +33,18 @@ bindings alone would silently re-break the other two.
 
 ## Tasks
 
-- [ ] Add a crosscheck regression for a duck-typed **constant** argument: a
+- [x] Add a crosscheck regression for a duck-typed **constant** argument: a
       `define-constant` whose analysed type needs duck-typing to the parameter
       type of a local call (e.g. a constant tuple with a `none` field passed
       where the field is `(optional uint)`), asserting result equality and,
       via the crosscheck harness, cost equality with the interpreter.
-- [ ] Add the same for a duck-typed **user-function result** argument: an
+- [x] Add the same for a duck-typed **user-function result** argument: an
       inner call whose declared return type needs duck-typing to the outer
       call's parameter type.
-- [ ] Make both tests fail against the pre-`43eefade` measurement (module
+- [x] Make both tests fail against the pre-`43eefade` measurement (module
       refused or size misread) so they are pinned to the rule, not to
       incidental codegen.
-- [ ] Sweep the imported mainnet state (`cargo xtask sweep-contracts`) after
+- [x] Sweep the imported mainnet state (`cargo xtask sweep-contracts`) after
       the tests land, confirming no contract regressed to a module-load
       refusal.
 
@@ -59,3 +60,24 @@ bindings alone would silently re-break the other two.
   `value_type_before_context` doc comment.
 - Original stall and binding-arm regression: task 111, mainnet block
   8,733,929, `SPMPMA1V6P430M8C91QS1G9XJ95S59JS1TZFZ4Q4.fastpool-max500-signer-manager`.
+
+## Evidence
+
+- Commit `b129274b` adds the constant and user-function-result crosschecks.
+  `cargo test -p clar2wasm --lib
+  wasm_generator::tests::local_call_widens_a_ -- --nocapture
+  --test-threads=1` passes all three producer cases, and strict all-target
+  Clippy passes.
+- With only `value_type_before_context` temporarily restored to its
+  pre-`43eefade` implementation, both new exact tests fail at module load:
+  the constant case at Wasm offset 6,969 and the function-result case at
+  offset 10,117, each with `type mismatch: expected i32, found i64`. The
+  production rule was restored and the three-test slice rerun green before
+  committing.
+- The read-only full-state sweep at compiler
+  `sha256:06f5a88eda5d3b81f9f5216014d8955020e6396e4296d62dabed4bee89dde5bd`
+  and state tip `63f2beda310a00e9c790f9f8e2e41f42f6f145f034e6cac040cd9bd46746c2b6`
+  reports 137,284/137,284 current-tip contracts compile and load, from
+  137,342 distinct candidates/146,346 metadata rows. It excludes 58 proven
+  stale metadata candidates and reports zero unmeasured contracts. The log is
+  retained at `/tmp/task112-sweep-b129274b.log`.
