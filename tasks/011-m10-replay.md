@@ -2,12 +2,13 @@
 id: "011"
 group: build
 title: "M10: implement full block execution and fixture replay"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["008", "009", "010", "075"]
 tags: ["m10", "replay"]
 created_at: 2026-07-27
+completed_at: 2026-08-09
 ---
 
 # M10: implement full block execution and fixture replay
@@ -26,7 +27,7 @@ Clarity receipts and state roots as stacks-core.
 - [x] Enforce post-conditions and transaction-level runtime error semantics.
 - [x] Carry block-level cost limits and receipt costs/events through execution.
 - [x] Replay captured blocks from the checkpoint and report the exact first divergence.
-- [ ] Restore the regressed bounded replay under
+- [x] Restore the regressed bounded replay under
       [[075-make-the-consensus-scoreboard-an-authoritative-gat]].
 
 ## Acceptance Criteria
@@ -37,7 +38,8 @@ Clarity receipts and state roots as stacks-core.
 
 ## Regression status
 
-The original implementation reached 340/340, but M10 is not currently green. On
-2026-08-07 replay stopped at 75/340 on a transaction-status difference while the
-scoreboard exited zero. Task 075 owns the regression and the authoritative gate;
-this milestone remains in progress until that task passes.
+The task-075 gate is authoritative and green on the current compiler tree.
+`cargo xtask scoreboard` reports 340/340 matching state roots, receipts and all
+five cost dimensions, plus 500/500 frozen mainnet receipt digests. Retained
+output is `/tmp/scoreboard-task068-final.txt`, SHA-256
+`8546a5eb0791f642f5dfec3a077d9b2941c0c6443990bf4304e7eab790dfbef0`.
