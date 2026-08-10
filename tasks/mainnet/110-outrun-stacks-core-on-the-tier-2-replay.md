@@ -318,3 +318,20 @@ against stacks-core's 5:43.2 — 19 s, from 53. Next by count and cost:
 down), `admit_function_argument` re-parses type strings per argument, and
 the non-primitive remainder of `runtime_value_size` still deserializes to
 measure.
+
+## Twelfth round: standing at 6:02–6:05 against 5:43
+
+The primitive-admission short-circuit (identity on inline bytes, full
+1,472-test clar2wasm suite green) measured within run noise (~2 s expected
+against a ±10 s band) and is reverted by the same rule that reverted the
+pooling allocator: nothing ships that the benchmark cannot see. The diff is
+one mechanical patch away when a quieter rig can resolve it — reorder the
+type-string read ahead of `signature_from_string`, return early on
+`("int"|"uint"|"bool")` matching the declared primitive.
+
+Best verified configuration: **6:02.6** (band 6:02–6:15 under load) vs
+stacks-core 5:43.2. From 53 s behind to ~19 s across three landed
+host-boundary cuts, with the remaining ~19 s mapped by name and count:
+`load_constant` (670 k deep clones + re-serializations of per-contract
+constants), the non-primitive `runtime_value_size` remainder, and
+admission. The pattern is established; the distribution is the to-do list.
