@@ -37,7 +37,7 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
 - [x] Reduce the exact source expression that leaves the invalid stack shape
       and add a focused compiler regression.
 - [x] Fix the general lowering rule rather than special-case this contract.
-- [ ] Prove compiler/interpreter parity for result, receipt, costs, events and
+- [x] Prove compiler/interpreter parity for result, receipt, costs, events and
       writes on the real transaction.
 - [ ] Replay block 8,733,929 with root verification, then show the same deployed
       release artifact follows past it.
@@ -57,4 +57,10 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
 - Recorded-epoch `check-module` now loads the exact signer-manager contract from
   `/home/aldur/nano-111.QRgHwq/state`. `call-both-tx` on the staged transaction
   reports the same `ArithmeticUnderflow` outcome from both engines and zero
-  result disagreements; full receipt/effect and root evidence remains open.
+  result disagreements.
+- Exact-state checkpoint `cf561365` replays checked-in block 8,733,929 twice
+  under `RootPolicy::Verify`. At transaction index 1, the compiler and pinned
+  interpreter agree on the serialized result, all five costs
+  `(2049, 274713, 2869483, 1062, 123401)`, both ordered events and the complete
+  asset-write map. Both block passes seal the header's committed root, and the
+  immutable source database stamps remain unchanged.
