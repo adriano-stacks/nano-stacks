@@ -45,7 +45,7 @@ and steady state, with evidence tied to the durable executed chain.
       hosted Stacks HTTP endpoint absent from configuration and the selected
       peer set. Retain the discovered endpoints and per-tenure serving peer so
       the run proves distribution rather than merely having several peers open.
-- [ ] Eliminate compiler-chosen historical epochs under [[064-compile-a-contract-under-the-epoch-it-was-deployed-]]
+- [x] Eliminate compiler-chosen historical epochs under [[064-compile-a-contract-under-the-epoch-it-was-deployed-]]
       and prove every rebuilt historical contract uses semantic epoch data from
       chain state.
 - [x] Run an event observer against the executed chain and retain delivered
@@ -57,7 +57,7 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Run the stock signer/client-facing RPC and an event observer against the
       same executed chain far enough to validate request and payload shapes.
       This checked item does not imply proposal acceptance or transaction mining.
-- [ ] Close every known clarity-wasm semantic differential, including
+- [x] Close every known clarity-wasm semantic differential, including
       [[067-reject-contract-call-through-a-constant-while-depl]] and
       [[068-resolve-asymmetric-tuple-least-supertype-semantics]]; an ignored
       crosscheck is a failed release gate. Also evaluate the 8 mainnet
@@ -67,7 +67,7 @@ and steady state, with evidence tied to the durable executed chain.
       typed` (`trajan-endorsement-alpha`) — confirm each against the
       production `compile_under` path first; some may be sweep-harness
       artifacts.
-- [ ] Reproduce and close the PoX-5 follower root mismatch under
+- [x] Reproduce and close the PoX-5 follower root mismatch under
       [[069-resolve-the-pox-5-follower-state-root-divergence]] before using that
       signer run as interoperability evidence.
 - [ ] Run the signer-set and signer-weight mainnet gates in reward cycle 141 or
@@ -78,33 +78,33 @@ and steady state, with evidence tied to the durable executed chain.
 
 ### Audit regressions opened 2026-08-07
 
-- [ ] Restore the bounded replay and make red scoreboard output fail under
+- [x] Restore the bounded replay and make red scoreboard output fail under
       [[075-make-the-consensus-scoreboard-an-authoritative-gat]].
 - [ ] Remove fail-open block authentication under
       [[076-refuse-blocks-when-consensus-authentication-inputs]].
-- [ ] Remove peer-derived consensus context under
+- [x] Remove peer-derived consensus context under
       [[077-remove-peer-derived-consensus-execution-fallbacks]].
-- [ ] Make release evidence reproducible and mandatory under [[078]].
-- [ ] Remove residual MARF storage panics under [[079]].
+- [x] Make release evidence reproducible and mandatory under [[078]].
+- [x] Remove residual MARF storage panics under [[079]].
 - [ ] Make the release report fail closed under [[074]].
 - [ ] Cross reward-cycle boundaries using only locally derived consensus under
       [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]].
-- [ ] Refuse contradictory or missing checkpoint winner-seed evidence under
+- [x] Refuse contradictory or missing checkpoint winner-seed evidence under
       [[083-refuse-an-unrecoverable-checkpoint-winner-seed-bef]].
-- [ ] Eliminate network-valid WebAssembly function-type arity refusals under
+- [x] Eliminate network-valid WebAssembly function-type arity refusals under
       [[084-eliminate-wasm-function-type-arity-refusals-for-ne]].
 - [ ] Account for and execute every required ignored or conditional gate under
       [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
-- [ ] Execute the captured mainnet block at 8,708,126 and close its corrupted
+- [x] Execute the captured mainnet block at 8,708,126 and close its corrupted
       trait-principal ABI path under
       [[086-execute-mainnet-block-8708126-without-corrupting-i]].
-- [ ] Make read-only diagnostic evidence non-mutating and fail closed on a wrong
+- [x] Make read-only diagnostic evidence non-mutating and fail closed on a wrong
       state path under
       [[087-make-read-only-state-diagnostics-refuse-absent-or]].
-- [ ] Cross a same-sortition Stacks fork without mixing staged siblings or
+- [x] Cross a same-sortition Stacks fork without mixing staged siblings or
       leaving restart state behind under [[096]].
 - [x] Mirror recursive trait argument casting and refusal costs under [[097]].
-- [ ] Execute the 8,724,865 nested trait-reference call under [[098]].
+- [x] Execute the 8,724,865 nested trait-reference call under [[098]].
 
 ### Audit coverage map
 
