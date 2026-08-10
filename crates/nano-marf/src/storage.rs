@@ -268,9 +268,15 @@ impl TrieStorage {
         // somewhere else in the tree. Against SQLite's default two megabytes
         // of page cache that is one random read per node, which is where a
         // mainnet import spent its time — 159 MB/s of reads to write 29.
+        // `wal_autocheckpoint`: the default checkpoints every 16 MB of WAL,
+        // and each checkpoint fsyncs and rewrites pages into the main tree —
+        // measured at ~12 ms a block across a mainnet replay, fifty seconds
+        // of a 4,149-block range. A larger WAL trades that for bounded extra
+        // recovery reading after a crash, which the kill suites cover.
         connection.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -2000000;
+             PRAGMA wal_autocheckpoint = 16384;
              PRAGMA temp_store = MEMORY;",
         )?;
         Self::from_connection(connection)

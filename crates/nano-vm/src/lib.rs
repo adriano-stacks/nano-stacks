@@ -3551,9 +3551,12 @@ fn open_side_store_with_journal(
     // lands somewhere else in the destination's B-tree. The same two megabytes
     // of default page cache that slowed the MARF slows this more.
     //
+    // The same checkpoint spacing as the MARF store, for the same measured
+    // fsync cost.
     connection.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -1000000;
+         PRAGMA wal_autocheckpoint = 16384;
          PRAGMA temp_store = MEMORY;",
     )?;
     connection.execute_batch(SIDE_STORE_SCHEMA)?;
