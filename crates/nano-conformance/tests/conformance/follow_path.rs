@@ -1605,9 +1605,9 @@ pub fn second_burn_view(chain: &[NakamotoBlock], burn_of: &impl Fn(&NakamotoBloc
 /// carried on when refused would pass the first claim while still letting a
 /// reachable peer choose its burn heights.
 ///
-/// The chain is derived rather than quoted. The served prefix stays inside one
-/// reward cycle so this test isolates peer-sortition refusal; `pox_boundary`
-/// independently derives the captured burnchain across all five cycle boundaries.
+/// The chain is derived rather than quoted. The whole capture is served so the
+/// execution path crosses every reward-cycle boundary that `pox_boundary`
+/// independently checks at the sortition layer.
 /// Close the same gap against a peer that *does* serve sortitions.
 ///
 /// The control, and the whole test rests on it: without a run that reached the same
@@ -1672,12 +1672,7 @@ async fn peer_sortition_lies_never_reach_execution() {
     // The second burn view the chain holds. The first is the checkpoint's own, and a
     // chain seeded below it would have to walk the block that opens the cycle.
     let seed = second_burn_view(&chain, &burn_of);
-    let boundary = (seed / CYCLE + 1) * CYCLE;
-    let served: Vec<NakamotoBlock> = chain
-        .iter()
-        .take_while(|block| burn_of(block) < boundary)
-        .cloned()
-        .collect();
+    let served = chain.clone();
     let upto_seed = served
         .iter()
         .take_while(|block| burn_of(block) <= seed)

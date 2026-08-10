@@ -43,8 +43,8 @@ use nano_primitives::{StacksBlockId, TrieHash};
 use nano_sync::{SyncClient, TenureSource};
 
 use crate::follow_path::{
-    MovableBurnchain, Policy, Served, captured_burnchain, captured_chain, node, pox, serve,
-    snapshots,
+    CYCLE, MovableBurnchain, Policy, Served, burn_height_of, captured_burnchain, captured_chain,
+    node, pox, serve, snapshots,
 };
 
 /// The captured blocks a peer holds for the single-tenure gap.
@@ -465,6 +465,36 @@ async fn a_gap_across_many_tenures_closes_under_rate_limits_and_short_pages() {
     assert!(
         progress.rounds > 1,
         "the gap closed in one round, so no round resumed from another's progress"
+    );
+}
+
+/// The production catch-up path executes the complete capture across reward-cycle
+/// boundaries without asking a peer to supply a sortition.
+#[tokio::test]
+async fn the_full_capture_closes_without_peer_sortitions_across_reward_cycles() {
+    let chain = captured_chain();
+    let rows = snapshots();
+    let first_burn = burn_height_of(&rows, chain.first().expect("the capture has a first block"));
+    let last_burn = burn_height_of(&rows, chain.last().expect("the capture has a last block"));
+    assert!(
+        first_burn / CYCLE < last_burn / CYCLE,
+        "the capture does not cross a reward-cycle boundary"
+    );
+
+    let policy = Policy::default();
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 64,
+    };
+    let (progress, _) = close_the_gap(Run::new(chain.len(), budget, &policy)).await;
+    assert!(
+        progress.executed > 0,
+        "the complete capture executed nothing"
+    );
+    assert_eq!(
+        policy.sortitions_asked(),
+        0,
+        "catch-up asked a peer for a sortition while crossing a reward-cycle boundary"
     );
 }
 

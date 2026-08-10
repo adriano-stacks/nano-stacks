@@ -54,9 +54,9 @@ gates both sit on the far side of this.
 - [x] Keep the refusal for the case that remains genuinely unanswerable, and say
       which of the two it is: a node that cannot yet decide, and a node whose state
       does not reach the prepare phase at all.
-- [~] Derive the captured Bitcoin snapshots across a boundary without a peer.
-      The focused derivation crosses all five boundaries; the execution rigs do
-      not yet replay the whole capture across one.
+- [x] Derive the captured Bitcoin snapshots across a boundary without a peer.
+      Both execution rigs now replay the complete 340-block capture across all
+      five boundaries and assert that no peer sortition route was called.
 - [ ] Cross a boundary on mainnet with the derived chain and compare the resulting
       consensus hashes against a stock node's for the whole cycle after it.
 
@@ -244,3 +244,24 @@ pox_boundary::a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain ...
 This closes the missing winner half of the first acceptance criterion. It does not
 substitute for executing the captured Nakamoto blocks across the boundary, and it
 does not supply the live rollover evidence, so task 082 remains in progress.
+
+## Reconciliation, 2026-08-10
+
+The execution half now covers the whole capture too. `follow_path` serves all 340
+blocks to a node whose peer lies about every sortition field; the node executes the
+same tip and roots as the control while `sortitions_asked() == 0` across burns
+360–479. `catch_up_rounds` independently closes the complete gap through the
+production round driver and asserts the same zero-request invariant.
+
+The exact gates passed on the current tree:
+
+```text
+catch_up_rounds::the_full_capture_closes_without_peer_sortitions_across_reward_cycles ... ok
+follow_path::peer_sortition_lies_never_reach_execution ... ok
+catch_up_rounds:: ... 9 passed
+follow_path:: ... 6 passed
+cargo clippy -p nano-conformance --all-targets -- -D warnings ... ok
+```
+
+Only the live mainnet rollover and following-cycle comparison remains; offline
+execution evidence is not substituted for it.
