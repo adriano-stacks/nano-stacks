@@ -212,3 +212,15 @@ amortized, side values cached, fsync spaced. The remaining ~40 s sits inside
 the wasm runtime and host-call path (280 s user vs core's 158 s), and closing
 it means instrumenting the VM boundary itself: value (de)serialization at
 host calls, per-call Store setup, memory copies. That work continues here.
+
+## Controlled pair, follower stopped (definitive for this hardware)
+
+| 4,149 blocks, quiet box | wall | user | sys |
+|---|---|---|---|
+| nano, all committed work, durable commits | 6:36.79 | 281 s | 51 s |
+| stacks-core validate-only | **5:43.18** | 177 s | 75 s |
+
+Identical to the noisy runs for nano — contention was not its constraint —
+and slightly better for stacks-core. The 53 s gap (1.16×) is the wasm
+runtime and host-call path, full stop. Everything reachable from outside
+the VM is measured and either shipped or ruled out above.
