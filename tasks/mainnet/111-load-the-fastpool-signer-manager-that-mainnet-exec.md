@@ -34,9 +34,9 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
 
 ## Tasks
 
-- [ ] Reduce the exact source expression that leaves the invalid stack shape
+- [x] Reduce the exact source expression that leaves the invalid stack shape
       and add a focused compiler regression.
-- [ ] Fix the general lowering rule rather than special-case this contract.
+- [x] Fix the general lowering rule rather than special-case this contract.
 - [ ] Prove compiler/interpreter parity for result, receipt, costs, events and
       writes on the real transaction.
 - [ ] Replay block 8,733,929 with root verification, then show the same deployed
@@ -48,3 +48,13 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
 - Artifact SHA-256:
   `ef6629d966e110974beabc543a51399f451de7a41875e70379b1441f8c82acae`.
 - Live fail-closed log: `/home/aldur/mainnet-tip/run-155042-docker.log`.
+- Reduced cause: a local private call passed a let-bound tuple containing
+  `bond-index: none` directly into a parameter whose field is `(optional uint)`.
+  Replacing that argument with the widened literal made the real module load.
+- Compiler checkpoint: `43eefade` (`vm: widen local call arguments to parameter
+  ABI`). The focused regression, all 36 `wasm_generator` tests, all 1,475 library
+  tests, and strict all-target clar2wasm Clippy are green.
+- Recorded-epoch `check-module` now loads the exact signer-manager contract from
+  `/home/aldur/nano-111.QRgHwq/state`. `call-both-tx` on the staged transaction
+  reports the same `ArithmeticUnderflow` outcome from both engines and zero
+  result disagreements; full receipt/effect and root evidence remains open.
