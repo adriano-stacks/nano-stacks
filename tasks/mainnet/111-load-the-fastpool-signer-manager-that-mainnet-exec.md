@@ -1,13 +1,14 @@
 ---
 title: "Load the fastpool signer manager that mainnet executed"
 id: "111"
-status: in-progress
+status: completed
 priority: critical
 type: bug
 tags: ["mainnet", "wasm", "consensus", "release"]
 created_at: "2026-08-10"
 parent: 053
 effort: medium
+completed_at: 2026-08-10
 ---
 
 # Load the fastpool signer manager that mainnet executed
@@ -39,7 +40,7 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
 - [x] Fix the general lowering rule rather than special-case this contract.
 - [x] Prove compiler/interpreter parity for result, receipt, costs, events and
       writes on the real transaction.
-- [ ] Replay block 8,733,929 with root verification, then show the same deployed
+- [x] Replay block 8,733,929 with root verification, then show the same deployed
       release artifact follows past it.
 
 ## Evidence
@@ -64,3 +65,10 @@ i64`. The engine fails closed and leaves the node sealed at 8,733,928.
   `(2049, 274713, 2869483, 1062, 123401)`, both ordered events and the complete
   asset-write map. Both block passes seal the header's committed root, and the
   immutable source database stamps remain unchanged.
+- Release artifact `0c8624bc`, SHA-256
+  `b1c751e862808ea563e226117c26ae66525bce1841bd52165108425f9c2e00b2`,
+  is preserved as `/home/aldur/mainnet-tip/stacks-node.0c8624bc` and deployed as
+  `/home/aldur/mainnet-tip/stacks-node`. PID 1564948 resumed the root-verified
+  state at 8,734,282 and immediately executed 7 then 2 blocks through 8,734,291
+  with zero refusals. The earlier `43eefade` artifact had independently executed
+  the formerly blocked child and continued from 8,733,928 through 8,734,113.
