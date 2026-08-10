@@ -28,6 +28,10 @@ BITCOIN_RPC=${BITCOIN_RPC:-http://127.0.0.1:18443}
 PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 # Seconds between Bitcoin blocks once Nakamoto is active.
 MINE_INTERVAL_EPOCH3=${MINE_INTERVAL_EPOCH3:-10}
+# Keep the upstream 25-block cycle by default; diagnostics can give the
+# prepare phase more time without stretching the whole run.
+POX_PREPARE_LENGTH=${POX_PREPARE_LENGTH:-5}
+POX_REWARD_LENGTH=${POX_REWARD_LENGTH:-20}
 # Seconds a frozen Stacks tip is tolerated while Bitcoin keeps advancing.
 STALL_SECS=${STALL_SECS:-240}
 # Hacknet otherwise locks for one cycle and can miss its only renewal window.
@@ -65,6 +69,7 @@ stock_index() { case ${1:?index} in 1) echo 2 ;; *) echo 1 ;; esac; }
 compose() {
     (cd "$SRC" && CHAINSTATE_DIR="$(chainstate_dir)" \
         PAUSE_HEIGHT="$PAUSE_HEIGHT" MINE_INTERVAL_EPOCH3="$MINE_INTERVAL_EPOCH3" \
+        POX_PREPARE_LENGTH="$POX_PREPARE_LENGTH" POX_REWARD_LENGTH="$POX_REWARD_LENGTH" \
         STACKING_CYCLES="$STACKING_CYCLES" \
         STACKS_30_HEIGHT="$STACKS_30_HEIGHT" STACKS_31_HEIGHT="$STACKS_31_HEIGHT" \
         STACKS_32_HEIGHT="$STACKS_32_HEIGHT" STACKS_33_HEIGHT="$STACKS_33_HEIGHT" \

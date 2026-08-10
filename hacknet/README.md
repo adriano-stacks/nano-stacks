@@ -64,20 +64,24 @@ cycle boundary. It requires the Stacks tip to keep moving and the new cycle's
 `/v3/stacker_set` response to contain at least one signer. Run this before using
 a long-lived Hacknet chain as release evidence.
 
-A separate stock-only failure occurred at the first Nakamoto reward-cycle
-boundary: Bitcoin advanced while the nodes repeated `Missing canonical anchor
-block`. The current hypothesis is that epoch 3.0 starts too close to that prepare
-phase. The harness keeps Hacknet's upstream heights until this is proved. To run
-the earlier-start diagnostic without editing the checkout:
+A separate stock-only failure occurred at a Nakamoto reward-cycle boundary:
+Bitcoin advanced while the nodes repeated `Missing canonical anchor block`.
+Retained-state inspection found no processed tenure start from the affected
+prepare window: one run had a single sortition in its five blocks, another had
+none. stacks-core therefore had no canonical prepare-phase anchor to select.
+
+The next stock-only control starts Nakamoto earlier, mines more slowly and
+makes the prepare phase ten blocks while keeping the 25-block cycle length:
 
 ```
+MINE_INTERVAL_EPOCH3=30 POX_PREPARE_LENGTH=10 POX_REWARD_LENGTH=15 \
 STACKS_30_HEIGHT=222 STACKS_31_HEIGHT=223 \
 STACKS_32_HEIGHT=224 STACKS_33_HEIGHT=225 \
   hacknet/harness.sh up
 hacknet/harness.sh cycles 2
 ```
 
-Only a successful boundary run can promote those diagnostic heights to defaults.
+Only a successful boundary run can promote those diagnostic settings to defaults.
 
 ## The other direction: a stock signer on nano
 

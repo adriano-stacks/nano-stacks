@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# The mock functions below are called through functions sourced from the harness.
+# shellcheck disable=SC2329
 set -euo pipefail
 
 TEST_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=./harness.sh
+# shellcheck disable=SC1091
 source "$TEST_ROOT/hacknet/harness.sh"
 
 fail() { printf 'harness-test: %s\n' "$*" >&2; exit 1; }
@@ -10,19 +13,22 @@ equal() { [ "$1" = "$2" ] || fail "expected [$2], got [$1]"; }
 
 test_dir=$(mktemp -d)
 trap 'rm -rf -- "$test_dir"' EXIT
-SRC=$test_dir
+export SRC=$test_dir
 
 docker() {
-    printf '%s|%s|%s|%s|%s\n' "$STACKING_CYCLES" "$STACKS_30_HEIGHT" \
-        "$STACKS_31_HEIGHT" "$STACKS_32_HEIGHT" "$STACKS_33_HEIGHT"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$STACKING_CYCLES" "$STACKS_30_HEIGHT" \
+        "$STACKS_31_HEIGHT" "$STACKS_32_HEIGHT" "$STACKS_33_HEIGHT" \
+        "$POX_PREPARE_LENGTH" "$POX_REWARD_LENGTH"
 }
-equal "$(compose config)" '12|232|233|234|235'
+equal "$(compose config)" '12|232|233|234|235|5|20'
 STACKING_CYCLES=7
 STACKS_30_HEIGHT=222
 STACKS_31_HEIGHT=223
 STACKS_32_HEIGHT=224
 STACKS_33_HEIGHT=225
-equal "$(compose config)" '7|222|223|224|225'
+POX_PREPARE_LENGTH=10
+POX_REWARD_LENGTH=15
+equal "$(compose config)" '7|222|223|224|225|10|15'
 
 peer_url() { printf 'mock-peer\n'; }
 pox_cycle() { printf '22 ST000000000000000000002AMW42H.pox-5\n'; }
