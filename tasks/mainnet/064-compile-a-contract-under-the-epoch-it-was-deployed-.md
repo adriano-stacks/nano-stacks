@@ -1,7 +1,7 @@
 ---
 id: "064"
 title: "Compile a contract under the epoch it was deployed in"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["060"]
 tags: ["mainnet", "vm", "clarity", "conformance"]
 created_at: 2026-08-06
+completed_at: 2026-08-10
 ---
 
 # Compile a contract under the epoch it was deployed in
@@ -246,5 +247,5 @@ different divergence.
 - The full typed sweep completed in about two hours, left both source database
   stamps unchanged, and produced the exact counts above with no unmeasured row.
 
-All task-local implementation and evidence are complete. The task remains
-in-progress only because its declared dependency [[060]] is still in-progress.
+All task-local implementation and evidence are complete. The declared dependency
+[[060]] completed after its pristine release-binary replay, so this task can close.
