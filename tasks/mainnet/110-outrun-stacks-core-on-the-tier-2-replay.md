@@ -224,3 +224,22 @@ Identical to the noisy runs for nano — contention was not its constraint —
 and slightly better for stacks-core. The 53 s gap (1.16×) is the wasm
 runtime and host-call path, full stop. Everything reachable from outside
 the VM is measured and either shipped or ruled out above.
+
+## Sixth round: inside the VM boundary
+
+The per-call path measured directly (the earlier linker number covered only
+the deploy site): 18,392 contract calls over 1,500 blocks spend 1.76 s
+building linkers and 1.23 s instantiating — ~8 s over the full range, not
+the gap. With storage (5 s), decode (0.5 s), linking and instantiation
+(8 s), compilation (amortized), allocation (shipped) and fsync (spaced) all
+accounted for, the 53 s that separate nano from stacks-core on this range
+are the generated wasm code and the host-function bodies themselves —
+value marshalling through linear memory, per-host-call dispatch and cost
+tracking. This block range is host-call-heavy DeFi traffic, the profile
+where an interpreter's direct execution is cheapest and a wasm boundary is
+paid on every data access.
+
+Closing it is engine work inside clarity-wasm (W6 territory): batching or
+flattening host calls, cheaper value marshalling, possibly caching
+instances per (contract, block). That is the continuation, with this
+harness as its regression gate.
