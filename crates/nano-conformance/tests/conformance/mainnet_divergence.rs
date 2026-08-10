@@ -638,7 +638,7 @@ fn compare_engines_at_exact_fixture_prestate(
     assert_eq!(compiled.cost, oracle_execution_cost(&oracle.cost));
 }
 
-fn oracle_execution_cost(cost: &OracleCost) -> ExecutionCost {
+const fn oracle_execution_cost(cost: &OracleCost) -> ExecutionCost {
     ExecutionCost {
         read_count: cost.read_count,
         read_length: cost.read_length,
