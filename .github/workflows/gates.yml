@@ -20,6 +20,7 @@ on:
 # would build release evidence with a compiler nobody chose.
 env:
   CARGO_TERM_COLOR: always
+  NANO_RUSTC_VERSION: 1.97.1
 
 jobs:
   gates:
@@ -32,9 +33,13 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: the lock file decides the toolchain, and a run may not rewrite it
+      - name: the lock file and exact Rust release decide the toolchain
         run: |
-          nix develop --command rustc --version
+          configured=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          selected=$(nix develop --command rustc --version | awk '{print $2}')
+          test "$configured" = "$NANO_RUSTC_VERSION"
+          test "$selected" = "$NANO_RUSTC_VERSION"
+          nix develop --command sh -c 'cargo --version; cargo clippy --version; rustfmt --version'
           git diff --exit-code flake.lock
 
       - uses: Swatinem/rust-cache@v2
