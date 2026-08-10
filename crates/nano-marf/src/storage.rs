@@ -60,10 +60,8 @@ const NODE_CACHE_BYTES: usize = 1_500_000_000;
 /// Node hashes are 32 bytes each; this keeps the same ~1M entries per
 /// generation the entry-count bound did.
 const NODE_HASH_CACHE_BYTES: usize = 100_000_000;
-/// Block records and id→hash entries are ~100 bytes; these keep the previous
-/// 65,536 entries.
+/// Block records are ~100 bytes; this keeps the previous 65,536 entries.
 const BLOCK_CACHE_BYTES: usize = 12_000_000;
-const HASH_CACHE_BYTES: usize = 8_000_000;
 const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
 
 const LEAF_RECORD: u8 = 0;
@@ -182,7 +180,18 @@ pub struct TrieStorage {
     /// Node hashes, which are read with the fanout of the trie while sealing.
     node_hashes: RefCell<Cache<(u32, u32), TrieHash>>,
     blocks: RefCell<Cache<MarfBlockId, BlockRecord>>,
-    hashes: RefCell<Cache<u32, MarfBlockId>>,
+    /// Every sealed block's hash, indexed by its dense row id (id 1 at index 0).
+    ///
+    /// An arena rather than a cache, because decoding one wide trie node
+    /// resolves up to 256 back-pointer children to ancestor block hashes, and a
+    /// bounded cache against 8.7 million mainnet blocks thrashed: resolving
+    /// hashes was 221 of 389 seconds of a 1,500-block replay. The mapping is
+    /// append-only — ids are never reused — and an entry whose row a
+    /// retraction deleted is unreachable, because a surviving node's
+    /// back-pointers only name ancestors at heights the retraction kept.
+    /// Zeroes mark ids the arena has no answer for; those fall back to the
+    /// database.
+    hashes_by_id: RefCell<Vec<MarfBlockId>>,
     /// Whether nodes are being staged for a checkpoint import.
     staging: std::cell::Cell<bool>,
 }
@@ -216,7 +225,9 @@ impl TrieStorage {
             "PRAGMA cache_size = -2000000;
              PRAGMA temp_store = MEMORY;",
         )?;
-        Ok(Self::with_caches(connection))
+        let storage = Self::with_caches(connection);
+        storage.preload_hashes()?;
+        Ok(storage)
     }
 
     /// Open a store that is about to be written in one enormous transaction.
@@ -267,7 +278,9 @@ impl TrieStorage {
 
     fn from_connection(connection: Connection) -> Result<Self, MarfError> {
         connection.execute_batch(SCHEMA)?;
-        Ok(Self::with_caches(connection))
+        let storage = Self::with_caches(connection);
+        storage.preload_hashes()?;
+        Ok(storage)
     }
 
     fn with_caches(connection: Connection) -> Self {
@@ -276,7 +289,7 @@ impl TrieStorage {
             nodes: RefCell::new(Cache::new(NODE_CACHE_BYTES)),
             node_hashes: RefCell::new(Cache::new(NODE_HASH_CACHE_BYTES)),
             blocks: RefCell::new(Cache::new(BLOCK_CACHE_BYTES)),
-            hashes: RefCell::new(Cache::new(HASH_CACHE_BYTES)),
+            hashes_by_id: RefCell::new(Vec::new()),
             staging: std::cell::Cell::new(false),
         }
     }
@@ -355,13 +368,18 @@ impl TrieStorage {
             node,
         };
         self.blocks.borrow_mut().insert(hash, record);
-        self.hashes.borrow_mut().insert(id, hash);
+        self.remember_hash(id, hash);
         Ok(Some(record))
     }
 
     pub(crate) fn block_hash(&self, id: u32) -> Result<MarfBlockId, MarfError> {
-        if let Some(hash) = self.hashes.borrow_mut().get(&id) {
-            return Ok(hash);
+        if let Some(hash) = self
+            .hashes_by_id
+            .borrow()
+            .get(id.checked_sub(1).ok_or_else(|| missing("block 0"))? as usize)
+            .filter(|hash| **hash != [0u8; 32])
+        {
+            return Ok(*hash);
         }
         let hash: Option<Vec<u8>> = self
             .connection
@@ -369,8 +387,40 @@ impl TrieStorage {
             .query_row(params![id], |row| row.get(0))
             .optional()?;
         let hash = block_id(&hash.ok_or_else(|| missing(&format!("block {id}")))?)?;
-        self.hashes.borrow_mut().insert(id, hash);
+        self.remember_hash(id, hash);
         Ok(hash)
+    }
+
+    /// Put one block's hash into the arena, padding over ids retraction removed.
+    fn remember_hash(&self, id: u32, hash: MarfBlockId) {
+        let index = id as usize - 1;
+        let mut arena = self.hashes_by_id.borrow_mut();
+        if arena.len() <= index {
+            arena.resize(index + 1, [0u8; 32]);
+        }
+        arena[index] = hash;
+    }
+
+    /// Fill the arena with every sealed block's hash, in one sequential scan.
+    ///
+    /// Skipped for an empty store, where there is nothing to scan; a store this
+    /// open created fills it as blocks arrive.
+    fn preload_hashes(&self) -> Result<(), MarfError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, hash FROM marf_block ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        let mut arena = self.hashes_by_id.borrow_mut();
+        while let Some(row) = rows.next()? {
+            let id: u32 = row.get(0)?;
+            let hash: Vec<u8> = row.get(1)?;
+            let index = id as usize - 1;
+            if arena.len() <= index {
+                arena.resize(index + 1, [0u8; 32]);
+            }
+            arena[index] = block_id(&hash)?;
+        }
+        Ok(())
     }
 
     /// The state's ancestors at back-distances 1, 2, 4, 8, …
@@ -542,7 +592,13 @@ impl TrieStorage {
         // because it goes straight into a parent's preimage and moves a root.
         *self.node_hashes.borrow_mut() = Cache::new(NODE_HASH_CACHE_BYTES);
         *self.blocks.borrow_mut() = Cache::new(BLOCK_CACHE_BYTES);
-        *self.hashes.borrow_mut() = Cache::new(HASH_CACHE_BYTES);
+        // The arena as well, and not only trimmed: a rolled-back insert hands
+        // its id back to the sequence, so an entry read inside that
+        // transaction could answer for a reused id with another block's hash.
+        // Rebuilt from the database, which is consistent again by the time
+        // anything calls this; an empty arena is only slower, never wrong.
+        *self.hashes_by_id.borrow_mut() = Vec::new();
+        let _ = self.preload_hashes();
     }
 
     fn decode(&self, block: u32, bytes: &[u8]) -> Result<TrieNode, MarfError> {
