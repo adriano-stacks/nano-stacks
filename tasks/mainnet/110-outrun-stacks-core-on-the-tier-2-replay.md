@@ -173,3 +173,25 @@ wasmtime linker rebuild (223 host functions per call — blocked on
 find a native-cache key on process-cold contracts, boundary value
 copies, and a validate-only replay mode if an exactly-symmetric
 benchmark is ever wanted.
+
+## Fourth round: the last measured levers (6e694ef6, 491a109c)
+
+- WAL checkpoints spaced 16× (`wal_autocheckpoint = 16384`): kill suites
+  green; neutral-to-small on the replay, kept for fewer write stalls at tip.
+- Side-store value cache under the value hash, present-values only
+  (a remembered absence could go stale when a later block writes that hash):
+  ~10 s of the replay.
+- Warmed native-module cache in the anchor state: 486 contracts, −50 s of
+  user CPU, but the wall trades compile CPU for module-load I/O — net ~zero.
+- **Measured dead end**: the per-call wasmtime linker rebuild costs 5 ms
+  over 52 builds per 1,500 blocks — it is per contract *initialization*,
+  not per call. The audit's per-call concern does not apply to this path.
+
+Standing: nano 6:34–6:48 (run-to-run variance under the live follower's
+load), stacks-core 5:54, both on the 4,149-block range — nano committing
+durably, core discarding. The remaining ~40 s is wasm-runtime and host-path
+CPU (294 s user vs core's 158 s), where fetch, decode, hashes, linking,
+compilation and the side store are now all measured small. Next: profile
+inside the VM boundary (value serialization at the host boundary, per-call
+Store/Instance setup, memory copies) — instrumented builds, since the box
+allows no perf or ptrace.
