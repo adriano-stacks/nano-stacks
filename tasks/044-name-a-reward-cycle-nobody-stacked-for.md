@@ -123,3 +123,24 @@ The earlier-Nakamoto idea is still a hypothesis. The harness passes the four
 epoch heights as overrides but keeps Hacknet's defaults. The README gives the
 `222..225` diagnostic command, followed by `cycles 2`; until that stock-only run
 crosses the boundary, the fresh-genesis item above stays open.
+
+## The stock coordinator confirms the missing condition
+
+The pinned stacks-core source removes the ambiguity in the log. For a
+post-Epoch30 cycle, `load_nakamoto_reward_set` enumerates the preceding prepare
+phase's sortitions and selects the first one for which chainstate can read a
+processed tenure-start or Stacks header. With no such header it returns `None`;
+the burn-block coordinator turns that exact answer into `Missing canonical
+anchor block`.
+
+That is the retained state measured above: the prepare window contained no
+processed tenure start. It is not a missing signer set, a different PoX bit or
+an anchor-selection arithmetic error. stacks-core's own consensus harness also
+mines out of a pre-Nakamoto prepare phase before switching block formats, with
+the comment that otherwise it may fail to calculate the PoX anchor.
+
+The proposed control therefore changes the three inputs that can make the
+required header exist: Nakamoto begins earlier, Bitcoin waits 30 seconds per
+block, and the prepare window is ten blocks. Source inspection proves that this
+targets the refusal; only the fresh stock-only run can prove that the timing is
+sufficient, so the task remains open until `cycles 2` crosses it.
