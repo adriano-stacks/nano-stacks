@@ -3761,7 +3761,7 @@ mod tests {
         let (view, blocks) = view_with_blocks(3);
         let refusing = RecordingAdmission {
             asked: Arc::default(),
-            refusal: Some("unsupported Nakamoto block version 3".to_owned()),
+            refusal: Some("signer weight is below approval threshold".to_owned()),
         };
         let (blocks_out, mut offered) = mpsc::unbounded_channel();
         let state = RpcState::new(NETWORK)
@@ -3792,6 +3792,23 @@ mod tests {
         assert!(
             offered.try_recv().is_err(),
             "a refused block was handed to the node anyway"
+        );
+        let metrics = super::metrics::router(state.metrics())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+        let metrics = axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        assert!(
+            std::str::from_utf8(&metrics)
+                .expect("UTF-8 metrics")
+                .contains("nano_block_refusals_total{reason=\"signature\"} 1")
         );
 
         // The same block, from a node whose validator accepts it, is taken once
