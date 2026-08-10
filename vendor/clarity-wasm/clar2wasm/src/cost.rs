@@ -2397,6 +2397,54 @@ mod crosscheck {
         );
     }
 
+    /// Higher-order public/read-only calls carry the actual size of each value
+    /// into the callee just like an ordinary call. The list's entry type allows
+    /// eight bytes, but each string below has a different runtime size.
+    #[test]
+    fn charges_higher_order_arguments_by_their_values() {
+        for (snippet, function) in [
+            (
+                "(define-read-only (size (item (string-ascii 8))) (len item))
+                 (define-public (mapped)
+                   (ok (map size (list \"a\" \"abc\" \"abcdefgh\"))))",
+                "mapped",
+            ),
+            (
+                "(define-read-only (step (item (string-ascii 8)) (acc uint))
+                   (+ acc (len item)))
+                 (define-public (folded)
+                   (ok (fold step
+                     (list \"a\" \"abc\" \"abcdefgh\")
+                     u0)))",
+                "folded",
+            ),
+        ] {
+            crosscheck_cost(snippet, function, &[]);
+        }
+    }
+
+    /// `filter` passes each element to its predicate before any declared-type
+    /// widening, just like an ordinary private call.
+    #[test]
+    fn charges_filter_predicate_arguments_by_their_values() {
+        let entry = Value::Tuple(
+            TupleData::from_data(vec![(
+                ClarityName::from_literal("payload"),
+                Value::buff_from(vec![0x5a; 7]).expect("payload buffer"),
+            )])
+            .expect("entry tuple"),
+        );
+        let entries = Value::cons_list_unsanitized(vec![entry.clone(), entry.clone(), entry])
+            .expect("entries list");
+        crosscheck_cost(
+            "(define-private (keep (entry {payload: (buff 100)})) true)
+             (define-public (f (entries (list 3 {payload: (buff 100)})))
+               (ok (filter keep entries)))",
+            "f",
+            &[entries],
+        );
+    }
+
     /// A transaction argument reaches a public function as a serialized
     /// principal, is cast to the trait in the declared list-entry type, and is
     /// then read back out of the tuple by `element-at?` and `get`.

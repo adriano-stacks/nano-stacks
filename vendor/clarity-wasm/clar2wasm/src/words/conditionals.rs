@@ -623,6 +623,14 @@ impl ComplexWord for Filter {
             .clone();
 
         let elem_ty = generator.get_sequence_element_type(sequence)?;
+        let element_value_ty = match &ty {
+            TypeSignature::SequenceType(sequence) => sequence.unit_type(),
+            _ => {
+                return Err(GeneratorError::TypeError(
+                    "filter input must be a sequence".to_owned(),
+                ))
+            }
+        };
         let is_list = matches!(
             &ty,
             TypeSignature::SequenceType(SequenceSubtype::ListType(_))
@@ -668,6 +676,7 @@ impl ComplexWord for Filter {
             // The function expects a `response int bool` but the type of the element is `response int UNKNOWN`.
             // This is something we can't fix with a regulare "workaround" since the type of the expression is identical
             // to the type of the sequence.
+            let argument_size = generator.take_argument_size(&mut loop_, &element_value_ty)?;
             if let SequenceElementType::Other(list_elem_ty) = &elem_ty {
                 let arg_ty = match generator
                     .get_function_type(discriminator.as_str())
@@ -695,7 +704,14 @@ impl ComplexWord for Filter {
                 loop_.i32_const(ducktype_offset as _).local_set(*l);
                 generator.duck_type(&mut loop_, list_elem_ty, &arg_ty, Some(*l))?;
             }
-            loop_.call(generator.func_by_name(discriminator.as_str()));
+            generator.visit_call_user_defined(
+                &mut loop_,
+                discriminator,
+                &TypeSignature::BoolType,
+                Some(&TypeSignature::BoolType),
+                None,
+                Some(std::slice::from_ref(&argument_size)),
+            )?;
         }
         // [ Discriminator result (bool) ]
 
