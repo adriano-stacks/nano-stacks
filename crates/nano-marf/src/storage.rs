@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS marf_node_staging (
 );
 ";
 
-/// How many resident bytes of trie nodes stay cached per generation.
+/// How many estimated bytes of trie nodes stay cached per generation.
 ///
 /// A byte bound rather than an entry count, because the entries are nothing
 /// alike. Near mainnet height 8.7 million, 42% of the nodes recent blocks read
@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS marf_node_staging (
 /// after fifteen hours. The working set the cache exists for is precisely the
 /// wide ancestor nodes, so the fix is to bound what they cost, not to stop
 /// caching them.
-const NODE_CACHE_BYTES: usize = 1_500_000_000;
+/// Live metrics measured roughly 3x more RSS growth than this estimate.
+const NODE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// Node hashes are 32 bytes each; this keeps the same ~1M entries per
 /// generation the entry-count bound did.
 const NODE_HASH_CACHE_BYTES: usize = 100_000_000;

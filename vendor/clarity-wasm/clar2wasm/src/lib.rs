@@ -134,14 +134,14 @@ pub trait NativeModuleStore: std::fmt::Debug + Send + Sync {
 /// megabytes each, for the life of the process — a mainnet follower leaked its
 /// way to an OOM kill through it. Eviction costs a recompilation on the next
 /// call, never a wrong answer, so the budget only has to keep the hot set.
-const MODULE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const MODULE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// What keeping a compiled contract costs, estimated.
 ///
 /// The wasm bytes are measurable. The analysis — the whole AST plus a boxed
 /// type per node — and the native module are not, and both scale with the
-/// wasm, so they are charged as a multiple of it. Deliberately an
-/// overestimate.
+/// wasm, so they are charged as a multiple of it. This is a relative weight,
+/// not an allocator measurement.
 fn entry_weight(module: &CompiledContract) -> usize {
     module.wasm.len() * 6 + 65_536
 }
