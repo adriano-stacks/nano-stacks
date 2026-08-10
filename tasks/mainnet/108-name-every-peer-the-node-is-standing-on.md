@@ -51,8 +51,12 @@ fetching history from 8 peers: http://172.96.141.17:20443/, …,
       from, and the p2p session/known counts discovery reports.
 - [x] Show it in the TUI: a `peer pool` line under the sync source with the
       pool's size, live p2p sessions and known peers.
-- [ ] Deploy: binary staged as `stacks-node.new` (`9a055ab8`); swap after the
-      107 memory measurement window closes so it is not cut short.
+- [ ] Deploy after the 107 memory measurement window closes so it is not cut
+      short. The earlier `9a055ab8` artifact was superseded in place; the file
+      now at `stacks-node.new` has SHA-256
+      `a01c28a9aed67a94511148976345540531149c2b685be2184dca7e53f9082211`
+      but no retained commit provenance. Rebuild
+      from the final clean HEAD, stage that exact artifact, then swap it in.
 
 ## Acceptance Criteria
 
