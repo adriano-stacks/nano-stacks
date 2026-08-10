@@ -132,8 +132,8 @@ jobs:
             parent=$(dirname "$template")
             mkdir -p "$parent"
             directory=$(mktemp -d "$parent/.$(basename "$template").XXXXXX")
-            cp -a --reflink=always "$source/." "$directory/"
             scratch_dirs+=("$directory")
+            cp -a --reflink=always "$source/." "$directory/"
             printf -v "$scratch_name" %s "$directory"
             export "${scratch_name?}"
           }
