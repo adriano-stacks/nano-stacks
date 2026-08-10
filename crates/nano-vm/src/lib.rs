@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -2206,6 +2207,50 @@ impl WriteJournal {
     }
 }
 
+/// Two generations of side-store values, bounded in bytes.
+///
+/// A value is immutable under its key — the key's first 32 bytes are the
+/// Sha512/256 of the value — so a cached answer can never be stale. Bounded
+/// the way the MARF's node cache is: the older generation is dropped wholesale
+/// once the newer one fills its budget. A mainnet block reads the side store
+/// hundreds of times, and hot keys — token balances, pool state — repeat
+/// across blocks.
+///
+/// Only present values are cached: an absent row can appear when a later
+/// block writes that very hash, and a remembered absence would then answer
+/// wrongly forever.
+#[derive(Debug, Default)]
+struct SideValueCache {
+    hot: HashMap<MarfValue, String>,
+    cold: HashMap<MarfValue, String>,
+    hot_bytes: usize,
+}
+
+impl SideValueCache {
+    /// Per generation; two may be resident.
+    const CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+
+    fn get(&mut self, key: MarfValue) -> Option<String> {
+        if let Some(value) = self.hot.get(&key) {
+            return Some(value.clone());
+        }
+        let (key, value) = self.cold.remove_entry(&key)?;
+        self.insert(key, value.clone());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: MarfValue, value: String) {
+        if self.hot_bytes >= Self::CAPACITY_BYTES {
+            self.cold = std::mem::take(&mut self.hot);
+            self.hot_bytes = 0;
+        }
+        let weight = 96 + value.len();
+        if self.hot.insert(key, value).is_none() {
+            self.hot_bytes += weight;
+        }
+    }
+}
+
 /// A versioned Clarity key/value store whose state roots are committed by the MARF.
 ///
 /// Values live in the MARF and its side store, so nothing a sealed block wrote
@@ -2217,6 +2262,9 @@ pub struct MarfStore {
     network: Network,
     marf: VersionedMarf,
     side_store: rusqlite::Connection,
+    /// Read-through cache over `data_table`, sound because a value is
+    /// immutable under its hash key.
+    side_values: RefCell<SideValueCache>,
     metadata: BTreeMap<(String, String), String>,
     checkpoint_heights: BTreeMap<[u8; 32], u32>,
     read_block: Option<[u8; 32]>,
@@ -2479,7 +2527,7 @@ impl MarfStore {
         Self::open(network, directory)
     }
 
-    const fn assemble(
+    fn assemble(
         network: Network,
         marf: VersionedMarf,
         side_store: rusqlite::Connection,
@@ -2489,6 +2537,11 @@ impl MarfStore {
             network,
             marf,
             side_store,
+            side_values: RefCell::new(SideValueCache {
+                hot: HashMap::new(),
+                cold: HashMap::new(),
+                hot_bytes: 0,
+            }),
             metadata: BTreeMap::new(),
             checkpoint_heights: BTreeMap::new(),
             read_block,
@@ -3103,7 +3156,10 @@ impl MarfStore {
     }
 
     fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {
-        Ok(self
+        if let Some(known) = self.side_values.borrow_mut().get(value) {
+            return Ok(Some(known));
+        }
+        let read: Option<String> = self
             .side_store
             .prepare_cached("SELECT value FROM data_table WHERE key = ?1")
             .and_then(|mut statement| {
@@ -3111,7 +3167,11 @@ impl MarfStore {
                     .query_row(params![marf_value_key(value)], |row| row.get(0))
                     .optional()
             })
-            .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?)
+            .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?;
+        if let Some(found) = &read {
+            self.side_values.borrow_mut().insert(value, found.clone());
+        }
+        Ok(read)
     }
 
     fn metadata_from_side_store(
