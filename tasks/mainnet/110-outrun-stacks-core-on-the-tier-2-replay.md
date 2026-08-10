@@ -335,3 +335,33 @@ host-boundary cuts, with the remaining ~19 s mapped by name and count:
 `load_constant` (670 k deep clones + re-serializations of per-contract
 constants), the non-primitive `runtime_value_size` remainder, and
 admission. The pattern is established; the distribution is the to-do list.
+
+## Thirteenth round: two correctness walls, banked as guards (63cd30e5)
+
+Widening the size fast path found two rules the compiler's own crosschecks
+enforce, now recorded in code comments and here:
+
+1. **Trait erasure**: a trait reference arrives as `principal` in the
+   runtime type string but sizes as the callee's own type. `principal`
+   left the fast path.
+2. **Wide runtime shapes**: at a function entry, duck typing may hand a
+   value *wider* than the declared type, and the reference charges what
+   was actually given — a tuple can never be sized from its declaration.
+   The static-tuple path (which measured 3.2 M of 3.2 M calls!) is
+   therefore unsound and was reverted before commit; only the three
+   monomorphic primitives, which have no wider shape, keep the shortcut.
+
+These same rules bound the `load_constant` and admission work: any cache
+must key on the runtime shape, not the declaration.
+
+## Session close
+
+Best verified honest configuration: **6:02.6** against stacks-core's
+5:43.2 (both controlled); late-session runs swing ±40 s because the box is
+shared with another active session, so further measurement tonight is
+noise. Gap at close: ~19 s, held entirely by `runtime_value_size` over
+tuples (3.2 M calls that *must* read their values — the fix is emitting
+size tracking in generated code where the compiler knows the shape
+statically), `load_constant` (670 k deep clones), and admission. All three
+are compiler-side work with the wide-shape rule as their constraint and
+this harness as their gate.
