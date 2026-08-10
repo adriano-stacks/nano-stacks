@@ -303,3 +303,18 @@ The same family holds the rest: per-name call distribution is the next
 measurement (the hook cannot name functions; counting needs one inserted
 statement per wrap site), and the shape/size bookkeeping calls the compiler
 could prove statically are the likely bulk of the 3,264 calls per block.
+
+## Eleventh round: the distribution, and the first two boundary cuts
+
+Per-name counts over 1,500 blocks: `runtime_value_size` 3,214,723 (66% of
+all host calls), `load_constant` 670,068, `admit_function_argument`
+409,204, `get_variable` 356,095 — the actual database reads are 7%.
+
+Landed: the memory-handle cache (`b86f9bca`, −25 s) and the primitive-size
+short-circuit (this commit, −9 s). 4,149 blocks now replay in **6:02.6**
+against stacks-core's 5:43.2 — 19 s, from 53. Next by count and cost:
+`load_constant` deep-clones the constant and recomputes its type on all
+670 k calls (cacheable per contract once the write-side ABI is pinned
+down), `admit_function_argument` re-parses type strings per argument, and
+the non-primitive remainder of `runtime_value_size` still deserializes to
+measure.
