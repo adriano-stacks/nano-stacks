@@ -394,3 +394,22 @@ The gap therefore closes only in codegen: emit size accounting where the
 compiler knows the shape statically, or store the size beside the arena
 entry when a shape is preserved. Both are specified; both inherit the
 wide-shape and trait-erasure rules and this harness.
+
+## Sixteenth round: the sizing lattice, walked to its floor
+
+Length-based dynamic typing (build `type_of`'s answer from repr lengths,
+size with clarity's own arithmetic — no value construction) is sound,
+suite-green, and moves nothing: the measured tuples carry trait-typed and
+principal fields, which decline the walk exactly where the call volume is.
+Extending the walker one type at a time chases each decline into the next
+— optionals need indicator reads, callables need name-length reads plus
+the trait identity, and the outer swap tuples are trait-laden regardless.
+Reverted like its three siblings.
+
+Sixteen rounds establish the final shape of this benchmark: every layer
+outside generated code is optimal or within noise of it, and the 19 s gap
+is the per-call cost of measuring values whose sizes the *compiler* knows
+how to compute inline — constants plus length-slot loads, a handle-guarded
+host fallback. That emission (`wasm_generator`, walrus IR) is the whole
+remaining work, sized at one focused session, gated by this harness and
+the 1,472 crosschecks that caught every unsound shortcut tonight.
