@@ -780,6 +780,9 @@ impl Rounds {
         if let Some(chosen) =
             better_peer(&self.peer, config, discovered, executor, pox, state).await
         {
+            if let Some(state) = state {
+                state.metrics().record_peer_failover();
+            }
             self.node = Node::new(chosen.clone());
             self.peer = chosen;
         }
@@ -1038,6 +1041,9 @@ async fn check_relayed(
                 }
             }
         }
+    }
+    if let Some(metrics) = metrics {
+        metrics.record_pushed_blocks(accepted, rejected);
     }
     let admitted = admit_relayed(executor, mempool, relay, transactions).await;
     if accepted > 0 || rejected > 0 || admitted > 0 {
@@ -3203,6 +3209,9 @@ async fn track_peer(
             }
             Err(error) => {
                 eprintln!("asking the peer how far ahead it is failed: {error}");
+                if let Some(state) = state {
+                    state.metrics().record_sync_round_unanswered();
+                }
                 true
             }
         }
@@ -3220,6 +3229,9 @@ async fn track_peer(
             }
             Err(error) => {
                 eprintln!("following the peer failed: {error}");
+                if let Some(state) = state {
+                    state.metrics().record_sync_round_unanswered();
+                }
                 true
             }
         }

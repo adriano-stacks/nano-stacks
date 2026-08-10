@@ -124,9 +124,44 @@ impl RefusalCounters {
     }
 }
 
+struct SyncCounters {
+    peer_failovers: Counter,
+    rounds_unanswered: Counter,
+    pushed_blocks_accepted: Counter,
+    pushed_blocks_refused: Counter,
+}
+
+impl SyncCounters {
+    fn register(registry: &mut Registry) -> Self {
+        Self {
+            peer_failovers: counter(
+                registry,
+                "peer_failovers",
+                "Times the follower selected a different serving peer.",
+            ),
+            rounds_unanswered: counter(
+                registry,
+                "sync_rounds_unanswered",
+                "Follow polls the selected peer did not answer.",
+            ),
+            pushed_blocks_accepted: counter(
+                registry,
+                "pushed_blocks_accepted",
+                "Peer-pushed blocks accepted by local authentication.",
+            ),
+            pushed_blocks_refused: counter(
+                registry,
+                "pushed_blocks_refused",
+                "Peer-pushed blocks refused by local authentication.",
+            ),
+        }
+    }
+}
+
 struct Inner {
     registry: Registry,
     block_refusals: RefusalCounters,
+    sync: SyncCounters,
     executed_stacks_height: IntGauge,
     followed_stacks_height: IntGauge,
     selected_stacks_height: IntGauge,
@@ -161,6 +196,7 @@ impl Default for NodeMetrics {
     fn default() -> Self {
         let mut registry = Registry::with_prefix("nano");
         let block_refusals = RefusalCounters::register(&mut registry);
+        let sync = SyncCounters::register(&mut registry);
         let executed_stacks_height = gauge(
             &mut registry,
             "executed_stacks_height",
@@ -240,6 +276,7 @@ impl Default for NodeMetrics {
         Self(Arc::new(Inner {
             registry,
             block_refusals,
+            sync,
             executed_stacks_height,
             followed_stacks_height,
             selected_stacks_height,
@@ -273,6 +310,22 @@ impl NodeMetrics {
         if let Some(reason) = RefusalReason::consensus(message) {
             self.0.block_refusals.record(reason);
         }
+    }
+
+    /// Record a follower moving to another selected peer.
+    pub fn record_peer_failover(&self) {
+        self.0.sync.peer_failovers.inc();
+    }
+
+    /// Record a selected peer failing to answer the follow poll.
+    pub fn record_sync_round_unanswered(&self) {
+        self.0.sync.rounds_unanswered.inc();
+    }
+
+    /// Record peer-pushed blocks authenticated during one follow round.
+    pub fn record_pushed_blocks(&self, accepted: usize, refused: usize) {
+        self.0.sync.pushed_blocks_accepted.inc_by(as_u64(accepted));
+        self.0.sync.pushed_blocks_refused.inc_by(as_u64(refused));
     }
 
     pub(crate) fn publish_executed(&self, stacks_height: u64, burn_height: u64, now: u64) {
@@ -322,6 +375,12 @@ fn gauge(registry: &mut Registry, name: &'static str, help: &'static str) -> Int
     gauge
 }
 
+fn counter(registry: &mut Registry, name: &'static str, help: &'static str) -> Counter {
+    let counter = Counter::default();
+    registry.register(name, help, counter.clone());
+    counter
+}
+
 fn set_option<T>(gauge: &IntGauge, value: Option<T>)
 where
     T: TryInto<i64>,
@@ -336,6 +395,13 @@ where
     T: TryInto<i64>,
 {
     value.try_into().unwrap_or(i64::MAX)
+}
+
+fn as_u64<T>(value: T) -> u64
+where
+    T: TryInto<u64>,
+{
+    value.try_into().unwrap_or(u64::MAX)
 }
 
 /// Build the separately bound observability surface.
@@ -386,6 +452,9 @@ mod tests {
         metrics.record_block_refusal("the reward set is absent");
         metrics.record_block_refusal("proposal names the wrong chain");
         metrics.record_consensus_refusal("the peer timed out");
+        metrics.record_peer_failover();
+        metrics.record_sync_round_unanswered();
+        metrics.record_pushed_blocks(3, 2);
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -447,6 +516,10 @@ mod tests {
             "nano_block_refusals_total{reason=\"signature\"} 1",
             "nano_block_refusals_total{reason=\"missing_context\"} 1",
             "nano_block_refusals_total{reason=\"other\"} 1",
+            "nano_peer_failovers_total 1",
+            "nano_sync_rounds_unanswered_total 1",
+            "nano_pushed_blocks_accepted_total 3",
+            "nano_pushed_blocks_refused_total 2",
             "# EOF",
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
