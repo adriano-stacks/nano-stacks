@@ -195,3 +195,20 @@ compilation and the side store are now all measured small. Next: profile
 inside the VM boundary (value serialization at the host boundary, per-call
 Store/Instance setup, memory copies) — instrumented builds, since the box
 allows no perf or ptrace.
+
+## Fifth round: negative results, recorded so nobody repeats them
+
+- wasmtime pooling allocator: ~5 s, inside run variance; reverted — a pool
+  limit an instantiation could hit is a block that fails wrongly, and an
+  unmeasurable win does not buy that risk.
+- `metadata_table` read-through cache: no effect; those reads were already
+  rare. Reverted.
+- `target-cpu=native`: ~1%, machine-specific, bench-only.
+
+Closing state of the extended benchmark: nano 6:33–6:48 across runs, durably
+committing; stacks-core 5:54, validate-only. Every lever outside the VM is
+now measured: storage fetch 5 s, decode 0.5 s, linking 5 ms, compilation
+amortized, side values cached, fsync spaced. The remaining ~40 s sits inside
+the wasm runtime and host-call path (280 s user vs core's 158 s), and closing
+it means instrumenting the VM boundary itself: value (de)serialization at
+host calls, per-call Store setup, memory copies. That work continues here.
