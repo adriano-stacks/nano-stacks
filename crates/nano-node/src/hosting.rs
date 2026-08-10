@@ -87,6 +87,7 @@ pub async fn validate_proposals(
             &mut endpoints,
             "validating proposals",
         );
+        state.metrics().publish_proposal_peers(endpoints.len());
         let request = tokio::select! {
             request = requests.recv() => request,
             // A validator that only catches up when asked would execute the whole
@@ -709,6 +710,9 @@ pub async fn replicate(
             &config,
             discovered.as_ref(),
         ));
+        state
+            .metrics()
+            .publish_stackerdb_peers(replicas.endpoints.len());
         // Drained before the round rather than inside it, and kept when the round
         // fails: a chunk the hosted signer wrote is the whole reason this loop
         // exists, and dropping it because the peer whose turn it was went away
@@ -718,7 +722,10 @@ pub async fn replicate(
         }
         match round(&mut replicas, network, &state, &outbound).await {
             Ok(()) => outbound.clear(),
-            Err(refusal) => eprintln!("{refusal}"),
+            Err(refusal) => {
+                state.metrics().record_stackerdb_round_unanswered();
+                eprintln!("{refusal}");
+            }
         }
         // What the run can be held to afterwards. `71` asks a no-hosted-API run to
         // *prove* distribution rather than assert it, and a pool that was never

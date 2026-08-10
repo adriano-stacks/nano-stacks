@@ -136,8 +136,39 @@ impl RefusalCounters {
 struct SyncCounters {
     peer_failovers: Counter,
     rounds_unanswered: Counter,
+    stackerdb_rounds_unanswered: Counter,
     pushed_blocks_accepted: Counter,
     pushed_blocks_refused: Counter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ServingRole {
+    Follower,
+    ProposalValidator,
+    StackerDbReplication,
+}
+
+impl EncodeLabelValue for ServingRole {
+    fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
+        encoder.write_str(match self {
+            Self::Follower => "follower",
+            Self::ProposalValidator => "proposal_validator",
+            Self::StackerDbReplication => "stackerdb_replication",
+        })
+    }
+}
+
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+struct ServingPeerLabels {
+    role: ServingRole,
+}
+
+struct PeerGauges {
+    follower: IntGauge,
+    proposal_validator: IntGauge,
+    stackerdb_replication: IntGauge,
+    p2p_connected: IntGauge,
+    p2p_known: IntGauge,
 }
 
 struct ResourceGauges {
@@ -239,6 +270,11 @@ impl SyncCounters {
                 "sync_rounds_unanswered",
                 "Follow polls the selected peer did not answer.",
             ),
+            stackerdb_rounds_unanswered: counter(
+                registry,
+                "stackerdb_rounds_unanswered",
+                "StackerDB replication rounds no serving peer answered.",
+            ),
             pushed_blocks_accepted: counter(
                 registry,
                 "pushed_blocks_accepted",
@@ -253,14 +289,36 @@ impl SyncCounters {
     }
 }
 
+impl PeerGauges {
+    fn register(registry: &mut Registry) -> Self {
+        let family = Family::<ServingPeerLabels, IntGauge>::default();
+        let serving_gauge = |role| family.get_or_create(&ServingPeerLabels { role }).clone();
+        let peers = Self {
+            follower: serving_gauge(ServingRole::Follower),
+            proposal_validator: serving_gauge(ServingRole::ProposalValidator),
+            stackerdb_replication: serving_gauge(ServingRole::StackerDbReplication),
+            p2p_connected: gauge(registry, "p2p_connected", "Live binary P2P sessions."),
+            p2p_known: gauge(
+                registry,
+                "p2p_known",
+                "Peers known to the binary P2P table.",
+            ),
+        };
+        registry.register(
+            "serving_peers",
+            "Peers available to each network-facing node role.",
+            family,
+        );
+        peers
+    }
+}
+
 struct Inner {
     registry: Registry,
     block_refusals: RefusalCounters,
     sync: SyncCounters,
     progress: ProgressGauges,
-    serving_peers: IntGauge,
-    p2p_connected: IntGauge,
-    p2p_known: IntGauge,
+    peers: PeerGauges,
     staged_blocks: IntGauge,
     relay_offered: IntGauge,
     relay_announcing: IntGauge,
@@ -291,17 +349,7 @@ impl Default for NodeMetrics {
         let sync = SyncCounters::register(&mut registry);
         let resources = ResourceGauges::register(&mut registry);
         let progress = ProgressGauges::register(&mut registry);
-        let serving_peers = gauge(
-            &mut registry,
-            "serving_peers",
-            "Peers currently serving the follower.",
-        );
-        let p2p_connected = gauge(&mut registry, "p2p_connected", "Live binary P2P sessions.");
-        let p2p_known = gauge(
-            &mut registry,
-            "p2p_known",
-            "Peers known to the binary P2P table.",
-        );
+        let peers = PeerGauges::register(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
             "staged_blocks",
@@ -347,9 +395,7 @@ impl Default for NodeMetrics {
             block_refusals,
             sync,
             progress,
-            serving_peers,
-            p2p_connected,
-            p2p_known,
+            peers,
             staged_blocks,
             relay_offered,
             relay_announcing,
@@ -388,6 +434,11 @@ impl NodeMetrics {
         self.0.sync.rounds_unanswered.inc();
     }
 
+    /// Record a `StackerDB` replication round that no serving peer answered.
+    pub fn record_stackerdb_round_unanswered(&self) {
+        self.0.sync.stackerdb_rounds_unanswered.inc();
+    }
+
     /// Record peer-pushed blocks authenticated during one follow round.
     pub fn record_pushed_blocks(&self, accepted: usize, refused: usize) {
         self.0.sync.pushed_blocks_accepted.inc_by(as_u64(accepted));
@@ -419,6 +470,16 @@ impl NodeMetrics {
             .set(as_i64(usage.wasm_module_bytes));
     }
 
+    /// Publish the peers available to the hosted proposal validator.
+    pub fn publish_proposal_peers(&self, peers: usize) {
+        self.0.peers.proposal_validator.set(as_i64(peers));
+    }
+
+    /// Publish the peers available to `StackerDB` replication.
+    pub fn publish_stackerdb_peers(&self, peers: usize) {
+        self.0.peers.stackerdb_replication.set(as_i64(peers));
+    }
+
     pub(crate) fn publish_tenure_history(&self, tenures: usize) {
         self.0.resources.tenure_history_window.set(as_i64(tenures));
     }
@@ -444,9 +505,9 @@ impl NodeMetrics {
     }
 
     pub(crate) fn publish_peers(&self, serving: usize, connected: usize, known: usize) {
-        self.0.serving_peers.set(as_i64(serving));
-        self.0.p2p_connected.set(as_i64(connected));
-        self.0.p2p_known.set(as_i64(known));
+        self.0.peers.follower.set(as_i64(serving));
+        self.0.peers.p2p_connected.set(as_i64(connected));
+        self.0.peers.p2p_known.set(as_i64(known));
     }
 
     pub(crate) fn publish_queues(&self, queues: &QueueReport) {
@@ -555,7 +616,10 @@ mod tests {
         metrics.record_consensus_refusal("the peer timed out");
         metrics.record_peer_failover();
         metrics.record_sync_round_unanswered();
+        metrics.record_stackerdb_round_unanswered();
         metrics.record_pushed_blocks(3, 2);
+        metrics.publish_proposal_peers(2);
+        metrics.publish_stackerdb_peers(4);
         metrics.publish_mempool_size(11);
         metrics.publish_execution_caches(ExecutionCacheReport {
             marf_node_entries: 13,
@@ -617,7 +681,9 @@ mod tests {
             "nano_selected_stacks_height 9",
             "nano_executed_stacks_height 4",
             "nano_burn_height 3",
-            "nano_serving_peers 3",
+            "nano_serving_peers{role=\"follower\"} 3",
+            "nano_serving_peers{role=\"proposal_validator\"} 2",
+            "nano_serving_peers{role=\"stackerdb_replication\"} 4",
             "nano_staged_blocks 7",
             "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
             "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
@@ -626,6 +692,7 @@ mod tests {
             "nano_block_refusals_total{reason=\"other\"} 1",
             "nano_peer_failovers_total 1",
             "nano_sync_rounds_unanswered_total 1",
+            "nano_stackerdb_rounds_unanswered_total 1",
             "nano_pushed_blocks_accepted_total 3",
             "nano_pushed_blocks_refused_total 2",
             "nano_mempool_transactions 11",
