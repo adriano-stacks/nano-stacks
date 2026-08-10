@@ -71,9 +71,10 @@ before it starts.
 - [x] Age the mempool on a follower, not only inside the miner's `advance`.
       `admit_relayed` advances the pool under the locks it already holds.
 - [x] Redeploy `/home/aldur/mainnet-tip` on the fixed binary and measure the
-      slope at tip again. Deployed `8e27c16b` 2026-08-10 ~12:15 UTC; back at
-      tip in one round, 248 MiB at startup (previously 6.8 GiB after sync).
-      Slope measurement running.
+      slope at tip again. Docker records the `8e27c16b` process starting at
+      2026-08-10 11:22:06 UTC, two minutes after that commit; it returned to
+      tip in one round at 248 MiB (previously 6.8 GiB after sync). Slope
+      measurement running.
 
 ## Acceptance Criteria
 
