@@ -12,7 +12,7 @@ use crate::check_args;
 use crate::cost::WordCharge;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
-    clar2wasm_ty, drop_value, uses_packed_value, ArgumentsExt, GeneratorError, LiteralMemoryEntry,
+    clar2wasm_ty, uses_packed_value, ArgumentsExt, GeneratorError, LiteralMemoryEntry,
     WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
@@ -116,8 +116,9 @@ impl ComplexWord for MapGet {
 
         let (key_offset, _) = generator.create_call_stack_local(builder, &key_ty, true, false);
 
-        // In epoch >= 2.05, we generate a local to compute intermediary results used in the
-        // cost tracking. In this case, the cost tracking charge is applied after the delete operation.
+        // In epoch >= 2.05, the host reports the serialized bytes that the
+        // database actually read. This distinguishes an absent entry from a
+        // persisted one-byte deletion marker, even though both answer `none`.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
         let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
             Some(generator.borrow_local(ValType::I32))
@@ -137,12 +138,6 @@ impl ComplexWord for MapGet {
         // The key is read where it is and serialised, not copied out of
         // its binding, so a bound name here does not pay to be copied.
         generator.traverse_expr_as_borrowed_value(builder, key)?;
-        // for epoch >= 2.05, we compute the serialization size of the key.
-        if let Some(cost_local) = &post205_cost_local {
-            generator.serialization_size(builder, &key_ty)?;
-            builder.local_set(**cost_local);
-        }
-
         // Write the key to the memory (it's already on the data stack)
         let key_size = generator.write_to_memory(builder, key_offset, 0, &key_ty)?;
 
@@ -161,6 +156,11 @@ impl ComplexWord for MapGet {
 
         // Call the host-interface function, `map_get`
         builder.call(generator.func_by_name("stdlib.map_get"));
+        if let Some(cost_local) = &post205_cost_local {
+            builder.local_set(**cost_local);
+        } else {
+            builder.drop();
+        }
 
         // Host interface fills the result into the specified memory. Read it
         // back out, and place the value on the data stack.
@@ -184,32 +184,7 @@ impl ComplexWord for MapGet {
             // When the linked operation does not fail due to an interpreter error
             let mut success_block = builder.dangling_instr_seq(block_ty);
             if let Some(cost_local) = &post205_cost_local {
-                if let Some(return_locals) = &return_locals {
-                    for local in return_locals {
-                        success_block.local_get(*local);
-                    }
-                }
-                generator.serialization_size(&mut success_block, &return_type)?;
-                let value_serialization_size = generator.borrow_local(ValType::I32);
-                // We check if the serialized size of the returned value is different than 1, aka the serialization size of a none
-                success_block
-                    // We check if the serialization size of the TOS is not equal to 1, Which is the serialization size of a none
-                    // If it is not a none, aka a value was found in the map, we add the serialization size of the value we retrieved to the cost
-                    // Otherwise the cost is just the serialization size key
-                    .local_tee(*value_serialization_size)
-                    .i32_const(0)
-                    .local_get(*value_serialization_size)
-                    .i32_const(1)
-                    .binop(BinaryOp::I32Ne)
-                    .select(None);
-                success_block
-                    .local_get(**cost_local)
-                    .binop(BinaryOp::I32Add)
-                    .local_set(**cost_local);
                 self.charge(generator, &mut success_block, **cost_local)?;
-                if packed_return {
-                    drop_value(&mut success_block, &return_type);
-                }
             }
             success_block.id()
         };
@@ -747,9 +722,12 @@ mod tests {
     // use clarity::vm::errors::{CheckErrors, Error};
 
     use clarity::vm::errors::{RuntimeCheckErrorKind, VmExecutionError};
-    use clarity::vm::Value;
+    use clarity::vm::types::{PrincipalData, TupleData};
+    use clarity::vm::{ClarityName, Value};
 
-    use crate::tools::{crosscheck, crosscheck_expect_failure, evaluate};
+    use crate::tools::{
+        crosscheck, crosscheck_cost_multi_contract, crosscheck_expect_failure, evaluate,
+    };
 
     //
     // Module with tests that should only be executed
@@ -941,5 +919,49 @@ mod tests {
             RuntimeCheckErrorKind::IncorrectArgumentCount(2, 3),
         ));
         crosscheck(snippet, expected);
+    }
+
+    /// A deleted map entry is charged for its persisted one-byte tombstone as
+    /// well as its serialized key. A truly absent entry has no tombstone.
+    #[test]
+    fn a_deleted_entry_charges_the_bytes_the_database_read() {
+        let user = Value::Principal(
+            PrincipalData::parse("SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0")
+                .expect("user principal"),
+        );
+        let asset = Value::Principal(
+            PrincipalData::parse_qualified_contract_principal(
+                "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token",
+            )
+            .expect("asset contract principal"),
+        );
+        let key = Value::Tuple(
+            TupleData::from_data(vec![
+                (ClarityName::from_literal("asset"), asset.clone()),
+                (ClarityName::from_literal("user"), user.clone()),
+            ])
+            .expect("map key"),
+        );
+        assert_eq!(key.serialize_to_vec().expect("serialized key").len(), 71);
+        crosscheck_cost_multi_contract(
+            &[
+                (
+                    "data",
+                    "(define-map m { user: principal, asset: principal } uint)
+                     (define-public (read (user principal) (asset principal))
+                       (begin
+                         (map-set m { user: user, asset: asset } u1)
+                         (map-delete m { user: user, asset: asset })
+                         (ok (map-get? m { user: user, asset: asset }))))",
+                ),
+                (
+                    "snippet",
+                    "(define-public (f (user principal) (asset principal))
+                       (contract-call? .data read user asset))",
+                ),
+            ],
+            "f",
+            &[user, asset],
+        );
     }
 }

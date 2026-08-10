@@ -3801,21 +3801,21 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     epoch,
                 )?;
 
-                let result = caller.data_mut().global_context.database.fetch_entry(
-                    &contract,
-                    &map_name,
-                    &key,
-                    &data_types,
-                    &epoch,
-                );
+                let result = caller
+                    .data_mut()
+                    .global_context
+                    .database
+                    .fetch_entry_with_size(&contract, &map_name, &key, &data_types, &epoch);
 
                 match result {
                     Err(error) => {
                         handle_vm_execution_errors(&mut caller, error)?;
-                        Ok(())
+                        Ok(0i32)
                     }
 
                     Ok(data) => {
+                        let serialized_byte_len = i32::try_from(data.serialized_byte_len)
+                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
                         let memory = caller
                             .get_export("memory")
                             .and_then(|export| export.into_memory())
@@ -3828,11 +3828,11 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                             &ty,
                             return_offset,
                             return_offset + get_type_size(&ty),
-                            &data,
+                            &data.value,
                             true,
                         )?;
 
-                        Ok(())
+                        Ok(serialized_byte_len)
                     }
                 }
             },
@@ -7853,7 +7853,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
          _key_offset: i32,
          _key_length: i32,
          _return_offset: i32,
-         _return_length: i32| { Ok(()) },
+         _return_length: i32| { Ok(0i32) },
     )?;
 
     linker.func_wrap(
