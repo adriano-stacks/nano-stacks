@@ -3638,7 +3638,7 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Epochs before 2.1 leave `none` as `NoType` instead of the optional
         // parameter type expected by the function ABI.
-        let return_ty = match self.get_function_type(name).cloned() {
+        let (function_args, return_ty) = match self.get_function_type(name).cloned() {
             Some(FunctionType::Fixed(FixedFunction {
                 args: function_args,
                 returns,
@@ -3652,7 +3652,7 @@ impl WasmGenerator {
                 );
                 for (arg, signature) in args
                     .iter()
-                    .zip(function_args.into_iter().map(|a| a.signature))
+                    .zip(function_args.iter().map(|argument| &argument.signature))
                 {
                     let needs_expected_type = self.get_expr_type(arg).is_none_or(|ty| match ty {
                         TypeSignature::NoType => true,
@@ -3662,10 +3662,10 @@ impl WasmGenerator {
                         _ => false,
                     });
                     if needs_expected_type {
-                        self.set_expr_type(arg, signature)?;
+                        self.set_expr_type(arg, signature.clone())?;
                     }
                 }
-                returns
+                (function_args, returns)
             }
             fn_ty => {
                 return Err(GeneratorError::TypeError(format!(
@@ -3674,8 +3674,10 @@ impl WasmGenerator {
             }
         };
         let mut argument_sizes = Vec::new();
-        for arg in args {
-            let value_ty = self.value_type_before_context(arg);
+        for (arg, parameter) in args.iter().zip(&function_args) {
+            let value_ty = self.value_type_before_context(arg).ok_or_else(|| {
+                GeneratorError::TypeError("function argument must be typed".into())
+            })?;
             self.traverse_expr(builder, arg)?;
             let size = self.borrow_local(ValType::I32);
             if let SymbolicExpressionType::LiteralValue(value) = &arg.expr {
@@ -3689,13 +3691,11 @@ impl WasmGenerator {
                 })?;
                 builder.i32_const(value_size).local_set(*size);
             } else {
-                let value_ty = value_ty.ok_or_else(|| {
-                    GeneratorError::TypeError("function argument must be typed".into())
-                })?;
                 self.clarity_value_size_on_stack(builder, &value_ty)?;
                 builder.local_set(*size);
             }
             argument_sizes.push(size);
+            self.duck_type(builder, &value_ty, &parameter.signature, None)?;
         }
 
         let expected_ty = self
@@ -3946,31 +3946,57 @@ impl WasmGenerator {
         Ok(())
     }
 
-    /// Return the type an argument has before a user-function entry casts it to
-    /// the parameter type. The analyzer records the contextual type at the call
-    /// site, so constants, bindings, and user-function results need their own
-    /// source type here to reproduce the interpreter's entry charge.
+    /// Return the type describing the Wasm layout an expression's traversal
+    /// leaves on the stack, which is not always the analyzer's contextual type
+    /// and not always the value's own. A constant, binding, or user-function
+    /// result is produced with its own source type — that sameness reproduces
+    /// the interpreter's entry charge, since `runtime_size` reads sizes from
+    /// the value either way — but when the read converts it to the contextual
+    /// type (a binding widened out of a `NoType` placeholder layout, a constant
+    /// or call result duck-typed), the stack holds the contextual layout and
+    /// measuring the source layout against it emits a module that will not
+    /// load. Mainnet contract `fastpool-max500-signer-manager` passes a
+    /// let-bound `{bond-index: none}` to a `(optional uint)` parameter and is
+    /// that module.
     pub(crate) fn value_type_before_context(
         &self,
         expr: &SymbolicExpression,
     ) -> Option<TypeSignature> {
-        match &expr.expr {
-            SymbolicExpressionType::Atom(name) => self
-                .constants
-                .get(name.as_str())
-                .cloned()
-                .or_else(|| self.bindings.get_locals_and_type(name).map(|(_, ty, _)| ty))
-                .or_else(|| self.get_expr_type(expr).cloned()),
-            SymbolicExpressionType::List(items) => items
-                .first()
-                .and_then(SymbolicExpression::match_atom)
-                .and_then(|name| self.get_function_type(name.as_str()))
-                .and_then(|function| match function {
-                    FunctionType::Fixed(function) => Some(function.returns.clone()),
-                    _ => None,
-                })
-                .or_else(|| self.get_expr_type(expr).cloned()),
-            _ => self.get_expr_type(expr).cloned(),
+        type ConversionRule = fn(&TypeSignature, &TypeSignature) -> bool;
+        fn widens(stored: &TypeSignature, expected: &TypeSignature) -> bool {
+            widen_actions(stored, expected).is_some()
+        }
+        let contextual = self.get_expr_type(expr);
+        let (produced, converts): (_, ConversionRule) = match &expr.expr {
+            SymbolicExpressionType::Atom(name) => {
+                if let Some(constant) = self.constants.get(name.as_str()) {
+                    (Some(constant.clone()), need_ducktyping)
+                } else {
+                    let binding = self.bindings.get_locals_and_type(name).map(|(_, ty, _)| ty);
+                    (binding, widens)
+                }
+            }
+            SymbolicExpressionType::List(items) => {
+                let returns = items
+                    .first()
+                    .and_then(SymbolicExpression::match_atom)
+                    .and_then(|name| self.get_function_type(name.as_str()))
+                    .and_then(|function| match function {
+                        FunctionType::Fixed(function) => Some(function.returns.clone()),
+                        _ => None,
+                    });
+                (returns, need_ducktyping)
+            }
+            _ => (None, need_ducktyping),
+        };
+        let Some(produced) = produced else {
+            return contextual.cloned();
+        };
+        match contextual {
+            Some(expected) if *expected != produced && converts(&produced, expected) => {
+                Some(expected.clone())
+            }
+            _ => Some(produced),
         }
     }
 
@@ -5105,6 +5131,27 @@ mod tests {
             clarity::vm::version::ClarityVersion::Clarity1,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn local_call_widens_a_nested_none_argument() {
+        crosscheck(
+            r#"
+            (define-private (reward-cycle (key {
+                bond-index: (optional uint),
+                reward-cycle: uint,
+            }))
+                (get reward-cycle key)
+            )
+            (let ((key {
+                bond-index: none,
+                reward-cycle: u7,
+            }))
+                (reward-cycle key)
+            )
+            "#,
+            Ok(Some(clarity::vm::Value::UInt(7))),
+        );
     }
 
     #[test]
