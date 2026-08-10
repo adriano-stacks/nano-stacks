@@ -150,3 +150,26 @@ call; caching blocked on `ClarityWasmContext` lifetimes), boundary value
 copies, `compile_under` running full codegen to find a native-cache key,
 and per-seal hashing. Lockstep, checkpoint and kill-during suites green
 after the change.
+
+## Third round: allocator and codegen (commits 35487894, f9ed1e95)
+
+| same 4,149 blocks, durable commits | wall |
+|---|---|
+| nano, pre-optimization | 23:36 |
+| + block-hash arena | 7:46 |
+| + mimalloc | 6:40 |
+| + thin LTO, one codegen unit (+`target-cpu=native`, bench only) | **6:34** |
+| stacks-core validate-only, no commits | 5:54 |
+
+The gap is 1.11×, with a structural asymmetry in stacks-core's favor
+still in the number: nano writes and fsyncs every block durably; core
+validates and discards (~60 s of nano's remaining time is that WAL
+traffic). Per block executed-and-committed, nano is at 95 ms against
+core's 85 ms validated-only.
+
+Remaining path to parity and beyond, in measured order: the per-call
+wasmtime linker rebuild (223 host functions per call — blocked on
+`ClarityWasmContext` lifetimes), `compile_under` running full codegen to
+find a native-cache key on process-cold contracts, boundary value
+copies, and a validate-only replay mode if an exactly-symmetric
+benchmark is ever wanted.
