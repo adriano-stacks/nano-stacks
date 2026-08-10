@@ -58,14 +58,22 @@ before it starts.
 
 ## Tasks
 
-- [ ] Bound the MARF node cache by resident bytes rather than entry count, and
+- [x] Bound the MARF node cache by resident bytes rather than entry count, and
       stop the cold→hot promotion holding an entry in both generations.
-- [ ] Give the module cache an eviction policy with a byte budget.
-- [ ] Window `TenureFollower.history` to what its consumers can name, and stop
-      the per-round deep clones of the whole history.
-- [ ] Age the mempool on a follower, not only inside the miner's `advance`.
-- [ ] Redeploy `/home/aldur/mainnet-tip` on the fixed binary and measure the
-      slope at tip again.
+      Measured first: near tip 42% of cached nodes are wide (~2.5 KB serialized,
+      ~14 KB decoded), so 2×1M entries was ~12 GB. Now 1.5 GB per generation.
+- [x] Give the module cache an eviction policy with a byte budget.
+      Least-recently-called beyond 512 MB estimated; `get` keeps `&self` via a
+      `Cell` stamp, so no caller changed.
+- [x] Window `TenureFollower.history` to what its consumers can name, and stop
+      the per-round deep clones of the whole history. Sixteen kept (fork check
+      walks 10, winner scan wants 8); the winner scan reads the slice in place.
+- [x] Age the mempool on a follower, not only inside the miner's `advance`.
+      `admit_relayed` advances the pool under the locks it already holds.
+- [x] Redeploy `/home/aldur/mainnet-tip` on the fixed binary and measure the
+      slope at tip again. Deployed `8e27c16b` 2026-08-10 ~12:15 UTC; back at
+      tip in one round, 248 MiB at startup (previously 6.8 GiB after sync).
+      Slope measurement running.
 
 ## Acceptance Criteria
 
