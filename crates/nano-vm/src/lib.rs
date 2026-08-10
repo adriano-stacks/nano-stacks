@@ -3500,7 +3500,6 @@ fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
     })
 }
 
-const SQLITE_MMAP_BYTES: i64 = 64 * 1024 * 1024 * 1024;
 const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
@@ -3516,7 +3515,6 @@ fn open_side_store_existing(path: &Path) -> Result<rusqlite::Connection, rusqlit
         nano_marf::immutable_uri(path),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
     connection.execute_batch(
         "PRAGMA cache_size = -1000000;
          PRAGMA temp_store = MEMORY;",
@@ -3553,10 +3551,6 @@ fn open_side_store_with_journal(
     // lands somewhere else in the destination's B-tree. The same two megabytes
     // of default page cache that slowed the MARF slows this more.
     //
-    // `mmap_size` for the same reason the MARF sets it: a value read is keyed
-    // by hash, so it lands anywhere in an eleven-gigabyte file, and through
-    // `pread` even a page-cache hit costs a syscall.
-    connection.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
     connection.execute_batch(
         "PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -1000000;
@@ -5144,25 +5138,21 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_MMAP_BYTES, SQLITE_PAGE_BYTES,
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_PAGE_BYTES,
         SemanticEpochInspection, StaticCheckError, compile_under, ensure_wasm_module, loadable,
         open_side_store_with_journal, recorded_network, reports_analysis_failure,
     };
 
     #[test]
-    fn a_durable_side_store_uses_wide_pages_and_maps_large_databases() {
+    fn a_durable_side_store_uses_wide_pages() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let connection = open_side_store_with_journal(&directory.path().join(CLARITY_FILE), true)
             .expect("open a durable side store");
         let page_bytes: i64 = connection
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .expect("read the page size");
-        let mmap_bytes: i64 = connection
-            .pragma_query_value(None, "mmap_size", |row| row.get(0))
-            .expect("read the mmap size");
 
         assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
-        assert_eq!(mmap_bytes, SQLITE_MMAP_BYTES);
     }
 
     #[test]

@@ -1,13 +1,6 @@
 [alias]
 xtask = "run -p xtask --"
 
-# SQLite's compiled-in mmap ceiling is 2 GB, which reduces `PRAGMA mmap_size`
-# on a 23 GB MARF to mapping the file's first two gigabytes — the pragma the
-# stores set would silently do nothing. Raised here because it can only be
-# raised at compile time.
-[env]
-LIBSQLITE3_FLAGS = "-DSQLITE_MAX_MMAP_SIZE=1099511627776"
-
 # Four, on a sixteen-core machine, deliberately.
 #
 # This workspace links clarity, stackslib and wasmtime, and several of those
