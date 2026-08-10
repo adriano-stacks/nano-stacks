@@ -1945,6 +1945,20 @@ mod crosscheck {
         }
     }
 
+    #[test]
+    fn charges_panic_unwraps_only_after_their_inputs_return() {
+        for snippet in [
+            "(define-public (f)
+               (ok (unwrap-panic
+                 (try! (if true (err u1) (ok (some u2)))))))",
+            "(define-public (f)
+               (ok (unwrap-err-panic
+                 (try! (if true (err u1) (ok (err u2)))))))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
     /// From epoch 3.3 a function's arguments are type-checked at the size of
     /// the values passed, not of the types declared, so a short buffer in a
     /// wide parameter costs what it is rather than what it could have been

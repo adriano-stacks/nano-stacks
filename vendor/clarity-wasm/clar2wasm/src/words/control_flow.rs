@@ -69,10 +69,11 @@ impl ComplexWord for UnwrapPanic {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         let input = args.get_expr(0)?;
         generator.traverse_expr(builder, input)?;
+        // Native functions are applied only after their arguments evaluate.
+        // If the argument short-returns, the panic unwrap never runs.
+        self.charge(generator, builder, 0)?;
         // There must be either an `optional` or a `response` on the top of the
         // stack. Both use an i32 indicator, where 0 means `none` or `err`. In
         // both cases, if this indicator is a 0, then we need to panic.
@@ -214,10 +215,11 @@ impl ComplexWord for UnwrapErrPanic {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         let input = args.get_expr(0)?;
         generator.traverse_expr(builder, input)?;
+        // Native functions are applied only after their arguments evaluate.
+        // If the argument short-returns, the panic unwrap never runs.
+        self.charge(generator, builder, 0)?;
         // The input must be a `response` type. It uses an i32 indicator, where
         // 0 means `err`. If this indicator is a 1, then we need to panic.
 
