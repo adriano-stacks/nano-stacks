@@ -413,3 +413,21 @@ how to compute inline — constants plus length-slot loads, a handle-guarded
 host fallback. That emission (`wasm_generator`, walrus IR) is the whole
 remaining work, sized at one focused session, gated by this harness and
 the 1,472 crosschecks that caught every unsound shortcut tonight.
+
+## Seventeenth round: the emitted fix is wall-neutral — the count was a decoy
+
+Inline tuple sizing emitted in codegen (the response-arm pattern: fixed
+overhead constant plus per-field recursion over locals, host fallback on a
+set shape handle) — suite-green on all 1,472 tests and state-root-identical
+across the 4,149-block replay — moves user CPU not at all, exactly like
+the three host-side variants before it. Four implementations of
+`runtime_value_size`, from full deserialization to no host call, are
+CPU-indistinguishable: the 3.2 M calls are individually cheap, and the
+59 s of measured host time concentrates in the *low-count* calls that
+touch the database and serialize values. The distribution by count was a
+decoy.
+
+Reverted with its siblings. The next session's first datum is per-name
+host *timing* (the count instrumentation with an `Instant` pair), and the
+likely target moves to `get_variable`/`map_get`/`map_set` bodies — the
+MARF trip, the key-string construction, and `write_to_wasm` per read.
