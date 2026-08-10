@@ -1,14 +1,132 @@
-use std::sync::{Arc, atomic::AtomicI64};
+use std::{
+    fmt::Write as _,
+    sync::{Arc, atomic::AtomicI64},
+};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
-use prometheus_client::{encoding::text::encode, metrics::gauge::Gauge, registry::Registry};
+use prometheus_client::{
+    encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder, text::encode},
+    metrics::{counter::Counter, family::Family, gauge::Gauge},
+    registry::Registry,
+};
 
 use crate::QueueReport;
 
 type IntGauge = Gauge<i64, AtomicI64>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RefusalReason {
+    CompilerGap,
+    RootMismatch,
+    Signature,
+    MissingContext,
+    Other,
+}
+
+impl EncodeLabelValue for RefusalReason {
+    fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
+        encoder.write_str(match self {
+            Self::CompilerGap => "compiler_gap",
+            Self::RootMismatch => "root_mismatch",
+            Self::Signature => "signature",
+            Self::MissingContext => "missing_context",
+            Self::Other => "other",
+        })
+    }
+}
+
+impl RefusalReason {
+    fn classify(message: &str) -> Self {
+        let message = message.to_ascii_lowercase();
+        if message.contains("compil")
+            || message.contains("wasm")
+            || message.contains("module that will not load")
+            || message.contains("contract analysis failed")
+        {
+            Self::CompilerGap
+        } else if message.contains("root")
+            && (message.contains("mismatch")
+                || message.contains("does not match")
+                || message.contains("disagree"))
+        {
+            Self::RootMismatch
+        } else if message.contains("signature")
+            || message.contains("signer weight")
+            || message.contains("vrf")
+            || message.contains("leader key")
+        {
+            Self::Signature
+        } else if message.contains("missing")
+            || message.contains("absent")
+            || message.contains("unknown parent")
+            || message.contains("has not executed")
+            || message.contains("no snapshot")
+            || message.contains("cannot check")
+            || message.contains("unavailable")
+            || message.contains("no signer set")
+            || message.contains("does not hold")
+            || message.contains("runs no chain")
+        {
+            Self::MissingContext
+        } else {
+            Self::Other
+        }
+    }
+
+    fn consensus(message: &str) -> Option<Self> {
+        match Self::classify(message) {
+            Self::Other => None,
+            reason => Some(reason),
+        }
+    }
+}
+
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+struct RefusalLabels {
+    reason: RefusalReason,
+}
+
+struct RefusalCounters {
+    compiler_gap: Counter,
+    root_mismatch: Counter,
+    signature: Counter,
+    missing_context: Counter,
+    other: Counter,
+}
+
+impl RefusalCounters {
+    fn register(registry: &mut Registry) -> Self {
+        let family = Family::<RefusalLabels, Counter>::default();
+        let counter = |reason| family.get_or_create(&RefusalLabels { reason }).clone();
+        let counters = Self {
+            compiler_gap: counter(RefusalReason::CompilerGap),
+            root_mismatch: counter(RefusalReason::RootMismatch),
+            signature: counter(RefusalReason::Signature),
+            missing_context: counter(RefusalReason::MissingContext),
+            other: counter(RefusalReason::Other),
+        };
+        registry.register(
+            "block_refusals",
+            "Blocks refused by this node, classified at the refusal boundary.",
+            family,
+        );
+        counters
+    }
+
+    fn record(&self, reason: RefusalReason) {
+        match reason {
+            RefusalReason::CompilerGap => self.compiler_gap.inc(),
+            RefusalReason::RootMismatch => self.root_mismatch.inc(),
+            RefusalReason::Signature => self.signature.inc(),
+            RefusalReason::MissingContext => self.missing_context.inc(),
+            RefusalReason::Other => self.other.inc(),
+        };
+    }
+}
+
 struct Inner {
     registry: Registry,
+    block_refusals: RefusalCounters,
     executed_stacks_height: IntGauge,
     followed_stacks_height: IntGauge,
     selected_stacks_height: IntGauge,
@@ -42,6 +160,7 @@ impl std::fmt::Debug for NodeMetrics {
 impl Default for NodeMetrics {
     fn default() -> Self {
         let mut registry = Registry::with_prefix("nano");
+        let block_refusals = RefusalCounters::register(&mut registry);
         let executed_stacks_height = gauge(
             &mut registry,
             "executed_stacks_height",
@@ -120,6 +239,7 @@ impl Default for NodeMetrics {
         );
         Self(Arc::new(Inner {
             registry,
+            block_refusals,
             executed_stacks_height,
             followed_stacks_height,
             selected_stacks_height,
@@ -141,6 +261,20 @@ impl Default for NodeMetrics {
 }
 
 impl NodeMetrics {
+    /// Record a block rejected at an explicit validation boundary.
+    pub fn record_block_refusal(&self, message: &str) {
+        self.0
+            .block_refusals
+            .record(RefusalReason::classify(message));
+    }
+
+    /// Record a catch-up failure only when it names a consensus refusal.
+    pub fn record_consensus_refusal(&self, message: &str) {
+        if let Some(reason) = RefusalReason::consensus(message) {
+            self.0.block_refusals.record(reason);
+        }
+    }
+
     pub(crate) fn publish_executed(&self, stacks_height: u64, burn_height: u64, now: u64) {
         self.0.executed_stacks_height.set(as_i64(stacks_height));
         self.0.burn_height.set(as_i64(burn_height));
@@ -238,13 +372,20 @@ mod tests {
     };
     use tower::ServiceExt as _;
 
-    use super::router;
+    use super::{RefusalReason, router};
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 
     #[tokio::test]
     async fn metrics_are_well_formed_and_name_the_three_chain_heights() {
         let state = RpcState::new(Network::MAINNET);
+        let metrics = state.metrics();
+        metrics.record_block_refusal("contract compilation failed");
+        metrics.record_block_refusal("state root mismatch");
+        metrics.record_block_refusal("signer signature is invalid");
+        metrics.record_block_refusal("the reward set is absent");
+        metrics.record_block_refusal("proposal names the wrong chain");
+        metrics.record_consensus_refusal("the peer timed out");
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -280,7 +421,7 @@ mod tests {
             })
             .await;
 
-        let response = router(state.metrics())
+        let response = router(metrics)
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -301,9 +442,28 @@ mod tests {
             "nano_burn_height 3",
             "nano_serving_peers 3",
             "nano_staged_blocks 7",
+            "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
+            "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
+            "nano_block_refusals_total{reason=\"signature\"} 1",
+            "nano_block_refusals_total{reason=\"missing_context\"} 1",
+            "nano_block_refusals_total{reason=\"other\"} 1",
             "# EOF",
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
         }
+    }
+
+    #[test]
+    fn block_refusals_are_classified_into_bounded_reasons() {
+        for (message, expected) in [
+            ("Wasm module will not load", RefusalReason::CompilerGap),
+            ("state root does not match", RefusalReason::RootMismatch),
+            ("signer weight is too low", RefusalReason::Signature),
+            ("unknown parent block", RefusalReason::MissingContext),
+            ("proposal names another chain", RefusalReason::Other),
+        ] {
+            assert_eq!(RefusalReason::classify(message), expected, "{message}");
+        }
+        assert_eq!(RefusalReason::consensus("peer timed out"), None);
     }
 }

@@ -529,6 +529,7 @@ struct RoundInputs<'a> {
     /// What the peers said about the cycle being walked, tenure by tenure. Empty
     /// when the transport is off, which leaves the round the backward descent it was.
     claims: Vec<nano_p2p::TenureClaim>,
+    metrics: Option<nano_rpc::NodeMetrics>,
 }
 
 /// Run one catch-up round, and publish what it makes this node able to say.
@@ -544,6 +545,7 @@ async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> Ex
         budget,
         advertised,
         claims,
+        metrics,
     } = inputs;
     let mut executor = executor.lock().await;
     let mut peer_failed = false;
@@ -559,6 +561,9 @@ async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> Ex
         // twenty-two, and left its accounting behind its own chain.
         Err(error) => {
             eprintln!("executing the peer's chain failed: {error}");
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.record_consensus_refusal(&error.to_string());
+            }
             // And where that leaves this node, in the sentence every other batch
             // is reported in. The error names the peer's chain; this names ours.
             println!("{}", failed_round_report(from, executor.tip()));
@@ -621,6 +626,7 @@ struct AdmittedInputs<'a> {
     mempool: &'a Arc<Mutex<nano_mempool::Mempool>>,
     relay: &'a nano_p2p::Relay,
     staging: &'a Staging,
+    metrics: Option<nano_rpc::NodeMetrics>,
 }
 
 /// Take everything that arrived other than by following, before the round that
@@ -638,11 +644,12 @@ async fn take_admitted(inputs: AdmittedInputs<'_>) {
         mempool,
         relay,
         staging,
+        metrics,
     } = inputs;
     stage_admitted_blocks(offered, staging, relay);
     relay_admitted_transactions(submitted, relay);
     if let Some(executor) = executor {
-        check_relayed(executor, mempool, relay, staging).await;
+        check_relayed(executor, mempool, relay, staging, metrics.as_ref()).await;
     }
 }
 
@@ -801,12 +808,7 @@ async fn follow(follower: Follower) -> Role {
         Ok(staging) => staging,
         Err(role) => return role,
     };
-    let budget = CatchUpBudget {
-        // Bounded so a round ends and execution gets its turn: an unbounded descent
-        // would spend every round fetching and never execute what it already holds.
-        fetch: ROUND_FETCH,
-        execute: config.node.max_sync_blocks,
-    };
+    let budget = follow_budget(&config);
     prepare_to_follow(executor.as_ref(), &peer, &pox, source).await?;
     let mut rounds = Rounds::new(peer);
     loop {
@@ -828,6 +830,7 @@ async fn follow(follower: Follower) -> Role {
             mempool: &mempool,
             relay: &relay,
             staging: &staging,
+            metrics: state.as_ref().map(RpcState::metrics),
         })
         .await;
         // Following the peer's current tenure is pointless while this node is
@@ -857,6 +860,7 @@ async fn follow(follower: Follower) -> Role {
                     .as_ref()
                     .map(Discovered::claims)
                     .unwrap_or_default(),
+                metrics: state.as_ref().map(RpcState::metrics),
             };
             let round = execute_round(executor, inputs).await;
             rounds.executed_height = round.executed_height;
@@ -883,6 +887,15 @@ async fn follow(follower: Follower) -> Role {
             interval,
         )
         .await;
+    }
+}
+
+const fn follow_budget(config: &Config) -> CatchUpBudget {
+    // Bounded so a round ends and execution gets its turn: an unbounded descent
+    // would spend every round fetching and never execute what it already holds.
+    CatchUpBudget {
+        fetch: ROUND_FETCH,
+        execute: config.node.max_sync_blocks,
     }
 }
 
@@ -978,6 +991,7 @@ async fn check_relayed(
     mempool: &Arc<Mutex<nano_mempool::Mempool>>,
     relay: &nano_p2p::Relay,
     staging: &Staging,
+    metrics: Option<&nano_rpc::NodeMetrics>,
 ) {
     let offers = relay.take_offered();
     if offers.is_empty() {
@@ -1013,6 +1027,9 @@ async fn check_relayed(
                 }
                 Err(error) => {
                     rejected += 1;
+                    if let Some(metrics) = metrics {
+                        metrics.record_block_refusal(&error);
+                    }
                     eprintln!(
                         "a pushed block {} at height {} did not authenticate: {error}",
                         block.block_id(),

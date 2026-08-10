@@ -1617,10 +1617,10 @@ async fn upload_block(
 ) -> Result<axum::Json<BlockUploadWire>, RpcError> {
     let block = NakamotoBlock::decode(&body)
         .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
-    state
-        .authenticate(&block)
-        .await
-        .map_err(|error| RpcError::BadRequest(format!("block refused: {error}")))?;
+    if let Err(error) = state.authenticate(&block).await {
+        state.metrics.record_block_refusal(&error);
+        return Err(RpcError::BadRequest(format!("block refused: {error}")));
+    }
     let stacks_block_id = format!("0x{}", block.block_id());
     // A node that already holds the block does not re-accept it, and does not
     // offer it again either: the executor would only walk past it.
@@ -1697,9 +1697,13 @@ async fn block_proposal(
                 let elapsed = started.elapsed().map_or(0, |elapsed| {
                     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
                 });
+                let outcome = resolve(answer, size, elapsed);
+                if let ProposalOutcome::Rejected { reason, .. } = &outcome {
+                    announced.metrics.record_block_refusal(reason);
+                }
                 announced.dispatch(
                     EventKind::ProposalResponse,
-                    &proposal_response_payload(digest, &resolve(answer, size, elapsed)),
+                    &proposal_response_payload(digest, &outcome),
                 );
             });
         }
@@ -1718,7 +1722,10 @@ async fn judge_proposal(
     proposal: &BlockProposalWire,
     block: &NakamotoBlock,
 ) -> Verdict {
-    let rejected = |reason: String, code| Verdict::Now(ProposalOutcome::Rejected { reason, code });
+    let rejected = |reason: String, code| {
+        state.metrics.record_block_refusal(&reason);
+        Verdict::Now(ProposalOutcome::Rejected { reason, code })
+    };
     // The chain identifier is in the request rather than in the block, and a
     // proposal for another chain is not a proposal at all.
     if let Some(chain_id) = proposal.chain_id
