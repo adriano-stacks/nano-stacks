@@ -2553,6 +2553,18 @@ where
         &mut self.chainstate
     }
 
+    /// Cache residency sampled while the executor is already exclusively owned.
+    #[must_use]
+    pub fn cache_usage(&mut self) -> nano_rpc::ExecutionCacheReport {
+        let usage = self.chainstate.vm_mut().cache_usage();
+        nano_rpc::ExecutionCacheReport {
+            marf_node_entries: usage.marf_node_entries,
+            marf_node_bytes: usage.marf_node_bytes,
+            wasm_module_entries: usage.wasm_module_entries,
+            wasm_module_bytes: usage.wasm_module_bytes,
+        }
+    }
+
     /// The burn view this node derived for itself, for weighing a peer's tip.
     ///
     /// `None` when this node derives no sortitions — then a fork choice has

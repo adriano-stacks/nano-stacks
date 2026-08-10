@@ -46,7 +46,7 @@ pub use events::{
     new_burn_block_payload, proposal_response_payload, stacker_set_payload,
     stackerdb_chunks_payload,
 };
-pub use metrics::{NodeMetrics, serve as serve_metrics};
+pub use metrics::{ExecutionCacheReport, NodeMetrics, serve as serve_metrics};
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
 const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;

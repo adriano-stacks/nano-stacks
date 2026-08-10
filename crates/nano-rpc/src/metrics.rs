@@ -14,6 +14,15 @@ use crate::QueueReport;
 
 type IntGauge = Gauge<i64, AtomicI64>;
 
+/// Execution-cache residency sampled while the executor is already owned.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionCacheReport {
+    pub marf_node_entries: usize,
+    pub marf_node_bytes: usize,
+    pub wasm_module_entries: usize,
+    pub wasm_module_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RefusalReason {
     CompilerGap,
@@ -134,6 +143,10 @@ struct SyncCounters {
 struct ResourceGauges {
     tenure_history_window: IntGauge,
     mempool_transactions: IntGauge,
+    marf_node_cache_entries: IntGauge,
+    marf_node_cache_bytes: IntGauge,
+    wasm_module_cache_entries: IntGauge,
+    wasm_module_cache_bytes: IntGauge,
 }
 
 struct ProgressGauges {
@@ -188,6 +201,26 @@ impl ResourceGauges {
                 registry,
                 "mempool_transactions",
                 "Transactions currently retained in the local mempool.",
+            ),
+            marf_node_cache_entries: gauge(
+                registry,
+                "marf_node_cache_entries",
+                "Decoded MARF trie nodes resident in memory.",
+            ),
+            marf_node_cache_bytes: gauge(
+                registry,
+                "marf_node_cache_bytes",
+                "Estimated bytes held by decoded MARF trie nodes.",
+            ),
+            wasm_module_cache_entries: gauge(
+                registry,
+                "wasm_module_cache_entries",
+                "Compiled Clarity contracts resident in memory.",
+            ),
+            wasm_module_cache_bytes: gauge(
+                registry,
+                "wasm_module_cache_bytes",
+                "Estimated bytes held by compiled Clarity contracts.",
             ),
         }
     }
@@ -369,6 +402,23 @@ impl NodeMetrics {
             .set(as_i64(transactions));
     }
 
+    /// Publish execution-cache residency observed while the VM was already owned.
+    pub fn publish_execution_caches(&self, usage: ExecutionCacheReport) {
+        let resources = &self.0.resources;
+        resources
+            .marf_node_cache_entries
+            .set(as_i64(usage.marf_node_entries));
+        resources
+            .marf_node_cache_bytes
+            .set(as_i64(usage.marf_node_bytes));
+        resources
+            .wasm_module_cache_entries
+            .set(as_i64(usage.wasm_module_entries));
+        resources
+            .wasm_module_cache_bytes
+            .set(as_i64(usage.wasm_module_bytes));
+    }
+
     pub(crate) fn publish_tenure_history(&self, tenures: usize) {
         self.0.resources.tenure_history_window.set(as_i64(tenures));
     }
@@ -489,7 +539,7 @@ mod tests {
     };
     use tower::ServiceExt as _;
 
-    use super::{RefusalReason, router};
+    use super::{ExecutionCacheReport, RefusalReason, router};
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 
@@ -507,6 +557,12 @@ mod tests {
         metrics.record_sync_round_unanswered();
         metrics.record_pushed_blocks(3, 2);
         metrics.publish_mempool_size(11);
+        metrics.publish_execution_caches(ExecutionCacheReport {
+            marf_node_entries: 13,
+            marf_node_bytes: 17,
+            wasm_module_entries: 19,
+            wasm_module_bytes: 23,
+        });
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -574,6 +630,10 @@ mod tests {
             "nano_pushed_blocks_refused_total 2",
             "nano_mempool_transactions 11",
             "nano_tenure_history_window 0",
+            "nano_marf_node_cache_entries 13",
+            "nano_marf_node_cache_bytes 17",
+            "nano_wasm_module_cache_entries 19",
+            "nano_wasm_module_cache_bytes 23",
             "# EOF",
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");

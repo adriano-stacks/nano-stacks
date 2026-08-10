@@ -382,13 +382,15 @@ async fn keep_executed_blocks(
 /// nothing at all.
 async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedExecutor>) {
     if let (Some(state), Some(executor)) = (state, executor) {
-        let (sealed, sortitions) = {
-            let executor = executor.lock().await;
+        let (sealed, sortitions, cache_usage) = {
+            let mut executor = executor.lock().await;
             (
                 sealed_tip(executor.tip(), executor.bitcoin_height()),
                 executor.derived_sortitions(),
+                executor.cache_usage(),
             )
         };
+        state.metrics().publish_execution_caches(cache_usage);
         state.publish_executed(sealed, sortitions).await;
     }
 }
@@ -716,13 +718,14 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let sortitions = {
+    let (sortitions, cache_usage) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
         executor.follow_burnchain(pox);
-        executor.derived_sortitions()
+        (executor.derived_sortitions(), executor.cache_usage())
     };
+    state.metrics().publish_execution_caches(cache_usage);
     state.publish_executed(sealed, sortitions).await;
     publish_reward_cycle(RewardCycleInputs {
         state,
