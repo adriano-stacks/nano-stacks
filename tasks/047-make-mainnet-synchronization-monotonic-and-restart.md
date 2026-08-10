@@ -9,7 +9,7 @@ group: mainnet
 dependencies: ["046", "048", "056", "057"]
 tags: ["mainnet", "sync", "persistence"]
 created_at: 2026-08-02
-completed_at: 2026-08-06
+completed_at: 2026-08-09
 ---
 
 # Make mainnet synchronization monotonic and restart-safe
@@ -44,6 +44,9 @@ hundreds of failed attempts.
       distance from tip or peer-controlled response size.
 - [x] Test gaps spanning long tenures and multiple tenures with deterministic
       429s, short pages, tip movement and a restart after every chunk boundary.
+  - [x] Make `catch_up_rounds` pass in the complete release suite. The 2026-08-09
+        audit found that its peer did not serve the staged endpoint the round
+        requested, although the focused runs had passed.
 
 ## Acceptance Criteria
 

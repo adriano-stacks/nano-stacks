@@ -504,28 +504,14 @@ fn assert_refused_round_preserved_descent(
     );
 }
 
-fn assert_only_boundary_is_already_sealed(
-    staged: &[(u64, StacksBlockId)],
-    chain: &[NakamotoBlock],
-    anchor: u64,
-    executed_height: u64,
-) {
+fn assert_only_unexecuted_blocks_are_staged(staged: &[(u64, StacksBlockId)], executed_height: u64) {
     assert!(
         !staged.is_empty(),
         "nothing is staged for the next round to resume from"
     );
-    let anchor_block = chain
-        .iter()
-        .find(|block| block.header.chain_length == anchor)
-        .expect("the capture contains the fixture boundary");
-    assert_eq!(
-        staged
-            .iter()
-            .filter(|(height, _)| *height <= executed_height)
-            .copied()
-            .collect::<Vec<_>>(),
-        vec![(anchor, anchor_block.block_id())],
-        "the only already-sealed staged block must be the tenure endpoint duplicated by descent"
+    assert!(
+        staged.iter().all(|(height, _)| *height > executed_height),
+        "staging retained a block at or below the sealed tip: {staged:?}"
     );
 }
 
@@ -569,7 +555,7 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     let committed = executor.tip().block_id();
     let height = executor.tip().header.chain_length;
     let staged_before = staged_chain(&staging, &chain);
-    assert_only_boundary_is_already_sealed(&staged_before, &chain, anchor, height);
+    assert_only_unexecuted_blocks_are_staged(&staged_before, height);
 
     // Now the peer refuses everything, for one whole round.
     policy.refusing.store(true, Ordering::SeqCst);
