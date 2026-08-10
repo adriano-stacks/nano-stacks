@@ -42,31 +42,28 @@ CREATE TABLE IF NOT EXISTS marf_node_staging (
 );
 ";
 
-/// How many trie nodes and block records stay resident per cache generation.
+/// How many resident bytes of trie nodes stay cached per generation.
 ///
-/// Measured rather than chosen. A mainnet replay reads about 225,000 database
-/// pages *per block* — 900 MB of `rchar` against a 30 GB `marf.sqlite` and a 2 GB
-/// page cache — because a MARF lookup walks back-pointers into ancestor states and
-/// a checkpointed node has 8.6 million ancestors. At 20,000 per generation the
-/// cache held under a fifth of one block's working set and thrashed on every
-/// block, so the same nodes were decoded again for each of them.
-///
-/// Nodes are small — a leaf or a Node4 is a couple of hundred bytes, and only a
-/// Node256 approaches 1.5 KB — so this is a few hundred megabytes per generation
-/// for a structure the whole replay reads out of.
-///
-/// Raised from 250,000 after a second measurement at mainnet height 8.7 million,
-/// where 250,000 was *one* block's working set and consecutive blocks therefore
-/// evicted each other's ancestry: 39 MB/s of `rchar` for 2.2 transactions a block,
-/// with the process at 70% of one core and only 11 MB/s of it reaching the disk.
-/// The work is decoding nodes, not fetching them, so the cache is the lever.
-/// Measured, both directions. At 250,000 a mainnet block near height 8.7 million
-/// evicted the previous block's ancestry and execution cost 1.8 s a block; at
-/// 1,000,000 it cost 0.78 s, with *less* resident memory, because a cache hit
-/// spares a page-cache read. At 3,000,000 it got worse again — 1.16 s marginal —
-/// so this is a measured optimum and not a ceiling somebody stopped short of.
-const NODE_CACHE: usize = 1_000_000;
-const BLOCK_CACHE: usize = 65_536;
+/// A byte bound rather than an entry count, because the entries are nothing
+/// alike. Near mainnet height 8.7 million, 42% of the nodes recent blocks read
+/// are wide internal nodes that decode to ~14 KB — 56 bytes per present child —
+/// while the rest are leaves under 200 bytes. The previous bound of 1,000,000
+/// *entries* per generation was tuned by block-execution time (0.78 s a block,
+/// against 1.8 s at 250,000, because a MARF lookup walks back-pointers into
+/// ancestor states and consecutive blocks share that ancestry), but its own
+/// sizing note assumed nodes were small: at the tip's real mix it held ~12 GB
+/// across the two generations, and the kernel OOM-killed a follower at 18.3 GB
+/// after fifteen hours. The working set the cache exists for is precisely the
+/// wide ancestor nodes, so the fix is to bound what they cost, not to stop
+/// caching them.
+const NODE_CACHE_BYTES: usize = 1_500_000_000;
+/// Node hashes are 32 bytes each; this keeps the same ~1M entries per
+/// generation the entry-count bound did.
+const NODE_HASH_CACHE_BYTES: usize = 100_000_000;
+/// Block records and id→hash entries are ~100 bytes; these keep the previous
+/// 65,536 entries.
+const BLOCK_CACHE_BYTES: usize = 12_000_000;
+const HASH_CACHE_BYTES: usize = 8_000_000;
 
 const LEAF_RECORD: u8 = 0;
 const INTERNAL_RECORD: u8 = 1;
@@ -86,20 +83,62 @@ pub struct BlockRecord {
     pub node: Option<u32>,
 }
 
+/// What a cached value costs to keep resident, beyond the table slot around it.
+trait Weight {
+    fn weight(&self) -> usize;
+}
+
+impl Weight for Arc<TrieNode> {
+    fn weight(&self) -> usize {
+        size_of::<TrieNode>()
+            + match self.as_ref() {
+                TrieNode::Leaf { path, .. } => path.capacity(),
+                TrieNode::Internal { path, children } => {
+                    path.capacity() + children.capacity() * size_of::<TrieChild>()
+                }
+            }
+    }
+}
+
+impl Weight for TrieHash {
+    fn weight(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+impl Weight for BlockRecord {
+    fn weight(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+impl Weight for MarfBlockId {
+    fn weight(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+/// The key and hash-table slot around each entry, charged so a generation of
+/// tiny values still has a bounded table.
+const ENTRY_OVERHEAD: usize = 64;
+
 /// A two-generation cache: the older generation is dropped wholesale once the
-/// newer one fills, which bounds residency without tracking access order.
+/// newer one fills its byte budget, which bounds residency without tracking
+/// access order.
 #[derive(Debug)]
 struct Cache<K, V> {
     hot: HashMap<K, V>,
     cold: HashMap<K, V>,
+    hot_bytes: usize,
     capacity: usize,
 }
 
-impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
+impl<K: Eq + Hash, V: Clone + Weight> Cache<K, V> {
     fn new(capacity: usize) -> Self {
         Self {
             hot: HashMap::new(),
             cold: HashMap::new(),
+            hot_bytes: 0,
             capacity,
         }
     }
@@ -108,20 +147,28 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
         if let Some(value) = self.hot.get(key) {
             return Some(value.clone());
         }
-        let value = self.cold.get(key)?.clone();
-        self.insert(key.clone(), value.clone());
+        // Moved, not copied: leaving the entry in the cold generation as well
+        // held the whole hot working set resident twice.
+        let (key, value) = self.cold.remove_entry(key)?;
+        self.insert(key, value.clone());
         Some(value)
     }
 
     fn insert(&mut self, key: K, value: V) {
-        if self.hot.len() >= self.capacity {
+        if self.hot_bytes >= self.capacity {
             self.cold = std::mem::take(&mut self.hot);
+            self.hot_bytes = 0;
         }
-        self.hot.insert(key, value);
+        let weight = ENTRY_OVERHEAD + value.weight();
+        if self.hot.insert(key, value).is_none() {
+            self.hot_bytes += weight;
+        }
     }
 
     fn remove(&mut self, key: &K) {
-        self.hot.remove(key);
+        if let Some(value) = self.hot.remove(key) {
+            self.hot_bytes -= ENTRY_OVERHEAD + value.weight();
+        }
         self.cold.remove(key);
     }
 }
@@ -219,10 +266,10 @@ impl TrieStorage {
     fn with_caches(connection: Connection) -> Self {
         Self {
             connection,
-            nodes: RefCell::new(Cache::new(NODE_CACHE)),
-            node_hashes: RefCell::new(Cache::new(NODE_CACHE)),
-            blocks: RefCell::new(Cache::new(BLOCK_CACHE)),
-            hashes: RefCell::new(Cache::new(BLOCK_CACHE)),
+            nodes: RefCell::new(Cache::new(NODE_CACHE_BYTES)),
+            node_hashes: RefCell::new(Cache::new(NODE_HASH_CACHE_BYTES)),
+            blocks: RefCell::new(Cache::new(BLOCK_CACHE_BYTES)),
+            hashes: RefCell::new(Cache::new(HASH_CACHE_BYTES)),
             staging: std::cell::Cell::new(false),
         }
     }
@@ -482,13 +529,13 @@ impl TrieStorage {
     /// Drop everything cached, for when a rolled-back write leaves the cache
     /// addressing rows the database no longer holds.
     pub(crate) fn forget(&self) {
-        *self.nodes.borrow_mut() = Cache::new(NODE_CACHE);
+        *self.nodes.borrow_mut() = Cache::new(NODE_CACHE_BYTES);
         // Not optional: a rolled-back write leaves this addressing rows the
         // database no longer holds, and a stale *hash* is worse than a stale node
         // because it goes straight into a parent's preimage and moves a root.
-        *self.node_hashes.borrow_mut() = Cache::new(NODE_CACHE);
-        *self.blocks.borrow_mut() = Cache::new(BLOCK_CACHE);
-        *self.hashes.borrow_mut() = Cache::new(BLOCK_CACHE);
+        *self.node_hashes.borrow_mut() = Cache::new(NODE_HASH_CACHE_BYTES);
+        *self.blocks.borrow_mut() = Cache::new(BLOCK_CACHE_BYTES);
+        *self.hashes.borrow_mut() = Cache::new(HASH_CACHE_BYTES);
     }
 
     fn decode(&self, block: u32, bytes: &[u8]) -> Result<TrieNode, MarfError> {

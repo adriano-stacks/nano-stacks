@@ -162,11 +162,23 @@ pub struct FollowedTenure {
     pub blocks: Vec<NakamotoBlock>,
 }
 
+/// How many followed tenures stay in memory.
+///
+/// The follower itself only ever extends the last one; the rest exist for the
+/// RPC's consumers. The deepest of those is the signer fork check, which walks
+/// ten tenures (`FORK_INFO_DEPTH` in `nano-rpc`), and `.miners` slot
+/// attribution, which wants eight recent sortition winners. A mainnet tenure
+/// runs to hundreds of blocks, so an unbounded history was a follower-lifetime
+/// memory leak — every block of every tenure since startup, deep-cloned into
+/// each published view.
+const TENURES_KEPT: usize = 16;
+
 /// Stateful HTTP follower for the peer's current tenure.
 #[derive(Clone, Debug)]
 pub struct TenureFollower {
     client: SyncClient,
     latest: Option<TenureInfo>,
+    /// The most recent [`TENURES_KEPT`] validated tenures, oldest first.
     history: Vec<FollowedTenure>,
 }
 
@@ -1712,6 +1724,12 @@ impl Node {
         Ok(followed)
     }
 
+    /// The validated tenures in hand, oldest first, without copying them.
+    #[must_use]
+    pub fn tenures(&self) -> &[FollowedTenure] {
+        self.follower.history()
+    }
+
     /// Return the latest complete local view after at least one successful poll.
     #[must_use]
     pub fn view(&self) -> Option<NodeView> {
@@ -2058,6 +2076,9 @@ impl TenureFollower {
         }
         self.latest = Some(followed.info.clone());
         self.history.push(followed);
+        if self.history.len() > TENURES_KEPT {
+            self.history.remove(0);
+        }
     }
 }
 

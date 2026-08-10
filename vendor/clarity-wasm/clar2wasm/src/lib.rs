@@ -7,6 +7,7 @@ use clarity::vm::errors::VmExecutionError;
 use clarity::vm::resource_limiter::ResourceLimiter;
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::ClarityVersion;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 pub use walrus::Module;
@@ -127,6 +128,24 @@ pub trait NativeModuleStore: std::fmt::Debug + Send + Sync {
     fn store(&self, wasm: &[u8], module: &wasmtime::Module);
 }
 
+/// How many estimated bytes of compiled contracts stay resident.
+///
+/// Without a bound this held every contract the chain ever called, several
+/// megabytes each, for the life of the process — a mainnet follower leaked its
+/// way to an OOM kill through it. Eviction costs a recompilation on the next
+/// call, never a wrong answer, so the budget only has to keep the hot set.
+const MODULE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// What keeping a compiled contract costs, estimated.
+///
+/// The wasm bytes are measurable. The analysis — the whole AST plus a boxed
+/// type per node — and the native module are not, and both scale with the
+/// wasm, so they are charged as a multiple of it. Deliberately an
+/// overestimate.
+fn entry_weight(module: &CompiledContract) -> usize {
+    module.wasm.len() * 6 + 65_536
+}
+
 /// The compiled contracts one execution context has to hand.
 ///
 /// Holds the `Engine` as well, because a `Module` may only be instantiated in a
@@ -136,7 +155,12 @@ pub trait NativeModuleStore: std::fmt::Debug + Send + Sync {
 pub struct ModuleCache {
     engine: wasmtime::Engine,
     persistent: Option<Arc<dyn NativeModuleStore>>,
-    contracts: HashMap<QualifiedContractIdentifier, Arc<CompiledContract>>,
+    contracts: HashMap<QualifiedContractIdentifier, (Arc<CompiledContract>, Cell<u64>)>,
+    /// A logical clock stamping each hit, so eviction drops what was touched
+    /// least recently. A `Cell` because a lookup is a read everywhere else.
+    clock: Cell<u64>,
+    /// The estimated bytes of everything held, kept in step with `contracts`.
+    bytes: usize,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -159,11 +183,38 @@ impl ModuleCache {
     }
 
     pub fn insert(&mut self, contract: QualifiedContractIdentifier, module: CompiledContract) {
-        self.contracts.insert(contract, Arc::new(module));
+        self.bytes += entry_weight(&module);
+        let stamped = (Arc::new(module), Cell::new(self.tick()));
+        if let Some((prior, _)) = self.contracts.insert(contract, stamped) {
+            self.bytes -= entry_weight(&prior);
+        }
+        // The entry just inserted carries the newest stamp, so with more than
+        // one entry it is never the minimum and survives its own insertion.
+        while self.bytes > MODULE_CACHE_BYTES && self.contracts.len() > 1 {
+            let Some(oldest) = self
+                .contracts
+                .iter()
+                .min_by_key(|(_, (_, used))| used.get())
+                .map(|(contract, _)| contract.clone())
+            else {
+                break;
+            };
+            if let Some((evicted, _)) = self.contracts.remove(&oldest) {
+                self.bytes -= entry_weight(&evicted);
+            }
+        }
     }
 
     pub fn get(&self, contract: &QualifiedContractIdentifier) -> Option<&Arc<CompiledContract>> {
-        self.contracts.get(contract)
+        let (module, used) = self.contracts.get(contract)?;
+        used.set(self.tick());
+        Some(module)
+    }
+
+    fn tick(&self) -> u64 {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        now
     }
 
     /// The engine every module in this cache belongs to.

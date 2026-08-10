@@ -821,7 +821,7 @@ async fn follow(follower: Follower) -> Role {
                     executor,
                     network,
                     context: bitcoin_context(&config, &pox),
-                    winners: &last_sortition_winners(rounds.node.view().as_ref()),
+                    winners: &last_sortition_winners(rounds.node.tenures()),
                     published: &mut rounds.published,
                     peer: &rounds.peer,
                     registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
@@ -1005,6 +1005,10 @@ async fn admit_relayed(
     let mut executor = executor.lock().await;
     let accounts = ExecutedAccounts::new(&mut *executor);
     let now = now_unix();
+    // A follower has no miner assembling blocks, so this is the only place its
+    // pool ever drops what a tip confirmed or what aged out — without it the
+    // pool was insert-only for the life of the process.
+    mempool.advance(&accounts, now);
     for (from, transaction) in transactions {
         let admission = mempool.submit((*transaction).clone(), &accounts, now);
         if matches!(
@@ -1266,12 +1270,9 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
 /// cannot derive ([[049-derive-sortitions-locally]]), so this is the peer's
 /// answer — and it is used for nothing but naming who may write a `StackerDB`
 /// slot, which is replication rather than consensus.
-fn last_sortition_winners(view: Option<&nano_sync::NodeView>) -> Vec<nano_primitives::Hash160> {
+fn last_sortition_winners(tenures: &[nano_sync::FollowedTenure]) -> Vec<nano_primitives::Hash160> {
     let mut winners = Vec::new();
-    let Some(view) = view else {
-        return winners;
-    };
-    for tenure in view.tenures.iter().rev() {
+    for tenure in tenures.iter().rev() {
         if !tenure.sortition.was_sortition {
             continue;
         }
