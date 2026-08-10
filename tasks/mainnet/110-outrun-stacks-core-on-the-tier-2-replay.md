@@ -260,3 +260,18 @@ full suite battery) for a symmetric benchmark, and host-call machinery
 work inside clarity-wasm for a real win that also speeds every node at
 tip. Neither is an evening's verified change; both inherit this harness
 as their gate.
+
+## Eighth round: the symmetric benchmark hits a real wall
+
+A validate-only replay mode was built to make the two tools do identical
+work (execute, root-check, roll back — stacks-core's semantics). The
+mechanism worked: `Persistence::Discard` leaves storage byte-identical by
+the same abort a failed block takes, carrying the ledger forward in memory.
+It cannot ship yet for one measured reason: validating an old block over a
+state that already holds its future resolves contract metadata through
+`load_contract_non_canonical`, which answers by *any* block hash — a
+contract redeployed later in the range answers with its newer analysis, and
+the block deterministically seals a different root (reproduced at
+8,665,602). A correct validate mode needs canonical-at-height metadata
+resolution first. The experiment is reverted whole; this note is what it
+bought.
