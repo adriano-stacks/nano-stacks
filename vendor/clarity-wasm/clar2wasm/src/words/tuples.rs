@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use clarity::types::StacksEpochId;
-use clarity::vm::types::TypeSignature;
+use clarity::vm::types::{TupleTypeSignature, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::BinaryOp;
 use walrus::ValType;
@@ -33,12 +33,12 @@ impl ComplexWord for TupleCons {
 
         check_argument_count(generator, builder, 1, args_len, ArgumentCountCheck::AtLeast)?;
 
-        let ty = generator
+        let result_ty = generator
             .get_expr_type(expr)
             .ok_or_else(|| GeneratorError::TypeError("tuple expression must be typed".to_string()))?
             .clone();
 
-        let mut tuple_ty = match ty {
+        let mut tuple_ty = match &result_ty {
             TypeSignature::TupleType(ref tuple) => tuple.get_type_map().clone(),
             _ => return Err(GeneratorError::TypeError("expected tuple type".to_string())),
         };
@@ -80,15 +80,18 @@ impl ComplexWord for TupleCons {
                 continue;
             };
 
-            // WORKAROUND: if you have a tuple like `(tuple (foo none))`, the `none` will have the type
-            // NoType, even if it has a defined type in the tuple. This creates issues because the placeholder
-            // does not have the same amount of values in the Wasm code than the correct type.
-            // While we wait for a real fix in the typechecker, here is a workaround to make sure that the type
-            // is correct.
-            generator.set_expr_type(value, value_ty.clone())?;
-
+            let mut source_ty = generator.value_type_before_context(value).ok_or_else(|| {
+                GeneratorError::TypeError("tuple field expression must be typed".to_string())
+            })?;
+            // A bare `none` is analysed as `NoType`, whose one-slot Wasm
+            // placeholder cannot represent the field's contextual layout.
+            if source_ty == TypeSignature::NoType {
+                source_ty = value_ty;
+                generator.set_expr_type(value, source_ty.clone())?;
+            }
             generator.traverse_expr(builder, value)?;
-            locals_map.insert(key, generator.save_to_locals(builder, &value_ty, true));
+            let locals = generator.save_to_locals(builder, &source_ty, true);
+            locals_map.insert(key, (source_ty, locals));
         }
 
         // Charged after the operands, as `dispatch_args` does; see `ok`.
@@ -102,13 +105,30 @@ impl ComplexWord for TupleCons {
         }
 
         // Finally load the locals onto the stack
-        let locals: Vec<_> = locals_map.into_values().flatten().collect();
+        let source_ty = TypeSignature::TupleType(
+            TupleTypeSignature::try_from(
+                locals_map
+                    .iter()
+                    .map(|(name, (ty, _))| ((*name).clone(), ty.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+        );
+        let locals: Vec<_> = locals_map
+            .into_values()
+            .flat_map(|(_, locals)| locals)
+            .collect();
         builder.i32_const(0);
         for local in &locals {
             builder.local_get(*local);
         }
         // The fields are on the stack; the slots they were saved in are dead.
         generator.release_locals(locals);
+
+        if source_ty != result_ty || generator.type_for_serialization(&source_ty) != source_ty {
+            generator.capture_runtime_shape(builder, &source_ty)?;
+            generator.duck_type_preserve(builder, &source_ty, &result_ty, None)?;
+        }
 
         Ok(())
     }
@@ -377,10 +397,10 @@ impl ComplexWord for TupleMerge {
 
 #[cfg(test)]
 mod tests {
-    use clarity::vm::types::TupleData;
+    use clarity::vm::types::{PrincipalData, TupleData};
     use clarity::vm::{ClarityName, Value};
 
-    use crate::tools::{crosscheck, evaluate};
+    use crate::tools::{crosscheck, crosscheck_cost_multi_contract, evaluate};
 
     #[test]
     fn test_get_optional() {
@@ -549,5 +569,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("expecting 2 arguments, got 3"));
+    }
+
+    /// A bound trait keeps its callable value shape when a tuple field is
+    /// contextually widened to `principal`. The pool vault prints this exact
+    /// event shape; losing the callable shape crosses a print-cost bucket.
+    #[test]
+    fn a_trait_inside_a_printed_tuple_keeps_its_value_shape() {
+        let trait_definition = "(define-trait ft ())";
+        let token = "(impl-trait .trait-definition.ft)";
+        let caller = "(use-trait ft .trait-definition.ft)
+                      (define-public (f (amount uint) (recipient principal) (asset <ft>))
+                        (ok (print
+                          { type: \"transfer-pool-vault\",
+                            payload: { amount: amount,
+                                       recipient: recipient,
+                                       asset: asset } })))";
+        let principal = |name| {
+            Value::Principal(
+                PrincipalData::parse_qualified_contract_principal(&format!(
+                    "S1G2081040G2081040G2081040G208105NK8PE5.{name}"
+                ))
+                .expect("contract principal"),
+            )
+        };
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("token", token),
+                ("caller", caller),
+            ],
+            "f",
+            &[
+                Value::UInt(1),
+                Value::Principal(PrincipalData::Standard(
+                    clarity::vm::types::StandardPrincipalData::transient(),
+                )),
+                principal("token"),
+            ],
+        );
     }
 }

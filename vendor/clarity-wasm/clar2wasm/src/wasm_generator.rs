@@ -1835,6 +1835,17 @@ impl WasmGenerator {
         Ok((offset as i32, length as i32))
     }
 
+    fn serialized_runtime_type(
+        &mut self,
+        ty: &TypeSignature,
+    ) -> Result<(i32, i32), GeneratorError> {
+        let serialized =
+            serde_json::to_vec(ty).map_err(|error| GeneratorError::TypeError(error.to_string()))?;
+        let (offset, length) =
+            self.add_clarity_string_literal(&CharType::ASCII(ASCIIData { data: serialized }))?;
+        Ok((offset as i32, length as i32))
+    }
+
     /// Materialize a composite stack value in the execution context's
     /// runtime-shape arena, then put the same projected value back on stack
     /// with its new handle.
@@ -1856,7 +1867,7 @@ impl WasmGenerator {
         let handle = *locals.first().ok_or_else(|| {
             GeneratorError::InternalError("composite value is missing its shape handle".to_owned())
         })?;
-        let (type_offset, type_length) = self.serialized_type(ty)?;
+        let (type_offset, type_length) = self.serialized_runtime_type(ty)?;
         let mut capture = builder.dangling_instr_seq(None);
         for local in &locals {
             capture.local_get(*local);
@@ -3619,6 +3630,32 @@ impl WasmGenerator {
         }
 
         Ok(())
+    }
+
+    /// Return the type a value has before contextual widening. Constants,
+    /// bindings, and user-function results retain their source type here.
+    pub(crate) fn value_type_before_context(
+        &self,
+        expr: &SymbolicExpression,
+    ) -> Option<TypeSignature> {
+        match &expr.expr {
+            SymbolicExpressionType::Atom(name) => self
+                .constants
+                .get(name.as_str())
+                .cloned()
+                .or_else(|| self.bindings.get_locals_and_type(name).map(|(_, ty, _)| ty))
+                .or_else(|| self.get_expr_type(expr).cloned()),
+            SymbolicExpressionType::List(items) => items
+                .first()
+                .and_then(SymbolicExpression::match_atom)
+                .and_then(|name| self.get_function_type(name.as_str()))
+                .and_then(|function| match function {
+                    FunctionType::Fixed(function) => Some(function.returns.clone()),
+                    _ => None,
+                })
+                .or_else(|| self.get_expr_type(expr).cloned()),
+            _ => self.get_expr_type(expr).cloned(),
+        }
     }
 
     /// Whether a function of this contract is entered the way a transaction

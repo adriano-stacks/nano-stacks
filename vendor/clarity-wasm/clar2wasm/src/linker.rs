@@ -389,12 +389,24 @@ fn link_save_runtime_shape_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let value = read_runtime_value(
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let serialized_ty = read_identifier_from_wasm(
+                    memory,
                     &mut caller,
-                    value_offset,
                     serialized_ty_offset,
                     serialized_ty_length,
                 )?;
+                let value_ty = serde_json::from_str(&serialized_ty).map_err(|error| {
+                    crate::error::wasm_error(WasmError::Expect(format!(
+                        "runtime-shape type cannot be decoded: {error}"
+                    )))
+                })?;
+                let epoch = caller.data().global_context.epoch_id;
+                let value =
+                    read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
                 let handle = caller.data_mut().save_runtime_shape(value)?;
                 Ok(handle)
             },
