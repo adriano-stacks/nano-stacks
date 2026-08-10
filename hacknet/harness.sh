@@ -354,6 +354,7 @@ network = "testnet"
 chain_id = $chain_id
 peers = ["$peer/"]
 ${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
+${NANO_METRICS_BIND:+metrics_bind = \"$NANO_METRICS_BIND\"}
 ${NANO_PROPOSAL_TOKEN:+block_proposal_token = \"$NANO_PROPOSAL_TOKEN\"}
 pox_5_sbtc_contract = "$(compose_value POX_5_SBTC_CONTRACT)"
 pox_5_sbtc_registry_contract = "$(compose_value POX_5_SBTC_REGISTRY_CONTRACT)"

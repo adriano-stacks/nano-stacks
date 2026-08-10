@@ -39,6 +39,14 @@ prints what would be written without starting anything, and `restore` stops the
 node with `SIGTERM`. Set `NANO_RPC_BIND` to serve the public RPC as well, and
 `NANO_EVENT_OBSERVERS` to a comma-separated list to post events.
 
+Prometheus metrics are always served separately from that RPC. With no override,
+the target is `http://127.0.0.1:9153/metrics` (or the public RPC port plus one
+when `NANO_RPC_BIND` is set). Set `NANO_METRICS_BIND` to write an explicit
+`node.metrics_bind` into `run/nano.toml`, for example
+`NANO_METRICS_BIND=127.0.0.1:19153`. The harness does not register nano with a
+Prometheus service or make one a dependency; point the operator's existing
+Prometheus at that target.
+
 `status` prints the heights of all three participants, the reward cycle, the
 stacking horizon, and whether nano is running. `wait` fails as soon as Bitcoin
 advances with a frozen Stacks tip, which is what a broken replacement looks like.
