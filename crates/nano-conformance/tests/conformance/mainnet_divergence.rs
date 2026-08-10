@@ -977,7 +977,7 @@ fn the_mainnet_8733929_fastpool_fixture_is_self_consistent() {
     );
     assert_eq!(
         oracle.result.repr,
-        "(ok (tuple (amount-ustx u9030480000000) (first-reward-cycle u141) (num-cycles u96) (signer 'SPMPMA1V6P430M8C91QS1G9XJ95S59JS1TZFZ4Q4.fastpool-max500-signer-manager) (staker 'SP22XRPKA10DCQA77EFB596AKYTH042P1FZH0BMQZ) (unlock-burn-height u1163750) (unlock-cycle u237)))"
+        "(ok (tuple (amount-ustx u9030480000000) (first-reward-cycle u141) (num-cycles u96) (signer SPMPMA1V6P430M8C91QS1G9XJ95S59JS1TZFZ4Q4.fastpool-max500-signer-manager) (staker SP22XRPKA10DCQA77EFB596AKYTH042P1FZH0BMQZ) (unlock-burn-height u1163750) (unlock-cycle u237)))"
     );
 }
 
