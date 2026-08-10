@@ -3271,7 +3271,17 @@ mod tests {
     #[tokio::test]
     async fn no_route_serves_a_block_the_node_has_not_executed() {
         let (view, blocks) = view_with_blocks(3);
-        let state = RpcState::new(NETWORK);
+        let (chain, _) = scripted_chain([
+            Ok(pox_contract_info(
+                Value::UInt(50_000),
+                Value::UInt(4_000_000),
+            )),
+            Ok(Value::UInt(1_250_000)),
+            Ok(Value::UInt(2_500_000)),
+        ]);
+        let state = RpcState::new(NETWORK)
+            .with_pox_config(pox_config())
+            .with_chain(chain);
         state.publish(view).await;
         state
             .publish_executed(sealed_at(&blocks[1]), Vec::new())

@@ -363,6 +363,15 @@ execution.
       breaks the first peer six ways over real HTTP. The live half — removing a
       configured peer from a running node — stays open there.
 
+### Release audit regression, 2026-08-09
+
+- [x] Make `no_route_serves_a_block_the_node_has_not_executed` pass inside the
+      complete release suite. The route invariant was already correct; the
+      regression reached `/v2/pox` without the local PoX configuration and
+      Clarity answers that route now requires. The fixture now installs those
+      inputs and proves that block, tenure-info, tenure-stream and PoX answers
+      are all bounded by the same executed snapshot.
+
 ## A consumer for `/v2/pox`'s `stacked_ustx` now exists
 
 `pox_info`'s note says `stacked_ustx` is "read from `.pox-5`'s `get-pox-info`,
