@@ -2084,6 +2084,44 @@ mod crosscheck {
         );
     }
 
+    /// A private call charges its values before declared trait casts, and a
+    /// dynamic call through the forwarded trait reads the value as a contract
+    /// principal. This is the shape incentives-v2-2 uses when it forwards one
+    /// token and supplies two token constants to `claim-rewards-priv`.
+    #[test]
+    fn charges_private_and_dynamic_trait_values_at_their_call_boundaries() {
+        crosscheck_cost_multi_contract(
+            &[
+                (
+                    "token",
+                    "(define-public (get-balance (who principal)) (ok u0))",
+                ),
+                (
+                    "snippet",
+                    "(define-trait ft ((get-balance (principal) (response uint uint))))
+                     (define-constant token-b .token)
+                     (define-constant token-c .token)
+                     (define-private (g (a <ft>) (b <ft>) (c <ft>) (who principal))
+                       (contract-call? a get-balance who))
+                     (define-public (f (a <ft>) (who principal))
+                       (g a token-b token-c who))",
+                ),
+            ],
+            "f",
+            &[
+                Value::Principal(
+                    PrincipalData::parse_qualified_contract_principal(
+                        "S1G2081040G2081040G2081040G208105NK8PE5.token",
+                    )
+                    .expect("contract principal"),
+                ),
+                Value::Principal(PrincipalData::Standard(
+                    clarity::vm::types::StandardPrincipalData::transient(),
+                )),
+            ],
+        );
+    }
+
     /// Constructs `.pox-5 stake-update` is built from, one at a time.
     ///
     /// Its cost still diverges by a fraction of a percent and the divergence
@@ -2201,6 +2239,69 @@ mod crosscheck {
         }
     }
 
+    /// NFT costs scale with the serialized identifier in the current epoch,
+    /// not with the token name. The setup mints run during deployment and are
+    /// excluded from the measured get, transfer, and burn calls.
+    #[test]
+    fn charges_non_fungible_token_operations() {
+        for snippet in [
+            "(define-non-fungible-token token uint)
+             (define-public (f) (nft-mint? token u1 tx-sender))",
+            "(define-non-fungible-token token uint)
+             (nft-mint? token u1 tx-sender)
+             (define-public (f) (ok (nft-get-owner? token u1)))",
+            "(define-non-fungible-token token uint)
+             (nft-mint? token u1 tx-sender)
+             (define-public (f)
+               (nft-transfer? token u1 tx-sender current-contract))",
+            "(define-non-fungible-token token uint)
+             (nft-mint? token u1 tx-sender)
+             (define-public (f) (nft-burn? token u1 tx-sender))",
+        ] {
+            crosscheck_cost(snippet, "f", &[]);
+        }
+    }
+
+    #[test]
+    fn charges_stx_and_non_fungible_token_operands_in_place() {
+        let principal = || {
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse("S1G2081040G2081040G2081040G208105NK8PE5")
+                    .expect("principal"),
+            )
+        };
+        for (snippet, arguments) in [
+            (
+                "(define-public (f (amount uint) (recipient principal))
+                   (stx-transfer? amount tx-sender recipient))",
+                vec![Value::UInt(1), principal()],
+            ),
+            (
+                "(define-public (f (amount uint) (recipient principal) (memo (buff 34)))
+                   (stx-transfer-memo? amount tx-sender recipient memo))",
+                vec![
+                    Value::UInt(1),
+                    principal(),
+                    Value::buff_from(vec![1]).expect("buffer"),
+                ],
+            ),
+        ] {
+            crosscheck_cost(snippet, "f", &arguments);
+        }
+        crosscheck_cost(
+            "(define-non-fungible-token token uint)
+             (define-public (f)
+               (let ((id u1) (owner tx-sender) (recipient current-contract))
+                 (begin
+                   (try! (nft-mint? token id owner))
+                   (nft-get-owner? token id)
+                   (try! (nft-transfer? token id owner recipient))
+                   (nft-burn? token id recipient))))",
+            "f",
+            &[],
+        );
+    }
+
     /// A comparison or a branch over a bound name costs what the interpreter
     /// charges.
     ///
@@ -2256,6 +2357,110 @@ mod crosscheck {
              (define-public (f) (begin (try! (h u0)) (ok true)))"
         );
         crosscheck_cost(&snippet, "f", &[]);
+    }
+
+    /// A computed `slice?` bound evaluates its own operands normally, and a
+    /// successful slice is charged for the bytes it returns.
+    #[test]
+    fn charges_a_slice_with_computed_bounds() {
+        crosscheck_cost(
+            "(define-public (f) (ok (slice? 0x001122334455 u1 u3)))",
+            "f",
+            &[],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8192)) (left uint)) (ok u1))",
+            "f",
+            &[
+                Value::buff_from(vec![0x5a; 2_007]).expect("buffer"),
+                Value::UInt(3),
+            ],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8)) (left uint))
+                 (ok (slice? bytes (+ left u0) u4)))",
+            "f",
+            &[
+                Value::buff_from(vec![0, 1, 2, 3, 4, 5]).expect("buffer"),
+                Value::UInt(1),
+            ],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8)))
+                 (ok (slice? bytes u1 (len bytes))))",
+            "f",
+            &[Value::buff_from(vec![0, 1, 2, 3, 4, 5]).expect("buffer")],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8192)))
+                 (ok (slice? bytes u3 (len bytes))))",
+            "f",
+            &[Value::buff_from(vec![0x5a; 2_007]).expect("buffer")],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8192)) (left uint))
+                 (ok (slice? bytes (+ left u0) (len bytes))))",
+            "f",
+            &[
+                Value::buff_from(vec![0x5a; 2_007]).expect("buffer"),
+                Value::UInt(3),
+            ],
+        );
+        crosscheck_cost(
+            "(define-public (f (bytes (buff 8192)))
+                 (ok (slice?
+                   (list
+                     (default-to 0x (slice? bytes u0 u2))
+                     (default-to 0x (slice? bytes u2 u4)))
+                   u0 u1)))",
+            "f",
+            &[Value::buff_from(vec![0, 1, 2, 3]).expect("buffer")],
+        );
+    }
+
+    #[test]
+    fn charges_a_list_of_runtime_shaped_tuples() {
+        let update = Value::Tuple(
+            TupleData::from_data(vec![
+                (
+                    ClarityName::from_literal("proof"),
+                    Value::cons_list_unsanitized(vec![
+                        Value::buff_from(vec![0x5a; 3]).expect("proof node")
+                    ])
+                    .expect("proof list"),
+                ),
+                (ClarityName::from_literal("value"), Value::UInt(42)),
+            ])
+            .expect("update tuple"),
+        );
+        crosscheck_cost(
+            "(define-public (f
+                 (update { proof: (list 8 (buff 20)), value: uint }))
+               (ok (list update update update)))",
+            "f",
+            &[update],
+        );
+    }
+
+    #[test]
+    fn charges_secp256k1_recover_arguments_in_place() {
+        let message =
+            hex::decode("de5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04")
+                .expect("message hash");
+        let signature = hex::decode(
+            "8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b8735\
+             54428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301",
+        )
+        .expect("signature");
+        crosscheck_cost(
+            "(define-public (f (message (buff 32)) (signature (buff 65)))
+                 (secp256k1-recover? message signature))",
+            "f",
+            &[
+                Value::buff_from(message).expect("message buffer"),
+                Value::buff_from(signature).expect("signature buffer"),
+            ],
+        );
     }
 
     /// A constant counts towards the contract's size, which is what a
@@ -2443,6 +2648,28 @@ mod crosscheck {
             ],
             "f",
             &[target],
+        );
+    }
+
+    /// A contract literal is still a principal when the caller evaluates it,
+    /// even when the receiving function declares a trait parameter.
+    #[test]
+    fn charges_a_cross_contract_trait_literal_as_a_principal() {
+        let trait_definition = "(define-trait route-trait ())";
+        let target = "(impl-trait .trait-definition.route-trait)";
+        let callee = "(use-trait route-trait .trait-definition.route-trait)
+                      (define-public (take (target <route-trait>)) (ok true))";
+        let caller = "(define-public (f)
+                        (contract-call? .callee take .target))";
+        crosscheck_cost_multi_contract(
+            &[
+                ("trait-definition", trait_definition),
+                ("target", target),
+                ("callee", callee),
+                ("caller", caller),
+            ],
+            "f",
+            &[],
         );
     }
 
@@ -2711,6 +2938,31 @@ mod crosscheck {
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }
+    }
+
+    #[test]
+    fn charges_refusing_a_wide_runtime_shape_at_local_function_entry() {
+        let wide = Value::some(Value::Tuple(
+            TupleData::from_data(vec![
+                (
+                    ClarityName::try_from("full").expect("field name"),
+                    Value::Bool(true),
+                ),
+                (
+                    ClarityName::try_from("soft").expect("field name"),
+                    Value::Bool(true),
+                ),
+            ])
+            .expect("wide tuple"),
+        ))
+        .expect("optional tuple");
+        crosscheck_cost(
+            "(define-private (echo (entry {soft: bool})) entry) \
+             (define-public (f (entry (optional {soft: bool, full: bool}))) \
+               (ok (echo (default-to {soft: false} entry))))",
+            "f",
+            &[wide],
+        );
     }
 
     #[test]

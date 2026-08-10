@@ -82,9 +82,9 @@ impl ComplexWord for StxTransfer {
         let sender = args.get_expr(1)?;
         let recipient = args.get_expr(2)?;
 
-        generator.traverse_expr(builder, amount)?;
-        generator.traverse_expr(builder, sender)?;
-        generator.traverse_expr(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, amount)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
 
         // placeholder for memo
         builder.i32_const(0).i32_const(0);
@@ -119,10 +119,10 @@ impl ComplexWord for StxTransferMemo {
         let recipient = args.get_expr(2)?;
         let memo = args.get_expr(3)?;
 
-        generator.traverse_expr(builder, amount)?;
-        generator.traverse_expr(builder, sender)?;
-        generator.traverse_expr(builder, recipient)?;
-        generator.traverse_expr(builder, memo)?;
+        generator.traverse_expr_as_borrowed_value(builder, amount)?;
+        generator.traverse_expr_as_borrowed_value(builder, sender)?;
+        generator.traverse_expr_as_borrowed_value(builder, recipient)?;
+        generator.traverse_expr_as_borrowed_value(builder, memo)?;
 
         builder.call(generator.func_by_name("stdlib.stx_transfer"));
         Ok(())

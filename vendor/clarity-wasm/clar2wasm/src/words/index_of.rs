@@ -34,7 +34,7 @@ impl ComplexWord for IndexOf {
         _expr: &SymbolicExpression,
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
-        let serialization_size = generator.module.locals.add(ValType::I32);
+        let serialization_size = generator.alloc_local(ValType::I32);
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
 
         if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
@@ -103,9 +103,9 @@ impl ComplexWord for IndexOf {
         }
 
         // Locals declaration.
-        let seq_size = generator.module.locals.add(ValType::I32);
-        let offset = generator.module.locals.add(ValType::I32);
-        let end_offset = generator.module.locals.add(ValType::I32);
+        let seq_size = generator.alloc_local(ValType::I32);
+        let offset = generator.alloc_local(ValType::I32);
+        let end_offset = generator.alloc_local(ValType::I32);
 
         builder.local_set(seq_size).local_set(offset);
         if matches!(
@@ -164,7 +164,7 @@ impl ComplexWord for IndexOf {
             // STACK: []
 
             // Create and store an index into a local.
-            let index = generator.module.locals.add(ValType::I64);
+            let index = generator.alloc_local(ValType::I64);
             else_case.i64_const(0);
             // STACK: [0]
             else_case.local_set(index);

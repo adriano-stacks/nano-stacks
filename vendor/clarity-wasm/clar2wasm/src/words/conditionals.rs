@@ -48,7 +48,7 @@ impl<'a> ShortReturnable<'a> {
         match ty {
             TypeSignature::OptionalType(opt) => {
                 let value = generator.save_to_locals(builder, opt, true);
-                let variant = generator.module.locals.add(ValType::I32);
+                let variant = generator.alloc_local(ValType::I32);
                 builder.local_set(variant);
                 Ok((
                     Self::Optional {
@@ -62,7 +62,7 @@ impl<'a> ShortReturnable<'a> {
                 let (ok_type, err_type) = resp.as_ref();
                 let err_value = generator.save_to_locals(builder, err_type, true);
                 let ok_value = generator.save_to_locals(builder, ok_type, true);
-                let variant = generator.module.locals.add(ValType::I32);
+                let variant = generator.alloc_local(ValType::I32);
                 builder.local_set(variant);
                 Ok((
                     Self::Response {
@@ -130,6 +130,21 @@ impl<'a> ShortReturnable<'a> {
         } else {
             Err(GeneratorError::TypeError("Expected a response".to_owned()))
         }
+    }
+
+    fn release(self, generator: &mut WasmGenerator) {
+        let locals = match self {
+            Self::Optional { value, .. } | Self::Any { value, .. } => value,
+            Self::Response {
+                mut ok_value,
+                err_value,
+                ..
+            } => {
+                ok_value.extend(err_value);
+                ok_value
+            }
+        };
+        generator.release_locals(locals);
     }
 
     /// Generates the handling of a ShortReturn error.
@@ -441,13 +456,14 @@ impl ComplexWord for Match {
                 // WORKAROUND: set type on none body
                 generator.set_expr_type(none_body, expr_ty.clone())?;
 
-                let some_locals = generator.save_to_locals(builder, &inner_type, true);
-
-                generator.bindings.insert(
+                let success_name = args.get_expr(1)?;
+                let (some_storage, some_binding) =
+                    generator.capture_binding_value(builder, success_name, &inner_type)?;
+                generator.bindings.insert_spilled(
                     success_binding.clone(),
                     *inner_type,
-                    some_locals,
-                    generator.binding_id(args.get_expr(1)?),
+                    some_storage,
+                    some_binding,
                 );
 
                 let some_block = if let Some(result_offset) = result_offset {
@@ -504,14 +520,18 @@ impl ComplexWord for Match {
 
                 let err_name_used = generator.binding_name_already_used(err_binding);
 
-                let err_locals = generator.save_to_locals(builder, err_ty, true);
-                let ok_locals = generator.save_to_locals(builder, ok_ty, true);
+                let err_name = args.get_expr(3)?;
+                let (err_storage, err_binding_id) =
+                    generator.capture_binding_value(builder, err_name, err_ty)?;
+                let success_name = args.get_expr(1)?;
+                let (ok_storage, ok_binding_id) =
+                    generator.capture_binding_value(builder, success_name, ok_ty)?;
 
-                generator.bindings.insert(
+                generator.bindings.insert_spilled(
                     success_binding.clone(),
                     ok_ty.clone(),
-                    ok_locals,
-                    generator.binding_id(args.get_expr(1)?),
+                    ok_storage,
+                    ok_binding_id,
                 );
                 let ok_block = if let Some(result_offset) = result_offset {
                     generator.block_from_bound_expr_into_memory(
@@ -535,11 +555,11 @@ impl ComplexWord for Match {
                 generator.bindings.clone_from(&saved_bindings);
 
                 // bind err branch local
-                generator.bindings.insert(
+                generator.bindings.insert_spilled(
                     err_binding.clone(),
                     err_ty.clone(),
-                    err_locals,
-                    generator.binding_id(args.get_expr(3)?),
+                    err_storage,
+                    err_binding_id,
                 );
 
                 let err_block = if let Some(result_offset) = result_offset {
@@ -637,9 +657,10 @@ impl ComplexWord for Filter {
         );
 
         // Setup neccesary locals for the operations.
-        let input_len = generator.module.locals.add(ValType::I32);
-        let input_offset = generator.module.locals.add(ValType::I32);
-        let output_len = generator.module.locals.add(ValType::I32);
+        let input_len = generator.alloc_local(ValType::I32);
+        let input_offset = generator.alloc_local(ValType::I32);
+        let output_len = generator.alloc_local(ValType::I32);
+        builder.i32_const(0).local_set(output_len);
 
         // save list (offset, length) to locals
         builder.local_set(input_len).local_set(input_offset);
@@ -1002,9 +1023,12 @@ impl ComplexWord for Unwrap {
             // we need to short-return if the variant is `none` or `err`
             instrs.local_get(variant).unop(UnaryOp::I32Eqz);
         })?;
+        short_returnable_throw.release(generator);
+        generator.release_locals(vec![variant]);
 
         // if we didn't short-return, we push the inner value of the input.
         short_returnable_input.push_success_value(builder);
+        short_returnable_input.release(generator);
 
         Ok(())
     }
@@ -1088,9 +1112,12 @@ impl ComplexWord for UnwrapErr {
             // we need to short-return if the variant is `ok`
             instrs.local_get(variant);
         })?;
+        short_returnable_throw.release(generator);
+        generator.release_locals(vec![variant]);
 
         // if we didn't short-return, we push the `err` value of the input.
         short_returnable_input.push_err_value(builder)?;
+        short_returnable_input.release(generator);
 
         Ok(())
     }
@@ -1123,7 +1150,7 @@ impl ComplexWord for Asserts {
         // The interpreter keeps the evaluated predicate rather than reading it
         // in place, so a bound name here does pay to be copied.
         generator.traverse_expr(builder, predicate_expr)?;
-        let predicate = generator.module.locals.add(ValType::I32);
+        let predicate = generator.alloc_local(ValType::I32);
         builder.local_set(predicate);
 
         let thrown_type = generator
@@ -1151,6 +1178,8 @@ impl ComplexWord for Asserts {
             consequent: success,
             alternative: failure,
         });
+        short_returnable_thrown.release(generator);
+        generator.release_locals(vec![predicate]);
 
         // if we didn't short-return, the result is always `true`
         builder.i32_const(1);
@@ -1200,6 +1229,8 @@ impl ComplexWord for Try {
 
         // if no short-return, we push the success value to the stack.
         short_returnable_value.push_success_value(builder);
+        short_returnable_value.release(generator);
+        generator.release_locals(vec![variant]);
 
         Ok(())
     }

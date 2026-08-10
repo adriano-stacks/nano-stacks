@@ -410,6 +410,7 @@ where
     S::Data: RuntimeShapeStore,
 {
     let mut length = get_type_size(ty);
+    let value_offset = offset;
 
     if matches!(
         ty,
@@ -427,9 +428,33 @@ where
     // then read the actual value.
     if is_in_memory_type(ty) {
         (offset, length) = read_indirect_offset_and_length(memory, store, offset)?;
+        if matches!(
+            ty,
+            TypeSignature::PrincipalType
+                | TypeSignature::CallableType(_)
+                | TypeSignature::ListUnionType(_)
+                | TypeSignature::TraitReferenceType(_)
+        ) {
+            validate_principal_length(ty, value_offset, offset, length)?;
+        }
     };
 
     read_from_wasm(memory, store, ty, offset, length, epoch)
+}
+
+fn validate_principal_length(
+    ty: &TypeSignature,
+    value_offset: i32,
+    principal_offset: i32,
+    length: i32,
+) -> Result<(), VmExecutionError> {
+    if length < STANDARD_PRINCIPAL_BYTES as i32 || length > PRINCIPAL_BYTES_MAX as i32 {
+        return Err(crate::error::wasm_error(WasmError::Expect(format!(
+            "principal representation for {ty:?} at value offset {value_offset} points to \
+             offset {principal_offset} with invalid length {length}"
+        ))));
+    }
+    Ok(())
 }
 
 /// Read a value from the Wasm memory at `offset` with `length`, given the
@@ -503,9 +528,7 @@ where
         | TypeSignature::CallableType(_)
         | TypeSignature::ListUnionType(_)
         | TypeSignature::TraitReferenceType(_) => {
-            debug_assert!(
-                length >= STANDARD_PRINCIPAL_BYTES as i32 && length <= PRINCIPAL_BYTES_MAX as i32
-            );
+            validate_principal_length(ty, offset, offset, length)?;
             let mut current_offset = offset as usize;
             let mut version: [u8; PRINCIPAL_VERSION_BYTES] = [0; PRINCIPAL_VERSION_BYTES];
             let mut hash: [u8; PRINCIPAL_HASH_BYTES] = [0; PRINCIPAL_HASH_BYTES];

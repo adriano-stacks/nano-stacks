@@ -73,7 +73,7 @@ impl WasmGenerator {
 
         let memory_pointer = preallocated_memory.unwrap_or_else(|| {
             self.ensure_work_space(dt_needed_workspace(target_ty));
-            let pointer = self.module.locals.add(ValType::I32);
+            let pointer = self.alloc_local(ValType::I32);
             builder.global_get(self.stack_pointer).local_set(pointer);
             pointer
         });
@@ -262,8 +262,8 @@ impl WasmGenerator {
                 };
                 let source_handle = self.borrow_local(ValType::I32);
 
-                let offset_target = self.module.locals.add(ValType::I32);
-                let length_target = self.module.locals.add(ValType::I32);
+                let offset_target = self.alloc_local(ValType::I32);
+                let length_target = self.alloc_local(ValType::I32);
 
                 builder
                     .local_set(*length)
@@ -360,7 +360,7 @@ impl WasmGenerator {
     fn create_locals_for_ty(&mut self, ty: &TypeSignature) -> Vec<LocalId> {
         clar2wasm_ty(ty)
             .into_iter()
-            .map(|vt| self.module.locals.add(vt))
+            .map(|vt| self.alloc_local(vt))
             .collect()
     }
 }

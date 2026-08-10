@@ -192,7 +192,7 @@ mod tests {
             let memory = gen.get_memory().expect("couldn't find memory");
 
             let copy_offset_int = 65536 - get_type_in_memory_size(ty, true);
-            let copy_offset = gen.module.locals.add(walrus::ValType::I32);
+            let copy_offset = gen.alloc_local(walrus::ValType::I32);
 
             gen.pass_value(builder, value, ty)
                 .expect("failed to write instructions for passed value");

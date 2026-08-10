@@ -4,14 +4,14 @@ use std::sync::Mutex;
 
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
-use clarity::vm::costs::{CostTracker, constants as cost_constants};
+use clarity::vm::costs::{constants as cost_constants, CostTracker};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 #[cfg(any())]
 use clarity::vm::functions::crypto::{pubkey_to_address_v1, pubkey_to_address_v2};
 #[cfg(any())]
 use clarity::vm::functions::post_conditions::{
-    Allowance, FtAllowance, NftAllowance, StackingAllowance, StxAllowance, check_allowances,
+    check_allowances, Allowance, FtAllowance, NftAllowance, StackingAllowance, StxAllowance,
 };
 use clarity::vm::types::{
     AssetIdentifier, BuffData, BufferLength, FunctionType, ListTypeData, PrincipalData,
@@ -24,13 +24,13 @@ use stacks_common::address::{
     AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
 use stacks_common::consts::CHAIN_ID_TESTNET;
-use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::StacksEpochId;
 use stacks_common::util::ed25519::ed25519_verify;
 use stacks_common::util::hash::{Keccak256Hash, Sha512Sum, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{
-    Secp256k1PublicKey, secp256k1_decompress, secp256k1_recover, secp256k1_verify,
+    secp256k1_decompress, secp256k1_recover, secp256k1_verify, Secp256k1PublicKey,
 };
 use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
@@ -41,7 +41,9 @@ use wasmtime::{
 use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
-use crate::initialize::{ClarityWasmContext, call_function_with_argument_sizes};
+use crate::initialize::{
+    admit_function_argument, call_function_with_argument_sizes, ClarityWasmContext,
+};
 use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_utils::*;
 
@@ -271,6 +273,8 @@ pub fn link_host_functions(
     link_save_runtime_shape_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
     link_runtime_value_size_fn(linker)?;
+    link_runtime_sequence_element_size_fn(linker)?;
+    link_admit_function_argument_fn(linker)?;
     link_runtime_shape_is_equal_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
@@ -480,12 +484,135 @@ fn link_runtime_value_size_fn(
         })
 }
 
-fn read_runtime_value(
+fn link_runtime_sequence_element_size_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_sequence_element_size",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             value_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                let value = read_runtime_value(
+                    &mut caller,
+                    value_offset,
+                    serialized_ty_offset,
+                    serialized_ty_length,
+                )?;
+                let sequence = match value {
+                    Value::Sequence(sequence) => sequence,
+                    _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
+                };
+                let size = sequence
+                    .element_size()
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                let size = i32::try_from(size)
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                Ok(size)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_sequence_element_size".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn link_admit_function_argument_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "admit_function_argument",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             value_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32,
+             function_name_offset: i32,
+             function_name_length: i32,
+             argument_index: i32| {
+                let (memory, representation_type) =
+                    runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
+                let function_name = read_identifier_from_wasm(
+                    memory,
+                    &mut caller,
+                    function_name_offset,
+                    function_name_length,
+                )?;
+                let argument_index = usize::try_from(argument_index)
+                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                let expected_type = {
+                    let function = caller
+                        .data()
+                        .contract_context()
+                        .lookup_function(&function_name)
+                        .ok_or_else(|| {
+                            VmExecutionError::from(RuntimeCheckErrorKind::UndefinedFunction(
+                                function_name.clone(),
+                            ))
+                        })?;
+                    function
+                        .get_arg_types()
+                        .get(argument_index)
+                        .cloned()
+                        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?
+                };
+                let epoch = caller.data().global_context.epoch_id;
+                let argument = read_from_wasm_indirect(
+                    memory,
+                    &mut caller,
+                    &representation_type,
+                    value_offset,
+                    epoch,
+                )?;
+                let admitted = admit_function_argument(&expected_type, &argument, epoch)?;
+
+                let representation_size = get_type_size(&representation_type);
+                let in_memory_offset = value_offset
+                    .checked_add(representation_size)
+                    .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                let zeroes = vec![
+                    0;
+                    usize::try_from(representation_size).map_err(|_| {
+                        crate::error::wasm_error(WasmError::ValueTypeMismatch)
+                    })?
+                ];
+                memory
+                    .write(&mut caller, value_offset as usize, &zeroes)
+                    .map_err(|error| {
+                        crate::error::wasm_error(WasmError::UnableToWriteMemory(error.into()))
+                    })?;
+                write_to_wasm(
+                    &mut caller,
+                    memory,
+                    &expected_type,
+                    value_offset,
+                    in_memory_offset,
+                    &admitted,
+                    true,
+                )?;
+                Ok(())
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "admit_function_argument".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn runtime_value_type(
     caller: &mut Caller<'_, ClarityWasmContext>,
-    value_offset: i32,
     serialized_ty_offset: i32,
     serialized_ty_length: i32,
-) -> Result<Value, VmExecutionError> {
+) -> Result<(Memory, TypeSignature), VmExecutionError> {
     let memory = caller
         .get_export("memory")
         .and_then(|export| export.into_memory())
@@ -497,18 +624,30 @@ fn read_runtime_value(
         serialized_ty_length,
     )?;
     let epoch = caller.data().global_context.epoch_id;
-    let (version, contract_identifier) = {
+    let version = *caller.data().contract_context().get_clarity_version();
+    Ok((
+        memory,
+        signature_from_string(&serialized_ty, version, epoch)?,
+    ))
+}
+
+fn read_runtime_value(
+    caller: &mut Caller<'_, ClarityWasmContext>,
+    value_offset: i32,
+    serialized_ty_offset: i32,
+    serialized_ty_length: i32,
+) -> Result<Value, VmExecutionError> {
+    let (memory, value_ty) =
+        runtime_value_type(caller, serialized_ty_offset, serialized_ty_length)?;
+    let epoch = caller.data().global_context.epoch_id;
+    let contract_identifier = {
         let contract = caller.data().contract_context();
-        (
-            *contract.get_clarity_version(),
-            contract.contract_identifier.clone(),
-        )
+        contract.contract_identifier.clone()
     };
-    let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
     read_from_wasm_indirect(memory, caller, &value_ty, value_offset, epoch).map_err(|error| {
         crate::error::wasm_error(WasmError::Expect(format!(
             "runtime value in {contract_identifier} at offset {value_offset} with outer type \
-             {serialized_ty} could not be read: {error}"
+             {value_ty} could not be read: {error}"
         )))
     })
 }
@@ -7366,6 +7505,23 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         "clarity",
         "runtime_value_size",
         |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "runtime_sequence_element_size",
+        |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "admit_function_argument",
+        |_value_offset: i32,
+         _type_offset: i32,
+         _type_length: i32,
+         _function_name_offset: i32,
+         _function_name_length: i32,
+         _argument_index: i32| Ok(()),
     )?;
 
     linker.func_wrap(

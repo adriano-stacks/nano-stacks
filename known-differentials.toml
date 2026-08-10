@@ -1,17 +1,3 @@
-# Deliberately unequal engine answers asserted by running tests. These are useful
-# measurements, not passing conformance: every entry blocks a release until its
-# owner removes both the mismatch and this declaration.
-
-[[differential]]
-test = "a_narrowed_default_parts_from_the_reference_only_where_it_must"
-file = "crates/nano-conformance/tests/conformance/wasm_response_fold.rs"
-owner = "068"
-policy = "blocking"
-surface = "value, consensus serialization, state and receipt"
-
-[[differential]]
-test = "every_narrowing_kind_parts_on_the_some_branch_only"
-file = "crates/nano-conformance/tests/conformance/wasm_response_fold.rs"
-owner = "068"
-policy = "blocking"
-surface = "nested tuple, optional and response values"
+# Deliberately unequal engine answers asserted by running tests belong here.
+# Every entry blocks a release until its owner removes both the mismatch and
+# this declaration.

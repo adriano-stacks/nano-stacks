@@ -180,7 +180,7 @@ impl WasmGenerator {
             );
 
         // Read the prefix byte
-        let type_prefix = self.module.locals.add(ValType::I32);
+        let type_prefix = self.alloc_local(ValType::I32);
         block
             .local_get(offset_local)
             .load(
@@ -206,7 +206,7 @@ impl WasmGenerator {
                     then.i32_const(1);
 
                     // Allocate space for the principal on the call stack
-                    let principal_offset = self.module.locals.add(ValType::I32);
+                    let principal_offset = self.alloc_local(ValType::I32);
                     then.local_get(offset_result).local_tee(principal_offset);
                     then.i32_const(STANDARD_PRINCIPAL_BYTES as i32)
                         .binop(BinaryOp::I32Add)
@@ -256,7 +256,7 @@ impl WasmGenerator {
                 block_ty,
                 |then| {
                     // Read the contract name length
-                    let contract_length = self.module.locals.add(ValType::I32);
+                    let contract_length = self.alloc_local(ValType::I32);
                     then.local_get(offset_local)
                         .load(
                             memory,
@@ -272,7 +272,7 @@ impl WasmGenerator {
 
                     // Verify that the contract name length is within the
                     // buffer.
-                    let computed_end = self.module.locals.add(ValType::I32);
+                    let computed_end = self.alloc_local(ValType::I32);
                     then.local_get(offset_local)
                         .binop(BinaryOp::I32Add)
                         .i32_const(STANDARD_PRINCIPAL_BYTES as i32 + 1)
@@ -360,7 +360,7 @@ impl WasmGenerator {
             );
 
         // Read the prefix byte
-        let type_prefix = self.module.locals.add(ValType::I32);
+        let type_prefix = self.alloc_local(ValType::I32);
         block
             .local_get(offset_local)
             .load(
@@ -478,7 +478,7 @@ impl WasmGenerator {
             );
 
         // Read the prefix byte
-        let type_prefix = self.module.locals.add(ValType::I32);
+        let type_prefix = self.alloc_local(ValType::I32);
         block
             .local_get(offset_local)
             .load(
@@ -652,7 +652,7 @@ impl WasmGenerator {
             );
 
         // Read the prefix byte
-        let type_prefix = self.module.locals.add(ValType::I32);
+        let type_prefix = self.alloc_local(ValType::I32);
         block
             .local_get(offset_local)
             .load(
@@ -873,7 +873,7 @@ impl WasmGenerator {
             );
 
         // Read the length of the list
-        let length = self.module.locals.add(ValType::I32);
+        let length = self.alloc_local(ValType::I32);
         block
             .local_get(offset_local)
             .i32_const(1)
@@ -897,8 +897,8 @@ impl WasmGenerator {
 
         // Allocate space for the list on the call stack
         let element_ty = list_ty.get_list_item_type();
-        let result = self.module.locals.add(ValType::I32);
-        let element_offset = self.module.locals.add(ValType::I32);
+        let result = self.alloc_local(ValType::I32);
+        let element_offset = self.alloc_local(ValType::I32);
         let element_size = get_type_size(element_ty);
         block
             .local_get(offset_result)
@@ -919,7 +919,7 @@ impl WasmGenerator {
             .local_set(offset_local);
 
         // Initialize an index variable to 0
-        let index = self.module.locals.add(ValType::I32);
+        let index = self.alloc_local(ValType::I32);
         block.i32_const(0).local_set(index);
 
         // Loop and deserialize each element
@@ -1086,7 +1086,7 @@ impl WasmGenerator {
         let (tuple_output, tuple_output_offset) = if let Some(output) = output {
             output
         } else {
-            let tuple_output = self.module.locals.add(ValType::I32);
+            let tuple_output = self.alloc_local(ValType::I32);
             builder
                 .local_get(offset_result)
                 .local_set(tuple_output)
@@ -1100,7 +1100,7 @@ impl WasmGenerator {
         // bitset which will indicate if a field was defined or not
         let result_len = tm.len();
         let bitset: Vec<LocalId> = (0..result_len.div_ceil(32))
-            .map(|_| self.module.locals.add(ValType::I32))
+            .map(|_| self.alloc_local(ValType::I32))
             .collect();
 
         let field_offsets = tm
@@ -1113,7 +1113,7 @@ impl WasmGenerator {
             .collect::<Vec<_>>();
 
         // This locale will contain the remaining number of fields to deserialize
-        let remaining_fields = self.module.locals.add(ValType::I32);
+        let remaining_fields = self.alloc_local(ValType::I32);
 
         // Create a main block for the body of this operation, so that we can
         // early exit as needed.
@@ -1209,7 +1209,7 @@ impl WasmGenerator {
                     let loop_id = loop_.id();
 
                     // variable for the field name size
-                    let name_size = self.module.locals.add(ValType::I32);
+                    let name_size = self.alloc_local(ValType::I32);
 
                     // Here are all the blocks needed for the switch-case
                     let switch_case_blocks: Vec<_> = (0..=tuple_ty.get_type_map().len())
@@ -1517,7 +1517,7 @@ impl WasmGenerator {
                 block_ty,
                 |then| {
                     // Read the buffer length
-                    let buffer_length = self.module.locals.add(ValType::I32);
+                    let buffer_length = self.alloc_local(ValType::I32);
                     then.local_get(offset_local)
                         .i32_const(1)
                         .binop(BinaryOp::I32Add)
@@ -1540,7 +1540,7 @@ impl WasmGenerator {
 
                     // Verify that the buffer length is within the
                     // buffer.
-                    let computed_end = self.module.locals.add(ValType::I32);
+                    let computed_end = self.alloc_local(ValType::I32);
                     then.local_get(buffer_length)
                         .local_get(offset_local)
                         .binop(BinaryOp::I32Add)
@@ -1647,7 +1647,7 @@ impl WasmGenerator {
                 block_ty,
                 |then| {
                     // Read the string length
-                    let string_length = self.module.locals.add(ValType::I32);
+                    let string_length = self.alloc_local(ValType::I32);
                     then.local_get(offset_local)
                         .i32_const(1)
                         .binop(BinaryOp::I32Add)
@@ -1670,7 +1670,7 @@ impl WasmGenerator {
 
                     // Verify that the string length is within the
                     // buffer.
-                    let computed_end = self.module.locals.add(ValType::I32);
+                    let computed_end = self.alloc_local(ValType::I32);
                     then.local_get(string_length)
                         .local_get(offset_local)
                         .binop(BinaryOp::I32Add)
@@ -1794,7 +1794,7 @@ impl WasmGenerator {
             return_type,
             |then| {
                 // Read the string length in bytes
-                let string_length = self.module.locals.add(ValType::I32);
+                let string_length = self.alloc_local(ValType::I32);
                 then.local_get(offset_local)
                     .i32_const(1)
                     .binop(BinaryOp::I32Add)

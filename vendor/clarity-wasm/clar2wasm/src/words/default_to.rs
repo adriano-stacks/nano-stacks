@@ -93,7 +93,7 @@ impl ComplexWord for DefaultTo {
                 clar2wasm_ty(&expr_type).len(),
                 clar2wasm_ty(&expr_type).len(),
             );
-            let indicator = generator.module.locals.add(ValType::I32);
+            let indicator = generator.alloc_local(ValType::I32);
             builder.local_set(indicator);
             let default_locals = generator.save_to_locals(builder, &expr_type, true);
             let (result_offset, _) =

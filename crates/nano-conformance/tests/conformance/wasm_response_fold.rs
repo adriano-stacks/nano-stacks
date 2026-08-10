@@ -1,6 +1,6 @@
-//! The shape mainnet block 8,665,719 diverges on, in both engines.
+//! The shape mainnet block 8,665,719 used to diverge on, in both engines.
 //!
-//! `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market::borrow` answers
+//! `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market::borrow` answered
 //! `Runtime(UnwrapFailure)` under clarity-wasm where the chain and the
 //! interpreter say `(ok true)`. Its first `try!` runs
 //!
@@ -18,7 +18,7 @@
 //! position no `let` reaches.
 //!
 //! The interpreter is the oracle and nothing else: clarity-wasm has to be the
-//! engine that runs mainnet, so a disagreement is a compiler bug to fix.
+//! engine that runs mainnet, so every result below must agree with it.
 
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::types::{QualifiedContractIdentifier, TupleData};
@@ -166,8 +166,7 @@ fn both(function: &str, arguments: &[Vec<u8>]) -> (String, String) {
 }
 
 /// The consensus serialization goes in beside the value, because that is what a
-/// receipt carries and what a contract-call boundary hands on: two values that
-/// print the same and serialize differently are still a divergence.
+/// receipt carries and what a contract-call boundary hands on.
 fn describe<E: std::fmt::Display>(outcome: Result<nano_vm::ContractCallOutcome, E>) -> String {
     match outcome {
         Ok(
@@ -593,8 +592,8 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
     }
 }
 
-/// The supertype asymmetry, now reachable through `default-to`, in every
-/// position the narrowed value can reach.
+/// The dynamic branch shape, reached through `default-to`, in every position the
+/// value can escape to.
 ///
 /// `least_supertype` walks the default's fields and looks each one up in the
 /// optional's payload, dropping the payload's extra fields
@@ -602,91 +601,53 @@ fn a_default_naming_fewer_fields_loads_and_reads_the_ones_it_named() {
 /// `least_supertype_v2_1`), so `(default-to { soft: false } entry)` over an
 /// `(optional { soft: bool, full: bool })` analyses as `{ soft: bool }`. The
 /// interpreter's `native_default_to` hands back whichever value its branch
-/// produced, unconverted; clar2wasm lays every value out for its static type and
-/// converts the payload to it in `words/default_to.rs`, where `need_ducktyping`
-/// then `duck_type` drop the field the target does not name
-/// (`duck_type.rs`, the `TupleType`/`TupleType` arm of `duck_type_stack`).
+/// produced, unconverted. The compiler therefore has to carry the branch's
+/// runtime shape alongside the statically projected tuple representation.
 ///
 /// Measured on `(some { soft: true, full: true })`, consensus serialization and
-/// all — five escapes, five consensus-visible disagreements:
+/// all: the returned value, state admission, equality, print event and function
+/// argument admission must all match the reference.
 ///
-/// ```text
-/// whole  returned    compiled    0c0000000104736f667403
-///                    interpreted 0c000000020466756c6c0304736f667403
-/// store  var-set     compiled    (ok { soft: true }), the var written
-///                    interpreted RuntimeCheck(TypeValueError), nothing written
-/// same   is-eq       compiled    true   (03)
-///                    interpreted false  (04)
-/// shown  print       compiled    event value { soft: true }
-///                    interpreted event value { full: true, soft: true }
-/// passed argument    compiled    { soft: true }
-///                    interpreted RuntimeCheck(TypeValueError)
-/// ```
-///
-/// `store` and `passed` are the ones that matter most: both type-check at run
-/// time — `ClarityDatabase::set_variable` and `clarity2_implicit_cast` — so the
-/// reference *aborts the transaction* where nano commits a write and carries on.
-/// That is a state-root divergence, not only a receipt one, and it needs no
-/// exotic contract to reach.
-///
-/// `blacklist-susdh-v1` reads every one of its `default-to`s through `get`, so
-/// mainnet block 8,667,509 does not depend on which value comes back, and no
-/// shape found on the chain so far does.
-///
-/// Asserted rather than `#[ignore]`d, and asserted on *both* engines. An ignored
-/// equality is a divergence nobody measures; the same divergence pinned in both
-/// directions is one that cannot move — in either engine — without turning this
-/// red. The `none` branch must agree, because there the value *is* its analysed
-/// type; the `some` branch must disagree exactly as written above, because no
-/// single static layout can reproduce a shape that follows the branch taken (see
-/// `the_reference_answer_here_has_no_single_static_layout`).
 #[test]
-fn a_narrowed_default_parts_from_the_reference_only_where_it_must() {
-    // The `none` branch: the default's own value, so both engines lay out the
-    // type the expression was analysed as, and every escape agrees.
+fn a_narrowed_default_matches_the_reference_across_resolved_escapes() {
     for function in ESCAPES {
         let (compiled, interpreted) =
             both_in(NARROWING_DEFAULT, function, &[serialized(&Value::none())]);
         assert_eq!(compiled, interpreted, "{function} of none");
     }
 
-    // The `some` branch: the payload's own value, which is wider than the
-    // analysed type. Every escape parts, and each one is pinned by what the
-    // reference — the oracle — answers, so a change there is caught even if
-    // clar2wasm never moves.
     let entry = serialized(&some_entry(true, true));
-    let expectations: [(&str, &str, &str); 5] = [
-        (
-            "whole",
-            "0c0000000104736f667403",
-            "0c000000020466756c6c0304736f667403",
-        ),
-        ("store", "Some(Response", "TypeValueError"),
-        ("same", "Some(Bool(true))", "Some(Bool(false))"),
-        ("shown", "soft", "full"),
-        ("passed", "0c0000000104736f667403", "TypeValueError"),
+    let expectations = [
+        ("whole", "0c000000020466756c6c0304736f667403"),
+        ("store", "TypeValueError"),
+        ("same", "Some(Bool(false))"),
+        ("shown", "full"),
     ];
-    for (function, in_compiled, in_interpreted) in expectations {
+    for (function, expected) in expectations {
         let (compiled, interpreted) =
             both_in(NARROWING_DEFAULT, function, std::slice::from_ref(&entry));
-        assert_ne!(
-            compiled, interpreted,
-            "{function} of the wide payload is the known divergence; if it has closed, \
-             close the accounting in tasks/mainnet/068 with it"
-        );
-        assert!(
-            compiled.contains(in_compiled),
-            "{function} under clarity-wasm should still narrow: {compiled}"
-        );
-        assert!(
-            interpreted.contains(in_interpreted),
-            "{function} under the reference should still carry the branch: {interpreted}"
-        );
+        assert_eq!(compiled, interpreted, "{function} of the wide payload");
+        assert!(compiled.contains(expected), "{function}: {compiled}");
     }
 }
 
-/// Why the differential above cannot be closed by choosing differently inside
-/// clar2wasm.
+/// Local function admission sees the same runtime shape in both engines.
+///
+/// The reference casts every argument after charging the application and rejects
+/// the extra tuple field. Compiled local calls must do the same rather than pass
+/// only the projected slots into the callee.
+#[test]
+fn a_local_function_rejects_the_same_runtime_shaped_argument() {
+    let entry = serialized(&some_entry(true, true));
+    let (compiled, interpreted) = both_in(NARROWING_DEFAULT, "passed", &[entry]);
+    assert_eq!(compiled, interpreted, "local function argument admission");
+    assert!(
+        compiled.contains("TypeValueError") && compiled.contains("full"),
+        "the refusal must name the original wide value: {compiled}"
+    );
+}
+
+/// Why the compiler needs a runtime shape rather than one static tuple layout.
 ///
 /// `default-to` in the reference returns whichever value its branch produced,
 /// unconverted, so the *shape* of the answer follows the branch: the `some`
@@ -695,16 +656,8 @@ fn a_narrowed_default_parts_from_the_reference_only_where_it_must() {
 /// the expression's analysed type — `least_supertype` gave that the narrow one —
 /// and it is not any other single type either.
 ///
-/// clar2wasm fixes a value's representation from one static type. Narrowing,
-/// which is what it does, reproduces the `none` branch and loses a field on the
-/// `some` branch; widening would reproduce the `some` branch and have to invent
-/// a field on the other. Neither is the reference, so the disagreement is not a
-/// choice clar2wasm gets to make — it is `least_supertype` handing an expression
-/// a type its value need not have. Only the reference's own analysis or a
-/// sanitized return closes it; a shipped node can do neither.
-///
-/// Measured, and only on the interpreter, so it states the fact without freezing
-/// what clar2wasm answers.
+/// The hidden runtime handle is what lets compiled code preserve both answers;
+/// the projected static fields remain available to ordinary tuple consumers.
 #[test]
 fn the_reference_answer_here_has_no_single_static_layout() {
     let (_, wide) = both_in(
@@ -738,8 +691,8 @@ fn the_reference_answer_here_has_no_single_static_layout() {
 /// So the wide tuple `least_supertype` allows into existence is a value the
 /// reference's own runtime calls impossible: it can be returned, printed and
 /// compared, and it aborts the transaction as soon as it is passed anywhere.
-/// nano hands the narrowed tuple over and the call succeeds — measured in the
-/// ignored differential above, which covers this escape too.
+/// The compiled engine must reproduce both the refusal and the successful
+/// `none` branch; the cross-engine test above covers this escape too.
 #[test]
 fn the_reference_refuses_to_pass_the_wide_tuple_to_a_function() {
     let passed = |entry: &Value| both_in(NARROWING_DEFAULT, "passed", &[serialized(entry)]).1;
@@ -766,9 +719,7 @@ fn the_reference_refuses_to_pass_the_wide_tuple_to_a_function() {
 /// compares `TupleData`, type signature included, so the wide tuple is not equal
 /// to the narrow literal the `none` branch matches exactly.
 ///
-/// nano answers `(ok { soft: true })` with the var written, and `true`, to those
-/// two — measured in the ignored differential above. Only the reference's half
-/// is asserted here: it is the oracle, so it is the half that must not move.
+/// The cross-engine test above pins the compiler to these reference answers.
 #[test]
 fn the_reference_carries_the_branch_into_state_and_into_a_comparison() {
     let stored = |entry: &Value| both_in(NARROWING_DEFAULT, "store", &[serialized(entry)]).1;
@@ -816,9 +767,9 @@ fn a_default_to_with_nothing_to_narrow_is_unchanged() {
 /// `least_supertype_v2_1`'s tuple arm walks `a`'s fields and *errors*
 /// `TypeMismatch` on one `b` does not have, while silently dropping the ones `b`
 /// has and `a` does not (`clarity-types/src/types/signatures.rs`). So the
-/// asymmetry has exactly two sides, and only one of them is a divergence: with
-/// the narrower operand first the wider value escapes at run time, and with the
-/// wider operand first the contract does not deploy.
+/// asymmetry has exactly two sides: with the narrower operand first a
+/// runtime-shaped value escapes, and with the wider operand first the contract
+/// does not deploy.
 ///
 /// Asserted on both engines because the analyser is shared: whichever engine runs
 /// the block, this shape is refused before either gets a value to lay out. That
@@ -844,8 +795,7 @@ fn the_wider_operand_first_is_refused_before_it_runs() {
     }
 }
 
-/// Where the narrowed value can get to, which is the inventory the divergence has
-/// to be sized against.
+/// A runtime-shaped value can also cross a contract-call boundary.
 ///
 /// `special_contract_call` sanitizes its result against `type_of(&result)` — the
 /// value's *own* type, not the callee's analysed return type — so field dropping
@@ -900,10 +850,9 @@ const NARROWING_KINDS: &str = "
   (default-to { got: (ok u0) } entry))
 ";
 
-/// Each of the three, measured on both branches. The `some` branch is where the
-/// engines part; the `none` branch is where they must not.
+/// Each of the three, measured on both branches.
 #[test]
-fn every_narrowing_kind_parts_on_the_some_branch_only() {
+fn every_narrowing_kind_matches_on_both_branches() {
     let nested = Value::Tuple(
         TupleData::from_data(vec![
             (
@@ -955,14 +904,10 @@ fn every_narrowing_kind_parts_on_the_some_branch_only() {
 
         let entry = serialized(&Value::some(payload).expect("an optional"));
         let (compiled, interpreted) = both_in(NARROWING_KINDS, function, &[entry]);
-        assert_ne!(
-            compiled, interpreted,
-            "{function} on the some branch is the known divergence; if it has closed, \
-             close the accounting in tasks/mainnet/068 with it"
-        );
+        assert_eq!(compiled, interpreted, "{function} on the some branch");
         assert!(
-            interpreted.contains("047461696c"),
-            "the reference keeps the field the analysed type dropped: {interpreted}"
+            compiled.contains("047461696c"),
+            "the branch retains the field the analysed type omitted: {compiled}"
         );
     }
 }

@@ -12,7 +12,9 @@ use clarity::vm::types::{
     SequenceSubtype, StringSubtype, TraitIdentifier, TupleTypeSignature, TypeSignature,
 };
 use clarity::vm::variables::NativeVariables;
-use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType, functions, variables};
+use clarity::vm::{
+    functions, variables, ClarityName, ClarityVersion, SymbolicExpression, SymbolicExpressionType,
+};
 use walrus::ir::{
     BinaryOp, IfElse, InstrSeqId, InstrSeqType, LoadKind, MemArg, StoreKind, UnaryOp,
 };
@@ -25,8 +27,8 @@ use crate::cost::{ChargeContext, ChargeGenerator, WordCharge};
 use crate::duck_type::need_ducktyping;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_utils::{
-    ArgumentCountCheck, PRINCIPAL_BYTES_MAX, get_type_in_memory_size, get_type_size,
-    signature_from_string, trait_identifier_as_bytes,
+    get_type_in_memory_size, get_type_size, signature_from_string, trait_identifier_as_bytes,
+    ArgumentCountCheck, PRINCIPAL_BYTES_MAX,
 };
 use crate::{check_args, debug_msg, words};
 
@@ -96,6 +98,8 @@ pub struct WasmGenerator {
     /// to be available on the stack.
     max_work_space: u32,
     local_pool: Rc<RefCell<LocalPool>>,
+    /// Reusable locals allocated while emitting each nested expression.
+    expression_locals: Vec<Vec<LocalId>>,
     /// Peak live locals measured per generated function.
     pub(crate) locals_report: Rc<RefCell<LocalsReport>>,
     /// Maximum flattened arities encountered before wide values are packed.
@@ -107,9 +111,9 @@ pub struct WasmGenerator {
     /// The binding id introduced by each binding-name expression, by the
     /// expression's AST id.
     pub(crate) binding_ids: HashMap<u64, u32>,
-    /// `let` scopes whose bindings spill to the frame, by the scope
+    /// `let`/`match` bindings that spill to the frame, by the binding-name
     /// expression's AST id.
-    pub(crate) spilled_scopes: HashSet<u64>,
+    pub(crate) spilled_bindings: HashSet<u64>,
     /// Spill-area bytes reserved at each function's entry, by function name
     /// (`.top-level` for the contract body).
     spill_sizes: HashMap<String, u32>,
@@ -120,12 +124,10 @@ pub struct WasmGenerator {
     pub(crate) spill_cursor: u32,
 }
 
-/// A `let`/`match` scope introducing more than this many bindings keeps its
-/// bindings in the function's frame (one constant-offset memory slot each)
-/// instead of in wasm locals, so that no source the analyzer accepts can
-/// reach the runtime's 50,000-locals-per-function limit through scope width
-/// alone. Far above any scope a normal contract writes, far below the limit.
-const SPILL_SCOPE_THRESHOLD: usize = 1_000;
+/// Maximum flattened slots kept in wasm locals for lexically live bindings.
+/// The remaining validator headroom covers parameters and compiler
+/// temporaries; bindings beyond this conservative budget live in the frame.
+const BINDING_LOCAL_BUDGET: usize = 1_000;
 
 /// Counts the reads of every lexically introduced binding (`let` and
 /// `match` names) in the contract's expressions, so that code generation
@@ -135,23 +137,20 @@ const SPILL_SCOPE_THRESHOLD: usize = 1_000;
 /// whichever order the two visits happen in. Function parameters are not
 /// counted: they stay live for their whole body.
 ///
-/// The same walk marks the scopes wide enough to spill
-/// (`SPILL_SCOPE_THRESHOLD`) and sizes each function's spill area, both of
-/// which code generation must know before the function's body is emitted.
+/// A second walk plans individual spills from the finalized use counts and
+/// flattened slot widths. This catches one wide composite, cumulative nested
+/// scopes, and `match` payloads as well as a flat, many-name `let`.
 #[derive(Debug, Default)]
 struct BindingUses {
     uses: Vec<u32>,
     ids: HashMap<u64, u32>,
     /// Bindings in scope during the walk, innermost last.
     scopes: HashMap<ClarityName, Vec<u32>>,
-    /// Wide scopes whose bindings spill to the frame, by the scope
-    /// expression's AST id.
+    /// Bindings whose values spill to the frame, by binding-name expression id.
     spilled: HashSet<u64>,
     /// Spill-area bytes to reserve at each function's entry, by function
     /// name (`.top-level` for the contract body).
     spill_sizes: HashMap<String, u32>,
-    /// The function whose body is being walked.
-    current_fn: String,
 }
 
 impl BindingUses {
@@ -159,13 +158,16 @@ impl BindingUses {
         expressions: &[SymbolicExpression],
         get_ty: impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
     ) -> Self {
-        let mut uses = Self {
-            current_fn: ".top-level".to_owned(),
-            ..Self::default()
-        };
+        let mut uses = Self::default();
         for expr in expressions {
             uses.walk(expr, &get_ty);
         }
+        let mut planner = SpillPlanner::new(&uses.uses, &uses.ids);
+        for expr in expressions {
+            planner.walk(expr, &get_ty);
+        }
+        uses.spilled = planner.spilled;
+        uses.spill_sizes = planner.spill_sizes;
         uses
     }
 
@@ -194,14 +196,13 @@ impl BindingUses {
                     self.uses[id as usize] += 1;
                 }
             }
-            SymbolicExpressionType::List(list) => self.walk_list(expr.id, list, get_ty),
+            SymbolicExpressionType::List(list) => self.walk_list(list, get_ty),
             _ => {}
         }
     }
 
     fn walk_list(
         &mut self,
-        expr_id: u64,
         list: &[SymbolicExpression],
         get_ty: &impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
     ) {
@@ -254,18 +255,6 @@ impl BindingUses {
                 for expr in args.get(1..).unwrap_or(&[]) {
                     self.walk(expr, get_ty);
                 }
-                // Counts are final once the body is walked. A wide scope
-                // spills every binding anything reads to the frame.
-                if bound.len() > SPILL_SCOPE_THRESHOLD {
-                    self.spilled.insert(expr_id);
-                    let size: u32 = bound
-                        .iter()
-                        .filter(|(_, id, _)| self.uses[*id as usize] > 0)
-                        .filter_map(|(_, _, ty)| ty.as_ref())
-                        .map(|ty| get_type_size(ty) as u32)
-                        .sum();
-                    *self.spill_sizes.entry(self.current_fn.clone()).or_default() += size;
-                }
                 for (name, _, _) in bound.iter().rev() {
                     self.unbind(name);
                 }
@@ -291,30 +280,149 @@ impl BindingUses {
                     self.walk(&args[4], get_ty);
                 }
             }
-            // A function body is walked as its own function: spill areas
-            // are per-frame.
             "define-public" | "define-read-only" | "define-private" => {
-                let outer = match args.first() {
-                    Some(SymbolicExpression {
-                        expr: SymbolicExpressionType::List(signature),
-                        ..
-                    }) => match signature.first() {
-                        Some(SymbolicExpression {
-                            expr: SymbolicExpressionType::Atom(name),
-                            ..
-                        }) => std::mem::replace(&mut self.current_fn, name.as_str().to_owned()),
-                        _ => self.current_fn.clone(),
-                    },
-                    _ => self.current_fn.clone(),
-                };
                 for expr in args {
                     self.walk(expr, get_ty);
                 }
-                self.current_fn = outer;
             }
             _ => {
                 for expr in list {
                     self.walk(expr, get_ty);
+                }
+            }
+        }
+    }
+}
+
+struct SpillPlanner<'a> {
+    uses: &'a [u32],
+    ids: &'a HashMap<u64, u32>,
+    spilled: HashSet<u64>,
+    spill_sizes: HashMap<String, u32>,
+    current_fn: String,
+    live_slots: usize,
+}
+
+impl<'a> SpillPlanner<'a> {
+    fn new(uses: &'a [u32], ids: &'a HashMap<u64, u32>) -> Self {
+        Self {
+            uses,
+            ids,
+            spilled: HashSet::new(),
+            spill_sizes: HashMap::new(),
+            current_fn: ".top-level".to_owned(),
+            live_slots: 0,
+        }
+    }
+
+    fn plan_binding(&mut self, name: &SymbolicExpression, ty: Option<&TypeSignature>) -> usize {
+        let Some(id) = self.ids.get(&name.id).copied() else {
+            return 0;
+        };
+        if self.uses.get(id as usize).copied().unwrap_or(0) == 0 {
+            return 0;
+        }
+        let Some(ty) = ty else { return 0 };
+        let slots = clar2wasm_ty(ty).len();
+        if self.live_slots.saturating_add(slots) <= BINDING_LOCAL_BUDGET {
+            self.live_slots += slots;
+            return slots;
+        }
+        self.spilled.insert(name.id);
+        let bytes = u32::try_from(get_type_size(ty)).unwrap_or(u32::MAX);
+        let size = self.spill_sizes.entry(self.current_fn.clone()).or_default();
+        *size = size.saturating_add(bytes);
+        0
+    }
+
+    fn walk(
+        &mut self,
+        expr: &SymbolicExpression,
+        get_ty: &impl Fn(&SymbolicExpression) -> Option<TypeSignature>,
+    ) {
+        let SymbolicExpressionType::List(list) = &expr.expr else {
+            return;
+        };
+        let Some((head, args)) = list.split_first() else {
+            return;
+        };
+        let SymbolicExpressionType::Atom(head) = &head.expr else {
+            for item in list {
+                self.walk(item, get_ty);
+            }
+            return;
+        };
+        match head.as_str() {
+            "let" => {
+                let mut local_slots = 0;
+                if let Some(SymbolicExpression {
+                    expr: SymbolicExpressionType::List(bindings),
+                    ..
+                }) = args.first()
+                {
+                    for pair in bindings {
+                        let SymbolicExpressionType::List(pair) = &pair.expr else {
+                            continue;
+                        };
+                        let [name, value] = pair.as_slice() else {
+                            continue;
+                        };
+                        self.walk(value, get_ty);
+                        local_slots += self.plan_binding(name, get_ty(value).as_ref());
+                    }
+                }
+                for body in args.get(1..).unwrap_or(&[]) {
+                    self.walk(body, get_ty);
+                }
+                self.live_slots = self.live_slots.saturating_sub(local_slots);
+            }
+            "match" if args.len() == 4 || args.len() == 5 => {
+                self.walk(&args[0], get_ty);
+                let match_type = get_ty(&args[0]);
+                let (success_ty, error_ty) = match match_type.as_ref() {
+                    Some(TypeSignature::OptionalType(inner)) => (Some(inner.as_ref()), None),
+                    Some(TypeSignature::ResponseType(inner)) => (Some(&inner.0), Some(&inner.1)),
+                    _ => (None, None),
+                };
+                // Response code generation captures both payloads before it
+                // selects a branch, so both count as live at the same point.
+                let error_slots = if args.len() == 5 {
+                    self.plan_binding(&args[3], error_ty)
+                } else {
+                    0
+                };
+                let success_slots = self.plan_binding(&args[1], success_ty);
+                self.walk(&args[2], get_ty);
+                self.walk(args.last().expect("match has a final branch"), get_ty);
+                self.live_slots = self
+                    .live_slots
+                    .saturating_sub(success_slots.saturating_add(error_slots));
+            }
+            "define-public" | "define-read-only" | "define-private" => {
+                let outer_fn = self.current_fn.clone();
+                let outer_slots = std::mem::replace(&mut self.live_slots, 0);
+                if let Some(SymbolicExpression {
+                    expr: SymbolicExpressionType::List(signature),
+                    ..
+                }) = args.first()
+                {
+                    if let Some(SymbolicExpression {
+                        expr: SymbolicExpressionType::Atom(name),
+                        ..
+                    }) = signature.first()
+                    {
+                        self.current_fn = name.as_str().to_owned();
+                    }
+                }
+                for item in args {
+                    self.walk(item, get_ty);
+                }
+                self.current_fn = outer_fn;
+                self.live_slots = outer_slots;
+            }
+            _ => {
+                for item in list {
+                    self.walk(item, get_ty);
                 }
             }
         }
@@ -340,10 +448,11 @@ struct InnerBindings {
 #[derive(Debug, Clone)]
 pub(crate) enum BindingStorage {
     Locals(Vec<LocalId>),
-    /// A constant byte offset into the function's frame spill area, used by
-    /// scopes wide enough that one wasm local per leaf would hit the
-    /// runtime's locals limit. The binding declares no wasm locals.
-    Spilled {
+    /// A constant byte offset from a memory base. This covers planned frame
+    /// spills and packed function parameters without flattening either into
+    /// wasm locals.
+    Memory {
+        base: LocalId,
         delta: u32,
     },
 }
@@ -351,16 +460,6 @@ pub(crate) enum BindingStorage {
 impl Bindings {
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn insert(
-        &mut self,
-        name: ClarityName,
-        ty: TypeSignature,
-        locals: Vec<LocalId>,
-        binding: Option<u32>,
-    ) {
-        self.insert_spilled(name, ty, BindingStorage::Locals(locals), binding);
     }
 
     pub(crate) fn insert_spilled(
@@ -811,6 +910,7 @@ impl Deref for BorrowedLocal {
 #[derive(Debug, Default)]
 pub(crate) struct LocalPool {
     free: HashMap<ValType, Vec<LocalId>>,
+    in_use: HashSet<LocalId>,
     live: u32,
     max_live: u32,
 }
@@ -818,10 +918,17 @@ pub(crate) struct LocalPool {
 impl LocalPool {
     fn take(&mut self, ty: ValType) -> Option<LocalId> {
         let local = self.free.get_mut(&ty).and_then(Vec::pop);
-        if local.is_some() {
+        if let Some(local) = local {
+            self.in_use.insert(local);
             self.note_live(1);
+            return Some(local);
         }
-        local
+        None
+    }
+
+    fn add(&mut self, local: LocalId) {
+        self.in_use.insert(local);
+        self.note_live(1);
     }
 
     fn note_live(&mut self, count: u32) {
@@ -830,44 +937,174 @@ impl LocalPool {
     }
 
     fn give_back(&mut self, ty: ValType, local: LocalId) {
+        if !self.in_use.remove(&local) {
+            return;
+        }
         self.live -= 1;
         self.free.entry(ty).or_default().push(local);
     }
 
-    /// Zero the live counts, returning their previous values so that
-    /// generating a function nested inside another one does not disturb the
-    /// caller's count.
-    fn reset_counts(&mut self) -> (u32, u32) {
-        let saved = (self.live, self.max_live);
-        self.live = 0;
-        self.max_live = 0;
-        saved
+    /// Give a generated function its own local namespace. Locals are scoped to
+    /// one Wasm function, so reusing a `LocalId` from the contract body or a
+    /// previously generated function is invalid even when its Rust lifetime
+    /// has ended.
+    fn enter_function(&mut self) -> Self {
+        std::mem::take(self)
     }
 
     fn max_live(&self) -> u32 {
         self.max_live
     }
 
-    /// Restore counts saved by `reset_counts`, returning the peak reached
-    /// since the reset.
-    fn restore_counts(&mut self, saved: (u32, u32)) -> u32 {
-        let peak = self.max_live;
-        self.live = saved.0;
-        self.max_live = saved.1;
-        peak
+    /// Restore the enclosing function's namespace and return this function's
+    /// peak.
+    fn leave_function(&mut self, outer: Self) -> u32 {
+        let function = std::mem::replace(self, outer);
+        function.max_live
     }
 }
 
-/// The peak number of simultaneously live locals each generated function
-/// reached, keyed by function name (`.top-level` for the contract body).
+/// Local use in a compiled contract.
 ///
-/// wasmtime refuses to load a module with a function declaring more than
-/// 50,000 locals, so the margin to that limit is a property of the contract
-/// worth measuring. This is measurement only: nothing refuses compilation
+/// `max_live_locals` is the compiler pool's peak and is useful when evaluating
+/// reuse. `emitted` is parsed from the final Wasm bytes and is the exact count
+/// the validator sees. This is measurement only: nothing refuses compilation
 /// based on it.
 #[derive(Debug, Clone, Default)]
 pub struct LocalsReport {
     pub max_live_locals: HashMap<String, u32>,
+    /// Exact parameter and declared-local counts parsed from the emitted Wasm.
+    pub emitted: HashMap<String, EmittedLocals>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmittedLocals {
+    pub parameters: u32,
+    pub declared: u32,
+    pub total: u32,
+}
+
+impl LocalsReport {
+    /// Measure the module bytes the runtime will validate.
+    pub fn measure_emitted(&mut self, wasm: &[u8]) -> Result<(), String> {
+        use wasmparser::{ExternalKind, Name, NameSectionReader, Parser, Payload, TypeRef};
+
+        let mut parameter_counts = Vec::new();
+        let mut imported_functions = 0_u32;
+        let mut function_types = Vec::new();
+        let mut declared_locals = Vec::new();
+        let mut names = HashMap::new();
+        let mut exports = HashMap::new();
+
+        for payload in Parser::new(0).parse_all(wasm) {
+            match payload.map_err(|error| error.to_string())? {
+                Payload::TypeSection(types) => {
+                    for ty in types.into_iter_err_on_gc_types() {
+                        let parameters =
+                            u32::try_from(ty.map_err(|error| error.to_string())?.params().len())
+                                .map_err(|_| "function parameter count exceeds u32".to_owned())?;
+                        parameter_counts.push(parameters);
+                    }
+                }
+                Payload::ImportSection(imports) => {
+                    for import in imports {
+                        if matches!(
+                            import.map_err(|error| error.to_string())?.ty,
+                            TypeRef::Func(_)
+                        ) {
+                            imported_functions = imported_functions
+                                .checked_add(1)
+                                .ok_or_else(|| "imported function count exceeds u32".to_owned())?;
+                        }
+                    }
+                }
+                Payload::FunctionSection(functions) => {
+                    for function in functions {
+                        function_types.push(function.map_err(|error| error.to_string())?);
+                    }
+                }
+                Payload::CodeSectionEntry(body) => {
+                    let mut declared = 0_u32;
+                    for local in body
+                        .get_locals_reader()
+                        .map_err(|error| error.to_string())?
+                    {
+                        let (count, _) = local.map_err(|error| error.to_string())?;
+                        declared = declared
+                            .checked_add(count)
+                            .ok_or_else(|| "declared local count exceeds u32".to_owned())?;
+                    }
+                    declared_locals.push(declared);
+                }
+                Payload::ExportSection(section) => {
+                    for export in section {
+                        let export = export.map_err(|error| error.to_string())?;
+                        if export.kind == ExternalKind::Func {
+                            exports.insert(export.index, export.name.to_owned());
+                        }
+                    }
+                }
+                Payload::CustomSection(section) if section.name() == "name" => {
+                    for subsection in NameSectionReader::new(section.data(), section.data_offset())
+                    {
+                        if let Name::Function(map) =
+                            subsection.map_err(|error| error.to_string())?
+                        {
+                            for naming in map {
+                                let naming = naming.map_err(|error| error.to_string())?;
+                                names.insert(naming.index, naming.name.to_owned());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if function_types.len() != declared_locals.len() {
+            return Err(format!(
+                "function/code section mismatch: {} types for {} bodies",
+                function_types.len(),
+                declared_locals.len()
+            ));
+        }
+        self.emitted.clear();
+        for (defined_index, (type_index, declared)) in
+            function_types.into_iter().zip(declared_locals).enumerate()
+        {
+            let function_index = imported_functions
+                .checked_add(
+                    u32::try_from(defined_index)
+                        .map_err(|_| "defined function count exceeds u32".to_owned())?,
+                )
+                .ok_or_else(|| "function index exceeds u32".to_owned())?;
+            let parameters = *parameter_counts.get(type_index as usize).ok_or_else(|| {
+                format!("function {function_index} has unknown type {type_index}")
+            })?;
+            let total = parameters
+                .checked_add(declared)
+                .ok_or_else(|| format!("function {function_index} local total exceeds u32"))?;
+            let base = names
+                .get(&function_index)
+                .or_else(|| exports.get(&function_index))
+                .cloned()
+                .unwrap_or_else(|| format!("function-{function_index}"));
+            let label = if self.emitted.contains_key(&base) {
+                format!("{base}#{function_index}")
+            } else {
+                base
+            };
+            self.emitted.insert(
+                label,
+                EmittedLocals {
+                    parameters,
+                    declared,
+                    total,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Maximum flattened WebAssembly arities in a compiled Clarity contract.
@@ -911,6 +1148,25 @@ impl WasmGenerator {
         let (value_size, _) =
             module.add_import_func("clarity", "runtime_value_size", save_shape_ty);
         module.funcs.get_mut(value_size).name = Some("stdlib.runtime_value_size".to_owned());
+        let (element_size, _) =
+            module.add_import_func("clarity", "runtime_sequence_element_size", save_shape_ty);
+        module.funcs.get_mut(element_size).name =
+            Some("stdlib.runtime_sequence_element_size".to_owned());
+        let admit_argument_ty = module.types.add(
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[],
+        );
+        let (admit_argument, _) =
+            module.add_import_func("clarity", "admit_function_argument", admit_argument_ty);
+        module.funcs.get_mut(admit_argument).name =
+            Some("stdlib.admit_function_argument".to_owned());
         let shape_equal_ty = module.types.add(
             &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             &[ValType::I32],
@@ -952,11 +1208,12 @@ impl WasmGenerator {
             datavars_types: HashMap::new(),
             maps_types: HashMap::new(),
             local_pool: Rc::new(RefCell::new(LocalPool::default())),
+            expression_locals: Vec::new(),
             locals_report: Rc::new(RefCell::new(LocalsReport::default())),
             arity_report: Rc::new(RefCell::new(ArityReport::default())),
             binding_uses: Vec::new(),
             binding_ids: HashMap::new(),
-            spilled_scopes: HashSet::new(),
+            spilled_bindings: HashSet::new(),
             spill_sizes: HashMap::new(),
             frame_pointer: None,
             spill_cursor: 0,
@@ -1005,7 +1262,6 @@ impl WasmGenerator {
             write_length: wl,
             runtime_error: get_function(module, "stdlib.runtime-error")?,
         });
-
         Ok(generator)
     }
 
@@ -1039,7 +1295,7 @@ impl WasmGenerator {
             BindingUses::compute(&expressions, |expr| self.get_expr_type(expr).cloned());
         self.binding_uses = binding_uses.uses;
         self.binding_ids = binding_uses.ids;
-        self.spilled_scopes = binding_uses.spilled;
+        self.spilled_bindings = binding_uses.spilled;
         self.spill_sizes = binding_uses.spill_sizes;
 
         // Get the type of the last top-level expression with a return value.
@@ -1175,14 +1431,21 @@ impl WasmGenerator {
         builder: &mut InstrSeqBuilder,
         expr: &SymbolicExpression,
     ) -> Result<(), GeneratorError> {
-        match &expr.expr {
+        self.expression_locals.push(Vec::new());
+        let result = match &expr.expr {
             SymbolicExpressionType::Atom(name) => self.visit_atom(builder, expr, name),
             SymbolicExpressionType::List(exprs) => self.traverse_list(builder, expr, exprs),
             SymbolicExpressionType::LiteralValue(value) => {
                 self.visit_literal_value(builder, expr, value)
             }
             _ => Ok(()),
-        }
+        };
+        let locals = self
+            .expression_locals
+            .pop()
+            .expect("an expression local scope was pushed");
+        self.release_locals(locals);
+        result
     }
 
     /// Traverse an expression whose value the interpreter reads in place, so a
@@ -1225,13 +1488,8 @@ impl WasmGenerator {
         })?;
         let values = match storage {
             BindingStorage::Locals(values) => values,
-            BindingStorage::Spilled { delta } => {
-                let frame_pointer = self.frame_pointer.ok_or_else(|| {
-                    GeneratorError::InternalError(
-                        "spilled binding read outside of its frame".to_owned(),
-                    )
-                })?;
-                self.read_from_memory(builder, frame_pointer, delta, &ty)?;
+            BindingStorage::Memory { base, delta } => {
+                self.read_from_memory(builder, base, delta, &ty)?;
                 let values = self.save_to_locals(builder, &ty, true);
                 for value in &values {
                     builder.local_get(*value);
@@ -1413,10 +1671,7 @@ impl WasmGenerator {
                 None => format!("unable to find function type for {}", name.as_str()),
             }));
         };
-        let external_entry = matches!(kind, FunctionKind::Public | FunctionKind::ReadOnly);
-        if external_entry {
-            self.max_argument_sizes = self.max_argument_sizes.max(function_type.args.len());
-        }
+        self.max_argument_sizes = self.max_argument_sizes.max(function_type.args.len());
 
         self.current_function_type = Some(function_type.clone());
         {
@@ -1435,7 +1690,7 @@ impl WasmGenerator {
 
         // Count live locals from zero for this function; the caller's counts
         // (the top-level's, for a define) are restored on the way out.
-        let saved_counts = (*self.local_pool).borrow_mut().reset_counts();
+        let outer_pool = (*self.local_pool).borrow_mut().enter_function();
 
         // Call the host interface to save this function
         // Arguments are kind (already pushed) and name (offset, length)
@@ -1461,22 +1716,41 @@ impl WasmGenerator {
             params_types.extend([ValType::I32, ValType::I32]);
             (arguments, result)
         });
+        let mut packed_argument_offset = 0_u32;
         for param in function_type.args.iter() {
             // Interpreter returns the first reused arg as NameAlreadyUsed argument
             if reused_arg.is_none() && bindings.contains(&param.name) {
                 reused_arg = Some(param.name.clone());
             }
 
-            let param_types = clar2wasm_ty(&param.signature);
-            let mut plocals = Vec::with_capacity(param_types.len());
-            for ty in param_types {
-                let local = self.module.locals.add(ty);
-                plocals.push(local);
-                if !packed_abi {
+            let storage = if let Some((arguments, _)) = packed_offsets {
+                let delta = packed_argument_offset;
+                packed_argument_offset = packed_argument_offset
+                    .checked_add(u32::try_from(get_type_size(&param.signature)).map_err(|_| {
+                        GeneratorError::InternalError(
+                            "negative packed parameter representation size".to_owned(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        GeneratorError::InternalError(
+                            "packed parameter representation overflow".to_owned(),
+                        )
+                    })?;
+                BindingStorage::Memory {
+                    base: arguments,
+                    delta,
+                }
+            } else {
+                let param_types = clar2wasm_ty(&param.signature);
+                let mut locals = Vec::with_capacity(param_types.len());
+                for ty in param_types {
+                    let local = self.module.locals.add(ty);
+                    locals.push(local);
                     param_locals.push(local);
                     params_types.push(ty);
                 }
-            }
+                BindingStorage::Locals(locals)
+            };
             // A public function receives a trait argument as a bare principal.
             let value_ty = if matches!(&kind, FunctionKind::Public)
                 && matches!(
@@ -1489,13 +1763,13 @@ impl WasmGenerator {
             };
             // Parameters are not counted by the use pre-pass: they stay live
             // for the whole body.
-            bindings.insert(
+            bindings.insert_spilled(
                 param.name.clone(),
                 param.signature.clone(),
-                plocals.clone(),
+                storage.clone(),
                 None,
             );
-            parameters.push((param.signature.clone(), value_ty, plocals));
+            parameters.push((param.signature.clone(), value_ty, storage));
         }
 
         // A call from outside writes this function's arguments into this
@@ -1553,55 +1827,46 @@ impl WasmGenerator {
             self.frame_pointer = Some(frame_pointer);
         }
 
-        if let Some((arguments_offset, _)) = packed_offsets {
-            let mut offset = 0;
-            for (_, value_type, locals) in &parameters {
-                let bytes_read =
-                    self.read_from_memory(&mut func_body, arguments_offset, offset, value_type)?;
-                offset += u32::try_from(bytes_read).map_err(|_| {
-                    GeneratorError::InternalError(
-                        "a Clarity value representation has a negative size".to_owned(),
-                    )
-                })?;
-                for local in locals.iter().rev() {
-                    func_body.local_set(*local);
-                }
-            }
-        }
-
         // Entering the function type-checks every argument it was given.
         self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
         let memory = self.get_memory()?;
-        for (index, (parameter_type, value_type, locals)) in parameters.iter().enumerate() {
+        for index in 0..parameters.len() {
             let size = self.borrow_local(ValType::I32);
-            if external_entry {
-                let offset = u32::try_from(index)
-                    .ok()
-                    .and_then(|index| index.checked_mul(4))
-                    .ok_or_else(|| {
-                        GeneratorError::InternalError(
-                            "function argument-size offset overflow".into(),
-                        )
-                    })?;
-                func_body
-                    .global_get(self.argument_sizes)
-                    .load(
-                        memory,
-                        LoadKind::I32 { atomic: false },
-                        MemArg { align: 4, offset },
-                    )
-                    .local_set(*size);
-            } else {
-                for local in locals {
-                    func_body.local_get(*local);
-                }
-                self.clarity_value_size_on_stack(&mut func_body, value_type)?;
-                func_body.local_set(*size);
-                for _ in clar2wasm_ty(parameter_type) {
-                    func_body.drop();
+            let offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .ok_or_else(|| {
+                    GeneratorError::InternalError("function argument-size offset overflow".into())
+                })?;
+            func_body
+                .global_get(self.argument_sizes)
+                .load(
+                    memory,
+                    LoadKind::I32 { atomic: false },
+                    MemArg { align: 4, offset },
+                )
+                .local_set(*size);
+            self.charge_inner_type_check(&mut func_body, *size)?;
+        }
+
+        // Clarity 2+ casts, sanitizes and admits every argument only after it
+        // has charged the complete application. Static slots alone cannot do
+        // that for a tuple or list whose hidden handle carries a wider runtime
+        // shape, so reconstruct those arguments through the shared host
+        // boundary before the body can read its bindings.
+        if self.contract_analysis.clarity_version >= ClarityVersion::Clarity2 {
+            for (index, (parameter_type, _, storage)) in parameters.iter().enumerate() {
+                if has_runtime_shape(parameter_type) {
+                    self.admit_runtime_shape_parameter(
+                        &mut func_body,
+                        parameter_type,
+                        storage,
+                        id_offset,
+                        id_length,
+                        index,
+                    )?;
                 }
             }
-            self.charge_inner_type_check(&mut func_body, *size)?;
         }
 
         // Setup the locals map for this function, saving the top-level map to
@@ -1642,7 +1907,10 @@ impl WasmGenerator {
         // its peak.
         let binding_locals = parameters
             .iter()
-            .map(|(_, _, locals)| locals.len() as u32)
+            .map(|(_, _, storage)| match storage {
+                BindingStorage::Locals(locals) => locals.len() as u32,
+                BindingStorage::Memory { .. } => 0,
+            })
             .sum::<u32>();
         (*self.local_pool).borrow_mut().note_live(
             binding_locals + u32::from(packed_abi) * 2 + 1 + u32::from(switches_sender) * 2,
@@ -1703,7 +1971,6 @@ impl WasmGenerator {
                 .local_get(caller_depth)
                 .call(self.func_by_name("stdlib.restore_principal_depth"));
         }
-
         // Restore the top-level locals map.
         self.bindings = top_level_locals;
 
@@ -1717,7 +1984,7 @@ impl WasmGenerator {
         self.packed_return_offset = None;
 
         // Record this function's peak and hand the counts back to the caller.
-        let peak = (*self.local_pool).borrow_mut().restore_counts(saved_counts);
+        let peak = (*self.local_pool).borrow_mut().leave_function(outer_pool);
         self.locals_report
             .borrow_mut()
             .max_live_locals
@@ -2392,7 +2659,7 @@ impl WasmGenerator {
         size: i32,
     ) -> (LocalId, i32) {
         // Save the offset (current stack pointer) into a local
-        let offset = self.module.locals.add(ValType::I32);
+        let offset = self.alloc_local(ValType::I32);
         builder
             // []
             .global_get(self.stack_pointer)
@@ -2455,14 +2722,18 @@ impl WasmGenerator {
     /// when one of the same type is available.
     pub(crate) fn alloc_local(&mut self, ty: ValType) -> LocalId {
         let reuse = (*self.local_pool).borrow_mut().take(ty);
-        match reuse {
+        let local = match reuse {
             Some(local) => local,
             None => {
                 let local = self.module.locals.add(ty);
-                (*self.local_pool).borrow_mut().note_live(1);
+                (*self.local_pool).borrow_mut().add(local);
                 local
             }
+        };
+        if let Some(scope) = self.expression_locals.last_mut() {
+            scope.push(local);
         }
+        local
     }
 
     /// Return `locals` previously obtained from `save_to_locals` or
@@ -2482,6 +2753,41 @@ impl WasmGenerator {
     /// expression, if it introduces a `let`/`match` binding.
     pub(crate) fn binding_id(&self, name_expr: &SymbolicExpression) -> Option<u32> {
         self.binding_ids.get(&name_expr.id).copied()
+    }
+
+    /// Capture a newly evaluated lexical binding without allowing its
+    /// flattened representation to consume the function's locals budget.
+    pub(crate) fn capture_binding_value(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        name_expr: &SymbolicExpression,
+        ty: &TypeSignature,
+    ) -> Result<(BindingStorage, Option<u32>), GeneratorError> {
+        let binding = self.binding_id(name_expr);
+        if binding.is_some_and(|id| self.binding_uses[id as usize] == 0) {
+            drop_value(builder, ty);
+            return Ok((BindingStorage::Locals(Vec::new()), binding));
+        }
+        if self.spilled_bindings.contains(&name_expr.id) {
+            let base = self.frame_pointer.ok_or_else(|| {
+                GeneratorError::InternalError(
+                    "spilled binding written outside of its frame".to_owned(),
+                )
+            })?;
+            let delta = self.spill_cursor;
+            let bytes = u32::try_from(get_type_size(ty)).map_err(|_| {
+                GeneratorError::InternalError("negative binding representation size".to_owned())
+            })?;
+            self.spill_cursor = self.spill_cursor.checked_add(bytes).ok_or_else(|| {
+                GeneratorError::InternalError("binding spill offset overflow".to_owned())
+            })?;
+            self.write_to_memory(builder, base, delta, ty)?;
+            return Ok((BindingStorage::Memory { base, delta }, binding));
+        }
+        Ok((
+            BindingStorage::Locals(self.save_to_locals(builder, ty, true)),
+            binding,
+        ))
     }
 
     /// Note a read of a binding's locals, returning them to the pool when it
@@ -3243,13 +3549,8 @@ impl WasmGenerator {
         // returning; the binding itself has no locals to free.
         let (values, spill_temps) = match storage {
             BindingStorage::Locals(values) => (values, false),
-            BindingStorage::Spilled { delta } => {
-                let frame_pointer = self.frame_pointer.ok_or_else(|| {
-                    GeneratorError::InternalError(
-                        "spilled binding read outside of its frame".to_owned(),
-                    )
-                })?;
-                self.read_from_memory(builder, frame_pointer, delta, &ty)?;
+            BindingStorage::Memory { base, delta } => {
+                self.read_from_memory(builder, base, delta, &ty)?;
                 (self.save_to_locals(builder, &ty, true), true)
             }
         };
@@ -3372,40 +3673,29 @@ impl WasmGenerator {
                 )));
             }
         };
-        let external_entry = self
-            .contract_analysis
-            .get_public_function_type(name.as_str())
-            .or_else(|| {
-                self.contract_analysis
-                    .get_read_only_function_type(name.as_str())
-            })
-            .is_some();
         let mut argument_sizes = Vec::new();
         for arg in args {
+            let value_ty = self.value_type_before_context(arg);
             self.traverse_expr(builder, arg)?;
-            if external_entry {
-                let size = self.borrow_local(ValType::I32);
-                if let SymbolicExpressionType::LiteralValue(value) = &arg.expr {
-                    let value_size = i32::try_from(
-                        value
-                            .size()
-                            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
-                    )
-                    .map_err(|_| {
-                        GeneratorError::InternalError(
-                            "literal argument size exceeds i32".to_owned(),
-                        )
-                    })?;
-                    builder.i32_const(value_size).local_set(*size);
-                } else {
-                    let ty = self.get_expr_type(arg).cloned().ok_or_else(|| {
-                        GeneratorError::TypeError("function argument must be typed".into())
-                    })?;
-                    self.clarity_value_size_on_stack(builder, &ty)?;
-                    builder.local_set(*size);
-                }
-                argument_sizes.push(size);
+            let size = self.borrow_local(ValType::I32);
+            if let SymbolicExpressionType::LiteralValue(value) = &arg.expr {
+                let value_size = i32::try_from(
+                    value
+                        .size()
+                        .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                )
+                .map_err(|_| {
+                    GeneratorError::InternalError("literal argument size exceeds i32".to_owned())
+                })?;
+                builder.i32_const(value_size).local_set(*size);
+            } else {
+                let value_ty = value_ty.ok_or_else(|| {
+                    GeneratorError::TypeError("function argument must be typed".into())
+                })?;
+                self.clarity_value_size_on_stack(builder, &value_ty)?;
+                builder.local_set(*size);
             }
+            argument_sizes.push(size);
         }
 
         let expected_ty = self
@@ -3420,7 +3710,7 @@ impl WasmGenerator {
             &return_ty,
             Some(&expected_ty),
             None,
-            external_entry.then_some(argument_sizes.as_slice()),
+            Some(argument_sizes.as_slice()),
         )?;
         Ok(())
     }
@@ -3445,7 +3735,7 @@ impl WasmGenerator {
         // if there is an in-memory type
         let in_memory_offset = has_in_memory_type(return_ty).then(|| {
             preallocated_memory.unwrap_or_else(|| {
-                let return_offset = self.module.locals.add(ValType::I32);
+                let return_offset = self.alloc_local(ValType::I32);
 
                 // in case there is an in-memory type to copy, we reserve some space in memory
                 let return_size = count_in_memory_space(return_ty) as i32;
@@ -3479,7 +3769,15 @@ impl WasmGenerator {
             .get_private_function(name.as_str())
             .is_some()
         {
-            self.local_call(builder, name)?;
+            self.write_argument_sizes(
+                builder,
+                argument_sizes.ok_or_else(|| {
+                    GeneratorError::InternalError(
+                        "private call is missing its argument sizes".into(),
+                    )
+                })?,
+            )?;
+            let _ = self.local_call(builder, name, true)?;
         } else {
             return Err(GeneratorError::TypeError(format!(
                 "function not found: {name}",
@@ -3501,9 +3799,10 @@ impl WasmGenerator {
             let locals = self.save_to_locals(builder, &expected_ty, true);
             self.copy_value(builder, &expected_ty, &locals, return_offset)?;
 
-            for l in locals {
-                builder.local_get(l);
+            for local in &locals {
+                builder.local_get(*local);
             }
+            self.release_locals(locals);
         }
 
         Ok(())
@@ -3514,7 +3813,8 @@ impl WasmGenerator {
         &mut self,
         builder: &mut InstrSeqBuilder,
         name: &ClarityName,
-    ) -> Result<(), GeneratorError> {
+        unpack_return: bool,
+    ) -> Result<Option<LocalId>, GeneratorError> {
         let function = self.user_functions.get(name).copied().ok_or_else(|| {
             GeneratorError::InternalError(format!("function {name} was not defined"))
         })?;
@@ -3529,55 +3829,52 @@ impl WasmGenerator {
         };
         if !uses_packed_abi(&function_type) {
             builder.call(function);
-            return Ok(());
+            return Ok(None);
         }
 
-        // Arguments are already on the operand stack in declaration order.
-        // Save them from the top down, then write their representations in
-        // declaration order into one bounded function argument.
-        let mut arguments = function_type
+        let arguments_size = function_type
             .args
             .iter()
-            .rev()
-            .map(|argument| {
-                (
-                    argument.signature.clone(),
-                    self.save_to_locals(builder, &argument.signature, true),
-                )
-            })
-            .collect::<Vec<_>>();
-        arguments.reverse();
-
-        let arguments_size = arguments
-            .iter()
-            .map(|(ty, _)| get_type_size(ty) as u32)
+            .map(|argument| get_type_size(&argument.signature) as u32)
             .sum::<u32>();
         let return_size = get_type_size(&function_type.returns);
         let (arguments_offset, _) =
             self.create_call_stack_bytes(builder, arguments_size as i32 + return_size);
-        let return_offset = self.module.locals.add(ValType::I32);
+        let return_offset = self.alloc_local(ValType::I32);
         builder
             .local_get(arguments_offset)
             .i32_const(arguments_size as i32)
             .binop(BinaryOp::I32Add)
             .local_set(return_offset);
 
+        let mut offsets = Vec::with_capacity(function_type.args.len());
         let mut offset = 0;
-        for (ty, locals) in arguments {
-            for local in &locals {
-                builder.local_get(*local);
-            }
-            offset += self.write_to_memory(builder, arguments_offset, offset, &ty)?;
-            self.release_locals(locals);
+        for argument in &function_type.args {
+            offsets.push(offset);
+            offset += u32::try_from(get_type_size(&argument.signature)).map_err(|_| {
+                GeneratorError::InternalError(
+                    "negative packed argument representation size".to_owned(),
+                )
+            })?;
+        }
+        // Arguments are on the operand stack in declaration order. Consume
+        // them from the top down directly into their fixed memory offsets;
+        // flattening them into locals recreates the validator limit the packed
+        // ABI exists to avoid.
+        for (argument, offset) in function_type.args.iter().zip(offsets).rev() {
+            self.write_to_memory(builder, arguments_offset, offset, &argument.signature)?;
         }
 
         builder
             .local_get(arguments_offset)
             .local_get(return_offset)
             .call(function);
-        self.read_from_memory(builder, return_offset, 0, &function_type.returns)?;
+        if unpack_return {
+            self.read_from_memory(builder, return_offset, 0, &function_type.returns)?;
+            return Ok(None);
+        }
 
-        Ok(())
+        Ok(Some(return_offset))
     }
 
     /// Call a public function defined in the current contract. This requires
@@ -3599,10 +3896,10 @@ impl WasmGenerator {
         // Call the host interface function, `begin_public_call`
         builder.call(self.func_by_name("stdlib.begin_public_call"));
 
-        self.local_call(builder, name)?;
-
-        // Save the result to a local
-        let result_locals = self.save_to_locals(builder, return_ty, true);
+        let packed_return = self.local_call(builder, name, false)?;
+        let result_locals = packed_return
+            .is_none()
+            .then(|| self.save_to_locals(builder, return_ty, true));
 
         // If the result is an `ok`, then we can commit the call, and if it
         // is an `err`, then we roll it back. `result_locals[0]` is the
@@ -3619,21 +3916,40 @@ impl WasmGenerator {
             else_case.id()
         };
 
-        builder.local_get(result_locals[0]).instr(IfElse {
+        if let Some(return_offset) = packed_return {
+            builder.local_get(return_offset).load(
+                self.get_memory()?,
+                LoadKind::I32 { atomic: false },
+                MemArg {
+                    align: 4,
+                    offset: 0,
+                },
+            );
+        } else if let Some(result_locals) = &result_locals {
+            builder.local_get(result_locals[0]);
+        }
+        builder.instr(IfElse {
             consequent: if_id,
             alternative: else_id,
         });
 
         // Restore the result to the top of the stack.
-        for local in &result_locals {
-            builder.local_get(*local);
+        if let Some(return_offset) = packed_return {
+            self.read_from_memory(builder, return_offset, 0, return_ty)?;
+        } else if let Some(result_locals) = result_locals {
+            for local in &result_locals {
+                builder.local_get(*local);
+            }
+            self.release_locals(result_locals);
         }
 
         Ok(())
     }
 
-    /// Return the type a value has before contextual widening. Constants,
-    /// bindings, and user-function results retain their source type here.
+    /// Return the type an argument has before a user-function entry casts it to
+    /// the parameter type. The analyzer records the contextual type at the call
+    /// site, so constants, bindings, and user-function results need their own
+    /// source type here to reproduce the interpreter's entry charge.
     pub(crate) fn value_type_before_context(
         &self,
         expr: &SymbolicExpression,
@@ -3658,20 +3974,8 @@ impl WasmGenerator {
         }
     }
 
-    /// Whether a function of this contract is entered the way a transaction
-    /// enters it.
-    ///
-    /// A public or read-only function reads each argument's size out of the
-    /// `argument-sizes` region rather than measuring the value itself, so every
-    /// call to one has to put them there — including the calls that do not look
-    /// like calls. `fold` and `map` apply a *named* function, and when that name
-    /// is a public or read-only one they reach the same prologue by the same
-    /// path ([[099-measure-the-arguments-fold-and-map-hand-to-a-function]]).
-    pub(crate) fn is_external_entry(&self, name: &str) -> bool {
-        self.contract_analysis
-            .get_public_function_type(name)
-            .or_else(|| self.contract_analysis.get_read_only_function_type(name))
-            .is_some()
+    pub(crate) fn is_user_defined_function(&self, name: &str) -> bool {
+        self.get_function_type(name).is_some()
     }
 
     /// Measure the value on top of the stack and keep the size for the callee.
@@ -3687,6 +3991,58 @@ impl WasmGenerator {
         self.clarity_value_size_on_stack(builder, ty)?;
         builder.local_set(*size);
         Ok(size)
+    }
+
+    fn admit_runtime_shape_parameter(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        storage: &BindingStorage,
+        function_name_offset: u32,
+        function_name_length: u32,
+        argument_index: usize,
+    ) -> Result<(), GeneratorError> {
+        match storage {
+            BindingStorage::Locals(locals) => {
+                for local in locals {
+                    builder.local_get(*local);
+                }
+            }
+            BindingStorage::Memory { base, delta } => {
+                self.read_from_memory(builder, *base, *delta, ty)?;
+            }
+        }
+
+        // The host first reads the original value, so it can safely overwrite
+        // this region with the admitted representation and its pointed data.
+        // The region remains in the callee frame for the whole function body.
+        let (value_offset, _) = self.create_call_stack_local(builder, ty, true, true);
+        self.write_to_memory(builder, value_offset, 0, ty)?;
+        let (type_offset, type_length) = self.serialized_type(ty)?;
+        let argument_index = i32::try_from(argument_index).map_err(|_| {
+            GeneratorError::InternalError("function argument index exceeds i32".into())
+        })?;
+        builder
+            .local_get(value_offset)
+            .i32_const(type_offset)
+            .i32_const(type_length)
+            .i32_const(function_name_offset as i32)
+            .i32_const(function_name_length as i32)
+            .i32_const(argument_index)
+            .call(self.func_by_name("stdlib.admit_function_argument"));
+        self.read_from_memory(builder, value_offset, 0, ty)?;
+
+        match storage {
+            BindingStorage::Locals(locals) => {
+                for local in locals.iter().rev() {
+                    builder.local_set(*local);
+                }
+            }
+            BindingStorage::Memory { base, delta } => {
+                self.write_to_memory(builder, *base, *delta, ty)?;
+            }
+        }
+        Ok(())
     }
 
     /// Call a read-only function defined in the current contract.
@@ -3706,7 +4062,7 @@ impl WasmGenerator {
         // Call the host interface function, `begin_readonly_call`
         builder.call(self.func_by_name("stdlib.begin_read_only_call"));
 
-        self.local_call(builder, name)?;
+        let _ = self.local_call(builder, name, true)?;
 
         // Call the host interface function, `roll_back_call`
         builder.call(self.func_by_name("stdlib.roll_back_call"));
@@ -3987,13 +4343,37 @@ mod tests {
     use crate::{
         compile,
         tools::{crosscheck, crosscheck_compare_only, crosscheck_cost, evaluate},
-        wasm_generator::END_OF_STANDARD_DATA,
+        wasm_generator::{EmittedLocals, LocalsReport, END_OF_STANDARD_DATA},
     };
+
+    #[test]
+    fn emitted_locals_are_measured_from_the_final_wasm() {
+        let wasm = wat::parse_str(
+            "(module
+                (import \"host\" \"f\" (func (param i32)))
+                (func $named (export \"named-export\")
+                    (param i32 i64)
+                    (local i32 i32 i64)))",
+        )
+        .expect("valid Wasm fixture");
+        let mut report = LocalsReport::default();
+        report
+            .measure_emitted(&wasm)
+            .expect("the final Wasm can be measured");
+        assert_eq!(
+            report.emitted.get("named"),
+            Some(&EmittedLocals {
+                parameters: 2,
+                declared: 3,
+                total: 5,
+            })
+        );
+    }
 
     fn one_exact_price_feed() -> Value {
         Value::some(
             Value::cons_list_unsanitized(vec![
-                Value::buff_from(vec![0x5a; 2_007]).expect("a valid price feed"),
+                Value::buff_from(vec![0x5a; 2_007]).expect("a valid price feed")
             ])
             .expect("a valid price-feed list"),
         )
@@ -4283,6 +4663,186 @@ mod tests {
             .expect("wasmtime loads the module");
     }
 
+    fn uint_tuple(fields: usize, values: bool) -> String {
+        (0..fields)
+            .map(|index| {
+                if values {
+                    format!("f{index}: u{index}")
+                } else {
+                    format!("f{index}: uint")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn loadable_report(source: &str, name: &str) -> LocalsReport {
+        let mut compiled = compile(
+            source,
+            &QualifiedContractIdentifier::new(
+                StandardPrincipalData::transient(),
+                ContractName::try_from(name.to_owned()).expect("generated contract name is valid"),
+            ),
+            LimitedCostTracker::new_free(),
+            ClarityVersion::latest(),
+            StacksEpochId::latest(),
+            &mut AnalysisDatabase::new(&mut MemoryBackingStore::new()),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("{name} compiles: {error:?}"));
+        let mut report = compiled.locals_report.clone();
+        let wasm = compiled.module.emit_wasm();
+        report
+            .measure_emitted(&wasm)
+            .unwrap_or_else(|error| panic!("{name} emitted locals are measurable: {error}"));
+        wasmtime::Module::new(&wasmtime::Engine::default(), wasm)
+            .unwrap_or_else(|error| panic!("{name} loads: {error}"));
+        report
+    }
+
+    fn loadable_peak(source: &str, name: &str) -> u32 {
+        loadable_report(source, name)
+            .max_live_locals
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn assert_emitted_locals_below_limit(source: &str, name: &str) {
+        let report = loadable_report(source, name);
+        let (function, measurement) = report
+            .emitted
+            .iter()
+            .max_by_key(|(_, measurement)| measurement.total)
+            .expect("a module defines functions");
+        assert!(
+            measurement.total < 50_000,
+            "{name} emitted {function} with {} parameters+locals",
+            measurement.total
+        );
+    }
+
+    fn emitted_function_locals(source: &str, contract: &str, function: &str) -> u32 {
+        let report = loadable_report(source, contract);
+        report
+            .emitted
+            .get(function)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{contract} emitted no {function:?} function; names were {:?}",
+                    report.emitted.keys().collect::<Vec<_>>()
+                )
+            })
+            .total
+    }
+
+    #[test]
+    fn cumulative_nested_bindings_spill_by_flattened_slots() {
+        let tuple = uint_tuple(300, true);
+        let source = format!(
+            "(define-read-only (f)
+               (let ((outer {{{tuple}}}))
+                 (let ((inner outer))
+                   (is-eq (get f0 outer) (get f0 inner)))))
+             (f)"
+        );
+        crosscheck_compare_only(&source);
+        assert!(loadable_peak(&source, "nested-spill") < 50_000);
+    }
+
+    #[test]
+    fn wide_optional_match_binding_stays_loadable() {
+        let tuple = uint_tuple(600, true);
+        let source = format!(
+            "(define-read-only (f (present bool))
+               (match (if present (some {{{tuple}}}) none)
+                 value (get f0 value)
+                 u0))
+             (list (f true) (f false))"
+        );
+        crosscheck_compare_only(&source);
+        assert!(loadable_peak(&source, "wide-optional-match") < 50_000);
+    }
+
+    #[test]
+    fn response_match_plans_both_payloads_together() {
+        let ok = uint_tuple(300, true);
+        let err = uint_tuple(300, true);
+        let source = format!(
+            "(define-read-only (f (succeed bool))
+               (match (if succeed (ok {{{ok}}}) (err {{{err}}}))
+                 ok-value (get f0 ok-value)
+                 err-value (get f0 err-value)))
+             (list (f true) (f false))"
+        );
+        crosscheck_compare_only(&source);
+        assert!(loadable_peak(&source, "wide-response-match") < 50_000);
+    }
+
+    #[test]
+    fn packed_parameters_never_expand_into_function_locals() {
+        let tuple_type = uint_tuple(600, false);
+        let tuple_value = uint_tuple(600, true);
+        let source = format!(
+            "(define-private (identity (value {{{tuple_type}}})) value)
+             (define-public (f) (ok (get f0 (identity {{{tuple_value}}}))))
+             (f)"
+        );
+        crosscheck_compare_only(&source);
+        assert!(loadable_peak(&source, "packed-parameter") < 50_000);
+    }
+
+    #[test]
+    fn sequential_wide_try_values_reuse_their_emitted_locals() {
+        let tuple = uint_tuple(600, true);
+        let calls = std::iter::repeat_n("(try! (wide))", 45)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!(
+            "(define-private (wide) (if true (ok {{{tuple}}}) (err u0)))
+             (define-public (f) (begin {calls} (ok true)))
+             (f)"
+        );
+        crosscheck_compare_only(&source);
+        assert_emitted_locals_below_limit(&source, "wide-sequential-try");
+    }
+
+    #[test]
+    fn packed_public_responses_are_inspected_without_flattening() {
+        let tuple = uint_tuple(600, true);
+        let calls = std::iter::repeat_n("(try! (wide))", 45)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!(
+            "(define-public (wide) (if true (ok {{{tuple}}}) (err u0)))
+             (define-public (f) (begin {calls} (ok true)))
+             (f)"
+        );
+        crosscheck_compare_only(&source);
+        assert_emitted_locals_below_limit(&source, "packed-public-response");
+        assert!(
+            emitted_function_locals(&source, "packed-public-response", "f") < 5_000,
+            "the public caller accumulated one flattened response per call"
+        );
+    }
+
+    #[test]
+    fn expression_temporaries_reuse_their_emitted_locals() {
+        let values = std::iter::repeat_n("tx-sender", 200)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!(
+            "(define-read-only (f) (begin {values}))
+             (f)"
+        );
+        crosscheck_compare_only(&source);
+        assert!(
+            emitted_function_locals(&source, "expression-temporaries", "f") < 100,
+            "a repeated native principal allocated one offset local per expression"
+        );
+    }
+
     #[test]
     fn more_wasm_returns_than_wasmtime_allows_uses_packed_abi_and_loads() {
         // A return value flattens to one wasm result per leaf value: one
@@ -4539,14 +5099,12 @@ mod tests {
         crosscheck(snippet, Ok(Some(clarity::vm::Value::Bool(true))));
 
         // issue 340 showed a bug for epoch < 2.1
-        assert!(
-            crate::tools::evaluate_at(
-                snippet,
-                clarity::types::StacksEpochId::Epoch20,
-                clarity::vm::version::ClarityVersion::Clarity1,
-            )
-            .is_ok()
-        );
+        assert!(crate::tools::evaluate_at(
+            snippet,
+            clarity::types::StacksEpochId::Epoch20,
+            clarity::vm::version::ClarityVersion::Clarity1,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -4632,9 +5190,10 @@ mod tests {
                 (
                     ClarityName::from_literal("fn"),
                     Value::error(
-                        Value::cons_list_unsanitized(vec![
-                            Value::string_utf8_from_bytes(b"foo".to_vec()).unwrap(),
-                        ])
+                        Value::cons_list_unsanitized(vec![Value::string_utf8_from_bytes(
+                            b"foo".to_vec(),
+                        )
+                        .unwrap()])
                         .unwrap(),
                     )
                     .unwrap(),

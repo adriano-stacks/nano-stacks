@@ -32,7 +32,8 @@ impl ComplexWord for IsEq {
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         let args_len = args.len();
-        let serialization_size_sum = generator.module.locals.add(ValType::I32);
+        let serialization_size_sum = generator.alloc_local(ValType::I32);
+        builder.i32_const(0).local_set(serialization_size_sum);
 
         check_args!(generator, builder, 1, args_len, ArgumentCountCheck::AtLeast);
         if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
@@ -123,7 +124,7 @@ impl ComplexWord for IsEq {
             drop_value(builder, &ty);
             builder.i32_const(1); // TRUE
         } else {
-            let equality_accumulator = generator.module.locals.add(ValType::I32);
+            let equality_accumulator = generator.alloc_local(ValType::I32);
             // Initialize boolean result accumulator to TRUE
             builder.i32_const(1).local_set(equality_accumulator);
 
@@ -252,8 +253,8 @@ fn wasm_equal_runtime_shape(
     })?;
     let first_offset_value = generator.reserve_static_memory(value_size);
     let second_offset_value = generator.reserve_static_memory(value_size);
-    let first_offset = generator.module.locals.add(ValType::I32);
-    let second_offset = generator.module.locals.add(ValType::I32);
+    let first_offset = generator.alloc_local(ValType::I32);
+    let second_offset = generator.alloc_local(ValType::I32);
 
     builder
         .i32_const(first_offset_value as i32)

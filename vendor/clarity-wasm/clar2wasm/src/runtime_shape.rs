@@ -39,17 +39,17 @@ impl RuntimeShapeArena {
         let index = usize::try_from(handle)
             .ok()
             .and_then(|handle| handle.checked_sub(1))
-            .ok_or_else(invalid_runtime_shape_handle)?;
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))?;
         self.values
             .get(index)
-            .ok_or_else(invalid_runtime_shape_handle)
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))
     }
 }
 
-fn invalid_runtime_shape_handle() -> VmExecutionError {
-    crate::error::wasm_error(WasmError::WasmGeneratorError(
-        "invalid runtime-shape handle".to_owned(),
-    ))
+fn invalid_runtime_shape_handle(handle: i32, entries: usize) -> VmExecutionError {
+    crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
+        "invalid runtime-shape handle {handle}; arena contains {entries} entries"
+    )))
 }
 
 pub trait RuntimeShapeStore {
@@ -65,7 +65,7 @@ pub trait RuntimeShapeStore {
 
     fn load_runtime_shape(&self, handle: i32) -> Result<Value, VmExecutionError> {
         self.runtime_shapes()
-            .ok_or_else(invalid_runtime_shape_handle)?
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, 0))?
             .get(handle)
             .cloned()
     }

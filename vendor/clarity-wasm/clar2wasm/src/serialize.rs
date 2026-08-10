@@ -115,13 +115,13 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         // Data stack: TOP | Length | Offset |
         // Save the offset/length to locals.
-        let poffset = self.module.locals.add(ValType::I32);
-        let plength = self.module.locals.add(ValType::I32);
+        let poffset = self.alloc_local(ValType::I32);
+        let plength = self.alloc_local(ValType::I32);
         builder.local_set(plength).local_set(poffset);
 
         // Create a local for the write pointer by adjusting the
         // offset local by the offset amount.
-        let write_ptr = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
         if offset > 0 {
             builder
                 .local_get(offset_local)
@@ -324,7 +324,7 @@ impl WasmGenerator {
         offset: u32,
     ) -> Result<(), GeneratorError> {
         // Save the bool to a local
-        let local = self.module.locals.add(ValType::I32);
+        let local = self.alloc_local(ValType::I32);
         builder.local_set(local);
 
         // Load the location to write to
@@ -439,9 +439,9 @@ impl WasmGenerator {
         list_ty: &ListTypeData,
     ) -> Result<(), GeneratorError> {
         // Data stack: TOP | Length | Offset |
-        let write_ptr = self.module.locals.add(ValType::I32);
-        let read_ptr = self.module.locals.add(ValType::I32);
-        let bytes_length = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
+        let read_ptr = self.alloc_local(ValType::I32);
+        let bytes_length = self.alloc_local(ValType::I32);
 
         // Write the type prefix to memory
         builder
@@ -570,9 +570,9 @@ impl WasmGenerator {
         offset: u32,
     ) -> Result<(), GeneratorError> {
         // Data stack: TOP | Length | Offset |
-        let write_ptr = self.module.locals.add(ValType::I32);
-        let read_ptr = self.module.locals.add(ValType::I32);
-        let length = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
+        let read_ptr = self.alloc_local(ValType::I32);
+        let length = self.alloc_local(ValType::I32);
 
         // Save the length and offset to locals
         builder.local_set(length).local_set(read_ptr);
@@ -637,9 +637,9 @@ impl WasmGenerator {
         offset: u32,
     ) -> Result<(), GeneratorError> {
         // Data stack: TOP | Length | Offset |
-        let write_ptr = self.module.locals.add(ValType::I32);
-        let read_ptr = self.module.locals.add(ValType::I32);
-        let length = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
+        let read_ptr = self.alloc_local(ValType::I32);
+        let length = self.alloc_local(ValType::I32);
 
         // Save the length and offset to locals
         builder.local_set(length).local_set(read_ptr);
@@ -704,10 +704,10 @@ impl WasmGenerator {
         offset: u32,
     ) -> Result<(), GeneratorError> {
         // Data stack: TOP | Length | Offset |
-        let write_ptr = self.module.locals.add(ValType::I32);
-        let read_ptr = self.module.locals.add(ValType::I32);
-        let length = self.module.locals.add(ValType::I32);
-        let utf8_length = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
+        let read_ptr = self.alloc_local(ValType::I32);
+        let length = self.alloc_local(ValType::I32);
+        let utf8_length = self.alloc_local(ValType::I32);
 
         // Save the length and offset to locals
         builder.local_set(length).local_set(read_ptr);
@@ -779,7 +779,7 @@ impl WasmGenerator {
         // representation of a tuple, so we get the keys from the type
         // and the values from the data stack.
 
-        let write_ptr = self.module.locals.add(ValType::I32);
+        let write_ptr = self.alloc_local(ValType::I32);
 
         // First, save the values to locals, so that we can get them in
         // the correct order.

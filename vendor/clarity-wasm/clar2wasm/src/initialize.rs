@@ -1,7 +1,7 @@
 use clarity::vm::analysis::ContractAnalysis;
 use clarity::vm::contexts::GlobalContext;
 use clarity::vm::costs::cost_functions::ClarityCostFunction;
-use clarity::vm::costs::{CostTracker, runtime_cost};
+use clarity::vm::costs::{runtime_cost, CostTracker};
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::events::*;
 use clarity::vm::types::signatures::CallableSubtype;
@@ -11,8 +11,8 @@ use clarity::vm::types::{
     TupleData, TypeSignature,
 };
 use clarity::vm::{CallStack, ContractContext, Value};
-use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::StacksEpochId;
 use wasmtime::{AsContextMut, Linker, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
@@ -566,6 +566,40 @@ fn charge_refused_application(
     Ok(())
 }
 
+/// Apply the same Clarity 2+ function-entry conversion as the interpreter.
+///
+/// The original value is kept for the refusal because that is what
+/// `DefinedFunction::execute_apply` names when an implicit cast or Epoch 4
+/// sanitization fails.
+pub(crate) fn admit_function_argument(
+    expected_type: &TypeSignature,
+    argument: &Value,
+    epoch: StacksEpochId,
+) -> Result<Value, VmExecutionError> {
+    let cast_argument = implicit_contract_cast(expected_type, argument)?;
+    let admitted = if epoch.sanitize_in_function_invocation() {
+        Value::sanitize_value(&epoch, expected_type, cast_argument)
+            .ok_or_else(|| {
+                clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
+                    Box::new(expected_type.clone()),
+                    argument.to_error_string(),
+                )
+            })?
+            .0
+    } else {
+        cast_argument
+    };
+
+    if !expected_type.admits(&epoch, &admitted)? {
+        return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
+            Box::new(expected_type.clone()),
+            argument.to_error_string(),
+        )
+        .into());
+    }
+    Ok(admitted)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_function(
     function_name: &str,
@@ -741,7 +775,7 @@ pub(crate) fn call_function_with_argument_sizes(
     };
     let mut wasm_arguments = Vec::new();
     for (argument, expected_type) in arguments.iter().zip(expected_arguments) {
-        let cast_argument = match implicit_contract_cast(expected_type, argument) {
+        let argument = match admit_function_argument(expected_type, argument, epoch) {
             Ok(argument) => argument,
             Err(error) => {
                 charge_refused_application(
@@ -754,47 +788,6 @@ pub(crate) fn call_function_with_argument_sizes(
                 return Err(error);
             }
         };
-        let argument = if epoch.sanitize_in_function_invocation() {
-            let Some((sanitized, _)) = Value::sanitize_value(&epoch, expected_type, cast_argument)
-            else {
-                charge_refused_application(
-                    store.data_mut().global_context,
-                    arguments,
-                    argument_sizes,
-                    expected_arguments,
-                    epoch,
-                )?;
-                return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
-                    Box::new(expected_type.clone()),
-                    argument.to_error_string(),
-                )
-                .into());
-            };
-            sanitized
-        } else {
-            cast_argument
-        };
-        // `TypeValueError` and not `TypeError`: the interpreter refuses a
-        // mistyped transaction argument by naming the *value*
-        // (`DefinedFunction::execute_apply`, `clarity2_implicit_cast`), and the
-        // refusal is a receipt — a contract-call that fails a runtime check at
-        // 4.0 keeps its transaction, with `error.to_string()` recorded as its
-        // `vm_error`. Naming the argument's type instead put a different string
-        // in the receipt for every mistyped call.
-        if !expected_type.admits(&epoch, &argument)? {
-            charge_refused_application(
-                store.data_mut().global_context,
-                arguments,
-                argument_sizes,
-                expected_arguments,
-                epoch,
-            )?;
-            return Err(clarity::vm::errors::RuntimeCheckErrorKind::TypeValueError(
-                Box::new(expected_type.clone()),
-                argument.to_error_string(),
-            )
-            .into());
-        }
         if packed_abi {
             let (written, in_memory_written) = write_to_wasm(
                 &mut store,

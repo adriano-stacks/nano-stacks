@@ -90,8 +90,8 @@ impl SimpleWord for Sub {
                 let type_suffix = "int";
                 if arg_types.len() == 1 {
                     // Locals declaration.
-                    let op_lo = generator.module.locals.add(ValType::I64);
-                    let op_hi = generator.module.locals.add(ValType::I64);
+                    let op_lo = generator.alloc_local(ValType::I64);
+                    let op_hi = generator.alloc_local(ValType::I64);
                     builder.local_set(op_hi).local_set(op_lo);
                     // unary 'int' subtraction:
                     // 0 - n.

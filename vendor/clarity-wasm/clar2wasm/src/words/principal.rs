@@ -51,7 +51,7 @@ impl SimpleWord for IsStandard {
         );
 
         // Save the version byte in a local
-        let version_local = generator.module.locals.add(ValType::I32);
+        let version_local = generator.alloc_local(ValType::I32);
         builder.local_tee(version_local);
 
         // TODO: It would be nice if this was a global variable that gets set
@@ -226,9 +226,9 @@ impl SimpleWord for Destruct {
             .binop(BinaryOp::I32Sub);
 
         // Save the length and offset in locals
-        let length = generator.module.locals.add(ValType::I32);
+        let length = generator.alloc_local(ValType::I32);
         builder.local_set(length);
-        let principal_offset = generator.module.locals.add(ValType::I32);
+        let principal_offset = generator.alloc_local(ValType::I32);
         builder.local_tee(principal_offset);
 
         // Load the version byte

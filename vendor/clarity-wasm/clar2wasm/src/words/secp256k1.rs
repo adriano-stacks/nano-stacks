@@ -27,8 +27,8 @@ impl ComplexWord for Recover {
 
         self.charge(generator, builder, 0)?;
 
-        generator.traverse_expr(builder, args.get_expr(0)?)?;
-        generator.traverse_expr(builder, args.get_expr(1)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(0)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
 
         // Reserve stack space for the host-function to write the result
         let ret_ty = generator
@@ -87,7 +87,7 @@ impl ComplexWord for Ed25519Verify {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
         generator.traverse_expr(builder, args.get_expr(0)?)?;
-        let message_length = generator.module.locals.add(walrus::ValType::I32);
+        let message_length = generator.alloc_local(walrus::ValType::I32);
         builder.local_tee(message_length);
         generator.traverse_expr(builder, args.get_expr(1)?)?;
         generator.traverse_expr(builder, args.get_expr(2)?)?;

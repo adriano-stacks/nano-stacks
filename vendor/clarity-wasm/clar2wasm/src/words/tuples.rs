@@ -312,7 +312,7 @@ impl ComplexWord for TupleMerge {
                     name,
                     clar2wasm_ty(&ty_)
                         .into_iter()
-                        .map(|local_ty| generator.module.locals.add(local_ty))
+                        .map(|local_ty| generator.alloc_local(local_ty))
                         .collect(),
                 )
             })

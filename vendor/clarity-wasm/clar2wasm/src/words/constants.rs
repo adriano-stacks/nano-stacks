@@ -80,7 +80,7 @@ impl ComplexWord for DefineConstant {
 
             // Prepare space in memory for the expression's result.
             let offset = generator.literal_memory_end;
-            let offset_local = generator.module.locals.add(ValType::I32);
+            let offset_local = generator.alloc_local(ValType::I32);
             builder.i32_const(offset as i32).local_set(offset_local);
             let value_ty_len = get_type_size(&value_ty) as u32;
             generator.literal_memory_end += value_ty_len;

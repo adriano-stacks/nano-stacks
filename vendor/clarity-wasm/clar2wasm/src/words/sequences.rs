@@ -13,8 +13,8 @@ use crate::duck_type::{dt_needed_workspace, need_ducktyping};
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
     add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, get_global, has_in_memory_type,
-    uses_packed_value, ArgumentsExt, BorrowedLocal, GeneratorError, SequenceElementType,
-    WasmGenerator,
+    has_runtime_shape, uses_packed_value, ArgumentsExt, BorrowedLocal, GeneratorError,
+    SequenceElementType, WasmGenerator,
 };
 use crate::wasm_utils::{get_type_in_memory_size, ArgumentCountCheck};
 use crate::words::{self, ComplexWord, Word};
@@ -59,11 +59,11 @@ impl ComplexWord for ListCons {
         // (`vm/functions/sequences.rs`, `list_cons`). A sequence element is
         // only as big as its contents, so the sum is accumulated as each one
         // is written.
-        // Only a sequence element needs measuring at runtime; anything else is
-        // the same size every time, and measuring it would burn a local an
-        // element on a list that may hold thousands.
-        let measured = matches!(elem_ty, TypeSignature::SequenceType(_));
-        let charged = generator.module.locals.add(ValType::I32);
+        // Sequences carry their actual length, and composite elements can
+        // retain narrower nested shapes than the list's declared item type.
+        let measured =
+            matches!(elem_ty, TypeSignature::SequenceType(_)) || has_runtime_shape(elem_ty);
+        let charged = generator.alloc_local(ValType::I32);
         builder.i32_const(0).local_set(charged);
 
         let mut total_size = 0;
@@ -292,7 +292,7 @@ impl ComplexWord for Fold {
         }
         // Measured here rather than at the call, because a size is read off the
         // top of the stack and by then the accumulator is sitting on top of it.
-        let measure_arguments = generator.is_external_entry(func.as_str());
+        let measure_arguments = generator.is_user_defined_function(func.as_str());
         let element_size = measure_arguments
             .then(|| generator.take_argument_size(&mut loop_, &element_clar_ty))
             .transpose()?;
@@ -476,8 +476,8 @@ impl ComplexWord for Append {
 
         // Keep the runtime-shape handle out of memory.copy's arguments. Append
         // derives a new list shape, so the result starts with handle zero.
-        let src_length = generator.module.locals.add(ValType::I32);
-        let src_offset = generator.module.locals.add(ValType::I32);
+        let src_length = generator.alloc_local(ValType::I32);
+        let src_offset = generator.alloc_local(ValType::I32);
         builder
             .local_set(src_length)
             .local_set(src_offset)
@@ -495,7 +495,7 @@ impl ComplexWord for Append {
         // At this point, we can compute the cost which depends on the actual number of elements in the list:
         // ((number of elements in the list) * (element type size) + (1 element type size)) / (element type size)
         let elem_size = get_type_size(&elem_ty);
-        let number_of_elements = generator.module.locals.add(ValType::I32);
+        let number_of_elements = generator.alloc_local(ValType::I32);
         builder
             .local_get(src_length)
             .i32_const(elem_size)
@@ -582,9 +582,9 @@ impl ComplexWord for AsMaxLen {
 
         // Save the offset and length to locals for later. Leave the length on
         // top of the stack.
-        let length_local = generator.module.locals.add(ValType::I32);
+        let length_local = generator.alloc_local(ValType::I32);
         builder.local_set(length_local);
-        let offset_local = generator.module.locals.add(ValType::I32);
+        let offset_local = generator.alloc_local(ValType::I32);
         builder.local_set(offset_local);
         if is_list {
             builder.drop();
@@ -703,7 +703,7 @@ impl ComplexWord for Concat {
             TypeSignature::SequenceType(SequenceSubtype::ListType(_))
         );
 
-        let length = generator.module.locals.add(ValType::I32);
+        let length = generator.alloc_local(ValType::I32);
         builder.i32_const(0).local_set(length);
 
         for arg in args {
@@ -711,8 +711,8 @@ impl ComplexWord for Concat {
             generator.set_expr_type(arg, ty.clone())?;
             generator.traverse_expr(builder, arg)?;
 
-            let arg_length = generator.module.locals.add(ValType::I32);
-            let arg_offset = generator.module.locals.add(ValType::I32);
+            let arg_length = generator.alloc_local(ValType::I32);
+            let arg_offset = generator.alloc_local(ValType::I32);
             builder.local_set(arg_length).local_set(arg_offset);
             if is_list {
                 builder.drop();
@@ -832,7 +832,7 @@ impl ComplexWord for Map {
 
         // if result needs to be copied back to result_offset, we will copy at the offset in this local
         let in_memory_offset = has_in_memory_type(return_element_type).then(|| {
-            let l = generator.module.locals.add(ValType::I32);
+            let l = generator.alloc_local(ValType::I32);
             builder
                 .local_get(result_offset)
                 .i32_const(get_type_size(return_element_type) * return_list_max_size as i32)
@@ -1082,11 +1082,11 @@ impl ComplexWord for Map {
                         .local_set(**args_memory_local);
                 }
 
-                // A public or read-only function reads its argument sizes out of
-                // the `argument-sizes` region, so they are measured as each
+                // A user-defined function reads its argument sizes out of the
+                // `argument-sizes` region, so they are measured as each
                 // argument reaches the top of the stack
                 // ([[099-measure-the-arguments-fold-and-map-hand-to-a-function]]).
-                let measure_arguments = generator.is_external_entry(fname.as_str());
+                let measure_arguments = generator.is_user_defined_function(fname.as_str());
                 let mut argument_sizes = Vec::new();
                 for (
                     MapArg {
@@ -1221,7 +1221,7 @@ impl ComplexWord for Len {
         generator.traverse_expr(builder, seq)?;
 
         // Save the length, then drop the offset and push the length back.
-        let length_local = generator.module.locals.add(ValType::I32);
+        let length_local = generator.alloc_local(ValType::I32);
         builder.local_set(length_local).drop();
         if is_list {
             builder.drop();
@@ -1334,11 +1334,11 @@ impl ComplexWord for ElementAt {
         builder.i64_const(0).binop(BinaryOp::I64GtU);
 
         // Save the overflow indicator to a local.
-        let overflow_local = generator.module.locals.add(ValType::I32);
+        let overflow_local = generator.alloc_local(ValType::I32);
         builder.local_set(overflow_local);
 
         // Save the lower part of the index to a local.
-        let index_local = generator.module.locals.add(ValType::I64);
+        let index_local = generator.alloc_local(ValType::I64);
         builder.local_tee(index_local);
 
         // Check if the lower 64-bits are greater than 1024x1024 (max value
@@ -1417,8 +1417,8 @@ impl ComplexWord for ElementAt {
         let result_wasm_types = clar2wasm_ty(&result_ty);
         let packed_result = uses_packed_value(&result_ty);
         let (sequence_offset, result_offset) = if packed_result {
-            let condition = generator.module.locals.add(ValType::I32);
-            let sequence_offset = generator.module.locals.add(ValType::I32);
+            let condition = generator.alloc_local(ValType::I32);
+            let sequence_offset = generator.alloc_local(ValType::I32);
             builder.local_set(condition).local_set(sequence_offset);
             let result_offset = generator
                 .create_call_stack_local(builder, &result_ty, true, false)
@@ -1463,7 +1463,7 @@ impl ComplexWord for ElementAt {
         let mut else_ = builder.dangling_instr_seq(branch_ty);
         let else_id = else_.id();
 
-        let offset_local = generator.module.locals.add(ValType::I32);
+        let offset_local = generator.alloc_local(ValType::I32);
 
         // Add the element offset to the offset of the list.
         else_
@@ -1542,8 +1542,8 @@ impl ComplexWord for ReplaceAt {
             .clone();
         let element_ty = generator.get_sequence_element_type(seq)?;
 
-        let length = generator.module.locals.add(ValType::I32);
-        let number_of_elements = generator.module.locals.add(ValType::I32);
+        let length = generator.alloc_local(ValType::I32);
+        let number_of_elements = generator.alloc_local(ValType::I32);
 
         // Create a new stack local for a copy of the input list
         let (dest_offset, _) = generator.create_call_stack_local(builder, &seq_ty, false, true);
@@ -1556,7 +1556,7 @@ impl ComplexWord for ReplaceAt {
 
         // Save actual list length and remove a list's runtime-shape handle from
         // the memcpy arguments.
-        let source_offset = generator.module.locals.add(ValType::I32);
+        let source_offset = generator.alloc_local(ValType::I32);
         builder.local_set(length).local_set(source_offset);
         if matches!(&element_ty, SequenceElementType::Other(_)) {
             builder.drop();
@@ -1596,11 +1596,11 @@ impl ComplexWord for ReplaceAt {
         builder.i64_const(0).binop(BinaryOp::I64GtU);
 
         // Save the overflow indicator to a local.
-        let overflow_local = generator.module.locals.add(ValType::I32);
+        let overflow_local = generator.alloc_local(ValType::I32);
         builder.local_set(overflow_local);
 
         // Save the lower part of the index to a local.
-        let index_local = generator.module.locals.add(ValType::I64);
+        let index_local = generator.alloc_local(ValType::I64);
         builder.local_tee(index_local);
 
         // Check if the lower 64-bits are greater than 1024x1024 (max value
@@ -1666,7 +1666,7 @@ impl ComplexWord for ReplaceAt {
             element_ty,
             SequenceElementType::Byte | SequenceElementType::UnicodeScalar
         ) {
-            let repl_len = generator.module.locals.add(ValType::I32);
+            let repl_len = generator.alloc_local(ValType::I32);
             let error_id = {
                 let mut error = builder.dangling_instr_seq(None);
                 // replace-at? fails when a string of size 0 is passed.
@@ -1758,7 +1758,7 @@ impl ComplexWord for ReplaceAt {
             }
         }
 
-        let offset_local = generator.module.locals.add(ValType::I32);
+        let offset_local = generator.alloc_local(ValType::I32);
 
         // Add the element offset to the offset of the destination.
         else_
@@ -1780,7 +1780,7 @@ impl ComplexWord for ReplaceAt {
                 else_.drop();
 
                 // Save the source offset to a local.
-                let src_local = generator.module.locals.add(ValType::I32);
+                let src_local = generator.alloc_local(ValType::I32);
                 else_.local_set(src_local);
 
                 else_
@@ -1797,7 +1797,7 @@ impl ComplexWord for ReplaceAt {
                 else_.drop();
 
                 // Save the source offset to a local.
-                let src_local = generator.module.locals.add(ValType::I32);
+                let src_local = generator.alloc_local(ValType::I32);
                 else_.local_set(src_local);
 
                 else_
@@ -1849,8 +1849,6 @@ impl ComplexWord for Slice {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
 
-        self.charge(generator, builder, 0)?;
-
         let seq = args.get_expr(0)?;
 
         // Traverse the sequence, leaving the offset and length on the stack.
@@ -1860,41 +1858,45 @@ impl ComplexWord for Slice {
             generator.get_expr_type(seq),
             Some(TypeSignature::SequenceType(SequenceSubtype::ListType(_)))
         );
-        if is_list {
+        let list_representation = if is_list {
             let length = generator.borrow_local(ValType::I32);
             let offset = generator.borrow_local(ValType::I32);
+            let shape = generator.borrow_local(ValType::I32);
             builder
                 .local_set(*length)
                 .local_set(*offset)
-                .drop()
+                .local_set(*shape)
                 .local_get(*offset)
                 .local_get(*length);
-        }
+            Some((shape, offset, length))
+        } else {
+            None
+        };
 
         // Extend the sequence length to 64-bits.
         builder.unop(UnaryOp::I64ExtendUI32);
 
         // Save the length to a local.
-        let length_local = generator.module.locals.add(ValType::I64);
+        let length_local = generator.alloc_local(ValType::I64);
         builder.local_tee(length_local);
 
         // Traverse the left position, leaving it on the stack. The
         // interpreter reads the positions where they are rather than copying
         // them out of their bindings, so a bound one must not be charged a
         // copy — `element-at?` next door already reads its index that way.
-        generator.traverse_expr_without_value_copy_charge(builder, args.get_expr(1)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
 
         // Save the overflow indicator to a local.
-        let overflow_local = generator.module.locals.add(ValType::I32);
+        let overflow_local = generator.alloc_local(ValType::I32);
         builder.local_set(overflow_local);
 
         // Save the lower part of the index, which will ultimately be
         // multiplied by the element size and added to the source offset to be
         // the offset of the result, to a local.
-        let left_local = generator.module.locals.add(ValType::I64);
+        let left_local = generator.alloc_local(ValType::I64);
         builder.local_tee(left_local);
 
         // Check if the lower 64-bits are greater than 1024x1024 (max value
@@ -1966,7 +1968,7 @@ impl ComplexWord for Slice {
         builder.local_set(overflow_local);
 
         // Extend the base offset to 64-bits and save it to a local.
-        let base_offset_local = generator.module.locals.add(ValType::I64);
+        let base_offset_local = generator.alloc_local(ValType::I64);
         builder
             .unop(UnaryOp::I64ExtendUI32)
             .local_tee(base_offset_local);
@@ -1986,19 +1988,19 @@ impl ComplexWord for Slice {
         builder.local_get(length_local);
 
         // Traverse the right position, leaving it on the stack.
-        generator.traverse_expr_without_value_copy_charge(builder, args.get_expr(2)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(2)?)?;
 
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
 
         // Save the overflow indicator to a local.
-        let overflow_local = generator.module.locals.add(ValType::I32);
+        let overflow_local = generator.alloc_local(ValType::I32);
         builder.local_set(overflow_local);
 
         // Save the lower part of the index, which will ultimately be
         // multiplied by the element size and added to the source offset to be
         // the offset of the result, to a local.
-        let right_local = generator.module.locals.add(ValType::I64);
+        let right_local = generator.alloc_local(ValType::I64);
         builder.local_tee(right_local);
 
         // Check if the lower 64-bits are greater than 1024x1024 (max value
@@ -2090,6 +2092,107 @@ impl ComplexWord for Slice {
             .local_get(overflow_local)
             .binop(BinaryOp::I32Or)
             .local_set(overflow_local);
+
+        let (representation_element_size, static_cost_element_size) = match &seq_ty {
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                (get_type_size(list.get_list_item_type()), None)
+            }
+            TypeSignature::SequenceType(SequenceSubtype::BufferType(_)) => (
+                1,
+                Some(
+                    i32::try_from(
+                        TypeSignature::BUFFER_MIN
+                            .size()
+                            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        GeneratorError::InternalError("slice cost input exceeds i32".to_owned())
+                    })?,
+                ),
+            ),
+            TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::ASCII(_))) => (
+                1,
+                Some(
+                    i32::try_from(
+                        TypeSignature::STRING_ASCII_MIN
+                            .size()
+                            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        GeneratorError::InternalError("slice cost input exceeds i32".to_owned())
+                    })?,
+                ),
+            ),
+            TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::UTF8(_))) => (
+                4,
+                Some(
+                    i32::try_from(
+                        TypeSignature::STRING_UTF8_MIN
+                            .size()
+                            .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        GeneratorError::InternalError("slice cost input exceeds i32".to_owned())
+                    })?,
+                ),
+            ),
+            _ => {
+                return Err(GeneratorError::TypeError(
+                    "expected sequence type".to_owned(),
+                ))
+            }
+        };
+        let slice_elements = generator.borrow_local(ValType::I32);
+        builder
+            .local_get(right_local)
+            .local_get(left_local)
+            .binop(BinaryOp::I64Sub)
+            .unop(UnaryOp::I32WrapI64)
+            .i32_const(representation_element_size)
+            .binop(BinaryOp::I32DivU)
+            .local_set(*slice_elements);
+
+        let slice_cost = generator.borrow_local(ValType::I32);
+        if let Some(cost_element_size) = static_cost_element_size {
+            builder
+                .local_get(*slice_elements)
+                .i32_const(cost_element_size)
+                .binop(BinaryOp::I32Mul)
+                .local_set(*slice_cost);
+        } else {
+            let (shape, offset, length) = list_representation
+                .as_ref()
+                .expect("a list has a saved representation");
+            builder
+                .local_get(**shape)
+                .local_get(**offset)
+                .local_get(**length);
+            let (value_offset, _) =
+                generator.create_call_stack_local(builder, &seq_ty, true, false);
+            generator.write_to_memory(builder, value_offset, 0, &seq_ty)?;
+            let (type_offset, type_length) = generator.serialized_type(&seq_ty)?;
+            builder
+                .local_get(*slice_elements)
+                .local_get(value_offset)
+                .i32_const(type_offset)
+                .i32_const(type_length)
+                .call(generator.func_by_name("stdlib.runtime_sequence_element_size"))
+                .binop(BinaryOp::I32Mul)
+                .local_set(*slice_cost);
+        }
+        let charged = {
+            let mut charged = builder.dangling_instr_seq(None);
+            self.charge(generator, &mut charged, *slice_cost)?;
+            charged.id()
+        };
+        let uncharged = builder.dangling_instr_seq(None).id();
+        builder
+            .local_get(overflow_local)
+            .unop(UnaryOp::I32Eqz)
+            .instr(IfElse {
+                consequent: charged,
+                alternative: uncharged,
+            });
 
         // Push a `0` and a `1` to the stack, for none or some, to be selected
         // by the `select` instruction, using the overflow indicator.

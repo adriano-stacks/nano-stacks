@@ -119,7 +119,7 @@ impl ComplexWord for ToConsensusBuff {
             let (value_offset, _) = generator.create_call_stack_local(builder, &ty, true, false);
             generator.write_to_memory(builder, value_offset, 0, &ty)?;
 
-            let value_param = generator.module.locals.add(ValType::I32);
+            let value_param = generator.alloc_local(ValType::I32);
             let mut helper = FunctionBuilder::new(
                 &mut generator.module.types,
                 &[ValType::I32],
@@ -163,7 +163,7 @@ impl FromConsensusBuff {
             ));
         };
         let (decoded_offset, _) = generator.create_call_stack_local(builder, ty, true, true);
-        let end = generator.module.locals.add(ValType::I32);
+        let end = generator.alloc_local(ValType::I32);
         builder
             .local_get(offset)
             .local_get(length)
@@ -271,20 +271,20 @@ impl ComplexWord for FromConsensusBuff {
         // Traverse the input buffer, leaving the offset and length on the stack.
         generator.traverse_expr(builder, args.get_expr(1)?)?;
 
-        let length = generator.module.locals.add(ValType::I32);
+        let length = generator.alloc_local(ValType::I32);
         builder.local_tee(length);
         self.charge(generator, builder, length)?;
         builder.local_set(length);
-        let offset = generator.module.locals.add(ValType::I32);
+        let offset = generator.alloc_local(ValType::I32);
         builder.local_set(offset);
 
         if uses_packed_value(&ty) {
             let result_offset = generator
                 .create_call_stack_local(builder, &ty, true, false)
                 .0;
-            let offset_param = generator.module.locals.add(ValType::I32);
-            let length_param = generator.module.locals.add(ValType::I32);
-            let result_param = generator.module.locals.add(ValType::I32);
+            let offset_param = generator.alloc_local(ValType::I32);
+            let length_param = generator.alloc_local(ValType::I32);
+            let result_param = generator.alloc_local(ValType::I32);
             let mut helper = FunctionBuilder::new(
                 &mut generator.module.types,
                 &[ValType::I32, ValType::I32, ValType::I32],

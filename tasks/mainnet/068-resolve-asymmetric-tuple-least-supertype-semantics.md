@@ -1,13 +1,14 @@
 ---
 id: "068"
 title: "Resolve asymmetric tuple least-supertype semantics"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: []
 tags: ["mainnet", "vm", "clarity", "conformance"]
 created_at: 2026-08-06
 type: bug
+completed_at: 2026-08-09
 ---
 
 # Resolve asymmetric tuple least-supertype semantics
@@ -27,28 +28,27 @@ observe only common fields.
 - [x] Minimize both operand orders and both taken branches, asserting the whole
       value rather than only fields common to the inferred type.
       `wasm_response_fold::the_wider_operand_first_is_refused_before_it_runs` and
-      `a_narrowed_default_parts_from_the_reference_only_where_it_must`.
+      `a_narrowed_default_matches_the_reference_across_resolved_escapes`.
 - [x] Carry the minimized value through a public function, a contract call and
       a transaction receipt to identify every ABI boundary that can expose the
       mismatch. `a_contract_call_does_not_normalise_the_narrowed_value`.
 - [x] Determine whether the conformant change belongs in the Clarity analyser,
       value sanitization or clarity-wasm's runtime representation, using the
       pinned stacks-core revision as the oracle. See *Where it belongs* below.
-- [ ] Implement the fix in the shared Clarity/clarity-wasm boundary without a
+- [x] Implement the fix in the shared Clarity/clarity-wasm boundary without a
       special case for the captured expression and without interpreter
-      execution in the node. **Blocked on the finding below: no static layout can
-      be conformant.** What is needed is a value representation that carries its
-      shape at run time, which is a clar2wasm architecture change and is not a
-      choice inside this word.
+      execution in the node. Tuple and list values now carry an arena-backed
+      runtime shape through stack, memory, function and host boundaries. Local
+      function entry reconstructs the ABI representation, looks up the analysed
+      parameter type, and applies the same cast, sanitization and admission rule
+      as public and cross-contract entry.
 - [x] Add differential coverage for nested tuples, optionals and responses whose
       branches union to different tuple shapes.
-      `every_narrowing_kind_parts_on_the_some_branch_only`.
+      `every_narrowing_kind_matches_on_both_branches`.
 - [x] Remove the ignored differential and verify the exact returned value,
       receipt serialization, costs and writes in both engines.
-      The ignore is gone. What replaced it is not an equality: it pins what *each*
-      engine answers, in both branch directions, so the divergence cannot move in
-      either engine without turning the suite red — including if it moves in the
-      reference, which is the half that decides the chain.
+      The former default/equality/index/state/contract-return mismatches and the
+      local-function admission refusal are equal and unignored.
 
 ## Where it belongs
 
@@ -153,3 +153,38 @@ This task remains open: tuple merge, every list-metadata-preserving mutation,
 constants and the complete function/state admission matrix still need the same
 actual-shape semantics. The implemented boundary is architectural progress, not
 a claim that all asymmetric escapes are closed.
+
+## Final local-function boundary — 2026-08-09
+
+The runtime-shape work has since closed tuple merge, equality/indexing, canonical
+serialization and cost sizing, list mutation, constants, state admission and
+cross-contract result boundaries. The former branch-direction tests now require
+byte-equal compiler/interpreter answers, and the full clar2wasm and conformance
+suites are green.
+
+The final unequal boundary was local user-function argument admission. The
+reference implicitly casts and sanitizes the wide runtime tuple before entering
+the function and returns `TypeValueError`; the compiler had passed projected
+slots straight into the callee.
+
+The fix is general. The generated call preserves the value's runtime shape,
+passes the function identity and argument index to one host admission boundary,
+and the host separates the serialized representation type from the function's
+true analysed parameter type. It then uses the shared public/cross-contract
+admission rule. Refused calls retain the reference cost and original offending
+value. No interpreter path, contract identity or expression shape appears in
+production code.
+
+`wasm_response_fold` now requires the exact compiler/interpreter
+`TypeValueError`, and `charges_refusing_a_wide_runtime_shape_at_local_function_entry`
+pins the result and all five cost dimensions. `known-differentials.toml` has no
+remaining semantic entry. Current gates are 1,457/1,457 clar2wasm library tests,
+strict all-target clar2wasm Clippy, and 277/277 conformance tests; the conformance
+log is `/tmp/conformance-task068-20260809.log`, SHA-256
+`1ab69265f7a8006085e8d88e710e05856a74ed8c7b23d057c49a5e434bb40d66`.
+
+The production-path inventory was then rerun over the unchanged compiler tree:
+137,284/137,284 current-tip contracts compile and load, 58 stale metadata
+candidates are separately excluded, and there are zero refused or unmeasured
+contracts. Retained output is `/tmp/task068-inventory-final.txt`, SHA-256
+`677c2e834e2a7209beabbf1af9c0531fbad570bd217c04135928f18fabdf77d6`.

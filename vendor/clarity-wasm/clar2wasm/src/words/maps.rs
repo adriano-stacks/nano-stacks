@@ -148,7 +148,7 @@ impl ComplexWord for MapGet {
         let (return_offset, size) =
             generator.create_call_stack_local(builder, &return_type, true, true);
 
-        let return_size = generator.module.locals.add(ValType::I32);
+        let return_size = generator.alloc_local(ValType::I32);
         builder.i32_const(size).local_set(return_size);
 
         // Push the return value offset and size to the data stack

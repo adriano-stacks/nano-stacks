@@ -1,10 +1,8 @@
 use clarity::vm::{ClarityName, SymbolicExpression};
 
 use crate::cost::WordCharge;
-use crate::wasm_generator::{
-    drop_value, ArgumentsExt, BindingStorage, GeneratorError, WasmGenerator,
-};
-use crate::wasm_utils::{get_type_size, ArgumentCountCheck};
+use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
+use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::{ComplexWord, Word};
 use crate::{check_args, error_mapping};
 
@@ -31,11 +29,6 @@ impl ComplexWord for Let {
 
         let bindings = args.get_list(0)?;
         self.charge(generator, builder, bindings.len() as u32)?;
-
-        // A scope wide enough to spill keeps its bindings at constant
-        // offsets into the function's frame, one slot each, instead of
-        // declaring one wasm local per leaf value.
-        let spilled = generator.spilled_scopes.contains(&_expr.id);
 
         // Save the current named locals
         let saved_locals = generator.bindings.clone();
@@ -66,42 +59,10 @@ impl ComplexWord for Let {
                 })?
                 .clone();
 
-            let binding = generator.binding_id(name_expr);
-            match binding {
-                // A binding nothing reads: the value is still evaluated for
-                // its cost and side effects, but the result is dropped
-                // instead of saved. The name stays in the map so shadowing
-                // checks still see it; its empty locals are never read.
-                Some(id) if generator.binding_uses[id as usize] == 0 => {
-                    drop_value(builder, &ty);
-                    generator
-                        .bindings
-                        .insert(name.clone(), ty, Vec::new(), binding);
-                }
-                _ if spilled => {
-                    let delta = generator.spill_cursor;
-                    generator.spill_cursor += get_type_size(&ty) as u32;
-                    let frame_pointer = generator.frame_pointer.ok_or_else(|| {
-                        GeneratorError::InternalError(
-                            "spilled binding written outside of its frame".to_owned(),
-                        )
-                    })?;
-                    generator.write_to_memory(builder, frame_pointer, delta, &ty)?;
-                    generator.bindings.insert_spilled(
-                        name.clone(),
-                        ty,
-                        BindingStorage::Spilled { delta },
-                        binding,
-                    );
-                }
-                _ => {
-                    let locals = generator.save_to_locals(builder, &ty, true);
-
-                    // Add these named locals to the map. The locals return to
-                    // the pool at the binding's last read (see visit_atom).
-                    generator.bindings.insert(name.clone(), ty, locals, binding);
-                }
-            }
+            let (storage, binding) = generator.capture_binding_value(builder, name_expr, &ty)?;
+            generator
+                .bindings
+                .insert_spilled(name.clone(), ty, storage, binding);
         }
 
         // WORKAROUND: need to set the last statement type to the type of the let expression

@@ -28,10 +28,10 @@ impl ComplexWord for VerifyMerkleProof {
             generator.traverse_expr(builder, argument)?;
         }
         generator.traverse_expr(builder, args.get_expr(4)?)?;
-        let siblings_length = generator.module.locals.add(walrus::ValType::I32);
+        let siblings_length = generator.alloc_local(walrus::ValType::I32);
         builder.local_tee(siblings_length);
         builder.call(generator.func_by_name("stdlib.verify_merkle_proof"));
-        let siblings = generator.module.locals.add(walrus::ValType::I32);
+        let siblings = generator.alloc_local(walrus::ValType::I32);
         builder
             .local_get(siblings_length)
             .i32_const(3)
@@ -61,7 +61,7 @@ impl ComplexWord for GetBitcoinTxOutput {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
         generator.traverse_expr(builder, args.get_expr(0)?)?;
-        let tx_length = generator.module.locals.add(walrus::ValType::I32);
+        let tx_length = generator.alloc_local(walrus::ValType::I32);
         builder.local_tee(tx_length);
         generator.traverse_expr(builder, args.get_expr(1)?)?;
         let return_type = generator

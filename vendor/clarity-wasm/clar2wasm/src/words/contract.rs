@@ -11,8 +11,8 @@ use super::{ComplexWord, Word};
 use crate::check_args;
 use crate::cost::WordCharge;
 use crate::wasm_generator::{
-    ArgumentsExt, GeneratorError, WasmGenerator, add_placeholder_for_clarity_type, clar2wasm_ty,
-    uses_packed_value,
+    add_placeholder_for_clarity_type, clar2wasm_ty, uses_packed_value, ArgumentsExt,
+    GeneratorError, WasmGenerator,
 };
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::SimpleWord;
@@ -40,9 +40,9 @@ fn finish_safe_contract_result(
     let wasm_return = clar2wasm_ty(return_ty);
     if let Some(result_offset) = result_offset {
         generator.note_control_arity(2, wasm_return.len());
-        let condition = generator.module.locals.add(ValType::I32);
-        let hi = generator.module.locals.add(ValType::I64);
-        let lo = generator.module.locals.add(ValType::I64);
+        let condition = generator.alloc_local(ValType::I32);
+        let hi = generator.alloc_local(ValType::I64);
+        let lo = generator.alloc_local(ValType::I64);
         builder.local_set(condition).local_set(hi).local_set(lo);
 
         let mut success = builder.dangling_instr_seq(None);
@@ -78,8 +78,8 @@ fn finish_safe_contract_result(
                 then.i64_const(0).i64_const(0);
             },
             |else_| {
-                let hi = generator.module.locals.add(ValType::I64);
-                let lo = generator.module.locals.add(ValType::I64);
+                let hi = generator.alloc_local(ValType::I64);
+                let lo = generator.alloc_local(ValType::I64);
                 else_.local_set(hi).local_set(lo).i32_const(0);
                 add_placeholder_for_clarity_type(else_, inner_ty);
                 else_.local_get(lo).local_get(hi);
@@ -207,7 +207,7 @@ impl ComplexWord for AsContractSafe {
             _ => {
                 return Err(GeneratorError::TypeError(
                     "Invalid return type for as-contract? expression".to_owned(),
-                ))
+                ));
             }
         };
 
@@ -362,7 +362,7 @@ impl ComplexWord for RestrictAssets {
             _ => {
                 return Err(GeneratorError::TypeError(
                     "Invalid return type for restrict-access? expression".to_owned(),
-                ))
+                ));
             }
         };
 
@@ -891,7 +891,7 @@ impl ComplexWord for ContractCall {
             .i32_const(fn_length as i32);
 
         // Write the arguments to the call stack, to be read by the host
-        let arg_offset = generator.module.locals.add(ValType::I32);
+        let arg_offset = generator.alloc_local(ValType::I32);
         let total_args_size: i32 = args_ty.iter().map(get_type_size).sum();
         let argument_sizes_length = i32::try_from(args.len())
             .ok()
@@ -910,7 +910,7 @@ impl ComplexWord for ContractCall {
             .i32_const(call_arguments_size)
             .binop(BinaryOp::I32Add)
             .global_set(generator.stack_pointer);
-        let argument_sizes_offset = generator.module.locals.add(ValType::I32);
+        let argument_sizes_offset = generator.alloc_local(ValType::I32);
         builder
             .local_get(arg_offset)
             .i32_const(total_args_size)
@@ -927,9 +927,23 @@ impl ComplexWord for ContractCall {
             // evaluated it, before the callee re-tags principals as traits.
             // Preserve that size beside the representations so the host does
             // not have to infer it from the callee's declared types.
-            generator.clarity_value_size_on_stack(builder, &arg_ty)?;
             let argument_size = generator.borrow_local(ValType::I32);
-            builder.local_set(*argument_size);
+            if let SymbolicExpressionType::LiteralValue(value) = &arg.expr {
+                let value_size = i32::try_from(
+                    value
+                        .size()
+                        .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
+                )
+                .map_err(|_| {
+                    GeneratorError::InternalError(
+                        "literal contract-call? argument size exceeds i32".to_owned(),
+                    )
+                })?;
+                builder.i32_const(value_size).local_set(*argument_size);
+            } else {
+                generator.clarity_value_size_on_stack(builder, &arg_ty)?;
+                builder.local_set(*argument_size);
+            }
 
             arg_length += generator.write_to_memory(builder, arg_offset, arg_length, &arg_ty)?;
             let size_offset = u32::try_from(index)

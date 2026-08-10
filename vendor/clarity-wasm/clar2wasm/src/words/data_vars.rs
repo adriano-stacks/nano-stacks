@@ -53,7 +53,7 @@ impl ComplexWord for DefineDataVar {
 
         // The initial value can be placed on the top of the memory, since at
         // the top-level, we have not set up the call stack yet.
-        let offset = generator.module.locals.add(ValType::I32);
+        let offset = generator.alloc_local(ValType::I32);
         builder
             .i32_const(generator.literal_memory_end as i32)
             .local_set(offset);
