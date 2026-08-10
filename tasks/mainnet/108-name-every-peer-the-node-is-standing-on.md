@@ -2,13 +2,14 @@
 id: "108"
 group: mainnet
 title: "Name every peer the node is standing on"
-status: in-progress
+status: completed
 priority: medium
 effort: small
 dependencies: []
 tags: ["mainnet", "p2p", "sync", "operations", "tui"]
 created_at: 2026-08-10
 type: bug
+completed_at: 2026-08-10
 ---
 
 # Name every peer the node is standing on
@@ -51,12 +52,12 @@ fetching history from 8 peers: http://172.96.141.17:20443/, …,
       from, and the p2p session/known counts discovery reports.
 - [x] Show it in the TUI: a `peer pool` line under the sync source with the
       pool's size, live p2p sessions and known peers.
-- [ ] Deploy after the 107 memory measurement window closes so it is not cut
-      short. The earlier `9a055ab8` artifact was superseded in place; the file
-      now at `stacks-node.new` has SHA-256
-      `a01c28a9aed67a94511148976345540531149c2b685be2184dca7e53f9082211`
-      but no retained commit provenance. Rebuild
-      from the final clean HEAD, stage that exact artifact, then swap it in.
+- [x] Deploy after the old 107 diagnostic window showed the remaining
+      whole-tenure clone and was no longer release evidence. Clean commit
+      `063215c6f4e62f78901c844b86c67fe9e43719d7` built artifact SHA-256
+      `ef6629d966e110974beabc543a51399f451de7a41875e70379b1441f8c82acae`;
+      the exact binary is retained as `stacks-node.063215c6` and deployed as
+      `/home/aldur/mainnet-tip/stacks-node`.
 
 ## Acceptance Criteria
 
@@ -65,3 +66,12 @@ fetching history from 8 peers: http://172.96.141.17:20443/, …,
 - `/nano/sync_status` names the fetch pool and the p2p counts.
 - The TUI dashboard shows pool size and p2p sessions alongside the sync
   source.
+
+## Deployment evidence
+
+The process started at `2026-08-10T15:50:41Z`. Its first live report named four
+unique fetch endpoints, four P2P sessions and 97 known peers. The startup log
+names the same four unique endpoints for both `fetching history` and
+`replicating StackerDB chunks`; the duplicate trailing-slash spelling is gone.
+The TUI consumes those exact `fetching_from_peers` and `p2p_sessions` fields on
+its `peer pool` row.
