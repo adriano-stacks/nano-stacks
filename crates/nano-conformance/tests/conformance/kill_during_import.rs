@@ -90,41 +90,6 @@ fn wait_for(path: &Path, child: &mut Child) -> bool {
     false
 }
 
-/// Run an import to completion, timing the two phases a kill can land in.
-///
-/// Reported because the windows are what the kills have to hit: a phase whose
-/// window is zero would mean the test below is killing somewhere else.
-fn phase_windows(directory: &Path) -> (Duration, Duration) {
-    let marker = UnfinishedImport::marker(directory);
-    let clarity = directory.join("clarity.sqlite");
-    let mut child = import_process(directory);
-    let start = Instant::now();
-    assert!(
-        wait_for(&marker, &mut child),
-        "the import marks the directory before it writes to it"
-    );
-    let trie_started = start.elapsed();
-    assert!(
-        wait_for(&clarity, &mut child),
-        "the import reaches the value store"
-    );
-    let side_store = start.elapsed();
-    assert!(
-        child.wait().expect("reap the import").success(),
-        "the uninterrupted import finishes"
-    );
-    let finished = start.elapsed();
-    assert!(
-        !marker.exists(),
-        "a finished import leaves no mark: absence is what lets a directory \
-         imported before this existed still open"
-    );
-    (
-        side_store.saturating_sub(trie_started),
-        finished.saturating_sub(side_store),
-    )
-}
-
 /// What one killed import left behind.
 struct Wreckage {
     /// Whether the directory carries the import mark.
@@ -162,28 +127,13 @@ fn refusal(directory: &Path) -> String {
     }
 }
 
-/// A delay that spreads the kills through a phase instead of stacking them at
-/// its first instant.
-///
-/// Over the first half of the window, not all of it: the window is measured on a
-/// cold import and the runs that are killed are warm, so a delay near the
-/// measured end lands past the real one. Scattering over the whole window put
-/// seventeen of twenty-four kills after the import had already finished — the same
-/// mistake `kill_during_replay` made with a fixed delay, in a different disguise.
-fn scatter(iteration: usize, window: Duration) -> Duration {
-    let steps = u32::try_from(KILLS).expect("the kill count fits");
-    let step = u32::try_from(iteration).expect("the iteration fits") % steps;
-    window * step / (2 * steps)
-}
-
 /// Kill one import in `phase`, and say what it left.
-fn kill_during(directory: &Path, trigger: &Path, delay: Duration) -> Wreckage {
+fn kill_during(directory: &Path, trigger: &Path) -> Wreckage {
     let mut child = import_process(directory);
     let started = wait_for(trigger, &mut child);
-    std::thread::sleep(delay);
     // SIGKILL: no destructor runs, no connection is closed, nothing is flushed
     // that was not already written. SIGTERM would exercise the orderly path.
-    drop(child.kill());
+    let _ = child.kill();
     child.wait().expect("reap the import");
     assert!(
         started,
@@ -199,41 +149,23 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
         nano_conformance::skip_gate("the captured blocks are unavailable");
         return;
     }
-    // Measured twice and taken at the shorter: the first import of a process is
-    // cold, and a window measured cold is longer than the ones being killed.
-    let cold = tempfile::tempdir().expect("a directory");
-    let (cold_trie, cold_side_store) = phase_windows(cold.path());
-    let reference_directory = tempfile::tempdir().expect("a directory");
-    let (warm_trie, warm_side_store) = phase_windows(reference_directory.path());
-    let (trie_window, side_store_window) = (
-        cold_trie.min(warm_trie),
-        cold_side_store.min(warm_side_store),
-    );
-    println!("import phases: trie {trie_window:?}, side store {side_store_window:?}");
-
     let mut refused = 0_usize;
     let mut resumable = 0_usize;
     let mut bare = 0_usize;
-    let mut raced = 0_usize;
     let mut kept: Option<tempfile::TempDir> = None;
     for iteration in 0..KILLS * 2 {
         let directory = tempfile::tempdir().expect("a directory");
         let trie_phase = iteration % 2 == 0;
-        let (trigger, window) = if trie_phase {
-            (UnfinishedImport::marker(directory.path()), trie_window)
+        let trigger = if trie_phase {
+            UnfinishedImport::marker(directory.path())
         } else {
-            (directory.path().join("clarity.sqlite"), side_store_window)
+            directory.path().join("clarity.sqlite")
         };
-        let left = kill_during(directory.path(), &trigger, scatter(iteration / 2, window));
-        if !left.marked {
-            // The import finished between the trigger and the signal landing.
-            // Then the directory is complete and must open — which is the other
-            // half of the claim, so it is checked rather than skipped.
-            raced += 1;
-            durable_replay_chainstate(&fixtures(), directory.path())
-                .expect("a directory whose import did finish opens");
-            continue;
-        }
+        let left = kill_during(directory.path(), &trigger);
+        assert!(
+            left.marked,
+            "the import completed after exposing the phase marker but before SIGKILL"
+        );
 
         refused += 1;
         let message = refusal(directory.path());
@@ -269,14 +201,10 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
 
     println!(
         "of {} kills: {refused} refused ({resumable} already holding sealed states, \
-         {bare} holding none), {raced} finished before the signal landed",
+         {bare} holding none)",
         KILLS * 2
     );
-    assert!(
-        refused * 4 >= KILLS * 2 * 3,
-        "at least three kills in four landed inside the import: {refused} of {}",
-        KILLS * 2
-    );
+    assert_eq!(refused, KILLS * 2, "every signal lands inside the import");
     assert!(
         resumable > 0,
         "at least one killed import left the sealed states the old rule read as \
@@ -294,6 +222,7 @@ fn an_import_a_kill_interrupted_is_refused_and_not_resumed() {
     let wrecked = kept.expect("a killed import was kept");
     fs::remove_dir_all(wrecked.path()).expect("remove the wrecked state");
     let recovered = state_after_two_blocks(wrecked.path());
+    let reference_directory = tempfile::tempdir().expect("a reference directory");
     assert_eq!(
         recovered,
         state_after_two_blocks(reference_directory.path()),
