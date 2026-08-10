@@ -174,6 +174,18 @@ impl std::fmt::Debug for ModuleCache {
 }
 
 impl ModuleCache {
+    /// Compiled contracts currently held in memory.
+    #[must_use]
+    pub fn resident_entries(&self) -> usize {
+        self.contracts.len()
+    }
+
+    /// Estimated resident bytes charged to the cache's eviction budget.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// A cache that also reads and writes native code through `store`.
     pub fn persisting_in(store: Arc<dyn NativeModuleStore>) -> Self {
         Self {

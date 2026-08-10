@@ -1206,6 +1206,15 @@ pub struct ModuleInspection {
     pub refusal: Option<VmExecutionError>,
 }
 
+/// Resident execution caches published for process-memory observability.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheUsage {
+    pub marf_node_entries: usize,
+    pub marf_node_bytes: usize,
+    pub wasm_module_entries: usize,
+    pub wasm_module_bytes: usize,
+}
+
 /// The result of compiling a stored source under one explicit semantic epoch.
 ///
 /// Compiler rejection is a property of the source/epoch pair. Errors outside
@@ -1226,6 +1235,18 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Current in-memory cache residency, read while the VM is already owned.
+    #[must_use]
+    pub fn cache_usage(&self) -> CacheUsage {
+        let marf = self.store.marf.node_cache_usage();
+        CacheUsage {
+            marf_node_entries: marf.entries,
+            marf_node_bytes: marf.estimated_bytes,
+            wasm_module_entries: self.modules.resident_entries(),
+            wasm_module_bytes: self.modules.estimated_bytes(),
+        }
+    }
+
     /// Create an empty VM for the supplied network.
     pub fn new(network: Network) -> Result<Self, MarfStoreError> {
         Ok(Self {
@@ -5201,10 +5222,16 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_PAGE_BYTES,
-        SemanticEpochInspection, StaticCheckError, compile_under, ensure_wasm_module, loadable,
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_PAGE_BYTES, SemanticEpochInspection,
+        StaticCheckError, compile_under, ensure_wasm_module, loadable,
         open_side_store_with_journal, recorded_network, reports_analysis_failure,
     };
+
+    #[test]
+    fn an_empty_vm_reports_empty_resident_caches() {
+        let vm = Vm::new(Network::MAINNET).expect("an empty VM");
+        assert_eq!(vm.cache_usage(), super::CacheUsage::default());
+    }
 
     #[test]
     fn a_durable_side_store_uses_wide_pages() {

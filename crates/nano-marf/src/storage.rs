@@ -129,6 +129,7 @@ struct Cache<K, V> {
     hot: HashMap<K, V>,
     cold: HashMap<K, V>,
     hot_bytes: usize,
+    cold_bytes: usize,
     capacity: usize,
 }
 
@@ -138,6 +139,7 @@ impl<K: Eq + Hash, V: Clone + Weight> Cache<K, V> {
             hot: HashMap::new(),
             cold: HashMap::new(),
             hot_bytes: 0,
+            cold_bytes: 0,
             capacity,
         }
     }
@@ -149,6 +151,7 @@ impl<K: Eq + Hash, V: Clone + Weight> Cache<K, V> {
         // Moved, not copied: leaving the entry in the cold generation as well
         // held the whole hot working set resident twice.
         let (key, value) = self.cold.remove_entry(key)?;
+        self.cold_bytes -= ENTRY_OVERHEAD + value.weight();
         self.insert(key, value.clone());
         Some(value)
     }
@@ -156,19 +159,31 @@ impl<K: Eq + Hash, V: Clone + Weight> Cache<K, V> {
     fn insert(&mut self, key: K, value: V) {
         if self.hot_bytes >= self.capacity {
             self.cold = std::mem::take(&mut self.hot);
-            self.hot_bytes = 0;
+            self.cold_bytes = std::mem::take(&mut self.hot_bytes);
         }
         let weight = ENTRY_OVERHEAD + value.weight();
-        if self.hot.insert(key, value).is_none() {
-            self.hot_bytes += weight;
+        if let Some(prior) = self.cold.remove(&key) {
+            self.cold_bytes -= ENTRY_OVERHEAD + prior.weight();
         }
+        let prior = self.hot.insert(key, value);
+        self.hot_bytes += weight;
+        self.hot_bytes -= prior.map_or(0, |prior| ENTRY_OVERHEAD + prior.weight());
     }
 
     fn remove(&mut self, key: &K) {
         if let Some(value) = self.hot.remove(key) {
             self.hot_bytes -= ENTRY_OVERHEAD + value.weight();
         }
-        self.cold.remove(key);
+        if let Some(value) = self.cold.remove(key) {
+            self.cold_bytes -= ENTRY_OVERHEAD + value.weight();
+        }
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        (
+            self.hot.len() + self.cold.len(),
+            self.hot_bytes + self.cold_bytes,
+        )
     }
 }
 
@@ -197,6 +212,10 @@ pub struct TrieStorage {
 }
 
 impl TrieStorage {
+    pub(crate) fn node_cache_usage(&self) -> (usize, usize) {
+        self.nodes.borrow().usage()
+    }
+
     /// Open an ephemeral store, for tests and for states nothing will reopen.
     pub(crate) fn in_memory() -> Result<Self, MarfError> {
         Self::from_connection(Connection::open_in_memory()?)
@@ -757,7 +776,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SQLITE_PAGE_BYTES, TrieStorage};
+    use super::{Cache, ENTRY_OVERHEAD, SQLITE_PAGE_BYTES, TrieStorage};
+    use crate::TrieHash;
 
     #[test]
     fn a_durable_store_uses_wide_pages() {
@@ -769,5 +789,21 @@ mod tests {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .expect("read the page size");
         assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
+    }
+
+    #[test]
+    fn cache_usage_follows_entries_across_both_generations() {
+        let mut cache = Cache::new(1);
+        let weight = ENTRY_OVERHEAD + std::mem::size_of::<TrieHash>();
+        cache.insert(1, TrieHash::from_bytes([1; 32]));
+        assert_eq!(cache.usage(), (1, weight));
+
+        cache.insert(2, TrieHash::from_bytes([2; 32]));
+        assert_eq!(cache.usage(), (2, 2 * weight));
+        assert_eq!(cache.get(&1), Some(TrieHash::from_bytes([1; 32])));
+        assert_eq!(cache.usage(), (2, 2 * weight));
+
+        cache.remove(&2);
+        assert_eq!(cache.usage(), (1, weight));
     }
 }
