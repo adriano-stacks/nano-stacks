@@ -1,12 +1,13 @@
 ---
 title: "Expose Prometheus metrics from the node"
 id: "113"
-status: in-progress
+status: completed
 priority: medium
 type: feature
 tags: ["mainnet", "node", "observability", "rpc"]
 created_at: "2026-08-10"
 effort: medium
+completed_at: 2026-08-10
 ---
 
 # Expose Prometheus metrics from the node
