@@ -1,7 +1,7 @@
 ---
 id: "073"
 title: "Decide whether a contract clarity-wasm cannot load is mainnet-valid"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["060"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "vm", "clarity", "conformance", "release"]
 created_at: 2026-08-07
 type: bug
 group: mainnet
+completed_at: 2026-08-10
 ---
 
 # Decide whether a contract clarity-wasm cannot load is mainnet-valid
@@ -131,8 +132,8 @@ every module in the current-tip inventory. Retained current-tree sweep output:
 `677c2e834e2a7209beabbf1af9c0531fbad570bd217c04135928f18fabdf77d6`.
 
 The locals requirement, release-report bridge and independent pinned stock-node
-deployment proof are complete. Every task-local checkbox is now satisfied; the
-task remains in progress only while its formal task-060 dependency is open.
+deployment proof are complete. Every task-local checkbox is satisfied, and the
+formal task-060 dependency completed after its pristine clarity-wasm replay.
 
 ## Findings
 
