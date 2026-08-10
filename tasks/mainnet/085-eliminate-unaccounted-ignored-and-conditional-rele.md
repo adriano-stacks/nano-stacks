@@ -163,17 +163,19 @@ block and tenure 0 has no answer at all. The assertion is agreement plus
 to tenure, and every one is a reward some header was sealed with. A hand-derived
 expectation is exactly what left `asserts_false` ignored.
 
-## What is still open
+## Historical follow-ups, reconciled
 
-- The last semantic entry has to reach zero. Owner 023.
-- `cargo test -p clar2wasm --all-features` fails one test,
-  `clarity_v3::at_block_with_stacks_block_height`, where enabling every
-  `test-clarity-vN` feature at once resolves `TestConfig::clarity_version()` to
-  Clarity1 while the test wants v3. It is newly *visible* rather than newly
-  broken: `--all-features` did not compile at all before the missing
-  `VmExecutionError` import was added. Default features are green — 1,408 passed,
-  0 failed.
-- `skip_gate` is not inventoried by call site yet. `NANO_REQUIRE_MAINNET` already
-  turns every skip into a failure, so a release run cannot report green on gates
-  that did not run; what it lacks is the per-site ownership the `#[ignore]` sites
-  now have.
+- `contract_call_with_epoch_3_3` is no longer a semantic entry. Its measured
+  `out-of-scope` policy in `ignored-tests.toml` records that production always
+  charges Epoch40, while the scoreboard and mainnet receipts cover that live
+  schedule. `known-differentials.toml` is empty.
+- Enabling every mutually exclusive `test-clarity-vN` feature together still
+  makes the block-info harness select the wrong test version. That developer
+  feature-matrix collision is neither an ignored/conditional release behavior
+  nor a production configuration; the release-owned configurations remain the
+  mandatory gates.
+- `skip_gate` and `skip_diagnostic` are inventoried by stable call-site identity
+  in `conditional-tests.toml`. Both conformance and `release-report` scan the
+  current source against it and reject a missing, stale or unowned entry.
+
+The only task item still open is therefore the infrastructure run named above.
