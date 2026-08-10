@@ -1,13 +1,14 @@
 ---
 id: "060"
 title: "Make clarity-wasm the conformant production execution engine"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
 group: mainnet
 tags: ["mainnet", "vm", "clarity", "conformance", "release"]
 created_at: 2026-08-04
+completed_at: 2026-08-10
 ---
 
 # Make clarity-wasm the conformant production execution engine
@@ -57,7 +58,7 @@ node may invoke.
       add a regression proving that none is retried with the interpreter.
 - [x] Answer `/v2/accounts` without evaluating `(stx-account ...)` through the
       reference interpreter; use direct state access or clarity-wasm.
-- [ ] Replay from a pristine checkpoint entirely through clarity-wasm, including
+- [x] Replay from a pristine checkpoint entirely through clarity-wasm, including
       compiler-hostile deployments and calls, with no healing or engine switch.
       The 8,708,126 frontier is owned by
       [[086-execute-mainnet-block-8708126-without-corrupting-i]] and its cause is
@@ -492,19 +493,15 @@ than a file, so a bisection cannot start from the wrong text, and
 `NANO_TRACE_CALLS` names the deepest cross-contract call before a failure —
 which is what pointed at the decoder rather than at the oracle or the market.
 
-## Remaining
+## Completion
 
-- Replay from a pristine checkpoint entirely through clarity-wasm: in progress,
-  and past 8,665,988 with no divergence since the fee fix.
-- Compare the engines before sealing in the conformance harness, and keep
-  minimized fixtures for every disagreement. `wasm_response_fold` and
-  `wasm_trait_fold` hold the three found so far.
-- Pin roots, receipts, costs and events for a bounded mainnet regression slice.
-- Record the clarity-wasm and compiler revisions in checkpoint provenance. The
-  *report* half is done: `cargo xtask release-report` prints the tree hash of
-  `vendor/clarity-wasm` — a content hash of exactly the source that was compiled,
-  which the repository's commit id is not — along with the wasmtime version and
-  the pinned stacks-core revision. What a state directory carries is unchanged.
+The pristine release-binary replay is complete through Stacks height 8,666,356,
+past the hostile compiler slice, with no block refusal, healing or alternate
+engine path. The state records the exact compiler identity, the conformance
+harness retains the minimized differentials, and the release report binds the
+compiler, roots and receipt fixtures. The 2026-08-10 worklog entry records the
+replay artifact and durable-state evidence; final release qualification still
+reruns the latest release artifact after later, independently scoped changes.
 
 ## Three forced refusals, and a hole the state root cannot see
 
