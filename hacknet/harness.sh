@@ -494,7 +494,7 @@ host() {
     log "stopping stock participant $index: stacks-miner-$index and stacks-signer-$index"
     compose stop "stacks-miner-$index" "stacks-signer-$index"
 
-    signer_container=$(compose ps -q "stacks-signer-$index")
+    signer_container=$(compose ps -a -q "stacks-signer-$index")
     image=$(docker inspect --format '{{.Config.Image}}' "$signer_container")
     docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
     mkdir -p "$RUN/hosted-signer"
@@ -557,7 +557,9 @@ nano_sink() {
 unhost() {
     need_source
     docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
-    [ -f "$RUN/nano-sink.pid" ] && kill "$(cat "$RUN/nano-sink.pid")" 2>/dev/null
+    if [ -f "$RUN/nano-sink.pid" ]; then
+        kill "$(cat "$RUN/nano-sink.pid")" 2>/dev/null || true
+    fi
     rm -f "$RUN/nano-sink.pid"
     restore
 }
