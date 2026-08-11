@@ -1674,19 +1674,6 @@ fn engines_disagree_before_sealing(
     None
 }
 
-fn bench_sidecar(samples: &Path, suffix: &str, enabled: bool) -> std::io::Result<Option<fs::File>> {
-    if !enabled {
-        return Ok(None);
-    }
-    let mut path = samples.as_os_str().to_owned();
-    path.push(suffix);
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(PathBuf::from(path))
-        .map(Some)
-}
-
 /// Time both engines on every contract call in a block, against the parent.
 ///
 /// The same seam and the same open-and-abort discipline as
@@ -1724,10 +1711,18 @@ fn bench_engines_before_sealing(
         .open(samples)?;
     // With `NANO_WASM_PHASES` also set, each call's compiled runs get a phase
     // attribution row: where inside the engine those nanoseconds went.
-    let mut phase_sink = bench_sidecar(samples, ".phases", nano_vm::phases::enabled())?;
-    // `NANO_VALUE_TRAFFIC` records the owned strings, decoded values, clones
-    // and linear-memory bytes used by each compiled call.
-    let mut traffic_sink = bench_sidecar(samples, ".traffic", nano_vm::traffic::enabled())?;
+    let mut phase_sink = if nano_vm::phases::enabled() {
+        let mut path = samples.as_os_str().to_owned();
+        path.push(".phases");
+        Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(PathBuf::from(path))?,
+        )
+    } else {
+        None
+    };
     for call in calls {
         if ask_engine_before_sealing(chainstate, parent, &call, false, false).is_none() {
             return Ok(());
@@ -1736,21 +1731,12 @@ fn bench_engines_before_sealing(
         let mut agree = true;
         let mut runtime = 0;
         let (mut compiled, mut interpreted) = (Vec::new(), Vec::new());
-        let mut traffic = [(0_u64, 0_u64); nano_vm::traffic::TRAFFIC];
         for _ in 0..repeats {
-            let traffic_before = nano_vm::traffic::snapshot();
             let Some((wasm_answer, cost, took)) =
                 ask_engine_before_sealing(chainstate, parent, &call, false, false)
             else {
                 return Ok(());
             };
-            for (total, (after, before)) in traffic
-                .iter_mut()
-                .zip(nano_vm::traffic::snapshot().into_iter().zip(traffic_before))
-            {
-                total.0 += after.0 - before.0;
-                total.1 += after.1 - before.1;
-            }
             runtime = cost.runtime;
             compiled.push(took);
             let Some((interpreter_answer, _, took)) =
@@ -1791,18 +1777,6 @@ fn bench_engines_before_sealing(
                 .join("\t");
             writeln!(
                 phase_sink,
-                "{}\t{}\t{}\t{}\t{repeats}\t{split}",
-                block.header.chain_length, call.txid, call.contract, call.function,
-            )?;
-        }
-        if let Some(traffic_sink) = traffic_sink.as_mut() {
-            let split = traffic
-                .iter()
-                .map(|(count, bytes)| format!("{count}:{bytes}"))
-                .collect::<Vec<_>>()
-                .join("\t");
-            writeln!(
-                traffic_sink,
                 "{}\t{}\t{}\t{}\t{repeats}\t{split}",
                 block.header.chain_length, call.txid, call.contract, call.function,
             )?;

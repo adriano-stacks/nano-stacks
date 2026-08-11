@@ -896,25 +896,16 @@ where
     S::Data: RuntimeShapeStore,
 {
     crate::phases::time(crate::phases::Phase::ValueWrite, || {
-        crate::traffic::wasm_write(|| {
-            write_to_wasm_untimed(
-                store,
-                memory,
-                ty,
-                offset,
-                in_mem_offset,
-                value,
-                include_repr,
-            )
-        })
+        write_to_wasm_untimed(
+            store,
+            memory,
+            ty,
+            offset,
+            in_mem_offset,
+            value,
+            include_repr,
+        )
     })
-}
-
-fn clone_for_wasm(value: &Value) -> Value {
-    if let Ok(bytes) = value.size() {
-        crate::traffic::record(crate::traffic::Traffic::ValueClone, u64::from(bytes));
-    }
-    value.clone()
 }
 
 fn write_to_wasm_untimed<S>(
@@ -962,7 +953,7 @@ where
             Ok((16, 0))
         }
         TypeSignature::SequenceType(SequenceSubtype::BufferType(_length)) => {
-            let buffdata = value_as_buffer(clone_for_wasm(value))?;
+            let buffdata = value_as_buffer(value.clone())?;
             let mut written = 0;
             let mut in_mem_written = 0;
 
@@ -999,7 +990,7 @@ where
         }
         TypeSignature::SequenceType(SequenceSubtype::StringType(string_subtype)) => {
             let string = match string_subtype {
-                StringSubtype::ASCII(_length) => value_as_string_ascii(clone_for_wasm(value))?.data,
+                StringSubtype::ASCII(_length) => value_as_string_ascii(value.clone())?.data,
                 StringSubtype::UTF8(_length) => {
                     let Value::Sequence(SequenceData::String(CharType::UTF8(utf8_data))) = value
                     else {
@@ -1051,7 +1042,7 @@ where
         TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
             let mut written = 0;
             let list_data = value_as_list(value)?;
-            let handle = save_runtime_shape(&mut store, clone_for_wasm(value))?;
+            let handle = save_runtime_shape(&mut store, value.clone())?;
             let elem_ty = list.get_list_item_type();
             // For a list, the values are written to the memory at
             // `in_mem_offset`, and the representation (offset and length) is
@@ -1284,7 +1275,7 @@ where
         }
         TypeSignature::TupleType(type_sig) => {
             let tuple_data = value_as_tuple(value)?;
-            let handle = save_runtime_shape(&mut store, clone_for_wasm(value))?;
+            let handle = save_runtime_shape(&mut store, value.clone())?;
             memory
                 .write(&mut store, offset as usize, &handle.to_le_bytes())
                 .map_err(|e| crate::error::wasm_error(WasmError::UnableToWriteMemory(e.into())))?;
