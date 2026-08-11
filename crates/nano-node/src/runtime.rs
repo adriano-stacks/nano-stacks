@@ -1873,6 +1873,34 @@ where
     Ok(())
 }
 
+fn persist_validator_sortitions_at_standing<S: nano_bitcoin::BitcoinSource>(
+    pox: &PoxInfo,
+    tracker: &mut SortitionTracker,
+    bitcoin: &mut S,
+    state: &Path,
+    standing: u64,
+) -> Result<(), Box<dyn Error>>
+where
+    S::Error: std::fmt::Display,
+{
+    if tracker.tip().bitcoin_height < standing {
+        let payouts = crate::payout_schedule(pox).ok_or(
+            "the proposal validator cannot derive its standing burn view without a PoX payout calendar",
+        )?;
+        let limit = standing - tracker.tip().bitcoin_height;
+        tracker.catch_up(|height| bitcoin.block_at(height), standing, payouts, limit)?;
+    }
+    if tracker.snapshot_at(standing).is_none() {
+        return Err(format!(
+            "local sortition derivation stopped at burn {}, before the proposal validator's standing burn {standing}",
+            tracker.tip().bitcoin_height
+        )
+        .into());
+    }
+    tracker.save_standing_on(state, standing)?;
+    Ok(())
+}
+
 fn authenticate_fresh_checkpoint(
     config: &Config,
     pox: &PoxInfo,
@@ -1958,6 +1986,17 @@ async fn open_executor_with_sortition_copy(
             &history,
         )?;
     }
+    if let Some(state) = sortition_copy {
+        let standing = context.as_ref().map_or_else(
+            || {
+                chainstate
+                    .recorded_header(*anchor.block_id().as_bytes())
+                    .map_or(0, |header| u64::from(header.burn_block_height))
+            },
+            |context| context.height,
+        );
+        persist_validator_sortitions_at_standing(pox, &mut tracker, &mut bitcoin, state, standing)?;
+    }
     println!(
         "deriving sortitions locally from burn {} on PoX history {}",
         tracker.tip().bitcoin_height,
@@ -1976,9 +2015,6 @@ async fn open_executor_with_sortition_copy(
         }
         None => CheckpointExecutor::resume(chainstate, anchor, bitcoin),
     };
-    if let Some(state) = sortition_copy {
-        tracker.save_standing_on(state, executor.bitcoin_height())?;
-    }
     executor.track_sortitions(tracker, config.node.working_dir.clone());
     Ok(executor)
 }
@@ -4011,6 +4047,51 @@ mod tests {
             v2_unlock_height: None,
             v3_unlock_height: None,
         }
+    }
+
+    #[test]
+    fn validator_sortitions_are_saved_at_the_sealed_standing_height() {
+        let root = captured_fixtures();
+        let chain = captured_blocks(&root);
+        let (boundary_index, _, source_index) = authentication_window(&chain);
+        let boundary = chain[boundary_index].header.consensus_hash;
+        let (mut bitcoin, heights) = captured_burnchain(&root);
+        let mut tracker = crate::sortition::SortitionTracker::from_capture_at_consensus(
+            &root.join("sortition"),
+            boundary,
+        )
+        .expect("seed at the authentication boundary");
+        tracker
+            .recover_seed(|height| bitcoin.block_at(height))
+            .expect("recover the boundary winner seed");
+        let source_view = chain[source_index]
+            .bitcoin_view_consensus_hash()
+            .unwrap_or(chain[source_index].header.consensus_hash)
+            .to_string();
+        let standing = heights[&source_view];
+        assert!(standing > tracker.tip().bitcoin_height);
+
+        let state = tempfile::tempdir().expect("a role-specific state directory");
+        super::persist_validator_sortitions_at_standing(
+            &captured_pox(),
+            &mut tracker,
+            &mut bitcoin,
+            state.path(),
+            standing,
+        )
+        .expect("derive and persist through the validator's standing burn");
+        let expected = tracker
+            .consensus_hash_at(standing)
+            .expect("the derived chain names the standing burn");
+
+        let resumed = crate::sortition::SortitionTracker::resume_or_capture_below(
+            state.path(),
+            &root.join("sortition"),
+            standing,
+        )
+        .expect("the role resumes its locally derived chain");
+        assert_eq!(resumed.tip().bitcoin_height, standing);
+        assert_eq!(resumed.consensus_hash_at(standing), Some(expected));
     }
 
     struct AuthenticatedHistoryFixture {
