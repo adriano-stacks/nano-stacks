@@ -2,13 +2,14 @@
 id: "107"
 group: mainnet
 title: "Hold the follower's memory flat while it follows at tip"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: []
 tags: ["mainnet", "liveness", "operations", "release", "marf", "vm", "sync"]
 created_at: 2026-08-10
 type: bug
+completed_at: 2026-08-11
 ---
 
 # Hold the follower's memory flat while it follows at tip
