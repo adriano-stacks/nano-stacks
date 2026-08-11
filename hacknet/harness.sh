@@ -548,7 +548,7 @@ nano_sink() {
     fi
     mkdir -p "$out"
     log "recording nano's events into $out"
-    python3 "$ROOT/hacknet/event-sink.py" "$out" "$port" \
+    nohup setsid python3 "$ROOT/hacknet/event-sink.py" "$out" "$port" \
         >> "$RUN/nano-sink.log" 2>&1 &
     echo $! > "$RUN/nano-sink.pid"
 }
