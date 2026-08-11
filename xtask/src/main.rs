@@ -2541,6 +2541,7 @@ struct CaptureConfig {
     replay_blocks: u64,
     checkpoint_height: u64,
     bitcoin_magic: String,
+    full_sortition_history: bool,
 }
 
 fn capture_fixtures(arguments: &[String]) -> ExitCode {
@@ -2573,6 +2574,7 @@ impl CaptureConfig {
         let mut replay_blocks = None;
         let mut checkpoint_height = None;
         let mut bitcoin_magic = None;
+        let mut full_sortition_history = false;
 
         while let Some(flag) = values.next() {
             let value = values
@@ -2597,6 +2599,11 @@ impl CaptureConfig {
                 "--replay-blocks" => replay_blocks = Some(parse_u64(flag, value)?),
                 "--checkpoint-height" => checkpoint_height = Some(parse_u64(flag, value)?),
                 "--bitcoin-magic" => bitcoin_magic = Some(value.to_owned()),
+                "--full-sortition-history" => {
+                    full_sortition_history = value
+                        .parse()
+                        .map_err(|error| format!("invalid {flag}: {error}"))?;
+                }
                 _ => return Err(format!("unknown capture-fixtures argument: {flag}")),
             }
         }
@@ -2622,6 +2629,7 @@ impl CaptureConfig {
             checkpoint_height: checkpoint_height
                 .ok_or_else(|| "--checkpoint-height is required".to_owned())?,
             bitcoin_magic: bitcoin_magic.unwrap_or_else(|| "T3".to_owned()),
+            full_sortition_history,
         })
     }
 
@@ -2933,11 +2941,16 @@ impl CaptureConfig {
         // canonical snapshot at each height. A chain with forks has more than
         // one row per height, and a chain with a million burn blocks does not
         // want all of them in a fixture.
-        let (first_burn, last_burn) = Self::burn_span(
+        let (bounded_first_burn, last_burn) = Self::burn_span(
             sortition_db,
             &node_root.join("chainstate/vm/index.sqlite"),
             blocks,
         )?;
+        let first_burn = if self.full_sortition_history {
+            0
+        } else {
+            bounded_first_burn
+        };
         let snapshot_query = format!(
             "select block_height, burn_header_hash, sortition_id, parent_sortition_id, burn_header_timestamp, parent_burn_header_hash, consensus_hash, ops_hash, total_burn, sortition, sortition_hash, winning_block_txid, winning_stacks_block_hash, num_sortitions, stacks_block_accepted, stacks_block_height, arrival_index, canonical_stacks_tip_height, canonical_stacks_tip_hash, canonical_stacks_tip_consensus_hash, pox_valid, accumulated_coinbase_ustx, pox_payouts, miner_pk_hash from snapshots where pox_valid = 1 and block_height between {first_burn} and {last_burn} group by block_height order by block_height"
         );
@@ -3455,13 +3468,14 @@ impl CaptureConfig {
             .map_or_else(Self::pinned_stacks_core, Ok)?;
         let unlock_heights = self.unlock_height_lines();
         let contents = format!(
-            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}{unlock_heights}\n",
+            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nfull_sortition_history = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}{unlock_heights}\n",
             self.hacknet_commit,
             checkpoint.height,
             checkpoint.index_block_hash,
             checkpoint_root,
             self.first_height,
             self.replay_blocks,
+            self.full_sortition_history,
             self.bitcoin_rpc.as_deref().unwrap_or_default(),
             self.stacks_rpc,
             blocks[0].block_hash,

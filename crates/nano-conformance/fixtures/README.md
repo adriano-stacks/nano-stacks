@@ -16,7 +16,8 @@ cargo xtask capture-fixtures \
   --hacknet-commit <commit> \
   --checkpoint-height <height> \
   --first-height <height> \
-  --replay-blocks <count>
+  --replay-blocks <count> \
+  --full-sortition-history true
 ```
 
 The command records all live inputs plus a portable `checkpoint-H/`: a stable
@@ -34,6 +35,11 @@ A complete capture contains:
 - `chainstate/checkpoint-H/`
 - `chainstate/checkpoint-H/native-effects.json`
 - `stacker_set/cycle-N.json`
+
+The checked-in Hacknet oracle keeps the complete sortition history so its
+Bitcoin and sortition decisions can be re-derived offline. Large diagnostic
+captures may omit `--full-sortition-history`; they retain only the bounded burn
+window execution needs.
 
 Replace `manifest.toml`'s `replay_blocks` with the captured block count in the
 same change that adds the data and a fixture integrity test. A captured tree

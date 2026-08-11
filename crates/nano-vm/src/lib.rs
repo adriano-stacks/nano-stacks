@@ -3472,13 +3472,20 @@ fn import(
         // whose headers stop at the anchor is exactly the state this import
         // exists to stop shipping: it answers Clarity for history it holds no
         // header for, and it does so silently.
-        import_block_headers(&importing, &checkpoint.join(HEADER_EXPORT_FILE))?;
+        import_block_headers(
+            &importing,
+            &checkpoint_companion(checkpoint, HEADER_EXPORT_FILE),
+        )?;
     }
     Ok(unfinished.finish(&[marf_path, clarity_path])?)
 }
 
 /// What a checkpoint calls the headers of the ancestry it carries.
 pub const HEADER_EXPORT_FILE: &str = "block-headers.sqlite";
+
+fn checkpoint_companion(checkpoint: &Path, name: &str) -> std::path::PathBuf {
+    checkpoint.with_file_name(name)
+}
 
 /// The header export's own schema, so a writer and this reader share one.
 ///
@@ -6551,6 +6558,20 @@ mod tests {
             .put("nano-checkpoint-extension", "value")
             .expect("write extension");
         store.seal().expect("seal checkpoint extension");
+    }
+
+    #[test]
+    fn loads_the_checkpoint_header_export_beside_the_marf() {
+        let (checkpoint, source, root) = captured_checkpoint();
+        let directory = tempfile::tempdir().expect("state directory");
+        let vm =
+            Vm::open_from_checkpoint(Network::TESTNET, directory.path(), checkpoint, source, root)
+                .expect("load checkpoint");
+
+        assert!(
+            vm.recorded_header(source).is_some(),
+            "the checkpoint source has its complete exported header"
+        );
     }
 
     #[test]

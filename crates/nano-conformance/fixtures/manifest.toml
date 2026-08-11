@@ -1,2 +1,3 @@
 mode = "captured"
 replay_blocks = 340
+receipts = true

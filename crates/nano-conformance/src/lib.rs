@@ -44,6 +44,7 @@ struct CapturedBitcoinSnapshot {
     burn_header_timestamp: u64,
     consensus_hash: String,
     winning_block_txid: String,
+    accumulated_coinbase_ustx: String,
     /// stacks-core's own `pox_payouts` column, verbatim: a JSON pair of the payout
     /// addresses and the amount *per address*.
     ///
@@ -2109,7 +2110,9 @@ fn captured_signer_sets(root: &Path) -> BTreeMap<u64, nano_chainstate::SignerSet
                 )
             })
             .collect();
-        if let Ok((set, _)) = nano_chainstate::SignerSet::from_reward_slots(signers, 30) {
+        if let Ok((set, _)) =
+            nano_chainstate::SignerSet::from_reward_slots(signers, captured_reward_slots(root))
+        {
             sets.insert(cycle, set);
         }
     }
@@ -2156,9 +2159,17 @@ fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
             )
         })
         .collect();
-    nano_chainstate::SignerSet::from_reward_slots(signers, 30)
+    nano_chainstate::SignerSet::from_reward_slots(signers, captured_reward_slots(root))
         .expect("build the captured signer set")
         .0
+}
+
+#[cfg(test)]
+fn captured_reward_slots(root: &Path) -> u32 {
+    provenance_field(root, "pox_reward_phase_length")
+        .and_then(|length| length.parse::<u32>().ok())
+        .and_then(|length| length.checked_mul(2))
+        .expect("the capture names its nonzero reward-slot schedule")
 }
 
 /// Where the captured chain deployed the sBTC registry `.pox-5` reads.
@@ -2190,6 +2201,26 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
     let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
     let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
     let operations = captured_bitcoin_operations(root)?;
+    let registrations = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            operations
+                .get(&snapshot.consensus_hash)
+                .into_iter()
+                .flatten()
+                .filter_map(move |operation| match operation.kind {
+                    BitcoinOperationKind::LeaderKeyRegistration {
+                        vrf_public_key,
+                        block_signing_key_hash,
+                        ..
+                    } => Some((
+                        (snapshot.block_height, operation.transaction_index),
+                        (vrf_public_key, block_signing_key_hash),
+                    )),
+                    _ => None,
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
     snapshots
         .into_iter()
         .map(|snapshot| {
@@ -2212,18 +2243,22 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                     .map(|output| u128::from(output.amount_sats))
                     .sum()
             };
-            let (vrf_seed, burn_spend_winner) = commits
-                .and_then(|commits| {
-                    commits.iter().find_map(|operation| match operation.kind {
-                        BitcoinOperationKind::LeaderBlockCommit { new_seed, .. }
-                            if Some(operation.txid) == winner =>
-                        {
-                            Some((new_seed, burn(operation)))
-                        }
-                        _ => None,
-                    })
+            let winner = commits.and_then(|commits| {
+                commits.iter().find_map(|operation| match operation.kind {
+                    BitcoinOperationKind::LeaderBlockCommit {
+                        new_seed,
+                        key_block_height,
+                        key_transaction_index,
+                        ..
+                    } if Some(operation.txid) == winner => Some((
+                        new_seed,
+                        burn(operation),
+                        u64::from(key_block_height),
+                        u32::from(key_transaction_index),
+                    )),
+                    _ => None,
                 })
-                .unwrap_or(([0; 32], 0));
+            });
             Some((snapshot.consensus_hash.clone(), {
                 // Through `at_height`, so this snapshot's burn block is both the
                 // tenure and the view. A replayed block carrying an extend moves
@@ -2234,9 +2269,16 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
                 context.reward_phase_length = reward_phase_length;
                 context.burn_header_hash = decode_hash(&snapshot.burn_header_hash)?;
                 context.burn_block_time = snapshot.burn_header_timestamp;
-                context.vrf_seed = vrf_seed;
                 context.burn_spend_total = burn_spend_total;
-                context.burn_spend_winner = burn_spend_winner;
+                if let Some((vrf_seed, burn_spend_winner, key_height, key_index)) = winner {
+                    context.vrf_seed = vrf_seed;
+                    context.burn_spend_winner = burn_spend_winner;
+                    let (vrf_public_key, signing_key_hash) =
+                        registrations.get(&(key_height, key_index)).copied()?;
+                    context.winner_vrf_public_key = Some(vrf_public_key);
+                    context.winner_signing_key_hash = signing_key_hash;
+                }
+                context.accumulated_coinbase = snapshot.accumulated_coinbase_ustx.parse().ok()?;
                 // Validation only, and absent from a capture written before it
                 // was recorded: zero then, which reads as "cannot check" at the
                 // rule rather than as a wrong answer.
@@ -2315,10 +2357,10 @@ mod tests {
         CHECKPOINT_HISTORY_LIMIT, ChainState, FixtureManifest, FixtureMode, FixtureStatus,
         FixtureValidationError, apply_captured_block, baseline_replay, captured_accounting,
         captured_bitcoin_operations, captured_bitcoin_snapshots, captured_chainstate,
-        captured_checkpoint_block, captured_magic, captured_network, captured_signer_set,
-        captured_signer_sets, checkpoint_manifest, checkpoint_state, decode_hash, scoreboard,
-        validate_checkpoint_authentication_history, validate_execution_fixture_tree,
-        validate_fixture_tree, validate_sortition_seed,
+        captured_checkpoint_block, captured_magic, captured_network, captured_reward_slots,
+        captured_signer_set, captured_signer_sets, checkpoint_manifest, checkpoint_state,
+        decode_hash, durable_replay_chainstate, provenance_field, scoreboard,
+        validate_checkpoint_authentication_history, validate_fixture_tree, validate_sortition_seed,
     };
     use blockstack_lib::burnchains::{
         MagicBytes,
@@ -2378,8 +2420,10 @@ mod tests {
     use nano_node::{
         Checkpoint, CheckpointExecutor, CheckpointTrustError, adopt_checkpoint, attest_checkpoint,
     };
-    use nano_primitives::{BitVec, Network, TrieHash, hash160, sha256, sha512, sha512_256};
-    use nano_signer::{ChainstateProposalValidator, ProposalValidator};
+    use nano_primitives::{
+        BitVec, Network, StacksBlockId, TrieHash, hash160, sha256, sha512, sha512_256,
+    };
+    use nano_signer::{AccumulatedCoinbase, ChainstateProposalValidator, ProposalValidator};
     use nano_sortition::BURN_BLOCK_MINED_AT_MODULUS;
     use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, Chunk, SignerMessage};
     use proptest::prelude::*;
@@ -2910,21 +2954,11 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_capture_is_explicitly_execution_only_until_recaptured() {
+    fn checked_in_capture_authenticates_the_checkpoint_it_publishes() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let status = validate_execution_fixture_tree(&root)
-            .expect("the checked-in post-checkpoint execution oracle remains valid");
+        let status = validate_fixture_tree(&root)
+            .expect("the checked-in capture authenticates its published checkpoint");
         assert_eq!(status, FixtureStatus::Captured { replay_blocks: 340 });
-        let error = validate_fixture_tree(&root).expect_err(
-            "a capture without the checkpoint authentication suffix cannot qualify a release",
-        );
-        assert!(
-            matches!(
-                error,
-                FixtureValidationError::InvalidCheckpointHistory { .. }
-            ),
-            "{error}"
-        );
         assert!(fs::metadata(root.join("README.md")).is_ok());
     }
 
@@ -3289,8 +3323,77 @@ mod tests {
         );
     }
 
+    fn captured_context_change(
+        fixture: &Path,
+        snapshots: &BTreeMap<String, BitcoinBlockContext>,
+    ) -> (Vec<NanoNakamotoBlock>, usize) {
+        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
+            .expect("read blocks")
+            .map(|entry| entry.expect("block entry").path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        let blocks = paths
+            .iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(path).expect("read captured block"))
+                    .expect("decode captured block")
+            })
+            .collect::<Vec<_>>();
+        let context = |block: &NanoNakamotoBlock| {
+            snapshots
+                .get(&block.header.consensus_hash.to_string())
+                .expect("captured Bitcoin context")
+        };
+        let pair = blocks
+            .windows(2)
+            .enumerate()
+            .position(|(index, pair)| {
+                let first = context(&pair[0]);
+                let second = context(&pair[1]);
+                nano_chainstate::starts_new_tenure(&pair[1])
+                    && blocks[..index]
+                        .iter()
+                        .any(nano_chainstate::starts_new_tenure)
+                    && (first.vrf_seed, first.sortition_hash)
+                        != (second.vrf_seed, second.sortition_hash)
+            })
+            .expect("the capture crosses an authenticated tenure context");
+        (blocks, pair)
+    }
+
+    fn apply_captured_prefix(
+        chainstate: &mut ChainState,
+        blocks: &[NanoNakamotoBlock],
+        through: usize,
+        source: [u8; 32],
+        snapshots: &BTreeMap<String, BitcoinBlockContext>,
+        operations: &BTreeMap<String, Vec<nano_bitcoin::BitcoinOperation>>,
+    ) {
+        chainstate
+            .seed_unauthenticated_fixture_extension_from_parent_header(StacksBlockId::from_bytes(
+                source,
+            ))
+            .expect("seed checkpoint extension continuity");
+        let mut parent = Some(source);
+        for block in &blocks[..=through] {
+            let consensus_hash = block.header.consensus_hash.to_string();
+            chainstate
+                .append_unauthenticated_fixture_block_with_bitcoin_operations(
+                    *snapshots
+                        .get(&consensus_hash)
+                        .expect("captured Bitcoin context"),
+                    operations
+                        .get(&consensus_hash)
+                        .expect("captured Bitcoin operations"),
+                    parent,
+                    block,
+                )
+                .expect("apply captured prefix");
+            parent = Some(*block.block_id().as_bytes());
+        }
+    }
+
     #[test]
-    #[ignore = "checked-in capture lacks checkpoint authentication history"]
     fn signer_validator_executes_a_captured_proposal() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
@@ -3305,12 +3408,8 @@ mod tests {
             .expect("decode first block");
         let second = NanoNakamotoBlock::decode(&fs::read(&paths[1]).expect("read second block"))
             .expect("decode second block");
-        let first_context = *snapshots
-            .get(&first.header.consensus_hash.to_string())
-            .expect("first Bitcoin context");
-        let second_context = *snapshots
-            .get(&second.header.consensus_hash.to_string())
-            .expect("second Bitcoin context");
+        let first_context = snapshots[&first.header.consensus_hash.to_string()];
+        let second_context = snapshots[&second.header.consensus_hash.to_string()];
         let mut chainstate = captured_chainstate(&fixture);
         let mut bitcoin = FixtureBitcoinSource {
             blocks: [
@@ -3375,35 +3474,27 @@ mod tests {
     /// captured burn blocks have to disagree about the seed at all, or a validator
     /// carrying the wrong one would look correct.
     #[test]
-    #[ignore = "checked-in capture lacks checkpoint authentication history"]
     fn a_proposal_is_validated_under_its_own_burn_block() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, _) = checkpoint_state(&fixture).expect("checkpoint metadata");
         let snapshots = captured_bitcoin_snapshots(&fixture).expect("snapshots");
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
-        let mut paths = fs::read_dir(fixture.join("nakamoto/blocks"))
-            .expect("read blocks")
-            .map(|entry| entry.expect("block entry").path())
-            .collect::<Vec<_>>();
-        paths.sort();
-        let first = NanoNakamotoBlock::decode(&fs::read(&paths[0]).expect("read first block"))
-            .expect("decode first block");
-        let second = NanoNakamotoBlock::decode(&fs::read(&paths[1]).expect("read second block"))
-            .expect("decode second block");
-        let first_context = *snapshots
-            .get(&first.header.consensus_hash.to_string())
-            .expect("first Bitcoin context");
-        let second_context = *snapshots
-            .get(&second.header.consensus_hash.to_string())
-            .expect("second Bitcoin context");
+        let (blocks, pair) = captured_context_change(&fixture, &snapshots);
+        let first = blocks[pair].clone();
+        let second = blocks[pair + 1].clone();
+        let first_context = snapshots[&first.header.consensus_hash.to_string()];
+        let second_context = snapshots[&second.header.consensus_hash.to_string()];
         assert_ne!(
             (first_context.vrf_seed, first_context.sortition_hash),
             (second_context.vrf_seed, second_context.sortition_hash),
             "two burn blocks that agree about the seed cannot show which one was used"
         );
 
-        let mut chainstate = captured_chainstate(&fixture);
-        let mut bitcoin = FixtureBitcoinSource {
+        let directory = tempfile::tempdir().expect("proposal state directory");
+        let (mut chainstate, durable_source) =
+            durable_replay_chainstate(&fixture, directory.path()).expect("open checkpoint durably");
+        assert_eq!(durable_source, source);
+        let bitcoin = FixtureBitcoinSource {
             blocks: [
                 (&first_context, &first.header.consensus_hash),
                 (&second_context, &second.header.consensus_hash),
@@ -3425,17 +3516,14 @@ mod tests {
             })
             .collect(),
         };
-        let first_operations = bitcoin
-            .block_at(first_context.height)
-            .expect("first Bitcoin operations");
-        chainstate
-            .append_unauthenticated_fixture_block_with_bitcoin_operations(
-                first_context,
-                &first_operations.operations,
-                Some(source),
-                &first,
-            )
-            .expect("apply anchor block");
+        apply_captured_prefix(
+            &mut chainstate,
+            &blocks,
+            pair,
+            source,
+            &snapshots,
+            &bitcoin_operations,
+        );
         let mut validator =
             ChainstateProposalValidator::new(chainstate, &first, first_context, bitcoin);
 
@@ -3449,6 +3537,8 @@ mod tests {
         // What the hosted validator does before every proposal, out of its own
         // derived sortition chain rather than out of the peer that served it.
         validator.set_bitcoin_context(second_context);
+        validator
+            .set_accumulated_coinbase(second_context.height, second_context.accumulated_coinbase);
         assert_eq!(
             validator.bitcoin_context().vrf_seed,
             second_context.vrf_seed,
@@ -3471,7 +3561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "checked-in capture lacks checkpoint authentication history"]
     fn checkpoint_executor_executes_captured_descendants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let (source, root) = checkpoint_state(&fixture).expect("checkpoint metadata");
@@ -5164,29 +5253,70 @@ mod tests {
         root: &Path,
         fixture: &Path,
     ) -> Result<(serde_json::Value, BitcoinBlock), Box<dyn std::error::Error>> {
-        let history = fs::read(fixture.join("sortition/consensus-hashes.json"))?;
-        let history: serde_json::Value = serde_json::from_slice(&history)?;
-        let seed_consensus_hash = history["hashes"]
-            .as_array()
-            .and_then(|hashes| hashes.last())
-            .and_then(serde_json::Value::as_str)
-            .expect("the captured history ends at a consensus hash");
+        let mut history: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("sortition/consensus-hashes.json"))?)?;
         let snapshots: Vec<serde_json::Value> =
             serde_json::from_slice(&fs::read(fixture.join("sortition/snapshots.json"))?)?;
-        let seed = snapshots
-            .into_iter()
-            .find(|snapshot| snapshot["consensus_hash"] == seed_consensus_hash)
-            .expect("the capture carries its seed snapshot");
+        let hashes = history["hashes"]
+            .as_array()
+            .expect("the capture carries consensus hashes");
+        let (history_end, seed, block) = hashes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, hash)| {
+                let hash = hash.as_str()?;
+                let seed = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot["consensus_hash"] == hash)?;
+                let bitcoin_hash = seed["burn_header_hash"].as_str()?;
+                let bitcoin_height = seed["block_height"].as_u64()?;
+                let raw = hex::decode(
+                    fs::read_to_string(
+                        fixture
+                            .join("bitcoin/blocks")
+                            .join(format!("{bitcoin_hash}.hex")),
+                    )
+                    .ok()?
+                    .trim(),
+                )
+                .ok()?;
+                let block =
+                    decode_bitcoin_block(bitcoin_height, &raw, captured_magic(root)).ok()?;
+                let mut eligible = block
+                    .operations
+                    .iter()
+                    .filter_map(|operation| match operation.kind {
+                        nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                            new_seed,
+                            parent_modulus,
+                            ..
+                        } if nano_sortition::commitment_is_on_time(
+                            parent_modulus,
+                            bitcoin_height,
+                        ) =>
+                        {
+                            Some(new_seed)
+                        }
+                        _ => None,
+                    });
+                let first = eligible.next()?;
+                eligible
+                    .any(|candidate| candidate != first)
+                    .then(|| (index + 1, seed.clone(), block))
+            })
+            .expect("the capture carries a seed with disagreeing eligible commitments");
+        history["hashes"]
+            .as_array_mut()
+            .expect("the capture carries consensus hashes")
+            .truncate(history_end);
         let bitcoin_hash = seed["burn_header_hash"]
             .as_str()
             .expect("the seed names its Bitcoin block");
-        let bitcoin_height = seed["block_height"]
-            .as_u64()
-            .expect("the seed names its Bitcoin height");
         fs::create_dir_all(root.join("sortition"))?;
-        fs::copy(
-            fixture.join("sortition/consensus-hashes.json"),
-            root.join("sortition/consensus-hashes.json"),
+        write_file(
+            &root.join("sortition/consensus-hashes.json"),
+            &serde_json::to_string(&history)?,
         )?;
         fs::copy(
             fixture.join("sortition/leader-keys.json"),
@@ -5207,14 +5337,6 @@ mod tests {
         )?;
         validate_sortition_seed(root).expect("the unmodified captured seed is recoverable");
 
-        let raw = hex::decode(
-            fs::read_to_string(
-                root.join("bitcoin/blocks")
-                    .join(format!("{bitcoin_hash}.hex")),
-            )?
-            .trim(),
-        )?;
-        let block = decode_bitcoin_block(bitcoin_height, &raw, captured_magic(root))?;
         Ok((seed, block))
     }
 
@@ -5708,8 +5830,6 @@ mod tests {
 
     #[test]
     fn captured_blocks_have_the_expected_signer_weight() {
-        const HACKNET_REWARD_SLOTS: u32 = 30;
-
         #[derive(Deserialize)]
         struct SignerWire {
             signing_key: String,
@@ -5757,7 +5877,7 @@ mod tests {
                 })
                 .collect();
             let (signer_set, threshold) =
-                SignerSet::from_reward_slots(signers, HACKNET_REWARD_SLOTS)
+                SignerSet::from_reward_slots(signers, captured_reward_slots(&fixture_root))
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert_eq!(
                 threshold,
@@ -5960,7 +6080,14 @@ mod tests {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let snapshots = captured_sortition_snapshots(&fixture_root);
         let (genesis, rest) = snapshots.split_first().expect("captured genesis snapshot");
-        let (replayed, discarded) = rest.split_at(200);
+        let schedule = captured_sortition_schedule(&fixture_root);
+        let boundary = rest
+            .iter()
+            .position(|snapshot| {
+                snapshot.block_height > 200 && schedule.starts_at(snapshot.block_height)
+            })
+            .expect("the captured sortitions cross a reward-cycle boundary");
+        let (replayed, discarded) = rest.split_at(boundary);
         let mut replay = CapturedReplay::new(&fixture_root, genesis);
         for snapshot in replayed {
             replay.append(snapshot);
@@ -6026,10 +6153,39 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).expect("read captured sortition snapshots"))
                 .expect("parse captured sortition snapshots");
         assert_eq!(
+            provenance_field(fixture_root, "full_sortition_history").as_deref(),
+            Some("true"),
+            "the checked-in oracle must carry its full sortition history"
+        );
+        assert_eq!(
             snapshots.first().map(|snapshot| snapshot.block_height),
             Some(0)
         );
         snapshots
+    }
+
+    fn captured_sortition_schedule(fixture_root: &Path) -> nano_sortition::RewardCycleSchedule {
+        let field = |name: &str| {
+            provenance_field(fixture_root, name)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("the capture names {name}"))
+        };
+        let first = field("pox_first_bitcoin_height");
+        let length = field("pox_prepare_phase_length") + field("pox_reward_phase_length");
+        let first_event = fs::read_dir(fixture_root.join("events/new_block"))
+            .expect("read captured events")
+            .map(|entry| entry.expect("captured event entry").path())
+            .min()
+            .expect("the capture carries an observer event");
+        let event: serde_json::Value =
+            serde_json::from_slice(&fs::read(first_event).expect("read first captured event"))
+                .expect("decode first captured event");
+        let activation = event["pox_v4_unlock_height"]
+            .as_u64()
+            .expect("the capture names its PoX-5 activation height");
+        let waterfall = first + (activation.saturating_sub(first) / length + 1) * length;
+        nano_sortition::RewardCycleSchedule::new(first, length, Some(waterfall))
+            .expect("captured reward-cycle schedule is valid")
     }
 
     /// A replay of the captured Bitcoin chain into sortition snapshots.
@@ -6057,12 +6213,10 @@ mod tests {
                 chain.tip().sortition_id.as_bytes(),
                 &hex_array(&genesis.sortition_id)
             );
-            let schedule = nano_sortition::RewardCycleSchedule::new(0, 20, Some(280))
-                .expect("captured reward-cycle schedule is valid");
             Self {
                 fixture_root: fixture_root.to_path_buf(),
                 chain,
-                pox: nano_sortition::PoxIdTracker::new(schedule),
+                pox: nano_sortition::PoxIdTracker::new(captured_sortition_schedule(fixture_root)),
                 pre_stx: PreStxCache::new(),
             }
         }
