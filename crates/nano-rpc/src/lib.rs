@@ -1656,7 +1656,7 @@ async fn upload_block(
         state.metrics.record_block_refusal(&error);
         return Err(RpcError::BadRequest(format!("block refused: {error}")));
     }
-    let stacks_block_id = format!("0x{}", block.block_id());
+    let stacks_block_id = block.block_id().to_string();
     // A node that already holds the block does not re-accept it, and does not
     // offer it again either: the executor would only walk past it.
     let held = state.holds_block(&block).await;
@@ -3958,6 +3958,7 @@ mod tests {
         )
         .await;
         assert_eq!(taken["accepted"], json!(true));
+        assert_eq!(taken["stacks_block_id"], blocks[2].block_id().to_string());
         assert_eq!(
             offered.try_recv().expect("the node was offered the block"),
             blocks[2]
