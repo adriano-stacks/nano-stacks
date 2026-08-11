@@ -2346,9 +2346,10 @@ impl WasmGenerator {
                     .zip(tuple.type_size())
                     .and_then(|(map, ty)| map.checked_add(ty))
                     .and_then(|base| {
-                        tuple.get_type_map().keys().try_fold(base, |sum, name| {
-                            sum.checked_add(u32::try_from(name.len()).ok()?)
-                        })
+                        tuple
+                            .get_type_map()
+                            .keys()
+                            .try_fold(base, |sum, name| sum.checked_add(u32::from(name.len())))
                     })
                     .ok_or_else(|| {
                         GeneratorError::TypeError(format!("tuple overhead overflows: {ty}"))
@@ -2356,9 +2357,7 @@ impl WasmGenerator {
                 let field_size = self.borrow_local(ValType::I32);
                 let inline = {
                     let mut inline = builder.dangling_instr_seq(None);
-                    inline
-                        .i32_const(overhead as i32)
-                        .local_set(size);
+                    inline.i32_const(overhead as i32).local_set(size);
                     let mut cursor = 1;
                     for field_ty in tuple.get_type_map().values() {
                         let width = clar2wasm_ty(field_ty).len();
@@ -2382,7 +2381,8 @@ impl WasmGenerator {
                     for local in locals {
                         host.local_get(*local);
                     }
-                    let (value_offset, _) = self.create_call_stack_local(&mut host, ty, true, false);
+                    let (value_offset, _) =
+                        self.create_call_stack_local(&mut host, ty, true, false);
                     self.write_to_memory(&mut host, value_offset, 0, ty)?;
                     let (type_offset, type_length) = self.serialized_type(ty)?;
                     host.local_get(value_offset)
