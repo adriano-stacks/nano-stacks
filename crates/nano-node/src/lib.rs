@@ -71,11 +71,7 @@ pub struct CheckpointExecutor<S> {
     /// One entry rather than a map, because a replay walks burn views in order and
     /// never looks back. Keeping the earlier ones would be a leak dressed as a
     /// cache — a catch-up crosses thousands of them.
-    /// Where to announce the blocks this node executes.
-    ///
-    /// An observer's whole purpose is to see what a node *executed*, so this
-    /// belongs on the executor rather than beside it: a `new_block` sent from
-    /// anywhere else would announce a block that had only been downloaded.
+    /// Where to announce executed Stacks blocks and locally derived Bitcoin blocks.
     observers: Option<nano_rpc::EventDispatcher>,
     /// Where the blocks this node executes are kept, so it can serve them.
     ///
@@ -198,20 +194,6 @@ enum LocalView {
     /// role and no way to derive sortitions does not begin
     /// ([[077-remove-peer-derived-consensus-execution-fallbacks]]).
     NoChain,
-}
-
-/// The burn view a block was executed under, as this node named it.
-///
-/// A local type on purpose. This used to be `nano_sync::SortitionInfo` — the peer's
-/// own wire type — travelling from the request that fetched it all the way into the
-/// `new_burn_block` event and the trace line, which made the peer's answer part of
-/// the execution path's vocabulary even where nothing in it was used. Three fields
-/// are what those two callers actually read.
-#[derive(Clone, Copy, Debug)]
-struct ExecutedView {
-    bitcoin_height: u64,
-    bitcoin_block_hash: nano_primitives::BitcoinHeaderHash,
-    consensus_hash: nano_primitives::ConsensusHash,
 }
 
 /// Where a round of execution spent its time.
@@ -1547,11 +1529,10 @@ where
         nano_chainstate::starts_new_tenure(&block).then_some(block)
     }
 
-    /// Announce every block this node executes to these observers.
+    /// Announce executed Stacks blocks and locally derived Bitcoin blocks.
     ///
-    /// An observer's whole purpose is to see what a node *executed*, so this
-    /// belongs on the executor: a `new_block` sent from anywhere else would be
-    /// announcing a block that had only been downloaded.
+    /// The executor owns both boundaries: its chainstate executes Stacks blocks,
+    /// and its sortition tracker derives Bitcoin blocks.
     pub fn announce_to(&mut self, observers: nano_rpc::EventDispatcher) {
         self.observers = Some(observers);
     }
@@ -2262,7 +2243,7 @@ where
         block: &NakamotoBlock,
         timing: &mut ExecutionTiming,
         previous_view: &mut Option<nano_primitives::ConsensusHash>,
-    ) -> Result<Option<(BitcoinBlockContext, ExecutedView)>, NodeExecutionError> {
+    ) -> Result<Option<(BitcoinBlockContext, u64)>, NodeExecutionError> {
         // The burn view, not the tenure. A tenure that outlives the burn
         // block that elected it is extended, and the extension moves the
         // view forward — so a block mid-tenure sees a later burn height
@@ -2346,14 +2327,7 @@ where
             return Ok(None);
         };
         timing.coinbase += phase.elapsed();
-        let executed = ExecutedView {
-            bitcoin_height,
-            bitcoin_block_hash: nano_primitives::BitcoinHeaderHash::from_bytes(
-                bitcoin_context.burn_header_hash,
-            ),
-            consensus_hash: view,
-        };
-        Ok(Some((bitcoin_context, executed)))
+        Ok(Some((bitcoin_context, bitcoin_height)))
     }
 
     /// Fill in the coinbase a tenure-start block's tenure accumulated.
@@ -2429,21 +2403,13 @@ where
             let Some(block) = staging.child_of(self.tip.block_id())? else {
                 break;
             };
-            let Some((bitcoin_context, executed_view)) = self
+            let Some((bitcoin_context, executed_height)) = self
                 .context_for(peers, pox, &block, &mut timing, &mut previous_view)
                 .await?
             else {
                 rate_limited = true;
                 break;
             };
-            // A burn block is news exactly once: when the tenure it elected
-            // begins. `bitcoin_spent` is a running total, so the difference
-            // between consecutive headers is what this burn block burned —
-            // which is the one field of the event a follower could otherwise
-            // not answer.
-            let previous_spent = self.tip.header.bitcoin_spent;
-            let announce_burn = self.tip.header.consensus_hash != block.header.consensus_hash;
-            let burned = block.header.bitcoin_spent.saturating_sub(previous_spent);
             let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
             let block_execution = phase.elapsed();
@@ -2480,22 +2446,8 @@ where
             // most wants to ask. Handing the scheduler a turn between blocks is the
             // whole fix; the work is unchanged.
             tokio::task::yield_now().await;
-            trace_executed_block(&block, executed_view.bitcoin_height);
+            trace_executed_block(&block, executed_height);
             let phase = std::time::Instant::now();
-            if announce_burn && let Some(observers) = self.observers.as_ref() {
-                let payload = nano_rpc::new_burn_block_payload(
-                    executed_view.bitcoin_block_hash,
-                    executed_view.bitcoin_height,
-                    executed_view.consensus_hash,
-                    nano_primitives::BitcoinHeaderHash::from_bytes(
-                        self.bitcoin
-                            .block_hash_at(executed_view.bitcoin_height.saturating_sub(1))
-                            .unwrap_or_default(),
-                    ),
-                    burned,
-                );
-                observers.dispatch(nano_rpc::EventKind::NewBurnBlock, &payload);
-            }
             self.announce_block(&block, &applied, bitcoin_context);
             timing.dispatch += phase.elapsed();
             let phase = std::time::Instant::now();
@@ -2874,6 +2826,7 @@ where
         let Self {
             sortition: Some(tracker),
             bitcoin,
+            observers,
             ..
         } = self
         else {
@@ -2898,14 +2851,24 @@ where
             crate::sortition::CATCH_UP_LIMIT,
         ) {
             Ok(walk) if walk.advanced > 0 => {
+                let tip = tracker.tip().bitcoin_height;
                 println!(
                     "derived {} sortitions locally as Bitcoin advanced, from burn {standing_on} \
-                     to {}",
-                    walk.advanced,
-                    self.sortition
-                        .as_ref()
-                        .map_or(standing_on, |tracker| tracker.tip().bitcoin_height)
+                     to {tip}",
+                    walk.advanced
                 );
+                if let Some(observers) = observers.as_ref() {
+                    for notification in tracker.burn_notifications_after(standing_on) {
+                        let payload = nano_rpc::new_burn_block_payload(
+                            notification.bitcoin_block_hash,
+                            notification.bitcoin_height,
+                            notification.consensus_hash,
+                            notification.parent_bitcoin_block_hash,
+                            notification.burned,
+                        );
+                        observers.dispatch(nano_rpc::EventKind::NewBurnBlock, &payload);
+                    }
+                }
                 self.save_sortitions();
                 walk.advanced
             }

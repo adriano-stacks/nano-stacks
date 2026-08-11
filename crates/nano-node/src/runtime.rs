@@ -242,7 +242,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let executor = open_executed_state(&config, network, &pox, discovered.as_ref()).await?;
     let dispatcher = EventDispatcher::new(config.node.event_observers()?);
     let phase = Phase::start("announcing the blocks already executed");
-    announce_executed_blocks(executor.as_ref(), &dispatcher).await;
+    announce_node_events(executor.as_ref(), &dispatcher).await;
     drop(phase);
     // One mempool, shared: a node whose RPC admits transactions into a pool the
     // miner cannot see accepts them and never mines them, which is worse than
@@ -2628,12 +2628,11 @@ async fn start_hosting(
     Ok(())
 }
 
-/// Send the blocks this node executes to the configured observers.
+/// Send locally derived Bitcoin blocks and executed Stacks blocks to observers.
 ///
-/// An observer wants what a node *executed*, which only the executor knows it
-/// has: everything else in the runtime sees blocks that have merely been
-/// downloaded.
-async fn announce_executed_blocks(executor: Option<&SharedExecutor>, dispatcher: &EventDispatcher) {
+/// The executor owns both boundaries: the local sortition tracker derives Bitcoin
+/// blocks, and the chainstate executes Stacks blocks.
+async fn announce_node_events(executor: Option<&SharedExecutor>, dispatcher: &EventDispatcher) {
     if let Some(executor) = executor {
         executor.lock().await.announce_to(dispatcher.clone());
     }

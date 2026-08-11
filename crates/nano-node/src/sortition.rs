@@ -15,7 +15,7 @@
 use std::{fmt::Display, fs, path::Path};
 
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
-use nano_primitives::ConsensusHash;
+use nano_primitives::{BitcoinHeaderHash, ConsensusHash};
 use nano_sortition::{
     LeaderKeys, MINING_COMMITMENT_WINDOW, PayoutSchedule, PoxId, SortitionEngine, SortitionError,
     SortitionSnapshot, accepted_operation_txids, commitment_is_on_time, commitment_window_block,
@@ -197,6 +197,16 @@ pub struct SortitionTracker {
     /// snapshot of. Without them the window is short and the winner is not the
     /// one the network picked.
     primed: bool,
+}
+
+/// One newly derived Bitcoin block to publish to event observers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BurnNotification {
+    pub bitcoin_block_hash: BitcoinHeaderHash,
+    pub bitcoin_height: u64,
+    pub consensus_hash: ConsensusHash,
+    pub parent_bitcoin_block_hash: BitcoinHeaderHash,
+    pub burned: u64,
 }
 
 impl SortitionTracker {
@@ -384,6 +394,28 @@ impl SortitionTracker {
             walk = self.previous_sortition_height(height);
         }
         sortitions
+    }
+
+    /// Every locally derived Bitcoin block above a previously published height.
+    #[must_use]
+    pub(crate) fn burn_notifications_after(&self, bitcoin_height: u64) -> Vec<BurnNotification> {
+        let mut notifications = Vec::new();
+        for height in bitcoin_height.saturating_add(1)..=self.tip().bitcoin_height {
+            let Some(parent) = self.snapshot_at(height.saturating_sub(1)) else {
+                break;
+            };
+            let Some(snapshot) = self.snapshot_at(height) else {
+                break;
+            };
+            notifications.push(BurnNotification {
+                bitcoin_block_hash: snapshot.bitcoin_header_hash,
+                bitcoin_height: height,
+                consensus_hash: snapshot.consensus_hash,
+                parent_bitcoin_block_hash: parent.bitcoin_header_hash,
+                burned: snapshot.total_burn.saturating_sub(parent.total_burn),
+            });
+        }
+        notifications
     }
 
     /// The last burn height below this one that elected somebody.
@@ -2172,5 +2204,14 @@ mod anchor_tests {
         assert_eq!(sortitions[0].last_sortition_consensus_hash, Some(executed));
         assert_eq!(sortitions[1].bitcoin_height, 100);
         assert!(sortitions[1].was_sortition);
+
+        let notifications = chain.burn_notifications_after(100);
+        let [notification] = notifications.as_slice() else {
+            panic!("the locally derived burn is announced before Stacks execution");
+        };
+        assert_eq!(notification.bitcoin_height, 101);
+        assert_eq!(notification.bitcoin_block_hash.as_bytes(), &[101; 32]);
+        assert_eq!(notification.parent_bitcoin_block_hash.as_bytes(), &[1; 32]);
+        assert_eq!(notification.burned, 0);
     }
 }
