@@ -2560,6 +2560,9 @@ where
         nano_rpc::ExecutionCacheReport {
             marf_node_entries: usage.marf_node_entries,
             marf_node_bytes: usage.marf_node_bytes,
+            marf_auxiliary_bytes: usage.marf_auxiliary_bytes,
+            clarity_value_entries: usage.clarity_value_entries,
+            clarity_value_bytes: usage.clarity_value_bytes,
             wasm_module_entries: usage.wasm_module_entries,
             wasm_module_bytes: usage.wasm_module_bytes,
         }

@@ -213,8 +213,15 @@ pub struct TrieStorage {
 }
 
 impl TrieStorage {
-    pub(crate) fn node_cache_usage(&self) -> (usize, usize) {
-        self.nodes.borrow().usage()
+    pub(crate) fn cache_usage(&self) -> crate::CacheUsage {
+        let (entries, estimated_bytes) = self.nodes.borrow().usage();
+        let auxiliary_estimated_bytes =
+            self.node_hashes.borrow().usage().1 + self.blocks.borrow().usage().1;
+        crate::CacheUsage {
+            entries,
+            estimated_bytes,
+            auxiliary_estimated_bytes,
+        }
     }
 
     /// Open an ephemeral store, for tests and for states nothing will reopen.

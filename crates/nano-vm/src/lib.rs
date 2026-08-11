@@ -1211,6 +1211,9 @@ pub struct ModuleInspection {
 pub struct CacheUsage {
     pub marf_node_entries: usize,
     pub marf_node_bytes: usize,
+    pub marf_auxiliary_bytes: usize,
+    pub clarity_value_entries: usize,
+    pub clarity_value_bytes: usize,
     pub wasm_module_entries: usize,
     pub wasm_module_bytes: usize,
 }
@@ -1238,10 +1241,14 @@ impl Vm {
     /// Current in-memory cache residency, read while the VM is already owned.
     #[must_use]
     pub fn cache_usage(&self) -> CacheUsage {
-        let marf = self.store.marf.node_cache_usage();
+        let marf = self.store.marf.cache_usage();
+        let clarity = self.store.side_values.borrow().usage();
         CacheUsage {
             marf_node_entries: marf.entries,
             marf_node_bytes: marf.estimated_bytes,
+            marf_auxiliary_bytes: marf.auxiliary_estimated_bytes,
+            clarity_value_entries: clarity.0,
+            clarity_value_bytes: clarity.1,
             wasm_module_entries: self.modules.resident_entries(),
             wasm_module_bytes: self.modules.estimated_bytes(),
         }
@@ -2245,6 +2252,7 @@ struct SideValueCache {
     hot: HashMap<MarfValue, String>,
     cold: HashMap<MarfValue, String>,
     hot_bytes: usize,
+    cold_bytes: usize,
 }
 
 impl SideValueCache {
@@ -2256,6 +2264,7 @@ impl SideValueCache {
             return Some(value.clone());
         }
         let (key, value) = self.cold.remove_entry(&key)?;
+        self.cold_bytes = self.cold_bytes.saturating_sub(Self::weight(&value));
         self.insert(key, value.clone());
         Some(value)
     }
@@ -2263,12 +2272,24 @@ impl SideValueCache {
     fn insert(&mut self, key: MarfValue, value: String) {
         if self.hot_bytes >= Self::CAPACITY_BYTES {
             self.cold = std::mem::take(&mut self.hot);
+            self.cold_bytes = self.hot_bytes;
             self.hot_bytes = 0;
         }
-        let weight = 96 + value.len();
+        let weight = Self::weight(&value);
         if self.hot.insert(key, value).is_none() {
             self.hot_bytes += weight;
         }
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        (
+            self.hot.len() + self.cold.len(),
+            self.hot_bytes + self.cold_bytes,
+        )
+    }
+
+    const fn weight(value: &str) -> usize {
+        96 + value.len()
     }
 }
 
@@ -2558,11 +2579,7 @@ impl MarfStore {
             network,
             marf,
             side_store,
-            side_values: RefCell::new(SideValueCache {
-                hot: HashMap::new(),
-                cold: HashMap::new(),
-                hot_bytes: 0,
-            }),
+            side_values: RefCell::new(SideValueCache::default()),
             metadata: BTreeMap::new(),
             checkpoint_heights: BTreeMap::new(),
             read_block,
@@ -5207,6 +5224,7 @@ mod tests {
     use clarity::vm::database::{ClarityBackingStore, HeadersDB};
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
     use clarity::vm::{ClarityVersion, Value};
+    use nano_marf::MarfValue;
     use nano_primitives::{Network, TrieHash};
 
     use stacks_common::types::StacksEpochId;
@@ -5230,7 +5248,25 @@ mod tests {
     #[test]
     fn an_empty_vm_reports_empty_resident_caches() {
         let vm = Vm::new(Network::MAINNET).expect("an empty VM");
-        assert_eq!(vm.cache_usage(), super::CacheUsage::default());
+        let usage = vm.cache_usage();
+        assert_eq!(usage.marf_node_entries, 0);
+        assert_eq!(usage.marf_node_bytes, 0);
+        assert_eq!(usage.marf_auxiliary_bytes, 0);
+        assert_eq!(usage.clarity_value_entries, 0);
+        assert_eq!(usage.clarity_value_bytes, 0);
+        assert_eq!(usage.wasm_module_entries, 0);
+        assert_eq!(usage.wasm_module_bytes, 0);
+    }
+
+    #[test]
+    fn side_value_cache_reports_what_it_retains() {
+        let mut cache = super::SideValueCache::default();
+        let key = MarfValue::from_u32(1);
+        cache.insert(key, "hello".to_owned());
+
+        assert_eq!(cache.usage(), (1, 101));
+        assert_eq!(cache.get(key).as_deref(), Some("hello"));
+        assert_eq!(cache.usage(), (1, 101));
     }
 
     #[test]

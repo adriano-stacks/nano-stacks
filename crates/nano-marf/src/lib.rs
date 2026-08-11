@@ -953,11 +953,12 @@ fn shared_prefix(left: &[u8], right: &[u8]) -> usize {
 /// An immutable MARF state identifier.
 pub type MarfBlockId = [u8; 32];
 
-/// Resident entries and estimated bytes held by one in-memory cache.
+/// Resident MARF cache usage.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheUsage {
     pub entries: usize,
     pub estimated_bytes: usize,
+    pub auxiliary_estimated_bytes: usize,
 }
 
 /// A copy-on-write MARF keyed by block identifier, held on disk.
@@ -990,14 +991,10 @@ struct ActiveVersion {
 pub struct MarfSnapshot(Option<ActiveVersion>);
 
 impl VersionedMarf {
-    /// Current residency of the decoded trie-node cache.
+    /// Current residency of the MARF caches.
     #[must_use]
-    pub fn node_cache_usage(&self) -> CacheUsage {
-        let (entries, estimated_bytes) = self.storage.node_cache_usage();
-        CacheUsage {
-            entries,
-            estimated_bytes,
-        }
+    pub fn cache_usage(&self) -> CacheUsage {
+        self.storage.cache_usage()
     }
 
     /// Open, creating if absent, the MARF held in `path`.

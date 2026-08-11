@@ -19,6 +19,9 @@ type IntGauge = Gauge<i64, AtomicI64>;
 pub struct ExecutionCacheReport {
     pub marf_node_entries: usize,
     pub marf_node_bytes: usize,
+    pub marf_auxiliary_bytes: usize,
+    pub clarity_value_entries: usize,
+    pub clarity_value_bytes: usize,
     pub wasm_module_entries: usize,
     pub wasm_module_bytes: usize,
 }
@@ -176,6 +179,9 @@ struct ResourceGauges {
     mempool_transactions: IntGauge,
     marf_node_cache_entries: IntGauge,
     marf_node_cache_bytes: IntGauge,
+    marf_auxiliary_cache_bytes: IntGauge,
+    clarity_value_cache_entries: IntGauge,
+    clarity_value_cache_bytes: IntGauge,
     wasm_module_cache_entries: IntGauge,
     wasm_module_cache_bytes: IntGauge,
 }
@@ -242,6 +248,21 @@ impl ResourceGauges {
                 registry,
                 "marf_node_cache_bytes",
                 "Estimated bytes held by decoded MARF trie nodes.",
+            ),
+            marf_auxiliary_cache_bytes: gauge(
+                registry,
+                "marf_auxiliary_cache_bytes",
+                "Estimated bytes held by MARF block and node-hash caches.",
+            ),
+            clarity_value_cache_entries: gauge(
+                registry,
+                "clarity_value_cache_entries",
+                "Clarity values resident in the side-store read cache.",
+            ),
+            clarity_value_cache_bytes: gauge(
+                registry,
+                "clarity_value_cache_bytes",
+                "Estimated bytes held by the Clarity side-store read cache.",
             ),
             wasm_module_cache_entries: gauge(
                 registry,
@@ -463,6 +484,15 @@ impl NodeMetrics {
             .marf_node_cache_bytes
             .set(as_i64(usage.marf_node_bytes));
         resources
+            .marf_auxiliary_cache_bytes
+            .set(as_i64(usage.marf_auxiliary_bytes));
+        resources
+            .clarity_value_cache_entries
+            .set(as_i64(usage.clarity_value_entries));
+        resources
+            .clarity_value_cache_bytes
+            .set(as_i64(usage.clarity_value_bytes));
+        resources
             .wasm_module_cache_entries
             .set(as_i64(usage.wasm_module_entries));
         resources
@@ -604,6 +634,18 @@ mod tests {
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 
+    const fn execution_cache_fixture() -> ExecutionCacheReport {
+        ExecutionCacheReport {
+            marf_node_entries: 13,
+            marf_node_bytes: 17,
+            marf_auxiliary_bytes: 19,
+            clarity_value_entries: 23,
+            clarity_value_bytes: 29,
+            wasm_module_entries: 31,
+            wasm_module_bytes: 37,
+        }
+    }
+
     #[tokio::test]
     async fn metrics_are_well_formed_and_name_the_three_chain_heights() {
         let state = RpcState::new(Network::MAINNET);
@@ -621,12 +663,7 @@ mod tests {
         metrics.publish_proposal_peers(2);
         metrics.publish_stackerdb_peers(4);
         metrics.publish_mempool_size(11);
-        metrics.publish_execution_caches(ExecutionCacheReport {
-            marf_node_entries: 13,
-            marf_node_bytes: 17,
-            wasm_module_entries: 19,
-            wasm_module_bytes: 23,
-        });
+        metrics.publish_execution_caches(execution_cache_fixture());
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -699,8 +736,11 @@ mod tests {
             "nano_tenure_history_window 0",
             "nano_marf_node_cache_entries 13",
             "nano_marf_node_cache_bytes 17",
-            "nano_wasm_module_cache_entries 19",
-            "nano_wasm_module_cache_bytes 23",
+            "nano_marf_auxiliary_cache_bytes 19",
+            "nano_clarity_value_cache_entries 23",
+            "nano_clarity_value_cache_bytes 29",
+            "nano_wasm_module_cache_entries 31",
+            "nano_wasm_module_cache_bytes 37",
             "# EOF",
         ] {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
