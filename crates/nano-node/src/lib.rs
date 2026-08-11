@@ -2818,9 +2818,18 @@ where
     ///
     /// Bounded and quiet: a walk that finds nothing new costs one `tip_height` call,
     /// and only a walk that actually moved is written down or reported.
-    pub(crate) fn follow_burnchain(&mut self, pox: &PoxInfo) -> Vec<sortition::BurnNotification> {
+    pub fn follow_burnchain(&mut self, pox: &PoxInfo) -> u64 {
+        let (advanced, notifications) = self.follow_burnchain_deferred(pox);
+        self.announce_burn_blocks(&notifications);
+        advanced
+    }
+
+    pub(crate) fn follow_burnchain_deferred(
+        &mut self,
+        pox: &PoxInfo,
+    ) -> (u64, Vec<sortition::BurnNotification>) {
         let Some(payouts) = payout_schedule(pox) else {
-            return Vec::new();
+            return (0, Vec::new());
         };
         let executed = self.bitcoin_height();
         let Self {
@@ -2829,7 +2838,7 @@ where
             ..
         } = self
         else {
-            return Vec::new();
+            return (0, Vec::new());
         };
         if executed > 0 {
             tracker.keep_from(executed);
@@ -2837,10 +2846,10 @@ where
         let Ok(burnchain_tip) = bitcoin.tip_height() else {
             // Reported by the execution path already, and every round would repeat
             // it: a burnchain that cannot be read is not news twice a minute.
-            return Vec::new();
+            return (0, Vec::new());
         };
         if burnchain_tip <= tracker.tip().bitcoin_height {
-            return Vec::new();
+            return (0, Vec::new());
         }
         let standing_on = tracker.tip().bitcoin_height;
         match tracker.follow_burnchain(
@@ -2858,12 +2867,12 @@ where
                 );
                 let notifications = tracker.burn_notifications_after(standing_on);
                 self.save_sortitions();
-                notifications
+                (walk.advanced, notifications)
             }
-            Ok(_) => Vec::new(),
+            Ok(_) => (0, Vec::new()),
             Err(error) => {
                 eprintln!("following the burnchain locally failed: {error}");
-                Vec::new()
+                (0, Vec::new())
             }
         }
     }

@@ -185,8 +185,8 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
 }
 
 async fn publish_burnchain(state: &State, executor: &mut CheckpointExecutor<BurnchainSource>) {
-    let notifications = executor.follow_burnchain(&state.pox);
-    if notifications.is_empty() {
+    let (advanced, notifications) = executor.follow_burnchain_deferred(&state.pox);
+    if advanced == 0 {
         return;
     }
     state

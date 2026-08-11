@@ -725,7 +725,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
-        let notifications = executor.follow_burnchain(pox);
+        let (_, notifications) = executor.follow_burnchain_deferred(pox);
         let latest_local_winner = executor
             .latest_local_winner()
             .ok()
