@@ -649,6 +649,7 @@ pub fn router(state: RpcState) -> Router {
         )
         .route("/v3/tenures/{start_block_id}", get(tenure))
         .route("/v3/blocks/upload", post(upload_block))
+        .route("/v3/blocks/upload/", post(upload_block))
         .route("/v3/blocks/{block_id}", get(block))
         .route("/v3/block_proposal", post(block_proposal))
         .route("/events", get(events))
@@ -3895,13 +3896,13 @@ mod tests {
         state
             .publish_executed(sealed_at(&blocks[1]), Vec::new())
             .await;
-        let upload = |block: &NakamotoBlock, app: Router| {
+        let upload = |block: &NakamotoBlock, app: Router, path: &'static str| {
             let body = block.encode();
             async move {
                 app.oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v3/blocks/upload")
+                        .uri(path)
                         .body(Body::from(body))
                         .expect("request"),
                 )
@@ -3910,7 +3911,7 @@ mod tests {
             }
         };
 
-        let refused = upload(&blocks[2], router(state.clone())).await;
+        let refused = upload(&blocks[2], router(state.clone()), "/v3/blocks/upload").await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(refusing.asked.lock().expect("record").len(), 1);
         assert!(
@@ -3947,14 +3948,22 @@ mod tests {
             .publish_executed(sealed_at(&blocks[1]), Vec::new())
             .await;
 
-        let taken = body_json(upload(&blocks[2], router(state.clone())).await).await;
+        let taken = body_json(
+            upload(
+                &blocks[2],
+                router(state.clone()),
+                "/v3/blocks/upload/?broadcast=1",
+            )
+            .await,
+        )
+        .await;
         assert_eq!(taken["accepted"], json!(true));
         assert_eq!(
             offered.try_recv().expect("the node was offered the block"),
             blocks[2]
         );
 
-        let held = body_json(upload(&blocks[1], router(state)).await).await;
+        let held = body_json(upload(&blocks[1], router(state), "/v3/blocks/upload").await).await;
         assert_eq!(held["accepted"], json!(false));
         assert!(
             offered.try_recv().is_err(),
