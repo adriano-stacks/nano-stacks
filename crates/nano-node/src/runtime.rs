@@ -721,21 +721,31 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let (sortitions, cache_usage) = {
+    let (sortitions, cache_usage, latest_local_winner) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
         executor.follow_burnchain(pox);
-        (executor.derived_sortitions(), executor.cache_usage())
+        let latest_local_winner = executor
+            .latest_local_winner()
+            .ok()
+            .flatten()
+            .and_then(|winner| winner.miner_public_key_hash);
+        (
+            executor.derived_sortitions(),
+            executor.cache_usage(),
+            latest_local_winner,
+        )
     };
     state.metrics().publish_execution_caches(cache_usage);
     state.publish_executed(sealed, sortitions).await;
+    let winners = include_local_winner(latest_local_winner, last_sortition_winners(node.tenures()));
     publish_reward_cycle(RewardCycleInputs {
         state,
         executor,
         network,
         context: bitcoin_context(config, pox),
-        winners: &last_sortition_winners(node.tenures()),
+        winners: &winners,
         published,
         peer,
         registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
@@ -1370,6 +1380,17 @@ fn last_sortition_winners(tenures: &[nano_sync::FollowedTenure]) -> Vec<nano_pri
         }
     }
     winners
+}
+
+fn include_local_winner(
+    local: Option<nano_primitives::Hash160>,
+    mut followed: Vec<nano_primitives::Hash160>,
+) -> Vec<nano_primitives::Hash160> {
+    if let Some(local) = local {
+        followed.retain(|winner| *winner != local);
+        followed.insert(0, local);
+    }
+    followed
 }
 
 /// How many recent sortition winners a `.miners` slot may be attributed to.
@@ -3953,6 +3974,13 @@ mod tests {
             super::one_miner_slots(&[newest, newest, older]),
             None,
             "an older writer may still own the slot the newest miner did not rewrite"
+        );
+        let candidates = super::include_local_winner(Some(newest), vec![older, older]);
+        assert_eq!(candidates, vec![newest, older, older]);
+        assert_eq!(
+            super::one_miner_slots(&candidates),
+            None,
+            "the locally elected miner is visible before its first proposal is accepted"
         );
     }
 
