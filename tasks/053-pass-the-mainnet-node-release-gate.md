@@ -86,7 +86,10 @@ and steady state, with evidence tied to the durable executed chain.
       [[077-remove-peer-derived-consensus-execution-fallbacks]].
 - [x] Make release evidence reproducible and mandatory under [[078]].
 - [x] Remove residual MARF storage panics under [[079]].
-- [ ] Make the release report fail closed under [[074]].
+- [x] Make the release report fail closed under [[074]]. The recaptured fixture
+      carries authenticated history, missing or inconsistent history is rejected
+      before replay and artifact evidence, and the checked-in release report gate
+      is green against the authenticated capture.
 - [ ] Cross reward-cycle boundaries using only locally derived consensus under
       [[082-cross-a-reward-cycle-boundary-with-a-locally-derive]].
 - [x] Refuse contradictory or missing checkpoint winner-seed evidence under
