@@ -149,5 +149,6 @@ jobs:
           fresh_reflink 064
           fresh_reflink 086
           fresh_reflink 098
+          fresh_reflink 111
           nix develop --command cargo xtask release-report \
             --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE"
