@@ -481,6 +481,13 @@ impl RpcState {
         });
     }
 
+    /// Advance only the locally derived Bitcoin view of an already published tip.
+    pub async fn publish_local_sortitions(&self, sortitions: Vec<nano_sync::SortitionInfo>) {
+        if let Some(executed) = self.executed.write().await.as_mut() {
+            executed.sortitions = sortitions;
+        }
+    }
+
     /// Say how far ahead the peer is, which is all a node this far behind knows.
     ///
     /// Catching up, the follower asks the peer only for its height: the tenure
@@ -3292,8 +3299,9 @@ mod tests {
             consensus_hash: ConsensusHash::from_bytes([10; 20]),
             ..captured_view().tenures[0].sortition.clone()
         };
+        state.publish_executed(sealed.clone(), Vec::new()).await;
         state
-            .publish_executed(sealed.clone(), vec![local_burn.clone()])
+            .publish_local_sortitions(vec![local_burn.clone()])
             .await;
 
         let info = body_json(

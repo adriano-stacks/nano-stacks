@@ -67,6 +67,7 @@ pub struct Runtime {
     /// The pool the RPC admits transactions into, so they are the same ones.
     pub mempool: Arc<Mutex<Mempool>>,
     pub metrics: nano_rpc::NodeMetrics,
+    pub rpc: nano_rpc::RpcState,
 }
 
 /// Commit on every Bitcoin block and mine every tenure this miner wins.
@@ -88,6 +89,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         dispatcher,
         relay,
         metrics,
+        rpc,
     } = runtime;
     let miner_key = miner.block_signing_private_key()?;
     let vrf_key = miner.vrf_private_key()?;
@@ -124,6 +126,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         mined: MinedTenures::default(),
         mempool,
         metrics,
+        rpc,
         tenure: None,
     };
     let funded = state.funded_wallet(&wallet)?;
@@ -162,7 +165,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             sleep(interval).await;
             continue;
         }
-        executor.follow_burnchain(&state.pox);
+        publish_burnchain(&state, &mut executor).await;
         let bitcoin_height = wallet.block_count()?;
         if bitcoin_height > state.committed_at {
             match state.commit(&wallet, &mut executor) {
@@ -179,6 +182,18 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         drop(executor);
         sleep(interval).await;
     }
+}
+
+async fn publish_burnchain(state: &State, executor: &mut CheckpointExecutor<BurnchainSource>) {
+    let notifications = executor.follow_burnchain(&state.pox);
+    if notifications.is_empty() {
+        return;
+    }
+    state
+        .rpc
+        .publish_local_sortitions(executor.derived_sortitions())
+        .await;
+    executor.announce_burn_blocks(&notifications);
 }
 
 /// A tenure this miner started and is still building on.
@@ -273,6 +288,7 @@ struct State {
     /// miner cannot see accepts them and never mines them.
     mempool: Arc<Mutex<Mempool>>,
     metrics: nano_rpc::NodeMetrics,
+    rpc: nano_rpc::RpcState,
     tenure: Option<TenureState>,
 }
 

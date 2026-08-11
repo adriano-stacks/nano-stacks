@@ -2818,19 +2818,18 @@ where
     ///
     /// Bounded and quiet: a walk that finds nothing new costs one `tip_height` call,
     /// and only a walk that actually moved is written down or reported.
-    pub fn follow_burnchain(&mut self, pox: &PoxInfo) -> u64 {
+    pub(crate) fn follow_burnchain(&mut self, pox: &PoxInfo) -> Vec<sortition::BurnNotification> {
         let Some(payouts) = payout_schedule(pox) else {
-            return 0;
+            return Vec::new();
         };
         let executed = self.bitcoin_height();
         let Self {
             sortition: Some(tracker),
             bitcoin,
-            observers,
             ..
         } = self
         else {
-            return 0;
+            return Vec::new();
         };
         if executed > 0 {
             tracker.keep_from(executed);
@@ -2838,10 +2837,10 @@ where
         let Ok(burnchain_tip) = bitcoin.tip_height() else {
             // Reported by the execution path already, and every round would repeat
             // it: a burnchain that cannot be read is not news twice a minute.
-            return 0;
+            return Vec::new();
         };
         if burnchain_tip <= tracker.tip().bitcoin_height {
-            return 0;
+            return Vec::new();
         }
         let standing_on = tracker.tip().bitcoin_height;
         match tracker.follow_burnchain(
@@ -2857,26 +2856,32 @@ where
                      to {tip}",
                     walk.advanced
                 );
-                if let Some(observers) = observers.as_ref() {
-                    for notification in tracker.burn_notifications_after(standing_on) {
-                        let payload = nano_rpc::new_burn_block_payload(
-                            notification.bitcoin_block_hash,
-                            notification.bitcoin_height,
-                            notification.consensus_hash,
-                            notification.parent_bitcoin_block_hash,
-                            notification.burned,
-                        );
-                        observers.dispatch(nano_rpc::EventKind::NewBurnBlock, &payload);
-                    }
-                }
+                let notifications = tracker.burn_notifications_after(standing_on);
                 self.save_sortitions();
-                walk.advanced
+                notifications
             }
-            Ok(_) => 0,
+            Ok(_) => Vec::new(),
             Err(error) => {
                 eprintln!("following the burnchain locally failed: {error}");
-                0
+                Vec::new()
             }
+        }
+    }
+
+    /// Announce Bitcoin blocks only after their locally derived view is public.
+    pub(crate) fn announce_burn_blocks(&self, notifications: &[sortition::BurnNotification]) {
+        let Some(observers) = self.observers.as_ref() else {
+            return;
+        };
+        for notification in notifications {
+            let payload = nano_rpc::new_burn_block_payload(
+                notification.bitcoin_block_hash,
+                notification.bitcoin_height,
+                notification.consensus_hash,
+                notification.parent_bitcoin_block_hash,
+                notification.burned,
+            );
+            observers.dispatch(nano_rpc::EventKind::NewBurnBlock, &payload);
         }
     }
 

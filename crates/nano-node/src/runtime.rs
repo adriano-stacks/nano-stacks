@@ -270,7 +270,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         &pox,
         &peer,
         (executor.clone(), mempool.clone()),
-        (dispatcher, relay.clone(), state.metrics()),
+        (dispatcher, relay.clone(), state.metrics(), state.clone()),
         &mut roles,
     );
     start_signer(&config, network, &pox, discovered.as_ref(), &mut roles).await?;
@@ -721,11 +721,11 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let (sortitions, cache_usage, latest_local_winner, registered_miners) = {
+    let (sortitions, cache_usage, latest_local_winner, registered_miners, notifications) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
-        executor.follow_burnchain(pox);
+        let notifications = executor.follow_burnchain(pox);
         let latest_local_winner = executor
             .latest_local_winner()
             .ok()
@@ -736,10 +736,12 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
             executor.cache_usage(),
             latest_local_winner,
             executor.registered_local_miner_keys(),
+            notifications,
         )
     };
     state.metrics().publish_execution_caches(cache_usage);
     state.publish_executed(sealed, sortitions).await;
+    executor.lock().await.announce_burn_blocks(&notifications);
     let winners = include_local_winner(latest_local_winner, last_sortition_winners(node.tenures()));
     publish_reward_cycle(RewardCycleInputs {
         state,
@@ -2489,11 +2491,16 @@ fn start_miner(
     pox: &PoxInfo,
     peer: &SyncClient,
     chain: (Option<SharedExecutor>, Arc<Mutex<nano_mempool::Mempool>>),
-    announce: (EventDispatcher, nano_p2p::Relay, nano_rpc::NodeMetrics),
+    announce: (
+        EventDispatcher,
+        nano_p2p::Relay,
+        nano_rpc::NodeMetrics,
+        RpcState,
+    ),
     roles: &mut JoinSet<(Job, Role)>,
 ) {
     let (executor, mempool) = chain;
-    let (dispatcher, relay, metrics) = announce;
+    let (dispatcher, relay, metrics, rpc) = announce;
     let (Some(miner), Some(executor)) = (config.miner.clone(), executor) else {
         return;
     };
@@ -2508,6 +2515,7 @@ fn start_miner(
         mempool,
         relay,
         metrics,
+        rpc,
     };
     roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
 }
