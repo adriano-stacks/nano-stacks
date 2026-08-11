@@ -939,6 +939,26 @@ mod tests {
     }
 
     #[test]
+    fn node_metrics_instances_are_isolated() {
+        let first = NodeMetrics::default();
+        let second = NodeMetrics::default();
+        first.record_peer_failover();
+
+        assert!(
+            first
+                .encode()
+                .expect("encode first registry")
+                .contains("nano_peer_failovers_total 1")
+        );
+        assert!(
+            second
+                .encode()
+                .expect("encode second registry")
+                .contains("nano_peer_failovers_total 0")
+        );
+    }
+
+    #[test]
     fn block_refusals_are_classified_into_bounded_reasons() {
         for (message, expected) in [
             ("Wasm module will not load", RefusalReason::CompilerGap),
