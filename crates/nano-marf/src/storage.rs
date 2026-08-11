@@ -64,6 +64,8 @@ const NODE_HASH_CACHE_BYTES: usize = 100_000_000;
 /// Block records are ~100 bytes; this keeps the previous 65,536 entries.
 const BLOCK_CACHE_BYTES: usize = 12_000_000;
 const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
+const SQLITE_RUNTIME_CACHE_KIB: i64 = 512 * 1024;
+const SQLITE_IMPORT_CACHE_KIB: i64 = 2_000_000;
 
 const LEAF_RECORD: u8 = 0;
 const INTERNAL_RECORD: u8 = 1;
@@ -248,10 +250,8 @@ impl TrieStorage {
             crate::immutable_uri(path),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        connection.execute_batch(
-            "PRAGMA cache_size = -2000000;
-             PRAGMA temp_store = MEMORY;",
-        )?;
+        connection.pragma_update(None, "cache_size", -SQLITE_RUNTIME_CACHE_KIB)?;
+        connection.execute_batch("PRAGMA temp_store = MEMORY;")?;
         let storage = Self::with_caches(connection);
         storage.preload_hashes()?;
         Ok(storage)
@@ -300,9 +300,14 @@ impl TrieStorage {
         // measured at ~12 ms a block across a mainnet replay, fifty seconds
         // of a 4,149-block range. A larger WAL trades that for bounded extra
         // recovery reading after a crash, which the kill suites cover.
+        let cache_kib = if journal {
+            SQLITE_RUNTIME_CACHE_KIB
+        } else {
+            SQLITE_IMPORT_CACHE_KIB
+        };
+        connection.pragma_update(None, "cache_size", -cache_kib)?;
         connection.execute_batch(
             "PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = -2000000;
              PRAGMA wal_autocheckpoint = 16384;
              PRAGMA temp_store = MEMORY;",
         )?;
@@ -784,7 +789,10 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cache, ENTRY_OVERHEAD, SQLITE_PAGE_BYTES, TrieStorage};
+    use super::{
+        Cache, ENTRY_OVERHEAD, SQLITE_IMPORT_CACHE_KIB, SQLITE_PAGE_BYTES,
+        SQLITE_RUNTIME_CACHE_KIB, TrieStorage,
+    };
     use crate::TrieHash;
 
     #[test]
@@ -797,6 +805,24 @@ mod tests {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .expect("read the page size");
         assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
+    }
+
+    #[test]
+    fn runtime_and_import_stores_use_their_own_page_cache_budgets() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let runtime =
+            TrieStorage::open(&directory.path().join("runtime.sqlite")).expect("runtime store");
+        let import = TrieStorage::open_for_import(&directory.path().join("import.sqlite"))
+            .expect("import store");
+        let cache_kib = |store: &TrieStorage| {
+            store
+                .connection
+                .pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))
+                .expect("read the cache budget")
+        };
+
+        assert_eq!(cache_kib(&runtime), -SQLITE_RUNTIME_CACHE_KIB);
+        assert_eq!(cache_kib(&import), -SQLITE_IMPORT_CACHE_KIB);
     }
 
     #[test]

@@ -3599,6 +3599,8 @@ fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
 }
 
 const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
+const SQLITE_RUNTIME_CACHE_KIB: i64 = 256 * 1024;
+const SQLITE_IMPORT_CACHE_KIB: i64 = 1_000_000;
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
     open_side_store_with_journal(path, true)
@@ -3613,10 +3615,8 @@ fn open_side_store_existing(path: &Path) -> Result<rusqlite::Connection, rusqlit
         nano_marf::immutable_uri(path),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    connection.execute_batch(
-        "PRAGMA cache_size = -1000000;
-         PRAGMA temp_store = MEMORY;",
-    )?;
+    connection.pragma_update(None, "cache_size", -SQLITE_RUNTIME_CACHE_KIB)?;
+    connection.execute_batch("PRAGMA temp_store = MEMORY;")?;
     Ok(connection)
 }
 
@@ -3651,9 +3651,14 @@ fn open_side_store_with_journal(
     //
     // The same checkpoint spacing as the MARF store, for the same measured
     // fsync cost.
+    let cache_kib = if journal {
+        SQLITE_RUNTIME_CACHE_KIB
+    } else {
+        SQLITE_IMPORT_CACHE_KIB
+    };
+    connection.pragma_update(None, "cache_size", -cache_kib)?;
     connection.execute_batch(
         "PRAGMA synchronous = NORMAL;
-         PRAGMA cache_size = -1000000;
          PRAGMA wal_autocheckpoint = 16384;
          PRAGMA temp_store = MEMORY;",
     )?;
@@ -5252,9 +5257,10 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_PAGE_BYTES, SemanticEpochInspection,
-        StaticCheckError, compile_under, ensure_wasm_module, loadable,
-        open_side_store_with_journal, recorded_network, reports_analysis_failure,
+        AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_IMPORT_CACHE_KIB, SQLITE_PAGE_BYTES,
+        SQLITE_RUNTIME_CACHE_KIB, SemanticEpochInspection, StaticCheckError, compile_under,
+        ensure_wasm_module, loadable, open_side_store_with_journal, recorded_network,
+        reports_analysis_failure,
     };
 
     #[test]
@@ -5291,6 +5297,23 @@ mod tests {
             .expect("read the page size");
 
         assert_eq!(page_bytes, SQLITE_PAGE_BYTES);
+    }
+
+    #[test]
+    fn runtime_and_import_side_stores_use_their_own_page_cache_budgets() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let runtime = open_side_store_with_journal(&directory.path().join("runtime.sqlite"), true)
+            .expect("runtime side store");
+        let import = open_side_store_with_journal(&directory.path().join("import.sqlite"), false)
+            .expect("import side store");
+        let cache_kib = |connection: &rusqlite::Connection| {
+            connection
+                .pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))
+                .expect("read the cache budget")
+        };
+
+        assert_eq!(cache_kib(&runtime), -SQLITE_RUNTIME_CACHE_KIB);
+        assert_eq!(cache_kib(&import), -SQLITE_IMPORT_CACHE_KIB);
     }
 
     #[test]
