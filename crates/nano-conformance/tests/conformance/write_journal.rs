@@ -506,24 +506,34 @@ fn trim_to_source(checkpoint: &Path, destination: &Path, source: [u8; 32]) {
         fs::copy(checkpoint.join(&name), destination.with_file_name(&name))
             .unwrap_or_else(|error| panic!("copy {name}: {error}"));
     }
-    let connection = rusqlite::Connection::open(destination).expect("open the copy");
+    let mut retried_moved_database = false;
+    loop {
+        match trim_database(destination, source) {
+            Ok(()) => break,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_READONLY_DBMOVED
+                    && !retried_moved_database =>
+            {
+                retried_moved_database = true;
+            }
+            Err(error) => panic!("trim the later blocks: {error}"),
+        }
+    }
+}
+
+fn trim_database(destination: &Path, source: [u8; 32]) -> rusqlite::Result<()> {
+    let connection = rusqlite::Connection::open(destination)?;
     // Written back as a rollback journal: nano's importer opens the fixture with
     // `immutable=1`, which ignores a write-ahead log, and a trimmed database
     // whose deletions lived only in a WAL would be read as untrimmed.
-    connection
-        .pragma_update(None, "journal_mode", "DELETE")
-        .expect("no write-ahead log");
-    connection
-        .execute(
-            "DELETE FROM marf_data WHERE block_id > \
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    connection.execute(
+        "DELETE FROM marf_data WHERE block_id > \
              (SELECT block_id FROM marf_data WHERE block_hash = ?1)",
-            rusqlite::params![hex::encode(source)],
-        )
-        .expect("trim the later blocks");
-    connection
-        .execute_batch("DELETE FROM block_extension_locks")
-        .expect("release any extension lock");
-    drop(connection);
+        rusqlite::params![hex::encode(source)],
+    )?;
+    connection.execute_batch("DELETE FROM block_extension_locks")?;
+    Ok(())
 }
 
 /// One key per write, keeping the value the block ended up with.

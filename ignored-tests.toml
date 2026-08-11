@@ -198,6 +198,30 @@ measured = "A search over generated programs. It asserts no required behaviour."
 # ---------------------------------------------------------------------------
 
 [[ignored]]
+test = "signer_validator_executes_a_captured_proposal"
+class = "infrastructure"
+owner = "119"
+job = "release-qualification"
+requires = "a recaptured fixture with checkpoint authentication history"
+note = "The checked-in capture is an execution oracle; strict fixture validation rejects it as a release checkpoint."
+
+[[ignored]]
+test = "a_proposal_is_validated_under_its_own_burn_block"
+class = "infrastructure"
+owner = "119"
+job = "release-qualification"
+requires = "a recaptured fixture with checkpoint authentication history"
+note = "The checked-in capture is an execution oracle; strict fixture validation rejects it as a release checkpoint."
+
+[[ignored]]
+test = "checkpoint_executor_executes_captured_descendants"
+class = "infrastructure"
+owner = "119"
+job = "release-qualification"
+requires = "a recaptured fixture with checkpoint authentication history"
+note = "The checked-in capture is an execution oracle; strict fixture validation rejects it as a release checkpoint."
+
+[[ignored]]
 test = "reads_a_mainnet_burn_block"
 class = "infrastructure"
 owner = "053"

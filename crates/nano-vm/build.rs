@@ -8,6 +8,9 @@
 include!("src/compiler_identity.rs");
 
 fn main() {
+    // A shared target directory must not reuse absolute source watches emitted
+    // by this build script from another checkout.
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/clarity-wasm");
     // Watching the directory itself matters when it was absent during an earlier
     // build: Cargo then has no covered files whose later appearance can rerun us.

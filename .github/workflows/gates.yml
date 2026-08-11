@@ -52,9 +52,9 @@ jobs:
         run: nix develop --command actionlint
 
       - name: formatting
-        run: |
-          nix develop --command cargo fmt --all -- --check
-          nix develop --command cargo fmt --manifest-path vendor/clarity-wasm/Cargo.toml --all -- --check
+        # The script covers both Cargo workspaces; root `cargo fmt` cannot see
+        # the independently vendored clarity-wasm workspace.
+        run: nix develop --command scripts/fmt.sh --check
 
       - name: clippy, release profile, every target
         run: |

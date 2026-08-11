@@ -9,7 +9,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nano_conformance::{FixtureManifest, FixtureStatus, validate_fixture_tree};
+use nano_conformance::{
+    FixtureManifest, FixtureStatus, validate_execution_fixture_tree, validate_fixture_tree,
+};
 // The maturity window comes from the node's own crate rather than being restated
 // here: the export refuses a window shorter than it, and a copy that drifted
 // would write a checkpoint the node it is for cannot pay from.
@@ -2377,11 +2379,20 @@ fn print_scoreboard() -> ExitCode {
 }
 
 fn validate_fixtures() -> ExitCode {
-    match validate_fixture_tree(&fixture_root()) {
+    let root = fixture_root();
+    match validate_execution_fixture_tree(&root) {
         Ok(FixtureStatus::Captured { replay_blocks }) => {
-            match describe_fixture(&fixture_root(), replay_blocks) {
+            match describe_fixture(&root, replay_blocks) {
                 Ok(description) => {
                     print!("{description}");
+                    if !root
+                        .join("chainstate/checkpoint-H/authentication-history")
+                        .exists()
+                    {
+                        println!(
+                            "qualification: execution-only; checkpoint authentication history is absent"
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
