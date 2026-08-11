@@ -1380,6 +1380,14 @@ fn last_sortition_winners(tenures: &[nano_sync::FollowedTenure]) -> Vec<nano_pri
 /// and every attribution is still checked against a signature.
 const MINER_SLOT_CANDIDATES: usize = 8;
 
+fn one_miner_slots(winners: &[nano_primitives::Hash160]) -> Option<Vec<nano_primitives::Hash160>> {
+    let latest = *winners.first()?;
+    winners
+        .iter()
+        .all(|winner| *winner == latest)
+        .then(|| vec![latest, latest])
+}
+
 /// Replicate `.miners`, so a signer hosted here can read what a miner proposed.
 ///
 /// The two slots belong to the last two sortition winners, and which winner gets
@@ -1403,14 +1411,13 @@ async fn configure_miner_slots(
     published: &mut RewardCyclePublication,
     peer: &SyncClient,
 ) {
-    let Some(&latest) = winners.first() else {
+    if winners.is_empty() {
         return;
-    };
+    }
     let contract = crate::config::miner_contract(network);
-    let previous = winners.get(1).copied().unwrap_or(latest);
-    let assignment = if previous == latest {
-        // One miner, so no order to get wrong.
-        Some(vec![latest, latest])
+    let assignment = if let Some(assignment) = one_miner_slots(winners) {
+        // One miner in the retained candidate window, so no order to get wrong.
+        Some(assignment)
     } else {
         miner_slots(peer, &contract, winners).await
     };
@@ -3930,6 +3937,22 @@ mod tests {
                 "executed 50 blocks, 1150 to 1200, state root {}, then the round failed",
                 tip.header.state_index_root
             )
+        );
+    }
+
+    #[test]
+    fn consecutive_wins_do_not_hide_the_other_miner_slot_owner() {
+        let newest = nano_primitives::Hash160::from_bytes([1; 20]);
+        let older = nano_primitives::Hash160::from_bytes([2; 20]);
+
+        assert_eq!(
+            super::one_miner_slots(&[newest, newest]),
+            Some(vec![newest, newest])
+        );
+        assert_eq!(
+            super::one_miner_slots(&[newest, newest, older]),
+            None,
+            "an older writer may still own the slot the newest miner did not rewrite"
         );
     }
 
