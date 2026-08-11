@@ -2317,8 +2317,7 @@ impl WasmGenerator {
                     .binop(BinaryOp::I32Add)
                     .local_set(size);
             }
-            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
-            | TypeSignature::TupleType(_) => {
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
                 for local in locals {
                     builder.local_get(*local);
                 }
@@ -2331,6 +2330,72 @@ impl WasmGenerator {
                     .i32_const(type_length)
                     .call(self.func_by_name("stdlib.runtime_value_size"))
                     .local_set(size);
+            }
+            TypeSignature::TupleType(tuple) => {
+                // A tuple's first local is its runtime-shape handle. Zero
+                // means nothing widened this value — widening is a
+                // preservation or host crossing, and crossings assign handles
+                // — so its size is the fixed tuple overhead plus its fields',
+                // each already in locals: the sum the host computed by having
+                // the whole value serialized to memory and read back. A set
+                // handle keeps that host path, which sizes the arena value
+                // the handle names.
+                let overhead = u32::try_from(tuple.get_type_map().len())
+                    .ok()
+                    .and_then(|fields| fields.checked_mul(2))
+                    .zip(tuple.type_size())
+                    .and_then(|(map, ty)| map.checked_add(ty))
+                    .and_then(|base| {
+                        tuple.get_type_map().keys().try_fold(base, |sum, name| {
+                            sum.checked_add(u32::try_from(name.len()).ok()?)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        GeneratorError::TypeError(format!("tuple overhead overflows: {ty}"))
+                    })?;
+                let field_size = self.borrow_local(ValType::I32);
+                let inline = {
+                    let mut inline = builder.dangling_instr_seq(None);
+                    inline
+                        .i32_const(overhead as i32)
+                        .local_set(size);
+                    let mut cursor = 1;
+                    for field_ty in tuple.get_type_map().values() {
+                        let width = clar2wasm_ty(field_ty).len();
+                        self.runtime_size(
+                            &mut inline,
+                            field_ty,
+                            &locals[cursor..cursor + width],
+                            *field_size,
+                        )?;
+                        inline
+                            .local_get(size)
+                            .local_get(*field_size)
+                            .binop(BinaryOp::I32Add)
+                            .local_set(size);
+                        cursor += width;
+                    }
+                    inline.id()
+                };
+                let host = {
+                    let mut host = builder.dangling_instr_seq(None);
+                    for local in locals {
+                        host.local_get(*local);
+                    }
+                    let (value_offset, _) = self.create_call_stack_local(&mut host, ty, true, false);
+                    self.write_to_memory(&mut host, value_offset, 0, ty)?;
+                    let (type_offset, type_length) = self.serialized_type(ty)?;
+                    host.local_get(value_offset)
+                        .i32_const(type_offset)
+                        .i32_const(type_length)
+                        .call(self.func_by_name("stdlib.runtime_value_size"))
+                        .local_set(size);
+                    host.id()
+                };
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: host,
+                    alternative: inline,
+                });
             }
             _ => {
                 builder
