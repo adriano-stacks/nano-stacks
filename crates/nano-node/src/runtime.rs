@@ -256,6 +256,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone(), archive);
     let rpc_enabled = config.node.rpc_bind.is_some();
     let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
+    if let Some(executor) = executor.as_ref() {
+        executor.lock().await.publish_execution_to(state.metrics());
+    }
     publish_sealed_tip(Some(&state), executor.as_ref()).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served

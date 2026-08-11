@@ -1,18 +1,28 @@
 use std::{
     fmt::Write as _,
-    sync::{Arc, atomic::AtomicI64},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64},
+    },
 };
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use clarity::vm::costs::ExecutionCost;
 use prometheus_client::{
     encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder, text::encode},
-    metrics::{counter::Counter, family::Family, gauge::Gauge},
+    metrics::{
+        counter::Counter,
+        family::Family,
+        gauge::Gauge,
+        histogram::{Histogram, exponential_buckets},
+    },
     registry::Registry,
 };
 
 use crate::QueueReport;
 
 type IntGauge = Gauge<i64, AtomicI64>;
+type FloatGauge = Gauge<f64, AtomicU64>;
 
 /// Execution-cache residency sampled while the executor is already owned.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -186,6 +196,75 @@ struct ResourceGauges {
     wasm_module_cache_bytes: IntGauge,
 }
 
+/// The last executed block's spend, as stacks-core's monitoring reports it:
+/// each cost dimension as the fraction of the block limit it consumed
+/// (`stacks_node_last_block_*`), plus how long executing the block actually
+/// took — the number stacks-core only prints to its log.
+struct ExecutionGauges {
+    read_count: FloatGauge,
+    read_length: FloatGauge,
+    write_count: FloatGauge,
+    write_length: FloatGauge,
+    runtime: FloatGauge,
+    transaction_count: IntGauge,
+    contract_calls: Counter,
+    block_execution_seconds: Histogram,
+}
+
+impl ExecutionGauges {
+    fn register(registry: &mut Registry) -> Self {
+        let fraction = |registry: &mut Registry, name, help| {
+            let gauge = FloatGauge::default();
+            registry.register(name, help, gauge.clone());
+            gauge
+        };
+        let block_execution_seconds = Histogram::new(exponential_buckets(0.005, 2.0, 12));
+        registry.register(
+            "block_execution_seconds",
+            "Wall time this node took to execute and seal one block.",
+            block_execution_seconds.clone(),
+        );
+        Self {
+            read_count: fraction(
+                registry,
+                "last_block_read_count",
+                "Reads of the last executed block, as a fraction of the block limit.",
+            ),
+            read_length: fraction(
+                registry,
+                "last_block_read_length",
+                "Bytes read by the last executed block, as a fraction of the block limit.",
+            ),
+            write_count: fraction(
+                registry,
+                "last_block_write_count",
+                "Writes of the last executed block, as a fraction of the block limit.",
+            ),
+            write_length: fraction(
+                registry,
+                "last_block_write_length",
+                "Bytes written by the last executed block, as a fraction of the block limit.",
+            ),
+            runtime: fraction(
+                registry,
+                "last_block_runtime",
+                "Charged runtime of the last executed block, as a fraction of the block limit.",
+            ),
+            transaction_count: gauge(
+                registry,
+                "last_block_transaction_count",
+                "Transactions in the last executed block.",
+            ),
+            contract_calls: counter(
+                registry,
+                "contract_calls_processed",
+                "Contract-call transactions executed by this node.",
+            ),
+            block_execution_seconds,
+        }
+    }
+}
+
 struct ProgressGauges {
     executed_stacks_height: IntGauge,
     followed_stacks_height: IntGauge,
@@ -339,6 +418,7 @@ struct Inner {
     block_refusals: RefusalCounters,
     sync: SyncCounters,
     progress: ProgressGauges,
+    execution: ExecutionGauges,
     peers: PeerGauges,
     staged_blocks: IntGauge,
     relay_offered: IntGauge,
@@ -370,6 +450,7 @@ impl Default for NodeMetrics {
         let sync = SyncCounters::register(&mut registry);
         let resources = ResourceGauges::register(&mut registry);
         let progress = ProgressGauges::register(&mut registry);
+        let execution = ExecutionGauges::register(&mut registry);
         let peers = PeerGauges::register(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
@@ -416,6 +497,7 @@ impl Default for NodeMetrics {
             block_refusals,
             sync,
             progress,
+            execution,
             peers,
             staged_blocks,
             relay_offered,
@@ -464,6 +546,40 @@ impl NodeMetrics {
     pub fn record_pushed_blocks(&self, accepted: usize, refused: usize) {
         self.0.sync.pushed_blocks_accepted.inc_by(as_u64(accepted));
         self.0.sync.pushed_blocks_refused.inc_by(as_u64(refused));
+    }
+
+    /// Publish what executing one block spent and how long it took.
+    ///
+    /// The fractions mirror stacks-core's `stacks_node_last_block_*` gauges:
+    /// each dimension of the block's `ExecutionCost` divided by its own block
+    /// limit. The wall time is ours alone — stacks-core only logs it.
+    pub fn publish_block_execution(
+        &self,
+        cost: &ExecutionCost,
+        transactions: usize,
+        contract_calls: usize,
+        duration: std::time::Duration,
+    ) {
+        let execution = &self.0.execution;
+        let limit = &nano_vm::EPOCH_4_BLOCK_LIMIT;
+        execution
+            .read_count
+            .set(fraction(cost.read_count, limit.read_count));
+        execution
+            .read_length
+            .set(fraction(cost.read_length, limit.read_length));
+        execution
+            .write_count
+            .set(fraction(cost.write_count, limit.write_count));
+        execution
+            .write_length
+            .set(fraction(cost.write_length, limit.write_length));
+        execution.runtime.set(fraction(cost.runtime, limit.runtime));
+        execution.transaction_count.set(as_i64(transactions));
+        execution.contract_calls.inc_by(as_u64(contract_calls));
+        execution
+            .block_execution_seconds
+            .observe(duration.as_secs_f64());
     }
 
     /// Publish the current local mempool size after a mutation.
@@ -582,6 +698,13 @@ where
     }
 }
 
+// The dimensions are bounded by their block limits (at most 5e9), where f64
+// is exact; the lint guards magnitudes a cost can never reach.
+#[allow(clippy::cast_precision_loss)]
+fn fraction(spent: u64, limit: u64) -> f64 {
+    spent as f64 / limit as f64
+}
+
 fn as_i64<T>(value: T) -> i64
 where
     T: TryInto<i64>,
@@ -634,6 +757,60 @@ mod tests {
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
 
+    /// Every sample the golden scrape must contain, one per published metric.
+    const GOLDEN_SAMPLES: &[&str] = &[
+        "nano_followed_stacks_height 12",
+        "nano_selected_stacks_height 9",
+        "nano_executed_stacks_height 4",
+        "nano_burn_height 3",
+        "nano_serving_peers{role=\"follower\"} 3",
+        "nano_serving_peers{role=\"proposal_validator\"} 2",
+        "nano_serving_peers{role=\"stackerdb_replication\"} 4",
+        "nano_staged_blocks 7",
+        "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
+        "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
+        "nano_block_refusals_total{reason=\"signature\"} 1",
+        "nano_block_refusals_total{reason=\"missing_context\"} 1",
+        "nano_block_refusals_total{reason=\"other\"} 1",
+        "nano_peer_failovers_total 1",
+        "nano_sync_rounds_unanswered_total 1",
+        "nano_stackerdb_rounds_unanswered_total 1",
+        "nano_pushed_blocks_accepted_total 3",
+        "nano_pushed_blocks_refused_total 2",
+        "nano_mempool_transactions 11",
+        "nano_tenure_history_window 0",
+        "nano_marf_node_cache_entries 13",
+        "nano_marf_node_cache_bytes 17",
+        "nano_marf_auxiliary_cache_bytes 19",
+        "nano_clarity_value_cache_entries 23",
+        "nano_clarity_value_cache_bytes 29",
+        "nano_wasm_module_cache_entries 31",
+        "nano_wasm_module_cache_bytes 37",
+        "nano_last_block_read_count 0.5",
+        "nano_last_block_read_length 0.5",
+        "nano_last_block_write_count 0.5",
+        "nano_last_block_write_length 0.5",
+        "nano_last_block_runtime 0.5",
+        "nano_last_block_transaction_count 3",
+        "nano_contract_calls_processed_total 2",
+        "nano_block_execution_seconds_sum 0.25",
+        "nano_block_execution_seconds_count 1",
+        "# EOF",
+    ];
+
+    /// Exactly half of every dimension of `EPOCH_4_BLOCK_LIMIT`, so each
+    /// exported fraction is a clean 0.5.
+    fn half_limit_cost() -> clarity::vm::costs::ExecutionCost {
+        let limit = nano_vm::EPOCH_4_BLOCK_LIMIT;
+        clarity::vm::costs::ExecutionCost {
+            write_length: limit.write_length / 2,
+            write_count: limit.write_count / 2,
+            read_length: limit.read_length / 2,
+            read_count: limit.read_count / 2,
+            runtime: limit.runtime / 2,
+        }
+    }
+
     const fn execution_cache_fixture() -> ExecutionCacheReport {
         ExecutionCacheReport {
             marf_node_entries: 13,
@@ -664,6 +841,12 @@ mod tests {
         metrics.publish_stackerdb_peers(4);
         metrics.publish_mempool_size(11);
         metrics.publish_execution_caches(execution_cache_fixture());
+        metrics.publish_block_execution(
+            &half_limit_cost(),
+            3,
+            2,
+            std::time::Duration::from_millis(250),
+        );
         state.publish_followed_height(12).await;
         state
             .publish_selected(SelectedTip {
@@ -713,36 +896,7 @@ mod tests {
             .await
             .expect("body");
         let body = std::str::from_utf8(&body).expect("UTF-8 metrics");
-        for sample in [
-            "nano_followed_stacks_height 12",
-            "nano_selected_stacks_height 9",
-            "nano_executed_stacks_height 4",
-            "nano_burn_height 3",
-            "nano_serving_peers{role=\"follower\"} 3",
-            "nano_serving_peers{role=\"proposal_validator\"} 2",
-            "nano_serving_peers{role=\"stackerdb_replication\"} 4",
-            "nano_staged_blocks 7",
-            "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
-            "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
-            "nano_block_refusals_total{reason=\"signature\"} 1",
-            "nano_block_refusals_total{reason=\"missing_context\"} 1",
-            "nano_block_refusals_total{reason=\"other\"} 1",
-            "nano_peer_failovers_total 1",
-            "nano_sync_rounds_unanswered_total 1",
-            "nano_stackerdb_rounds_unanswered_total 1",
-            "nano_pushed_blocks_accepted_total 3",
-            "nano_pushed_blocks_refused_total 2",
-            "nano_mempool_transactions 11",
-            "nano_tenure_history_window 0",
-            "nano_marf_node_cache_entries 13",
-            "nano_marf_node_cache_bytes 17",
-            "nano_marf_auxiliary_cache_bytes 19",
-            "nano_clarity_value_cache_entries 23",
-            "nano_clarity_value_cache_bytes 29",
-            "nano_wasm_module_cache_entries 31",
-            "nano_wasm_module_cache_bytes 37",
-            "# EOF",
-        ] {
+        for sample in GOLDEN_SAMPLES {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
         }
     }

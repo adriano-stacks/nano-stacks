@@ -610,6 +610,19 @@ pub fn interpret_contract_call(
     call: ContractCall<'_>,
     cost_tracker: LimitedCostTracker,
 ) -> Result<ContractCallOutcome, VmExecutionError> {
+    interpret_contract_call_measured(vm, call, cost_tracker).map(|(outcome, _)| outcome)
+}
+
+/// [`interpret_contract_call`], also answering how long the interpreter took.
+///
+/// Measured here rather than around the call because the healing and its
+/// restore are this oracle's own scaffolding: a benchmark that charged them to
+/// the interpreter would report our architecture, not the reference engine.
+pub fn interpret_contract_call_measured(
+    vm: &mut nano_vm::Vm,
+    call: ContractCall<'_>,
+    cost_tracker: LimitedCostTracker,
+) -> Result<(ContractCallOutcome, std::time::Duration), VmExecutionError> {
     let (store, context) = vm.state_and_context();
     // A contract the compiler deployed carries placeholder bodies, which the
     // interpreter would evaluate and report as a type error. Rebuild its
@@ -630,9 +643,11 @@ pub fn interpret_contract_call(
         healed.extend(heal_reachable_contracts(store, context, &root));
     }
     let (store, context) = vm.state_and_context();
+    let started = std::time::Instant::now();
     let result = execute_contract_call_outcome_in_context(store, context, call, cost_tracker);
+    let took = started.elapsed();
     restore_contracts(store, healed)?;
-    result
+    result.map(|outcome| (outcome, took))
 }
 
 /// Contracts in a state the interpreter cannot run, because the compiler

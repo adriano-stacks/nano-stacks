@@ -1482,26 +1482,26 @@ fn crosschecking_engines() -> bool {
     std::env::var_os("NANO_REPLAY_BOTH_ENGINES").is_some()
 }
 
-/// Ask both engines every contract call in a block, before the block is applied.
-///
-/// Before, not after, and that is the whole point: at this moment the chainstate
-/// stands on the parent, which is the state the call actually ran against. Each
-/// call opens a block on the parent and aborts it, so nothing is sealed and no
-/// root moves.
-///
-/// Answers a description of the first disagreement. Seven of the eight mainnet
-/// divergences found so far were a compiler bug that showed up first as a
-/// different answer to one call, and every one of them was localised with this
-/// comparison run by hand (`xtask call-both-tx`); running it in the harness is
-/// the same question asked without being asked to.
-fn engines_disagree_before_sealing(
-    chainstate: &mut ChainState,
-    parent: Option<[u8; 32]>,
-    block: &NakamotoBlock,
-) -> Option<String> {
-    let parent = parent?;
+/// Where the engine bench appends its samples, when `NANO_BENCH_ENGINES` names it.
+fn benching_engines() -> Option<PathBuf> {
+    std::env::var_os("NANO_BENCH_ENGINES").map(PathBuf::from)
+}
+
+/// A contract call as a captured transaction carries it, decoded once so the
+/// crosscheck and the bench ask both engines exactly the same question.
+struct CapturedCall<'a> {
+    txid: String,
+    sender: clarity::vm::types::PrincipalData,
+    contract: clarity::vm::types::QualifiedContractIdentifier,
+    function: &'a str,
+    arguments: Vec<Vec<u8>>,
+}
+
+/// Every contract call in a block that both engines can be asked.
+fn contract_calls(block: &NakamotoBlock) -> Vec<CapturedCall<'_>> {
+    let mut calls = Vec::new();
     for transaction in &block.transactions {
-        let nano_codec::TransactionPayloadData::ContractCall {
+        let TransactionPayloadData::ContractCall {
             address,
             contract_name,
             function_name,
@@ -1520,63 +1520,208 @@ fn engines_disagree_before_sealing(
         let Ok(contract) = clarity::vm::types::QualifiedContractIdentifier::parse(&name) else {
             continue;
         };
-        let encoded: Vec<Vec<u8>> = arguments
-            .iter()
-            .map(|argument| argument.as_bytes().to_vec())
-            .collect();
-        let mut answers = [String::new(), String::new()];
-        for (slot, interpreted) in answers.iter_mut().zip([false, true]) {
-            let vm = chainstate.vm_mut();
-            if vm.begin_block(Some(parent), [0xcc; 32]).is_err() {
-                return None;
-            }
-            let free = clarity::vm::costs::LimitedCostTracker::new_free();
-            let outcome = if interpreted {
-                nano_oracle::interpret_contract_call(
-                    vm,
-                    nano_oracle::ContractCall {
-                        sender: sender.clone(),
-                        sponsor: None,
-                        contract: contract.clone(),
-                        function: function_name,
-                        arguments: &encoded,
-                    },
-                    free,
-                )
-            } else {
-                vm.execute_contract_call_outcome(
-                    sender.clone(),
-                    None,
-                    contract.clone(),
-                    function_name,
-                    &encoded,
-                    &free,
-                )
-            };
-            *slot = match &outcome {
-                Ok(
-                    nano_vm::ContractCallOutcome::Success(result)
-                    | nano_vm::ContractCallOutcome::AbortedByResponse(result),
-                ) => format!("{:?}", result.value),
-                Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, .. }) => {
-                    format!("failed: {error:?}")
-                }
-                Err(error) => format!("error: {error:?}"),
-            };
-            drop(vm.abort_block());
+        calls.push(CapturedCall {
+            txid: transaction.txid().to_string(),
+            sender,
+            contract,
+            function: function_name,
+            arguments: arguments
+                .iter()
+                .map(|argument| argument.as_bytes().to_vec())
+                .collect(),
+        });
+    }
+    calls
+}
+
+/// Ask one engine one call against the parent state, opened and aborted.
+///
+/// Answers the formatted result, the cost the call was charged, and how long
+/// the engine took — the execution alone, not the open, the tracker build or
+/// the abort, which cost the same whichever engine runs. `None` when the
+/// parent cannot be opened, which ends the caller's whole comparison the way
+/// it always has.
+fn ask_engine_before_sealing(
+    chainstate: &mut ChainState,
+    parent: [u8; 32],
+    call: &CapturedCall<'_>,
+    interpreted: bool,
+    free: bool,
+) -> Option<(
+    String,
+    clarity::vm::costs::ExecutionCost,
+    std::time::Duration,
+)> {
+    use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
+    let vm = chainstate.vm_mut();
+    vm.begin_block(Some(parent), [0xcc; 32]).ok()?;
+    let tracker = if free {
+        Some(LimitedCostTracker::new_free())
+    } else {
+        vm.transaction_cost_tracker().ok()
+    };
+    let started = std::time::Instant::now();
+    let mut measured = None;
+    let outcome = tracker.map(|tracker| {
+        if interpreted {
+            // The oracle reports the interpreter's own time, without the
+            // healing scaffolding it wraps compiler-deployed contracts in.
+            nano_oracle::interpret_contract_call_measured(
+                vm,
+                nano_oracle::ContractCall {
+                    sender: call.sender.clone(),
+                    sponsor: None,
+                    contract: call.contract.clone(),
+                    function: call.function,
+                    arguments: &call.arguments,
+                },
+                tracker,
+            )
+            .map(|(outcome, took)| {
+                measured = Some(took);
+                outcome
+            })
+        } else {
+            vm.execute_contract_call_outcome(
+                call.sender.clone(),
+                None,
+                call.contract.clone(),
+                call.function,
+                &call.arguments,
+                &tracker,
+            )
         }
-        let [compiled, interpreted] = answers;
+    });
+    let took = measured.unwrap_or_else(|| started.elapsed());
+    let (answer, cost) = match &outcome {
+        Some(Ok(
+            nano_vm::ContractCallOutcome::Success(result)
+            | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+        )) => (format!("{:?}", result.value), result.cost.clone()),
+        Some(Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, cost })) => {
+            (format!("failed: {error:?}"), cost.clone())
+        }
+        Some(Err(error)) => (format!("error: {error:?}"), ExecutionCost::ZERO),
+        None => (
+            "error: the consensus cost tracker cannot be built".to_owned(),
+            ExecutionCost::ZERO,
+        ),
+    };
+    drop(vm.abort_block());
+    Some((answer, cost, took))
+}
+
+/// Ask both engines every contract call in a block, before the block is applied.
+///
+/// Before, not after, and that is the whole point: at this moment the chainstate
+/// stands on the parent, which is the state the call actually ran against. Each
+/// call opens a block on the parent and aborts it, so nothing is sealed and no
+/// root moves.
+///
+/// Answers a description of the first disagreement. Seven of the eight mainnet
+/// divergences found so far were a compiler bug that showed up first as a
+/// different answer to one call, and every one of them was localised with this
+/// comparison run by hand (`xtask call-both-tx`); running it in the harness is
+/// the same question asked without being asked to.
+fn engines_disagree_before_sealing(
+    chainstate: &mut ChainState,
+    parent: Option<[u8; 32]>,
+    block: &NakamotoBlock,
+) -> Option<String> {
+    let parent = parent?;
+    for call in contract_calls(block) {
+        let (compiled, ..) = ask_engine_before_sealing(chainstate, parent, &call, false, true)?;
+        let (interpreted, ..) = ask_engine_before_sealing(chainstate, parent, &call, true, true)?;
         if compiled != interpreted {
             return Some(format!(
-                "the engines answer {name}::{function_name} in transaction {} differently: \
+                "the engines answer {}::{} in transaction {} differently: \
                  clarity-wasm says {compiled} and the interpreter says {interpreted}. \
                  clarity-wasm is the engine that has to run mainnet, so this is a compiler \
                  bug to fix rather than a reason to prefer the other answer",
-                transaction.txid()
+                call.contract, call.function, call.txid
             ));
         }
     }
     None
+}
+
+/// Time both engines on every contract call in a block, against the parent.
+///
+/// The same seam and the same open-and-abort discipline as
+/// [`engines_disagree_before_sealing`], measured instead of compared: each call
+/// runs once unmeasured — compiling the wasm module and walking the trie pages
+/// a following node would already have warm — and then `NANO_BENCH_REPEATS`
+/// times per engine, alternating so neither engine systematically inherits the
+/// other's cache warmth. Consensus cost trackers rather than free ones, because
+/// cost tracking is part of what an engine costs in production.
+///
+/// One tab-separated line per call: height, txid, contract, function, the
+/// charged `runtime` cost dimension, the compiled and interpreted wall times in
+/// nanoseconds (comma-joined repeats), and whether the answers agreed.
+fn bench_engines_before_sealing(
+    chainstate: &mut ChainState,
+    parent: Option<[u8; 32]>,
+    block: &NakamotoBlock,
+    samples: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let calls = contract_calls(block);
+    if calls.is_empty() {
+        return Ok(());
+    }
+    let repeats: usize = std::env::var("NANO_BENCH_REPEATS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let mut sink = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(samples)?;
+    for call in calls {
+        if ask_engine_before_sealing(chainstate, parent, &call, false, false).is_none() {
+            return Ok(());
+        }
+        let mut agree = true;
+        let mut runtime = 0;
+        let (mut compiled, mut interpreted) = (Vec::new(), Vec::new());
+        for _ in 0..repeats {
+            let Some((wasm_answer, cost, took)) =
+                ask_engine_before_sealing(chainstate, parent, &call, false, false)
+            else {
+                return Ok(());
+            };
+            runtime = cost.runtime;
+            compiled.push(took);
+            let Some((interpreter_answer, _, took)) =
+                ask_engine_before_sealing(chainstate, parent, &call, true, false)
+            else {
+                return Ok(());
+            };
+            interpreted.push(took);
+            agree &= wasm_answer == interpreter_answer;
+        }
+        let nanos = |timings: &[std::time::Duration]| {
+            timings
+                .iter()
+                .map(|duration| duration.as_nanos().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        writeln!(
+            sink,
+            "{}\t{}\t{}\t{}\t{runtime}\t{}\t{}\t{agree}",
+            block.header.chain_length,
+            call.txid,
+            call.contract,
+            call.function,
+            nanos(&compiled),
+            nanos(&interpreted),
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_captured_block(
@@ -1667,6 +1812,13 @@ fn apply_captured_block(
         && let Some(disagreement) = engines_disagree_before_sealing(chainstate, parent, &block)
     {
         return Err(ReplayDivergence::Engine(disagreement));
+    }
+    if let Some(samples) = benching_engines()
+        && let Err(error) = bench_engines_before_sealing(chainstate, parent, &block, &samples)
+    {
+        return Err(ReplayDivergence::Fixture(format!(
+            "the engine bench cannot write its samples: {error}"
+        )));
     }
     let applied = execute(chainstate, bitcoin_context, operations, parent, &block)
         .map_err(|error| ReplayDivergence::Application(error.to_string()))?;

@@ -83,6 +83,10 @@ pub struct CheckpointExecutor<S> {
     /// block was executed rather than downloaded, and it is the executed ones a
     /// node answers `/v3/blocks` and `/v3/tenures` with.
     archive: Option<std::sync::Arc<crate::archive::Archive>>,
+    /// Where execution is measured: block cost against the block limit and the
+    /// wall time a block took. Beside the observers for the same reason they
+    /// are here — only the executor knows a block was executed.
+    metrics: Option<nano_rpc::NodeMetrics>,
     bitcoin: S,
 }
 
@@ -749,6 +753,7 @@ where
             bitcoin_view: None,
             observers: None,
             archive: None,
+            metrics: None,
             bitcoin,
         })
     }
@@ -771,6 +776,7 @@ where
             bitcoin_view: None,
             observers: None,
             archive: None,
+            metrics: None,
             bitcoin,
         }
     }
@@ -1548,6 +1554,11 @@ where
     /// announcing a block that had only been downloaded.
     pub fn announce_to(&mut self, observers: nano_rpc::EventDispatcher) {
         self.observers = Some(observers);
+    }
+
+    /// Measure every block this node executes into these metrics.
+    pub fn publish_execution_to(&mut self, metrics: nano_rpc::NodeMetrics) {
+        self.metrics = Some(metrics);
     }
 
     /// Keep every block this node executes in this store.
@@ -2435,7 +2446,26 @@ where
             let burned = block.header.bitcoin_spent.saturating_sub(previous_spent);
             let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
-            timing.execution += phase.elapsed();
+            let block_execution = phase.elapsed();
+            timing.execution += block_execution;
+            if let Some(metrics) = self.metrics.as_ref() {
+                let contract_calls = block
+                    .transactions
+                    .iter()
+                    .filter(|transaction| {
+                        matches!(
+                            transaction.payload().data(),
+                            nano_codec::TransactionPayloadData::ContractCall { .. }
+                        )
+                    })
+                    .count();
+                metrics.publish_block_execution(
+                    &applied.execution_cost,
+                    applied.receipts.len(),
+                    contract_calls,
+                    block_execution,
+                );
+            }
             // Executing a block is synchronous and takes as long as it takes, and a
             // round executes up to five hundred of them. Between two blocks standing
             // on the same burn view nothing above awaits, so the whole run was one
