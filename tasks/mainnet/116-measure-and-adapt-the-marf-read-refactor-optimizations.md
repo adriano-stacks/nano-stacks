@@ -2,7 +2,7 @@
 id: "116"
 group: mainnet
 title: "Measure and adapt the marf-read-refactor optimizations"
-status: pending
+status: in-progress
 priority: medium
 effort: medium
 dependencies: ["110", "114"]
