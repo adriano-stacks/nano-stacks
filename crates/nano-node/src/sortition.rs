@@ -364,6 +364,28 @@ impl SortitionTracker {
         })
     }
 
+    /// The current locally derived burn view and the election before it.
+    ///
+    /// Signers need the current Bitcoin view even when Stacks execution has not
+    /// advanced under it yet. The previous election is included because the
+    /// current view names it as `last_sortition_consensus_hash`.
+    #[must_use]
+    pub fn latest_and_last_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
+        let mut sortitions = Vec::new();
+        let mut walk = Some(self.tip().bitcoin_height);
+        while let Some(height) = walk.take() {
+            let Some(sortition) = self.sortition_info_at(height) else {
+                break;
+            };
+            sortitions.push(sortition);
+            if sortitions.len() == 2 {
+                break;
+            }
+            walk = self.previous_sortition_height(height);
+        }
+        sortitions
+    }
+
     /// The last burn height below this one that elected somebody.
     ///
     /// A tenure collects the coinbase of every burn block since that height, so this
@@ -1664,7 +1686,7 @@ mod tests {
         tracker_with_seed(None, Some([9; 32]), total_burn)
     }
 
-    fn tracker_with_seed(
+    pub(super) fn tracker_with_seed(
         winner_txid: Option<[u8; 32]>,
         winner_vrf_seed: Option<[u8; 32]>,
         total_burn: u64,
@@ -2039,7 +2061,7 @@ mod anchor_tests {
     use nano_bitcoin::BitcoinBlock;
     use nano_sortition::{PayoutSchedule, PoxId, RewardCycleSchedule};
 
-    use super::{CATCH_UP_LIMIT, tests::a_chain};
+    use super::{CATCH_UP_LIMIT, tests::a_chain, tests::tracker_with_seed};
 
     /// A cycle length of ten from burn zero, so 111 and 121 both open one.
     fn payouts() -> PayoutSchedule {
@@ -2133,5 +2155,22 @@ mod anchor_tests {
             chain.snapshot_at(executed).is_some(),
             "lookahead dropped the burn view execution still stands on"
         );
+    }
+
+    #[test]
+    fn the_signer_view_advances_before_stacks_execution() {
+        let mut chain = tracker_with_seed(Some([0x11; 32]), Some([9; 32]), 1_000);
+        let executed = chain.tip().consensus_hash;
+        chain
+            .advance(&empty_block(101), payouts())
+            .expect("derive a no-winner burn above execution");
+
+        let sortitions = chain.latest_and_last_sortitions();
+        assert_eq!(sortitions.len(), 2);
+        assert_eq!(sortitions[0].bitcoin_height, 101);
+        assert!(!sortitions[0].was_sortition);
+        assert_eq!(sortitions[0].last_sortition_consensus_hash, Some(executed));
+        assert_eq!(sortitions[1].bitcoin_height, 100);
+        assert!(sortitions[1].was_sortition);
     }
 }

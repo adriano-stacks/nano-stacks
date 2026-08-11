@@ -2917,13 +2917,11 @@ where
         }
     }
 
-    /// The sortitions this node derived, anchored at the burn view it executed.
+    /// The current sortitions this node derived from its local Bitcoin source.
     ///
-    /// What `/v3/sortitions` answers from. Anchored at the *executed* tip's burn
-    /// view rather than at the derived chain's own tip, which is usually further
-    /// ahead: the chain is walked forward to name the view a staged block stands
-    /// on, and reporting that as the node's sortition would be reporting a burn
-    /// block it has executed nothing under.
+    /// What `/v3/sortitions` answers from. This signer-facing route advances with
+    /// the locally derived Bitcoin chain even when the sealed Stacks tip has not
+    /// advanced under it yet. `/v2/info` continues to report the executed view.
     ///
     /// The pair, because a signer reads its whole view of who may mine from one
     /// route and refuses to act on a first entry whose `last_sortition_ch` names an
@@ -2935,30 +2933,10 @@ where
     /// take from a stranger.
     #[must_use]
     pub fn derived_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
-        let Some(tracker) = self.sortition.as_ref() else {
-            return Vec::new();
-        };
-        let executed = self.tip.header.consensus_hash;
-        let Some(height) = tracker.height_of_consensus_hash(executed) else {
-            return Vec::new();
-        };
-        let mut sortitions = Vec::new();
-        let mut walk = Some(height);
-        // The executed view, then the last one before it that elected somebody.
-        // Two is what the route needs; anything further back is a question about
-        // history, which `/v3/sortitions/consensus` answers by walking this same
-        // chain rather than by keeping a window here.
-        while let Some(at) = walk.take() {
-            let Some(sortition) = tracker.sortition_info_at(at) else {
-                break;
-            };
-            sortitions.push(sortition);
-            if sortitions.len() == 2 {
-                break;
-            }
-            walk = tracker.previous_sortition_height(at);
-        }
-        sortitions
+        self.sortition.as_ref().map_or_else(
+            Vec::new,
+            crate::sortition::SortitionTracker::latest_and_last_sortitions,
+        )
     }
 
     /// Place an ancestor's tenure on this node's burnchain for a partial header backfill.
