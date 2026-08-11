@@ -466,7 +466,7 @@ host() {
     need_source
     local index=${1:?participant index}
     local port=${NANO_HOST_PORT:-24443} endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
-    local sink=${NANO_SINK_PORT:-3801} key token image
+    local sink=${NANO_SINK_PORT:-3801} key token image signer_container
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
     [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
@@ -493,7 +493,8 @@ host() {
     log "stopping stock participant $index: stacks-miner-$index and stacks-signer-$index"
     compose stop "stacks-miner-$index" "stacks-signer-$index"
 
-    image=$(docker inspect --format '{{.Config.Image}}' "stacks-signer-$index")
+    signer_container=$(compose ps -q "stacks-signer-$index")
+    image=$(docker inspect --format '{{.Config.Image}}' "$signer_container")
     docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
     mkdir -p "$RUN/hosted-signer"
     log "starting a stock stacks-signer against nano at 127.0.0.1:$port"
