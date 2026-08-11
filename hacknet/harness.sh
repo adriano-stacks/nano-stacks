@@ -511,7 +511,7 @@ host() {
         "$HOSTED_SIGNER" "$HOSTED_SIGNER" >&2
 }
 
-HOSTED_SIGNER=nano-hosted-signer
+HOSTED_SIGNER=${NANO_HOSTED_SIGNER_NAME:-nano-hosted-signer}
 
 # Wait until nano can host a signer: a tip to serve, and the reward set derived.
 #
@@ -677,9 +677,12 @@ mine() {
 # the chainstate survives it, the chain does not restart.
 observe() {
     need_source
-    local sink=$RUN/events port=${NANO_EVENT_PORT:-3800} name=nano-event-sink network
-    network=$( (docker network inspect "$PROJECT"_default stacks --format \
-        '{{.Name}}' 2>/dev/null || true) | head -1)
+    local sink=$RUN/events port=${NANO_EVENT_PORT:-3800}
+    local name=${NANO_STOCK_SINK_NAME:-$PROJECT-event-sink} container network
+    container=$(compose ps -q stacks-miner-1)
+    network=$(docker inspect --format \
+        '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+        "$container" 2>/dev/null | head -1)
     [ -n "$network" ] || die "the Hacknet network is not up"
 
     # The sink runs on the Hacknet network rather than on the host: a node
@@ -716,7 +719,7 @@ EOF
 }
 
 stop_observing() {
-    docker rm -f nano-event-sink >/dev/null 2>&1 || true
+    docker rm -f "${NANO_STOCK_SINK_NAME:-$PROJECT-event-sink}" >/dev/null 2>&1 || true
 }
 
 restore() {
