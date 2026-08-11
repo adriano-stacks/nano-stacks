@@ -7,7 +7,7 @@ effort: large
 type: chore
 group: mainnet
 parent: "053"
-dependencies: ["037", "046", "047", "054", "079", "082"]
+dependencies: ["037", "046", "047", "054", "079", "082", "107"]
 tags: ["mainnet", "liveness", "operations", "release"]
 created_at: "2026-08-09"
 ---
