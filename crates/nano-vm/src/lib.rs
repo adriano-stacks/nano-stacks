@@ -4341,7 +4341,13 @@ fn deploy_contract_with_wasm_in_context(
         }
     }
 
-    let database = clarity_database(store, bitcoin_context);
+    // The reference attaches this cache per transaction, and its own guards
+    // scope it: a retargeted read bypasses it and a pending write refuses it.
+    // Without one attached, every cross-contract call deserializes the
+    // callee's whole stored context — 470 µs a call on a mainnet replay —
+    // where stacks-core's interpreter pays only the first per transaction.
+    let mut execution_cache = clarity::vm::database::ClarityExecutionCache::default();
+    let database = clarity_database(store, bitcoin_context).with_cache(&mut execution_cache);
     let mut global = GlobalContext::new(
         network.is_mainnet(),
         network.chain_id(),
@@ -4571,7 +4577,13 @@ fn call_compiled_contract(
     let module = modules
         .get(contract)
         .ok_or_else(|| VmInternalError::Expect(format!("missing WASM module for {contract}")))?;
-    let database = clarity_database(store, bitcoin_context);
+    // The reference attaches this cache per transaction, and its own guards
+    // scope it: a retargeted read bypasses it and a pending write refuses it.
+    // Without one attached, every cross-contract call deserializes the
+    // callee's whole stored context — 470 µs a call on a mainnet replay —
+    // where stacks-core's interpreter pays only the first per transaction.
+    let mut execution_cache = clarity::vm::database::ClarityExecutionCache::default();
+    let database = clarity_database(store, bitcoin_context).with_cache(&mut execution_cache);
     let mut global = GlobalContext::new(
         network.is_mainnet(),
         network.chain_id(),
