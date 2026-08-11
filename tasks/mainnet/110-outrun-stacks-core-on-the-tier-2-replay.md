@@ -460,3 +460,15 @@ and the durability asymmetry that only the validate-mode (blocked on
 canonical-at-height metadata) or a decomposed write path can remove. The
 harness, the timing instrumentation recipe, and nineteen rounds of banked
 results are the continuation.
+
+## Twentieth round: the next 23 seconds, measured and located
+
+`contract_call`'s self-time split begins with `database.get_contract`:
+**470 µs per cross-contract call — 8.3 s per 1,500 blocks, ~23 s over the
+range** — deserializing the callee's whole stored contract context on
+every hop. The sound cache already has a home: the module cache's
+`CompiledContract` entry, whose lifecycle is exactly the needed
+invalidation — a redeploy replaces the entry, eviction drops it. Share
+the loaded `Contract` there (`Arc`, clone only what a call mutates), and
+the measured 23 s meets a 26 s median gap. That is the next session's
+first change, with this probe recipe to verify its landing.
