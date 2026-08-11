@@ -115,9 +115,12 @@ and the task itself remain open.
 
 ### Remaining acceptance gate
 
-- [ ] Close dependency 070's retained stock-signer proposal gate, so the same
+- [x] Close dependency 070's retained stock-signer proposal gate, so the same
       checkpoint-authenticated leader-key and parent-proof context is proven on
-      proposal validation as well as canonical following.
+      proposal validation as well as canonical following. Task 070's retained
+      stock signer accepted and signed a proposal after nano validated it under
+      the locally authenticated checkpoint view; missing and inconsistent
+      history controls remain typed refusals.
 - [ ] Start a fresh state directory from the real mainnet checkpoint, the exported
       authentication-history suffix, its boundary proof, the attested signer set
       and accounting; complete the captured replay/follow window and retain release
