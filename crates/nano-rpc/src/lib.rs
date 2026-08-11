@@ -1245,7 +1245,11 @@ async fn latest_and_last_sortition(
     State(state): State<RpcState>,
 ) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
     let derived = executed(&state).await?.sortitions;
-    let latest = derived.first().ok_or(RpcError::Unavailable)?.clone();
+    let latest = derived
+        .iter()
+        .find(|sortition| sortition.was_sortition)
+        .ok_or(RpcError::Unavailable)?
+        .clone();
     let mut sortitions = vec![latest.clone()];
     if let Some(previous) = latest.last_sortition_consensus_hash {
         let last = derived
@@ -1334,25 +1338,34 @@ async fn tenure_fork_info(
     State(state): State<RpcState>,
     Path((start, stop)): Path<(String, String)>,
 ) -> Result<axum::Json<Vec<TenureForkInfoWire>>, RpcError> {
-    let chain = executed(&state).await?.chain;
+    let executed = executed(&state).await?;
     let position = |consensus_hash: &str| {
-        chain
+        executed
+            .sortitions
             .iter()
-            .rposition(|tenure| tenure.sortition.consensus_hash.to_string() == consensus_hash)
+            .position(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
     };
-    let first = position(&start).ok_or(RpcError::NotFound)?;
-    let last = position(&stop).ok_or(RpcError::NotFound)?;
-    if last < first {
+    let newest = position(&stop).ok_or(RpcError::NotFound)?;
+    let oldest = position(&start).ok_or(RpcError::NotFound)?;
+    if oldest < newest {
         return Err(RpcError::BadRequest(
             "the stop sortition is older than the start sortition".to_owned(),
         ));
     }
     Ok(axum::Json(
-        chain[first..=last]
+        executed.sortitions[newest..=oldest]
             .iter()
-            .rev()
             .take(FORK_INFO_DEPTH)
-            .map(TenureForkInfoWire::from)
+            .map(|sortition| {
+                executed
+                    .chain
+                    .iter()
+                    .find(|tenure| tenure.sortition.consensus_hash == sortition.consensus_hash)
+                    .map_or_else(
+                        || TenureForkInfoWire::from_sortition(sortition, &[]),
+                        TenureForkInfoWire::from,
+                    )
+            })
             .collect(),
     ))
 }
@@ -2284,7 +2297,12 @@ struct TenureForkInfoWire {
 
 impl From<&FollowedTenure> for TenureForkInfoWire {
     fn from(tenure: &FollowedTenure) -> Self {
-        let sortition = &tenure.sortition;
+        Self::from_sortition(&tenure.sortition, tenure.blocks.as_ref())
+    }
+}
+
+impl TenureForkInfoWire {
+    fn from_sortition(sortition: &nano_sync::SortitionInfo, blocks: &[NakamotoBlock]) -> Self {
         Self {
             burn_block_hash: format!("0x{}", sortition.bitcoin_block_hash),
             burn_block_height: sortition.bitcoin_height,
@@ -2292,14 +2310,10 @@ impl From<&FollowedTenure> for TenureForkInfoWire {
             parent_sortition_id: format!("0x{}", sortition.parent_sortition_id),
             consensus_hash: format!("0x{}", sortition.consensus_hash),
             was_sortition: sortition.was_sortition,
-            first_block_mined: tenure
-                .blocks
+            first_block_mined: blocks
                 .first()
                 .map(|block| format!("0x{}", block.block_id())),
-            nakamoto_blocks: Some(format!(
-                "0x{}",
-                hex::encode(encode_blocks(tenure.blocks.as_ref()))
-            )),
+            nakamoto_blocks: Some(format!("0x{}", hex::encode(encode_blocks(blocks)))),
         }
     }
 }
@@ -3152,6 +3166,88 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(peers.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn signer_routes_keep_a_winning_sortition_that_mined_no_block() {
+        let (view, blocks) = view_with_blocks(1);
+        let parent = view.tenures[0].sortition.clone();
+        let missing = SortitionInfo {
+            bitcoin_block_hash: BitcoinHeaderHash::from_bytes([12; 32]),
+            bitcoin_height: 12,
+            sortition_id: SortitionId::from_bytes([12; 32]),
+            parent_sortition_id: parent.sortition_id,
+            consensus_hash: ConsensusHash::from_bytes([12; 20]),
+            last_sortition_consensus_hash: Some(parent.consensus_hash),
+            ..parent.clone()
+        };
+        let current = SortitionInfo {
+            bitcoin_block_hash: BitcoinHeaderHash::from_bytes([13; 32]),
+            bitcoin_height: 13,
+            sortition_id: SortitionId::from_bytes([13; 32]),
+            parent_sortition_id: missing.sortition_id,
+            consensus_hash: ConsensusHash::from_bytes([13; 20]),
+            was_sortition: false,
+            last_sortition_consensus_hash: Some(missing.consensus_hash),
+            ..missing.clone()
+        };
+        let state = RpcState::new(NETWORK);
+        state.publish(view).await;
+        state
+            .publish_executed(
+                sealed_at(&blocks[0]),
+                vec![current, missing.clone(), parent.clone()],
+            )
+            .await;
+
+        let app = router(state);
+        let pair = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v3/sortitions/latest_and_last")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(pair.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            pair[0]["consensus_hash"],
+            format!("0x{}", missing.consensus_hash)
+        );
+        assert_eq!(
+            pair[1]["consensus_hash"],
+            format!("0x{}", parent.consensus_hash)
+        );
+
+        let fork = body_json(
+            app.oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v3/tenures/fork_info/{}/{}",
+                        parent.consensus_hash, missing.consensus_hash
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response"),
+        )
+        .await;
+        assert_eq!(fork.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            fork[0]["consensus_hash"],
+            format!("0x{}", missing.consensus_hash)
+        );
+        assert_eq!(fork[0]["first_block_mined"], json!(null));
+        assert_eq!(fork[0]["nakamoto_blocks"], "0x00000000");
+        assert_eq!(
+            fork[1]["first_block_mined"],
+            format!("0x{}", blocks[0].block_id())
+        );
     }
 
     #[tokio::test]

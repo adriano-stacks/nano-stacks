@@ -2898,7 +2898,7 @@ where
     pub fn derived_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
         self.sortition.as_ref().map_or_else(
             Vec::new,
-            crate::sortition::SortitionTracker::latest_and_last_sortitions,
+            crate::sortition::SortitionTracker::recent_sortitions,
         )
     }
 

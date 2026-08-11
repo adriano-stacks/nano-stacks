@@ -374,21 +374,24 @@ impl SortitionTracker {
         })
     }
 
-    /// The current locally derived burn view and the election before it.
+    /// The current locally derived burn view and recent winning elections.
     ///
     /// Signers need the current Bitcoin view even when Stacks execution has not
     /// advanced under it yet. The previous election is included because the
     /// current view names it as `last_sortition_consensus_hash`.
     #[must_use]
-    pub fn latest_and_last_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
+    pub fn recent_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
+        const KEPT: usize = 12;
         let mut sortitions = Vec::new();
         let mut walk = Some(self.tip().bitcoin_height);
         while let Some(height) = walk.take() {
             let Some(sortition) = self.sortition_info_at(height) else {
                 break;
             };
-            sortitions.push(sortition);
-            if sortitions.len() == 2 {
+            if height == self.tip().bitcoin_height || sortition.was_sortition {
+                sortitions.push(sortition);
+            }
+            if sortitions.len() == KEPT {
                 break;
             }
             walk = self.previous_sortition_height(height);
@@ -2197,8 +2200,8 @@ mod anchor_tests {
             .advance(&empty_block(101), payouts())
             .expect("derive a no-winner burn above execution");
 
-        let sortitions = chain.latest_and_last_sortitions();
-        assert_eq!(sortitions.len(), 2);
+        let sortitions = chain.recent_sortitions();
+        assert!(sortitions.len() >= 2);
         assert_eq!(sortitions[0].bitcoin_height, 101);
         assert!(!sortitions[0].was_sortition);
         assert_eq!(sortitions[0].last_sortition_consensus_hash, Some(executed));
