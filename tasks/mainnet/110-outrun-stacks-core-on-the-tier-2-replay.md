@@ -431,3 +431,32 @@ Reverted with its siblings. The next session's first datum is per-name
 host *timing* (the count instrumentation with an `Instant` pair), and the
 likely target moves to `get_variable`/`map_get`/`map_set` bodies — the
 MARF trip, the key-string construction, and `write_to_wasm` per read.
+
+## Rounds eighteen and nineteen: the parse cache and the unmasked emission
+
+Per-name host *timing* (not counts) found the truth the counts hid:
+`runtime_value_size` really did cost 40 s per 1,500 blocks — in
+`signature_from_string`, a recursive text parser run per measurement on a
+data-segment constant. Cached per call context under (offset, length)
+(`94e71d73`): user CPU to a new floor, peak RSS down two gigabytes. That
+cache had also been *masking* the inline tuple emission — Amdahl's trap:
+rounds 14 and 17 measured "neutral" because parsing dominated every call
+they optimized. Re-applied over the cache (`1cb9ebf4`), the emission is
+measurable and shipped: suite green, all roots verified.
+
+## Final verdict, all paired runs of the final configuration
+
+nano 5:45.7 / 5:53.7 / 5:59.2 / 6:27.9 / 6:30.2 / 6:30.6 (median ~6:13,
+user 265–277 s); stacks-core 5:35.7–5:52.6 (median 5:46.7, user ~177 s).
+nano beat core once in a directly adjacent pairing — the first such win —
+and the medians still favor core by ~26 s. nano burns 1.5× the user CPU
+(durable commits plus the remaining VM overhead) and its two gigabytes of
+writes per run make its wall volatile on an 87%-full btrfs, which core,
+writing nothing, never feels.
+
+**Condition: not met.** Remaining, in measured order: `contract_call`'s
+inclusive 156 s wants a self-time split; the size measurements' residue;
+and the durability asymmetry that only the validate-mode (blocked on
+canonical-at-height metadata) or a decomposed write path can remove. The
+harness, the timing instrumentation recipe, and nineteen rounds of banked
+results are the continuation.
