@@ -1,13 +1,14 @@
 ---
 id: "070"
 title: "Carry leader-key history into proposal validation"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["050", "051"]
 tags: ["mainnet", "signer", "checkpoint", "conformance"]
 created_at: 2026-08-06
 type: feature
+completed_at: 2026-08-11
 ---
 
 # Carry leader-key history into proposal validation
@@ -66,7 +67,7 @@ not wired into proposal execution.
         when the window has none — the two fields these gates check, the VRF key and
         the block-signing hash, are exactly what a row states.
 
-- [ ] Run a stock `stacks-signer` against nano and retain evidence that it
+- [x] Run a stock `stacks-signer` against nano and retain evidence that it
       accepts and signs a valid proposal after nano validates it locally.
 
 ## What was actually broken
