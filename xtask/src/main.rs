@@ -2521,6 +2521,8 @@ struct CaptureConfig {
     events_dir: Option<PathBuf>,
     /// The unlock heights the events otherwise carry, needed only without them.
     unlock_heights: Option<[u64; 4]>,
+    /// The configured sBTC registry whose aggregate key PoX-5 reads.
+    sbtc_registry_contract: Option<String>,
     bitcoin_rpc: Option<String>,
     /// A build to capture from other than the pinned one, named explicitly.
     ///
@@ -2565,6 +2567,7 @@ impl CaptureConfig {
         let mut node_root = None;
         let mut events_dir = None;
         let mut unlock_heights: [Option<u64>; 4] = [None; 4];
+        let mut sbtc_registry_contract = None;
         let mut bitcoin_rpc = None;
         let mut bitcoin_rest = None;
         let mut accept_node_revision = None;
@@ -2590,6 +2593,7 @@ impl CaptureConfig {
                 "--pox-v2-unlock-height" => unlock_heights[1] = Some(parse_u64(flag, value)?),
                 "--pox-v3-unlock-height" => unlock_heights[2] = Some(parse_u64(flag, value)?),
                 "--pox-v4-unlock-height" => unlock_heights[3] = Some(parse_u64(flag, value)?),
+                "--sbtc-registry-contract" => sbtc_registry_contract = Some(value.to_owned()),
                 "--bitcoin-rpc" => bitcoin_rpc = Some(value.to_owned()),
                 "--bitcoin-rest" => bitcoin_rest = Some(value.to_owned()),
                 "--accept-node-revision" => accept_node_revision = Some(value.to_owned()),
@@ -2618,6 +2622,7 @@ impl CaptureConfig {
                 [Some(v1), Some(v2), Some(v3), Some(v4)] => Some([v1, v2, v3, v4]),
                 _ => None,
             },
+            sbtc_registry_contract,
             bitcoin_rpc,
             bitcoin_rest,
             accept_node_revision,
@@ -3437,13 +3442,36 @@ impl CaptureConfig {
     }
 
     /// The unlock heights a receipt-less capture has to record itself.
-    fn unlock_height_lines(&self) -> String {
-        self.unlock_heights.map_or_else(String::new, |heights| {
-            format!(
-                "\npox_v1_unlock_height = {}\npox_v2_unlock_height = {}\npox_v3_unlock_height = {}\npox_v4_unlock_height = {}",
-                heights[0], heights[1], heights[2], heights[3]
-            )
-        })
+    fn unlock_heights(&self, staging: &Path) -> Result<[u64; 4], String> {
+        if let Some(heights) = self.unlock_heights {
+            return Ok(heights);
+        }
+        let events = staging.join("events/new_block");
+        let first = fs::read_dir(&events)
+            .map_err(io_error("read captured observer events"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io_error("read captured observer event entry"))?
+            .into_iter()
+            .min()
+            .ok_or_else(|| {
+                "capture needs observer events or all four --pox-v*-unlock-height values".to_owned()
+            })?;
+        let event: serde_json::Value = serde_json::from_slice(
+            &fs::read(&first).map_err(io_error("read captured observer event"))?,
+        )
+        .map_err(|error| format!("cannot decode {}: {error}", first.display()))?;
+        let height = |field| {
+            event[field]
+                .as_u64()
+                .ok_or_else(|| format!("{} does not name {field}", first.display()))
+        };
+        Ok([
+            height("pox_v1_unlock_height")?,
+            height("pox_v2_unlock_height")?,
+            height("pox_v3_unlock_height")?,
+            height("pox_v4_unlock_height")?,
+        ])
     }
 
     fn write_provenance(
@@ -3466,9 +3494,15 @@ impl CaptureConfig {
             .accept_node_revision
             .clone()
             .map_or_else(Self::pinned_stacks_core, Ok)?;
-        let unlock_heights = self.unlock_height_lines();
+        let unlock_heights = self.unlock_heights(staging)?;
+        let sbtc_registry = self
+            .sbtc_registry_contract
+            .as_ref()
+            .map_or_else(String::new, |contract| {
+                format!("\nsbtc_registry_contract = \"{contract}\"")
+            });
         let contents = format!(
-            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nfull_sortition_history = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}{unlock_heights}\n",
+            "source = \"hacknet\"\nhacknet_commit = \"{}\"\ncaptured_at_unix = {captured_at}\nchain_id = {chain_id}\nbitcoin_magic = \"{magic}\"\nstacks_core_rev = \"{stacks_core_rev}\"\ncheckpoint_stacks_height = {}\ncheckpoint_state_id = \"{}\"\ncheckpoint_state_index_root = \"{}\"\nfirst_stacks_height = {}\nreplay_blocks = {}\nfull_sortition_history = {}\nbitcoin_rpc = \"{}\"\nstacks_rpc = \"{}\"\nfirst_block_hash = \"{}\"\nfirst_consensus_hash = \"{}\"\npox_first_bitcoin_height = {pox_first_height}\npox_prepare_phase_length = {prepare_phase_length}\npox_reward_phase_length = {reward_phase_length}\npox_v1_unlock_height = {}\npox_v2_unlock_height = {}\npox_v3_unlock_height = {}\npox_v4_unlock_height = {}{sbtc_registry}\n",
             self.hacknet_commit,
             checkpoint.height,
             checkpoint.index_block_hash,
@@ -3480,6 +3514,10 @@ impl CaptureConfig {
             self.stacks_rpc,
             blocks[0].block_hash,
             blocks[0].consensus_hash,
+            unlock_heights[0],
+            unlock_heights[1],
+            unlock_heights[2],
+            unlock_heights[3],
         );
         write_file(&staging.join("provenance.toml"), contents.as_bytes())
     }

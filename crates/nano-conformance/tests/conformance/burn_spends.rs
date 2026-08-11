@@ -148,10 +148,21 @@ fn the_payout_output_count_is_the_one_stacks_core_builds() {
         sbtc_address: recipient(9),
     });
 
-    // The captured chain's own calendar, which is the one that derived nothing: a
-    // twenty-block cycle from Bitcoin 0, five of them the prepare phase, and the
-    // waterfall opening at 280.
-    let schedule = nano_node::payout_schedule(&follow_path::pox()).expect("a payout schedule");
+    // A small explicit calendar keeps this unit test about the three output-count
+    // rules. Capture-specific agreement is checked against every archived row below.
+    let calendar = nano_sync::PoxInfo {
+        first_bitcoin_height: 0,
+        bitcoin_height: 0,
+        prepare_phase_length: 5,
+        reward_phase_length: 15,
+        reward_slots: 30,
+        rejection_fraction: None,
+        pox_5_activation_height: Some(262),
+        v1_unlock_height: None,
+        v2_unlock_height: None,
+        v3_unlock_height: None,
+    };
+    let schedule = nano_node::payout_schedule(&calendar).expect("a payout schedule");
 
     // A reward phase, one recipient: stacks-core pays two, so nano must count two.
     let outs = RewardSetInfo::commit_outs_for(Some(reward_set(1)), false, false);
@@ -278,17 +289,31 @@ fn the_captured_snapshots_state_the_payout_output_count() {
 /// already being walked.
 #[test]
 fn the_derived_burn_spends_are_the_archives() {
-    // Seeded inside one reward cycle, because a chain cannot be derived across a
-    // cycle boundary whose anchor block it has not resolved — the consensus hash
-    // mixes one bit per cycle. Cycle 18 of this capture opens at burn 360.
-    const SEED: u64 = 362;
-
     let root = follow_path::fixtures();
     let rows = snapshots(&root);
     let blocks = captured_blocks(&root, &rows, *b"T3");
-    let schedule = nano_node::payout_schedule(&follow_path::pox()).expect("a schedule");
+    let calendar = follow_path::pox();
+    let schedule = nano_node::payout_schedule(&calendar).expect("a schedule");
+    let cycle = u64::from(calendar.prepare_phase_length + calendar.reward_phase_length);
+    let last = rows
+        .last()
+        .expect("the capture has a last snapshot")
+        .block_height;
+    let seed = rows
+        .iter()
+        .rev()
+        .find(|snapshot| {
+            let start = snapshot.block_height;
+            snapshot.sortition == 1
+                && start >= 6
+                && start + 5 <= last
+                && start.saturating_sub(calendar.first_bitcoin_height) / cycle
+                    == (start + 5).saturating_sub(calendar.first_bitcoin_height) / cycle
+        })
+        .map(|snapshot| snapshot.block_height)
+        .expect("the capture holds a winning seed with five successors in its reward cycle");
     let directory = tempfile::tempdir().expect("a directory for the seed");
-    let mut chain = seeded_chain(&rows, SEED, directory.path());
+    let mut chain = seeded_chain(&rows, seed, directory.path());
     let read = |height: u64| {
         blocks
             .get(&height)
@@ -296,14 +321,14 @@ fn the_derived_burn_spends_are_the_archives() {
             .ok_or_else(|| format!("no Bitcoin block at {height}"))
     };
     chain
-        .catch_up(read, SEED, schedule, nano_node::sortition::CATCH_UP_LIMIT)
+        .catch_up(read, seed, schedule, nano_node::sortition::CATCH_UP_LIMIT)
         .expect("the mining window fills from behind the seed");
 
     let mut sortitions = 0;
     let mut empty = 0;
     for snapshot in rows
         .iter()
-        .filter(|snapshot| (SEED + 1..=SEED + 5).contains(&snapshot.block_height))
+        .filter(|snapshot| (seed + 1..=seed + 5).contains(&snapshot.block_height))
     {
         chain
             .advance(

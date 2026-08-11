@@ -21,8 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
-use nano_chainstate::{AppliedBlock, NakamotoBlock, starts_new_tenure};
-use nano_conformance::replay_captured_blocks;
+use nano_chainstate::{AppliedBlock, NakamotoBlock, SignerSet, starts_new_tenure};
+use nano_conformance::{captured_signer_sets, replay_captured_blocks};
+use nano_crypto::MessageSignature;
 use nano_primitives::{BitcoinHeaderHash, BlockHeaderHash, Sha256Sum};
 use nano_rpc::{BlockEventContext, RewardSetEvent, RewardSetSigner, new_block_payload};
 use serde_json::Value;
@@ -45,6 +46,36 @@ fn bytes32(value: &Value) -> [u8; 32] {
         .expect("hexadecimal hash")
         .try_into()
         .expect("32-byte hash")
+}
+
+fn signature(value: &Value) -> MessageSignature {
+    let bytes: [u8; 65] = hex::decode(
+        value
+            .as_str()
+            .expect("signer signature")
+            .trim_start_matches("0x"),
+    )
+    .expect("hexadecimal signer signature")
+    .try_into()
+    .expect("65-byte signer signature");
+    MessageSignature::from_bytes(bytes)
+}
+
+fn verify_signer_quorums(signers: &SignerSet, block: &NakamotoBlock, captured: &Value) {
+    signers
+        .verify(&block.header)
+        .unwrap_or_else(|error| panic!("nano block has an invalid signer quorum: {error}"));
+
+    let mut observed = block.header.clone();
+    observed.signer_signatures = captured["signer_signature"]
+        .as_array()
+        .expect("captured signer signatures")
+        .iter()
+        .map(signature)
+        .collect();
+    signers
+        .verify(&observed)
+        .unwrap_or_else(|error| panic!("captured event has an invalid signer quorum: {error}"));
 }
 
 /// The `new_block` event the capture recorded for this block.
@@ -93,7 +124,12 @@ fn context(
         // the block being replayed — outside this capture altogether, and below the
         // checkpoint it starts at. `a_matured_payout_names_the_tenure_that_earned_it`
         // is where the rule the node fills them by is checked instead.
-        matured_rewards: nano_rpc::matured_rewards(&applied.matured_rewards, None),
+        matured_rewards: nano_rpc::matured_rewards(
+            &applied.matured_rewards,
+            applied.matured_coinbase,
+            applied.matured_anchored_fees,
+            None,
+        ),
         reward_set: applied
             .reward_set
             .as_ref()
@@ -146,6 +182,11 @@ const UNKNOWN_PROVENANCE: [&str; 3] = [
 /// inputs, and the VM differential that once required removing them is closed.
 fn normalize(payload: &mut Value) {
     let object = payload.as_object_mut().expect("payload object");
+    // A Nakamoto block's identity commits to the signature digest, not to one
+    // particular threshold subset. The capture's observer and archive source
+    // can therefore publish different valid quorums for the same block. Both
+    // are verified before this non-unique vector is removed.
+    object.remove("signer_signature");
     if let Some(events) = object.get_mut("events").and_then(Value::as_array_mut) {
         events.sort_by_key(|event| event["event_index"].as_u64());
     }
@@ -165,6 +206,8 @@ fn normalize(payload: &mut Value) {
 #[test]
 fn new_block_payloads_match_the_ones_stacks_core_published() {
     let root = fixtures();
+    let signer_sets = captured_signer_sets(&root);
+    let pox = crate::follow_path::pox();
     let mut parent: Option<BlockHeaderHash> = None;
     let mut tenure_height = 0;
     let mut divergences: Vec<String> = Vec::new();
@@ -204,6 +247,13 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
         );
 
         let mut expected = event;
+        let reward_cycle = pox.reward_cycle(
+            context(&expected, applied, parent_block_hash, tenure_height).bitcoin_height,
+        );
+        let signers = signer_sets
+            .get(&reward_cycle)
+            .unwrap_or_else(|| panic!("capture has no signer set for cycle {reward_cycle}"));
+        verify_signer_quorums(signers, block, &expected);
         normalize(&mut payload);
         normalize(&mut expected);
         for key in expected.as_object().expect("event object").keys() {
@@ -330,7 +380,7 @@ fn a_matured_payout_names_the_tenure_that_earned_it() {
 #[test]
 fn a_matured_payout_is_built_from_the_tenures_that_earned_it() {
     let matured: Vec<nano_chainstate::NativeStxCredit> = [
-        ("ST2FW15NGB4H76FMVXKHYYSM865YVS6V3SA1GNABC", 1_020_400_000),
+        ("ST2FW15NGB4H76FMVXKHYYSM865YVS6V3SA1GNABC", 1_020_403_003),
         ("ST2MES40ZEXTX9M4YXW9QSWHRVC9HYT419S198VPM", 3_000_300),
     ]
     .into_iter()
@@ -346,7 +396,7 @@ fn a_matured_payout_is_built_from_the_tenures_that_earned_it() {
         fee_miner: "ST4DZ2J4VWYBEQC0319V7CN8JDYE2WMESPSWMGDE".to_owned(),
     };
 
-    let built = nano_rpc::matured_rewards(&matured, Some(&source));
+    let built = nano_rpc::matured_rewards(&matured, 1_020_400_000, 3_003, Some(&source));
     let [coinbase, fees] = built.as_slice() else {
         panic!("two payouts were built, not {}", built.len())
     };
@@ -356,6 +406,7 @@ fn a_matured_payout_is_built_from_the_tenures_that_earned_it() {
     );
     assert_eq!(coinbase.miner_address, source.coinbase_miner);
     assert_eq!(coinbase.coinbase, 1_020_400_000);
+    assert_eq!(coinbase.tx_fees_anchored, 3_003);
     assert_eq!(coinbase.tx_fees_streamed_produced, 0);
     assert_eq!(fees.recipient, "ST2MES40ZEXTX9M4YXW9QSWHRVC9HYT419S198VPM");
     assert_eq!(fees.miner_address, source.fee_miner);
@@ -369,7 +420,7 @@ fn a_matured_payout_is_built_from_the_tenures_that_earned_it() {
         );
     }
 
-    let without = nano_rpc::matured_rewards(&matured, None);
+    let without = nano_rpc::matured_rewards(&matured, 1_020_400_000, 3_003, None);
     assert!(without.iter().all(|reward| reward.miner_address.is_empty()));
     assert_eq!(without[0].coinbase, 1_020_400_000);
 }

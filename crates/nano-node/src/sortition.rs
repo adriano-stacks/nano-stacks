@@ -43,6 +43,12 @@ const POX_HISTORY_SEARCH_LIMIT: usize = 1024;
 /// what it derived and the next one carries on.
 pub const CATCH_UP_LIMIT: u64 = 144;
 
+fn execution_rollback_floor(bitcoin_height: u64) -> u64 {
+    let rollback = u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW)
+        .expect("the commitment window fits u64");
+    bitcoin_height.saturating_sub(rollback)
+}
+
 /// What one round of catching up did, and where its time went.
 ///
 /// It is worth counting because the cost of deriving a sortition was attributed
@@ -320,6 +326,14 @@ impl SortitionTracker {
     /// of execution is the design; running away from it is the defect.
     pub fn keep_from(&mut self, bitcoin_height: u64) {
         self.engine.snapshots_mut().keep_from(bitcoin_height);
+    }
+
+    /// Keep every burn view execution or an admitted Bitcoin reorganization can
+    /// still need. A same-sortition Stacks fork needs the immediately preceding
+    /// view; the deepest admitted Bitcoin reorganization reaches one commitment
+    /// window further back.
+    pub fn keep_for_execution(&mut self, bitcoin_height: u64) {
+        self.keep_from(execution_rollback_floor(bitcoin_height));
     }
 
     /// Whether the six burn blocks behind the seed have been read.
@@ -1205,7 +1219,7 @@ impl SortitionTracker {
                     "the saved sortitions cannot seed a chain, so it is re-derived from the \
                      checkpoint: {saved}"
                 );
-                Self::from_capture(capture).map_err(|captured| {
+                Self::from_capture_below(capture, executed_burn_view).map_err(|captured| {
                     TrackerError::Seed(format!(
                         "neither the saved sortitions ({saved}) nor the capture ({captured}) \
                          can seed a chain"
@@ -1415,6 +1429,37 @@ impl SortitionTracker {
                     "no snapshot for the hash the history ends at: {anchor}"
                 ))
             })?;
+        tracker_from_capture_seed(directory, seed, history)
+    }
+
+    /// Start from the latest winning captured snapshot below execution's admitted
+    /// rollback window.
+    fn from_capture_below(directory: &Path, executed_burn_view: u64) -> Result<Self, TrackerError> {
+        let snapshots = captured_snapshots(directory)?;
+        let mut history = Self::history_from(directory)?;
+        let rollback_floor = execution_rollback_floor(executed_burn_view);
+        let (index, seed) = history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, hash)| {
+                let hash = hash.to_string();
+                snapshots
+                    .iter()
+                    .find(|snapshot| {
+                        snapshot.consensus_hash == hash
+                            && snapshot.block_height <= rollback_floor
+                            && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
+                    })
+                    .map(|snapshot| (index, snapshot))
+            })
+            .ok_or_else(|| {
+                TrackerError::Seed(format!(
+                    "the capture has no winning seed at or below rollback floor burn \
+                     {rollback_floor} for executed burn {executed_burn_view}"
+                ))
+            })?;
+        history.truncate(index + 1);
         tracker_from_capture_seed(directory, seed, history)
     }
 
@@ -1698,7 +1743,7 @@ mod tests {
 
     use super::{
         CapturedSnapshot, History, SortitionTracker, TrackerError, captured_snapshots,
-        seed_snapshot,
+        execution_rollback_floor, seed_snapshot,
     };
 
     fn captured_sortitions() -> PathBuf {
@@ -1863,6 +1908,49 @@ mod tests {
         assert_eq!(
             selected.engine.snapshots().history(),
             ordinary.engine.snapshots().history()
+        );
+        assert_eq!(selected.leader_keys(), ordinary.leader_keys());
+    }
+
+    #[test]
+    fn a_capture_seed_above_execution_is_truncated_to_its_latest_winner() {
+        let capture = captured_sortitions();
+        let snapshots = captured_snapshots(&capture).expect("read captured snapshots");
+        let ordinary = SortitionTracker::from_capture(&capture).expect("load ordinary seed");
+        let executed = snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| {
+                snapshot.block_height < ordinary.tip().bitcoin_height
+                    && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
+            })
+            .expect("the capture has an earlier winning boundary");
+        let rollback_floor = execution_rollback_floor(executed.block_height);
+        let boundary = snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| {
+                snapshot.block_height <= rollback_floor
+                    && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
+            })
+            .expect("the capture has a winner below the rollback floor");
+        let state = tempfile::tempdir().expect("an empty role-specific state directory");
+
+        let selected = SortitionTracker::resume_or_capture_below(
+            state.path(),
+            &capture,
+            executed.block_height,
+        )
+        .expect("truncate the capture below execution's burn view");
+
+        assert_eq!(selected.tip().bitcoin_height, boundary.block_height);
+        assert_eq!(
+            selected.tip().consensus_hash,
+            captured_consensus_hash(boundary)
+        );
+        assert_eq!(
+            selected.engine.snapshots().history().last(),
+            Some(&selected.tip().consensus_hash)
         );
         assert_eq!(selected.leader_keys(), ordinary.leader_keys());
     }

@@ -908,9 +908,10 @@ pub fn derive_sortitions<S>(
     S: nano_bitcoin::BitcoinSource,
     S::Error: std::fmt::Display,
 {
-    let tracker = nano_node::sortition::SortitionTracker::resume_or_capture(
+    let tracker = nano_node::sortition::SortitionTracker::resume_or_capture_below(
         state,
         &fixtures.join("sortition"),
+        executor.bitcoin_height(),
     )
     .expect("the capture carries a sortition history a chain can be seeded from");
     executor.track_sortitions(tracker, state.to_path_buf());
@@ -2064,8 +2065,8 @@ fn captured_chainstate(root: &Path) -> ChainState {
 ///
 /// A block is signed by the set of its own cycle, and a window long enough to
 /// cross a rollover spans more than one.
-#[cfg(test)]
-fn captured_signer_sets(root: &Path) -> BTreeMap<u64, nano_chainstate::SignerSet> {
+#[must_use]
+pub fn captured_signer_sets(root: &Path) -> BTreeMap<u64, nano_chainstate::SignerSet> {
     #[derive(Deserialize)]
     struct SignerWire {
         signing_key: String,
@@ -2164,7 +2165,6 @@ fn captured_signer_set(root: &Path) -> nano_chainstate::SignerSet {
         .0
 }
 
-#[cfg(test)]
 fn captured_reward_slots(root: &Path) -> u32 {
     provenance_field(root, "pox_reward_phase_length")
         .and_then(|length| length.parse::<u32>().ok())

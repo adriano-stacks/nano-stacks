@@ -66,6 +66,10 @@ pub struct AppliedBlock {
     /// they are credited from the tenure accounting and leave no trace in the
     /// block.
     pub matured_rewards: Vec<NativeStxCredit>,
+    /// New STX in the first matured credit. Any remainder in that credit is
+    /// anchored transaction fees, which an observer reports separately.
+    pub matured_coinbase: u128,
+    pub matured_anchored_fees: u128,
     /// The reward set this block computed, if it is the prepare-phase block that
     /// computed one. Not "the set of this cycle" — a node can read that any
     /// time; this is the transition, which is what an observer is told about.
@@ -91,6 +95,21 @@ pub struct NativeBlockEffects {
 pub struct NativeStxCredit {
     pub recipient: PrincipalData,
     pub amount: u128,
+}
+
+fn matured_reward_amounts(effects: &NativeBlockEffects) -> Result<(u128, u128), ChainStateError> {
+    let coinbase = effects.liquid_supply_increase;
+    let anchored_fees = effects
+        .credits
+        .first()
+        .map_or(0, |credit| credit.amount)
+        .checked_sub(coinbase)
+        .ok_or_else(|| {
+            ChainStateError::InvalidTransaction(
+                "matured liquid supply exceeds the first reward credit".to_owned(),
+            )
+        })?;
+    Ok((coinbase, anchored_fees))
 }
 
 /// Number of sortition-created tenures before a miner reward matures.
@@ -2486,6 +2505,8 @@ impl ChainState {
         // Kept apart from `effects`, which also carries whatever the caller
         // brought: an observer is told what *matured*, not what was credited.
         let mut matured_rewards = Vec::new();
+        let mut matured_coinbase = 0;
+        let mut matured_anchored_fees = 0;
         let result = (|| {
             // Inside the block, and first: the reward set is read out of state, so
             // it has to be read from the state *this block* stands on. Before the
@@ -2500,6 +2521,7 @@ impl ChainState {
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
                 let matured = self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;
+                (matured_coinbase, matured_anchored_fees) = matured_reward_amounts(&matured)?;
                 matured_rewards.clone_from(&matured.credits);
                 effects.credits.extend(matured.credits);
                 effects.liquid_supply_increase = effects
@@ -2572,6 +2594,8 @@ impl ChainState {
                 receipts,
                 observer_transactions: self.phantom_unlocks_for_observer(block, unlock_events),
                 matured_rewards: std::mem::take(&mut matured_rewards),
+                matured_coinbase,
+                matured_anchored_fees,
                 reward_set,
             })
         })();

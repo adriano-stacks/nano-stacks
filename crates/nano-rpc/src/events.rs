@@ -95,9 +95,9 @@ pub struct MaturedRewardSource {
 /// tenure's coinbase goes to its own recipient, and the fees of the tenure
 /// *before* it go to that tenure's recipient under
 /// `tx_fees_streamed_produced` — `calculate_miner_reward` gives a Nakamoto miner
-/// the share `(0, parent_fees, 0)`. nano's accounting credits exactly that pair
-/// in exactly that order, so the mapping is positional and is written down here
-/// rather than in the node.
+/// the share `(0, parent_fees, 0)`. The first native credit can also contain
+/// anchored fees from the maturing tenure. Its liquid-supply component is the
+/// coinbase; execution keeps the remainder separately for this observer shape.
 ///
 /// That order is also why the source is one value rather than one per credit: the
 /// two entries share a block and differ only in whose tenure they are. A caller
@@ -107,6 +107,8 @@ pub struct MaturedRewardSource {
 #[must_use]
 pub fn matured_rewards(
     credits: &[nano_chainstate::NativeStxCredit],
+    coinbase_amount: u128,
+    anchored_fees: u128,
     source: Option<&MaturedRewardSource>,
 ) -> Vec<MaturedReward> {
     let (from_block_hash, from_block_id) = source.map_or_else(Default::default, |source| {
@@ -129,7 +131,8 @@ pub fn matured_rewards(
                         source.fee_miner.clone()
                     }
                 }),
-                coinbase: if coinbase { credit.amount } else { 0 },
+                coinbase: if coinbase { coinbase_amount } else { 0 },
+                tx_fees_anchored: if coinbase { anchored_fees } else { 0 },
                 tx_fees_streamed_produced: if coinbase { 0 } else { credit.amount },
                 from_stacks_block_hash: from_block_hash,
                 from_index_consensus_hash: from_block_id,

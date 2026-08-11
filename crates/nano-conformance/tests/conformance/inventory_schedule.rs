@@ -153,7 +153,8 @@ fn served_chain() -> Vec<NakamotoBlock> {
     let rows = snapshots();
     let burn_of = |block: &NakamotoBlock| burn_height_of(&rows, block);
     let seed = second_burn_view(&chain, &burn_of);
-    let boundary = (seed / crate::follow_path::CYCLE + 1) * crate::follow_path::CYCLE;
+    let cycle = crate::follow_path::cycle();
+    let boundary = (seed / cycle + 1) * cycle;
     chain
         .iter()
         .take_while(|block| burn_of(block) < boundary)

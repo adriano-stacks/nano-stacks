@@ -443,15 +443,29 @@ impl Served {
 
     fn block(&self, id: &str) -> Option<Vec<u8>> {
         let blocks = self.visible();
-        let wanted = |block: &&NakamotoBlock| hex::encode(block.block_id()) == id;
+        let wanted = |block: &NakamotoBlock| hex::encode(block.block_id()) == id;
+        let checkpoint = nano_conformance::captured_checkpoint_block(&fixtures());
+        let checkpoint_is_wanted = checkpoint
+            .as_ref()
+            .is_some_and(|block| hex::encode(block.block_id()) == id);
         if self.lying_blocks {
-            blocks.iter().find(wanted)?;
+            if !blocks.iter().any(wanted) && !checkpoint_is_wanted {
+                return None;
+            }
             return blocks
                 .iter()
                 .find(|block| !wanted(block))
                 .map(NakamotoBlock::encode);
         }
-        blocks.iter().find(wanted).map(NakamotoBlock::encode)
+        blocks
+            .iter()
+            .find(|block| wanted(block))
+            .map(NakamotoBlock::encode)
+            .or_else(|| {
+                checkpoint
+                    .filter(|_| checkpoint_is_wanted)
+                    .map(|block| block.encode())
+            })
     }
 
     /// Every block of the tenure the named block belongs to, back to back.
@@ -465,9 +479,14 @@ impl Served {
     /// asked for again from lower down.
     fn tenure(&self, id: &str) -> Option<Vec<u8>> {
         let blocks = self.visible();
-        let named = blocks
+        let Some(named) = blocks
             .iter()
-            .find(|block| hex::encode(block.block_id()) == id)?;
+            .find(|block| hex::encode(block.block_id()) == id)
+        else {
+            return nano_conformance::captured_checkpoint_block(&fixtures())
+                .filter(|block| hex::encode(block.block_id()) == id)
+                .map(|block| block.encode());
+        };
         let tenure: Vec<&NakamotoBlock> = blocks
             .iter()
             .filter(|block| block.header.consensus_hash == named.header.consensus_hash)
@@ -547,7 +566,7 @@ impl Served {
             // convenience.
             "contract_versions": [{
                 "contract_id": "ST000000000000000000002AMW42H.pox-5",
-                "activation_burnchain_block_height": POX_5_ACTIVATION_HEIGHT,
+                "activation_burnchain_block_height": calendar.pox_5_activation_height,
                 "first_reward_cycle_id": 0,
             }],
             "epochs": [],
@@ -841,35 +860,53 @@ pub const CHAIN_ID: u32 = 2_147_483_648;
 /// sortition was elected at any block of this capture and its running burn total
 /// never moved. `/v2/pox` states the field on a live chain, so this is a fixture
 /// that was missing what production is given.
-pub const fn pox() -> PoxInfo {
+pub fn pox() -> PoxInfo {
+    let provenance = fs::read_to_string(fixtures().join("provenance.toml"))
+        .expect("the capture provenance reads");
+    let number = |name: &str| -> u64 {
+        provenance
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&format!("{name} = ")))
+            .map_or_else(
+                || panic!("the capture provenance names {name}"),
+                |value| value.trim().trim_matches('"'),
+            )
+            .parse()
+            .unwrap_or_else(|_| panic!("the capture provenance gives {name} as a number"))
+    };
+    let number32 = |name| {
+        u32::try_from(number(name))
+            .unwrap_or_else(|_| panic!("the capture provenance gives {name} as a u32"))
+    };
     PoxInfo {
-        first_bitcoin_height: 0,
+        first_bitcoin_height: number("pox_first_bitcoin_height"),
         bitcoin_height: 0,
-        prepare_phase_length: 5,
-        reward_phase_length: 15,
-        reward_slots: 30,
+        prepare_phase_length: number32("pox_prepare_phase_length"),
+        reward_phase_length: number32("pox_reward_phase_length"),
+        reward_slots: number32("pox_reward_phase_length") * 2,
         rejection_fraction: None,
-        pox_5_activation_height: Some(POX_5_ACTIVATION_HEIGHT),
-        v1_unlock_height: None,
-        v2_unlock_height: None,
-        v3_unlock_height: None,
+        pox_5_activation_height: Some(number32("pox_v4_unlock_height")),
+        v1_unlock_height: Some(number32("pox_v1_unlock_height")),
+        v2_unlock_height: Some(number32("pox_v2_unlock_height")),
+        v3_unlock_height: Some(number32("pox_v3_unlock_height")),
     }
 }
 
-/// The captured chain's `pox_v4_unlock_height`, as its `new_block` events state it.
-///
-/// With a 20-block cycle starting at Bitcoin 0 this puts the waterfall at burn 280,
-/// and the capture's snapshots agree without being asked: their `pox_payouts`
-/// column switches from two classic reward addresses to one `Addr32` P2TR — the
-/// sBTC taproot output — at exactly 280.
-pub const POX_5_ACTIVATION_HEIGHT: u32 = 262;
+/// The captured reward-cycle length.
+pub fn cycle() -> u64 {
+    let calendar = pox();
+    u64::from(calendar.prepare_phase_length + calendar.reward_phase_length)
+}
 
-/// The capture starts on the last block of an already-running tenure. Its first
-/// tenure change therefore commits a nine-block parent tenure while only one of
-/// those blocks is present. Replay that incomplete boundary explicitly through
-/// the fixture-only API; every block followed after it has a complete local
-/// tenure ledger and goes through production authentication.
-const FIXTURE_BOUNDARY_BLOCKS: usize = 2;
+/// Replay through the first tenure change, whose parent started below the checkpoint.
+pub fn fixture_boundary_blocks(chain: &[NakamotoBlock]) -> usize {
+    let first = chain.first().expect("the capture has a first block");
+    chain
+        .iter()
+        .position(|block| block.header.consensus_hash != first.header.consensus_hash)
+        .map(|index| index + 1)
+        .expect("the capture crosses its first tenure boundary")
+}
 
 /// A node standing on the first complete tenure boundary in the capture.
 ///
@@ -886,13 +923,14 @@ pub fn node(
     let fixtures = fixtures();
     let (mut chainstate, source) = crate::restart::open(directory);
     let chain = captured_chain();
+    let fixture_boundary_blocks = fixture_boundary_blocks(&chain);
     let replay = nano_conformance::replay_into(
         &mut chainstate,
         source,
         &fixtures,
         nano_conformance::FixtureManifest {
             mode: nano_conformance::FixtureMode::Captured,
-            replay_blocks: u64::try_from(FIXTURE_BOUNDARY_BLOCKS).expect("the prefix fits"),
+            replay_blocks: u64::try_from(fixture_boundary_blocks).expect("the prefix fits"),
             receipts: true,
         },
         0,
@@ -900,11 +938,11 @@ pub fn node(
     );
     assert_eq!(
         replay.completed,
-        u64::try_from(FIXTURE_BOUNDARY_BLOCKS).expect("the prefix fits"),
+        u64::try_from(fixture_boundary_blocks).expect("the prefix fits"),
         "the explicit fixture boundary did not replay: {replay:?}"
     );
     let anchor = chain
-        .get(FIXTURE_BOUNDARY_BLOCKS - 1)
+        .get(fixture_boundary_blocks - 1)
         .expect("the capture has its boundary blocks")
         .clone();
     assert_eq!(
@@ -957,8 +995,9 @@ pub fn alternative_history(chain: &[NakamotoBlock], from: usize) -> Vec<Nakamoto
 #[tokio::test]
 async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
     let chain = captured_chain();
-    let honest: Vec<_> = chain[..8].to_vec();
-    let liar = alternative_history(&chain[..16], FIXTURE_BOUNDARY_BLOCKS);
+    let boundary = fixture_boundary_blocks(&chain);
+    let honest: Vec<_> = chain[..=boundary].to_vec();
+    let liar = alternative_history(&chain[..boundary + 8], boundary);
     assert!(
         liar.last().expect("a tip").header.chain_length
             > honest.last().expect("a tip").header.chain_length,
@@ -1449,7 +1488,18 @@ async fn a_peer_on_a_parted_burn_view_is_followed_onto_the_fork() {
 #[tokio::test]
 async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     let chain = captured_chain();
-    let (client, task) = serve(Served::honest(chain[..12].to_vec(), snapshots())).await;
+    let through_two_boundaries = chain
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[0].header.consensus_hash != pair[1].header.consensus_hash)
+        .nth(1)
+        .map(|(index, _)| index + 2)
+        .expect("the capture crosses two tenure boundaries");
+    let (client, task) = serve(Served::honest(
+        chain[..through_two_boundaries].to_vec(),
+        snapshots(),
+    ))
+    .await;
 
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -1576,9 +1626,6 @@ pub async fn close_the_gap(
 
 /// How many rounds a gap is given before it is called stuck.
 const ROUNDS: usize = 64;
-
-/// The reward cycle length the captured chain was produced under.
-pub const CYCLE: u64 = 20;
 
 /// The burn height a captured snapshot gives a block's tenure.
 pub fn burn_height_of(rows: &[Snapshot], block: &NakamotoBlock) -> u64 {

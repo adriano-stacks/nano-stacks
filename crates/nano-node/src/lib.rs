@@ -1454,6 +1454,8 @@ where
             pox_5_activation_height: context.pox_5_activation_height,
             matured_rewards: nano_rpc::matured_rewards(
                 &applied.matured_rewards,
+                applied.matured_coinbase,
+                applied.matured_anchored_fees,
                 matured_source.as_ref(),
             ),
             reward_set: applied
@@ -1633,7 +1635,7 @@ where
         if executed > 0
             && let Some(tracker) = self.sortition.as_mut()
         {
-            tracker.keep_from(executed);
+            tracker.keep_for_execution(executed);
         }
         // Split the borrow: the tracker reads burn blocks through the same
         // source the executor holds.
@@ -2841,7 +2843,7 @@ where
             return (0, Vec::new());
         };
         if executed > 0 {
-            tracker.keep_from(executed);
+            tracker.keep_for_execution(executed);
         }
         let Ok(burnchain_tip) = bitcoin.tip_height() else {
             // Reported by the execution path already, and every round would repeat

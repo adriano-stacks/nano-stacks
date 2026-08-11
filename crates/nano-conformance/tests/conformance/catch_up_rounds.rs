@@ -43,8 +43,8 @@ use nano_primitives::{StacksBlockId, TrieHash};
 use nano_sync::{SyncClient, TenureSource};
 
 use crate::follow_path::{
-    CYCLE, MovableBurnchain, Policy, Served, burn_height_of, captured_burnchain, captured_chain,
-    node, pox, serve, snapshots,
+    MovableBurnchain, Policy, Served, burn_height_of, captured_burnchain, captured_chain, cycle,
+    fixture_boundary_blocks, node, pox, serve, snapshots,
 };
 
 /// The captured blocks a peer holds for the single-tenure gap.
@@ -52,7 +52,7 @@ use crate::follow_path::{
 /// Heights 461 to 470: the anchor, and then the whole nine-block tenure above
 /// it. The gap is inside one tenure, which is the case a descent closes in a
 /// single answer and execution then has to chunk through.
-const ONE_TENURE: usize = 10;
+const ONE_TENURE: usize = 7;
 
 /// The captured blocks a peer holds for the many-tenure gap.
 ///
@@ -60,7 +60,7 @@ const ONE_TENURE: usize = 10;
 /// — twelve blocks, 493 to 504. A descent over this crosses tenure boundaries in
 /// both directions: walking back to the executed tip, and executing forward
 /// through the tenure changes that state each new burn view.
-const MANY_TENURES: usize = 44;
+const MANY_TENURES: usize = 42;
 
 /// How many rounds a scenario is given before it is called stuck.
 ///
@@ -291,7 +291,8 @@ async fn close_the_gap(run: Run<'_>) -> (Progress, Closed) {
         refusing_alternate_rounds,
     } = run;
     let chain = captured_chain();
-    let blocks: Vec<NakamotoBlock> = chain[..served].to_vec();
+    let boundary = fixture_boundary_blocks(&chain);
+    let blocks: Vec<NakamotoBlock> = chain[..(boundary + served).min(chain.len())].to_vec();
     let target = blocks
         .last()
         .expect("the peer serves a tip")
@@ -401,7 +402,8 @@ async fn a_gap_inside_one_tenure_closes_across_rounds() {
 #[tokio::test]
 async fn two_lookahead_batches_do_not_require_a_restart_before_execution() {
     let chain = captured_chain();
-    let blocks: Vec<NakamotoBlock> = chain[..ONE_TENURE].to_vec();
+    let boundary = fixture_boundary_blocks(&chain);
+    let blocks: Vec<NakamotoBlock> = chain[..boundary + ONE_TENURE].to_vec();
     let (client, task) = serve(Served::honest(blocks, snapshots())).await;
     let directory = tempfile::tempdir().expect("a directory");
     let burnchain = MovableBurnchain::new(captured_burnchain());
@@ -477,7 +479,7 @@ async fn the_full_capture_closes_without_peer_sortitions_across_reward_cycles() 
     let first_burn = burn_height_of(&rows, chain.first().expect("the capture has a first block"));
     let last_burn = burn_height_of(&rows, chain.last().expect("the capture has a last block"));
     assert!(
-        first_burn / CYCLE < last_burn / CYCLE,
+        first_burn / cycle() < last_burn / cycle(),
         "the capture does not cross a reward-cycle boundary"
     );
 
@@ -486,7 +488,12 @@ async fn the_full_capture_closes_without_peer_sortitions_across_reward_cycles() 
         fetch: 64,
         execute: 64,
     };
-    let (progress, _) = close_the_gap(Run::new(chain.len(), budget, &policy)).await;
+    let (progress, _) = close_the_gap(Run::new(
+        chain.len() - fixture_boundary_blocks(&chain),
+        budget,
+        &policy,
+    ))
+    .await;
     assert!(
         progress.executed > 0,
         "the complete capture executed nothing"
@@ -559,7 +566,8 @@ fn assert_only_unexecuted_blocks_are_staged(staged: &[(u64, StacksBlockId)], exe
 async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
     let policy = Policy::default();
     let chain = captured_chain();
-    let blocks: Vec<NakamotoBlock> = chain[..ONE_TENURE].to_vec();
+    let boundary = fixture_boundary_blocks(&chain);
+    let blocks: Vec<NakamotoBlock> = chain[..boundary + ONE_TENURE].to_vec();
     let target = blocks.last().expect("a tip").header.chain_length;
     let (client, task) = serve(Served::honest(blocks, snapshots()).under(policy.clone())).await;
 
@@ -670,7 +678,8 @@ async fn a_round_of_refusals_keeps_what_it_had_and_the_next_one_resumes() {
 async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
     let policy = Policy::default();
     let chain = captured_chain();
-    let blocks: Vec<NakamotoBlock> = chain[..ONE_TENURE].to_vec();
+    let boundary = fixture_boundary_blocks(&chain);
+    let blocks: Vec<NakamotoBlock> = chain[..boundary + ONE_TENURE].to_vec();
     let target = blocks.last().expect("a tip").header.chain_length;
     let (client, task) = serve(Served::honest(blocks, snapshots()).under(policy.clone())).await;
 
@@ -747,9 +756,10 @@ async fn a_peer_that_throttles_the_descent_is_asked_again_next_round() {
 /// own request count that moves the peer.
 #[tokio::test]
 async fn a_tip_that_moves_mid_round_is_followed() {
-    // Three blocks visible to begin with: the fixture boundary, and one above it for the
-    // first round to have something to do.
-    let policy = Policy::default().revealing(3, 3);
+    // The fixture boundary and one block above it are visible initially, so the
+    // first round has work without making the peer retract below the checkpoint.
+    let visible = fixture_boundary_blocks(&captured_chain()) + 1;
+    let policy = Policy::default().revealing(visible, 3);
     let budget = CatchUpBudget {
         fetch: 8,
         execute: 4,
