@@ -2,12 +2,13 @@
 id: "110"
 group: mainnet
 title: "Outrun stacks-core on the tier-2 replay"
-status: in-progress
+status: completed
 priority: medium
 effort: medium
 dependencies: ["109"]
 tags: ["mainnet", "performance", "marf", "vm", "storage"]
 created_at: 2026-08-10
+completed_at: 2026-08-11
 type: chore
 ---
 
@@ -472,3 +473,29 @@ invalidation — a redeploy replaces the entry, eviction drops it. Share
 the loaded `Contract` there (`Arc`, clone only what a call mutates), and
 the measured 23 s meets a 26 s median gap. That is the next session's
 first change, with this probe recipe to verify its landing.
+
+## Twenty-first round: the benchmark is won
+
+The `get_contract` cost had a one-change fix hiding in the reference
+itself: clarity ships a per-transaction execution cache that stacks-core
+attaches to every `ClarityDatabase` it hands out — and nano never attached
+it, so every cross-contract call paid the 470 µs the interpreter pays once
+per transaction. Attached at both execution sites with the same scope
+(`8ffb36d1`), invalidation untouched where clarity always kept it: the
+retargeting bypass and the pending-write refusal.
+
+Final alternating pairs, follower stopped, same 4,149 blocks:
+
+| pair | nano (committing) | stacks-core (validate-only) | margin |
+|---|---|---|---|
+| 1 | **5:17.13** | 5:44.43 | −27.3 s |
+| 2 | **5:35.08** | 5:42.65 | −7.6 s |
+
+nano wins both, median 5:26 against 5:43.5, replay user CPU at 248–254 s
+from the session's 501 — while writing every block durably. The campaign
+in one line: 23:36 → 5:17 (4.5×), twenty-three commits, every one gated on
+lockstep, checkpoint, kill, 1,472 crosschecks and bit-exact roots; six
+unsound or unmeasurable variants rejected on the record; two consensus
+laws, one Amdahl lesson and one measurement decoy documented so they stay
+found. The winning arc was measurement all the way down: count, then
+time, then self-time, then the reference's own idle machinery.
