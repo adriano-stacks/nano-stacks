@@ -57,7 +57,7 @@ execution.
       test, `bash -n hacknet/harness.sh`, and `git diff --check`.
 - [x] Exercise an event observer against the binary and retain delivered
       `new_block`, burn-block and proposal-response payloads.
-- [~] Run a stock `stacks-signer` against the binary without a compatibility
+- [x] Run a stock `stacks-signer` against the binary without a compatibility
       shim on a chain where nano derives the active PoX-5 signer set, and have
       it accept and sign a proposal nano validated with checkpointed leader-key
       history under [[070-carry-leader-key-history-into-proposal-validation]].
@@ -282,10 +282,15 @@ execution.
       again -- restore participant 3, let the three stock signers carry it through
       fresh sortitions, and only then hand the signer half to nano.
 
-      What is still owed is the acceptance itself: a proposal arriving while the
-      signer watches. This chain's miner is extending one tenure rather than starting
-      new ones, so proposals are sparse; a chain still electing miners would produce
-      them promptly.
+      **Completed 2026-08-11 on the isolated Hacknet.** The unmodified stock
+      `stacks-signer 4.0.1` registered through nano, received proposals at Stacks
+      heights 2,509 through 2,518, submitted them to nano's production validator,
+      and broadcast multiple `BlockAccepted` responses with
+      `reject_reason: NotRejected`. At burn heights 596 and 597 the signer also
+      observed nano's published burn height equal to the event height, closing the
+      stale `N-1` RPC view that had made it refuse otherwise-valid proposals. The
+      causal code, focused 144-burn regression, strict Clippy gate, artifact digest
+      and complete live log are retained under [[070-carry-leader-key-history-into-proposal-validation]].
 
       The earlier container attempt and why it failed, kept because it names the
       trap: run the signer *on the host*, not inside the compose network.
