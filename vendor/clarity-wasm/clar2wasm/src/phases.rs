@@ -47,10 +47,17 @@ pub enum Phase {
     ValueRead,
     /// Identifiers (names, serialized types) read out of linear memory.
     IdentRead,
+    /// Embedder: database + `GlobalContext` construction and `begin`.
+    ContextSetup,
+    /// Embedder: module-cache probes for the call's contract arguments.
+    ModuleProbe,
+    /// `commit`/`handle_tx_result`/`roll_back`: asset maps, event batches and
+    /// the rollback wrapper, once per call frame.
+    Commit,
 }
 
 /// How many phases a snapshot carries.
-pub const PHASES: usize = 14;
+pub const PHASES: usize = 17;
 
 /// The phase names, in snapshot order.
 #[must_use]
@@ -70,6 +77,9 @@ pub const fn labels() -> [&'static str; PHASES] {
         "value_write",
         "value_read",
         "ident_read",
+        "context_setup",
+        "module_probe",
+        "commit",
     ]
 }
 

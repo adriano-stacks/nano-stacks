@@ -4180,6 +4180,15 @@ fn ensure_wasm_module_and_references(
     modules: &mut ModuleCache,
     contract: &QualifiedContractIdentifier,
 ) -> Result<(), VmExecutionError> {
+    // The reference walk reads and parses the whole source to warm the
+    // callees a literal names; a contract already compiled had that walk when
+    // it entered the cache, and the on-demand retry in
+    // `call_contract_values_in_context` compiles anything a dispatch reaches
+    // that no literal names. Re-walking on every call parsed the target and
+    // every contract argument each time — 6.3 ms of an 11.7 ms mainnet swap.
+    if modules.get(contract).is_some() {
+        return Ok(());
+    }
     let referenced = contract_source(store, bitcoin_context, contract)
         .map(|(source, version)| referenced_contracts(contract, &source, version))
         .unwrap_or_default();
@@ -4473,10 +4482,13 @@ fn call_contract_values_in_context(
     // one that cannot be compiled is left alone rather than failing the call:
     // mainnet passes `.native-pool-signer`, which is not deployed anywhere, and
     // gets a value back.
+    let probe = clar2wasm::phases::start();
     for argument in arguments.iter().filter_map(contract_argument) {
         let _ = needed_module(store, bitcoin_context, modules, argument, cost_tracker);
     }
-    if let Some(failed) = needed_module(store, bitcoin_context, modules, contract, cost_tracker)? {
+    let failed = needed_module(store, bitcoin_context, modules, contract, cost_tracker);
+    clar2wasm::phases::finish(clar2wasm::phases::Phase::ModuleProbe, probe);
+    if let Some(failed) = failed? {
         return Ok(failed);
     }
     // A `contract-call?` reaches a contract this node never compiled — the
@@ -4588,6 +4600,7 @@ fn call_compiled_contract(
     // Without one attached, every cross-contract call deserializes the
     // callee's whole stored context — 470 µs a call on a mainnet replay —
     // where stacks-core's interpreter pays only the first per transaction.
+    let context_setup = clar2wasm::phases::start();
     let mut execution_cache = clarity::vm::database::ClarityExecutionCache::default();
     let database = clarity_database(store, bitcoin_context).with_cache(&mut execution_cache);
     let mut global = GlobalContext::new(
@@ -4598,6 +4611,7 @@ fn call_compiled_contract(
         StacksEpochId::Epoch40,
     );
     global.begin();
+    clar2wasm::phases::finish(clar2wasm::phases::Phase::ContextSetup, context_setup);
     let contract_context = clar2wasm::phases::time(clar2wasm::phases::Phase::ContractLoad, || {
         global.database.get_contract(contract)
     })?;
@@ -4625,12 +4639,14 @@ fn call_compiled_contract(
             // A call that returns an error response keeps its cost and its
             // value, but none of the state it wrote.
             let aborted = matches!(&value, Value::Response(response) if !response.committed);
+            let settle = clar2wasm::phases::start();
             let (assets, events) = if aborted {
                 global.roll_back()?;
                 (None, None)
             } else {
                 global.commit()?
             };
+            clar2wasm::phases::finish(clar2wasm::phases::Phase::Commit, settle);
             let result = Box::new(TransactionResult {
                 value: Some(value),
                 cost: global.cost_track.get_total(),

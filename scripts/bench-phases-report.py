@@ -28,8 +28,11 @@ LABELS = [
     "value_write",
     "value_read",
     "ident_read",
+    "context_setup",
+    "module_probe",
+    "commit",
 ]
-TOP_LEVEL = ["contract_load", "linker_setup", "instantiate", "call_setup", "wasm_invoke", "return_read"]
+TOP_LEVEL = ["context_setup", "module_probe", "contract_load", "linker_setup", "instantiate", "call_setup", "wasm_invoke", "return_read", "commit"]
 # Disjoint host buckets inside wasm_invoke; the marshalling rows below overlap
 # them (a shape measurement contains its value reads), so they inform but do
 # not sum.

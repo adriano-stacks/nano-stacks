@@ -890,15 +890,17 @@ pub(crate) fn call_function_with_argument_sizes(
         }
     })();
     crate::phases::finish(crate::phases::Phase::ReturnRead, return_read);
-    let value = if read_only {
-        store.data_mut().global_context.roll_back()?;
-        execution_result?
-    } else {
-        store
-            .data_mut()
-            .global_context
-            .handle_tx_result(execution_result, false)?
-    };
+    let value = crate::phases::time(crate::phases::Phase::Commit, || {
+        if read_only {
+            store.data_mut().global_context.roll_back()?;
+            execution_result
+        } else {
+            store
+                .data_mut()
+                .global_context
+                .handle_tx_result(execution_result, false)
+        }
+    })?;
     drop(store);
     if let Some(handler) = global_context.database.get_cc_special_cases_handler() {
         handler(

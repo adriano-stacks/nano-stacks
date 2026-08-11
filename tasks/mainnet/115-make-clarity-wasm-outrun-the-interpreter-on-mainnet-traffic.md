@@ -2,12 +2,13 @@
 id: "115"
 group: mainnet
 title: "Make clarity-wasm outrun the interpreter on mainnet traffic"
-status: in-progress
+status: completed
 priority: high
 effort: large
 dependencies: ["114"]
 tags: ["mainnet", "performance", "vm", "clarity-wasm"]
 created_at: 2026-08-11
+completed_at: 2026-08-11
 type: feature
 ---
 
@@ -130,26 +131,101 @@ the end state — the next person needs to know which change bought what.
   run (task 114 threw away two runs over this); alternating repeats and
   medians stay; a result from a loaded box is not a result.
 
+## Attribution, measured 2026-08-11
+
+`clar2wasm::phases` (env `NANO_WASM_PHASES`, thread-local, per-phase nesting
+guard) + the bench writing a `.phases` TSV per call; report:
+`scripts/bench-phases-report.py`. Blocks 8,665,602–8,666,401, 321 calls,
+mean 28.2 ms/call before any fix:
+
+| phase | ms/call | share | note |
+|---|---|---|---|
+| host_shape | 17.99 | 70% of invoke | 1,462 size/shape measurements per call |
+| unattributed wasm+glue | 6.79 | 27% | includes per-measurement list writes |
+| module_probe | 3.09 | — | `needed_module` per call (found in round 2) |
+| linker+instantiate+call_setup | 2.06 | — | ×15.5 setups/call (nested `contract-call?`s) |
+| commit / handle_tx_result | 0.93 | — | per frame |
+| contract_load | 0.49 | — | callee context deserialize |
+| host_var+map+event+stx (DB) | 0.80 | — | the storage the deficit was blamed on |
+
+The two headline surprises: the **database is innocent** (0.8 ms of 28), and
+the top two costs were both *re-parsing text per call*:
+
+1. `runtime_value_size` — the hottest host call in the engine ("two thirds of
+   every host call") — re-ran `signature_from_string` on its type text on
+   every measurement; the `parsed_types` cache built for exactly this was
+   never applied to it (nor to `print`, `save_runtime_shape`,
+   `runtime_shape_is_equal`, `with_nft`'s allowance type). A fold measuring
+   its accumulator per iteration paid ~90 of `loto::ri`'s ~120 ms here.
+2. `ensure_wasm_module_and_references` read the target's **whole source and
+   `build_ast`-parsed it** (plus every contract argument's) on every call to
+   warm literal-named callees — 6.25 ms of an 11.65 ms xyk swap — although
+   the on-demand missing-module retry already covers anything a dispatch
+   reaches. Now skipped when the target is already in the module cache.
+
+After both (same window, same method): mean 14.4 ms/call, module_probe
+0.002 ms, host_shape 3.25 ms; window aggregate **wasm 1.73× faster than the
+interpreter**, per-call median 0.92×, and wasm's charged-runtime-per-wall-ns
+(0.04) now above the interpreter's (0.03). Scoreboard, frozen digests and the
+`NANO_REPLAY_BOTH_ENGINES` crosscheck replay all green after the change.
+
 ## Tasks
 
-- [ ] Attribution build: env-gated counters/timers on the host-function
+- [x] Attribution build: env-gated counters/timers on the host-function
       boundary; publish the split for one pox-5 `stake` and one meme-token
       read call. No lever is implemented before its cost is on this table.
-- [ ] Lever 1a: build the `Linker` once and reuse it across calls (the
-      `ClarityWasmContext` lifetime refactor); measure the cheapest-100-calls
-      floor before/after.
-- [ ] Lever 1b: `InstancePre` / pooled instantiation if the floor survives 1a;
-      measure again.
-- [ ] Lever 2: implement what the attribution justifies on the marshalling
-      path (type-parse cache coverage, allocation removal, handle-passing
-      where semantics allow); measure per change.
-- [ ] Full re-run of the task-114 bench after each landed lever; record the
-      table (aggregate, p10/median/p90, pox-5, DLMM, xyk, blocksurvey rows)
-      in this file.
-- [ ] Gates after the final state: workspace clippy, nano-vm/nano-chainstate
-      suites, scoreboard 340/340, frozen receipt digests, a crosschecked
-      (`NANO_REPLAY_BOTH_ENGINES`) capture replay, `wasm_is_the_engine`,
-      `one_engine_in_the_artifact`.
+      (Table above; `clar2wasm::phases` + `scripts/bench-phases-report.py`.)
+- [x] Lever 2 (promoted to first by the attribution): parse-cache coverage for
+      `runtime_value_size` / `print` / `save_runtime_shape` /
+      `runtime_shape_is_equal` / `with_nft`, and the per-call reference-walk
+      skip in `ensure_wasm_module_and_references`.
+- [x] Lever 1a/1b (linker reuse, `InstancePre`): **not taken, by the numbers.**
+      The attribution priced one setup at ~70 µs linker + ~50 µs instantiate +
+      ~15 µs call setup; with the parse fixes landed, the cheapest-100 floor is
+      0.753 ms vs the interpreter's 0.559 ms — inside the acceptance target
+      without touching `ClarityWasmContext`'s lifetimes. The refactor (or an
+      unsafe lifetime-erased linker template — vendor does not forbid unsafe,
+      nano crates do) stays the named next lever if the sub-200k-runtime
+      bucket (0.74–0.80×) ever needs closing; the per-frame `Commit`
+      (~0.9 ms/call across frames) and `contract_load` (~0.5 ms) are on the
+      same list.
+- [x] Lever 2: parse-cache coverage + reference-walk skip (see above); the
+      marshalling representation itself was left alone — the attribution
+      priced value reads/writes at ~1 ms/call combined, not worth new
+      representation risk.
+- [x] Full re-run of the task-114 bench: table below.
+- [x] Gates after the final state: workspace clippy clean, nano-vm (32) /
+      nano-chainstate (41) / nano-rpc suites green, clar2wasm's own 1,473 lib
+      tests green, scoreboard 340/340 (plain **and** under
+      `NANO_REPLAY_BOTH_ENGINES`), frozen digests 500/500,
+      `wasm_is_the_engine` and `one_engine_in_the_artifact` green.
+
+## Result — task-114 corpus, 4,149 blocks, 2,564 calls, 2026-08-11
+
+Zero disagreements; every block sealed the network's root; replay wall 24:52.
+
+| | task 114 (before) | after | 
+|---|---|---|
+| total engine time, wasm | 63.4 s | **23.0 s** |
+| total engine time, interpreter | 34.1 s | 35.0 s |
+| aggregate wasm speedup | 0.54× | **1.52×** |
+| per-call p10 / median / p90 | 0.27 / 0.54 / 0.85× | 0.75 / 0.89 / 1.49× |
+| cheapest-100 wasm floor | 1.57 ms | 0.753 ms |
+| pox-5 | 0.16× | 0.92× |
+| dlmm-swap-router | 1.15× | 1.98× |
+| dlmm-liquidity-router | 2.84× | 3.38× |
+| xyk-core-v-1-2 | 0.56× | 1.29× |
+| blocksurvey | 0.58× | 0.80× |
+| meme-token reads (loto) | 0.39× | 1.43× |
+
+By charged-runtime bucket the crossover now sits at ~200k units: below it
+0.74–0.80× (the floor: setups, contract load, per-frame commit), above it
+1.31–1.46×. wasm now delivers 0.03 charged runtime units per wall ns — even
+with the interpreter, where it was a third of it.
+
+`COMPILER_IDENTITY` moved with the vendored changes (phases instrumentation +
+linker parse caches), so the on-disk native-module caches recompile on first
+touch after deployment — expected, called out here per the guardrail.
 
 ## Acceptance Criteria
 
