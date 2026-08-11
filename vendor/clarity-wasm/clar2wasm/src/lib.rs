@@ -38,6 +38,7 @@ mod error_mapping;
 mod layout;
 pub mod phases;
 pub mod runtime_shape;
+pub mod traffic;
 
 #[cfg(feature = "developer-mode")]
 pub mod test_utils;

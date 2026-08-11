@@ -1511,11 +1511,14 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     )
                 })?;
 
-                let value = fetch_result
-                    .map(|data| data.value)
-                    .ok_or(crate::error::wasm_error(WasmError::NotInDatabase(format!(
-                        "Value {var_name}"
-                    ))))?;
+                let data = fetch_result.ok_or(crate::error::wasm_error(
+                    WasmError::NotInDatabase(format!("Value {var_name}")),
+                ))?;
+                crate::traffic::record(
+                    crate::traffic::Traffic::ValueDecode,
+                    data.serialized_byte_len,
+                );
+                let value = data.value;
 
                 let memory = caller
                     .data()
@@ -4217,6 +4220,10 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     }
 
                     Ok(data) => {
+                        crate::traffic::record(
+                            crate::traffic::Traffic::ValueDecode,
+                            data.serialized_byte_len,
+                        );
                         let serialized_byte_len = i32::try_from(data.serialized_byte_len)
                             .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
                         let memory = caller

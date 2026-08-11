@@ -6,6 +6,7 @@ use std::{
 };
 
 pub use clar2wasm::phases;
+pub use clar2wasm::traffic;
 pub use clar2wasm::wasm_generator::{EmittedLocals, LocalsReport};
 pub use clar2wasm::{ArityReport, MAX_WASM_TYPE_ARITY};
 use clar2wasm::{CompiledContract, ModuleCache};
@@ -2264,10 +2265,12 @@ impl SideValueCache {
 
     fn get(&mut self, key: MarfValue) -> Option<String> {
         if let Some(value) = self.hot.get(&key) {
+            clar2wasm::traffic::record(clar2wasm::traffic::Traffic::CacheClone, value.len() as u64);
             return Some(value.clone());
         }
         let (key, value) = self.cold.remove_entry(&key)?;
         self.cold_bytes = self.cold_bytes.saturating_sub(Self::weight(&value));
+        clar2wasm::traffic::record(clar2wasm::traffic::Traffic::CacheClone, value.len() as u64);
         self.insert(key, value.clone());
         Some(value)
     }
@@ -3210,6 +3213,11 @@ impl MarfStore {
             })
             .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?;
         if let Some(found) = &read {
+            clar2wasm::traffic::record(
+                clar2wasm::traffic::Traffic::SqliteString,
+                found.len() as u64,
+            );
+            clar2wasm::traffic::record(clar2wasm::traffic::Traffic::CacheClone, found.len() as u64);
             self.side_values.borrow_mut().insert(value, found.clone());
         }
         Ok(read)
@@ -3789,6 +3797,12 @@ impl ClarityBackingStore for MarfStore {
             return Ok(None);
         };
         let found = self.data_from_side_store(value)?;
+        if let Some(value) = &found {
+            clar2wasm::traffic::record(
+                clar2wasm::traffic::Traffic::BackingStoreValue,
+                value.len() as u64,
+            );
+        }
         if found.is_none() {
             // The trie names a value the side store does not hold, which is a
             // different fault from a key the trie never had — and only this
@@ -5317,6 +5331,48 @@ mod tests {
         assert_eq!(cache.usage(), (1, 101));
         assert_eq!(cache.get(key).as_deref(), Some("hello"));
         assert_eq!(cache.usage(), (1, 101));
+    }
+
+    #[test]
+    fn side_value_traffic_names_each_owned_string_copy() {
+        let first = [1; 32];
+        let mut store = MarfStore::new(Network::TESTNET).expect("create a store");
+        store.begin(None, first).expect("begin state");
+        store.put("counter", "one").expect("write state");
+        store.seal().expect("seal state");
+        store
+            .set_block_hash(StacksBlockId(first))
+            .expect("select state");
+
+        let (value, cold) = clar2wasm::traffic::measure(|| store.get_data("counter"));
+        assert_eq!(value.expect("read state").as_deref(), Some("one"));
+        assert_eq!(
+            cold[clar2wasm::traffic::Traffic::SqliteString as usize],
+            (1, 3)
+        );
+        assert_eq!(
+            cold[clar2wasm::traffic::Traffic::CacheClone as usize],
+            (1, 3)
+        );
+        assert_eq!(
+            cold[clar2wasm::traffic::Traffic::BackingStoreValue as usize],
+            (1, 3)
+        );
+
+        let (value, warm) = clar2wasm::traffic::measure(|| store.get_data("counter"));
+        assert_eq!(value.expect("read cached state").as_deref(), Some("one"));
+        assert_eq!(
+            warm[clar2wasm::traffic::Traffic::SqliteString as usize],
+            (0, 0)
+        );
+        assert_eq!(
+            warm[clar2wasm::traffic::Traffic::CacheClone as usize],
+            (1, 3)
+        );
+        assert_eq!(
+            warm[clar2wasm::traffic::Traffic::BackingStoreValue as usize],
+            (1, 3)
+        );
     }
 
     #[test]
