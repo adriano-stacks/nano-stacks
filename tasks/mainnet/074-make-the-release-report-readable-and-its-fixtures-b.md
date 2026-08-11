@@ -1,7 +1,7 @@
 ---
 id: "074"
 title: "Make the release report readable and its fixtures self-describing"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: []
@@ -9,6 +9,7 @@ tags: ["mainnet", "conformance", "release", "tooling"]
 created_at: 2026-08-07
 type: bug
 group: mainnet
+completed_at: 2026-08-11
 ---
 
 # Make the release report readable and its fixtures self-describing
@@ -75,7 +76,7 @@ who learns to skip them on the report learns to skip them everywhere.
 - [x] Describe the artifact accurately: the Clarity interpreter machinery is
       linked as unreachable frontend/ABI code, while no interpreter entry point
       or call edge is reachable from production.
-- [ ] Carry the checkpoint's authenticated block suffix and parent-tenure VRF
+- [x] Carry the checkpoint's authenticated block suffix and parent-tenure VRF
       boundary in every captured release fixture. `validate-fixtures` and
       `release-report` must refuse a captured fixture when that history is absent,
       oversized, disconnected or inconsistent with the published source/root.
@@ -179,3 +180,24 @@ and the failing exit status. The current artifact identity is
 
 The authenticated-history fixture requirement remains independently open and is
 not weakened by this closure.
+
+## Authenticated fixture recapture closed — 2026-08-11
+
+The checked-in Hacknet fixture was recaptured from a retained chainstate at
+checkpoint height 541. Its authentication artifact carries the source block,
+the bounded canonical suffix and the preceding tenure's VRF boundary; the full
+fixture replay remains 340 blocks. The capture also records its actual PoX
+calendar, unlock heights and sBTC registry so conformance no longer depends on
+the prior capture's hardcoded schedule.
+
+Current-tree evidence: `cargo xtask validate-fixtures` names stacks-core revision
+`fb836af`, 340 replay blocks and 341 consensus hashes seeding burn 340;
+`cargo xtask scoreboard` reports roots, receipts and all cost dimensions 340/340
+plus frozen mainnet receipts 500/500. The checkpoint-history unit gates accept
+the complete artifact and refuse missing, disconnected, oversized and
+source/root-mismatched histories. The command-level
+`missing_checkpoint_authentication_stops_before_artifact_evidence` regression
+removes the artifact from a temporary capture and proves `release-report` exits
+1 before artifact evidence. Follow-path 6/6, catch-up 9/9, event-observer 6/6,
+PoX-boundary 2/2 and the release-binary kill/restart gate are green; strict
+Clippy is green for every affected package.
