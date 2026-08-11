@@ -1419,25 +1419,29 @@ fn include_local_winner(
 /// How many recent sortition winners retain the empty-slot fallback.
 ///
 /// Signed metadata is attributed through the complete local leader-key registry.
-/// This window is used only before both slots have written metadata, when repeated
+/// This window is used only before both pairs have signed metadata, when repeated
 /// wins by one miner make their assignment unambiguous.
 const MINER_SLOT_CANDIDATES: usize = 8;
+/// Proposal and pushed-block slots held by each of the two retained miners.
+const MINER_SLOTS_PER_WRITER: usize = 2;
+/// The current and prior sortition winner retained by `.miners`.
+const MINER_WRITERS: usize = 2;
 
 fn one_miner_slots(winners: &[nano_primitives::Hash160]) -> Option<Vec<nano_primitives::Hash160>> {
     let latest = *winners.first()?;
     winners
         .iter()
         .all(|winner| *winner == latest)
-        .then(|| vec![latest, latest])
+        .then(|| vec![latest; MINER_WRITERS * MINER_SLOTS_PER_WRITER])
 }
 
 /// Replicate `.miners`, so a signer hosted here can read what a miner proposed.
 ///
-/// The two slots belong to the last two sortition winners, and which winner gets
-/// which is `num_sortitions % 2` in stacks-core — a count over the whole
+/// Each of the last two sortition winners owns two adjacent slots. Which pair each
+/// winner gets is `num_sortitions % 2` in stacks-core — a count over the whole
 /// burnchain that a checkpointed node has never made and no snapshot nano holds
-/// carries. A `.miners` replica with its two slots swapped refuses the very chunks
-/// it exists for, so the count has to come from somewhere.
+/// carries. A `.miners` replica with its pairs swapped refuses the very chunks it
+/// exists for, so the order has to come from somewhere.
 ///
 /// It comes from the chunks. Every slot's metadata is signed by its writer, so
 /// asking the peer for its `.miners` listing and recovering each signature says
@@ -1463,7 +1467,7 @@ async fn configure_miner_slots(
         if published.ambiguous_miners != Some(cycle) {
             published.ambiguous_miners = Some(cycle);
             eprintln!(
-                "this node cannot authenticate both .miners slot writers against its local \
+                "this node cannot authenticate both .miners pair owners against its local \
                  leader-key registry, so it replicates neither: a slot assigned to the wrong \
                  writer refuses the proposals it exists for"
             );
@@ -1493,11 +1497,9 @@ async fn configure_miner_slots(
 /// signature says who that is — checked against the miners this node registered
 /// from Bitcoin, so a peer naming a stranger gets nothing configured.
 ///
-/// **Both slots have to resolve.** A slot nano assigns to the wrong writer refuses
-/// the very chunks it exists for, and a `.miners` replica that refuses proposals is
-/// worse than one that has none: the first looks configured. Guessing the second
-/// slot from the first is exactly that mistake, and it is what left a hosted signer
-/// with no proposals to answer while the log said `.miners` was replicated.
+/// **Both miner pairs have to resolve.** A slot nano assigns to the wrong writer
+/// refuses the very chunks it exists for, and a `.miners` replica that refuses
+/// proposals is worse than one that has none: the first looks configured.
 async fn miner_slots(
     peer: &SyncClient,
     contract: &nano_stackerdb::StackerDbContract,
@@ -1512,21 +1514,29 @@ fn authenticated_miner_slots(
     listing: impl IntoIterator<Item = nano_stackerdb::SlotMetadata>,
     registered_miners: &[nano_primitives::Hash160],
 ) -> Option<Vec<nano_primitives::Hash160>> {
-    let (mut first, mut second) = (None, None);
+    let mut owners = [None; MINER_WRITERS];
     for metadata in listing {
-        let slot = match (metadata.slot_version, metadata.slot_id) {
-            (0, _) | (_, 2..) => continue,
-            (_, 0) => &mut first,
-            (_, 1) => &mut second,
-        };
-        let writer = metadata.writer().ok()?;
-        if !registered_miners.contains(&writer) {
+        if metadata.slot_version == 0 {
             continue;
         }
-        *slot = Some(writer);
+        let Ok(slot) = usize::try_from(metadata.slot_id) else {
+            continue;
+        };
+        let owner = slot / MINER_SLOTS_PER_WRITER;
+        if owner >= MINER_WRITERS {
+            continue;
+        }
+        let writer = metadata.writer().ok()?;
+        if !registered_miners.contains(&writer) {
+            return None;
+        }
+        if owners[owner].is_some_and(|assigned| assigned != writer) {
+            return None;
+        }
+        owners[owner] = Some(writer);
     }
-    match (first, second) {
-        (Some(first), Some(second)) => Some(vec![first, second]),
+    match owners {
+        [Some(first), Some(second)] => Some(vec![first, first, second, second]),
         _ => None,
     }
 }
@@ -3989,7 +3999,7 @@ mod tests {
 
         assert_eq!(
             super::one_miner_slots(&[newest, newest]),
-            Some(vec![newest, newest])
+            Some(vec![newest, newest, newest, newest])
         );
         assert_eq!(
             super::one_miner_slots(&[newest, newest, older]),
@@ -4019,11 +4029,21 @@ mod tests {
             metadata.sign(key);
             metadata
         };
-        let listing = [signed(0, &first_key), signed(1, &second_key)];
+        let listing = [
+            signed(0, &first_key),
+            signed(1, &first_key),
+            signed(2, &second_key),
+            nano_stackerdb::SlotMetadata::unsigned(3, 0, Sha256Sum::default()),
+        ];
 
         assert_eq!(
             super::authenticated_miner_slots(listing.clone(), &[second_writer, first_writer]),
-            Some(vec![first_writer, second_writer]),
+            Some(vec![
+                first_writer,
+                first_writer,
+                second_writer,
+                second_writer
+            ]),
             "slot order comes from authenticated metadata, not registry order"
         );
         assert_eq!(
@@ -4033,11 +4053,27 @@ mod tests {
         );
         assert_eq!(
             super::authenticated_miner_slots(
-                [signed(0, &first_key), signed(1, &stranger_key)],
+                [
+                    signed(0, &first_key),
+                    signed(1, &first_key),
+                    signed(2, &stranger_key),
+                ],
                 &[first_writer, second_writer],
             ),
             None,
             "a peer cannot introduce a writer by signing its listing with a stranger key"
+        );
+        assert_eq!(
+            super::authenticated_miner_slots(
+                [
+                    signed(0, &first_key),
+                    signed(1, &second_key),
+                    signed(2, &second_key),
+                ],
+                &[first_writer, second_writer],
+            ),
+            None,
+            "both slots in a miner's pair must recover the same writer"
         );
     }
 
