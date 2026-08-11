@@ -22,7 +22,7 @@ use clarity::vm::database::{
     BurnStateDB, ClarityBackingStore, ClarityDatabase, ClarityDeserializable, HeadersDB,
 };
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError, VmInternalError};
-use clarity::vm::events::StacksTransactionEvent;
+use clarity::vm::events::{STXEventType, STXMintEventData, StacksTransactionEvent};
 use clarity::vm::representations::SymbolicExpression;
 use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value};
@@ -1688,7 +1688,9 @@ impl Vm {
     }
 
     /// Credit STX scheduled to unlock at the current Stacks block height.
-    pub fn process_scheduled_unlocks(&mut self) -> Result<u128, VmExecutionError> {
+    pub fn process_scheduled_unlocks(
+        &mut self,
+    ) -> Result<(u128, Vec<StacksTransactionEvent>), VmExecutionError> {
         let Self { store, context, .. } = self;
         process_scheduled_unlocks_in_context(store, context)
     }
@@ -5008,7 +5010,7 @@ fn transaction_cost_tracker_in_context(
 fn process_scheduled_unlocks_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
-) -> Result<u128, VmExecutionError> {
+) -> Result<(u128, Vec<StacksTransactionEvent>), VmExecutionError> {
     let network = store.network();
     let database = clarity_database(store, bitcoin_context);
     let mut context = GlobalContext::new(
@@ -5032,11 +5034,12 @@ fn process_scheduled_unlocks_in_context(
         )? {
             Value::Optional(optional) => match optional.data.map(|value| *value) {
                 Some(Value::Sequence(SequenceData::List(entries))) => entries.data,
-                _ => return Ok(0),
+                _ => return Ok((0, Vec::new())),
             },
-            _ => return Ok(0),
+            _ => return Ok((0, Vec::new())),
         };
         let mut total = 0_u128;
+        let mut events = Vec::with_capacity(entries.len());
         for entry in entries {
             let schedule = entry.expect_tuple()?;
             let amount = schedule.get("amount")?.to_owned().expect_u128()?;
@@ -5047,8 +5050,11 @@ fn process_scheduled_unlocks_in_context(
             total = total
                 .checked_add(amount)
                 .ok_or(RuntimeError::ArithmeticOverflow)?;
+            events.push(StacksTransactionEvent::STXEvent(
+                STXEventType::STXMintEvent(STXMintEventData { recipient, amount }),
+            ));
         }
-        Ok(total)
+        Ok((total, events))
     })
 }
 

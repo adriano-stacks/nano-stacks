@@ -234,6 +234,19 @@ pub fn new_block_payload(
         .map(|(index, (transaction, receipt))| {
             transaction_payload(index, &transaction.encode(), receipt)
         })
+        .chain(
+            applied
+                .observer_transactions
+                .iter()
+                .enumerate()
+                .map(|(index, observed)| {
+                    transaction_payload(
+                        block.transactions.len() + index,
+                        &observed.transaction.encode(),
+                        &observed.receipt,
+                    )
+                }),
+        )
         .collect();
     let (reward_set, cycle_number) = context
         .reward_set
@@ -259,7 +272,12 @@ pub fn new_block_payload(
         "parent_burn_block_height": context.parent_bitcoin_height,
         "parent_burn_block_timestamp": context.parent_bitcoin_timestamp,
         "matured_miner_rewards": context.matured_rewards.iter().map(matured_reward_payload).collect::<Vec<_>>(),
-        "events": receipt_events(&applied.receipts),
+        "events": receipt_events(
+            applied
+                .receipts
+                .iter()
+                .chain(applied.observer_transactions.iter().map(|entry| &entry.receipt)),
+        ),
         "transactions": transactions,
         "anchored_cost": cost_payload(&applied.execution_cost),
         "confirmed_microblocks_cost": cost_payload(&ExecutionCost::ZERO),
@@ -593,9 +611,9 @@ fn transaction_payload(
 }
 
 /// Flatten the receipts' Clarity events into one block-wide, indexed list.
-fn receipt_events(receipts: &[TransactionReceipt]) -> Vec<Value> {
+fn receipt_events<'a>(receipts: impl IntoIterator<Item = &'a TransactionReceipt>) -> Vec<Value> {
     receipts
-        .iter()
+        .into_iter()
         .flat_map(|receipt| {
             receipt
                 .result
@@ -1014,12 +1032,73 @@ mod tests {
         http::HeaderMap,
         routing::post,
     };
+    use clarity::vm::{
+        Value as ClarityValue,
+        contexts::AssetMap,
+        costs::ExecutionCost,
+        events::{STXEventType, STXMintEventData, StacksTransactionEvent},
+        types::PrincipalData,
+    };
+    use nano_chainstate::{TransactionReceipt, TransactionStatus};
+    use nano_codec::Transaction;
+    use nano_vm::TransactionResult;
     use serde_json::json;
 
     use super::{
         DEFAULT_DISPATCH_ATTEMPTS, DROPPED_HEADER, DispatchLimits, EventDispatcher, EventKind,
-        SEQUENCE_HEADER, Url, Value,
+        SEQUENCE_HEADER, Url, Value, receipt_events, transaction_payload,
     };
+
+    #[test]
+    fn phantom_unlock_receipts_have_the_stock_observer_shape() {
+        let raw = hex::decode(
+            "8000000000040000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003020000000000051a00000000000000000000000000000000000000000000000000000000426c6f636b203232363720746f6b656e20756e6c6f636b7300000000000000000000",
+        )
+        .expect("stock phantom transaction");
+        let transaction = Transaction::decode(&raw)
+            .expect("decode phantom transaction")
+            .0;
+        let mint = |recipient: &str, amount| {
+            StacksTransactionEvent::STXEvent(STXEventType::STXMintEvent(STXMintEventData {
+                recipient: PrincipalData::parse(recipient).expect("unlock recipient"),
+                amount,
+            }))
+        };
+        let receipt = TransactionReceipt {
+            txid: transaction.txid(),
+            status: TransactionStatus::Success,
+            committed: true,
+            result: TransactionResult {
+                value: Some(ClarityValue::okay_true()),
+                cost: ExecutionCost::ZERO,
+                assets: AssetMap::new(),
+                events: vec![
+                    mint("ST04MFJ3RWTADV6ZWTWD68DBZ14EJSDXT5MQV9E7", 4_139_394_444),
+                    mint("SN1ZH700J7CEDSEHM5AJ4C4MKKWNESTS35EKNW89D", 13_888_889),
+                    mint("SN260QHD6ZM2KKPBKZB8PFE5XWP0MHSKTD1JNTPNW", 208_333_333),
+                ],
+            },
+        };
+
+        let payload = transaction_payload(2, &raw, &receipt);
+        assert_eq!(payload["tx_index"], 2);
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["raw_result"], "0x0703");
+        assert_eq!(payload["raw_tx"], format!("0x{}", hex::encode(raw)));
+        assert_eq!(
+            payload["txid"],
+            "0x2a4ced275db5110c7fea499e54179b68f4560eca97159aa48179c16000c0f59b"
+        );
+        let events = receipt_events([&receipt]);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event_index"], 0);
+        assert_eq!(events[0]["stx_mint_event"]["amount"], "4139394444");
+        assert_eq!(
+            events[0]["stx_mint_event"]["recipient"],
+            "ST04MFJ3RWTADV6ZWTWD68DBZ14EJSDXT5MQV9E7"
+        );
+        assert!(events.iter().all(|event| event["txid"] == payload["txid"]));
+    }
 
     /// One POST an observer received.
     #[derive(Clone, Debug)]

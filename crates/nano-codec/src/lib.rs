@@ -704,6 +704,25 @@ impl TransactionPayload {
 }
 
 impl Transaction {
+    /// Build the unsigned transaction shape used for protocol-generated events.
+    #[must_use]
+    pub fn new(
+        version: TransactionVersion,
+        auth: TransactionAuth,
+        payload: TransactionPayloadData,
+    ) -> Self {
+        Self {
+            bytes: Vec::new(),
+            version,
+            chain_id: 0,
+            auth,
+            anchor_mode: AnchorMode::Any,
+            post_condition_mode: PostConditionMode::Deny,
+            post_conditions: Vec::new(),
+            payload: TransactionPayload::new(payload),
+        }
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), CodecError> {
         let mut reader = Reader::new(bytes);
         let version = TransactionVersion::parse(reader.byte()?);
