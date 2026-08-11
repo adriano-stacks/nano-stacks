@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub use clar2wasm::phases;
 pub use clar2wasm::wasm_generator::{EmittedLocals, LocalsReport};
 pub use clar2wasm::{ArityReport, MAX_WASM_TYPE_ARITY};
 use clar2wasm::{CompiledContract, ModuleCache};
@@ -4597,7 +4598,9 @@ fn call_compiled_contract(
         StacksEpochId::Epoch40,
     );
     global.begin();
-    let contract_context = global.database.get_contract(contract)?;
+    let contract_context = clar2wasm::phases::time(clar2wasm::phases::Phase::ContractLoad, || {
+        global.database.get_contract(contract)
+    })?;
     let mut call_stack = CallStack::new();
     // A call from outside a contract is its own caller: `contract-caller`
     // reads as the sender until a `contract-call?` moves it. Leaving it unset

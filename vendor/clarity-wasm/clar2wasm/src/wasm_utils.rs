@@ -402,6 +402,22 @@ pub fn read_from_wasm_indirect<S>(
     memory: Memory,
     store: &mut S,
     ty: &TypeSignature,
+    offset: i32,
+    epoch: StacksEpochId,
+) -> Result<Value, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
+    crate::phases::time(crate::phases::Phase::ValueRead, || {
+        read_from_wasm_indirect_untimed(memory, store, ty, offset, epoch)
+    })
+}
+
+fn read_from_wasm_indirect_untimed<S>(
+    memory: Memory,
+    store: &mut S,
+    ty: &TypeSignature,
     mut offset: i32,
     epoch: StacksEpochId,
 ) -> Result<Value, VmExecutionError>
@@ -460,6 +476,23 @@ fn validate_principal_length(
 /// Read a value from the Wasm memory at `offset` with `length`, given the
 /// provided Clarity `TypeSignature`.
 pub fn read_from_wasm<S>(
+    memory: Memory,
+    store: &mut S,
+    ty: &TypeSignature,
+    offset: i32,
+    length: i32,
+    epoch: StacksEpochId,
+) -> Result<Value, VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
+    crate::phases::time(crate::phases::Phase::ValueRead, || {
+        read_from_wasm_untimed(memory, store, ty, offset, length, epoch)
+    })
+}
+
+fn read_from_wasm_untimed<S>(
     memory: Memory,
     store: &mut S,
     ty: &TypeSignature,
@@ -850,6 +883,24 @@ pub fn placeholder_for_type(ty: ValType) -> Val {
 /// and length of the value will be written to the memory at `offset`.
 /// Returns the number of bytes written at `offset` and at `in_mem_offset`.
 pub fn write_to_wasm<S>(
+    store: S,
+    memory: Memory,
+    ty: &TypeSignature,
+    offset: i32,
+    in_mem_offset: i32,
+    value: &Value,
+    include_repr: bool,
+) -> Result<(i32, i32), VmExecutionError>
+where
+    S: AsContextMut,
+    S::Data: RuntimeShapeStore,
+{
+    crate::phases::time(crate::phases::Phase::ValueWrite, || {
+        write_to_wasm_untimed(store, memory, ty, offset, in_mem_offset, value, include_repr)
+    })
+}
+
+fn write_to_wasm_untimed<S>(
     mut store: S,
     memory: Memory,
     ty: &TypeSignature,
@@ -1530,9 +1581,11 @@ pub fn read_identifier_from_wasm(
     offset: i32,
     length: i32,
 ) -> Result<String, VmExecutionError> {
-    let buffer = read_bytes_from_wasm(memory, store, offset, length)?;
-    String::from_utf8(buffer)
-        .map_err(|e| crate::error::wasm_error(WasmError::UnableToReadIdentifier(e)))
+    crate::phases::time(crate::phases::Phase::IdentRead, || {
+        let buffer = read_bytes_from_wasm(memory, store, offset, length)?;
+        String::from_utf8(buffer)
+            .map_err(|e| crate::error::wasm_error(WasmError::UnableToReadIdentifier(e)))
+    })
 }
 
 /// Return true if the value of the given type stays in memory, and false if

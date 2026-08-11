@@ -36,6 +36,7 @@ pub mod duck_type;
 mod error;
 mod error_mapping;
 mod layout;
+pub mod phases;
 pub mod runtime_shape;
 
 #[cfg(feature = "developer-mode")]

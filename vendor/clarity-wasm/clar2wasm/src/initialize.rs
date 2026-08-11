@@ -728,13 +728,19 @@ pub(crate) fn call_function_with_argument_sizes(
         module_cache,
     );
     let mut store = Store::new(&engine, context);
-    let mut linker = Linker::new(&engine);
-    link_host_functions(&mut linker)?;
+    let mut linker = crate::phases::time(crate::phases::Phase::LinkerSetup, || {
+        let mut linker = Linker::new(&engine);
+        link_host_functions(&mut linker)?;
+        Ok::<_, VmExecutionError>(linker)
+    })?;
     let cost_globals = link_cost_globals(&mut linker, &mut store)?;
     store.data_mut().cost_globals = Some(cost_globals);
-    let instance = linker
-        .instantiate(&mut store, &wasm_module)
-        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    let instance = crate::phases::time(crate::phases::Phase::Instantiate, || {
+        linker
+            .instantiate(&mut store, &wasm_module)
+            .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))
+    })?;
+    let call_setup = crate::phases::start();
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
@@ -850,7 +856,11 @@ pub(crate) fn call_function_with_argument_sizes(
     } else {
         store.data_mut().global_context.begin();
     }
-    let call_result = wasm_function.call(&mut store, &wasm_arguments, &mut results);
+    crate::phases::finish(crate::phases::Phase::CallSetup, call_setup);
+    let call_result = crate::phases::time(crate::phases::Phase::WasmInvoke, || {
+        wasm_function.call(&mut store, &wasm_arguments, &mut results)
+    });
+    let return_read = crate::phases::start();
     let execution_result = (|| {
         let remaining = store
             .data()
@@ -879,6 +889,7 @@ pub(crate) fn call_function_with_argument_sizes(
                 )))
         }
     })();
+    crate::phases::finish(crate::phases::Phase::ReturnRead, return_read);
     let value = if read_only {
         store.data_mut().global_context.roll_back()?;
         execution_result?

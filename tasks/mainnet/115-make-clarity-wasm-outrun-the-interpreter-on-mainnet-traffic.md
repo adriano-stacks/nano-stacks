@@ -2,7 +2,7 @@
 id: "115"
 group: mainnet
 title: "Make clarity-wasm outrun the interpreter on mainnet traffic"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["114"]

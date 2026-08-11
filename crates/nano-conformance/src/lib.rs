@@ -1680,10 +1680,25 @@ fn bench_engines_before_sealing(
         .create(true)
         .append(true)
         .open(samples)?;
+    // With `NANO_WASM_PHASES` also set, each call's compiled runs get a phase
+    // attribution row: where inside the engine those nanoseconds went.
+    let mut phase_sink = if nano_vm::phases::enabled() {
+        let mut path = samples.as_os_str().to_owned();
+        path.push(".phases");
+        Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(PathBuf::from(path))?,
+        )
+    } else {
+        None
+    };
     for call in calls {
         if ask_engine_before_sealing(chainstate, parent, &call, false, false).is_none() {
             return Ok(());
         }
+        let phases_before = nano_vm::phases::snapshot();
         let mut agree = true;
         let mut runtime = 0;
         let (mut compiled, mut interpreted) = (Vec::new(), Vec::new());
@@ -1720,6 +1735,23 @@ fn bench_engines_before_sealing(
             nanos(&compiled),
             nanos(&interpreted),
         )?;
+        if let Some(phase_sink) = phase_sink.as_mut() {
+            // The interpreter runs between the compiled ones touch no phase
+            // counters, so the diff is the compiled repeats alone.
+            let split = nano_vm::phases::snapshot()
+                .iter()
+                .zip(phases_before)
+                .map(|((nanos, count), (nanos_before, count_before))| {
+                    format!("{}:{}", nanos - nanos_before, count - count_before)
+                })
+                .collect::<Vec<_>>()
+                .join("\t");
+            writeln!(
+                phase_sink,
+                "{}\t{}\t{}\t{}\t{repeats}\t{split}",
+                block.header.chain_length, call.txid, call.contract, call.function,
+            )?;
+        }
     }
     Ok(())
 }

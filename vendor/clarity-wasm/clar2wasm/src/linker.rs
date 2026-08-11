@@ -393,23 +393,43 @@ fn link_save_runtime_shape_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-                let serialized_ty = read_identifier_from_wasm(
-                    memory,
-                    &mut caller,
-                    serialized_ty_offset,
-                    serialized_ty_length,
-                )?;
-                let value_ty = serde_json::from_str(&serialized_ty).map_err(|error| {
-                    crate::error::wasm_error(WasmError::Expect(format!(
-                        "runtime-shape type cannot be decoded: {error}"
-                    )))
-                })?;
-                let epoch = caller.data().global_context.epoch_id;
-                let value =
-                    read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
-                let handle = caller.data_mut().save_runtime_shape(value)?;
-                Ok(handle)
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    // The same per-call parse cache the type-text host calls
+                    // use; the coordinates name one data-segment constant, so
+                    // the encoding (JSON here, type text elsewhere) rides
+                    // along with them.
+                    let value_ty = if let Some(known) = caller
+                        .data()
+                        .parsed_types
+                        .get(&(serialized_ty_offset, serialized_ty_length))
+                    {
+                        known.clone()
+                    } else {
+                        let serialized_ty = read_identifier_from_wasm(
+                            memory,
+                            &mut caller,
+                            serialized_ty_offset,
+                            serialized_ty_length,
+                        )?;
+                        let parsed: TypeSignature =
+                            serde_json::from_str(&serialized_ty).map_err(|error| {
+                                crate::error::wasm_error(WasmError::Expect(format!(
+                                    "runtime-shape type cannot be decoded: {error}"
+                                )))
+                            })?;
+                        caller.data_mut().parsed_types.insert(
+                            (serialized_ty_offset, serialized_ty_length),
+                            parsed.clone(),
+                        );
+                        parsed
+                    };
+                    let epoch = caller.data().global_context.epoch_id;
+                    let value =
+                        read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
+                    let handle = caller.data_mut().save_runtime_shape(value)?;
+                    Ok(handle)
+                })
             },
         )
         .map(|_| ())
@@ -429,14 +449,16 @@ fn link_runtime_shape_serialization_size_fn(
             "clarity",
             "runtime_shape_serialization_size",
             |caller: Caller<'_, ClarityWasmContext>, handle: i32| {
-                let size = caller
-                    .data()
-                    .load_runtime_shape(handle)?
-                    .serialized_size()
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                let size = i32::try_from(size)
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                Ok(size)
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let size = caller
+                        .data()
+                        .load_runtime_shape(handle)?
+                        .serialized_size()
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    let size = i32::try_from(size)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    Ok(size)
+                })
             },
         )
         .map(|_| ())
@@ -459,33 +481,26 @@ fn link_runtime_value_size_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
                 // `Value::size` is `type_of(value).size()`, and for a
                 // monomorphic primitive the dynamic type is the static type:
                 // materializing the value cannot change the answer. Two
                 // thirds of every host call a mainnet replay makes is this
-                // measurement, almost all of it over these primitives, and
-                // each one deserialized the whole value to reach a constant.
-                let memory = caller
-                    .data()
-                    .memory
-                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-                let serialized_ty = read_identifier_from_wasm(
-                    memory,
-                    &mut caller,
-                    serialized_ty_offset,
-                    serialized_ty_length,
-                )?;
+                // measurement — a fold measures its accumulator every
+                // iteration — so the type text goes through the per-call
+                // parse cache rather than being re-parsed per measurement,
+                // which was ~90 ms of a heavy read call's ~120.
+                let (memory, value_ty) =
+                    runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
                 // No `principal` arm, deliberately: a trait reference erases
                 // to `principal` in the runtime type string, and `type_of` on
                 // a callable value answers with the callee's own type, whose
                 // size is the contract name's, not the principal maximum.
-                let size = match serialized_ty.as_str() {
-                    "int" | "uint" => 16,
-                    "bool" => 1,
+                let size = match &value_ty {
+                    TypeSignature::IntType | TypeSignature::UIntType => 16,
+                    TypeSignature::BoolType => 1,
                     _ => {
                         let epoch = caller.data().global_context.epoch_id;
-                        let version = *caller.data().contract_context().get_clarity_version();
-                        let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
                         // Sizing from the declared type alone is unsound for
                         // anything wider than a monomorphic primitive: at a
                         // function entry the runtime shape may be *wider*
@@ -506,6 +521,7 @@ fn link_runtime_value_size_fn(
                     }
                 };
                 Ok(size)
+                })
             },
         )
         .map(|_| ())
@@ -528,22 +544,24 @@ fn link_runtime_sequence_element_size_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let value = read_runtime_value(
-                    &mut caller,
-                    value_offset,
-                    serialized_ty_offset,
-                    serialized_ty_length,
-                )?;
-                let sequence = match value {
-                    Value::Sequence(sequence) => sequence,
-                    _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
-                };
-                let size = sequence
-                    .element_size()
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                let size = i32::try_from(size)
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                Ok(size)
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let value = read_runtime_value(
+                        &mut caller,
+                        value_offset,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    let sequence = match value {
+                        Value::Sequence(sequence) => sequence,
+                        _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
+                    };
+                    let size = sequence
+                        .element_size()
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    let size = i32::try_from(size)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    Ok(size)
+                })
             },
         )
         .map(|_| ())
@@ -569,6 +587,7 @@ fn link_admit_function_argument_fn(
              function_name_offset: i32,
              function_name_length: i32,
              argument_index: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
                 let (memory, representation_type) =
                     runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
                 let function_name = read_identifier_from_wasm(
@@ -630,6 +649,7 @@ fn link_admit_function_argument_fn(
                     true,
                 )?;
                 Ok(())
+                })
             },
         )
         .map(|_| ())
@@ -706,21 +726,29 @@ fn link_runtime_shape_is_equal_fn(
              second_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-                let serialized_ty = read_identifier_from_wasm(
-                    memory,
-                    &mut caller,
-                    serialized_ty_offset,
-                    serialized_ty_length,
-                )?;
-                let epoch = caller.data().global_context.epoch_id;
-                let version = *caller.data().contract_context().get_clarity_version();
-                let value_ty = signature_from_string(&serialized_ty, version, epoch)?;
-                let first =
-                    read_from_wasm_indirect(memory, &mut caller, &value_ty, first_offset, epoch)?;
-                let second =
-                    read_from_wasm_indirect(memory, &mut caller, &value_ty, second_offset, epoch)?;
-                Ok(i32::from(first == second))
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let (memory, value_ty) = runtime_value_type(
+                        &mut caller,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    let epoch = caller.data().global_context.epoch_id;
+                    let first = read_from_wasm_indirect(
+                        memory,
+                        &mut caller,
+                        &value_ty,
+                        first_offset,
+                        epoch,
+                    )?;
+                    let second = read_from_wasm_indirect(
+                        memory,
+                        &mut caller,
+                        &value_ty,
+                        second_offset,
+                        epoch,
+                    )?;
+                    Ok(i32::from(first == second))
+                })
             },
         )
         .map(|_| ())
@@ -1260,11 +1288,13 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     StoreType::Variable,
                     var_name.as_str(),
                 );
-                let fetch_result = caller.data_mut().global_context.database.get_value(
-                    &key,
-                    &data_types.value_type,
-                    &epoch,
-                )?;
+                let fetch_result = crate::phases::time(crate::phases::Phase::HostVar, || {
+                    caller.data_mut().global_context.database.get_value(
+                        &key,
+                        &data_types.value_type,
+                        &epoch,
+                    )
+                })?;
 
                 let value = fetch_result
                     .map(|data| data.value)
@@ -1343,13 +1373,15 @@ fn link_set_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                 // env.add_memory(value.get_memory_use())?;
 
                 // Store the variable in the global context
-                caller.data_mut().global_context.database.set_variable(
-                    &contract,
-                    var_name.as_str(),
-                    value,
-                    &data_types,
-                    &epoch,
-                )?;
+                crate::phases::time(crate::phases::Phase::HostVar, || {
+                    caller.data_mut().global_context.database.set_variable(
+                        &contract,
+                        var_name.as_str(),
+                        value,
+                        &data_types,
+                        &epoch,
+                    )
+                })?;
 
                 Ok(())
             },
@@ -2307,16 +2339,8 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 // `meta_nft` refused that call outright, where the chain accepted
                 // it, and reading the named contract at all is a database lookup
                 // the reference never makes.
-                let identifiers_ty = signature_from_string(
-                    &read_identifier_from_wasm(
-                        memory,
-                        &mut caller,
-                        identifiers_ty_offset,
-                        identifiers_ty_length,
-                    )?,
-                    *caller.data().contract_context().get_clarity_version(),
-                    epoch,
-                )?;
+                let (_, identifiers_ty) =
+                    runtime_value_type(&mut caller, identifiers_ty_offset, identifiers_ty_length)?;
 
                 // This is a typed list of NFT key values, not a string. A
                 // nonzero shape handle is authoritative when the list crossed
@@ -2775,16 +2799,20 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     .add_memory(STXBalance::unlocked_and_v1_size as u64)
                     .map_err(VmExecutionError::from)?;
 
-                let mut sender_snapshot = caller
-                    .data_mut()
-                    .global_context
-                    .database
-                    .get_stx_balance_snapshot(sender)?;
+                let mut sender_snapshot = crate::phases::time(crate::phases::Phase::HostStx, || {
+                    caller
+                        .data_mut()
+                        .global_context
+                        .database
+                        .get_stx_balance_snapshot(sender)
+                })?;
                 if !sender_snapshot.can_transfer(amount)? {
                     return Ok((0i32, 0i32, StxErrorCodes::NOT_ENOUGH_BALANCE as i64, 0i64));
                 }
 
-                sender_snapshot.transfer_to(recipient, amount)?;
+                crate::phases::time(crate::phases::Phase::HostStx, || {
+                    sender_snapshot.transfer_to(recipient, amount)
+                })?;
 
                 caller
                     .data_mut()
@@ -3895,11 +3923,13 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     epoch,
                 )?;
 
-                let result = caller
-                    .data_mut()
-                    .global_context
-                    .database
-                    .fetch_entry_with_size(&contract, &map_name, &key, &data_types, &epoch);
+                let result = crate::phases::time(crate::phases::Phase::HostMap, || {
+                    caller
+                        .data_mut()
+                        .global_context
+                        .database
+                        .fetch_entry_with_size(&contract, &map_name, &key, &data_types, &epoch)
+                });
 
                 match result {
                     Err(error) => {
@@ -3998,14 +4028,16 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 )?;
 
                 // Store the value in the map in the global context
-                let result = caller.data_mut().global_context.database.set_entry(
-                    &contract,
-                    map_name.as_str(),
-                    key,
-                    value,
-                    &data_types,
-                    &epoch,
-                );
+                let result = crate::phases::time(crate::phases::Phase::HostMap, || {
+                    caller.data_mut().global_context.database.set_entry(
+                        &contract,
+                        map_name.as_str(),
+                        key,
+                        value,
+                        &data_types,
+                        &epoch,
+                    )
+                });
 
                 match result {
                     Err(error) => {
@@ -4104,14 +4136,16 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 )?;
 
                 // Insert the value into the map
-                let result = caller.data_mut().global_context.database.insert_entry(
-                    &contract,
-                    map_name.as_str(),
-                    key,
-                    value,
-                    &data_types,
-                    &epoch,
-                );
+                let result = crate::phases::time(crate::phases::Phase::HostMap, || {
+                    caller.data_mut().global_context.database.insert_entry(
+                        &contract,
+                        map_name.as_str(),
+                        key,
+                        value,
+                        &data_types,
+                        &epoch,
+                    )
+                });
 
                 match result {
                     Err(error) => {
@@ -4197,13 +4231,15 @@ fn link_map_delete_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 )?;
 
                 // Delete the key from the map in the global context
-                let result = caller.data_mut().global_context.database.delete_entry(
-                    &contract,
-                    map_name.as_str(),
-                    &key,
-                    &data_types,
-                    &epoch,
-                );
+                let result = crate::phases::time(crate::phases::Phase::HostMap, || {
+                    caller.data_mut().global_context.database.delete_entry(
+                        &contract,
+                        map_name.as_str(),
+                        &key,
+                        &data_types,
+                        &epoch,
+                    )
+                });
 
                 match result {
                     Err(error) => {
@@ -6278,24 +6314,15 @@ fn link_print_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecut
              _value_length: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-
-                let serialized_ty = read_identifier_from_wasm(
-                    memory,
-                    &mut caller,
-                    serialized_ty_offset,
-                    serialized_ty_length,
-                )?;
-
+                let (memory, value_ty) =
+                    runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
                 let epoch = caller.data().global_context.epoch_id;
-                let version = caller.data().contract_context().get_clarity_version();
-
-                let value_ty = signature_from_string(&serialized_ty, *version, epoch)?;
                 let clarity_val =
                     read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
 
-                caller.data_mut().register_print_event(clarity_val)?;
+                crate::phases::time(crate::phases::Phase::HostEvent, || {
+                    caller.data_mut().register_print_event(clarity_val)
+                })?;
 
                 Ok(())
             },
