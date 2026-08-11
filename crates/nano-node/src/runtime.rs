@@ -721,7 +721,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let (sortitions, cache_usage, latest_local_winner) = {
+    let (sortitions, cache_usage, latest_local_winner, registered_miners) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
@@ -735,6 +735,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
             executor.derived_sortitions(),
             executor.cache_usage(),
             latest_local_winner,
+            executor.registered_local_miner_keys(),
         )
     };
     state.metrics().publish_execution_caches(cache_usage);
@@ -746,6 +747,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         network,
         context: bitcoin_context(config, pox),
         winners: &winners,
+        registered_miners: &registered_miners,
         published,
         peer,
         registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
@@ -1191,8 +1193,10 @@ struct RewardCycleInputs<'a> {
     executor: &'a SharedExecutor,
     network: Network,
     context: nano_chainstate::BitcoinBlockContext,
-    /// Who won the recent sortitions, which is who may write to `.miners`.
+    /// Recent winners, used only when both unwritten slots have one clear owner.
     winners: &'a [nano_primitives::Hash160],
+    /// Every miner key registered by this node's locally derived burnchain.
+    registered_miners: &'a [nano_primitives::Hash160],
     published: &'a mut RewardCyclePublication,
     peer: &'a SyncClient,
     /// Where this chain's sBTC registry is deployed, which decides whether the
@@ -1244,6 +1248,28 @@ async fn carry_checkpoint_set(
     true
 }
 
+async fn configure_signer_slots(
+    state: &RpcState,
+    network: Network,
+    cycle: u64,
+    entries: &[nano_rpc::RewardSetSigner],
+) {
+    let writers = entries
+        .iter()
+        .map(|entry| nano_primitives::hash160(&entry.signing_key))
+        .collect::<Vec<_>>();
+    let store = state.stackerdb();
+    let mut store = store.write().await;
+    for message in SIGNER_MESSAGE_IDS {
+        let contract = crate::config::cycle_contract(network, cycle, message);
+        store.configure(
+            &format!("{}.{}", contract.address, contract.name),
+            writers.clone(),
+        );
+    }
+    drop(store);
+}
+
 /// Publish the reward set the executed state derives, and configure the
 /// `StackerDB` contracts that cycle's signers write to.
 ///
@@ -1258,6 +1284,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         network,
         mut context,
         winners,
+        registered_miners,
         published,
         peer,
         registry,
@@ -1267,7 +1294,16 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
         return;
     };
-    configure_miner_slots(state, network, cycle, winners, published, peer).await;
+    configure_miner_slots(
+        state,
+        network,
+        cycle,
+        winners,
+        registered_miners,
+        published,
+        peer,
+    )
+    .await;
     if published.served == Some(cycle) {
         return;
     }
@@ -1334,20 +1370,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
             ),
         )
         .await;
-    let writers: Vec<nano_primitives::Hash160> = entries
-        .iter()
-        .map(|entry| nano_primitives::hash160(&entry.signing_key))
-        .collect();
-    let store = state.stackerdb();
-    let mut store = store.write().await;
-    for message in SIGNER_MESSAGE_IDS {
-        let contract = crate::config::cycle_contract(network, cycle, message);
-        store.configure(
-            &format!("{}.{}", contract.address, contract.name),
-            writers.clone(),
-        );
-    }
-    drop(store);
+    configure_signer_slots(state, network, cycle, &entries).await;
     published.served = Some(cycle);
     println!(
         "derived the reward set for cycle {cycle} from this node's own state: {} signers, \
@@ -1393,12 +1416,11 @@ fn include_local_winner(
     followed
 }
 
-/// How many recent sortition winners a `.miners` slot may be attributed to.
+/// How many recent sortition winners retain the empty-slot fallback.
 ///
-/// Two would be the answer if both slots were always rewritten every tenure, and
-/// they are not: a slot keeps the last chunk its owner wrote, which can be several
-/// tenures old. So the candidates are the recent winners rather than the last two,
-/// and every attribution is still checked against a signature.
+/// Signed metadata is attributed through the complete local leader-key registry.
+/// This window is used only before both slots have written metadata, when repeated
+/// wins by one miner make their assignment unambiguous.
 const MINER_SLOT_CANDIDATES: usize = 8;
 
 fn one_miner_slots(winners: &[nano_primitives::Hash160]) -> Option<Vec<nano_primitives::Hash160>> {
@@ -1417,39 +1439,33 @@ fn one_miner_slots(winners: &[nano_primitives::Hash160]) -> Option<Vec<nano_prim
 /// carries. A `.miners` replica with its two slots swapped refuses the very chunks
 /// it exists for, so the count has to come from somewhere.
 ///
-/// It comes from the chunks. Every slot's metadata is signed by the writer that
-/// owns it, so asking the peer for its `.miners` listing and recovering each
-/// signature says which winner holds which slot — and says it in a form this node
-/// checks rather than believes: the recovered key has to be one of the two winners
-/// this node saw win. A peer that lies is a peer whose chunks stop verifying.
-///
-/// Only the winners are needed a priori, and where those come from is unchanged.
+/// It comes from the chunks. Every slot's metadata is signed by its writer, so
+/// asking the peer for its `.miners` listing and recovering each signature says
+/// who holds each slot. The recovered key still has to exist in this node's local
+/// leader-key registry; a peer cannot introduce a writer by naming one.
 async fn configure_miner_slots(
     state: &RpcState,
     network: Network,
     cycle: u64,
     winners: &[nano_primitives::Hash160],
+    registered_miners: &[nano_primitives::Hash160],
     published: &mut RewardCyclePublication,
     peer: &SyncClient,
 ) {
-    if winners.is_empty() {
+    if winners.is_empty() && registered_miners.is_empty() {
         return;
     }
     let contract = crate::config::miner_contract(network);
-    let assignment = if let Some(assignment) = one_miner_slots(winners) {
-        // One miner in the retained candidate window, so no order to get wrong.
-        Some(assignment)
-    } else {
-        miner_slots(peer, &contract, winners).await
-    };
+    let assignment = miner_slots(peer, &contract, registered_miners)
+        .await
+        .or_else(|| one_miner_slots(winners));
     let Some(assignment) = assignment else {
         if published.ambiguous_miners != Some(cycle) {
             published.ambiguous_miners = Some(cycle);
             eprintln!(
-                "the recent sortitions were won by more than one miner and this node \
-                 cannot attribute both .miners slots to one of them from the chunks they \
-                 hold, so it replicates neither: a slot assigned to the wrong writer \
-                 refuses the proposals it exists for"
+                "this node cannot authenticate both .miners slot writers against its local \
+                 leader-key registry, so it replicates neither: a slot assigned to the wrong \
+                 writer refuses the proposals it exists for"
             );
         }
         return;
@@ -1474,8 +1490,8 @@ async fn configure_miner_slots(
 /// Who owns each `.miners` slot, read off the peer's own listing.
 ///
 /// Each slot's metadata is signed by the writer that owns it, so recovering the
-/// signature says who that is — checked against the miners this node saw win a
-/// sortition, so a peer naming a stranger gets nothing configured.
+/// signature says who that is — checked against the miners this node registered
+/// from Bitcoin, so a peer naming a stranger gets nothing configured.
 ///
 /// **Both slots have to resolve.** A slot nano assigns to the wrong writer refuses
 /// the very chunks it exists for, and a `.miners` replica that refuses proposals is
@@ -1485,28 +1501,32 @@ async fn configure_miner_slots(
 async fn miner_slots(
     peer: &SyncClient,
     contract: &nano_stackerdb::StackerDbContract,
-    winners: &[nano_primitives::Hash160],
+    registered_miners: &[nano_primitives::Hash160],
 ) -> Option<Vec<nano_primitives::Hash160>> {
     let client = nano_stackerdb::StackerDbClient::new(peer.base_url().clone()).ok()?;
     let listing = client.slot_metadata(contract).await.ok()?;
+    authenticated_miner_slots(listing, registered_miners)
+}
+
+fn authenticated_miner_slots(
+    listing: impl IntoIterator<Item = nano_stackerdb::SlotMetadata>,
+    registered_miners: &[nano_primitives::Hash160],
+) -> Option<Vec<nano_primitives::Hash160>> {
     let (mut first, mut second) = (None, None);
     for metadata in listing {
-        if metadata.slot_version == 0 {
+        let slot = match (metadata.slot_version, metadata.slot_id) {
+            (0, _) | (_, 2..) => continue,
+            (_, 0) => &mut first,
+            (_, 1) => &mut second,
+        };
+        let writer = metadata.writer().ok()?;
+        if !registered_miners.contains(&writer) {
             continue;
         }
-        for writer in winners {
-            if !metadata.verify(*writer).unwrap_or(false) {
-                continue;
-            }
-            match metadata.slot_id {
-                0 => first = Some(*writer),
-                1 => second = Some(*writer),
-                _ => {}
-            }
-        }
+        *slot = Some(writer);
     }
     match (first, second) {
-        (Some(first), Some(second)) if first != second => Some(vec![first, second]),
+        (Some(first), Some(second)) => Some(vec![first, second]),
         _ => None,
     }
 }
@@ -3898,7 +3918,8 @@ mod tests {
         CheckpointHistoryError, ConsensusError, NakamotoBlock, TenureVrfError, coinbase_vrf_proof,
         starts_new_tenure,
     };
-    use nano_primitives::{ConsensusHash, Network, TrieHash};
+    use nano_crypto::StacksPrivateKey;
+    use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, hash160};
     use nano_sync::PoxInfo;
 
     /// Every execution batch says where it started, where it ended, how many
@@ -3981,6 +4002,42 @@ mod tests {
             super::one_miner_slots(&candidates),
             None,
             "the locally elected miner is visible before its first proposal is accepted"
+        );
+    }
+
+    #[test]
+    fn miner_slots_accept_only_registered_metadata_signers() {
+        let first_key = StacksPrivateKey::from_seed(b"first miner");
+        let second_key = StacksPrivateKey::from_seed(b"second miner");
+        let stranger_key = StacksPrivateKey::from_seed(b"stranger");
+        let first_writer = hash160(&first_key.public_key().to_bytes_compressed());
+        let second_writer = hash160(&second_key.public_key().to_bytes_compressed());
+
+        let signed = |slot_id, key: &StacksPrivateKey| {
+            let mut metadata =
+                nano_stackerdb::SlotMetadata::unsigned(slot_id, 7, Sha256Sum::default());
+            metadata.sign(key);
+            metadata
+        };
+        let listing = [signed(0, &first_key), signed(1, &second_key)];
+
+        assert_eq!(
+            super::authenticated_miner_slots(listing.clone(), &[second_writer, first_writer]),
+            Some(vec![first_writer, second_writer]),
+            "slot order comes from authenticated metadata, not registry order"
+        );
+        assert_eq!(
+            super::authenticated_miner_slots(listing, &[second_writer]),
+            None,
+            "both recovered writers must exist in the local registry"
+        );
+        assert_eq!(
+            super::authenticated_miner_slots(
+                [signed(0, &first_key), signed(1, &stranger_key)],
+                &[first_writer, second_writer],
+            ),
+            None,
+            "a peer cannot introduce a writer by signing its listing with a stranger key"
         );
     }
 

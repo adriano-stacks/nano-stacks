@@ -2686,6 +2686,14 @@ where
             .and_then(|tracker| tracker.sortition_info_at(height)))
     }
 
+    /// Every block-signing key registered on the locally derived burnchain.
+    pub(crate) fn registered_local_miner_keys(&self) -> Vec<nano_primitives::Hash160> {
+        self.sortition.as_ref().map_or_else(
+            Vec::new,
+            crate::sortition::SortitionTracker::registered_signing_key_hashes,
+        )
+    }
+
     /// One locally derived sortition, selected by its consensus hash.
     pub(crate) fn local_sortition_info(
         &self,

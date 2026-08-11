@@ -347,9 +347,13 @@ impl SlotMetadata {
         self.signature = key.sign(self.digest().as_bytes());
     }
 
-    pub fn verify(&self, writer: Hash160) -> Result<bool, StackerDbError> {
+    pub fn writer(&self) -> Result<Hash160, StackerDbError> {
         let public_key = self.signature.recover(self.digest().as_bytes())?;
-        Ok(hash160(&public_key.to_bytes_compressed()) == writer)
+        Ok(hash160(&public_key.to_bytes_compressed()))
+    }
+
+    pub fn verify(&self, writer: Hash160) -> Result<bool, StackerDbError> {
+        Ok(self.writer()? == writer)
     }
 }
 

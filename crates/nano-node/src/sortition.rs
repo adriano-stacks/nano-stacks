@@ -840,6 +840,16 @@ impl SortitionTracker {
         self.keys.available()
     }
 
+    /// Block-signing key hashes registered by the locally derived burnchain.
+    #[must_use]
+    pub fn registered_signing_key_hashes(&self) -> Vec<nano_primitives::Hash160> {
+        self.keys
+            .entries()
+            .filter_map(|(_, _, registration)| registration.signing_key_hash)
+            .map(nano_primitives::Hash160::from_bytes)
+            .collect()
+    }
+
     /// Take on the leader-key registry a checkpoint carries.
     ///
     /// A winning commitment names the registration that authorises its VRF proof
