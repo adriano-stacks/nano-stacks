@@ -13,12 +13,12 @@ use clarity::vm::types::{
 use clarity::vm::{CallStack, ContractContext, Value};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
-use wasmtime::{AsContextMut, Linker, Memory, Store, Val};
+use wasmtime::{Memory, Store, Val};
 
 use crate::cost::{CostGlobals, CostMeter};
 use crate::error::WasmError;
 use crate::error_mapping;
-use crate::linker::{link_cost_globals, link_host_functions};
+
 use crate::runtime_shape::{RuntimeShapeArena, RuntimeShapeStore};
 use crate::wasm_generator::{uses_packed_abi, uses_packed_value};
 use crate::wasm_utils::*;
@@ -437,17 +437,15 @@ pub fn initialize_contract(
         module_cache,
     );
     let mut store = Store::new(&engine, init_context);
-    let mut linker = Linker::new(&engine);
-    // Link in the host interface functions and globals.
-    link_host_functions(&mut linker)?;
-    store.data_mut().cost_globals = Some(
-        link_cost_globals(&mut linker, &mut store.as_context_mut())
-            .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e.into())))?,
-    );
-
+    // The host interface functions, from the cache's prebuilt template.
+    let linker = module_cache.host_linker()?;
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?;
+    store.data_mut().cost_globals = Some(
+        CostGlobals::from_instance(&instance, &mut store)
+            .map_err(|e| crate::error::wasm_error(WasmError::UnableToLoadModule(e)))?,
+    );
 
     // Call the `.top-level` function, which contains all top-level expressions
     // from the contract.
@@ -714,9 +712,6 @@ pub(crate) fn call_function_with_argument_sizes(
 
     let clarity_version = *contract_context.get_clarity_version();
     let engine = module_cache.engine().clone();
-    // Native code for a contract already called in this process comes back
-    // without touching Cranelift, which is the whole reason a replay moves.
-    let wasm_module = module.native(module_cache)?.clone();
     let context = ClarityWasmContext::new_run(
         global_context,
         contract_context,
@@ -728,18 +723,17 @@ pub(crate) fn call_function_with_argument_sizes(
         module_cache,
     );
     let mut store = Store::new(&engine, context);
-    let mut linker = crate::phases::time(crate::phases::Phase::LinkerSetup, || {
-        let mut linker = Linker::new(&engine);
-        link_host_functions(&mut linker)?;
-        Ok::<_, VmExecutionError>(linker)
+    let instance_pre = crate::phases::time(crate::phases::Phase::LinkerSetup, || {
+        module.instance_pre(module_cache)
     })?;
-    let cost_globals = link_cost_globals(&mut linker, &mut store)?;
-    store.data_mut().cost_globals = Some(cost_globals);
     let instance = crate::phases::time(crate::phases::Phase::Instantiate, || {
-        linker
-            .instantiate(&mut store, &wasm_module)
+        instance_pre
+            .instantiate(&mut store)
             .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))
     })?;
+    let cost_globals = CostGlobals::from_instance(&instance, &mut store)
+        .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+    store.data_mut().cost_globals = Some(cost_globals);
     let call_setup = crate::phases::start();
     let memory = instance
         .get_memory(&mut store, "memory")

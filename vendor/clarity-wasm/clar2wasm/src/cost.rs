@@ -125,6 +125,28 @@ pub struct CostGlobals {
 }
 
 impl CostGlobals {
+    /// One instance's meters, resolved from its exports.
+    ///
+    /// The globals are defined by the standard library and initialized to
+    /// `i64::MAX` per instance, exactly as the linker-created imports were.
+    pub fn from_instance<T>(
+        instance: &wasmtime::Instance,
+        store: &mut impl AsContextMut<Data = T>,
+    ) -> wasmtime::Result<Self> {
+        let mut global = |name: &str| {
+            instance
+                .get_global(store.as_context_mut(), name)
+                .ok_or_else(|| wasmtime::Error::msg(format!("missing {name} export")))
+        };
+        Ok(Self {
+            runtime: global("cost-runtime")?,
+            read_count: global("cost-read-count")?,
+            read_length: global("cost-read-length")?,
+            write_count: global("cost-write-count")?,
+            write_length: global("cost-write-length")?,
+        })
+    }
+
     pub fn remaining_costs<T>(
         &self,
         store: &mut impl AsContextMut<Data = T>,

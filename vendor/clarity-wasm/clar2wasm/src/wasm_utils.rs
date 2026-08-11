@@ -896,7 +896,15 @@ where
     S::Data: RuntimeShapeStore,
 {
     crate::phases::time(crate::phases::Phase::ValueWrite, || {
-        write_to_wasm_untimed(store, memory, ty, offset, in_mem_offset, value, include_repr)
+        write_to_wasm_untimed(
+            store,
+            memory,
+            ty,
+            offset,
+            in_mem_offset,
+            value,
+            include_repr,
+        )
     })
 }
 
@@ -1586,6 +1594,32 @@ pub fn read_identifier_from_wasm(
         String::from_utf8(buffer)
             .map_err(|e| crate::error::wasm_error(WasmError::UnableToReadIdentifier(e)))
     })
+}
+
+/// Whether admission cannot change any value this type can carry.
+///
+/// `admit_function_argument` is a cast, a sanitization and an `admits` check.
+/// The cast only re-tags callables; sanitization only strips tuple fields the
+/// callee does not declare; and an exact-typed value admits itself. A type
+/// with no tuple and no callable anywhere in it therefore admits every value
+/// it can represent unchanged — a wasm-level value of such a type cannot be
+/// wider than its declaration, arena-carried or not.
+pub fn admit_preserves(ty: &TypeSignature) -> bool {
+    match ty {
+        TypeSignature::IntType
+        | TypeSignature::UIntType
+        | TypeSignature::BoolType
+        | TypeSignature::PrincipalType => true,
+        TypeSignature::SequenceType(
+            SequenceSubtype::BufferType(_) | SequenceSubtype::StringType(_),
+        ) => true,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+            admit_preserves(list.get_list_item_type())
+        }
+        TypeSignature::OptionalType(inner) => admit_preserves(inner),
+        TypeSignature::ResponseType(both) => admit_preserves(&both.0) && admit_preserves(&both.1),
+        _ => false,
+    }
 }
 
 /// Return true if the value of the given type stays in memory, and false if

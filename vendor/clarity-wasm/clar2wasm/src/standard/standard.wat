@@ -423,11 +423,17 @@
     ;;      `stacks-core`
     ;;
     ;; ;; Cost tracking globals
-    (import "clarity" "cost-runtime" (global $cost-runtime (mut i64)))
-    (import "clarity" "cost-read-count" (global $cost-read-count (mut i64)))
-    (import "clarity" "cost-read-length" (global $cost-read-length (mut i64)))
-    (import "clarity" "cost-write-count" (global $cost-write-count (mut i64)))
-    (import "clarity" "cost-write-length" (global $cost-write-length (mut i64)))
+    ;; The cost meters are module-defined rather than imported: an imported
+    ;; global is store-owned state the linker would have to create per call,
+    ;; which is the one thing standing between the host and a pre-resolved
+    ;; instantiation. The host reads and writes them through the exports; a
+    ;; fresh instance starts every meter at i64::MAX exactly as the imported
+    ;; globals were initialized.
+    (global $cost-runtime (export "cost-runtime") (mut i64) (i64.const 9223372036854775807))
+    (global $cost-read-count (export "cost-read-count") (mut i64) (i64.const 9223372036854775807))
+    (global $cost-read-length (export "cost-read-length") (mut i64) (i64.const 9223372036854775807))
+    (global $cost-write-count (export "cost-write-count") (mut i64) (i64.const 9223372036854775807))
+    (global $cost-write-length (export "cost-write-length") (mut i64) (i64.const 9223372036854775807))
 
     ;; Global definitions
     (global $stack-pointer (mut i32) (i32.const 0))

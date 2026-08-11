@@ -25,6 +25,9 @@ LABELS = [
     "host_event",
     "host_stx",
     "host_shape",
+    "shape_save",
+    "shape_eq",
+    "shape_admit",
     "value_write",
     "value_read",
     "ident_read",
@@ -36,7 +39,7 @@ TOP_LEVEL = ["context_setup", "module_probe", "contract_load", "linker_setup", "
 # Disjoint host buckets inside wasm_invoke; the marshalling rows below overlap
 # them (a shape measurement contains its value reads), so they inform but do
 # not sum.
-NESTED = ["host_var", "host_map", "host_event", "host_stx", "host_shape"]
+NESTED = ["host_var", "host_map", "host_event", "host_stx", "host_shape", "shape_save", "shape_eq", "shape_admit"]
 OVERLAPPING = ["value_write", "value_read", "ident_read"]
 
 

@@ -66,7 +66,6 @@ pub struct CompileResult {
     pub arity_report: ArityReport,
 }
 
-#[derive(Debug)]
 pub struct CompiledContract {
     pub wasm: Vec<u8>,
     pub analysis: ContractAnalysis,
@@ -76,6 +75,11 @@ pub struct CompiledContract {
     /// compiling per call — which is what a fresh `Engine` per call forces —
     /// dominated everything else replay does.
     native: OnceLock<wasmtime::Module>,
+    /// The native module with its imports already resolved against the host
+    /// linker, built at most once. Import resolution walked 223 names per
+    /// call frame; a pre-resolved instantiation only allocates.
+    instance_pre:
+        OnceLock<wasmtime::InstancePre<initialize::ClarityWasmContext<'static, 'static, 'static>>>,
 }
 
 impl Clone for CompiledContract {
@@ -84,7 +88,18 @@ impl Clone for CompiledContract {
             wasm: self.wasm.clone(),
             analysis: self.analysis.clone(),
             native: self.native.clone(),
+            instance_pre: self.instance_pre.clone(),
         }
+    }
+}
+
+impl std::fmt::Debug for CompiledContract {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledContract")
+            .field("wasm", &self.wasm.len())
+            .field("native", &self.native.get().is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -94,6 +109,7 @@ impl CompiledContract {
             wasm,
             analysis,
             native: OnceLock::new(),
+            instance_pre: OnceLock::new(),
         }
     }
 
@@ -107,6 +123,41 @@ impl CompiledContract {
         self.native
             .get()
             .ok_or_else(|| crate::error::wasm_error(WasmError::ModuleNotFound))
+    }
+
+    /// This contract's pre-resolved instantiation, built at most once.
+    ///
+    /// Same lifetime story as [`ModuleCache::host_linker`]: the template's
+    /// `'static` context lifetimes are erased to the caller's, which is sound
+    /// for the same reasons — nothing of the context's lifetime lives in the
+    /// pre-resolved imports.
+    pub fn instance_pre<'a, 'b, 'hooks>(
+        &self,
+        cache: &ModuleCache,
+    ) -> Result<
+        wasmtime::InstancePre<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
+        VmExecutionError,
+    > {
+        if self.instance_pre.get().is_none() {
+            let native = self.native(cache)?.clone();
+            let linker = cache.host_linker()?;
+            let pre = linker
+                .instantiate_pre(&native)
+                .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
+            let _ = self.instance_pre.set(pre);
+        }
+        let pre = self
+            .instance_pre
+            .get()
+            .ok_or_else(|| crate::error::wasm_error(WasmError::ModuleNotFound))?
+            .clone();
+        #[allow(unsafe_code)]
+        Ok(unsafe {
+            std::mem::transmute::<
+                wasmtime::InstancePre<initialize::ClarityWasmContext<'static, 'static, 'static>>,
+                wasmtime::InstancePre<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
+            >(pre)
+        })
     }
 }
 
@@ -162,6 +213,11 @@ pub struct ModuleCache {
     clock: Cell<u64>,
     /// The estimated bytes of everything held, kept in step with `contracts`.
     bytes: usize,
+    /// The 223 host functions, registered once per cache instead of once per
+    /// call. See [`ModuleCache::host_linker`] for the lifetime story.
+    linker_template: std::cell::OnceCell<
+        wasmtime::Linker<initialize::ClarityWasmContext<'static, 'static, 'static>>,
+    >,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -233,6 +289,51 @@ impl ModuleCache {
     /// The engine every module in this cache belongs to.
     pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine
+    }
+
+    /// A linker carrying the host functions, built once and cloned per call.
+    ///
+    /// Re-registering 223 host functions on every contract call — and on
+    /// every *nested* `contract-call?` — was measured at roughly seventy
+    /// microseconds a call frame on a mainnet replay; a clone copies one
+    /// name-indexed map of `Arc`s. The per-call cost globals are deliberately
+    /// not in the template: they are store-owned, so the caller defines them
+    /// on its clone exactly as before.
+    ///
+    /// The template is typed with `'static` context lifetimes and transmuted
+    /// to the caller's. SAFETY: the two types differ only in lifetimes, so
+    /// their layouts are identical. The linker itself never holds a
+    /// `ClarityWasmContext` — its host functions receive one through
+    /// `Caller<'_, _>` at invocation, use it for the duration of that call
+    /// frame, and capture nothing from it; the store owning the real context
+    /// is created after this transmute and dropped before the context's
+    /// borrows end. No value of the erased lifetime crosses the template's
+    /// lifetime in either direction.
+    pub fn host_linker<'a, 'b, 'hooks>(
+        &self,
+    ) -> Result<wasmtime::Linker<initialize::ClarityWasmContext<'a, 'b, 'hooks>>, VmExecutionError>
+    {
+        if self.linker_template.get().is_none() {
+            let mut linker = wasmtime::Linker::new(&self.engine);
+            crate::linker::link_host_functions(&mut linker)?;
+            let _ = self.linker_template.set(linker);
+        }
+        let template = self
+            .linker_template
+            .get()
+            .ok_or_else(|| {
+                crate::error::wasm_error(WasmError::WasmGeneratorError(
+                    "the host linker template cannot be built".to_owned(),
+                ))
+            })?
+            .clone();
+        #[allow(unsafe_code)]
+        Ok(unsafe {
+            std::mem::transmute::<
+                wasmtime::Linker<initialize::ClarityWasmContext<'static, 'static, 'static>>,
+                wasmtime::Linker<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
+            >(template)
+        })
     }
 
     /// Native code for `wasm`, from the persistent store if it has it.

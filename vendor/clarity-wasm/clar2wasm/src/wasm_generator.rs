@@ -27,8 +27,8 @@ use crate::cost::{ChargeContext, ChargeGenerator, WordCharge};
 use crate::duck_type::need_ducktyping;
 use crate::error_mapping::ErrorMap;
 use crate::wasm_utils::{
-    get_type_in_memory_size, get_type_size, signature_from_string, trait_identifier_as_bytes,
-    ArgumentCountCheck, PRINCIPAL_BYTES_MAX,
+    admit_preserves, get_type_in_memory_size, get_type_size, signature_from_string,
+    trait_identifier_as_bytes, ArgumentCountCheck, PRINCIPAL_BYTES_MAX,
 };
 use crate::{check_args, debug_msg, words};
 
@@ -1152,6 +1152,9 @@ impl WasmGenerator {
             module.add_import_func("clarity", "runtime_sequence_element_size", save_shape_ty);
         module.funcs.get_mut(element_size).name =
             Some("stdlib.runtime_sequence_element_size".to_owned());
+        let (handle_size, _) =
+            module.add_import_func("clarity", "runtime_shape_size", shape_size_ty);
+        module.funcs.get_mut(handle_size).name = Some("stdlib.runtime_shape_size".to_owned());
         let admit_argument_ty = module.types.add(
             &[
                 ValType::I32,
@@ -1243,15 +1246,16 @@ impl WasmGenerator {
 
         let module = &mut generator.module;
 
-        // NOTE: these are added here, and not in standard.wat, to more easily
-        //       allow for cost tracking to be turned off without modifying
-        //       downstream. See standard.wat for more details
-
-        let (r, _) = module.add_import_global("clarity", "cost-runtime", ValType::I64, true);
-        let (rc, _) = module.add_import_global("clarity", "cost-read-count", ValType::I64, true);
-        let (rl, _) = module.add_import_global("clarity", "cost-read-length", ValType::I64, true);
-        let (wc, _) = module.add_import_global("clarity", "cost-write-count", ValType::I64, true);
-        let (wl, _) = module.add_import_global("clarity", "cost-write-length", ValType::I64, true);
+        // The meters live in the standard library as module-defined exported
+        // globals — store-owned imports would force the host to build them
+        // per call, which is the one thing standing between it and a
+        // pre-resolved instantiation. Generated code charges against the
+        // standard module's own globals.
+        let r = get_global(module, "cost-runtime")?;
+        let rc = get_global(module, "cost-read-count")?;
+        let rl = get_global(module, "cost-read-length")?;
+        let wc = get_global(module, "cost-write-count")?;
+        let wl = get_global(module, "cost-write-length")?;
 
         generator.cost_context = Some(ChargeContext {
             epoch: cost_epoch,
@@ -1856,7 +1860,11 @@ impl WasmGenerator {
         // boundary before the body can read its bindings.
         if self.contract_analysis.clarity_version >= ClarityVersion::Clarity2 {
             for (index, (parameter_type, _, storage)) in parameters.iter().enumerate() {
-                if has_runtime_shape(parameter_type) {
+                // A parameter whose declared type admission cannot change —
+                // no tuple, no callable anywhere in it, so no hidden handle
+                // can carry a wider shape — needs no reconstruction at all:
+                // the whole round trip through the host was the identity.
+                if has_runtime_shape(parameter_type) && !admit_preserves(parameter_type) {
                     self.admit_runtime_shape_parameter(
                         &mut func_body,
                         parameter_type,
@@ -2317,19 +2325,88 @@ impl WasmGenerator {
                     .binop(BinaryOp::I32Add)
                     .local_set(size);
             }
-            TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => {
-                for local in locals {
-                    builder.local_get(*local);
-                }
-                let (value_offset, _) = self.create_call_stack_local(builder, ty, true, false);
-                self.write_to_memory(builder, value_offset, 0, ty)?;
-                let (type_offset, type_length) = self.serialized_type(ty)?;
-                builder
-                    .local_get(value_offset)
-                    .i32_const(type_offset)
-                    .i32_const(type_length)
-                    .call(self.func_by_name("stdlib.runtime_value_size"))
-                    .local_set(size);
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)) => {
+                // The reference sizes a list value as
+                // `len × least-supertype(element dynamic types).size() + list
+                // type_size`. When the element type is its own dynamic type —
+                // every `int` is an `IntType`, every principal a
+                // `PrincipalType` — the supertype fold is the identity, the
+                // length is the byte length over the element stride, and the
+                // measurement is arithmetic over locals this function already
+                // holds. A fold measures per iteration, so the host round
+                // trip it replaces was quadratic in practice. Any other
+                // element type, and any list a nonzero handle says was
+                // widened, still asks the host, which sizes the arena value
+                // the handle names.
+                let element = list_type.get_list_item_type();
+                let invariant_element_size = match element {
+                    TypeSignature::IntType | TypeSignature::UIntType => Some(16),
+                    TypeSignature::BoolType => Some(1),
+                    TypeSignature::PrincipalType => Some(148),
+                    _ => None,
+                };
+                // A handled value's measurement is one host call carrying the
+                // handle: writing the whole representation into a fresh
+                // region for the host to read the handle back out of it was
+                // ceremony, paid per measurement.
+                let handled = {
+                    let mut handled = builder.dangling_instr_seq(None);
+                    handled
+                        .local_get(locals[0])
+                        .call(self.func_by_name("stdlib.runtime_shape_size"))
+                        .local_set(size);
+                    handled.id()
+                };
+                let unhandled = if let Some(element_size) = invariant_element_size {
+                    // `ListTypeData::type_size` is `entry.inner_type_size + 5`,
+                    // count-independent — and 1 for every invariant element
+                    // type, which is also `NoType`'s, so the empty list (whose
+                    // entry type the reference derives as `NoType`) answers
+                    // identically.
+                    let list_type_size = TypeSignature::SequenceType(SequenceSubtype::ListType(
+                        ListTypeData::new_list(element.clone(), 0).map_err(|error| {
+                            GeneratorError::TypeError(format!(
+                                "cannot size the empty list of {element}: {error}"
+                            ))
+                        })?,
+                    ))
+                    .type_size()
+                    .map_err(|error| {
+                        GeneratorError::TypeError(format!(
+                            "cannot size the list type of {element}: {error}"
+                        ))
+                    })?;
+                    let mut inline = builder.dangling_instr_seq(None);
+                    inline
+                        .local_get(locals[2])
+                        .i32_const(get_type_size(element))
+                        .binop(BinaryOp::I32DivU)
+                        .i32_const(element_size)
+                        .binop(BinaryOp::I32Mul)
+                        .i32_const(list_type_size as i32)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(size);
+                    inline.id()
+                } else {
+                    let mut host = builder.dangling_instr_seq(None);
+                    for local in locals {
+                        host.local_get(*local);
+                    }
+                    let (value_offset, _) =
+                        self.create_call_stack_local(&mut host, ty, true, false);
+                    self.write_to_memory(&mut host, value_offset, 0, ty)?;
+                    let (type_offset, type_length) = self.serialized_type(ty)?;
+                    host.local_get(value_offset)
+                        .i32_const(type_offset)
+                        .i32_const(type_length)
+                        .call(self.func_by_name("stdlib.runtime_value_size"))
+                        .local_set(size);
+                    host.id()
+                };
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: handled,
+                    alternative: unhandled,
+                });
             }
             TypeSignature::TupleType(tuple) => {
                 // A tuple's first local is its runtime-shape handle. Zero
@@ -2377,18 +2454,11 @@ impl WasmGenerator {
                     inline.id()
                 };
                 let host = {
+                    // The handle names the arena value the host would size
+                    // anyway; passing it is the whole message.
                     let mut host = builder.dangling_instr_seq(None);
-                    for local in locals {
-                        host.local_get(*local);
-                    }
-                    let (value_offset, _) =
-                        self.create_call_stack_local(&mut host, ty, true, false);
-                    self.write_to_memory(&mut host, value_offset, 0, ty)?;
-                    let (type_offset, type_length) = self.serialized_type(ty)?;
-                    host.local_get(value_offset)
-                        .i32_const(type_offset)
-                        .i32_const(type_length)
-                        .call(self.func_by_name("stdlib.runtime_value_size"))
+                    host.local_get(locals[0])
+                        .call(self.func_by_name("stdlib.runtime_shape_size"))
                         .local_set(size);
                     host.id()
                 };

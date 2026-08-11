@@ -271,6 +271,7 @@ pub fn link_host_functions(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
     link_save_runtime_shape_fn(linker)?;
+    link_runtime_shape_size_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
     link_runtime_value_size_fn(linker)?;
     link_runtime_sequence_element_size_fn(linker)?;
@@ -393,8 +394,11 @@ fn link_save_runtime_shape_fn(
              value_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                crate::phases::time(crate::phases::Phase::HostShape, || {
-                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                crate::phases::time(crate::phases::Phase::ShapeSave, || {
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                     // The same per-call parse cache the type-text host calls
                     // use; the coordinates name one data-segment constant, so
                     // the encoding (JSON here, type text elsewhere) rides
@@ -418,15 +422,20 @@ fn link_save_runtime_shape_fn(
                                     "runtime-shape type cannot be decoded: {error}"
                                 )))
                             })?;
-                        caller.data_mut().parsed_types.insert(
-                            (serialized_ty_offset, serialized_ty_length),
-                            parsed.clone(),
-                        );
+                        caller
+                            .data_mut()
+                            .parsed_types
+                            .insert((serialized_ty_offset, serialized_ty_length), parsed.clone());
                         parsed
                     };
                     let epoch = caller.data().global_context.epoch_id;
-                    let value =
-                        read_from_wasm_indirect(memory, &mut caller, &value_ty, value_offset, epoch)?;
+                    let value = read_from_wasm_indirect(
+                        memory,
+                        &mut caller,
+                        &value_ty,
+                        value_offset,
+                        epoch,
+                    )?;
                     let handle = caller.data_mut().save_runtime_shape(value)?;
                     Ok(handle)
                 })
@@ -441,6 +450,37 @@ fn link_save_runtime_shape_fn(
         })
 }
 
+/// Link `runtime_shape_size`: a handled value's `Value::size()` by handle.
+///
+/// The generator calls this instead of `runtime_value_size` when the value's
+/// representation already names an arena entry — the value is in the arena,
+/// so writing its whole representation into a fresh region just to have the
+/// host read the handle back out of it was pure ceremony, paid per measurement.
+fn link_runtime_shape_size_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_shape_size",
+            |caller: Caller<'_, ClarityWasmContext>, handle: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let size = caller.data().runtime_shape_value_size(handle)?;
+                    let size = i32::try_from(size)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    Ok(size)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_shape_size".to_owned(),
+                error,
+            ))
+        })
+}
+
 fn link_runtime_shape_serialization_size_fn(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
@@ -450,11 +490,7 @@ fn link_runtime_shape_serialization_size_fn(
             "runtime_shape_serialization_size",
             |caller: Caller<'_, ClarityWasmContext>, handle: i32| {
                 crate::phases::time(crate::phases::Phase::HostShape, || {
-                    let size = caller
-                        .data()
-                        .load_runtime_shape(handle)?
-                        .serialized_size()
-                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    let size = caller.data().runtime_shape_serialized_size(handle)?;
                     let size = i32::try_from(size)
                         .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
                     Ok(size)
@@ -482,45 +518,66 @@ fn link_runtime_value_size_fn(
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
                 crate::phases::time(crate::phases::Phase::HostShape, || {
-                // `Value::size` is `type_of(value).size()`, and for a
-                // monomorphic primitive the dynamic type is the static type:
-                // materializing the value cannot change the answer. Two
-                // thirds of every host call a mainnet replay makes is this
-                // measurement — a fold measures its accumulator every
-                // iteration — so the type text goes through the per-call
-                // parse cache rather than being re-parsed per measurement,
-                // which was ~90 ms of a heavy read call's ~120.
-                let (memory, value_ty) =
-                    runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
-                // No `principal` arm, deliberately: a trait reference erases
-                // to `principal` in the runtime type string, and `type_of` on
-                // a callable value answers with the callee's own type, whose
-                // size is the contract name's, not the principal maximum.
-                let size = match &value_ty {
-                    TypeSignature::IntType | TypeSignature::UIntType => 16,
-                    TypeSignature::BoolType => 1,
-                    _ => {
-                        let epoch = caller.data().global_context.epoch_id;
-                        // Sizing from the declared type alone is unsound for
-                        // anything wider than a monomorphic primitive: at a
-                        // function entry the runtime shape may be *wider*
-                        // than the declaration — duck typing hands `echo` a
-                        // `{soft, full}` where `{soft}` is declared — and the
-                        // reference charges the value it was actually given.
-                        let size = read_from_wasm_indirect(
-                            memory,
-                            &mut caller,
-                            &value_ty,
-                            value_offset,
-                            epoch,
-                        )?
-                        .size()
-                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                        i32::try_from(size)
-                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?
-                    }
-                };
-                Ok(size)
+                    // `Value::size` is `type_of(value).size()`, and for a
+                    // monomorphic primitive the dynamic type is the static type:
+                    // materializing the value cannot change the answer. Two
+                    // thirds of every host call a mainnet replay makes is this
+                    // measurement — a fold measures its accumulator every
+                    // iteration — so the type text goes through the per-call
+                    // parse cache rather than being re-parsed per measurement,
+                    // which was ~90 ms of a heavy read call's ~120.
+                    let (memory, value_ty) = runtime_value_type(
+                        &mut caller,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    // No bare-`principal` fast arm, deliberately: a trait
+                    // reference erases to `principal` in the runtime type string,
+                    // and `type_of` on a callable value answers with the callee's
+                    // own type, whose size is the contract name's, not the
+                    // principal maximum. Inside a list that distinction is gone —
+                    // materializing reads every element back as
+                    // `Value::Principal`, so the invariant-list path answers
+                    // exactly what the materializing one would.
+                    let size = match &value_ty {
+                        TypeSignature::IntType | TypeSignature::UIntType => 16,
+                        TypeSignature::BoolType => 1,
+                        _ => {
+                            if let Some(size) = handled_composite_size(
+                                &mut caller,
+                                memory,
+                                &value_ty,
+                                value_offset,
+                            )? {
+                                return Ok(size);
+                            }
+                            if let Some(size) =
+                                invariant_list_size(&mut caller, memory, &value_ty, value_offset)?
+                            {
+                                return Ok(size);
+                            }
+                            let epoch = caller.data().global_context.epoch_id;
+                            // Sizing from the declared type alone is unsound for
+                            // anything wider than a monomorphic primitive: at a
+                            // function entry the runtime shape may be *wider*
+                            // than the declaration — duck typing hands `echo` a
+                            // `{soft, full}` where `{soft}` is declared — and the
+                            // reference charges the value it was actually given.
+                            let size = read_from_wasm_indirect(
+                                memory,
+                                &mut caller,
+                                &value_ty,
+                                value_offset,
+                                epoch,
+                            )?
+                            .size()
+                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                            i32::try_from(size).map_err(|_| {
+                                crate::error::wasm_error(WasmError::ValueTypeMismatch)
+                            })?
+                        }
+                    };
+                    Ok(size)
                 })
             },
         )
@@ -587,68 +644,103 @@ fn link_admit_function_argument_fn(
              function_name_offset: i32,
              function_name_length: i32,
              argument_index: i32| {
-                crate::phases::time(crate::phases::Phase::HostShape, || {
-                let (memory, representation_type) =
-                    runtime_value_type(&mut caller, serialized_ty_offset, serialized_ty_length)?;
-                let function_name = read_identifier_from_wasm(
-                    memory,
-                    &mut caller,
-                    function_name_offset,
-                    function_name_length,
-                )?;
-                let argument_index = usize::try_from(argument_index)
-                    .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                let expected_type = {
-                    let function = caller
-                        .data()
-                        .contract_context()
-                        .lookup_function(&function_name)
-                        .ok_or_else(|| {
-                            VmExecutionError::from(RuntimeCheckErrorKind::UndefinedFunction(
-                                function_name.clone(),
-                            ))
-                        })?;
-                    function
-                        .get_arg_types()
-                        .get(argument_index)
-                        .cloned()
-                        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?
-                };
-                let epoch = caller.data().global_context.epoch_id;
-                let argument = read_from_wasm_indirect(
-                    memory,
-                    &mut caller,
-                    &representation_type,
-                    value_offset,
-                    epoch,
-                )?;
-                let admitted = admit_function_argument(&expected_type, &argument, epoch)?;
+                crate::phases::time(crate::phases::Phase::ShapeAdmit, || {
+                    let (memory, representation_type) = runtime_value_type(
+                        &mut caller,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    let function_name = read_identifier_from_wasm(
+                        memory,
+                        &mut caller,
+                        function_name_offset,
+                        function_name_length,
+                    )?;
+                    let argument_index = usize::try_from(argument_index)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    let expected_type = {
+                        let function = caller
+                            .data()
+                            .contract_context()
+                            .lookup_function(&function_name)
+                            .ok_or_else(|| {
+                                VmExecutionError::from(RuntimeCheckErrorKind::UndefinedFunction(
+                                    function_name.clone(),
+                                ))
+                            })?;
+                        function
+                            .get_arg_types()
+                            .get(argument_index)
+                            .cloned()
+                            .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?
+                    };
+                    // A value admitted against its own tuple-free type is the
+                    // identity, and the callee's argument region already
+                    // holds the caller's representation — the generator wrote
+                    // it there before this call — so the materialize, the
+                    // admission walk and the write-back of the same bytes buy
+                    // nothing. Function entries admit every argument (a fold
+                    // re-admits its accumulator each iteration), which made
+                    // this the hottest measurement in the engine once sizes
+                    // were fast.
+                    if representation_type == expected_type && admit_preserves(&expected_type) {
+                        return Ok(());
+                    }
+                    // A tuple is admitted for its widening, and a
+                    // `TupleData`'s signature is its dynamic type — kept in
+                    // step by every constructor. An arena value whose
+                    // signature equals the declaration therefore has nothing
+                    // to strip anywhere in it, and comparing signatures costs
+                    // no clone at all.
+                    if let TypeSignature::TupleType(expected_tuple) = &expected_type {
+                        let handle = read_i32(memory, &mut caller, value_offset)?;
+                        if handle != 0
+                            && caller.data().runtime_shapes().is_some_and(|arena| {
+                                matches!(
+                                    arena.get(handle),
+                                    Ok(Value::Tuple(tuple))
+                                        if tuple.type_signature == *expected_tuple
+                                )
+                            })
+                        {
+                            return Ok(());
+                        }
+                    }
+                    let epoch = caller.data().global_context.epoch_id;
+                    let argument = read_from_wasm_indirect(
+                        memory,
+                        &mut caller,
+                        &representation_type,
+                        value_offset,
+                        epoch,
+                    )?;
+                    let admitted = admit_function_argument(&expected_type, &argument, epoch)?;
 
-                let representation_size = get_type_size(&representation_type);
-                let in_memory_offset = value_offset
-                    .checked_add(representation_size)
-                    .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                let zeroes = vec![
-                    0;
-                    usize::try_from(representation_size).map_err(|_| {
-                        crate::error::wasm_error(WasmError::ValueTypeMismatch)
-                    })?
-                ];
-                memory
-                    .write(&mut caller, value_offset as usize, &zeroes)
-                    .map_err(|error| {
-                        crate::error::wasm_error(WasmError::UnableToWriteMemory(error.into()))
-                    })?;
-                write_to_wasm(
-                    &mut caller,
-                    memory,
-                    &expected_type,
-                    value_offset,
-                    in_memory_offset,
-                    &admitted,
-                    true,
-                )?;
-                Ok(())
+                    let representation_size = get_type_size(&representation_type);
+                    let in_memory_offset = value_offset
+                        .checked_add(representation_size)
+                        .ok_or(crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    let zeroes = vec![
+                        0;
+                        usize::try_from(representation_size).map_err(|_| {
+                            crate::error::wasm_error(WasmError::ValueTypeMismatch)
+                        })?
+                    ];
+                    memory
+                        .write(&mut caller, value_offset as usize, &zeroes)
+                        .map_err(|error| {
+                            crate::error::wasm_error(WasmError::UnableToWriteMemory(error.into()))
+                        })?;
+                    write_to_wasm(
+                        &mut caller,
+                        memory,
+                        &expected_type,
+                        value_offset,
+                        in_memory_offset,
+                        &admitted,
+                        true,
+                    )?;
+                    Ok(())
                 })
             },
         )
@@ -661,12 +753,111 @@ fn link_admit_function_argument_fn(
         })
 }
 
+/// The one size every value of this type has, when the type is its own
+/// dynamic type.
+///
+/// `Value::size()` is `type_of(value).size()`, so a measurement only needs the
+/// value itself when materializing could change the answer. For these four,
+/// it cannot: `type_of` maps every `Int` to `IntType`, every principal —
+/// standard or contract — to `PrincipalType`, and so on, and none of their
+/// wasm representations carries a runtime-shape handle that could name a
+/// widened value.
+const fn invariant_value_size(ty: &TypeSignature) -> Option<u32> {
+    match ty {
+        TypeSignature::IntType | TypeSignature::UIntType => Some(16),
+        TypeSignature::BoolType => Some(1),
+        TypeSignature::PrincipalType => Some(148),
+        _ => None,
+    }
+}
+
+/// A widened composite's `Value::size()` answered by the arena, clone-free.
+///
+/// Lists and tuples carry a runtime-shape handle as the first slot of their
+/// memory representation, and both read paths return the arena value when it
+/// is set — so the size is the arena entry's, which the arena memoizes. The
+/// materializing path answered the same number by cloning the whole value out
+/// and re-deriving its type, on every iteration of whatever loop is measuring.
+fn handled_composite_size(
+    caller: &mut Caller<'_, ClarityWasmContext>,
+    memory: Memory,
+    ty: &TypeSignature,
+    value_offset: i32,
+) -> Result<Option<i32>, VmExecutionError> {
+    if !matches!(
+        ty,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) | TypeSignature::TupleType(_)
+    ) {
+        return Ok(None);
+    }
+    let handle = read_i32(memory, caller, value_offset)?;
+    if handle == 0 {
+        return Ok(None);
+    }
+    let size = caller.data().runtime_shape_value_size(handle)?;
+    let size =
+        i32::try_from(size).map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    Ok(Some(size))
+}
+
+/// A list's `Value::size()` read from its representation alone, when its
+/// element type makes materialization unnecessary.
+///
+/// The reference computes a list value's size as
+/// `ListTypeData(len, least-supertype of element dynamic types).size()`.
+/// When every element's dynamic type *is* the declared element type
+/// ([`invariant_value_size`]), the supertype fold is the identity and the
+/// length is the representation's byte length over the element stride — so
+/// deserializing the whole list per measurement (a fold measures per
+/// iteration, so quadratic in practice) buys nothing.
+///
+/// `None` sends the caller down the materializing path: a non-list type, an
+/// element type whose values vary, a runtime-shape handle (the arena value
+/// governs then), or an empty list (whose entry type the reference derives
+/// differently).
+fn invariant_list_size(
+    caller: &mut Caller<'_, ClarityWasmContext>,
+    memory: Memory,
+    ty: &TypeSignature,
+    value_offset: i32,
+) -> Result<Option<i32>, VmExecutionError> {
+    let TypeSignature::SequenceType(SequenceSubtype::ListType(list)) = ty else {
+        return Ok(None);
+    };
+    let element = list.get_list_item_type();
+    if invariant_value_size(element).is_none() {
+        return Ok(None);
+    }
+    let handle = read_i32(memory, caller, value_offset)?;
+    if handle != 0 {
+        return Ok(None);
+    }
+    let length = read_i32(memory, caller, value_offset + 8)?;
+    let stride = get_type_size(element);
+    if length <= 0 || stride <= 0 || length % stride != 0 {
+        return Ok(None);
+    }
+    let count = (length / stride) as u32;
+    let Ok(list_ty) = ListTypeData::new_list(element.clone(), count) else {
+        return Ok(None);
+    };
+    let size = TypeSignature::SequenceType(SequenceSubtype::ListType(list_ty))
+        .size()
+        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    let size =
+        i32::try_from(size).map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    Ok(Some(size))
+}
+
 fn runtime_value_type(
     caller: &mut Caller<'_, ClarityWasmContext>,
     serialized_ty_offset: i32,
     serialized_ty_length: i32,
 ) -> Result<(Memory, TypeSignature), VmExecutionError> {
-    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+    let memory = caller
+        .data()
+        .memory
+        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
     // The serialized text is a data-segment constant, so within this call the
     // same coordinates always hold the same string; parsing it fresh was the
     // bulk of every size measurement.
@@ -686,10 +877,10 @@ fn runtime_value_type(
     let epoch = caller.data().global_context.epoch_id;
     let version = *caller.data().contract_context().get_clarity_version();
     let parsed = signature_from_string(&serialized_ty, version, epoch)?;
-    caller.data_mut().parsed_types.insert(
-        (serialized_ty_offset, serialized_ty_length),
-        parsed.clone(),
-    );
+    caller
+        .data_mut()
+        .parsed_types
+        .insert((serialized_ty_offset, serialized_ty_length), parsed.clone());
     Ok((memory, parsed))
 }
 
@@ -726,7 +917,7 @@ fn link_runtime_shape_is_equal_fn(
              second_offset: i32,
              serialized_ty_offset: i32,
              serialized_ty_length: i32| {
-                crate::phases::time(crate::phases::Phase::HostShape, || {
+                crate::phases::time(crate::phases::Phase::ShapeEq, || {
                     let (memory, value_ty) = runtime_value_type(
                         &mut caller,
                         serialized_ty_offset,
@@ -775,7 +966,10 @@ fn link_define_variable_fn(
              value_offset: i32,
              _value_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -867,7 +1061,10 @@ fn link_define_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
              supply_lo: i64,
              supply_hi: i64| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -927,7 +1124,10 @@ fn link_define_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "define_nft",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -994,7 +1194,10 @@ fn link_define_map_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "define_map",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier = caller
                     .data_mut()
@@ -1073,7 +1276,10 @@ fn link_define_function_fn(
              name_offset: i32,
              name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the variable name string from the memory
                 let function_name =
@@ -1179,7 +1385,10 @@ fn link_define_trait_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
             "define_trait",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let name =
                     read_identifier_from_wasm(memory, &mut caller, name_offset, name_length)?;
@@ -1221,7 +1430,10 @@ fn link_impl_trait_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
             "impl_trait",
             |mut caller: Caller<'_, ClarityWasmContext>, name_offset: i32, name_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let trait_id_string =
                     read_identifier_from_wasm(memory, &mut caller, name_offset, name_length)?;
@@ -1258,7 +1470,10 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the variable name for this identifier
                 let var_name =
@@ -1302,7 +1517,10 @@ fn link_get_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                         "Value {var_name}"
                     ))))?;
 
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 write_to_wasm(
                     &mut caller,
@@ -1339,7 +1557,10 @@ fn link_set_variable_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              value_offset: i32,
              _value_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -1414,7 +1635,10 @@ fn link_tx_sender_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
                         None,
                     ))?;
 
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1460,7 +1684,10 @@ fn link_contract_caller_fn(
                             None,
                         ))?;
 
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1498,7 +1725,10 @@ fn link_current_contract_fn(
              _return_length: i32| {
                 let contract = caller.data().contract_context().contract_identifier.clone();
 
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let (_, bytes_written) = write_to_wasm(
                     &mut caller,
@@ -1534,7 +1764,10 @@ fn link_tx_sponsor_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
              _return_length: i32| {
                 let opt_sponsor = caller.data().sponsor.clone();
                 if let Some(sponsor) = opt_sponsor {
-                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                     let (_, bytes_written) = write_to_wasm(
                         &mut caller,
@@ -2480,7 +2713,10 @@ fn link_stx_get_balance_fn(
              principal_offset: i32,
              principal_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2528,7 +2764,10 @@ fn link_stx_account_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
              principal_offset: i32,
              principal_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2619,7 +2858,10 @@ fn link_stx_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2714,7 +2956,10 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -2799,13 +3044,14 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     .add_memory(STXBalance::unlocked_and_v1_size as u64)
                     .map_err(VmExecutionError::from)?;
 
-                let mut sender_snapshot = crate::phases::time(crate::phases::Phase::HostStx, || {
-                    caller
-                        .data_mut()
-                        .global_context
-                        .database
-                        .get_stx_balance_snapshot(sender)
-                })?;
+                let mut sender_snapshot =
+                    crate::phases::time(crate::phases::Phase::HostStx, || {
+                        caller
+                            .data_mut()
+                            .global_context
+                            .database
+                            .get_stx_balance_snapshot(sender)
+                    })?;
                 if !sender_snapshot.can_transfer(amount)? {
                     return Ok((0i32, 0i32, StxErrorCodes::NOT_ENOUGH_BALANCE as i64, 0i64));
                 }
@@ -2848,7 +3094,10 @@ fn link_ft_get_supply_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     caller.data().contract_context().contract_identifier.clone();
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the token name
                 let token_name =
@@ -2885,7 +3134,10 @@ fn link_ft_get_balance_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
              owner_offset: i32,
              owner_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the token name
                 let name =
@@ -2952,7 +3204,10 @@ fn link_ft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3075,7 +3330,10 @@ fn link_ft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3199,7 +3457,10 @@ fn link_ft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3372,7 +3633,10 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3423,7 +3687,10 @@ fn link_nft_get_owner_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                 ) {
                     Ok(owner) => {
                         // Write the principal to the return buffer
-                        let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                        let memory = caller
+                            .data()
+                            .memory
+                            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                         let (_, bytes_written) = write_to_wasm(
                             caller,
@@ -3466,7 +3733,10 @@ fn link_nft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              sender_offset: i32,
              sender_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3600,7 +3870,10 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3726,7 +3999,10 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              recipient_offset: i32,
              recipient_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
@@ -3894,7 +4170,10 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the map name
                 let map_name =
@@ -3940,7 +4219,10 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                     Ok(data) => {
                         let serialized_byte_len = i32::try_from(data.serialized_byte_len)
                             .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
-                        let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                        let memory = caller
+                            .data()
+                            .memory
+                            .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                         let ty = TypeSignature::OptionalType(Box::new(data_types.value_type));
                         write_to_wasm(
@@ -3989,7 +4271,10 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 }
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -4097,7 +4382,10 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 }
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -4202,7 +4490,10 @@ fn link_map_delete_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 }
 
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Retrieve the map name
                 let map_name =
@@ -4406,7 +4697,10 @@ fn link_get_block_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4464,7 +4758,10 @@ fn link_get_block_info_vrf_seed_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4524,7 +4821,10 @@ fn link_get_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4584,7 +4884,10 @@ fn link_get_block_info_burnchain_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4644,7 +4947,10 @@ fn link_get_block_info_identity_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4704,7 +5010,10 @@ fn link_get_block_info_miner_address_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4758,7 +5067,10 @@ fn link_get_block_info_miner_spend_winner_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4811,7 +5123,10 @@ fn link_get_block_info_miner_spend_total_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4864,7 +5179,10 @@ fn link_get_block_info_block_reward_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) = check_block_info_height_valid(
                     &mut caller,
@@ -4935,7 +5253,10 @@ fn link_get_burn_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let height = ((height_hi as u128) << 64) | ((height_lo as u64) as u128);
 
                 // Note: we assume that we will not have a height bigger than u32::MAX.
@@ -5007,7 +5328,10 @@ fn link_get_burn_block_info_pox_addrs_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let height = ((height_hi as u128) << 64) | ((height_lo as u64) as u128);
 
@@ -5103,7 +5427,10 @@ fn link_get_stacks_block_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 // Get the memory from the caller
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5152,7 +5479,10 @@ fn link_get_stacks_block_info_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Get the memory from the caller
                 if let Some(height_value) =
@@ -5208,7 +5538,10 @@ fn link_get_stacks_block_info_identity_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5264,7 +5597,10 @@ fn link_get_tenure_info_burnchain_header_hash_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5320,7 +5656,10 @@ fn link_get_tenure_info_miner_address_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5370,7 +5709,10 @@ fn link_get_tenure_info_time_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5419,7 +5761,10 @@ fn link_get_tenure_info_vrf_seed_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5475,7 +5820,10 @@ fn link_get_tenure_info_block_reward_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5542,7 +5890,10 @@ fn link_get_tenure_info_miner_spend_total_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5591,7 +5942,10 @@ fn link_get_tenure_info_miner_spend_winner_property_fn(
              height_hi: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 if let Some(height_value) =
                     check_height_valid(&mut caller, memory, height_lo, height_hi, return_offset)?
@@ -5672,7 +6026,10 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     //   is checked in callables::DefinedFunction::execute_apply.
 
                     // Get the memory from the caller
-                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                     let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -5878,7 +6235,10 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              return_offset: i32,
              _return_length: i32| {
                 let result = (|| -> Result<(), VmExecutionError> {
-                    let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                     let epoch = caller.data().global_context.epoch_id;
                     let contract_value = read_from_wasm(
                         memory,
@@ -6120,7 +6480,10 @@ fn link_contract_hash_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              contract_length: i32,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -6344,7 +6707,10 @@ fn link_enter_at_block_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
             |mut caller: Caller<'_, ClarityWasmContext>,
              block_hash_offset: i32,
              block_hash_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data_mut().global_context.epoch_id;
                 // The *executing* epoch, not the one the module was built under,
                 // and this is why the check cannot be a compile-time one: a
@@ -6471,7 +6837,10 @@ fn link_keccak256_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6507,7 +6876,10 @@ fn link_sha512_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecu
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6540,7 +6912,10 @@ fn link_sha512_256_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
              return_offset: i32,
              return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the bytes from the memory
                 let bytes =
@@ -6580,7 +6955,10 @@ fn link_secp256k1_recover_fn(
              return_offset: i32,
              _return_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let ret_ty = TypeSignature::new_response(
                     TypeSignature::BUFFER_33.clone(),
@@ -6663,7 +7041,10 @@ fn link_secp256k1_verify_fn(
              pk_offset: i32,
              pk_length: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read the message bytes from the memory
                 let msg_bytes = read_bytes_from_wasm(memory, &mut caller, msg_offset, msg_length)?;
@@ -6726,7 +7107,10 @@ fn link_secp256r1_verify_fn(
              signature_length: i32,
              public_key_offset: i32,
              public_key_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let message =
                     read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
                 let signature =
@@ -6784,7 +7168,10 @@ fn link_ed25519_verify_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
              signature_length: i32,
              public_key_offset: i32,
              public_key_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let message =
                     read_bytes_from_wasm(memory, &mut caller, message_offset, message_length)?;
                 let signature =
@@ -6839,7 +7226,10 @@ fn link_secp256k1_decompress_fn(
              public_key_length: i32,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let public_key = read_bytes_from_wasm(
                     memory,
                     &mut caller,
@@ -6903,7 +7293,10 @@ fn link_verify_merkle_proof_fn(
              siblings_shape: i32,
              siblings_offset: i32,
              siblings_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data().global_context.epoch_id;
                 let leaf = read_from_wasm(
                     memory,
@@ -6962,7 +7355,10 @@ fn link_get_bitcoin_tx_output_fn(
              vout_high: i64,
              return_offset: i32,
              _return_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
                 let epoch = caller.data().global_context.epoch_id;
                 let tx = read_from_wasm(
                     memory,
@@ -7021,7 +7417,10 @@ fn link_principal_of_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
              key_length: i32,
              principal_offset: i32| {
                 // Get the memory from the caller
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -7111,7 +7510,10 @@ fn link_save_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              name_length: i32,
              value_offset: i32,
              _value_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
 
@@ -7161,7 +7563,10 @@ fn link_load_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
              name_length: i32,
              value_offset: i32,
              _value_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 // Read constant name from the memory.
                 let const_name =
@@ -7215,7 +7620,10 @@ fn link_principal_to_string_ascii(
              principal_length: i32,
              result_offset: i32,
              result_length: i32| {
-                let memory = caller.data().memory.ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data().global_context.epoch_id;
 
@@ -7340,6 +7748,8 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         "runtime_shape_serialization_size",
         |_handle: i32| Ok(0i32),
     )?;
+
+    linker.func_wrap("clarity", "runtime_shape_size", |_handle: i32| Ok(0i32))?;
 
     linker.func_wrap(
         "clarity",

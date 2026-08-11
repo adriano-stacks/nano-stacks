@@ -26,6 +26,8 @@ proptest! {
         .into();
 
         gen.create_module(&return_ty, |gen, builder| {
+            // The returned tuple's compiler-only runtime-shape handle.
+            builder.i32_const(0);
             gen.pass_value(builder, &value, &ty)
                 .expect("failed to write instructions for original value");
 

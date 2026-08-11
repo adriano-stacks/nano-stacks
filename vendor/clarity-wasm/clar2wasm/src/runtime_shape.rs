@@ -1,7 +1,11 @@
+use std::cell::Cell;
+
 use clarity::vm::errors::VmExecutionError;
 use clarity::vm::Value;
 
 use crate::error::WasmError;
+
+type Measurements = Cell<(Option<u32>, Option<u32>)>;
 
 /// Composite values whose run-time shape is wider than their analysed shape.
 ///
@@ -17,6 +21,11 @@ use crate::error::WasmError;
 #[derive(Debug, Default)]
 pub struct RuntimeShapeArena {
     values: Vec<Value>,
+    /// Memoized `Value::size()` and `serialized_size()` per entry, filled on
+    /// first ask. Entries are immutable once inserted, so the answers are
+    /// too — and a fold asks about its accumulator on every iteration, which
+    /// cloned the whole value out and re-derived its type each time.
+    measurements: Vec<Measurements>,
 }
 
 impl RuntimeShapeArena {
@@ -32,16 +41,56 @@ impl RuntimeShapeArena {
             ))
         })?;
         self.values.push(value);
+        self.measurements.push(Cell::new((None, None)));
         Ok(handle)
     }
 
     pub fn get(&self, handle: i32) -> Result<&Value, VmExecutionError> {
-        let index = usize::try_from(handle)
+        self.values
+            .get(self.index(handle)?)
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))
+    }
+
+    /// This entry's `Value::size()`, computed once.
+    pub fn value_size(&self, handle: i32) -> Result<u32, VmExecutionError> {
+        let cell = self.measurement(handle)?;
+        let (size, serialized) = cell.get();
+        if let Some(size) = size {
+            return Ok(size);
+        }
+        let size = self
+            .get(handle)?
+            .size()
+            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+        cell.set((Some(size), serialized));
+        Ok(size)
+    }
+
+    /// This entry's consensus `serialized_size()`, computed once.
+    pub fn serialized_size(&self, handle: i32) -> Result<u32, VmExecutionError> {
+        let cell = self.measurement(handle)?;
+        let (size, serialized) = cell.get();
+        if let Some(serialized) = serialized {
+            return Ok(serialized);
+        }
+        let serialized = self
+            .get(handle)?
+            .serialized_size()
+            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+        cell.set((size, Some(serialized)));
+        Ok(serialized)
+    }
+
+    fn measurement(&self, handle: i32) -> Result<&Measurements, VmExecutionError> {
+        self.measurements
+            .get(self.index(handle)?)
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))
+    }
+
+    fn index(&self, handle: i32) -> Result<usize, VmExecutionError> {
+        usize::try_from(handle)
             .ok()
             .and_then(|handle| handle.checked_sub(1))
-            .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))?;
-        self.values
-            .get(index)
             .ok_or_else(|| invalid_runtime_shape_handle(handle, self.values.len()))
     }
 }
@@ -68,6 +117,20 @@ pub trait RuntimeShapeStore {
             .ok_or_else(|| invalid_runtime_shape_handle(handle, 0))?
             .get(handle)
             .cloned()
+    }
+
+    /// The entry's `Value::size()`, without cloning the value out.
+    fn runtime_shape_value_size(&self, handle: i32) -> Result<u32, VmExecutionError> {
+        self.runtime_shapes()
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, 0))?
+            .value_size(handle)
+    }
+
+    /// The entry's `serialized_size()`, without cloning the value out.
+    fn runtime_shape_serialized_size(&self, handle: i32) -> Result<u32, VmExecutionError> {
+        self.runtime_shapes()
+            .ok_or_else(|| invalid_runtime_shape_handle(handle, 0))?
+            .serialized_size(handle)
     }
 }
 

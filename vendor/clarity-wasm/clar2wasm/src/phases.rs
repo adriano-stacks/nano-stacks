@@ -38,9 +38,15 @@ pub enum Phase {
     HostEvent,
     /// Host: STX transfer/account.
     HostStx,
-    /// Host: runtime shape and size measurement (`save_runtime_shape`,
-    /// `runtime_value_size`, `admit_function_argument`, …).
+    /// Host: runtime size measurement (`runtime_value_size`,
+    /// `runtime_shape_serialization_size`, `runtime_sequence_element_size`).
     HostShape,
+    /// Host: `save_runtime_shape` — materializing a value into the arena.
+    ShapeSave,
+    /// Host: `runtime_shape_is_equal` — composite `is-eq`.
+    ShapeEq,
+    /// Host: `admit_function_argument` — duck-typing a call's argument.
+    ShapeAdmit,
     /// Clarity values written into linear memory.
     ValueWrite,
     /// Clarity values read out of linear memory.
@@ -57,7 +63,7 @@ pub enum Phase {
 }
 
 /// How many phases a snapshot carries.
-pub const PHASES: usize = 17;
+pub const PHASES: usize = 20;
 
 /// The phase names, in snapshot order.
 #[must_use]
@@ -74,6 +80,9 @@ pub const fn labels() -> [&'static str; PHASES] {
         "host_event",
         "host_stx",
         "host_shape",
+        "shape_save",
+        "shape_eq",
+        "shape_admit",
         "value_write",
         "value_read",
         "ident_read",
@@ -162,7 +171,7 @@ pub fn snapshot() -> [(u64, u64); PHASES] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase, snapshot, time};
+    use super::{snapshot, time, Phase};
 
     #[test]
     fn timing_is_transparent_to_the_result() {

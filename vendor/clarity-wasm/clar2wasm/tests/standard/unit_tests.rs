@@ -3398,6 +3398,7 @@ fn principal_construct() {
         Val::I32(0),
         Val::I32(0),
         Val::I32(0),
+        Val::I32(0),
         Val::I64(0),
         Val::I64(0),
         Val::I32(0),
@@ -3440,14 +3441,15 @@ fn principal_construct() {
                 ],
                 &mut result,
             )
-            .expect("call to is_transient failed");
+            .expect("call to principal-construct failed");
         assert_eq!(result[0].unwrap_i32(), expected_ok as i32);
+        assert_eq!(result[3].unwrap_i32(), 0);
         if let Some(expected_principal) = expected_principal {
             let (offset, length) = if expected_ok {
                 (result[1].unwrap_i32(), result[2].unwrap_i32())
             } else {
-                assert_eq!(result[5].unwrap_i32(), 1);
-                (result[6].unwrap_i32(), result[7].unwrap_i32())
+                assert_eq!(result[6].unwrap_i32(), 1);
+                (result[7].unwrap_i32(), result[8].unwrap_i32())
             };
             assert_eq!(length, expected_principal.len() as i32);
             let mut buffer = vec![0u8; expected_principal.len()];
@@ -3457,7 +3459,7 @@ fn principal_construct() {
             assert_eq!(&buffer, expected_principal);
         }
 
-        let err = ((result[4].unwrap_i64() as u128) << 64) | result[3].unwrap_i64() as u128;
+        let err = ((result[5].unwrap_i64() as u128) << 64) | result[4].unwrap_i64() as u128;
         assert_eq!(err, expected_err);
     };
 
