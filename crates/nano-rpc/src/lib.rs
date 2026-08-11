@@ -788,25 +788,30 @@ async fn executed(state: &RpcState) -> Result<Executed, RpcError> {
         .ok_or(RpcError::Unavailable)
 }
 
-/// The Stacks-compatible fields describe the chain this node executed, never
-/// the chain its peer advertised: a caller reading an account and a caller
-/// reading the tip have to be told about the same state.
+/// The Stacks fields describe the chain this node executed, while the burn
+/// fields describe the newest burn block it derived locally.
+///
+/// A stock signer compares a `new_burn_block` event with the latter before it
+/// reads the corresponding sortition. Reporting the burn view the Stacks tip
+/// was executed under leaves the signer pending whenever Bitcoin advances
+/// before Stacks execution does.
 async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoWire>, RpcError> {
     // The chain identifier is this node's own, not something a peer tells it.
     // Reading it from a peer view made `/v2/info` unavailable whenever no peer
     // had been heard from, even with a perfectly good executed tip to report —
     // which is the opposite of what this route is for.
     let network_id = state.network.chain_id();
-    let tip = executed(&state).await?.tip;
+    let executed = executed(&state).await?;
+    let tip = executed.tip;
+    let burn = executed.sortitions.first();
     Ok(axum::Json(NodeInfoWire {
-        burn_block_height: tip.bitcoin_height,
+        burn_block_height: burn.map_or(tip.bitcoin_height, |burn| burn.bitcoin_height),
         stacks_tip_height: tip.stacks_height,
         stacks_tip: tip.stacks_block_hash.to_string(),
         stacks_tip_consensus_hash: tip.consensus_hash.to_string(),
-        // The burn view this node has *executed* under, which is the newest
-        // sortition it derived and checked. A node reporting the burnchain tip it
-        // had not yet elected a tenure from would be reporting its peer's view.
-        pox_consensus: tip.consensus_hash.to_string(),
+        pox_consensus: burn
+            .map_or(tip.consensus_hash, |burn| burn.consensus_hash)
+            .to_string(),
         server_version: format!("nano-stacks {}", env!("CARGO_PKG_VERSION")),
         network_id,
     }))
@@ -3166,15 +3171,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// A peer at one height and an executor at another are two facts, and the
-    /// Stacks-compatible route has to answer with the second.
+    /// A peer, a local burnchain, and execution are three separate facts.
     ///
     /// This is the regression for a node that followed mainnet to within three
     /// blocks of the tip for eighty minutes while having executed nothing at
     /// all: it published the peer's height as its own, and the difference was
     /// invisible from every endpoint it served.
     #[tokio::test]
-    async fn the_served_tip_is_the_executed_one_not_the_followed_one() {
+    async fn the_served_stacks_tip_is_executed_and_the_burn_view_is_local() {
         let state = RpcState::new(NETWORK);
         // The peer is at 12; this node has executed nothing beyond 4.
         state.publish(captured_view()).await;
@@ -3186,7 +3190,14 @@ mod tests {
             bitcoin_height: 3,
             state_index_root: TrieHash::from_bytes([9; 32]),
         };
-        state.publish_executed(sealed.clone(), Vec::new()).await;
+        let local_burn = SortitionInfo {
+            bitcoin_height: 5,
+            consensus_hash: ConsensusHash::from_bytes([10; 20]),
+            ..captured_view().tenures[0].sortition.clone()
+        };
+        state
+            .publish_executed(sealed.clone(), vec![local_burn.clone()])
+            .await;
 
         let info = body_json(
             router(state.clone())
@@ -3207,7 +3218,11 @@ mod tests {
             info["stacks_tip"],
             json!(sealed.stacks_block_hash.to_string())
         );
-        assert_eq!(info["burn_block_height"], json!(3));
+        assert_eq!(info["burn_block_height"], json!(5));
+        assert_eq!(
+            info["pox_consensus"],
+            json!(local_burn.consensus_hash.to_string())
+        );
 
         let status = body_json(
             router(state)
