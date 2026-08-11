@@ -261,6 +261,55 @@ fn an_invalid_checkpoint_seed_stops_before_replay_or_artifact_evidence() {
 }
 
 #[test]
+fn missing_checkpoint_authentication_stops_before_artifact_evidence() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask is under the workspace");
+    let temporary = tempfile::tempdir().expect("temporary fixture tree");
+    let fixtures = temporary.path().join("fixtures");
+    copy_tree(
+        &workspace.join("crates/nano-conformance/fixtures"),
+        &fixtures,
+    )
+    .expect("copy fixture tree");
+    fs::remove_dir_all(fixtures.join("chainstate/checkpoint-H/authentication-history"))
+        .expect("remove checkpoint authentication history");
+    let artifact = temporary.path().join("must-not-be-read");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "release-report",
+            "--capture",
+            fixtures.to_str().expect("UTF-8 fixture path"),
+            "--artifact",
+            artifact.to_str().expect("UTF-8 artifact path"),
+            "--no-gates",
+        ])
+        .env("NANO_FIXTURES", &fixtures)
+        .output()
+        .expect("run release report command");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing history passed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("checkpoint authentication history"),
+        "the report did not name the missing history:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("release qualification stopped"),
+        "the report did not say it short-circuited:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\nartifact\n"),
+        "the report inspected an artifact after invalid validation:\n{stdout}"
+    );
+}
+
+#[test]
 fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
     let temporary = tempfile::tempdir().expect("temporary release inputs");
     let fixtures = temporary.path().join("fixtures");
