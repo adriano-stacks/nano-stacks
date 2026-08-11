@@ -380,6 +380,7 @@ tenure_accounting = "$RUN/checkpoint/native-effects.json"
 attesting_block = "$RUN/checkpoint/checkpoint-block.bin"
 attesting_reward_set = "$RUN/checkpoint/reward-set.json"
 sortition = "$RUN/checkpoint/sortition"
+authentication_history = "$RUN/checkpoint/authentication-history"
 
 EOF
         # The signer half is a stock stacks-signer when this node hosts one, so

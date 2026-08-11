@@ -205,6 +205,12 @@ curl -sf "$PEER/v3/stacker_set/$attesting_cycle" -o "$OUT/reward-set.json"
 (cd "$ROOT" && cargo xtask export-sortition \
   "$SORTITION_DB" "$OUT/sortition" "$anchor_bitcoin_height")
 
+(cd "$ROOT" && cargo xtask export-checkpoint-history \
+  --blocks-db "$BLOCKS_DB" \
+  --source-id "$checkpoint_id" \
+  --state-root "$state_root" \
+  --out-dir "$OUT/authentication-history")
+
 # The same manifest a captured fixture publishes, so a checkpoint reads the
 # same whether it came from here or from `cargo xtask capture-fixtures`.
 cat > "$OUT/checkpoint.toml" <<EOF
