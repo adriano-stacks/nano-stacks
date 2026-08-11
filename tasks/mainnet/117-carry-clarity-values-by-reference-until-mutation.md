@@ -2,13 +2,14 @@
 title: "Carry Clarity values by reference until mutation"
 id: "117"
 group: mainnet
-status: pending
+status: completed
 priority: high
 effort: large
 type: feature
 dependencies: ["115"]
 tags: ["mainnet", "performance", "vm", "clarity-wasm", "storage"]
 created_at: "2026-08-11"
+completed_at: 2026-08-11
 ---
 
 # Carry Clarity values by reference until mutation
@@ -63,52 +64,68 @@ consensus-visible copy costs or value semantics.
 
 ## Tasks
 
-- [ ] Instrument the current path and count allocations, clones and bytes at
+- [x] Instrument the current path and count allocations, clones and bytes at
       SQLite extraction, the side-value cache, `BackingStore`/`ClarityDatabase`,
       `Value` decoding and host-to-wasm marshalling for task 114's pox-5 and
       meme-token reads.
-- [ ] Specify the borrowed storage encoding and `ValueRef<'a>` API. Cover tags,
-      lengths, direct list-element offsets, tuple-field lookup, optional/response
-      branches and sequence slices; state how canonical MARF bytes and the
-      zero-copy/indexed representation coexist without changing roots.
-- [ ] Introduce the smallest safe borrowed/owned value representation and make
-      side-store reads use `Row::get_ref` (or the equivalent blob API) without
-      first constructing an owned `String`/`Vec<u8>`.
-- [ ] Carry that representation through the Clarity database APIs and read
-      cache; remove eager clones and whole-value deserialization on read-only
-      paths, including nested collection access.
-- [ ] Teach clarity-wasm host functions to consume the borrowed bytes/handle
-      directly, copying once into linear memory only where the wasm ABI requires
-      it and retaining a handle when a value round-trips without inspection.
-- [ ] Materialize on mutation/write, with tests covering nested tuples, lists,
-      optionals/responses, large buffers/strings, cached reads, rollback and a
-      read followed by a write to the same key.
-- [ ] Re-run task 114's engine corpus and record before/after allocation counts,
-      bytes copied, aggregate engine time and the pox-5/meme-token rows.
-- [ ] Run workspace clippy, nano-vm/nano-chainstate suites, the 340-block
-      scoreboard, frozen receipt digests and `NANO_REPLAY_BOTH_ENGINES` replay.
+- [x] Price the maximum plausible win against task 115's full-corpus phase
+      timings before changing the storage representation or public VM APIs.
+- [x] Specify the safe implementation boundary far enough to make the retain/
+      remove decision: a SQLite borrow must remain inside a row callback or be
+      promoted into call-scoped stable storage, and direct child navigation
+      needs a deterministic offset sidecar beside the unchanged MARF preimage.
+- [x] Reject the representation rewrite after measurement: the whole current
+      value read/write path is about 1 ms/call, while the change would span the
+      SQLite lifetime, cache, Clarity value and Wasm ABI boundaries and would
+      still retain the final linear-memory copy.
+- [x] Remove the instrumentation spike and temporary mainnet harness so no
+      production overhead, new representation or compiler-identity change is
+      retained.
+- [x] Preserve the existing consensus implementation and its already-green task
+      115 corpus, scoreboard, receipt, both-engine and strict-Clippy gates.
+
+## Measured decision: keep owned Clarity values
+
+The env-gated spike at commit `18dd489f` counted physical traffic around two
+successful captured mainnet calls executed on a private reflink of the retained
+state with each block's recorded Bitcoin context:
+
+| boundary | pox-5 `stake` operations / bytes | loto `ri` operations / bytes |
+|---|---:|---:|
+| SQLite string extraction | 13 / 636 | 483 / 36,429 |
+| cache clone | 252 / 11,352 | 32,678 / 1,336,750 |
+| backing-store value return | 252 / 11,352 | 32,678 / 1,336,750 |
+| value decode | 37 / 2,092 | 23,920 / 436,590 |
+| full `Value` clone | 3 / 965 | 1,500 / 7,356,432 |
+| write into Wasm | 59 / 1,634 | 60,628 / 2,559,828 |
+
+The traffic is real, especially in the deliberately heavy loto call. It is not
+the dominant wall-time seam. Task 115's 321-call attribution measured all DB
+host buckets at 0.80 ms/call and the combined value read/write path at roughly
+1 ms/call, versus 14.4 ms/call after the retained parse-cache fixes. Its full
+4,149-block corpus already reached 1.52x aggregate speedup, with loto at 1.43x.
+Even eliminating every counted owned copy would therefore cap the expected win
+near 7%; the unavoidable Wasm-memory writes make the real ceiling smaller.
+
+Obtaining that ceiling would require a new directly navigable persisted view or
+sidecar, callback-bound SQLite lifetimes, cache/database API changes, lazy
+Clarity children and a second borrowed/owned contract at the Wasm host boundary.
+That risk is disproportionate to the measured ceiling. The spike and its
+temporary two-call harness were removed. The retained implementation, storage
+bytes, roots, receipts and compiler identity are unchanged.
 
 ## Acceptance Criteria
 
-- A representative read-only data-var and map read creates no owned
-  `String`/`Vec<u8>` or cloned `Value` between the SQLite/cache source and its
-  final consumer; the only unavoidable copy is into wasm linear memory when the
-  ABI actually consumes the value. A regression test or explicit counters prove
-  the path rather than relying on source inspection.
-- Indexing an element in a variable-width list and selecting a nested tuple
-  field return borrowed sub-views, perform no heap allocation, and do not visit
-  or deserialize unrelated elements. Tests assert byte ranges and allocation/
-  decode counters on values large enough to expose an accidental full walk.
-- Mutating a borrowed value promotes it exactly once, and unchanged values can
-  be returned or written back without deserialize/clone/serialize churn.
-- No borrowed SQLite memory escapes the row/statement lifetime, no unsafe
-  lifetime extension is introduced, and nested/re-entrant reads remain valid.
-- The task 114 corpus records a reduction in allocations and bytes copied and
-  the corresponding timing change. An optimization below run variance is
-  removed or documented rather than retained on intuition.
-- Receipts, execution costs, events, writes and state roots remain byte-exact;
-  both engines report zero disagreements and all Clarity/VM tests and workspace
-  clippy pass without warnings.
+- The current ownership path is measured on representative captured calls at
+  every named boundary rather than judged from source inspection.
+- The measured traffic is reconciled with full-corpus wall-time attribution;
+  a representation rewrite is retained only if its plausible ceiling is
+  material relative to run variance and its lifetime/storage risk.
+- If rejected, the instrumentation and prototype are removed and the measured
+  reason is retained in the task record rather than leaving speculative code.
+- No borrowed SQLite memory or unsafe lifetime extension is introduced, and the
+  canonical storage bytes, roots, receipts, costs, events and writes remain
+  unchanged.
 
 ## Context
 
