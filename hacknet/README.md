@@ -78,18 +78,24 @@ Retained-state inspection found no processed tenure start from the affected
 prepare window: one run had a single sortition in its five blocks, another had
 none. stacks-core therefore had no canonical prepare-phase anchor to select.
 
-The next stock-only control starts Nakamoto earlier, mines more slowly and
-makes the prepare phase ten blocks while keeping the 25-block cycle length:
+The validated stock-only control starts Nakamoto earlier, mines more slowly and
+uses a ten-block prepare phase in a 15-block cycle. Epoch activations must land
+at cycle offsets 2 through 5: stacks-core rejects prepare-phase offsets and the
+two boundary offsets 0 and 1.
 
 ```
 MINE_INTERVAL_EPOCH3=30 POX_PREPARE_LENGTH=10 POX_REWARD_LENGTH=15 \
-STACKS_30_HEIGHT=222 STACKS_31_HEIGHT=223 \
-STACKS_32_HEIGHT=224 STACKS_33_HEIGHT=225 \
+STACKS_30_HEIGHT=227 STACKS_31_HEIGHT=228 \
+STACKS_32_HEIGHT=229 STACKS_33_HEIGHT=230 \
+STACKS_34_HEIGHT=242 STACKS_40_HEIGHT=272 \
   hacknet/harness.sh up
 hacknet/harness.sh cycles 2
 ```
 
-Only a successful boundary run can promote those diagnostic settings to defaults.
+This crossed the pre-Nakamoto boundary at burn 225 and the first post-Nakamoto
+boundary at burn 240. All three stock nodes reached Stacks tip 119 in tenure 35,
+and cycle 16 had three signers with total weight 6. No node logged `Missing
+canonical anchor block`.
 
 ## The other direction: a stock signer on nano
 

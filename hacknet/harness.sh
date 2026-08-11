@@ -43,6 +43,8 @@ STACKS_30_HEIGHT=${STACKS_30_HEIGHT:-232}
 STACKS_31_HEIGHT=${STACKS_31_HEIGHT:-233}
 STACKS_32_HEIGHT=${STACKS_32_HEIGHT:-234}
 STACKS_33_HEIGHT=${STACKS_33_HEIGHT:-235}
+STACKS_34_HEIGHT=${STACKS_34_HEIGHT:-242}
+STACKS_40_HEIGHT=${STACKS_40_HEIGHT:-262}
 # Where the node binaries are. Release by default: this node executes every
 # block it is given, and a debug build is too slow to keep up with a tenure.
 BIN=${NANO_BIN_DIR:-$ROOT/target/release}
@@ -73,6 +75,7 @@ compose() {
         STACKING_CYCLES="$STACKING_CYCLES" \
         STACKS_30_HEIGHT="$STACKS_30_HEIGHT" STACKS_31_HEIGHT="$STACKS_31_HEIGHT" \
         STACKS_32_HEIGHT="$STACKS_32_HEIGHT" STACKS_33_HEIGHT="$STACKS_33_HEIGHT" \
+        STACKS_34_HEIGHT="$STACKS_34_HEIGHT" STACKS_40_HEIGHT="$STACKS_40_HEIGHT" \
         docker compose -f docker/docker-compose.yml --profile default -p "$PROJECT" "$@")
 }
 

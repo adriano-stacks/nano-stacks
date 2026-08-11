@@ -2,13 +2,14 @@
 id: "044"
 group: mainnet
 title: "Name a reward cycle nobody stacked for"
-status: in-progress
+status: completed
 priority: medium
 effort: small
 type: bug
 dependencies: ["043"]
 tags: ["chainstate", "signer", "hacknet"]
 created_at: 2026-07-30
+completed_at: 2026-08-11
 ---
 
 # Name a reward cycle nobody stacked for
@@ -97,9 +98,10 @@ window in the middle, which is worth knowing before planning to validate on it.
       notes the stacker needed a pox-5 path; this is the rest of it. The harness
       now locks for 12 cycles, reports the future pox-5 signer-set horizon, and
       has a `cycles` command that fails on a missing set or frozen Stacks tip.
-- [ ] Find why a fresh genesis wedges on `Missing canonical anchor block` at
+- [x] Find why a fresh genesis wedges on `Missing canonical anchor block` at
       the first cycle boundary, and whether the boot needs a longer pre-Nakamoto
-      run or a prepared snapshot.
+      run or a prepared snapshot. An earlier transition, ten-block prepare
+      window and 30-second Nakamoto mining cadence crossed it from genesis.
 
 ## Acceptance Criteria
 
@@ -119,10 +121,11 @@ Stacks tip and a non-empty `/v3/stacker_set` on the far side. The offline shell
 test pins the compose inputs, Clarity uint encoding, horizon diagnosis and
 reward-set summary without starting Docker.
 
-The earlier-Nakamoto idea is still a hypothesis. The harness passes the four
-epoch heights as overrides but keeps Hacknet's defaults. The README gives the
-`222..225` diagnostic command, followed by `cycles 2`; until that stock-only run
-crosses the boundary, the fresh-genesis item above stays open.
+The harness exposes every Nakamoto epoch height needed by the control. The
+original `222..225` proposal was invalid: with reward-cycle length 15 and
+prepare length 10, 222 is prepare-phase offset 12. Epoch 3.0 and Epoch 4.0 now
+start at 227 and 272, both reward-phase offset 2, and the intermediate epochs
+remain ordered.
 
 ## The stock coordinator confirms the missing condition
 
@@ -139,8 +142,10 @@ an anchor-selection arithmetic error. stacks-core's own consensus harness also
 mines out of a pre-Nakamoto prepare phase before switching block formats, with
 the comment that otherwise it may fail to calculate the PoX anchor.
 
-The proposed control therefore changes the three inputs that can make the
-required header exist: Nakamoto begins earlier, Bitcoin waits 30 seconds per
-block, and the prepare window is ten blocks. Source inspection proves that this
-targets the refusal; only the fresh stock-only run can prove that the timing is
-sufficient, so the task remains open until `cycles 2` crosses it.
+The control changes the three inputs that make the required header exist:
+Nakamoto begins earlier, Bitcoin waits 30 seconds per block, and the prepare
+window is ten blocks. The isolated stock-only run crossed cycle 15 at burn 225
+with Stacks tip 22, then crossed the first post-Nakamoto boundary into cycle 16
+at burn 240 with Stacks tip 119 and tenure 35. All three participants agreed;
+cycle 16 had three signers with total weight 6, and no node logged `Missing
+canonical anchor block`.
