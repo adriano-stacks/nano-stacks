@@ -4518,11 +4518,21 @@ mod tests {
         let bitcoin_operations = captured_bitcoin_operations(&fixture).expect("Bitcoin operations");
         let mut chainstate = captured_chainstate(&fixture);
 
+        let captured = captured_block_paths(&fixture)
+            .into_iter()
+            .map(|path| {
+                NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
+                    .expect("decode block")
+            })
+            .collect::<Vec<_>>();
+        let tenure_start = captured
+            .iter()
+            .position(nano_chainstate::starts_new_tenure)
+            .expect("a captured tenure-start block");
+        let through_tenure = tenure_start.saturating_add(3).min(captured.len());
         let mut parent = Some(source);
         let mut blocks = Vec::new();
-        for path in captured_block_paths(&fixture).into_iter().take(8) {
-            let block = NanoNakamotoBlock::decode(&fs::read(&path).expect("read block"))
-                .expect("decode block");
+        for block in captured.into_iter().take(through_tenure) {
             let view = block.header.consensus_hash.to_string();
             chainstate
                 .append_unauthenticated_fixture_block_with_bitcoin_operations(
