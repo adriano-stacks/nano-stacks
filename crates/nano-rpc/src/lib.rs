@@ -347,6 +347,27 @@ impl RpcState {
         self.stackerdb.clone()
     }
 
+    /// Accept a `StackerDB` chunk and announce it to event observers.
+    ///
+    /// Both an HTTP upload and a peer replication round enter through here, so a
+    /// signer hosted by this node sees miner proposals whichever path delivered
+    /// them.
+    pub async fn accept_stackerdb_chunk(
+        &self,
+        contract_id: &str,
+        chunk: nano_stackerdb::Chunk,
+    ) -> Result<(), ChunkRefusal> {
+        self.stackerdb
+            .write()
+            .await
+            .put(contract_id, chunk.clone())?;
+        self.dispatch(
+            EventKind::StackerDbChunks,
+            &stackerdb_chunks_payload(contract_id, std::slice::from_ref(&chunk)),
+        );
+        Ok(())
+    }
+
     /// Serve accounts and read-only calls from this executed Clarity state.
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<Mutex<dyn ChainAccess>>) -> Self {
@@ -1565,7 +1586,7 @@ async fn stackerdb_chunk_upload(
     let contract_id = format!("{address}.{contract}");
     let announce = chunk.clone();
     let slot_id = chunk.slot_id;
-    let accepted = state.stackerdb.write().await.put(&contract_id, chunk);
+    let accepted = state.accept_stackerdb_chunk(&contract_id, chunk).await;
     // What the slot holds *now*, which a refused writer needs: stacks-core answers
     // a refusal with the current metadata so the writer can pick up the version,
     // and a client told nothing walks its version number up one request at a time
@@ -1582,14 +1603,6 @@ async fn stackerdb_chunk_upload(
         });
     Ok(axum::Json(match accepted {
         Ok(()) => {
-            // A chunk becomes news exactly when a slot takes it, which is here:
-            // this route is the only way a chunk enters a nano node, so it is
-            // the transition an observer — a signer watching its own reward
-            // cycle's contracts — is waiting on.
-            state.dispatch(
-                EventKind::StackerDbChunks,
-                &stackerdb_chunks_payload(&contract_id, std::slice::from_ref(&announce)),
-            );
             // A chunk written here has to leave here, or a signer this node hosts
             // is talking to nobody: the miner counting its response reads the
             // chunk from its own replica, and nothing else carries it there.
@@ -4031,7 +4044,7 @@ mod tests {
 
     /// A chunk becomes news when a slot takes it, and only then.
     #[tokio::test]
-    async fn an_accepted_chunk_is_announced_and_a_refused_one_is_not() {
+    async fn every_accepted_chunk_is_announced_and_a_refused_one_is_not() {
         let writer = key(b"signer");
         let (url, received) = recording_observer().await;
         let state = RpcState::new(NETWORK).with_observers(EventDispatcher::new(vec![url]));
@@ -4041,7 +4054,7 @@ mod tests {
                 &writer.public_key().to_bytes_compressed(),
             )],
         );
-        let app = router(state);
+        let app = router(state.clone());
         let put = |chunk: nano_stackerdb::Chunk, app: Router| async move {
             app.oneshot(
                 Request::builder()
@@ -4090,16 +4103,36 @@ mod tests {
             json!(hex::encode(b"a response"))
         );
 
+        let mut replicated = nano_stackerdb::Chunk::new(0, 2, b"a proposal".to_vec());
+        replicated.sign(&writer).expect("sign chunk");
+        state
+            .accept_stackerdb_chunk("ST000000000000000000002AMW42H.signers-0-1", replicated)
+            .await
+            .expect("accept a replicated chunk");
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if received.lock().expect("record").len() == 2 {
+                break;
+            }
+        }
+        let announced = received.lock().expect("record").clone();
+        assert_eq!(announced.len(), 2);
+        assert_eq!(announced[1].0, "stackerdb_chunks");
+        assert_eq!(
+            announced[1].1["modified_slots"][0]["data"],
+            json!(hex::encode(b"a proposal"))
+        );
+
         // A chunk a slot refuses changed nothing, so there is nothing to say.
         let stranger = key(b"stranger");
-        let mut forged = nano_stackerdb::Chunk::new(0, 2, b"forged".to_vec());
+        let mut forged = nano_stackerdb::Chunk::new(0, 3, b"forged".to_vec());
         forged.sign(&stranger).expect("sign chunk");
         assert_eq!(
             body_json(put(forged, app).await).await["accepted"],
             json!(false)
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(received.lock().expect("record").len(), 1);
+        assert_eq!(received.lock().expect("record").len(), 2);
     }
 
     /// The reward set this node derives and serves is one it can read back, which

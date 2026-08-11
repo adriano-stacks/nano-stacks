@@ -874,7 +874,7 @@ async fn pull(client: &StackerDbClient, state: &RpcState, contract: &StackerDbCo
         };
         // Verified against the writer this node assigned the slot, inside `put`:
         // a peer serving a forged chunk gets it refused here.
-        let taken = state.stackerdb().write().await.put(&contract_id, chunk);
+        let taken = state.accept_stackerdb_chunk(&contract_id, chunk).await;
         if let Err(refusal) = taken {
             eprintln!(
                 "the chunk the peer holds for {contract_id} slot {} is not one this node \
