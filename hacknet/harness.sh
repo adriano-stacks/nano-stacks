@@ -413,8 +413,8 @@ nano_start() {
     local index=${1:?participant index}
     nano_stop
     nano_config "$index"
-    "$BIN/stacks-node" start --config "$RUN/nano.toml" \
-        >> "$RUN/nano.log" 2>&1 &
+    nohup setsid "$BIN/stacks-node" start --config "$RUN/nano.toml" \
+        >> "$RUN/nano.log" 2>&1 < /dev/null &
     echo $! > "$RUN/nano.pid"
     printf 'nano runs as pid %s, logging to %s\n' "$(cat "$RUN/nano.pid")" "$RUN/nano.log" >&2
 }
