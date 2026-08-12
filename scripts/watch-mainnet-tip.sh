@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 7 ]; then
-    echo "usage: $0 OUTPUT RPC_URL METRICS_URL BITCOIN_TIP_URL SYSTEMD_UNIT STATE_DIR CONFIG" >&2
+if [ "$#" -ne 10 ]; then
+    echo "usage: $0 OUTPUT RPC_URL METRICS_URL BITCOIN_TIP_URL SYSTEMD_UNIT STATE_DIR CONFIG EVENT_DIR NODE_LOG ORACLE_URL" >&2
     exit 2
 fi
 
@@ -13,6 +13,11 @@ readonly bitcoin_tip_url="$4"
 readonly unit="$5"
 readonly state_dir="$6"
 readonly config="$7"
+readonly event_dir="$8"
+readonly node_log="$9"
+readonly oracle_url="${10%/}"
+verifier="$(dirname "$0")/verify-mainnet-observer.py"
+readonly verifier
 readonly interval_seconds=60
 readonly duration_seconds=86400
 
@@ -33,8 +38,47 @@ read_bitcoin_tip() {
     printf '%s\n' "$height"
 }
 
+latest_event_height() {
+    find "$event_dir/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+        sed -n 's/^0*\([0-9][0-9]*\)-.*$/\1/p' |
+        sort -n |
+        tail -n 1
+}
+
+verify_pending_events() {
+    local path height root result status
+    while IFS= read -r path; do
+        height="$(basename "$path")"
+        height="${height%%-*}"
+        height="$((10#$height))"
+        [ "$height" -gt "$last_verified_event_height" ] || continue
+        root="$(rg "^executed $height at burn .* verified root " "$node_log" | tail -n 1 | awk '{print $NF}' || true)"
+        [ -n "$root" ] || return 0
+
+        set +e
+        result="$($verifier "$path" "$oracle_url" "$root" 2> "$oracle_error")"
+        status="$?"
+        set -e
+        case "$status" in
+            0)
+                printf '%s\n' "$result" >> "$output"
+                last_verified_event_height="$height"
+                ;;
+            75)
+                return 0
+                ;;
+            *)
+                fail "$(cat "$oracle_error")"
+                ;;
+        esac
+    done < <(find "$event_dir/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%p\n' | sort)
+}
+
 test -d "$state_dir" || { echo "state directory is absent: $state_dir" >&2; exit 1; }
 test -r "$config" || { echo "config is unreadable: $config" >&2; exit 1; }
+test -d "$event_dir/new_block" || { echo "observer block directory is absent: $event_dir" >&2; exit 1; }
+test -r "$node_log" || { echo "node log is unreadable: $node_log" >&2; exit 1; }
+test -x "$verifier" || { echo "oracle verifier is not executable: $verifier" >&2; exit 1; }
 test ! -s "$output" || { echo "output already contains a run: $output" >&2; exit 1; }
 mkdir -p "$(dirname "$output")"
 : > "$output"
@@ -48,6 +92,8 @@ readonly initial_pid
 test "$initial_pid" -gt 0 || fail "the release unit has no main process"
 initial_start_ticks="$(awk '{print $22}' "/proc/$initial_pid/stat")"
 readonly initial_start_ticks
+tr '\0' '\n' < "/proc/$initial_pid/environ" | rg -qx 'NANO_TRACE_ROOTS=.*' || \
+    fail "the release process does not trace every verified state root"
 executable="$(readlink -f "/proc/$initial_pid/exe")"
 readonly executable
 executable_sha256="$(sha256sum "$executable" | awk '{print $1}')"
@@ -58,6 +104,12 @@ readonly config_sha256
 initial_sync="$(curl -fsS --max-time 10 "$rpc_url/nano/sync_status")" || \
     fail "the release RPC did not answer before the soak"
 initial_bitcoin_tip="$(read_bitcoin_tip)" || fail "the Bitcoin tip source did not answer"
+initial_event_height="$(latest_event_height)"
+test -n "$initial_event_height" || fail "the observer has no accepted block event"
+last_verified_event_height="$initial_event_height"
+oracle_error="$(mktemp)"
+readonly oracle_error
+trap 'rm -f -- "$oracle_error"' EXIT
 jq -e '
     .blocks_behind == 0 and
     .p2p_sessions > 0 and
@@ -74,6 +126,10 @@ jq -cn \
     --arg config "$config" \
     --arg config_sha256 "$config_sha256" \
     --arg state_dir "$state_dir" \
+    --arg event_dir "$event_dir" \
+    --arg node_log "$node_log" \
+    --arg oracle_url "$oracle_url" \
+    --argjson initial_event_height "$initial_event_height" \
     --arg bitcoin_tip_url "$bitcoin_tip_url" \
     --argjson bitcoin_tip "$initial_bitcoin_tip" \
     --argjson duration_seconds "$duration_seconds" \
@@ -87,6 +143,10 @@ jq -cn \
         config: $config,
         config_sha256: $config_sha256,
         state_dir: $state_dir,
+        event_dir: $event_dir,
+        node_log: $node_log,
+        oracle_url: $oracle_url,
+        initial_event_height: $initial_event_height,
         bitcoin_tip_url: $bitcoin_tip_url,
         bitcoin_tip: $bitcoin_tip,
         duration_seconds: $duration_seconds
@@ -119,6 +179,8 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         /^nano_(block_refusals_total|peer_failovers_total|sync_rounds_unanswered_total|stackerdb_rounds_unanswered_total|pushed_blocks_(accepted|refused)_total|followed_stacks_height|selected_stacks_height|burn_height|last_sealed_timestamp_seconds|serving_peers|staged_blocks|relay_(offered|dropped)|queued_(blocks|proposals|stackerdb_chunks|transactions))([ {]|$)/ { print }
     ')"
 
+    verify_pending_events
+
     jq -cn \
         --arg timestamp "$(date -u +%FT%TZ)" \
         --argjson elapsed_seconds "$SECONDS" \
@@ -131,6 +193,7 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         --argjson open_files "$open_files" \
         --argjson disk_available "$disk_available" \
         --argjson db_sizes "$db_sizes" \
+        --argjson oracle_height "$last_verified_event_height" \
         --arg metrics "$selected_metrics" \
         '{
             type: "sample",
@@ -147,13 +210,20 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
                 disk_available: $disk_available,
                 database_bytes: $db_sizes
             },
+            oracle_verified_height: $oracle_height,
             metrics: ($metrics | split("\n") | map(select(length > 0)))
         }' >> "$output"
 
     sleep "$interval_seconds"
 done
 
+verify_pending_events
+latest_height="$(latest_event_height)"
+[ "$last_verified_event_height" -ge "$latest_height" ] || \
+    fail "oracle verification remains pending at $last_verified_event_height of $latest_height"
+
 jq -cn \
     --arg timestamp "$(date -u +%FT%TZ)" \
     --argjson elapsed_seconds "$SECONDS" \
-    '{type: "complete", timestamp: $timestamp, elapsed_seconds: $elapsed_seconds}' >> "$output"
+    --argjson oracle_height "$last_verified_event_height" \
+    '{type: "complete", timestamp: $timestamp, elapsed_seconds: $elapsed_seconds, oracle_verified_height: $oracle_height}' >> "$output"
