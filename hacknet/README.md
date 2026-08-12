@@ -133,6 +133,25 @@ stage. The clone, the checkpoint, the configuration, the log and every byte of
 nano's own state live under `~/.cache/nano-stacks/hacknet` (`NANO_HACKNET_HOME`),
 with the node's state in `run/nano`.
 
+For an isolated run, give every host-visible and Docker-visible resource a new
+name. The compatibility patch preserves the historical defaults, while these
+variables make a second project disjoint:
+
+```sh
+export NANO_HACKNET_HOME=$HOME/.cache/nano-stacks/hacknet-054
+export NANO_HACKNET_PROJECT=nano054
+export NANO_HACKNET_CONTAINER_PREFIX=nano054-
+export NANO_HACKNET_NETWORK_PREFIX=10.121.0
+export NANO_BITCOIN_RPC_PORT=58443 NANO_BITCOIN_PEER_PORT=58444
+export NANO_MINER_1_RPC_PORT=30443 NANO_MINER_2_RPC_PORT=31443
+export NANO_MINER_3_RPC_PORT=32443
+export NANO_STACKS_API_EVENT_PORT=53700 NANO_STACKS_API_RPC_PORT=53999
+```
+
+The project then has its own checkout, chainstate, subnet, container names and
+loopback ports. Do not point a new acceptance run at a retained project's
+directory or ports.
+
 Compose is driven directly rather than through Hacknet's Makefile, whose Linux
 path assumes rootful Docker: it removes chainstate with `sudo` and extracts
 archives with `sudo tar`. The commands mirror `make build`, `make genesis`,

@@ -23,7 +23,14 @@ RUN=$HOME_DIR/run
 PROJECT=${NANO_HACKNET_PROJECT:-hacknet}
 
 # Host endpoints Hacknet publishes.
-BITCOIN_RPC=${BITCOIN_RPC:-http://127.0.0.1:18443}
+BITCOIN_RPC_PORT=${NANO_BITCOIN_RPC_PORT:-18443}
+BITCOIN_PEER_PORT=${NANO_BITCOIN_PEER_PORT:-18444}
+MINER_1_RPC_PORT=${NANO_MINER_1_RPC_PORT:-20443}
+MINER_2_RPC_PORT=${NANO_MINER_2_RPC_PORT:-21443}
+MINER_3_RPC_PORT=${NANO_MINER_3_RPC_PORT:-22443}
+STACKS_API_EVENT_PORT=${NANO_STACKS_API_EVENT_PORT:-3700}
+STACKS_API_RPC_PORT=${NANO_STACKS_API_RPC_PORT:-3999}
+BITCOIN_RPC=${BITCOIN_RPC:-http://127.0.0.1:$BITCOIN_RPC_PORT}
 # Bitcoin height at which the bitcoin-miner stops producing blocks.
 PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 # Seconds between Bitcoin blocks once Nakamoto is active.
@@ -55,9 +62,9 @@ die() { printf 'harness: %s\n' "$*" >&2; exit 1; }
 # The node RPC endpoint Hacknet publishes for one miner index.
 peer_url() {
     case ${1:?miner index} in
-    1) echo "http://127.0.0.1:20443" ;;
-    2) echo "http://127.0.0.1:21443" ;;
-    3) echo "http://127.0.0.1:22443" ;;
+    1) echo "http://127.0.0.1:$MINER_1_RPC_PORT" ;;
+    2) echo "http://127.0.0.1:$MINER_2_RPC_PORT" ;;
+    3) echo "http://127.0.0.1:$MINER_3_RPC_PORT" ;;
     *) die "no such participant: $1" ;;
     esac
 }
@@ -76,6 +83,15 @@ compose() {
         STACKS_30_HEIGHT="$STACKS_30_HEIGHT" STACKS_31_HEIGHT="$STACKS_31_HEIGHT" \
         STACKS_32_HEIGHT="$STACKS_32_HEIGHT" STACKS_33_HEIGHT="$STACKS_33_HEIGHT" \
         STACKS_34_HEIGHT="$STACKS_34_HEIGHT" STACKS_40_HEIGHT="$STACKS_40_HEIGHT" \
+        NANO_HACKNET_NETWORK_PREFIX="${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}" \
+        NANO_HACKNET_CONTAINER_PREFIX="${NANO_HACKNET_CONTAINER_PREFIX:-}" \
+        NANO_BITCOIN_RPC_PORT="$BITCOIN_RPC_PORT" \
+        NANO_BITCOIN_PEER_PORT="$BITCOIN_PEER_PORT" \
+        NANO_MINER_1_RPC_PORT="$MINER_1_RPC_PORT" \
+        NANO_MINER_2_RPC_PORT="$MINER_2_RPC_PORT" \
+        NANO_MINER_3_RPC_PORT="$MINER_3_RPC_PORT" \
+        NANO_STACKS_API_EVENT_PORT="$STACKS_API_EVENT_PORT" \
+        NANO_STACKS_API_RPC_PORT="$STACKS_API_RPC_PORT" \
         docker compose -f docker/docker-compose.yml --profile default -p "$PROJECT" "$@")
 }
 
@@ -132,7 +148,8 @@ setup() {
     git -C "$SRC" -c advice.detachedHead=false checkout --quiet --force "$HACKNET_COMMIT"
     git -C "$SRC" clean --quiet -fd -e docker/chainstate
     log "applying the nano compatibility patches"
-    for patch in "$ROOT"/hacknet/hacknet-main.patch "$ROOT"/hacknet/hacknet-api-main.patch; do
+    for patch in "$ROOT"/hacknet/hacknet-main.patch "$ROOT"/hacknet/hacknet-api-main.patch \
+        "$ROOT"/hacknet/hacknet-isolation.patch; do
         git -C "$SRC" apply --unidiff-zero "$patch"
         printf '  applied %s\n' "$(basename "$patch")" >&2
     done

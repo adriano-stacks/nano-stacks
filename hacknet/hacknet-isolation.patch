@@ -1,0 +1,152 @@
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index 59bdeb6..edf0764 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -50,14 +50,14 @@ x-common-vars:
+   # Container Static IP assignments
+   #   *Note*: The stacks miner ip's are used for the bootstrap config later in this file
+-  - &DOCKER_NETWORK_CIDR 10.0.0.0/24
+-  - &DOCKER_NETWORK_GATEWAY 10.0.0.1
+-  - &STACKS_MINER_1_IP 10.0.0.101
+-  - &STACKS_MINER_2_IP 10.0.0.102
+-  - &STACKS_MINER_3_IP 10.0.0.103
+-  - &STACKS_SIGNER_1_IP 10.0.0.111
+-  - &STACKS_SIGNER_2_IP 10.0.0.112
+-  - &STACKS_SIGNER_3_IP 10.0.0.113
+-  - &POSTGRES_IP 10.0.0.200
+-  - &STACKS_API_IP 10.0.0.201
+-  - &BITCOIN_IP 10.0.0.250
+-  - &BITCOIN_MINER_IP 10.0.0.251
++  - &DOCKER_NETWORK_CIDR "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.0/24"
++  - &DOCKER_NETWORK_GATEWAY "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.1"
++  - &STACKS_MINER_1_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.101"
++  - &STACKS_MINER_2_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.102"
++  - &STACKS_MINER_3_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.103"
++  - &STACKS_SIGNER_1_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.111"
++  - &STACKS_SIGNER_2_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.112"
++  - &STACKS_SIGNER_3_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.113"
++  - &POSTGRES_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.200"
++  - &STACKS_API_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.201"
++  - &BITCOIN_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.250"
++  - &BITCOIN_MINER_IP "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.251"
+@@ -164,4 +164,4 @@ x-stacks-node: &stacks-node
+     STACKS_LOG_DEBUG: *STACKS_LOG_DEBUG
+     STACKS_LOG_FORMAT_TIME: *STACKS_LOG_FORMAT_TIME
+     # Use static IP's defined in x-common-vars for the bootstrap nodes in case one or more miners are stopped/crashed and docker removes the DNS entry
+-    BOOTSTRAP_NODE: "0383bca67d28fce336ea7c2fc1120ecc63fbe55e89251e20587c2eb877f971e56b@10.0.0.101:20444,037f705fffab4de974d10563828ee3bf0c3e2e4f318f9ae670b8374a7b890195a2@10.0.0.102:20444,03180a98f60f943f1594adec7cd39d639a0cc5109a33219c268c796d55096fe66b@10.0.0.103:20444"
++    BOOTSTRAP_NODE: "0383bca67d28fce336ea7c2fc1120ecc63fbe55e89251e20587c2eb877f971e56b@${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.101:20444,037f705fffab4de974d10563828ee3bf0c3e2e4f318f9ae670b8374a7b890195a2@${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.102:20444,03180a98f60f943f1594adec7cd39d639a0cc5109a33219c268c796d55096fe66b@${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}.103:20444"
+@@ -206,10 +206,10 @@ services:
+   # --------------------
+   bitcoin:
+     image: *IMAGE_BITCOIN
+-    container_name: bitcoin
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}bitcoin"
+     volumes:
+       - ./bitcoin/bitcoin.conf:/root/.bitcoin/bitcoin.conf
+       - ${CHAINSTATE_DIR}/bitcoin:/root/.bitcoin/regtest
+     ports:
+-      - '127.0.0.1:18443:18443'
+-      - '127.0.0.1:18444:18444'
++      - "127.0.0.1:${NANO_BITCOIN_RPC_PORT:-18443}:18443"
++      - "127.0.0.1:${NANO_BITCOIN_PEER_PORT:-18444}:18444"
+@@ -232,4 +232,4 @@ services:
+ 
+   bitcoin-miner:
+     image: *IMAGE_BITCOIN
+-    container_name: bitcoin-miner
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}bitcoin-miner"
+@@ -278,3 +278,3 @@ services:
+   # ------------------
+   stacks-miner-1:
+-    container_name: stacks-miner-1
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-miner-1"
+@@ -299,4 +299,4 @@ services:
+       BLOCK_PUSH_FAIL_PROBABILITY: *STACKS_MINER_1_BLOCK_PUSH_FAIL_PROBABILITY
+       STACKS_EVENT_OBSERVER: stacks-api:3700
+     ports:
+-      - '127.0.0.1:20443:20443'
++      - "127.0.0.1:${NANO_MINER_1_RPC_PORT:-20443}:20443"
+@@ -312,3 +312,3 @@ services:
+ 
+   stacks-miner-2:
+-    container_name: stacks-miner-2
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-miner-2"
+@@ -330,3 +330,3 @@ services:
+       BLOCK_PUSH_FAIL_PROBABILITY: *STACKS_MINER_2_BLOCK_PUSH_FAIL_PROBABILITY
+     ports:
+-      - '127.0.0.1:21443:20443'
++      - "127.0.0.1:${NANO_MINER_2_RPC_PORT:-21443}:20443"
+@@ -343,3 +343,3 @@ services:
+ 
+   stacks-miner-3:
+-    container_name: stacks-miner-3
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-miner-3"
+@@ -361,3 +361,3 @@ services:
+       BLOCK_PUSH_FAIL_PROBABILITY: *STACKS_MINER_3_BLOCK_PUSH_FAIL_PROBABILITY
+     ports:
+-      - '127.0.0.1:22443:20443'
++      - "127.0.0.1:${NANO_MINER_3_RPC_PORT:-22443}:20443"
+@@ -374,3 +374,3 @@ services:
+ 
+   stacks-signer-1:
+-    container_name: stacks-signer-1
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-1"
+@@ -388,3 +388,3 @@ services:
+ 
+   stacks-signer-2:
+-    container_name: stacks-signer-2
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-2"
+@@ -402,3 +402,3 @@ services:
+ 
+   stacks-signer-3:
+-    container_name: stacks-signer-3
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-3"
+@@ -419,4 +419,4 @@ services:
+   # ------------------
+   postgres:
+     image: *IMAGE_POSTGRES
+-    container_name: postgres
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}postgres"
+@@ -443,5 +443,5 @@ services:
+   stacks-api:
+     build:
+       context: api
+     image: hacknet/stacks-api:9.0.1-pox5-core-main
+-    container_name: stacks-api
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-api"
+@@ -461,7 +461,7 @@ services:
+       STACKS_BLOCKCHAIN_API_HOST: "0.0.0.0"
+       STACKS_CORE_RPC_HOST: "stacks-miner-1"
+       STACKS_CORE_RPC_PORT: 20443
+-      API_DOCS_URL: http://127.0.0.1:3999/doc
++      API_DOCS_URL: "http://127.0.0.1:${NANO_STACKS_API_RPC_PORT:-3999}/doc"
+     ports:
+-      - '127.0.0.1:3700:3700'
+-      - '127.0.0.1:3999:3999'
++      - "127.0.0.1:${NANO_STACKS_API_EVENT_PORT:-3700}:3700"
++      - "127.0.0.1:${NANO_STACKS_API_RPC_PORT:-3999}:3999"
+@@ -480,5 +480,5 @@ services:
+   # ------------------
+   # Deploy the configured non-mainnet sBTC dependencies before Epoch 4.0.
+   pox5-setup:
+     build: stacker
+-    container_name: pox5-setup
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}pox5-setup"
+@@ -510,4 +510,4 @@ services:
+ 
+   stacker:
+     build: stacker
+-    container_name: stacker
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacker"
+@@ -539,4 +539,4 @@ services:
+ 
+   bitcoin-staking:
+     build: stacker
+-    container_name: bitcoin-staking
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}bitcoin-staking"
+@@ -575,4 +575,4 @@ services:
+ 
+   tx-broadcaster:
+     build: stacker
+-    container_name: tx-broadcaster
++    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}tx-broadcaster"
