@@ -18,17 +18,22 @@ readonly stock_rpcs=("$@")
 test ! -e "$output" || { echo "output already exists: $output" >&2; exit 1; }
 test -d "$event_dir/new_block" || { echo "new_block events are absent: $event_dir" >&2; exit 1; }
 
+fetch() {
+    curl --fail --silent --show-error --max-time 20 \
+        --retry 8 --retry-delay 1 --retry-all-errors "$@"
+}
+
 parent="$(dirname "$output")"
 mkdir -p "$parent"
 temporary="$(mktemp -d "$parent/.signer-evidence.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
 mkdir -p "$temporary/block" "$temporary/new_block" "$temporary/oracles" "$temporary/stacker_set"
 
-curl -fsS --max-time 20 "$nano_rpc/v2/pox" -o "$temporary/pox.json"
-curl -fsS --max-time 20 "$nano_rpc/v3/stacker_set/$cycle" \
+fetch "$nano_rpc/v2/pox" -o "$temporary/pox.json"
+fetch "$nano_rpc/v3/stacker_set/$cycle" \
     -o "$temporary/oracles/nano-cycle-$cycle.json"
 for index in "${!stock_rpcs[@]}"; do
-    curl -fsS --max-time 20 "${stock_rpcs[$index]%/}/v3/stacker_set/$cycle" \
+    fetch "${stock_rpcs[$index]%/}/v3/stacker_set/$cycle" \
         -o "$temporary/oracles/stock-$index-cycle-$cycle.json"
 done
 
@@ -56,7 +61,7 @@ rm "$temporary/events.list"
 while IFS= read -r event; do
     index_block_hash="$(jq -er '.index_block_hash' "$event")"
     index_block_hash="${index_block_hash#0x}"
-    curl -fsS --max-time 20 "$nano_rpc/v3/blocks/$index_block_hash" \
+    fetch "$nano_rpc/v3/blocks/$index_block_hash" \
         -o "$temporary/block/$index_block_hash.bin"
 done < <(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f | sort)
 
