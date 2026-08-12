@@ -75,16 +75,69 @@ impl ComplexWord for DefaultTo {
         // Charged after the operands, as `dispatch_args` does; see `ok`.
         self.charge(generator, builder, 0)?;
 
-        // The payload sits on top of the stack with the indicator underneath it,
-        // so it converts in place before either is consumed. A `none` converts
-        // its placeholder along with it, which costs a few instructions and
-        // cannot be read: the indicator says the value is not there.
+        // The payload sits on top of the stack with the indicator underneath
+        // it. When the analysed payload is wider than this expression's type,
+        // it converts on the branch that knows the value is there: a `none`
+        // carries a placeholder, and preserving a placeholder's runtime shape
+        // reads memory a placeholder principal does not have — mainnet block
+        // 8,742,090 failed on exactly that read.
         if need_ducktyping(&opt_val_ty, &expr_type) {
             let workspace = match dt_needed_workspace(&expr_type) {
                 0 => None,
                 size => Some(generator.create_call_stack_bytes(builder, size as i32).0),
             };
-            generator.duck_type_preserve(builder, &opt_val_ty, &expr_type, workspace)?;
+            let payload_locals = generator.save_to_locals(builder, &opt_val_ty, true);
+            let indicator = generator.alloc_local(ValType::I32);
+            builder.local_set(indicator);
+            let default_locals = generator.save_to_locals(builder, &expr_type, true);
+
+            if uses_packed_value(&expr_type) {
+                generator.note_control_arity(
+                    clar2wasm_ty(&expr_type).len(),
+                    clar2wasm_ty(&expr_type).len(),
+                );
+                let (result_offset, _) =
+                    generator.create_call_stack_local(builder, &expr_type, true, false);
+                let mut then = builder.dangling_instr_seq(None);
+                for local in &payload_locals {
+                    then.local_get(*local);
+                }
+                generator.duck_type_preserve(&mut then, &opt_val_ty, &expr_type, workspace)?;
+                generator.write_to_memory(&mut then, result_offset, 0, &expr_type)?;
+                let then = then.id();
+                let mut else_ = builder.dangling_instr_seq(None);
+                for local in &default_locals {
+                    else_.local_get(*local);
+                }
+                generator.write_to_memory(&mut else_, result_offset, 0, &expr_type)?;
+                let else_ = else_.id();
+                builder.local_get(indicator).instr(IfElse {
+                    consequent: then,
+                    alternative: else_,
+                });
+                generator.read_from_memory(builder, result_offset, 0, &expr_type)?;
+            } else {
+                let out_types = clar2wasm_ty(&expr_type);
+                let block_type = generator.bounded_control_type(&[], &out_types)?;
+                let mut then = builder.dangling_instr_seq(block_type);
+                for local in &payload_locals {
+                    then.local_get(*local);
+                }
+                generator.duck_type_preserve(&mut then, &opt_val_ty, &expr_type, workspace)?;
+                let then = then.id();
+                let mut else_ = builder.dangling_instr_seq(block_type);
+                for local in &default_locals {
+                    else_.local_get(*local);
+                }
+                let else_ = else_.id();
+                builder.local_get(indicator).instr(IfElse {
+                    consequent: then,
+                    alternative: else_,
+                });
+            }
+            generator.release_locals(payload_locals);
+            generator.release_locals(default_locals);
+            return Ok(());
         }
         let opt_val_locals = generator.save_to_locals(builder, &expr_type, true);
 
@@ -212,5 +265,35 @@ mod tests {
         "#;
 
         crosscheck_compare_only(SNIPPET);
+    }
+
+    /// A surviving *principal* field is the case a placeholder cannot fake:
+    /// principals live in linear memory, so a `none`'s placeholder payload has
+    /// an (offset, length) of (0, 0) and capturing its runtime shape reads
+    /// memory that is not there. Mainnet block 8,742,090
+    /// (`stxnft-auctions-v1::place-bid`) stopped the chain on exactly this.
+    #[test]
+    fn clar_default_to_narrowing_a_principal_answers_on_both_branches() {
+        const NARROWING: &str =
+            "(define-read-only (whole (entry (optional { buyer: principal, amount: uint })))
+               (default-to { buyer: 'ST000000000000000000002AMW42H } entry))";
+        crosscheck_compare_only(&format!("{NARROWING} (whole none)"));
+        crosscheck_compare_only(&format!(
+            "{NARROWING} (whole (some {{ buyer: 'ST000000000000000000002AMW42H, amount: u1 }}))"
+        ));
+    }
+
+    /// The principal survives while a sibling field is dropped, which is the
+    /// chain contract's own shape: a two-field default over a three-field map
+    /// value.
+    #[test]
+    fn clar_default_to_narrowing_keeps_a_principal_beside_a_dropped_field() {
+        const NARROWING: &str =
+            "(define-read-only (whole (entry (optional { buyer: principal, amount: uint, extra: uint })))
+               (default-to { buyer: 'ST000000000000000000002AMW42H, amount: u0 } entry))";
+        crosscheck_compare_only(&format!("{NARROWING} (whole none)"));
+        crosscheck_compare_only(&format!(
+            "{NARROWING} (whole (some {{ buyer: 'ST000000000000000000002AMW42H, amount: u1, extra: u2 }}))"
+        ));
     }
 }
