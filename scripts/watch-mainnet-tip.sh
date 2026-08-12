@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
-    echo "usage: $0 OUTPUT RPC_URL METRICS_URL SYSTEMD_UNIT STATE_DIR CONFIG" >&2
+if [ "$#" -ne 7 ]; then
+    echo "usage: $0 OUTPUT RPC_URL METRICS_URL BITCOIN_TIP_URL SYSTEMD_UNIT STATE_DIR CONFIG" >&2
     exit 2
 fi
 
 readonly output="$1"
 readonly rpc_url="${2%/}"
 readonly metrics_url="${3%/}"
-readonly unit="$4"
-readonly state_dir="$5"
-readonly config="$6"
+readonly bitcoin_tip_url="$4"
+readonly unit="$5"
+readonly state_dir="$6"
+readonly config="$7"
 readonly interval_seconds=60
 readonly duration_seconds=86400
 
@@ -23,6 +24,13 @@ fail() {
         '{type: "failure", timestamp: $timestamp, reason: $reason}' >> "$output"
     echo "$reason" >&2
     exit 1
+}
+
+read_bitcoin_tip() {
+    local height
+    height="$(curl -fsS --max-time 10 "$bitcoin_tip_url")"
+    [[ "$height" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$height"
 }
 
 test -d "$state_dir" || { echo "state directory is absent: $state_dir" >&2; exit 1; }
@@ -49,6 +57,7 @@ readonly config_sha256
 
 initial_sync="$(curl -fsS --max-time 10 "$rpc_url/nano/sync_status")" || \
     fail "the release RPC did not answer before the soak"
+initial_bitcoin_tip="$(read_bitcoin_tip)" || fail "the Bitcoin tip source did not answer"
 jq -e '
     .blocks_behind == 0 and
     .p2p_sessions > 0 and
@@ -65,6 +74,8 @@ jq -cn \
     --arg config "$config" \
     --arg config_sha256 "$config_sha256" \
     --arg state_dir "$state_dir" \
+    --arg bitcoin_tip_url "$bitcoin_tip_url" \
+    --argjson bitcoin_tip "$initial_bitcoin_tip" \
     --argjson duration_seconds "$duration_seconds" \
     '{
         type: "start",
@@ -76,6 +87,8 @@ jq -cn \
         config: $config,
         config_sha256: $config_sha256,
         state_dir: $state_dir,
+        bitcoin_tip_url: $bitcoin_tip_url,
+        bitcoin_tip: $bitcoin_tip,
         duration_seconds: $duration_seconds
     }' >> "$output"
 
@@ -91,6 +104,7 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         fail "the release sync RPC failed"
     metrics="$(curl -fsS --max-time 10 "$metrics_url/metrics")" || \
         fail "the release metrics RPC failed"
+    bitcoin_tip="$(read_bitcoin_tip)" || fail "the Bitcoin tip source failed"
     memory_current="$(systemctl --user show "$unit" --property MemoryCurrent --value)"
     memory_peak="$(systemctl --user show "$unit" --property MemoryPeak --value)"
     open_files="$(find "/proc/$current_pid/fd" -mindepth 1 -maxdepth 1 -printf . | wc -c)"
@@ -111,6 +125,7 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         --argjson pid "$current_pid" \
         --argjson info "$info" \
         --argjson sync "$sync" \
+        --argjson bitcoin_tip "$bitcoin_tip" \
         --argjson memory_current "$memory_current" \
         --argjson memory_peak "$memory_peak" \
         --argjson open_files "$open_files" \
@@ -124,6 +139,7 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
             pid: $pid,
             info: $info,
             sync: $sync,
+            bitcoin_tip: $bitcoin_tip,
             resources: {
                 memory_current: $memory_current,
                 memory_peak: $memory_peak,
