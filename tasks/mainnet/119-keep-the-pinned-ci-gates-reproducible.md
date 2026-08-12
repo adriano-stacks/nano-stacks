@@ -8,7 +8,7 @@ type: bug
 group: mainnet
 tags: ["ci", "tooling", "release", "gates"]
 created_at: "2026-08-11"
-completed_at: 2026-08-11
+completed_at: 2026-08-12
 ---
 
 # Keep the pinned CI gates reproducible
@@ -49,3 +49,5 @@ hosted runner.
   and cross-worktree compiler-identity regressions.
 - The offline release report builds and inspects the artifact, then exits with
   the required non-qualifying status 2; all three pinned lockfiles are unchanged.
+- The release-dependency checks force the workflow's `CARGO_TERM_COLOR=always`
+  locally and request uncoloured `cargo tree` output before parsing it.
