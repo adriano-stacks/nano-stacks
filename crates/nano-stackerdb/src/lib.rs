@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use nano_address::StacksAddress;
 use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey};
@@ -78,11 +78,15 @@ impl From<reqwest::Error> for StackerDbClientError {
 impl StackerDbClient {
     /// Construct a client for an HTTP node endpoint.
     pub fn new(base_url: Url) -> Result<Self, StackerDbClientError> {
+        Self::with_timeout(base_url, Duration::from_secs(30))
+    }
+
+    fn with_timeout(base_url: Url, timeout: Duration) -> Result<Self, StackerDbClientError> {
         if base_url.cannot_be_a_base() {
             return Err(StackerDbClientError::InvalidBaseUrl);
         }
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder().timeout(timeout).build()?,
             base_url,
         })
     }
@@ -474,7 +478,7 @@ impl<'a> ChunkReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{net::TcpListener, str::FromStr, thread, time::Duration};
 
     use nano_address::StacksAddress;
     use nano_crypto::StacksPrivateKey;
@@ -483,8 +487,38 @@ mod tests {
 
     use super::{
         BlockAcceptance, BlockResponse, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbClient,
-        StackerDbContract, StackerDbError,
+        StackerDbClientError, StackerDbContract, StackerDbError,
     };
+
+    #[tokio::test]
+    async fn a_stalled_stackerdb_peer_does_not_hold_a_role_forever() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled peer");
+        let address = listener.local_addr().expect("stalled peer address");
+        let server = thread::spawn(move || {
+            let (_connection, _) = listener.accept().expect("accept request");
+            thread::sleep(Duration::from_millis(500));
+        });
+        let client = StackerDbClient::with_timeout(
+            Url::parse(&format!("http://{address}/")).expect("local peer URL"),
+            Duration::from_millis(200),
+        )
+        .expect("create bounded client");
+        let contract = StackerDbContract {
+            address: StacksAddress::from_str("ST000000000000000000002AMW42H")
+                .expect("system address"),
+            name: "miners".to_owned(),
+        };
+
+        let error = client
+            .slot_metadata(&contract)
+            .await
+            .expect_err("the stalled peer times out");
+        assert!(matches!(
+            error,
+            StackerDbClientError::Http(error) if error.is_timeout()
+        ));
+        server.join().expect("stalled peer exits");
+    }
 
     #[test]
     fn signed_chunks_round_trip_and_verify() {
