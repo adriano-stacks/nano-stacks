@@ -26,6 +26,10 @@ impl Word for IsStandard {
 }
 
 impl SimpleWord for IsStandard {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,

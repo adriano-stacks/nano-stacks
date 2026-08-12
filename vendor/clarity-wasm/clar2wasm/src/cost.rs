@@ -2549,6 +2549,22 @@ mod crosscheck {
         }
     }
 
+    #[test]
+    fn charges_is_standard_operands_in_place() {
+        let principal = || {
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse("S1G2081040G2081040G2081040G208105NK8PE5")
+                    .expect("principal"),
+            )
+        };
+        crosscheck_cost(
+            "(define-public (f (a principal) (b principal))
+               (begin (is-standard a) (ok (is-standard b))))",
+            "f",
+            &[principal(), principal()],
+        );
+    }
+
     /// `slice?` reads its positions where they are, as `element-at?` does.
     ///
     /// This is `.pox-5 remove-staker-from-cycles` reduced: it slices a
