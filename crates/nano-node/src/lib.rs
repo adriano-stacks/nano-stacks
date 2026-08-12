@@ -345,6 +345,9 @@ pub struct CatchUpBudget {
 #[derive(Clone, Copy, Debug, Default)]
 struct ExecutedChunk {
     blocks: usize,
+    /// Successfully sealed tenure-start blocks. Each one passed the winner,
+    /// coinbase VRF and parent-seed checks in addition to the per-block checks.
+    tenure_starts: usize,
     /// Whether the peer asked this node to slow down part-way through.
     rate_limited: bool,
 }
@@ -370,6 +373,8 @@ pub struct CatchUpRound {
     pub reorganized: Option<[u8; 32]>,
     pub fetched: usize,
     pub executed: usize,
+    /// Tenure starts among `executed`, for positive authentication evidence.
+    pub authenticated_tenure_starts: usize,
     /// Tenures this round took from the inventory schedule rather than from the
     /// backward parent-walk.
     ///
@@ -382,6 +387,14 @@ pub struct CatchUpRound {
     /// Whether the peer asked this node to slow down, which ends a round
     /// successfully rather than discarding it.
     pub rate_limited: bool,
+}
+
+impl CatchUpRound {
+    const fn record_execution(&mut self, executed: ExecutedChunk) {
+        self.executed = executed.blocks;
+        self.authenticated_tenure_starts = executed.tenure_starts;
+        self.rate_limited |= executed.rate_limited;
+    }
 }
 
 #[derive(Debug)]
@@ -1207,8 +1220,7 @@ where
         let executed = self
             .execute_staged(history, pox, staging, budget.execute)
             .await?;
-        round.executed = executed.blocks;
-        round.rate_limited |= executed.rate_limited;
+        round.record_execution(executed);
         // A descent that fetched blocks and executed none, while the peer is
         // ahead, is what a fork looks like from here: the peer's chain walked
         // past this node's tip on another branch, so nothing staged extends it
@@ -2398,6 +2410,7 @@ where
         budget: usize,
     ) -> Result<ExecutedChunk, NodeExecutionError> {
         let mut executed = 0;
+        let mut tenure_starts = 0;
         let mut rate_limited = false;
         let mut timing = ExecutionTiming::default();
         let mut previous_view = None;
@@ -2414,6 +2427,9 @@ where
             };
             let phase = std::time::Instant::now();
             let applied = self.apply(&block, bitcoin_context)?;
+            if nano_chainstate::starts_new_tenure(&block) {
+                tenure_starts += 1;
+            }
             let block_execution = phase.elapsed();
             timing.execution += block_execution;
             if let Some(metrics) = self.metrics.as_ref() {
@@ -2478,6 +2494,7 @@ where
         }
         Ok(ExecutedChunk {
             blocks: executed,
+            tenure_starts,
             rate_limited,
         })
     }

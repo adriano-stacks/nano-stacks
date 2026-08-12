@@ -448,12 +448,20 @@ fn round_report(from: u64, round: &CatchUpRound, tip: &NakamotoBlock) -> String 
     } else {
         format!(", {} tenures the inventory scheduled", round.scheduled)
     };
+    let authentication = if round.executed == 0 {
+        String::new()
+    } else {
+        format!(
+            ", authentication passed: {} block envelope/miner-signature/winner-sortition/signer-threshold/tenure-continuity checks and {} tenure-start coinbase-vrf/parent-seed checks",
+            round.executed, round.authenticated_tenure_starts
+        )
+    };
     batch_report(
         from,
         round.executed,
         tip,
         &format!(
-            ", {} staged, {} fetched{scheduled}{limited}",
+            ", {} staged, {} fetched{scheduled}{authentication}{limited}",
             round.staged, round.fetched
         ),
     )
@@ -1978,12 +1986,21 @@ fn authenticate_fresh_checkpoint(
         history,
         config.checkpoint.anchor_bitcoin_height,
     )?;
+    let tenure_starts = history
+        .iter()
+        .filter(|entry| nano_chainstate::starts_new_tenure(&entry.block))
+        .count();
     chainstate.authenticate_checkpoint_history(
         config.checkpoint.source_state_id()?,
         config.checkpoint.state_root()?,
         boundary,
         &history,
     )?;
+    println!(
+        "authenticated checkpoint history: {} block envelope/miner-signature/winner-sortition/signer-threshold checks, {} tenure-continuity checks, {tenure_starts} tenure-start coinbase-vrf/parent-seed checks, and 1 finite-boundary parent proof",
+        history.len(),
+        history.len().saturating_sub(1),
+    );
     Ok(())
 }
 
@@ -2157,7 +2174,7 @@ pub async fn open_chainstate(
             Err(error) => eprintln!("cannot give back the states above {height}: {error}"),
         }
     }
-    recover_ledger(&mut chainstate, config, directory, &tip)?;
+    recover_ledger(&mut chainstate, *tip.block_id().as_bytes())?;
     Ok((chainstate, tip, None))
 }
 
@@ -2166,9 +2183,9 @@ pub async fn open_chainstate(
 /// The deepest sealed state is not always a block this node executed. A block is
 /// committed by writing its ledger and *then* sealing the MARF, so a state whose
 /// ledger is gone is one nothing points at — and standing on it costs the whole
-/// recovery: no reorganization reach, no tenure start heights, no parent tenure
-/// proof, and a maturity window read back from `accounting.json` instead of from
-/// the tip, which a mainnet node then refuses to start on.
+/// recovery: no reorganization reach, no tenure start heights and no parent tenure
+/// proof. Such a restart is refused instead of rebuilding partial state from
+/// `accounting.json`.
 ///
 /// A live mainnet state was left exactly there. It held sealed states to 8,713,522
 /// and one single ledger, for 8,713,222, because the block it could not execute
@@ -2203,9 +2220,9 @@ fn deepest_block_a_ledger_names(
         };
         walk = parent;
     }
-    // Nothing within reach has one, so the caller falls back to `accounting.json`
-    // and says what that costs. Reported here too, because the seal it is about to
-    // resume at is not the reason -- the missing ledgers are.
+    // Nothing within reach has one. Reported here too, because the seal it is
+    // about to resume at is not the reason -- the missing ledgers are. Recovery
+    // will refuse once the network confirms which sealed block it would resume.
     eprintln!(
         "no sealed state at or within {reach} blocks below {} has a ledger, so this run \
          cannot stand on one",
@@ -2219,24 +2236,19 @@ fn deepest_block_a_ledger_names(
 /// Recovered for the block this node is *resuming at*, which is not always the
 /// deepest one it sealed: a tip that lost a fork race while the node was down is
 /// abandoned for an ancestor, and the ledger has to be that ancestor's.
-fn recover_ledger(
-    chainstate: &mut ChainState,
-    config: &Config,
-    directory: &Path,
-    tip: &NakamotoBlock,
-) -> Result<(), Box<dyn Error>> {
-    if chainstate.recover_ledger_at(*tip.block_id().as_bytes())? {
+fn recover_ledger(chainstate: &mut ChainState, tip: [u8; 32]) -> Result<(), Box<dyn Error>> {
+    if chainstate.recover_ledger_at(tip)? {
         // Named field by field, because each one is a thing this node can do that
         // a run without it silently could not: walk a reorganization back, answer
         // `get-tenure-info?` for the tenure in flight, check the seed the next
         // tenure commits.
         let tenure = chainstate
-            .recorded_header(*tip.block_id().as_bytes())
+            .recorded_header(tip)
             .map(|header| header.tenure_height);
         println!(
             "recovered the ledger committed with block {}: {} executed blocks to walk back \
              over, tenure {} starting at height {}, parent tenure proof {}",
-            tip.block_id(),
+            hex::encode(tip),
             chainstate.executed_blocks().len(),
             tenure.map_or_else(|| "unknown".to_owned(), |height| height.to_string()),
             tenure
@@ -2257,23 +2269,12 @@ fn recover_ledger(
         // so a hole shortens it rather than hiding inside it.
         return check_maturity_window(chainstate.accounting_mut());
     }
-    // A state directory written before the ledger was committed with the seal
-    // has none, and the three things beside the accounting were never written
-    // anywhere at all. So say exactly what this run cannot do: it owes what the
-    // last catch-up *round* wrote rather than what its tip owes, it cannot walk
-    // a reorganization back past this restart, it will report the first block of
-    // the tenure in flight as that tenure's start height, and it cannot check
-    // the seed the next tenure commits. The first block this run seals writes a
-    // ledger, so the restart after it is whole.
-    eprintln!(
-        "no ledger was committed with block {}, so this run resumes from \
-         {ACCOUNTING_FILE} — which is written per catch-up round and may be behind the \
-         tip — with no reorganization reach, no tenure start heights and no parent \
-         tenure proof. The next block sealed writes one.",
-        tip.block_id()
-    );
-    *chainstate.accounting_mut() = accounting(config, directory)?;
-    Ok(())
+    Err(format!(
+        "block {} has no committed ledger, so this node cannot authenticate a restart: \
+         restore a complete checkpoint or repair the ledger before starting",
+        hex::encode(tip)
+    )
+    .into())
 }
 
 /// Find the block a resumed state can carry on from.
@@ -3955,6 +3956,7 @@ mod tests {
             reorganized: None,
             fetched: 40,
             executed,
+            authenticated_tenure_starts: usize::from(executed != 0),
             staged: 9,
             scheduled: 0,
             rate_limited,
@@ -3964,7 +3966,7 @@ mod tests {
         assert_eq!(
             moved,
             format!(
-                "executed 100 blocks, 1100 to 1200, state root {}, 9 staged, 40 fetched",
+                "executed 100 blocks, 1100 to 1200, state root {}, 9 staged, 40 fetched, authentication passed: 100 block envelope/miner-signature/winner-sortition/signer-threshold/tenure-continuity checks and 1 tenure-start coinbase-vrf/parent-seed checks",
                 tip.header.state_index_root
             )
         );
@@ -4542,21 +4544,28 @@ mod tests {
             );
         }
 
-        chainstate
+        let error = chainstate
             .authenticate_checkpoint_history(
                 fixture.source,
                 fixture.root,
                 fixture.boundary,
                 &fixture.history,
             )
-            .expect("the unmodified locally authenticated history is accepted");
+            .expect_err("an execution-only fixture carries no authenticated signer set");
+        assert!(
+            matches!(
+                error,
+                CheckpointHistoryError::Block {
+                    error: ChainStateError::InvalidTransaction(ref reason),
+                    ..
+                } if reason.contains("reward cycle 14 has no authenticated signer set")
+            ),
+            "the unmodified history reaches its missing signer set: {error}"
+        );
         assert_eq!(
-            chainstate.executed_blocks(),
-            fixture
-                .history
-                .iter()
-                .map(|entry| *entry.block.block_id().as_bytes())
-                .collect::<Vec<_>>()
+            authentication_state(&mut chainstate),
+            unchanged,
+            "the incomplete checkpoint history is refused atomically"
         );
     }
 
@@ -4812,10 +4821,10 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
     ///
     /// The two part exactly where a mainnet state parted them: sealed states above
     /// the last one a ledger names. Standing on the seal costs the whole recovery —
-    /// no reorganization reach, no tenure start heights, no parent tenure proof and
-    /// a maturity window read from `accounting.json`, which a mainnet node then
-    /// refuses to start on — and it also hides the residue from the give-back,
-    /// because there is nothing above the seal to give back.
+    /// no reorganization reach, no tenure start heights and no parent tenure proof.
+    /// It also hides the residue from the give-back, because there is nothing above
+    /// the seal to give back. Such a restart is now refused rather than reconstructed
+    /// from `accounting.json`.
     #[test]
     fn a_resume_stands_on_the_deepest_ledger_not_the_deepest_seal() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -4872,6 +4881,29 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
             .expect("read the sealed height")
             .expect("a sealed height");
         assert_eq!(chainstate.discard_above(height).expect("give back"), 2);
+    }
+
+    #[test]
+    fn a_sealed_state_without_a_ledger_cannot_resume_unauthenticated() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut chainstate =
+            nano_chainstate::ChainState::open(nano_primitives::Network::MAINNET, directory.path())
+                .expect("open");
+        let block_id = [1; 32];
+        chainstate
+            .vm_mut()
+            .begin_block(None, block_id)
+            .expect("begin");
+        chainstate
+            .vm_mut()
+            .seal_block_to(block_id)
+            .expect("seal without a ledger");
+
+        let error = super::recover_ledger(&mut chainstate, block_id)
+            .expect_err("an unverifiable restart must be refused")
+            .to_string();
+        assert!(error.contains("has no committed ledger"), "{error}");
+        assert!(error.contains("cannot authenticate a restart"), "{error}");
     }
 
     /// A reach that does not span the residue leaves the tip where it was.

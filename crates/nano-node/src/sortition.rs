@@ -1888,21 +1888,32 @@ mod tests {
     #[test]
     fn a_checkpoint_boundary_above_the_capture_seed_is_left_to_local_derivation() {
         let directory = captured_sortitions();
-        let snapshots = captured_snapshots(&directory).expect("read captured snapshots");
+        let mut snapshots = captured_snapshots(&directory).expect("read captured snapshots");
         let ordinary = SortitionTracker::from_capture(&directory).expect("load ordinary seed");
-        let boundary = snapshots
+        let mut boundary = snapshots
             .iter()
-            .find(|snapshot| {
-                snapshot.block_height > ordinary.tip().bitcoin_height
-                    && matches!(snapshot.sortition, Some(sortition) if sortition != 0)
-            })
-            .expect("the capture has a winning boundary above its seed");
+            .max_by_key(|snapshot| snapshot.block_height)
+            .expect("the capture has a snapshot")
+            .clone();
+        boundary.block_height = ordinary.tip().bitcoin_height + 1;
+        boundary.consensus_hash = "42".repeat(20);
+        boundary.sortition = Some(1);
+        let boundary_hash = captured_consensus_hash(&boundary);
+        snapshots.push(boundary);
 
-        let selected = SortitionTracker::from_capture_at_consensus(
-            &directory,
-            captured_consensus_hash(boundary),
+        let extended = tempfile::tempdir().expect("an extended capture");
+        fs::write(
+            extended.path().join("snapshots.json"),
+            serde_json::to_vec(&snapshots).expect("encode snapshots"),
         )
-        .expect("retain the authenticated seed below the boundary");
+        .expect("write snapshots");
+        for name in ["consensus-hashes.json", "leader-keys.json"] {
+            fs::copy(directory.join(name), extended.path().join(name))
+                .expect("copy the seed artifact");
+        }
+
+        let selected = SortitionTracker::from_capture_at_consensus(extended.path(), boundary_hash)
+            .expect("retain the authenticated seed below the boundary");
 
         assert_eq!(selected.tip(), ordinary.tip());
         assert_eq!(

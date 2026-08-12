@@ -1531,9 +1531,9 @@ impl ChainState {
 
     /// Stand on the ledger the run that sealed `block` committed with it.
     ///
-    /// Answers whether one was found, and changes nothing when none was: a state
+    /// Answers whether one was found, and changes nothing when none was. A state
     /// directory written before the ledger was committed with the seal has none,
-    /// and its caller still has `accounting.json` to fall back to.
+    /// so its caller must refuse an unauthenticated restart.
     ///
     /// The block is named by the caller rather than taken from the tip, because a
     /// restart whose tip lost a fork race stands on an ancestor instead — and the
@@ -2321,9 +2321,6 @@ impl ChainState {
         context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
     ) -> Result<(), ConsensusError> {
-        if !block_starts_new_tenure(block) {
-            return Ok(());
-        }
         let vrf_public_key = context
             .winner_vrf_public_key
             .ok_or(ConsensusError::WinnerVrfKeyUnavailable)?;
@@ -4533,16 +4530,13 @@ mod tests {
     /// the bug is already visible at two, and every attempt executes a block.
     const REJECTED_ATTEMPTS: usize = 25;
 
-    /// The tenure the captured checkpoint is standing in, mid-tenure.
-    const CHECKPOINT_TENURE: u64 = 120;
-
     /// Accounting that counts the fees of the tenure the checkpoint is inside.
     ///
     /// `add_fees` only counts for the tenure whose start block this node
     /// executed, and the captured checkpoint names none — which is why the
     /// captured chain on its own is a weak witness for the fee bug: nothing
-    /// moves either way. Recording earnings for tenure 120 is what a tenure-start
-    /// block does, and it is what makes the fees below actually land.
+    /// moves either way. Recording earnings for the tenure the imported VM names
+    /// is what a tenure-start block does, and it makes the fees below actually land.
     /// The earnings map stays bounded, and the bound does not break a payout.
     ///
     /// Both halves matter. A bound that let the map grow would pass a length
@@ -4601,10 +4595,10 @@ mod tests {
         );
     }
 
-    fn accounting_counting_fees() -> TenureAccounting {
+    fn accounting_counting_fees(tenure: u64) -> TenureAccounting {
         let mut accounting = TenureAccounting::default();
         accounting.record_earnings(
-            CHECKPOINT_TENURE,
+            tenure,
             TenureEarnings {
                 recipient: PrincipalData::parse("ST000000000000000000002AMW42H")
                     .expect("boot principal"),
@@ -4616,15 +4610,22 @@ mod tests {
     }
 
     /// Open the captured checkpoint in `directory`, resuming what is there.
-    fn open_captured(directory: &Path) -> (ChainState, [u8; 32], BitcoinBlockContext) {
+    fn open_captured(directory: &Path) -> (ChainState, [u8; 32], BitcoinBlockContext, u64) {
         let (checkpoint, source, root, bitcoin_height) = captured_checkpoint();
-        let chainstate =
+        let mut chainstate =
             ChainState::open_from_checkpoint(Network::TESTNET, directory, checkpoint, source, root)
                 .expect("open the checkpoint durably");
+        let tenure = u64::from(
+            chainstate
+                .vm_mut()
+                .tenure_height()
+                .expect("read the checkpoint tenure"),
+        );
         (
             chainstate,
             source,
             BitcoinBlockContext::at_height(bitcoin_height),
+            tenure,
         )
     }
 
@@ -4718,8 +4719,8 @@ mod tests {
     #[test]
     fn retrying_a_rejected_block_leaves_no_state_beside_the_marf() {
         let directory = tempfile::tempdir().expect("a directory");
-        let (mut chainstate, source, context) = open_captured(directory.path());
-        *chainstate.accounting_mut() = accounting_counting_fees();
+        let (mut chainstate, source, context, tenure) = open_captured(directory.path());
+        *chainstate.accounting_mut() = accounting_counting_fees(tenure);
 
         // A root this block cannot produce, so it is rejected in
         // `settle_state_root` — after its transactions ran and after its fees
@@ -4777,7 +4778,7 @@ mod tests {
 
         // A restart reads the disk, not the memory the assertions above hold.
         drop(chainstate);
-        let (mut chainstate, source, context) = open_captured(directory.path());
+        let (mut chainstate, source, context, tenure) = open_captured(directory.path());
         assert_eq!(
             chainstate.tip().expect("read reopened tip"),
             Some(source),
@@ -4798,13 +4799,13 @@ mod tests {
 
         // And an accepted block after all those rejections owes exactly what it
         // would have owed had none of them happened.
-        *chainstate.accounting_mut() = accounting_counting_fees();
+        *chainstate.accounting_mut() = accounting_counting_fees(tenure);
         let applied = execute_unauthenticated_fixture(&mut chainstate, context, source, &block)
             .expect("the pristine block executes");
         assert_eq!(
             chainstate
                 .accounting_mut()
-                .earnings_at(CHECKPOINT_TENURE)
+                .earnings_at(tenure)
                 .expect("the tenure is recorded")
                 .fees,
             fees,
@@ -4812,8 +4813,9 @@ mod tests {
         );
 
         let pristine = tempfile::tempdir().expect("a directory");
-        let (mut untouched, source, context) = open_captured(pristine.path());
-        *untouched.accounting_mut() = accounting_counting_fees();
+        let (mut untouched, source, context, pristine_tenure) = open_captured(pristine.path());
+        assert_eq!(pristine_tenure, tenure);
+        *untouched.accounting_mut() = accounting_counting_fees(pristine_tenure);
         let expected = execute_unauthenticated_fixture(&mut untouched, context, source, &block)
             .expect("the pristine block executes");
         assert_eq!(
@@ -4840,8 +4842,8 @@ mod tests {
     #[test]
     fn an_accepted_block_is_durable_with_its_header_and_parent_link() {
         let directory = tempfile::tempdir().expect("a directory");
-        let (mut chainstate, source, context) = open_captured(directory.path());
-        *chainstate.accounting_mut() = accounting_counting_fees();
+        let (mut chainstate, source, context, tenure) = open_captured(directory.path());
+        *chainstate.accounting_mut() = accounting_counting_fees(tenure);
 
         let block = captured_first_block();
         let id = *block.block_id().as_bytes();
@@ -4861,7 +4863,7 @@ mod tests {
         );
         drop(chainstate);
 
-        let (mut reopened, _, _) = open_captured(directory.path());
+        let (mut reopened, _, _, _) = open_captured(directory.path());
         assert!(
             reopened
                 .recover_ledger_at(id)
@@ -5034,7 +5036,7 @@ mod tests {
     #[test]
     fn a_ledger_reads_back_exactly_as_it_was_committed() {
         let mut ledger = ChainLedger {
-            accounting: accounting_counting_fees(),
+            accounting: accounting_counting_fees(120),
             tenure_start_heights: [(251_321, 8_665_600), (251_322, 8_665_612)].into(),
             tenure_start_blocks: [(251_321, [0x2a; 32]), (251_322, [0x3a; 32])].into(),
             executed: vec![ExecutedBlock {

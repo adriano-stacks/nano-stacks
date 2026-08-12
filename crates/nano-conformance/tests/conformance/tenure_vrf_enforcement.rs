@@ -35,6 +35,13 @@ struct Tenure {
     target: Captured,
 }
 
+/// A non-start block and the tenure-start block that authenticates its miner.
+struct MidTenure {
+    prefix: Vec<Captured>,
+    target: Captured,
+    start: Captured,
+}
+
 /// The selected captured tenure-start block above the checkpoint anchor.
 ///
 /// A tenure-start block cannot be executed on its own — the checkpoint's own
@@ -71,6 +78,42 @@ fn captured_tenure(number: usize) -> Option<Tenure> {
                     target: captured,
                 });
             }
+        }
+        prefix.push(captured);
+    }
+    None
+}
+
+fn captured_mid_tenure(number: usize) -> Option<MidTenure> {
+    let fixture = capture();
+    let snapshots = nano_conformance::captured_bitcoin_snapshots(&fixture)?;
+    let operations = nano_conformance::captured_bitcoin_operations(&fixture)?;
+    let mut prefix = Vec::new();
+    let mut tenure_starts = 0;
+    let mut start = None;
+    for path in nano_conformance::captured_block_paths(&fixture) {
+        let block = NakamotoBlock::decode(&fs::read(&path).ok()?).ok()?;
+        let view = block.header.consensus_hash.to_string();
+        let (Some(context), Some(operations)) = (snapshots.get(&view), operations.get(&view))
+        else {
+            continue;
+        };
+        let captured = Captured {
+            block,
+            context: *context,
+            operations: operations.clone(),
+        };
+        if nano_chainstate::starts_new_tenure(&captured.block) {
+            tenure_starts += 1;
+            start = Some(captured.clone());
+        } else if tenure_starts == number
+            && let Some(start) = start
+        {
+            return Some(MidTenure {
+                prefix,
+                target: captured,
+                start,
+            });
         }
         prefix.push(captured);
     }
@@ -241,11 +284,20 @@ fn accepts_with(
     context: BitcoinBlockContext,
     operations: &[nano_bitcoin::BitcoinOperation],
 ) -> Result<(), String> {
+    accepts_captured(&tenure.prefix, &tenure.target, context, operations)
+}
+
+fn accepts_captured(
+    prefix: &[Captured],
+    target: &Captured,
+    context: BitcoinBlockContext,
+    operations: &[nano_bitcoin::BitcoinOperation],
+) -> Result<(), String> {
     let fixture = capture();
     let (mut chainstate, source) = nano_conformance::replay_chainstate(&fixture)
         .map_err(|error| format!("open the checkpoint: {error}"))?;
     let mut parent = Some(source);
-    for captured in &tenure.prefix {
+    for captured in prefix {
         chainstate
             .append_unauthenticated_fixture_block_with_bitcoin_operations(
                 captured.context,
@@ -257,14 +309,49 @@ fn accepts_with(
         parent = Some(*captured.block.block_id().as_bytes());
     }
     chainstate
-        .append_nakamoto_block_with_bitcoin_operations(
-            context,
-            operations,
-            parent,
-            &tenure.target.block,
-        )
+        .append_nakamoto_block_with_bitcoin_operations(context, operations, parent, &target.block)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Every block in a tenure is signed by the miner that won it, not only the
+/// tenure-start block that carries the tenure-change transaction.
+#[test]
+fn a_mid_tenure_block_must_still_be_signed_by_the_winning_miner() {
+    let Some(mid) = captured_mid_tenure(2) else {
+        nano_conformance::skip_gate("the capture has no mid-tenure block after its second tenure");
+        return;
+    };
+    let start = Tenure {
+        prefix: Vec::new(),
+        target: mid.start,
+    };
+    let (Some(key), Some(registration)) = (winning_key(&start), winning_registration(&start))
+    else {
+        nano_conformance::skip_gate("the capture has no leader key for the winning commitment");
+        return;
+    };
+    let nano_bitcoin::BitcoinOperationKind::LeaderKeyRegistration {
+        block_signing_key_hash: Some(signing_key_hash),
+        ..
+    } = registration.kind
+    else {
+        nano_conformance::skip_gate("the winning registration has no block-signing key hash");
+        return;
+    };
+    let mut context = mid.target.context;
+    context.winner_vrf_public_key = Some(key);
+    context.winner_signing_key_hash = Some(signing_key_hash);
+    accepts_captured(&mid.prefix, &mid.target, context, &mid.target.operations)
+        .expect("the mid-tenure block the network accepted");
+
+    context.winner_signing_key_hash = Some([7; 20]);
+    let error = accepts_captured(&mid.prefix, &mid.target, context, &mid.target.operations)
+        .expect_err("a mid-tenure block signed by another miner must be refused");
+    assert!(
+        error.contains("whose leader key won its sortition"),
+        "the rejection names the winning miner: {error}"
+    );
 }
 
 /// A key that is a real curve point and did not produce this proof.
