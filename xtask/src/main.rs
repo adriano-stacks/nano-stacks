@@ -6478,7 +6478,7 @@ fn report_release_inventory(inventory: &ReleaseInventory, run_gates: bool) -> bo
 }
 
 /// Run the three gates tasks/053 names and report what each said.
-fn report_gates(capture: Option<&str>, inventory: &ReleaseInventory) -> bool {
+fn report_gates(capture: Option<&str>, state: Option<&Path>, inventory: &ReleaseInventory) -> bool {
     println!("\ngates");
     println!("  Each command below also inherits every variable under `inputs`.");
     let mut environment: Vec<(&str, &str)> = vec![("NANO_REQUIRE_MAINNET", "1")];
@@ -6488,6 +6488,13 @@ fn report_gates(capture: Option<&str>, inventory: &ReleaseInventory) -> bool {
             "  no --capture and no NANO_MAINNET_CAPTURE, so the mainnet gates cannot run \
              and the\n  conformance gate below is expected to FAIL under \
              NANO_REQUIRE_MAINNET. That failure is\n  the honest report."
+        ),
+    }
+    match state.and_then(Path::to_str) {
+        Some(path) => environment.push(("NANO_MAINNET_STATE", path)),
+        None => println!(
+            "  no UTF-8 --state path, so the mainnet state gates cannot run and the\n  \
+             conformance gate below is expected to FAIL under NANO_REQUIRE_MAINNET."
         ),
     }
     let gates = [
@@ -6610,7 +6617,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let release_inventory = report_release_inventory(&inventory, run_gates);
 
     let passed = if run_gates {
-        report_gates(capture.as_deref(), &inventory)
+        report_gates(capture.as_deref(), state.as_deref(), &inventory)
     } else {
         println!("\ngates");
         println!(
