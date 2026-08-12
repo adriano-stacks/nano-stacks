@@ -213,6 +213,14 @@ requires = "NANO_086_SOURCE read-only mainnet chainstate through 8,708,126 and N
 note = "VM receipt and verified-root oracle only; the fixture seam deliberately does not authenticate consensus."
 
 [[ignored]]
+test = "the_mainnet_8695878_receipt_costs_match_the_canonical_oracles"
+class = "infrastructure"
+owner = "052"
+job = "release-qualification"
+requires = "NANO_052_SOURCE immutable mainnet chainstate through 8,695,878 and NANO_052_SCRATCH fresh writable reflink clone"
+note = "Exact transaction-prestate compiler/interpreter result, cost, ordered-event and asset-map comparison for the two retained receipt divergences."
+
+[[ignored]]
 test = "the_mainnet_8686666_old_epoch_receipt_and_root_match_the_canonical_oracle"
 class = "infrastructure"
 owner = "064"

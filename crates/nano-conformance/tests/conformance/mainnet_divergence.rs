@@ -33,6 +33,11 @@ const TASK_064_BLOCK_FILE: &str = "block-8686666.hex";
 const TASK_064_ORACLE_FILE: &str = "tx-f338-receipt.json";
 const TASK_064_OLD_CONTRACT: &str = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1";
 
+const TASK_052_PARENT_HEIGHT: u32 = 8_695_877;
+const TASK_052_CHILD_HEIGHT: u32 = TASK_052_PARENT_HEIGHT + 1;
+const TASK_052_BLOCK_FILE: &str = "block-8695878.hex";
+const TASK_052_ORACLE_FILES: [&str; 2] = ["tx-6687-receipt.json", "tx-7856-receipt.json"];
+
 const TASK_086_PARENT_HEIGHT: u32 = 8_708_125;
 const TASK_086_CHILD_HEIGHT: u32 = TASK_086_PARENT_HEIGHT + 1;
 const TASK_086_BLOCK_FILE: &str = "block-8708126.bin";
@@ -61,6 +66,8 @@ struct OracleCost {
 struct OracleResult {
     hex: String,
     repr: String,
+    #[serde(default)]
+    vm_repr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,11 +494,21 @@ fn hex_fixture(block_file: &str, oracle_file: &str) -> (NakamotoBlock, Oracle) {
         .expect("fixture block is hexadecimal"),
     )
     .expect("decode fixture block");
-    let oracle = serde_json::from_slice(
-        &fs::read(fixture.join(oracle_file)).expect("canonical receipt oracle"),
-    )
-    .expect("decode canonical receipt oracle");
+    let oracle = oracle_fixture(oracle_file);
     (block, oracle)
+}
+
+fn oracle_fixture(oracle_file: &str) -> Oracle {
+    serde_json::from_slice(
+        &fs::read(fixtures().join(oracle_file)).expect("canonical receipt oracle"),
+    )
+    .expect("decode canonical receipt oracle")
+}
+
+fn task_052_fixture() -> (NakamotoBlock, [Oracle; 2]) {
+    let (block, first) = hex_fixture(TASK_052_BLOCK_FILE, TASK_052_ORACLE_FILES[0]);
+    let second = oracle_fixture(TASK_052_ORACLE_FILES[1]);
+    (block, [first, second])
 }
 
 fn assert_task_064_contract_epoch(source: &mut ChainState) {
@@ -634,6 +651,24 @@ fn compare_engines_at_exact_fixture_prestate(
     oracle: &Oracle,
     parent_height: u32,
 ) {
+    let (compiled, interpreted) = execute_both_engines_at_exact_fixture_prestate(
+        scratch,
+        block,
+        context,
+        oracle,
+        parent_height,
+    );
+    assert_eq!(compiled.cost, interpreted.cost);
+    assert_eq!(compiled.cost, oracle_execution_cost(&oracle.cost));
+}
+
+fn execute_both_engines_at_exact_fixture_prestate(
+    scratch: &mut ChainState,
+    block: &NakamotoBlock,
+    context: BitcoinBlockContext,
+    oracle: &Oracle,
+    parent_height: u32,
+) -> (TransactionResult, TransactionResult) {
     let compiled = call_at_exact_fixture_prestate(
         scratch,
         block,
@@ -651,10 +686,41 @@ fn compare_engines_at_exact_fixture_prestate(
         true,
     );
     assert_eq!(compiled.value, interpreted.value);
-    assert_eq!(compiled.cost, interpreted.cost);
     assert_eq!(compiled.events, interpreted.events);
     assert_eq!(compiled.assets, interpreted.assets);
-    assert_eq!(compiled.cost, oracle_execution_cost(&oracle.cost));
+    assert_contract_call_matches_oracle(&compiled, block, oracle);
+    (compiled, interpreted)
+}
+
+fn assert_contract_call_matches_oracle(
+    result: &TransactionResult,
+    block: &NakamotoBlock,
+    oracle: &Oracle,
+) {
+    let value = result.value.as_ref().expect("successful call result");
+    assert_eq!(
+        value.serialize_to_hex().expect("serialize call result"),
+        oracle.result.hex
+    );
+    let expected_repr = oracle
+        .result
+        .vm_repr
+        .as_deref()
+        .unwrap_or(&oracle.result.repr);
+    assert_eq!(value.to_string(), expected_repr);
+    let txid = block.transactions[oracle.tx_index].txid();
+    let events = result
+        .events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let serialized = event
+                .json_serialize(index, &txid, true)
+                .expect("serialize call event");
+            normalized_event(&serialized)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events, oracle.events);
 }
 
 const fn oracle_execution_cost(cost: &OracleCost) -> ExecutionCost {
@@ -819,6 +885,67 @@ fn the_mainnet_8686666_old_epoch_receipt_and_root_match_the_canonical_oracle() {
     );
     compare_task_064_engines(&mut scratch, &block, context);
     assert_eq!(first.cost, oracle.cost);
+    source_is_unchanged(&inputs);
+}
+
+#[test]
+fn the_mainnet_8695878_cost_fixture_is_self_consistent() {
+    let (block, oracles) = task_052_fixture();
+    assert_eq!(block.header.chain_length, u64::from(TASK_052_CHILD_HEIGHT));
+    assert_eq!(block.transactions.len(), 11);
+    assert_eq!(oracles[0].tx_index, 1);
+    assert_eq!(oracles[1].tx_index, 7);
+    assert_eq!(oracles[0].events.len(), 8);
+    assert_eq!(oracles[1].events.len(), 81);
+    for oracle in &oracles {
+        assert_eq!(
+            block.transactions[oracle.tx_index].txid().to_string(),
+            oracle.txid
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires immutable mainnet source state and a fresh writable reflink scratch"]
+fn the_mainnet_8695878_receipt_costs_match_the_canonical_oracles() {
+    let inputs = inputs("NANO_052_SOURCE", "NANO_052_SCRATCH");
+    let (block, oracles) = task_052_fixture();
+    let mut source = ChainState::open_existing(&inputs.source).expect("open source read-only");
+    let mut scratch = ChainState::open(source.network(), &inputs.scratch).expect("open scratch");
+    let (parent, child) = validate_fixture(
+        &mut source,
+        &mut scratch,
+        &block,
+        &oracles[0],
+        TASK_052_PARENT_HEIGHT,
+        TASK_052_CHILD_HEIGHT,
+    );
+    let context = context(parent, child);
+    let mut results = Vec::with_capacity(oracles.len());
+    for oracle in &oracles {
+        results.push(execute_both_engines_at_exact_fixture_prestate(
+            &mut scratch,
+            &block,
+            context,
+            oracle,
+            TASK_052_PARENT_HEIGHT,
+        ));
+    }
+    for (oracle, (compiled, interpreted)) in oracles.iter().zip(&results) {
+        eprintln!(
+            "task 052 {} runtime: compiled {}, interpreter {}, network {}",
+            oracle.txid, compiled.cost.runtime, interpreted.cost.runtime, oracle.cost.runtime
+        );
+    }
+    for (oracle, (compiled, interpreted)) in oracles.iter().zip(results) {
+        assert_eq!(compiled.cost, interpreted.cost, "{} cost", oracle.txid);
+        assert_eq!(
+            interpreted.cost,
+            oracle_execution_cost(&oracle.cost),
+            "{} network cost",
+            oracle.txid
+        );
+    }
     source_is_unchanged(&inputs);
 }
 
