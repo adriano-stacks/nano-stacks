@@ -146,6 +146,7 @@ jobs:
             export "${scratch_name?}"
           }
 
+          fresh_reflink 052
           fresh_reflink 064
           fresh_reflink 086
           fresh_reflink 098
