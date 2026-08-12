@@ -348,11 +348,12 @@ async fn a_transaction_posted_to_nano_is_admitted_and_reported() {
     )
     .expect("sign the transfer");
     let txid = transaction.txid().to_string();
+    let encoded = transaction.encode();
 
     let posted = reqwest::Client::new()
         .post(run.nano.join("v2/transactions").expect("the submit URL"))
         .header("content-type", "application/octet-stream")
-        .body(transaction.encode())
+        .body(encoded.clone())
         .send()
         .await
         .expect("post the transaction to nano");
@@ -366,6 +367,13 @@ async fn a_transaction_posted_to_nano_is_admitted_and_reported() {
         body.contains(&txid),
         "nano answered {body} for the transaction {txid} it admitted"
     );
+    if let Some(path) = env::var_os("NANO_HOSTED_TXID_OUT") {
+        fs::write(path, format!("{txid}\n")).expect("retain the admitted transaction id");
+    }
+    if let Some(path) = env::var_os("NANO_HOSTED_TRANSACTION_OUT") {
+        fs::write(path, format!("{}\n", hex::encode(encoded)))
+            .expect("retain the admitted transaction bytes");
+    }
     println!("nano admitted and relayed {txid}, answering {status}");
 
     let mined = mined_by_the_network(&run, &txid).await;

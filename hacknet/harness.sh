@@ -31,6 +31,14 @@ MINER_3_RPC_PORT=${NANO_MINER_3_RPC_PORT:-22443}
 STACKS_API_EVENT_PORT=${NANO_STACKS_API_EVENT_PORT:-3700}
 STACKS_API_RPC_PORT=${NANO_STACKS_API_RPC_PORT:-3999}
 BITCOIN_RPC=${BITCOIN_RPC:-http://127.0.0.1:$BITCOIN_RPC_PORT}
+HOSTED_SIGNER=${NANO_HOSTED_SIGNER_NAME:-${NANO_HACKNET_CONTAINER_PREFIX:-}nano-hosted-signer}
+HOST_RPC_PORT=${NANO_HOST_PORT:-24443}
+HOST_P2P_PORT=${NANO_HOST_P2P_PORT:-25444}
+STOCK_FOLLOWER=${NANO_STOCK_FOLLOWER_NAME:-$PROJECT-stock-follower}
+STOCK_FOLLOWER_RPC_PORT=${NANO_STOCK_FOLLOWER_RPC_PORT:-26443}
+STOCK_FOLLOWER_P2P_PORT=${NANO_STOCK_FOLLOWER_P2P_PORT:-26444}
+STOCK_FOLLOWER_METRICS_PORT=${NANO_STOCK_FOLLOWER_METRICS_PORT:-9653}
+STOCK_FOLLOWER_SINK_PORT=${NANO_STOCK_FOLLOWER_SINK_PORT:-3802}
 # Bitcoin height at which the bitcoin-miner stops producing blocks.
 PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 # Seconds between Bitcoin blocks once Nakamoto is active.
@@ -485,7 +493,7 @@ replace() {
 host() {
     need_source
     local index=${1:?participant index}
-    local port=${NANO_HOST_PORT:-24443} p2p_port=${NANO_HOST_P2P_PORT:-25444}
+    local port=$HOST_RPC_PORT p2p_port=$HOST_P2P_PORT
     local endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
     local sink=${NANO_SINK_PORT:-3801} key token image signer_container
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
@@ -535,8 +543,6 @@ host() {
         "$HOSTED_SIGNER" "$HOSTED_SIGNER" >&2
 }
 
-HOSTED_SIGNER=${NANO_HOSTED_SIGNER_NAME:-nano-hosted-signer}
-
 # Wait until nano can host a signer: a tip to serve, and the reward set derived.
 #
 # The reward set is the gate that matters. Until nano has walked pox-5 for the
@@ -564,32 +570,210 @@ nano_ready() {
 # Record nano's own events on the host, where nano runs.
 nano_sink() {
     local port=${1:-3801} out=$RUN/nano-events
-    if [ -f "$RUN/nano-sink.pid" ] && kill -0 "$(cat "$RUN/nano-sink.pid")" 2>/dev/null; then
-        log "nano's event sink is already recording into $out"
+    start_sink "$out" "$port" "$RUN/nano-sink.pid" "$RUN/nano-sink.log"
+}
+
+start_sink() {
+    local out=${1:?event directory} port=${2:?port} pid_file=${3:?pid file}
+    local log_file=${4:?log file}
+    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        log "the event sink is already recording into $out"
         return 0
     fi
     mkdir -p "$out"
-    log "recording nano's events into $out"
+    log "recording events into $out"
     nohup setsid python3 "$ROOT/hacknet/event-sink.py" "$out" "$port" \
-        >> "$RUN/nano-sink.log" 2>&1 &
-    echo $! > "$RUN/nano-sink.pid"
+        >> "$log_file" 2>&1 &
+    echo $! > "$pid_file"
+}
+
+stop_sink() {
+    local pid_file=$1
+    if [ -f "$pid_file" ]; then
+        kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+}
+
+# Start a stock follower whose only configured bootstrap peer is nano.
+#
+# It runs on the host network so nano's loopback-only P2P and RPC listeners are
+# reachable without making either public. Its chainstate, observer and logs are
+# all separate from the three mining participants.
+stock_follower_start() {
+    need_source
+    nano_running || die "start hosted nano before its stock follower"
+    grep -Fq "p2p_bind = \"127.0.0.1:$HOST_P2P_PORT\"" "$RUN/nano.toml" ||
+        die "hosted nano is not listening on the expected P2P endpoint"
+    grep -Fq "rpc_bind = \"127.0.0.1:$HOST_RPC_PORT\"" "$RUN/nano.toml" ||
+        die "hosted nano is not serving the expected RPC endpoint"
+    ! docker container inspect "$STOCK_FOLLOWER" > /dev/null 2>&1 ||
+        die "stock follower $STOCK_FOLLOWER already exists"
+
+    local directory=$RUN/stock-follower state=$RUN/stock-follower/state
+    local source_container image seed public_key start_height bootstrap
+    if [ -d "$state" ] && [ -n "$(find "$state" -mindepth 1 -print -quit)" ]; then
+        die "$state is not empty; use a fresh NANO_HACKNET_HOME for acceptance"
+    fi
+    seed=$(cat "$RUN/nano/p2p-seed" 2>/dev/null) ||
+        die "hosted nano has no persisted P2P identity"
+    public_key=$(cd "$ROOT" && cargo xtask seed-public-key "$seed")
+    bootstrap="$public_key@127.0.0.1:$HOST_P2P_PORT"
+    start_height=$(curl -sf --max-time 5 "http://127.0.0.1:$HOST_RPC_PORT/v2/info" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])') ||
+        die "hosted nano did not answer its starting height"
+    source_container=$(compose ps -q stacks-miner-1)
+    [ -n "$source_container" ] || die "the stock participant image is unavailable"
+    image=$(docker inspect --format '{{.Config.Image}}' "$source_container")
+
+    mkdir -p "$state" "$directory/events"
+    # The container entrypoint expands these after Docker supplies their values.
+    # shellcheck disable=SC2016
+    sed \
+        -e 's|^rpc_bind = .*|rpc_bind = "$FOLLOWER_RPC_BIND"|' \
+        -e 's|^p2p_bind = .*|p2p_bind = "$FOLLOWER_P2P_BIND"|' \
+        -e 's|^prometheus_bind = .*|prometheus_bind = "$FOLLOWER_METRICS_BIND"|' \
+        "$SRC/docker/stacks/stacks-follower.toml" > "$directory/config.toml.in"
+    {
+        printf '\n[[events_observer]]\n'
+        printf 'endpoint = "127.0.0.1:%s"\n' "$STOCK_FOLLOWER_SINK_PORT"
+        printf 'events_keys = ["*"]\ntimeout_ms = 10000\n'
+    } >> "$directory/config.toml.in"
+    printf '%s\n' "$start_height" > "$directory/nano-start-height"
+    printf '%s\n' "$bootstrap" > "$directory/bootstrap-node"
+    start_sink "$directory/events" "$STOCK_FOLLOWER_SINK_PORT" \
+        "$directory/sink.pid" "$directory/sink.log"
+
+    log "starting a stock follower bootstrapped only from nano at $bootstrap"
+    if ! docker run -d --name "$STOCK_FOLLOWER" --network host \
+        -v "$directory/config.toml.in:/data/config.toml.in:ro" \
+        -v "$state:/data/chainstate" \
+        -e "FOLLOWER_RPC_BIND=127.0.0.1:$STOCK_FOLLOWER_RPC_PORT" \
+        -e "FOLLOWER_P2P_BIND=127.0.0.1:$STOCK_FOLLOWER_P2P_PORT" \
+        -e "FOLLOWER_METRICS_BIND=127.0.0.1:$STOCK_FOLLOWER_METRICS_PORT" \
+        -e "BOOTSTRAP_NODE=$bootstrap" \
+        -e "BITCOIN_PEER_HOST=127.0.0.1" \
+        -e "BITCOIN_PEER_PORT=$BITCOIN_PEER_PORT" \
+        -e "BITCOIN_RPC_PORT=$BITCOIN_RPC_PORT" \
+        -e "BITCOIN_RPC_USER=$(compose_value BITCOIN_RPC_USER)" \
+        -e "BITCOIN_RPC_PASS=$(compose_value BITCOIN_RPC_PASS)" \
+        -e "STACKS_20_HEIGHT=$(compose_value STACKS_20_HEIGHT)" \
+        -e "STACKS_2_05_HEIGHT=$(compose_value STACKS_2_05_HEIGHT)" \
+        -e "STACKS_21_HEIGHT=$(compose_value STACKS_21_HEIGHT)" \
+        -e "STACKS_POX2_HEIGHT=$(compose_value STACKS_POX2_HEIGHT)" \
+        -e "STACKS_22_HEIGHT=$(compose_value STACKS_22_HEIGHT)" \
+        -e "STACKS_23_HEIGHT=$(compose_value STACKS_23_HEIGHT)" \
+        -e "STACKS_24_HEIGHT=$(compose_value STACKS_24_HEIGHT)" \
+        -e "STACKS_25_HEIGHT=$(compose_value STACKS_25_HEIGHT)" \
+        -e "STACKS_30_HEIGHT=$STACKS_30_HEIGHT" \
+        -e "STACKS_31_HEIGHT=$STACKS_31_HEIGHT" \
+        -e "STACKS_32_HEIGHT=$STACKS_32_HEIGHT" \
+        -e "STACKS_33_HEIGHT=$STACKS_33_HEIGHT" \
+        -e "STACKS_34_HEIGHT=$STACKS_34_HEIGHT" \
+        -e "STACKS_40_HEIGHT=$STACKS_40_HEIGHT" \
+        -e "POX_PREPARE_LENGTH=$POX_PREPARE_LENGTH" \
+        -e "POX_REWARD_LENGTH=$POX_REWARD_LENGTH" \
+        -e "POX_5_SBTC_CONTRACT=$(compose_value POX_5_SBTC_CONTRACT)" \
+        -e "POX_5_SBTC_REGISTRY_CONTRACT=$(compose_value POX_5_SBTC_REGISTRY_CONTRACT)" \
+        -e "POX_5_BOND_ADMIN=$(compose_value POX_5_BOND_ADMIN)" \
+        -e "MINER_NAME=$PROJECT-stock-follower" \
+        -e BLOCK_PUSH_FAIL_PROBABILITY=0 \
+        -e STACKS_LOG_JSON=0 -e STACKS_LOG_DEBUG=1 \
+        -e "STACKS_LOG_FORMAT_TIME=%Y-%m-%d %H:%M:%S" \
+        --entrypoint /bin/bash "$image" -c \
+        'cd /data && set -e
+        perl -pe '\''s/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/$ENV{$1}/ge'\'' \
+            < config.toml.in > config.toml
+        exec stacks-node start --config config.toml 2>&1'; then
+        stop_sink "$directory/sink.pid"
+        return 1
+    fi
+    docker logs --follow "$STOCK_FOLLOWER" >> "$directory/node.log" 2>&1 &
+    echo $! > "$directory/log.pid"
+    printf 'stock follower %s logs to %s\n' "$STOCK_FOLLOWER" "$directory/node.log" >&2
+}
+
+stock_follower_wait() {
+    local directory=$RUN/stock-follower timeout=${1:-}
+    [ -n "$timeout" ] || timeout=600
+    local deadline wanted height
+    deadline=$((SECONDS + timeout))
+    wanted=$(cat "$directory/nano-start-height" 2>/dev/null) ||
+        die "start the stock follower first"
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        [ "$(docker inspect --format '{{.State.Running}}' "$STOCK_FOLLOWER" 2>/dev/null)" = true ] ||
+            die "stock follower exited; see $directory/node.log"
+        height=$(curl -sf --max-time 5 \
+            "http://127.0.0.1:$STOCK_FOLLOWER_RPC_PORT/v2/info" 2>/dev/null |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])' \
+            2>/dev/null || true)
+        if [ -n "$height" ] && [ "$height" -ge "$wanted" ]; then
+            printf 'stock follower reached %s from nano bootstrap %s\n' \
+                "$height" "$(cat "$directory/bootstrap-node")" >&2
+            return 0
+        fi
+        sleep 5
+    done
+    die "stock follower did not reach nano's starting height $wanted"
+}
+
+stock_follower_verify() {
+    local directory=$RUN/stock-follower timeout=${1:-}
+    [ -n "$timeout" ] || timeout=180
+    local deadline txid transaction
+    deadline=$((SECONDS + timeout))
+    txid=$(cat "$RUN/hosted-txid" 2>/dev/null) ||
+        die "verify-hosted did not retain its transaction id"
+    transaction=$(cat "$RUN/hosted-transaction" 2>/dev/null) ||
+        die "verify-hosted did not retain its transaction bytes"
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if python3 - "$directory/events" "$txid" "$transaction" <<'PY'
+import json, pathlib, sys
+events, txid, transaction = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+mempool = any(
+    f"0x{transaction}" in json.loads(path.read_text())
+    for path in (events / "new_mempool_tx").glob("*.json")
+)
+mined = any(
+    any(tx.get("txid", "").removeprefix("0x") == txid for tx in json.loads(path.read_text()).get("transactions", []))
+    for path in (events / "new_block").glob("*.json")
+)
+raise SystemExit(0 if mempool and mined else 1)
+PY
+        then
+            printf 'stock follower accepted relayed transaction %s into its mempool and block\n' \
+                "$txid" >&2
+            return 0
+        fi
+        sleep 5
+    done
+    die "stock follower did not observe relayed transaction $txid in its mempool and block"
+}
+
+stock_follower_stop() {
+    local directory=$RUN/stock-follower
+    docker stop --time 30 "$STOCK_FOLLOWER" > /dev/null 2>&1 || true
+    if [ -f "$directory/log.pid" ]; then
+        wait "$(cat "$directory/log.pid")" 2>/dev/null || true
+        rm -f "$directory/log.pid"
+    fi
+    docker rm "$STOCK_FOLLOWER" > /dev/null 2>&1 || true
+    stop_sink "$directory/sink.pid"
 }
 
 # Stop the hosted signer and nano, and put the stock participant back.
 unhost() {
     need_source
+    stock_follower_stop
     docker rm -f "$HOSTED_SIGNER" > /dev/null 2>&1 || true
-    if [ -f "$RUN/nano-sink.pid" ]; then
-        kill "$(cat "$RUN/nano-sink.pid")" 2>/dev/null || true
-    fi
-    rm -f "$RUN/nano-sink.pid"
+    stop_sink "$RUN/nano-sink.pid"
     restore
 }
 
 # Assert a stock signer, a submitter and an observer all work through nano.
 verify_hosted() {
     need_source
-    local index port=${NANO_HOST_PORT:-24443} key
+    local index port=$HOST_RPC_PORT key
     index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
     [ -n "$index" ] || die "no participant is hosted"
     [ -n "$(docker ps -q --filter "name=^${HOSTED_SIGNER}$")" ] ||
@@ -602,6 +786,9 @@ verify_hosted() {
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
     NANO_EVENT_DIR="$RUN/nano-events" \
     NANO_STOCK_EVENT_DIR="$RUN/events" \
+    NANO_HACKNET_API="http://127.0.0.1:$STACKS_API_RPC_PORT/" \
+    NANO_HOSTED_TXID_OUT="$RUN/hosted-txid" \
+    NANO_HOSTED_TRANSACTION_OUT="$RUN/hosted-transaction" \
     NANO_FUNDED_KEY="$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
         --test conformance hosted_signer -- --ignored --nocapture --test-threads 1
@@ -800,6 +987,10 @@ host) shift && host "$@" ;;
 unhost) unhost ;;
 verify) verify ;;
 verify-hosted) verify_hosted ;;
+stock-follow) stock_follower_start ;;
+wait-stock-follower) shift && stock_follower_wait "$@" ;;
+verify-stock-follower) shift && stock_follower_verify "$@" ;;
+stop-stock-follower) stock_follower_stop ;;
 restore) restore ;;
 observe) observe ;;
 stop-observing) stop_observing ;;
@@ -817,6 +1008,13 @@ usage: harness.sh <command>
   replace <1|2|3>    stop one stock participant and run nano in its place
   host <1|2|3>       run nano as the node half and a stock stacks-signer on it
   unhost             stop the hosted signer and restore the participant
+  stock-follow       start an empty stock stacks-node bootstrapped only from nano
+  wait-stock-follower [s]
+                     require that follower to reach nano's starting height
+  verify-stock-follower [s]
+                     require nano's transaction in the stock mempool and block
+  stop-stock-follower
+                     stop the isolated stock follower and its event sink
   fund [btc]         give nano a funded Bitcoin wallet and miner keys
   register           register nano's leader key on Bitcoin
   mine               restart nano with the mining role on

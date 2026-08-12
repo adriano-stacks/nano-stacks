@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The mock functions below are called through functions sourced from the harness.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2016,SC2329
 set -euo pipefail
 
 TEST_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -65,5 +65,53 @@ curl() {
     printf '%s\n' '{"stacker_set":{"signers":[{"weight":1},{"weight":2}]}}'
 }
 equal "$(reward_set_summary mock-peer 23)" '2 signers, total weight 3'
+
+RUN=$test_dir/run
+mkdir -p "$RUN/stock-follower/events/new_mempool_tx" \
+    "$RUN/stock-follower/events/new_block"
+printf 'abc123\n' > "$RUN/hosted-txid"
+printf 'deadbeef\n' > "$RUN/hosted-transaction"
+printf '["0xdeadbeef"]\n' > "$RUN/stock-follower/events/new_mempool_tx/00000001.json"
+printf '{"transactions":[{"txid":"0xabc123"}]}\n' \
+    > "$RUN/stock-follower/events/new_block/00000001.json"
+stock_follower_verify 1
+
+SRC=$test_dir/source
+mkdir -p "$SRC/docker/stacks" "$RUN/nano"
+printf '%s\n' \
+    '[node]' \
+    'rpc_bind = "0.0.0.0:20443"' \
+    'p2p_bind = "0.0.0.0:20444"' \
+    'prometheus_bind = "0.0.0.0:9153"' \
+    'bootstrap_node = "$BOOTSTRAP_NODE"' \
+    '[burnchain]' \
+    'peer_host = "$BITCOIN_PEER_HOST"' \
+    > "$SRC/docker/stacks/stacks-follower.toml"
+printf '%s\n' \
+    'rpc_bind = "127.0.0.1:24443"' \
+    'p2p_bind = "127.0.0.1:25444"' \
+    > "$RUN/nano.toml"
+printf 'aabb\n' > "$RUN/nano/p2p-seed"
+nano_running() { return 0; }
+cargo() { printf '%066d\n' 2; }
+curl() { printf '{"stacks_tip_height":321}\n'; }
+compose() { printf 'stock-container\n'; }
+compose_value() { printf '1\n'; }
+start_sink() { :; }
+docker() {
+    case $* in
+    'container inspect '*) return 1 ;;
+    'inspect --format '*) printf 'stock-image\n' ;;
+    'run '*) printf '%s\n' "$@" > "$test_dir/docker-run.args"; printf 'container\n' ;;
+    'logs --follow '*) return 0 ;;
+    *) fail "unexpected docker call: $*" ;;
+    esac
+}
+stock_follower_start
+grep -Fq 'rpc_bind = "$FOLLOWER_RPC_BIND"' "$RUN/stock-follower/config.toml.in"
+grep -Fq 'p2p_bind = "$FOLLOWER_P2P_BIND"' "$RUN/stock-follower/config.toml.in"
+grep -Fq '@127.0.0.1:25444' "$RUN/stock-follower/bootstrap-node"
+grep -Fxq -- '--network' "$test_dir/docker-run.args"
+grep -Fxq -- 'host' "$test_dir/docker-run.args"
 
 printf 'harness-test: all checks passed\n'

@@ -101,7 +101,11 @@ canonical anchor block`.
 
 ```
 hacknet/harness.sh host 3           # nano as the node half, a stock signer on its RPC
+hacknet/harness.sh stock-follow      # an empty stock node bootstraps only from nano
+hacknet/harness.sh wait-stock-follower
 hacknet/harness.sh verify-hosted    # assert the signer, a submitter and an observer work
+hacknet/harness.sh verify-stock-follower
+hacknet/harness.sh stop-stock-follower
 hacknet/harness.sh unhost           # stop the hosted signer and restore the participant
 ```
 
@@ -119,6 +123,17 @@ nano runs no signer of its own in this configuration: the proposal validator and
 the embedded signer are the same chain state, and one owner is the whole point.
 The stock signer runs on the host network, because a Hacknet container cannot
 reach a host port through the bridge here and nano is a host process.
+
+`stock-follow` uses the same boundary for a full stock `stacks-node`. It starts
+with an empty, separately mounted chainstate and configures nano's persisted P2P
+identity as its only bootstrap peer. The follower's RPC, P2P, metrics, events
+and logs all use their own loopback endpoints. `wait-stock-follower` requires it
+to execute through the height nano advertised when the follower started.
+`verify-hosted` retains the exact admitted transaction, and
+`verify-stock-follower` requires the stock node's own observer to report those
+same bytes in its mempool and the same transaction id in a block. This is the
+reverse inventory/block/relay run; the reference-codec socket tests do not
+substitute for it.
 
 **nano comes up before the participant it replaces goes down.** Hacknet needs all
 three signatures, so a signer missing for a whole prepare phase leaves the cycle

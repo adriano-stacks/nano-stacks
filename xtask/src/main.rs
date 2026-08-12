@@ -90,6 +90,7 @@ fn main() -> ExitCode {
             export_checkpoint_history(&env::args().skip(2).collect::<Vec<_>>())
         }
         Some("public-key") => print_public_key(env::args().nth(2).as_deref()),
+        Some("seed-public-key") => print_seed_public_key(env::args().nth(2).as_deref()),
         Some("verify-block") => verify_block(&env::args().skip(2).collect::<Vec<_>>()),
         Some("decode-blocks") => decode_blocks(env::args().nth(2).as_deref()),
         Some("check-module") => check_module(&env::args().skip(2).collect::<Vec<_>>()),
@@ -133,7 +134,7 @@ fn main() -> ExitCode {
                  reads or writes elsewhere:\n\
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
                  \x20 export-checkpoint-history  export-leader-keys  export-sortition\n\
-                 \x20 freeze-receipts  public-key\n\
+                 \x20 freeze-receipts  public-key  seed-public-key\n\
                  \x20 infrastructure-tests  release-report  scoreboard  snapshot-state\n\
                  \x20 validate-fixtures\n\
                  \x20 verify-block"
@@ -2223,6 +2224,24 @@ fn print_public_key(private_key: Option<&str>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn print_seed_public_key(seed: Option<&str>) -> ExitCode {
+    let Some(public_key) = seed.and_then(public_key_for_seed) else {
+        eprintln!("usage: cargo xtask seed-public-key <hexadecimal seed>");
+        return ExitCode::from(2);
+    };
+    println!("{public_key}");
+    ExitCode::SUCCESS
+}
+
+fn public_key_for_seed(seed: &str) -> Option<String> {
+    let seed = hex::decode(seed.trim().trim_start_matches("0x")).ok()?;
+    if seed.is_empty() {
+        return None;
+    }
+    let key = nano_crypto::StacksPrivateKey::from_seed(&seed);
+    Some(hex::encode(key.public_key().to_bytes_compressed()))
 }
 
 /// The reward one tenure earned, as stacks-core scheduled it.
@@ -6759,8 +6778,8 @@ mod tests {
         ARCHIVED_NAKAMOTO_BLOCK_QUERY, CheckpointHistoryExport, ContractArity, ContractInventory,
         ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
         chainstate_directory, contract_metadata_candidates, crosses_wasm_arity_boundary,
-        encode_hex, refusal_reason, refuse_a_short_earnings_window, report_contract_arities,
-        write_checkpoint_authentication_history,
+        encode_hex, public_key_for_seed, refusal_reason, refuse_a_short_earnings_window,
+        report_contract_arities, write_checkpoint_authentication_history,
     };
     use nano_chainstate::NakamotoBlock;
     use serde_json::json;
@@ -6768,6 +6787,16 @@ mod tests {
     struct FixtureBlock {
         raw: Vec<u8>,
         decoded: NakamotoBlock,
+    }
+
+    #[test]
+    fn a_p2p_seed_derives_the_identity_a_node_advertises() {
+        assert_eq!(
+            public_key_for_seed("00").as_deref(),
+            Some("0243311589af63c2adda04fcd7792c038a05c12a4fe40351b3eb1612ff6b2e5a0e")
+        );
+        assert_eq!(public_key_for_seed(""), None);
+        assert_eq!(public_key_for_seed("not hexadecimal"), None);
     }
 
     #[test]
