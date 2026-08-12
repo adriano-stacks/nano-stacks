@@ -99,6 +99,83 @@ fn published_signer_set(root: &Path, cycle: u64) -> Option<BTreeMap<Hash160, u32
     )
 }
 
+fn published_cycle(root: &Path) -> u64 {
+    fs::read_dir(root.join("stacker_set"))
+        .expect("the evidence publishes a reward set")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_prefix("cycle-")?
+                .strip_suffix(".json")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("a published cycle")
+}
+
+fn signer_evidence(capture: &Path) -> (PathBuf, bool) {
+    match std::env::var_os("NANO_MAINNET_SIGNER_EVIDENCE") {
+        Some(path) => (PathBuf::from(path), true),
+        None => (capture.to_path_buf(), false),
+    }
+}
+
+fn decode_array<const N: usize>(encoded: &str, what: &str) -> [u8; N] {
+    hex::decode(encoded.trim_start_matches("0x"))
+        .unwrap_or_else(|error| panic!("{what} is hexadecimal: {error}"))
+        .try_into()
+        .unwrap_or_else(|bytes: Vec<u8>| panic!("{what} has {} bytes, expected {N}", bytes.len()))
+}
+
+fn observed_block_events(root: &Path, cycle: u64) -> Vec<(u64, [u8; 32], Vec<MessageSignature>)> {
+    let mut paths = fs::read_dir(root.join("new_block"))
+        .expect("the signer evidence contains accepted block events")
+        .map(|entry| entry.expect("a block-event entry").path())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let event: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap_or_else(|error| {
+                    panic!("read block event {}: {error}", path.display())
+                }))
+                .unwrap_or_else(|error| panic!("decode block event {}: {error}", path.display()));
+            if event["cycle_number"].as_u64() != Some(cycle) {
+                return None;
+            }
+            let height = event["burn_block_height"]
+                .as_u64()
+                .expect("a block event burn height");
+            let digest = decode_array(
+                event["signer_signature_hash"]
+                    .as_str()
+                    .expect("a block event signer digest"),
+                "signer digest",
+            );
+            let block_hash = decode_array(
+                event["block_hash"]
+                    .as_str()
+                    .expect("a block event block hash"),
+                "block hash",
+            );
+            assert_eq!(digest, block_hash, "the event names its signed block hash");
+            let signatures = event["signer_signature"]
+                .as_array()
+                .expect("a block event signer-signature list")
+                .iter()
+                .map(|signature| {
+                    MessageSignature::from_bytes(decode_array(
+                        signature.as_str().expect("a signer signature"),
+                        "signer signature",
+                    ))
+                })
+                .collect();
+            Some((height, digest, signatures))
+        })
+        .collect()
+}
+
 /// What nano read out of `.signers`, in the same shape.
 fn recorded_signer_set(
     chainstate: &mut ChainState,
@@ -329,14 +406,14 @@ fn a_signature_that_recovers_to_nothing_is_rejected() {
 
 /// The mainnet state a node has imported carries mainnet's own signer set.
 ///
-/// This is the question task 050 could not answer before: nothing is stacked in
-/// pox-5 for mainnet's cycle 140, because it was stacked in pox-4 below the
-/// checkpoint, so a walk of pox-5 positions finds no set and the check could not
-/// run. The `.signers` entries for that cycle came across with the state, and
-/// this puts them against `/v3/stacker_set/140` as the network published it.
+/// This is the question task 050 could not answer in cycle 140: that cycle was
+/// stacked in pox-4 below the imported checkpoint. A replay that crosses into
+/// cycle 141 records the new set itself. This compares it with the stock-node
+/// `/v3/stacker_set/141` document retained alongside this node's block events.
 ///
 /// Point `NANO_MAINNET_STATE` at a state directory a node has imported into and
-/// `NANO_MAINNET_CAPTURE` at the capture that published the reward set.
+/// `NANO_MAINNET_CAPTURE` at the authenticated capture and
+/// `NANO_MAINNET_SIGNER_EVIDENCE` at the later cycle's retained evidence.
 #[test]
 fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
     let (Some(state), Some(capture)) = (
@@ -354,21 +431,18 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
     // on an operator's 33 GB directory. See task 087.
     let mut chainstate =
         ChainState::open_existing(&state).expect("the mainnet state opens for reading");
-    // The cycle the capture published, taken from the file rather than computed:
-    // this test is about the set, and the calendar has its own tests.
-    let cycle = fs::read_dir(capture.join("stacker_set"))
-        .expect("the capture publishes a reward set")
-        .filter_map(|entry| {
-            let name = entry.ok()?.file_name().into_string().ok()?;
-            name.strip_prefix("cycle-")?
-                .strip_suffix(".json")?
-                .parse::<u64>()
-                .ok()
-        })
-        .max()
-        .expect("a published cycle");
-    let published = published_signer_set(&capture, cycle).expect("the published reward set reads");
-    let context = mainnet_context(&capture);
+    let (evidence, observed) = signer_evidence(&capture);
+    let cycle = published_cycle(&evidence);
+    let published = published_signer_set(&evidence, cycle).expect("the published reward set reads");
+    let context = if observed {
+        let height = observed_block_events(&evidence, cycle)
+            .first()
+            .expect("the evidence contains a block in the published cycle")
+            .0;
+        mainnet_context_at(&capture, height)
+    } else {
+        mainnet_context(&capture)
+    };
     assert_eq!(
         nano_chainstate::reward_cycle_at(context),
         Some(cycle),
@@ -389,12 +463,9 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
 
 /// Mainnet's own blocks pass the check against mainnet's own state.
 ///
-/// The one that matters for turning this into a rejection rather than a report.
-/// `mainnet_envelope` proves those five blocks carry threshold weight against the
-/// reward set `/v3/stacker_set/140` published, and the test above proves the set
-/// in the imported state is that same set — but composing two green tests is an
-/// argument, not a measurement, and the whole point of this task is that a rule
-/// which refuses a block the network accepted is the worst outcome available. So
+/// The one that matters for turning this into a rejection rather than a report:
+/// this applies the production ordering and threshold rule to the signatures in
+/// every retained accepted-block event from the later cycle.
 /// The set a mainnet state records for the cycle it stands in, or why it has none.
 ///
 /// **Mainnet cycle 140 has none, and cannot.** It was stacked under pox-4, before the
@@ -417,8 +488,8 @@ fn recorded_set_or_skip(
         Err(error) => {
             nano_conformance::skip_gate(&format!(
                 "the mainnet state stands in a cycle with no recorded signer set ({error}): \
-                 cycle 140 was stacked under pox-4, below the checkpoint, so this needs a \
-                 replay that has crossed into cycle 141 at burn 962,150"
+                 cycle 140 was stacked under pox-4, below the checkpoint, so release evidence \
+                 must come from a replay that crossed into cycle 141 at burn 962,150"
             ));
             None
         }
@@ -444,18 +515,45 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
     // on an operator's 33 GB directory. See task 087.
     let mut chainstate =
         ChainState::open_existing(&state).expect("the mainnet state opens for reading");
-    let Some(set) = recorded_set_or_skip(&mut chainstate, mainnet_context(&capture)) else {
+    let (evidence, observed) = signer_evidence(&capture);
+    let cycle = published_cycle(&evidence);
+    let events = observed.then(|| {
+        let events = observed_block_events(&evidence, cycle);
+        assert!(
+            !events.is_empty(),
+            "the signer evidence contains no block in cycle {cycle}"
+        );
+        events
+    });
+    let context = events
+        .as_ref()
+        .and_then(|events| events.first().map(|event| event.0))
+        .map_or_else(
+            || mainnet_context(&capture),
+            |height| mainnet_context_at(&capture, height),
+        );
+    let Some(set) = recorded_set_or_skip(&mut chainstate, context) else {
         return;
     };
     let threshold = set.approval_threshold().expect("a threshold");
-    // Both samples: the five blocks in the tree, and every block the capture
-    // holds. They are the same cycle, and the capture is the larger sample.
-    let mut checked = 0;
-    for directory in [
-        fixtures().join("mainnet/blocks"),
-        capture.join("nakamoto/blocks"),
-    ] {
-        for entry in fs::read_dir(&directory).expect("the captured mainnet blocks") {
+    let checked = if let Some(events) = events {
+        for (height, digest, signatures) in &events {
+            let weight = set
+                .verify_signatures(*digest, signatures)
+                .unwrap_or_else(|error| {
+                    panic!("mainnet block at burn height {height} was accepted: {error}")
+                });
+            assert!(
+                weight >= threshold,
+                "block at burn height {height} carries {weight} of the {threshold} required"
+            );
+        }
+        events.len()
+    } else {
+        let mut checked = 0;
+        for entry in
+            fs::read_dir(capture.join("nakamoto/blocks")).expect("the captured mainnet blocks")
+        {
             let path = entry.expect("a block entry").path();
             let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
                 .expect("a captured mainnet block decodes");
@@ -473,8 +571,12 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
             );
             checked += 1;
         }
-    }
-    assert!(checked > 5, "the capture holds no mainnet blocks to check");
+        checked
+    };
+    assert!(
+        checked > 5,
+        "the evidence holds too few mainnet blocks to check"
+    );
 }
 
 /// Every block the mainnet capture holds passes the complete validator.
@@ -530,11 +632,26 @@ fn mainnet_context(capture: &Path) -> BitcoinBlockContext {
             })
             .unwrap_or_else(|| panic!("the capture records {name}"))
     };
-    let provenance = fs::read_to_string(capture.join("provenance.toml"))
-        .expect("the capture records its provenance");
     let checkpoint = fs::read_to_string(capture.join("chainstate/checkpoint-H/checkpoint.toml"))
         .expect("the capture records its checkpoint");
-    let mut context = BitcoinBlockContext::at_height(number(&checkpoint, "first_bitcoin_height"));
+    mainnet_context_at(capture, number(&checkpoint, "first_bitcoin_height"))
+}
+
+fn mainnet_context_at(capture: &Path, height: u64) -> BitcoinBlockContext {
+    let number = |document: &str, name: &str| -> u64 {
+        document
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!("{name} = "))?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("the capture records {name}"))
+    };
+    let provenance = fs::read_to_string(capture.join("provenance.toml"))
+        .expect("the capture records its provenance");
+    let mut context = BitcoinBlockContext::at_height(height);
     context.first_height = number(&provenance, "pox_first_bitcoin_height");
     context.prepare_phase_length = u32::try_from(number(&provenance, "pox_prepare_phase_length"))
         .expect("the prepare phase fits");

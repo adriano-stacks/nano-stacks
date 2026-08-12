@@ -480,7 +480,7 @@ site = "signer_weight_enforcement::the_mainnet_state_carries_the_signer_set_main
 class = "infrastructure"
 owner = "076"
 job = "release-qualification"
-requires = "mainnet capture/state with blocks and published reward sets"
+requires = "mainnet capture/state and later-cycle signer evidence"
 policy = "required"
 
 [[conditional]]
@@ -496,7 +496,7 @@ site = "signer_weight_enforcement::mainnet_blocks_pass_the_check_against_mainnet
 class = "infrastructure"
 owner = "076"
 job = "release-qualification"
-requires = "mainnet capture/state with blocks and published reward sets"
+requires = "mainnet capture/state and later-cycle signer evidence"
 policy = "required"
 
 [[conditional]]

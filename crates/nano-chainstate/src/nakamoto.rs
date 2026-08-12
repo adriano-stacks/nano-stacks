@@ -372,9 +372,18 @@ impl SignerWeights {
     /// the chain is built on.
     pub fn verify(&self, header: &NakamotoBlockHeader) -> Result<u32, SignerSetError> {
         let digest = *header.signer_signature_hash().as_bytes();
+        self.verify_signatures(digest, &header.signer_signatures)
+    }
+
+    /// Verify signatures over a block digest recorded outside the binary block envelope.
+    pub fn verify_signatures(
+        &self,
+        digest: [u8; 32],
+        signatures: &[MessageSignature],
+    ) -> Result<u32, SignerSetError> {
         let mut next_index = 0;
         let mut signed_weight = 0_u32;
-        for signature in &header.signer_signatures {
+        for signature in signatures {
             let public_key = signature
                 .recover(&digest)
                 .map_err(SignerSetError::Signature)?;
