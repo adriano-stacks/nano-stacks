@@ -72,7 +72,7 @@ test "$block_count" -eq "$event_count" || {
     echo "retained $block_count raw blocks for $event_count accepted events" >&2
     exit 1
 }
-first_height="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | head -n 1)"
+first_height="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | sed -n '1p')"
 last_height="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | tail -n 1)"
 first_height="$((10#${first_height%%-*}))"
 last_height="$((10#${last_height%%-*}))"
