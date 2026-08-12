@@ -357,6 +357,8 @@ network = "testnet"
 chain_id = $chain_id
 peers = ["$peer/"]
 ${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
+${NANO_P2P_BIND:+p2p_bind = \"$NANO_P2P_BIND\"}
+${NANO_P2P_ADDRESS:+p2p_address = \"$NANO_P2P_ADDRESS\"}
 ${NANO_METRICS_BIND:+metrics_bind = \"$NANO_METRICS_BIND\"}
 ${NANO_PROPOSAL_TOKEN:+block_proposal_token = \"$NANO_PROPOSAL_TOKEN\"}
 pox_5_sbtc_contract = "$(compose_value POX_5_SBTC_CONTRACT)"
@@ -466,7 +468,8 @@ replace() {
 host() {
     need_source
     local index=${1:?participant index}
-    local port=${NANO_HOST_PORT:-24443} endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
+    local port=${NANO_HOST_PORT:-24443} p2p_port=${NANO_HOST_P2P_PORT:-25444}
+    local endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
     local sink=${NANO_SINK_PORT:-3801} key token image signer_container
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
     [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
@@ -485,7 +488,9 @@ host() {
     nano_sink "$sink"
     log "starting the nano node for participant $index, hosting a signer on :$endpoint"
     NANO_HOSTED_SIGNER=1 \
-    NANO_RPC_BIND="0.0.0.0:$port" \
+    NANO_RPC_BIND="127.0.0.1:$port" \
+    NANO_P2P_BIND="127.0.0.1:$p2p_port" \
+    NANO_P2P_ADDRESS="127.0.0.1:$p2p_port" \
     NANO_PROPOSAL_TOKEN="$token" \
     NANO_EVENT_OBSERVERS="http://127.0.0.1:$endpoint,http://127.0.0.1:$sink" \
         nano_start "$index"
