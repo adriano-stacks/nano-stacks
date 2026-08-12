@@ -24,13 +24,12 @@ use clarity::vm::{
 use clarity_types::types::TypeSignature;
 use regex::Regex;
 
-use crate::compile;
 use crate::cost::CostMeter;
 use crate::datastore::{BurnDatastore, Datastore, StacksConstants};
 use crate::error::WasmError;
 use crate::initialize::{call_function, initialize_contract};
 use crate::wasm_utils::get_type_in_memory_size;
-use crate::{CompiledContract, ModuleCache};
+use crate::{compile, compile_for_cost_epoch, CompiledContract, ModuleCache};
 
 const DEFAULT_ENV_AMOUNT: u128 = 1_000_000_000;
 
@@ -126,6 +125,7 @@ impl TestEnvironment {
                         true,
                         contract.code,
                         contract.version,
+                        contract.epoch,
                         contract.epoch,
                     )
                     .unwrap_or_else(|err| {
@@ -241,6 +241,26 @@ impl TestEnvironment {
             snippet,
             self.version,
             self.epoch,
+            self.epoch,
+        )
+    }
+
+    /// Compile a contract with its recorded semantics and this environment's
+    /// current cost schedule.
+    pub fn init_contract_with_recorded_semantics(
+        &mut self,
+        contract_name: &str,
+        snippet: &str,
+        version: ClarityVersion,
+        epoch: StacksEpochId,
+    ) -> Result<Option<Value>, VmExecutionError> {
+        self.inner_init_contract_with_snippet(
+            contract_name,
+            false,
+            snippet,
+            version,
+            epoch,
+            self.epoch,
         )
     }
 
@@ -251,6 +271,7 @@ impl TestEnvironment {
         snippet: &str,
         version: ClarityVersion,
         epoch: StacksEpochId,
+        cost_epoch: StacksEpochId,
     ) -> Result<Option<Value>, VmExecutionError> {
         let contract_id = match is_boot_contract {
             false => QualifiedContractIdentifier::new(
@@ -264,12 +285,13 @@ impl TestEnvironment {
             .datastore
             .as_analysis_db()
             .execute(|analysis_db| {
-                compile(
+                compile_for_cost_epoch(
                     snippet,
                     &contract_id,
                     LimitedCostTracker::new_free(),
                     version,
                     epoch,
+                    cost_epoch,
                     analysis_db,
                     !is_boot_contract && self.emit_cost_code,
                 )
@@ -288,7 +310,7 @@ impl TestEnvironment {
             })
             .expect("Failed to insert contract analysis.");
 
-        let mut contract_context = ContractContext::new(contract_id.clone(), self.version);
+        let mut contract_context = ContractContext::new(contract_id.clone(), version);
         let wasm = compile_result.module.emit_wasm();
 
         let mut cost_tracker = LimitedCostTracker::new_free();
@@ -568,6 +590,23 @@ impl TestEnvironment {
 
         self.cost_tracker = global_context.cost_track;
         Ok(result)
+    }
+
+    /// Interpret a deployment with its recorded semantics, then restore this
+    /// environment's current execution epoch for later calls.
+    pub fn interpret_contract_with_recorded_semantics(
+        &mut self,
+        contract_name: &str,
+        snippet: &str,
+        version: ClarityVersion,
+        epoch: StacksEpochId,
+    ) -> Result<Option<Value>, VmExecutionError> {
+        let current_epoch = std::mem::replace(&mut self.epoch, epoch);
+        let current_version = std::mem::replace(&mut self.version, version);
+        let result = self.interpret_contract_with_snippet(contract_name, snippet);
+        self.epoch = current_epoch;
+        self.version = current_version;
+        result
     }
 
     pub fn interpret(&mut self, snippet: &str) -> Result<Option<Value>, VmExecutionError> {
@@ -1120,6 +1159,40 @@ pub fn crosscheck_cost_multi_contract(
     );
 }
 
+/// [`crosscheck_cost_multi_contract`] for contracts deployed under an older
+/// semantic epoch and called under the current cost schedule.
+pub fn crosscheck_cost_recorded_semantics(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Value],
+    semantic_epoch: StacksEpochId,
+    version: ClarityVersion,
+) {
+    let (compiled, interpreted) =
+        cost_crosscheck_recorded_semantics(contracts, function, arguments, semantic_epoch, version);
+    assert_eq!(
+        compiled, interpreted,
+        "compiled and interpreted costs diverge calling {function} on {contracts:?}"
+    );
+}
+
+/// Charge a call into contracts deployed under older semantics through both
+/// runtimes, using the current cost schedule.
+pub fn cost_crosscheck_recorded_semantics(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Value],
+    semantic_epoch: StacksEpochId,
+    version: ClarityVersion,
+) -> (CostMeter, CostMeter) {
+    cost_crosscheck_with_semantics(
+        contracts,
+        function,
+        arguments,
+        Some((semantic_epoch, version)),
+    )
+}
+
 /// Charge one contract call through the compiler and through the interpreter,
 /// and report what each one charged.
 ///
@@ -1131,14 +1204,33 @@ pub fn cost_crosscheck(
     function: &str,
     arguments: &[Value],
 ) -> (CostMeter, CostMeter) {
+    cost_crosscheck_with_semantics(contracts, function, arguments, None)
+}
+
+fn cost_crosscheck_with_semantics(
+    contracts: &[(&str, &str)],
+    function: &str,
+    arguments: &[Value],
+    recorded_semantics: Option<(StacksEpochId, ClarityVersion)>,
+) -> (CostMeter, CostMeter) {
     let env =
         TestEnvironment::new_with_cost(TestConfig::latest_epoch(), TestConfig::clarity_version());
     let mut interpreted_env = env.clone();
     let mut compiled_env = env;
     for (name, snippet) in contracts {
+        let (compiled, interpreted) = match recorded_semantics {
+            Some((epoch, version)) => (
+                compiled_env.init_contract_with_recorded_semantics(name, snippet, version, epoch),
+                interpreted_env
+                    .interpret_contract_with_recorded_semantics(name, snippet, version, epoch),
+            ),
+            None => (
+                compiled_env.init_contract_with_snippet(name, snippet),
+                interpreted_env.interpret_contract_with_snippet(name, snippet),
+            ),
+        };
         assert_eq!(
-            compiled_env.init_contract_with_snippet(name, snippet),
-            interpreted_env.interpret_contract_with_snippet(name, snippet),
+            compiled, interpreted,
             "compiled and interpreted deployments diverge for {snippet}"
         );
     }

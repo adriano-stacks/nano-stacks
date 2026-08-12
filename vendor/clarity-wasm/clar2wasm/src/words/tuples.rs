@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use clarity::types::StacksEpochId;
 use clarity::vm::types::{TupleTypeSignature, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
-use walrus::ir::BinaryOp;
+use walrus::ir::{BinaryOp, IfElse};
 use walrus::ValType;
 
 use super::{ComplexWord, Word};
@@ -176,8 +176,6 @@ impl ComplexWord for TupleGet {
         // Determine the wasm types for each field of the tuple
         let field_types = tuple_ty.get_type_map();
 
-        self.charge(generator, builder, field_types.iter().len() as u32)?;
-
         // Create locals for the target field
         let field_ty = field_types
             .get(target_field_name)
@@ -211,6 +209,24 @@ impl ComplexWord for TupleGet {
         // Drop the tuple's root runtime-shape handle. The extracted field's
         // own handle, if composite, remains part of that field's slots.
         builder.drop();
+
+        if tuple_is_optional {
+            // The interpreter passes `none` through without charging
+            // `TupleGet`; only a present tuple performs the field lookup.
+            let indicator = generator.borrow_local(ValType::I32);
+            builder.local_set(*indicator);
+            let mut present = builder.dangling_instr_seq(None);
+            self.charge(generator, &mut present, field_types.len() as u32)?;
+            let present = present.id();
+            let absent = builder.dangling_instr_seq(None).id();
+            builder.local_get(*indicator).instr(IfElse {
+                consequent: present,
+                alternative: absent,
+            });
+            builder.local_get(*indicator);
+        } else {
+            self.charge(generator, builder, field_types.len() as u32)?;
+        }
 
         // Load the target field from the locals we created above.
         for local in val_locals.iter().rev() {

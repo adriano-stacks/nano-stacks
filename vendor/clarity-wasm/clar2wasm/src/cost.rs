@@ -1998,10 +1998,14 @@ mod word {
 /// the interpreter rather than a hand-written expectation.
 #[cfg(test)]
 mod crosscheck {
+    use clarity::types::StacksEpochId;
     use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TupleData};
     use clarity::vm::{ClarityName, Value};
 
-    use crate::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
+    use crate::tools::{
+        cost_crosscheck_recorded_semantics, crosscheck_cost, crosscheck_cost_multi_contract,
+        crosscheck_cost_recorded_semantics,
+    };
 
     #[test]
     fn charges_every_application() {
@@ -2014,6 +2018,184 @@ mod crosscheck {
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }
+    }
+
+    /// Contracts deployed under Clarity 3 keep those semantics while calls at
+    /// Epoch 4.0 pay the current cost schedule.
+    #[test]
+    fn charges_a_clarity3_as_contract_mint_at_current_costs() {
+        let recipient = Value::Principal(PrincipalData::Standard(
+            clarity::vm::types::StandardPrincipalData::transient(),
+        ));
+        crosscheck_cost_recorded_semantics(
+            &[(
+                "token",
+                "(define-fungible-token token) \
+                 (define-constant owner tx-sender) \
+                 (define-public (mint (amount uint) (recipient principal)) \
+                   (begin \
+                     (asserts! (and (is-eq tx-sender owner) \
+                                    (is-eq tx-sender recipient)) (err u1)) \
+                     (ft-mint? token amount (as-contract tx-sender))))",
+            )],
+            "mint",
+            &[Value::UInt(417), recipient],
+            StacksEpochId::Epoch31,
+            clarity::vm::ClarityVersion::Clarity3,
+        );
+    }
+
+    #[test]
+    fn charges_a_clarity3_cross_contract_mint_at_current_costs() {
+        let token = "(define-fungible-token token) \
+             (define-public (mint (amount uint) (recipient principal)) \
+               (ft-mint? token amount (as-contract tx-sender)))";
+        let caller = "(define-public (mint (amount uint) (recipient principal)) \
+               (contract-call? .token mint amount recipient))";
+        let recipient = Value::Principal(PrincipalData::Standard(
+            clarity::vm::types::StandardPrincipalData::transient(),
+        ));
+        crosscheck_cost_recorded_semantics(
+            &[("token", token), ("caller", caller)],
+            "mint",
+            &[Value::UInt(417), recipient],
+            StacksEpochId::Epoch31,
+            clarity::vm::ClarityVersion::Clarity3,
+        );
+    }
+
+    #[test]
+    fn charges_the_clarity3_blocksurvey_path_at_current_costs() {
+        let token = r#"
+            (define-fungible-token blocksurvey)
+            (define-constant owner tx-sender)
+            (define-public (mint (amount uint) (recipient principal))
+              (begin
+                (asserts! (and (is-eq tx-sender owner)
+                               (is-eq tx-sender recipient)) (err u1))
+                (ft-mint? blocksurvey amount (as-contract tx-sender))))
+        "#;
+        let proof = r#"
+            (define-constant owner tx-sender)
+            (define-data-var total-responses uint u0)
+            (define-map survey-responses
+              {survey-id: (string-utf8 64)} {count: uint})
+            (define-map responses
+              {response-id: (string-utf8 64)} {hash: (string-utf8 64)})
+            (define-map black-list-surveys (string-utf8 64) bool)
+
+            (define-private (validate-ownership)
+              (is-eq tx-sender owner))
+            (define-private (get-response-count (survey-id (string-utf8 64)))
+              (default-to u0
+                (get count (map-get? survey-responses {survey-id: survey-id}))))
+            (define-private (get-response (response-id (string-utf8 64)))
+              (default-to u""
+                (get hash (map-get? responses {response-id: response-id}))))
+            (define-private (is-response-new (response-id (string-utf8 64)))
+              (default-to false (some (is-eq u"" (get-response response-id)))))
+            (define-private (is-survey-open (survey-id (string-utf8 64)))
+              (not (default-to false (map-get? black-list-surveys survey-id))))
+
+            (define-public (submit
+              (survey-id (string-utf8 64))
+              (response-id (string-utf8 64))
+              (response-hash (string-utf8 64))
+              (gas-fee uint))
+              (begin
+                (asserts! (validate-ownership) (err u100))
+                (asserts! (is-response-new response-id) (err u103))
+                (asserts! (is-survey-open survey-id) (err u104))
+                (asserts! (>= gas-fee u1) (err u105))
+                (try! (contract-call? .blocksurvey-token mint gas-fee tx-sender))
+                (var-set total-responses (+ u1 (var-get total-responses)))
+                (map-set survey-responses {survey-id: survey-id}
+                  {count: (+ u1 (get-response-count survey-id))})
+                (map-set responses {response-id: response-id}
+                  {hash: response-hash})
+                (ok true)))
+        "#;
+        let text =
+            |byte| Value::string_utf8_from_bytes(vec![byte; 64]).expect("64-byte UTF-8 string");
+        crosscheck_cost_recorded_semantics(
+            &[("blocksurvey-token", token), ("proof", proof)],
+            "submit",
+            &[text(b'a'), text(b'b'), text(b'c'), Value::UInt(417)],
+            StacksEpochId::Epoch31,
+            clarity::vm::ClarityVersion::Clarity3,
+        );
+    }
+
+    #[test]
+    fn charges_clarity3_map_defaults_at_current_costs() {
+        let cases = [
+            (
+                "uint-none",
+                "(define-map m uint uint) \
+                 (define-read-only (f) (ok (default-to u0 (map-get? m u0))))",
+            ),
+            (
+                "uint-some",
+                "(define-map m uint uint) (map-set m u0 u1) \
+                 (define-read-only (f) (ok (default-to u0 (map-get? m u0))))",
+            ),
+            (
+                "bool-none",
+                "(define-map m (string-utf8 64) bool) \
+                 (define-read-only (f) \
+                   (ok (not (default-to false (map-get? m u\"a\")))))",
+            ),
+            (
+                "string-none",
+                "(define-map m (string-utf8 64) (string-utf8 64)) \
+                 (define-read-only (f) \
+                   (ok (default-to u\"\" (map-get? m u\"a\"))))",
+            ),
+            (
+                "nested-string-none",
+                "(define-map m (string-utf8 64) (string-utf8 64)) \
+                 (define-read-only (f) \
+                   (ok (default-to false \
+                     (some (is-eq u\"\" \
+                       (default-to u\"\" (map-get? m u\"a\")))))))",
+            ),
+            (
+                "tuple-uint-none",
+                "(define-map m uint {count: uint}) \
+                 (define-read-only (f) \
+                   (ok (default-to u0 (get count (map-get? m u0)))))",
+            ),
+            (
+                "tuple-uint-some",
+                "(define-map m uint {count: uint}) \
+                 (map-set m u0 {count: u1}) \
+                 (define-read-only (f) \
+                   (ok (default-to u0 (get count (map-get? m u0)))))",
+            ),
+            (
+                "tuple-string-none",
+                "(define-map m uint {hash: (string-utf8 64)}) \
+                 (define-read-only (f) \
+                   (ok (default-to u\"\" (get hash (map-get? m u0)))))",
+            ),
+        ];
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(name, contract)| {
+                let (compiled, interpreted) = cost_crosscheck_recorded_semantics(
+                    &[("legacy-default", contract)],
+                    "f",
+                    &[],
+                    StacksEpochId::Epoch31,
+                    clarity::vm::ClarityVersion::Clarity3,
+                );
+                (compiled != interpreted).then_some((name, compiled, interpreted))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "compiled and interpreted legacy defaults diverged: {mismatches:#?}"
+        );
     }
 
     #[test]
