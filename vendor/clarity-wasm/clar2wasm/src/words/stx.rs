@@ -44,6 +44,10 @@ impl Word for StxGetBalance {
 }
 
 impl SimpleWord for StxGetBalance {
+    fn reads_operands_in_place(&self) -> bool {
+        true
+    }
+
     fn visit(
         &self,
         generator: &mut WasmGenerator,

@@ -2565,6 +2565,19 @@ mod crosscheck {
         );
     }
 
+    #[test]
+    fn charges_stx_get_balance_operands_in_place() {
+        crosscheck_cost(
+            "(define-read-only (f (account principal))
+               (ok (stx-get-balance account)))",
+            "f",
+            &[Value::Principal(
+                clarity::vm::types::PrincipalData::parse("S1G2081040G2081040G2081040G208105NK8PE5")
+                    .expect("principal"),
+            )],
+        );
+    }
+
     /// `slice?` reads its positions where they are, as `element-at?` does.
     ///
     /// This is `.pox-5 remove-staker-from-cycles` reduced: it slices a

@@ -1993,9 +1993,11 @@ impl ComplexWord for Slice {
         // Check if the upper 64-bits are greater than 0.
         builder.i64_const(0).binop(BinaryOp::I64GtU);
 
-        // Save the overflow indicator to a local.
-        let overflow_local = generator.alloc_local(ValType::I32);
-        builder.local_set(overflow_local);
+        // Keep a failure from either bound.
+        builder
+            .local_get(overflow_local)
+            .binop(BinaryOp::I32Or)
+            .local_set(overflow_local);
 
         // Save the lower part of the index, which will ultimately be
         // multiplied by the element size and added to the source offset to be
@@ -3306,6 +3308,12 @@ mod tests {
         #[test]
         fn slice_overflow() {
             crosscheck("(slice? \"abc\" u4 u5)", evaluate("none"));
+        }
+
+        #[test]
+        fn slice_starting_at_the_end_is_none() {
+            crosscheck("(slice? \"abc\" u3 u3)", evaluate("none"));
+            crosscheck("(slice? 0x0102 u2 u2)", evaluate("none"));
         }
 
         #[test]
