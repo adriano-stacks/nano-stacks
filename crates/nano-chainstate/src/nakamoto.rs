@@ -684,6 +684,12 @@ mod tests {
             ordered,
             vec![first_response, second_response, third_response]
         );
+        assert_eq!(
+            set.signing_weights()
+                .expect("signer weights")
+                .verify_signatures(*digest.as_bytes(), &ordered),
+            Ok(10)
+        );
     }
 
     #[test]
