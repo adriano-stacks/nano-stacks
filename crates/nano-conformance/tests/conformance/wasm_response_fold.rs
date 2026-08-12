@@ -932,3 +932,67 @@ fn narrowing_a_tuple_keeps_the_fields_it_kept() {
         }
     }
 }
+
+/// The shape mainnet block 8,742,090 stops on: a `default-to` whose narrowed
+/// tuple carries a *principal*, read back out of the surviving value.
+///
+/// `SP1CSHTKVHMMQJ7PRQRFYW6SB4QAW6SR3XY2F81PA.stxnft-auctions-v1::place-bid`
+/// binds `(default-to { buyer: CONTRACT-OWNER, amount: u0 } (map-get?
+/// auction-bids k))` over a `{ buyer: principal, amount: uint, auction-id:
+/// uint }` map and then reads `(get buyer ...)` and `(get amount ...)`.
+/// clarity-wasm answers
+///
+/// ```text
+/// principal representation for PrincipalType at value offset 5654 points to
+/// offset 0 with invalid length 0
+/// ```
+///
+/// which fails the block instead of the transaction and pins the node's tip.
+/// Principals are in-memory values — an (offset, length) pair — so a field the
+/// projection did not materialise reads as (0, 0), which no bool or uint field
+/// in the earlier tests could show.
+const PRINCIPAL_DEFAULT: &str = "
+(define-constant OWNER tx-sender)
+(define-map bids { token-id: uint } { buyer: principal, amount: uint, auction-id: uint })
+
+;; `get-auction-bid`, verbatim in shape: the default names two of three fields
+;; and one of the survivors is a principal.
+(define-read-only (current-bid (token-id uint))
+  (default-to { buyer: OWNER, amount: u0 }
+    (map-get? bids { token-id: token-id })))
+
+;; The map-hit branch: a stored three-field bid narrowed by the two-field
+;; default, its principal then read out, printed and re-stored: `place-bid`'s
+;; own uses.
+(define-public (outbid (first principal) (amount uint))
+  (begin
+    (map-set bids { token-id: u1 } { buyer: first, amount: u1, auction-id: u7 })
+    (let ((current (current-bid u1)))
+      (asserts! (>= amount (+ (get amount current) u1)) (err u100))
+      (print (get buyer current))
+      (map-set bids { token-id: u1 } { buyer: tx-sender, amount: amount, auction-id: u7 })
+      (ok { buyer: (get buyer current), amount: (get amount current) }))))
+
+;; The map-miss branch: the default's constant principal is the survivor.
+(define-read-only (fresh-bid)
+  (let ((current (current-bid u2)))
+    { buyer: (get buyer current), amount: (get amount current) }))
+";
+
+#[test]
+fn a_narrowed_default_carrying_a_principal_reads_it_back() {
+    let alice = "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7";
+    let (compiled, interpreted) = both_in(PRINCIPAL_DEFAULT, "outbid", &[principal(alice), uint(5)]);
+    assert!(
+        !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
+        "outbid answered nothing: {compiled}"
+    );
+    assert_eq!(compiled, interpreted, "outbid over a stored wide bid");
+
+    let (compiled, interpreted) = both_in(PRINCIPAL_DEFAULT, "fresh-bid", &[]);
+    assert!(
+        !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
+        "fresh-bid answered nothing: {compiled}"
+    );
+    assert_eq!(compiled, interpreted, "fresh-bid over the default");
+}
