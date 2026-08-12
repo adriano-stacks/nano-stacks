@@ -900,17 +900,20 @@ fn pox_unavailable(message: impl Into<String>) -> RpcError {
 fn pox_read(
     chain: &mut dyn ChainAccess,
     network: Network,
+    contract_name: &str,
     function: &str,
     arguments: &[ClarityValue],
 ) -> Result<ClarityValue, RpcError> {
-    let contract = clarity::boot_util::boot_code_id("pox-5", network.is_mainnet());
+    let contract = clarity::boot_util::boot_code_id(contract_name, network.is_mainnet());
     let sender = PrincipalData::Standard(contract.issuer.clone());
     let arguments = arguments
         .iter()
         .map(ClarityValue::serialize_to_vec)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            pox_unavailable(format!("cannot encode pox-5.{function} arguments: {error}"))
+            pox_unavailable(format!(
+                "cannot encode {contract_name}.{function} arguments: {error}"
+            ))
         })?;
     chain
         .call_read_only(&ReadOnlyCall {
@@ -925,45 +928,55 @@ fn pox_read(
                 ChainAccessError::Unavailable(reason) | ChainAccessError::Failed(reason) => reason,
                 ChainAccessError::NotReadOnly => "the call attempted to write state".to_owned(),
             };
-            pox_unavailable(format!("cannot read pox-5.{function}: {reason}"))
+            pox_unavailable(format!("cannot read {contract_name}.{function}: {reason}"))
         })
 }
 
-fn pox_u64(value: &ClarityValue, context: &str) -> Result<u64, RpcError> {
+fn pox_u64(value: &ClarityValue, contract_name: &str, context: &str) -> Result<u64, RpcError> {
     let ClarityValue::UInt(value) = value else {
         return Err(pox_unavailable(format!(
-            "pox-5.{context} did not return a uint"
+            "{contract_name}.{context} did not return a uint"
         )));
     };
     (*value).try_into().map_err(|_| {
         pox_unavailable(format!(
-            "pox-5.{context} returned a value larger than a u64"
+            "{contract_name}.{context} returned a value larger than a u64"
         ))
     })
 }
 
-fn pox_tuple(value: ClarityValue) -> Result<TupleData, RpcError> {
+fn pox_tuple(value: ClarityValue, contract_name: &str) -> Result<TupleData, RpcError> {
     let ClarityValue::Response(response) = value else {
-        return Err(pox_unavailable(
-            "pox-5.get-pox-info did not return a response",
-        ));
+        return Err(pox_unavailable(format!(
+            "{contract_name}.get-pox-info did not return a response"
+        )));
     };
     if !response.committed {
-        return Err(pox_unavailable("pox-5.get-pox-info returned an error"));
+        return Err(pox_unavailable(format!(
+            "{contract_name}.get-pox-info returned an error"
+        )));
     }
     let ClarityValue::Tuple(tuple) = *response.data else {
-        return Err(pox_unavailable(
-            "pox-5.get-pox-info did not return an ok tuple",
-        ));
+        return Err(pox_unavailable(format!(
+            "{contract_name}.get-pox-info did not return an ok tuple"
+        )));
     };
     Ok(tuple)
 }
 
-fn pox_tuple_u64(tuple: &TupleData, field: &str) -> Result<u64, RpcError> {
+fn pox_tuple_u64(tuple: &TupleData, contract_name: &str, field: &str) -> Result<u64, RpcError> {
     let value = tuple
         .get(field)
-        .map_err(|_| pox_unavailable(format!("pox-5.get-pox-info omitted {field}")))?;
-    pox_u64(value, &format!("get-pox-info.{field}"))
+        .map_err(|_| pox_unavailable(format!("{contract_name}.get-pox-info omitted {field}")))?;
+    pox_u64(value, contract_name, &format!("get-pox-info.{field}"))
+}
+
+const fn pox_contract_for_cycle(cycle: u64, first_pox_5_cycle: u64) -> &'static str {
+    if cycle >= first_pox_5_cycle {
+        "pox-5"
+    } else {
+        "pox-4"
+    }
 }
 
 fn pox_chain_values(
@@ -971,20 +984,27 @@ fn pox_chain_values(
     network: Network,
     current_cycle: u64,
     next_cycle: u64,
+    first_pox_5_cycle: u64,
 ) -> Result<PoxChainValues, RpcError> {
-    let info = pox_tuple(pox_read(chain, network, "get-pox-info", &[])?)?;
+    let current_contract = pox_contract_for_cycle(current_cycle, first_pox_5_cycle);
+    let info = pox_tuple(
+        pox_read(chain, network, current_contract, "get-pox-info", &[])?,
+        current_contract,
+    )?;
     let stacked = |chain: &mut dyn ChainAccess, cycle: u64| {
+        let contract_name = pox_contract_for_cycle(cycle, first_pox_5_cycle);
         pox_read(
             chain,
             network,
+            contract_name,
             "get-total-ustx-stacked",
             &[ClarityValue::UInt(u128::from(cycle))],
         )
-        .and_then(|value| pox_u64(&value, "get-total-ustx-stacked"))
+        .and_then(|value| pox_u64(&value, contract_name, "get-total-ustx-stacked"))
     };
     Ok(PoxChainValues {
-        minimum_amount: pox_tuple_u64(&info, "min-amount-ustx")?,
-        liquid_supply: pox_tuple_u64(&info, "total-liquid-supply-ustx")?,
+        minimum_amount: pox_tuple_u64(&info, current_contract, "min-amount-ustx")?,
+        liquid_supply: pox_tuple_u64(&info, current_contract, "total-liquid-supply-ustx")?,
         current_cycle_stacked: stacked(chain, current_cycle)?,
         next_cycle_stacked: stacked(chain, next_cycle)?,
     })
@@ -1065,7 +1085,13 @@ async fn read_pox_chain_values(
 ) -> Result<PoxChainValues, RpcError> {
     let chain = state.chain()?;
     let mut chain = chain.lock().await;
-    pox_chain_values(&mut *chain, network, cycle.current_cycle, cycle.next_cycle)
+    pox_chain_values(
+        &mut *chain,
+        network,
+        cycle.current_cycle,
+        cycle.next_cycle,
+        cycle.first_reward_cycle,
+    )
 }
 
 fn pox_info_json(
@@ -1078,7 +1104,10 @@ fn pox_info_json(
     resolved: bool,
 ) -> Value {
     json!({
-        "contract_id": network.boot_contract_id("pox-5"),
+        "contract_id": network.boot_contract_id(pox_contract_for_cycle(
+            cycle.current_cycle,
+            cycle.first_reward_cycle,
+        )),
         "pox_activation_threshold_ustx": activation_threshold,
         "first_burnchain_block_height": pox.first_bitcoin_height,
         "current_burnchain_block_height": cycle.height,
@@ -2794,6 +2823,13 @@ mod tests {
         captured_view().pox_info
     }
 
+    fn boundary_pox() -> PoxInfo {
+        let mut pox = captured_pox();
+        // Activation occurs during cycle zero; cycle one is PoX-5's first.
+        pox.pox_5_activation_height = Some(2);
+        pox
+    }
+
     fn pox_config() -> PoxRpcConfig {
         PoxRpcConfig::for_network(
             NETWORK,
@@ -2822,7 +2858,7 @@ mod tests {
                     state_index_root: TrieHash::from_bytes([8; 32]),
                 },
                 Vec::new(),
-                captured_pox(),
+                boundary_pox(),
             )
             .await;
         state
@@ -2902,7 +2938,7 @@ mod tests {
         assert_eq!(
             body_json(response).await,
             json!({
-                "contract_id": "ST000000000000000000002AMW42H.pox-5",
+                "contract_id": "ST000000000000000000002AMW42H.pox-4",
                 "pox_activation_threshold_ustx": 200_000,
                 "first_burnchain_block_height": 0,
                 "current_burnchain_block_height": 11,
@@ -2930,7 +2966,7 @@ mod tests {
                 },
                 "epochs": [{
                     "epoch_id": "Epoch40",
-                    "start_height": 262,
+                    "start_height": 2,
                     "end_height": i64::MAX,
                     "block_limit": {
                         "write_length": 15_000_000,
@@ -2950,8 +2986,8 @@ mod tests {
                 "next_reward_cycle_in": 9,
                 "contract_versions": [{
                     "contract_id": "ST000000000000000000002AMW42H.pox-5",
-                    "activation_burnchain_block_height": 262,
-                    "first_reward_cycle_id": 14,
+                    "activation_burnchain_block_height": 2,
+                    "first_reward_cycle_id": 1,
                 }],
                 "pox_5_sbtc_contract":
                     "ST2SBXRBJJTH7GV5J93HJ62W2NRRQ46XYBK92Y039.sbtc-token",
@@ -2963,10 +2999,15 @@ mod tests {
         let calls = calls.lock().expect("call log");
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| {
-            call.sender.to_string() == "ST000000000000000000002AMW42H"
-                && call.contract.to_string() == "ST000000000000000000002AMW42H.pox-5"
-                && call.sponsor.is_none()
+            call.sender.to_string() == "ST000000000000000000002AMW42H" && call.sponsor.is_none()
         }));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.contract.name.to_string())
+                .collect::<Vec<_>>(),
+            ["pox-4", "pox-4", "pox-5"]
+        );
         assert_eq!(calls[0].function, "get-pox-info");
         assert!(calls[0].arguments.is_empty());
         for (call, cycle) in calls[1..].iter().zip([0, 1]) {
@@ -3013,7 +3054,7 @@ mod tests {
             (
                 "execution error",
                 vec![Err(ChainAccessError::Failed("MARF read failed".to_owned()))],
-                "cannot read pox-5.get-pox-info: MARF read failed",
+                "cannot read pox-4.get-pox-info: MARF read failed",
             ),
             (
                 "malformed stacked amount",
