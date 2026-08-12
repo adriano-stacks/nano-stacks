@@ -1,7 +1,7 @@
 ---
 id: "052"
 title: "Wire the complete RPC and event surface into the node"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["029", "046", "047", "050"]
 tags: ["mainnet", "rpc", "events"]
 created_at: 2026-08-02
+completed_at: 2026-08-12
 ---
 
 # Wire the complete RPC and event surface into the node
@@ -347,16 +348,18 @@ execution.
       is a bounded sqlite store written at seal and retracted on a fork switch; the
       handlers ask it first. The invariant holds because it only ever holds blocks
       the executor sealed.
-- [~] Populate matured rewards, reward set and miner transaction id in
+- [x] Populate matured rewards, reward set and miner transaction id in
       `new_block`, then compare receipts, costs and events with an independent
       stacks-core observer for the same executed blocks.
       `miner_address`, `from_stacks_block_hash` and `from_index_consensus_hash` are
       read back out of the executed-block archive, from the start block of the
       tenure that matured. They stay absent for the first 100 tenures after a
       checkpoint and for a node with no archive: a checkpoint carries what is owed,
-      not where it was earned, so they are empty rather than guessed. The
-      independent-observer comparison over the same *mainnet* blocks is the part
-      still open.
+      not where it was earned, so they are empty rather than guessed. The current
+      mainnet replay matches independent receipts, all five costs, ordered events,
+      reward provenance and miner identities. The 340-block captured replay also
+      matches stacks-core's complete `new_block` stream and requires a non-empty
+      derived reward-set payload; four such payloads were compared.
 - [x] Exercise a stock `stacks-signer`, transaction submitter and event observer
       against the binary far enough to validate RPC shapes, signer registration,
       StackerDB writes, transaction admission and observer payloads. This does
@@ -417,12 +420,10 @@ The payload is built synchronously and dispatched with owned values: holding the
 chainstate across the await makes the future non-`Send`, since a `ChainState`
 carries `RefCell`s and a sqlite connection.
 
-Only the fields a follower can answer are filled in — the parent, the burn block
-and its height, and the unlock heights — and the rest are left at their defaults
-rather than invented. An observer comparing nano against stacks-core is better
-served by a field that is plainly absent than by one that is confidently wrong.
-Filling in the matured rewards, the reward set and the miner's winning txid is
-the remaining work on this item.
+The first implementation filled only the fields a follower could answer — the
+parent, burn block, height and unlock heights — and left the rest absent rather
+than inventing them. The later archive, accounting and reward-set work fills the
+remaining fields from local executed state and verifies them below.
 
 `tests/event_observer.rs` already checks nano builds the same payload stacks-core
 published, which is the harder half and says nothing about whether anything sends
@@ -744,7 +745,7 @@ Every one of those is the route answering from real state or refusing for a
 reason it can name. None of them is `Unavailable` because a builder was never
 called, which is what the whole task was about.
 
-## Still open
+## What was still open after that live run
 
 - **A stock `stacks-signer` has not been run against the binary.** The binaries
   are on this machine (`/home/aldur/stacks-core/target/debug/stacks-signer`), but
