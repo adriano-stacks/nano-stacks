@@ -798,6 +798,12 @@ async fn executed(state: &RpcState) -> Result<Executed, RpcError> {
         .ok_or(RpcError::Unavailable)
 }
 
+fn read_only_bitcoin_context(executed: &Executed) -> nano_vm::BitcoinBlockContext {
+    let mut context = executed.pox.bitcoin_context();
+    context.move_to_burn_block(executed.tip.bitcoin_height);
+    context
+}
+
 /// The Stacks fields describe the chain this node executed, while the burn
 /// fields describe the newest burn block it derived locally.
 ///
@@ -900,6 +906,7 @@ fn pox_unavailable(message: impl Into<String>) -> RpcError {
 fn pox_read(
     chain: &mut dyn ChainAccess,
     network: Network,
+    bitcoin_context: nano_vm::BitcoinBlockContext,
     contract_name: &str,
     function: &str,
     arguments: &[ClarityValue],
@@ -917,6 +924,7 @@ fn pox_read(
         })?;
     chain
         .call_read_only(&ReadOnlyCall {
+            bitcoin_context,
             sender,
             sponsor: None,
             contract,
@@ -982,13 +990,21 @@ const fn pox_contract_for_cycle(cycle: u64, first_pox_5_cycle: u64) -> &'static 
 fn pox_chain_values(
     chain: &mut dyn ChainAccess,
     network: Network,
+    bitcoin_context: nano_vm::BitcoinBlockContext,
     current_cycle: u64,
     next_cycle: u64,
     first_pox_5_cycle: u64,
 ) -> Result<PoxChainValues, RpcError> {
     let current_contract = pox_contract_for_cycle(current_cycle, first_pox_5_cycle);
     let info = pox_tuple(
-        pox_read(chain, network, current_contract, "get-pox-info", &[])?,
+        pox_read(
+            chain,
+            network,
+            bitcoin_context,
+            current_contract,
+            "get-pox-info",
+            &[],
+        )?,
         current_contract,
     )?;
     let stacked = |chain: &mut dyn ChainAccess, cycle: u64| {
@@ -996,6 +1012,7 @@ fn pox_chain_values(
         pox_read(
             chain,
             network,
+            bitcoin_context,
             contract_name,
             "get-total-ustx-stacked",
             &[ClarityValue::UInt(u128::from(cycle))],
@@ -1081,6 +1098,7 @@ fn pox_cycle_position(pox: &PoxInfo, height: u64) -> Result<PoxCyclePosition, Rp
 async fn read_pox_chain_values(
     state: &RpcState,
     network: Network,
+    bitcoin_context: nano_vm::BitcoinBlockContext,
     cycle: &PoxCyclePosition,
 ) -> Result<PoxChainValues, RpcError> {
     let chain = state.chain()?;
@@ -1088,6 +1106,7 @@ async fn read_pox_chain_values(
     pox_chain_values(
         &mut *chain,
         network,
+        bitcoin_context,
         cycle.current_cycle,
         cycle.next_cycle,
         cycle.first_reward_cycle,
@@ -1169,13 +1188,14 @@ fn pox_info_json(
 async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
     let executed = executed(&state).await?;
     let network = state.network;
+    let bitcoin_context = read_only_bitcoin_context(&executed);
     let pox = executed.pox;
     let configured = state
         .pox_rpc
         .as_ref()
         .ok_or_else(|| pox_unavailable("PoX RPC constants were not installed at startup"))?;
     let cycle = pox_cycle_position(&pox, executed.tip.bitcoin_height)?;
-    let values = read_pox_chain_values(&state, network, &cycle).await?;
+    let values = read_pox_chain_values(&state, network, bitcoin_context, &cycle).await?;
     let activation_threshold = u128::from(values.liquid_supply)
         .checked_mul(u128::from(configured.participation_threshold_pct))
         .map(|value| value / 100)
@@ -1453,6 +1473,8 @@ async fn call_read_only(
     Path((address, contract, function)): Path<(String, String, String)>,
     axum::Json(body): axum::Json<CallReadOnlyBody>,
 ) -> Result<axum::Json<CallReadOnlyWire>, RpcError> {
+    let executed = executed(&state).await?;
+    let bitcoin_context = read_only_bitcoin_context(&executed);
     let principal = |value: &str| {
         PrincipalData::parse(value)
             .map_err(|error| RpcError::BadRequest(format!("invalid principal: {error}")))
@@ -1468,6 +1490,7 @@ async fn call_read_only(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let call = ReadOnlyCall {
+        bitcoin_context,
         sender: principal(&body.sender)?,
         sponsor: body.sponsor.as_deref().map(principal).transpose()?,
         contract,
@@ -2546,6 +2569,33 @@ mod tests {
         .expect("an ok response")
     }
 
+    fn assert_pox_calls(calls: &[ReadOnlyCall]) {
+        assert_eq!(calls.len(), 3);
+        let mut bitcoin_context = boundary_pox().bitcoin_context();
+        bitcoin_context.move_to_burn_block(11);
+        assert!(calls.iter().all(|call| {
+            call.bitcoin_context == bitcoin_context
+                && call.sender.to_string() == "ST000000000000000000002AMW42H"
+                && call.sponsor.is_none()
+        }));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.contract.name.to_string())
+                .collect::<Vec<_>>(),
+            ["pox-4", "pox-4", "pox-5"]
+        );
+        assert_eq!(calls[0].function, "get-pox-info");
+        assert!(calls[0].arguments.is_empty());
+        for (call, cycle) in calls[1..].iter().zip([0, 1]) {
+            assert_eq!(call.function, "get-total-ustx-stacked");
+            assert_eq!(
+                call.arguments,
+                vec![Value::UInt(cycle).serialize_to_vec().expect("a uint")]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reports_an_account_the_way_a_wallet_reads_it() {
         let sender = key(b"sender");
@@ -2581,7 +2631,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_only_call_reports_its_value_and_its_cause() {
-        let app = router(RpcState::new(NETWORK).with_chain(chain(&[], Some(Value::UInt(3)))));
+        let app = router(pox_state(chain(&[], Some(Value::UInt(3)))).await);
         let call = |uri: &str, app: Router| {
             let uri = uri.to_owned();
             async move {
@@ -2611,7 +2661,7 @@ mod tests {
             json!({ "okay": true, "result": "0x0100000000000000000000000000000003" })
         );
 
-        let failed = router(RpcState::new(NETWORK).with_chain(chain(&[], None)));
+        let failed = router(pox_state(chain(&[], None)).await);
         let response = call(
             "/v2/contracts/call-read/ST000000000000000000002AMW42H/pox-5/get-cycle",
             failed,
@@ -2996,27 +3046,7 @@ mod tests {
             })
         );
 
-        let calls = calls.lock().expect("call log");
-        assert_eq!(calls.len(), 3);
-        assert!(calls.iter().all(|call| {
-            call.sender.to_string() == "ST000000000000000000002AMW42H" && call.sponsor.is_none()
-        }));
-        assert_eq!(
-            calls
-                .iter()
-                .map(|call| call.contract.name.to_string())
-                .collect::<Vec<_>>(),
-            ["pox-4", "pox-4", "pox-5"]
-        );
-        assert_eq!(calls[0].function, "get-pox-info");
-        assert!(calls[0].arguments.is_empty());
-        for (call, cycle) in calls[1..].iter().zip([0, 1]) {
-            assert_eq!(call.function, "get-total-ustx-stacked");
-            assert_eq!(
-                call.arguments,
-                vec![Value::UInt(cycle).serialize_to_vec().expect("a uint")]
-            );
-        }
+        assert_pox_calls(&calls.lock().expect("call log"));
     }
 
     #[tokio::test]

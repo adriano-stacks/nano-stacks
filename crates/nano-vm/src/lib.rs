@@ -1469,6 +1469,18 @@ impl Vm {
         self.store.begin(parent, block)
     }
 
+    /// Set the Bitcoin view used by a read against the currently open state.
+    ///
+    /// A restarted VM recovers its MARF tip but has not begun another block, so
+    /// its in-memory view is otherwise still height zero. Read-only RPC calls
+    /// must use the sealed tip's view just as calls made while executing it did.
+    pub fn set_read_only_bitcoin_context(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<(), MarfStoreError> {
+        self.context.set_block(bitcoin_context)
+    }
+
     /// Begin block execution using the supplied temporary MARF state ID.
     pub fn begin_block_execution(
         &mut self,
@@ -5419,6 +5431,41 @@ mod tests {
         let sender: PrincipalData = contract.issuer.clone().into();
         vm.call_contract_values(&sender, &contract, "answer", &[])
             .expect("read through the reader")
+    }
+
+    #[test]
+    fn a_read_only_call_uses_the_supplied_bitcoin_height_after_restart() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [0x91; 32]).expect("begin block");
+        {
+            let mut database = vm.clarity_db();
+            database.begin();
+            database
+                .set_clarity_epoch_version(clarity::types::StacksEpochId::Epoch40)
+                .expect("set the current epoch");
+            database.commit().expect("commit the current epoch");
+        }
+        let contract = QualifiedContractIdentifier::parse(
+            "ST000000000000000000002AMW42H.read-only-burn-height",
+        )
+        .expect("a contract identifier");
+        vm.deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            "(define-read-only (answer) burn-block-height)",
+            LimitedCostTracker::new_free(),
+        )
+        .expect("deploy the reader");
+
+        vm.set_read_only_bitcoin_context(super::BitcoinBlockContext::at_height(321))
+            .expect("set the sealed Bitcoin view");
+        let sender: PrincipalData = contract.issuer.clone().into();
+
+        assert_eq!(
+            vm.call_contract_values(&sender, &contract, "answer", &[])
+                .expect("read the burn height"),
+            Value::UInt(321)
+        );
     }
 
     /// A trie that cannot be read is refused, not answered as an absence.

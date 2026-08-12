@@ -9,7 +9,7 @@ use clarity::vm::{
     costs::LimitedCostTracker,
     types::{PrincipalData, QualifiedContractIdentifier},
 };
-use nano_vm::{ContractCallOutcome, Vm};
+use nano_vm::{BitcoinBlockContext, ContractCallOutcome, Vm};
 
 /// What a node reports about one account.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub struct AccountEntry {
 /// consensus serialization.
 #[derive(Clone, Debug)]
 pub struct ReadOnlyCall {
+    pub bitcoin_context: BitcoinBlockContext,
     pub sender: PrincipalData,
     pub sponsor: Option<PrincipalData>,
     pub contract: QualifiedContractIdentifier,
@@ -73,6 +74,8 @@ impl ChainAccess for Vm {
     /// a call that writes cannot reach the MARF; the write dimensions it
     /// reports are what tells the caller it was not a read-only call.
     fn call_read_only(&mut self, call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
+        self.set_read_only_bitcoin_context(call.bitcoin_context)
+            .map_err(|error| ChainAccessError::Unavailable(error.to_string()))?;
         let outcome = self
             .execute_contract_call_outcome(
                 call.sender.clone(),
