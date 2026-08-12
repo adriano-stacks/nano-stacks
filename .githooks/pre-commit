@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  echo "pre-commit: stage every change before CI is verified" >&2
+  git status --short >&2
+  exit 1
+fi
+
+tree=$(git write-tree)
+nix develop --command scripts/ci.sh all
+
+if [[ "$(git write-tree)" != "$tree" ]] || ! git diff --quiet \
+  || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  echo "pre-commit: the index or worktree changed while CI was running" >&2
+  exit 1
+fi
+
+printf '%s\n' "$tree" >"$(git rev-parse --git-path nano-ci-verified-tree)"

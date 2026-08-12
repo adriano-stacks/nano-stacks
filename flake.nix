@@ -26,10 +26,12 @@
               pkgs.cargo
               pkgs.clippy
               pkgs.curl
+              pkgs.jq
               pkgs.openssl
               pkgs.pkg-config
               pkgs.rustc
               pkgs.rustfmt
+              pkgs.shellcheck
               pkgs.sqlite
             ];
 

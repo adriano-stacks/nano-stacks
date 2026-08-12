@@ -52,10 +52,7 @@ jobs:
       - name: fixture integrity
         run: nix develop --command scripts/ci.sh fixtures
 
-      - name: the conformance suite
-        run: nix develop --command scripts/ci.sh conformance
-
-      - name: unit tests
+      - name: workspace and conformance tests
         run: nix develop --command scripts/ci.sh tests
 
       # The report still builds and inspects the release artifact, checks the

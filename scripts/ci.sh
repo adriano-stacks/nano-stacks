@@ -15,10 +15,14 @@ run_gate() {
       test "$(cargo --version | awk '{print $2}')" = "1.97.0"
       test "$(cargo clippy --version | awk '{print $2}')" = "0.1.97"
       test "$(rustfmt --version | awk '{print $2}' | cut -d- -f1)" = "1.9.0"
+      cargo metadata --no-deps --format-version 1 \
+        | jq -e 'all(.workspace_members[]; contains("vendor/clarity-wasm") | not)' \
+          >/dev/null
       git diff --exit-code -- flake.lock
       ;;
     workflow)
       actionlint
+      shellcheck scripts/*.sh .githooks/*
       ;;
     formatting)
       scripts/fmt.sh --check
@@ -29,20 +33,22 @@ run_gate() {
         --release -p clar2wasm --all-targets -- -D warnings
       ;;
     scoreboard)
-      cargo xtask scoreboard
+      cargo run --profile ci -p xtask -- scoreboard
       ;;
     fixtures)
-      cargo xtask validate-fixtures
-      ;;
-    conformance)
-      cargo test --release -p nano-conformance --test conformance
+      cargo run --profile ci -p xtask -- validate-fixtures
       ;;
     tests)
-      cargo test --release --workspace
+      cargo test --profile ci --workspace --tests
+      cargo test --profile ci --workspace --doc
+      cargo test --manifest-path vendor/clarity-wasm/Cargo.toml \
+        --release -p clar2wasm --tests
+      cargo test --manifest-path vendor/clarity-wasm/Cargo.toml \
+        --release -p clar2wasm --doc
       ;;
     release)
       set +e
-      cargo xtask release-report --no-gates
+      cargo run --profile ci -p xtask -- release-report --no-gates
       status=$?
       set -e
       test "$status" -eq 2
@@ -58,7 +64,7 @@ run_gate() {
 }
 
 if [[ "$gate" == all ]]; then
-  for name in toolchain workflow formatting clippy scoreboard fixtures conformance tests release locks; do
+  for name in toolchain workflow formatting clippy scoreboard fixtures tests release locks; do
     run_gate "$name"
   done
 else

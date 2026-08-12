@@ -5,15 +5,27 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if [[ -n "$(git status --porcelain)" ]]; then
-  echo "pre-push: the worktree must be clean before CI is verified" >&2
+  echo "pre-push: the worktree must be clean" >&2
   git status --short >&2
   exit 1
 fi
 
-head=$(git rev-parse HEAD)
-nix develop --command scripts/ci.sh all
-
-if [[ "$(git rev-parse HEAD)" != "$head" || -n "$(git status --porcelain)" ]]; then
-  echo "pre-push: HEAD or the worktree changed while CI was running" >&2
+record=$(git rev-parse --git-path nano-ci-verified-tree)
+if [[ ! -r "$record" ]]; then
+  echo "pre-push: no commit has passed the checked-in CI gates" >&2
   exit 1
 fi
+verified=$(<"$record")
+zero=0000000000000000000000000000000000000000
+
+while read -r local_ref local_oid _; do
+  if [[ "$local_oid" == "$zero" ]]; then
+    continue
+  fi
+  tree=$(git rev-parse "$local_oid^{tree}")
+  if [[ "$tree" != "$verified" ]]; then
+    echo "pre-push: $local_ref is not the tree verified before commit" >&2
+    echo "pre-push: commit it normally to run the gates; do not use --no-verify" >&2
+    exit 1
+  fi
+done
